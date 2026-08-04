@@ -1,0 +1,15 @@
+KT Signal Connector
+Copyright (C) 2026 KTAIorg contributors
+
+This repository contains the KT Signal Connector and is licensed under AGPL-3.0-only.
+
+The connector is designed to execute, but not incorporate or modify, separately distributed
+software. Release bundles must preserve the licenses, copyright notices, corresponding source, and
+build information for every included component, including at minimum:
+
+- signal-cli: https://github.com/AsamK/signal-cli (GPL-3.0)
+- libsignal: https://github.com/signalapp/libsignal (AGPL-3.0)
+- the selected Java runtime and all other third-party dependencies
+
+Signal is a trademark of Signal Messenger, LLC. This project is not endorsed by or affiliated with
+Signal Messenger, LLC.

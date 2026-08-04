@@ -1,0 +1,11 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+*.log
+*.sock
+*.pid
+*.secret
+/runtime/
+/data/
+/artifacts/
