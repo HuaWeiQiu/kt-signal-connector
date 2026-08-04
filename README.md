@@ -9,11 +9,14 @@ keeps Signal account keys outside the KT renderer and feature runtime.
 
 ## Status
 
-The repository is in the contract and PoC phase. It is not ready for production use and does not
-yet connect to Signal.
+The Phase 1 process/protocol PoC is implemented and tested locally on macOS arm64 against a fake
+`signal-cli` fixture. It is not ready for production use and has not been tested with a real Signal
+account or a production `signal-cli`/JRE bundle.
 
 The complete implementation and acceptance plan is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
+The current local evidence and remaining gaps are in
+[`docs/phase-1-validation.md`](docs/phase-1-validation.md).
 
 ## Non-goals
 
@@ -27,6 +30,7 @@ The complete implementation and acceptance plan is in
 Prerequisites:
 
 - Rust 1.85 or newer.
+- Python 3 for the Unix fake-engine integration fixture.
 - A pinned, compatible `signal-cli` and JRE 25 bundle for real integration tests.
 
 Local checks:

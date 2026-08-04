@@ -25,8 +25,6 @@ fn missing_command_fails_closed() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8(output.stderr).expect("error output should be UTF-8"),
-        "kt-signal-connector: runtime implementation is not available yet\n"
-    );
+    let stderr = String::from_utf8(output.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("Usage: kt-signal-connector <COMMAND>"));
 }

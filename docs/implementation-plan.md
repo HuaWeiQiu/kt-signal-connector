@@ -3,7 +3,7 @@
 ## 1. Status
 
 - Decision date: 2026-08-04
-- Current phase: Phase 0, repository and delivery contract
+- Current phase: Phase 1 local PoC implemented; real-runtime and additional-platform acceptance pending
 - Target engine baseline: unmodified `signal-cli v0.14.7`
 - Target Java baseline: JRE 25
 - Initial platforms: Windows 10/11 x64, macOS x64, macOS arm64
@@ -109,6 +109,17 @@ connector with the file path, and the connector reads and deletes the file befor
 client. The first frame performs a challenge-response handshake and negotiates API capabilities.
 The secret and endpoint are never logged.
 
+The secret file contains exactly 64 lowercase hexadecimal characters. The server sends a random
+32-byte hexadecimal `serverNonce`; KT answers with a random 32-byte hexadecimal `clientNonce` and:
+
+```text
+proof = hex(HMAC-SHA256(secret,
+  "kt-signal-connector-v1\0" + serverNonce + "\0" + clientNonce + "\0" + apiVersion))
+```
+
+Nonces and proofs must be canonical lowercase hex. Authentication has a five-second deadline and a
+connection is closed after any malformed or failed handshake. Phase 1 supports exactly API `1.0`.
+
 ### 4.2 Framing
 
 The initial host protocol uses newline-delimited JSON with explicit maximum frame size. Each request
@@ -145,6 +156,9 @@ Phase 1 exposes only:
 - normalized runtime/account/conversation/message events
 
 No generic `call`, `exec`, `jsonRpc`, file-read, URL-open, or raw-envelope endpoint is allowed.
+The machine-readable Phase 1 envelope contract is
+[`schemas/connector-api-v1.schema.json`](../schemas/connector-api-v1.schema.json). Methods listed for
+later phases return `CAPABILITY_UNAVAILABLE` until their implementation and tests land.
 
 ## 5. signal-cli Boundary
 
@@ -165,6 +179,10 @@ Rules:
 - stderr is redacted diagnostic input, never protocol input.
 - read-only requests may be retried under policy; sends are never retried after an unknown outcome.
 - child shutdown is graceful first, then forced after a fixed deadline.
+
+During the local Phase 1 PoC, the trusted launcher supplies absolute executable and data-directory
+paths as process arguments; neither is accepted over host IPC. Phase 3 replaces this bootstrap with
+signed runtime-manifest verification before packaging acceptance.
 
 ## 6. Linking and Messaging
 
@@ -240,7 +258,7 @@ The signal-cli data directory is never a cache and must be explicitly excluded f
 | KT Signal gateway/UI/cache increment | 20-70 MB | 35-110 MB | 60-150 MB |
 | total Signal increment | 170-350 MB | 250-550 MB | 400-800 MB |
 
-These are capacity budgets, not measurements or promises. Phase 1 records actual process RSS on each
+These are capacity budgets, not measurements or promises. Phase 3 records actual process RSS on each
 target platform and replaces the estimates.
 
 Additional idle account budget: 20-80 MB while sharing the same JVM. An ordinary open text
@@ -316,6 +334,10 @@ Deliver:
   shutdown, duplicate ID, and unknown send outcome.
 
 Exit: fmt, unit/integration tests, clippy, release build, clean review, and local commit.
+
+The macOS implementation and tests use a private Unix socket. The Windows named-pipe module must be
+implemented and tested on Windows before Phase 3 packaging; a platform abstraction alone is not a
+claim that the Windows transport has passed acceptance.
 
 ### Phase 2: account linking and text channel
 
