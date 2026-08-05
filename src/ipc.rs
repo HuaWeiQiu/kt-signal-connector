@@ -124,26 +124,109 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::sync::Mutex;
+
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+
     use super::*;
 
-    pub struct LocalListener;
-    pub type LocalStream = tokio::net::windows::named_pipe::NamedPipeServer;
+    pub type LocalStream = NamedPipeServer;
+
+    pub struct LocalListener {
+        name: String,
+        server: Mutex<NamedPipeServer>,
+    }
 
     impl LocalListener {
-        pub fn bind(_endpoint: &Path) -> io::Result<Self> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Windows named-pipe transport is pending platform acceptance",
-            ))
+        pub fn bind(endpoint: &Path) -> io::Result<Self> {
+            let name = normalize_pipe_name(endpoint)?;
+            let server = create_server(&name)?;
+            Ok(Self {
+                name,
+                server: Mutex::new(server),
+            })
         }
 
         pub async fn accept(&self) -> io::Result<LocalStream> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Windows transport is unavailable",
-            ))
+            // Take the current server, wait for a client, then immediately create the next
+            // listening instance so the host can accept again after disconnect.
+            let server = {
+                let mut slot = self
+                    .server
+                    .lock()
+                    .map_err(|_| io::Error::new(io::ErrorKind::Other, "pipe listener poisoned"))?;
+                let next = create_server(&self.name)?;
+                std::mem::replace(&mut *slot, next)
+            };
+            server.connect().await?;
+            Ok(server)
+        }
+    }
+
+    fn create_server(name: &str) -> io::Result<NamedPipeServer> {
+        ServerOptions::new()
+            .first_pipe_instance(false)
+            .reject_remote_clients(true)
+            .create(name)
+    }
+
+    fn normalize_pipe_name(endpoint: &Path) -> io::Result<String> {
+        let raw = endpoint.to_string_lossy();
+        let name = if raw.starts_with(r"\\.\pipe\") || raw.starts_with("//./pipe/") {
+            raw.replace('/', "\\")
+        } else {
+            let leaf = endpoint
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "pipe endpoint is invalid")
+                })?;
+            if leaf.is_empty() || leaf.contains('\\') || leaf.contains('/') || leaf.contains("..") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pipe name must be a single path segment",
+                ));
+            }
+            format!(r"\\.\pipe\{leaf}")
+        };
+        if name.len() > 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pipe name is too long",
+            ));
+        }
+        Ok(name)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pipe_name_normalization_is_strict() {
+            assert_eq!(
+                normalize_pipe_name(Path::new(r"\\.\pipe\kt-signal-test")).unwrap(),
+                r"\\.\pipe\kt-signal-test"
+            );
+            assert_eq!(
+                normalize_pipe_name(Path::new("kt-signal-test")).unwrap(),
+                r"\\.\pipe\kt-signal-test"
+            );
+            assert!(normalize_pipe_name(Path::new(r"a\b")).is_err());
         }
     }
 }
 
 pub use platform::{LocalListener, LocalStream};
+
+/// Shared helper for packaging docs/tests: describe the platform endpoint shape.
+pub fn endpoint_kind() -> &'static str {
+    #[cfg(unix)]
+    {
+        "unix-socket"
+    }
+    #[cfg(windows)]
+    {
+        "named-pipe"
+    }
+}

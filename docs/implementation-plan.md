@@ -3,7 +3,7 @@
 ## 1. Status
 
 - Decision date: 2026-08-04
-- Current phase: Phase 2 account linking and text channel (local fixture acceptance)
+- Current phase: Phase 3 packaging and resource baseline (local unsigned manifests / LKG)
 - Target engine baseline: unmodified `signal-cli v0.14.7`
 - Target Java baseline: JRE 25
 - Initial platforms: Windows 10/11 x64, macOS x64, macOS arm64

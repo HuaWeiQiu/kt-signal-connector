@@ -28,3 +28,18 @@ fn missing_command_fails_closed() {
     let stderr = String::from_utf8(output.stderr).expect("error output should be UTF-8");
     assert!(stderr.contains("Usage: kt-signal-connector <COMMAND>"));
 }
+
+#[test]
+fn package_help_lists_lkg_commands() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
+        .args(["package", "--help"])
+        .output()
+        .expect("connector binary should run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("manifest"));
+    assert!(stdout.contains("stage"));
+    assert!(stdout.contains("activate"));
+    assert!(stdout.contains("rollback"));
+    assert!(stdout.contains("verify"));
+}

@@ -9,9 +9,15 @@ keeps Signal account keys outside the KT renderer and feature runtime.
 
 ## Status
 
-Phase 1 (process/protocol) and Phase 2 (link, accounts, text channel, SQLite) are implemented and
-tested locally on macOS arm64 against a fake `signal-cli` fixture. The connector is not ready for
-production use and has not completed an authorized real Signal account acceptance run.
+Phases 1–3 are implemented for local development:
+
+- Phase 1: process/protocol PoC
+- Phase 2: link, accounts, text channel, SQLite
+- Phase 3: unsigned local manifests, LKG stage/activate/rollback, resource smoke harness
+
+The connector is not ready for production use. Local bundles are unsigned, Windows runtime
+acceptance is pending a Windows host, and real Signal account acceptance requires separate
+authorization.
 
 The complete implementation and acceptance plan is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
@@ -19,6 +25,14 @@ Local evidence:
 
 - [`docs/phase-1-validation.md`](docs/phase-1-validation.md)
 - [`docs/phase-2-validation.md`](docs/phase-2-validation.md)
+- [`docs/phase-3-validation.md`](docs/phase-3-validation.md)
+
+Local packaging helpers:
+
+```bash
+./packaging/scripts/build-local-bundle.sh
+./packaging/scripts/measure-local-resources.sh
+```
 
 ## Non-goals
 
