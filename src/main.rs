@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use kt_signal_connector::auth::load_bootstrap_secret;
-use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::host::serve;
 use kt_signal_connector::ipc::LocalListener;
-use kt_signal_connector::supervisor::RuntimeSupervisor;
+use kt_signal_connector::supervisor::open_supervisor;
 
 #[derive(Debug, Parser)]
 #[command(name = "kt-signal-connector", version, about)]
@@ -29,6 +27,8 @@ enum Command {
         signal_cli: PathBuf,
         #[arg(long)]
         signal_data_dir: PathBuf,
+        #[arg(long)]
+        state_dir: PathBuf,
     },
 }
 
@@ -41,6 +41,7 @@ async fn main() {
             bootstrap_secret_file,
             signal_cli,
             signal_data_dir,
+            state_dir,
         } => {
             let secret = match load_bootstrap_secret(&bootstrap_secret_file) {
                 Ok(secret) => secret,
@@ -56,10 +57,13 @@ async fn main() {
                     std::process::exit(2);
                 }
             };
-            let supervisor = Arc::new(RuntimeSupervisor::new(SignalCliConfig::new(
-                signal_cli,
-                signal_data_dir,
-            )));
+            let supervisor = match open_supervisor(signal_cli, signal_data_dir, state_dir) {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    eprintln!("kt-signal-connector: {error}");
+                    std::process::exit(2);
+                }
+            };
             serve(listener, secret, supervisor).await
         }
     };

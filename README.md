@@ -9,14 +9,16 @@ keeps Signal account keys outside the KT renderer and feature runtime.
 
 ## Status
 
-The Phase 1 process/protocol PoC is implemented and tested locally on macOS arm64 against a fake
-`signal-cli` fixture. It is not ready for production use and has not been tested with a real Signal
-account or a production `signal-cli`/JRE bundle.
+Phase 1 (process/protocol) and Phase 2 (link, accounts, text channel, SQLite) are implemented and
+tested locally on macOS arm64 against a fake `signal-cli` fixture. The connector is not ready for
+production use and has not completed an authorized real Signal account acceptance run.
 
 The complete implementation and acceptance plan is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
-The current local evidence and remaining gaps are in
-[`docs/phase-1-validation.md`](docs/phase-1-validation.md).
+Local evidence:
+
+- [`docs/phase-1-validation.md`](docs/phase-1-validation.md)
+- [`docs/phase-2-validation.md`](docs/phase-2-validation.md)
 
 ## Non-goals
 

@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+use thiserror::Error;
+
+use crate::engine::{EngineError, NormalizedReceive};
+use crate::ids::{mask_address, stable_hash_id};
+use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
+use crate::protocol::ApiError;
+use crate::store::{AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError};
+
+const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_DEVICE_NAME_BYTES: usize = 64;
+
+#[derive(Debug, Error)]
+pub enum ServiceError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    #[error("api error: {0}")]
+    Api(ApiError),
+}
+
+impl ServiceError {
+    pub fn into_api(self) -> ApiError {
+        match self {
+            ServiceError::Api(error) => error,
+            ServiceError::Store(StoreError::AccountNotFound) => {
+                ApiError::new("ACCOUNT_NOT_FOUND", "account was not found", false)
+            }
+            ServiceError::Store(StoreError::ConversationNotFound) => ApiError::new(
+                "CONVERSATION_NOT_FOUND",
+                "conversation was not found",
+                false,
+            ),
+            ServiceError::Store(_) => {
+                ApiError::new("INTERNAL_ERROR", "connector store failed", true)
+            }
+            ServiceError::Engine(EngineError::NotRunning) => ApiError::new(
+                "RUNTIME_NOT_RUNNING",
+                "signal-cli runtime is not running",
+                false,
+            ),
+            ServiceError::Engine(EngineError::Timeout) => {
+                ApiError::new("UPSTREAM_TIMEOUT", "signal-cli request timed out", true)
+            }
+            ServiceError::Engine(EngineError::UnknownOutcome) => ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ),
+            ServiceError::Engine(EngineError::Exited) => {
+                ApiError::new("UPSTREAM_EXITED", "signal-cli exited", true)
+            }
+            ServiceError::Engine(EngineError::Protocol) => {
+                ApiError::new("UPSTREAM_PROTOCOL_ERROR", "signal-cli protocol error", true)
+            }
+            ServiceError::Engine(EngineError::Upstream) => {
+                ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true)
+            }
+            ServiceError::Engine(EngineError::Backpressure) => {
+                ApiError::new("INTERNAL_ERROR", "signal-cli request queue is full", true)
+            }
+            ServiceError::Engine(EngineError::StartFailed) => ApiError::new(
+                "RUNTIME_START_FAILED",
+                "signal-cli runtime could not be started",
+                true,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum HostSideEvent {
+    AccountChanged(AccountSummary),
+    ConversationChanged(ConversationSummary),
+    MessageUpserted(MessageRecord),
+    MessageStatusChanged {
+        message_id: String,
+        status: &'static str,
+    },
+}
+
+pub struct ConnectorService {
+    store: Store,
+    link: Option<ActiveLinkSession>,
+}
+
+impl ConnectorService {
+    pub fn new(store: Store) -> Self {
+        Self { store, link: None }
+    }
+
+    pub fn clear_link(&mut self) {
+        self.link = None;
+    }
+
+    pub fn sync_accounts_from_numbers(
+        &self,
+        numbers: &[String],
+    ) -> Result<Vec<AccountSummary>, ServiceError> {
+        for number in numbers {
+            let _ = self.store.upsert_account_from_signal(number, None)?;
+        }
+        Ok(self.store.list_accounts()?)
+    }
+
+    pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
+        Ok(self.store.list_accounts()?)
+    }
+
+    pub fn begin_link(
+        &mut self,
+        device_name: String,
+        device_link_uri: String,
+    ) -> Result<Value, ServiceError> {
+        validate_device_name(&device_name)?;
+        if let Some(existing) = self.link.as_ref() {
+            if !existing.is_expired(now_ms()) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "LINK_IN_PROGRESS",
+                    "a link session is already active",
+                    false,
+                )));
+            }
+            self.link = None;
+        }
+        let session = ActiveLinkSession::new(device_name, device_link_uri, LINK_SESSION_TTL);
+        let response = json!({
+            "linkSessionId": session.session_id,
+            "qrPayload": session.qr_payload(),
+            "expiresAt": session.expires_at_ms,
+        });
+        self.link = Some(session);
+        Ok(response)
+    }
+
+    pub fn take_link_for_finish(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<(String, String), ServiceError> {
+        let mut session = self.take_link_session(link_session_id)?;
+        let device_name = session.device_name.clone();
+        let device_link_uri = session.take_device_link_uri();
+        Ok((device_name, device_link_uri))
+    }
+
+    pub fn complete_link(&self, number: &str) -> Result<AccountSummary, ServiceError> {
+        Ok(self
+            .store
+            .upsert_account_from_signal(number, Some(now_ms()))?)
+    }
+
+    pub fn cancel_link(&mut self, link_session_id: &str) -> Result<Value, ServiceError> {
+        let _ = self.take_link_session(link_session_id)?;
+        Ok(json!({}))
+    }
+
+    pub fn list_conversations(
+        &self,
+        account_id: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Page<ConversationSummary>, ServiceError> {
+        if self.store.account_by_id(account_id)?.is_none() {
+            return Err(ServiceError::Store(StoreError::AccountNotFound));
+        }
+        Ok(self.store.list_conversations(account_id, limit, cursor)?)
+    }
+
+    pub fn list_messages(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        limit: u32,
+        before: Option<&str>,
+    ) -> Result<Page<MessageRecord>, ServiceError> {
+        if self.store.account_by_id(account_id)?.is_none() {
+            return Err(ServiceError::Store(StoreError::AccountNotFound));
+        }
+        if self
+            .store
+            .conversation_by_id(account_id, conversation_id)?
+            .is_none()
+        {
+            return Err(ServiceError::Store(StoreError::ConversationNotFound));
+        }
+        Ok(self
+            .store
+            .list_messages(account_id, conversation_id, limit, before)?)
+    }
+
+    pub fn prepare_send_text(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        text: &str,
+        client_request_id: &str,
+        quote_message_id: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_text(text)?;
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if let Some(quote) = quote_message_id {
+            validate_opaque_id(quote, "quoteMessageId")?;
+        }
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(existing));
+        }
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let conversation = self
+            .store
+            .conversation_by_id(account_id, conversation_id)?
+            .ok_or(StoreError::ConversationNotFound)?;
+
+        let pending_id =
+            stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
+        let pending = MessageRecord {
+            id: pending_id.clone(),
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sent_at: now_ms(),
+            received_at: None,
+            text: Some(text.to_string()),
+            attachments: Vec::new(),
+            status: "pending",
+            quote_message_id: quote_message_id.map(str::to_string),
+        };
+        let inserted =
+            self.store
+                .insert_message(&pending, Some(client_request_id), Some(text), false)?;
+        if !inserted {
+            if let Some(existing) = self
+                .store
+                .message_by_client_request(account_id, client_request_id)?
+            {
+                return Ok(PreparedSend::Existing(existing));
+            }
+        }
+
+        let mut params = json!({
+            "account": account.signal_account,
+            "message": text,
+        });
+        if conversation.kind == "group" {
+            params["groupId"] = json!(conversation.peer_key);
+        } else {
+            params["recipient"] = json!([conversation.peer_key]);
+        }
+        Ok(PreparedSend::Dispatch {
+            pending_id,
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            params,
+            pending_sent_at: pending.sent_at,
+        })
+    }
+
+    pub fn complete_send_success(
+        &self,
+        pending_id: &str,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: u64,
+    ) -> Result<(MessageRecord, Vec<HostSideEvent>), ServiceError> {
+        let updated = self
+            .store
+            .update_message_status(pending_id, "sent", Some(sent_at))?
+            .ok_or(StoreError::Unavailable)?;
+        let mut events = vec![HostSideEvent::MessageUpserted(updated.clone())];
+        if let Some(conversation) = self.store.conversation_summary(conversation_id)? {
+            events.push(HostSideEvent::ConversationChanged(conversation));
+        }
+        if let Some(account) = self.store.account_summary(account_id)? {
+            events.push(HostSideEvent::AccountChanged(account));
+        }
+        Ok((updated, events))
+    }
+
+    pub fn complete_send_unknown(&self, pending_id: &str) -> Result<(), ServiceError> {
+        let _ = self
+            .store
+            .update_message_status(pending_id, "unknown", None)?;
+        Ok(())
+    }
+
+    pub fn complete_send_failed(&self, pending_id: &str) -> Result<(), ServiceError> {
+        let _ = self
+            .store
+            .update_message_status(pending_id, "failed", None)?;
+        Ok(())
+    }
+
+    pub fn ingest_receive(
+        &self,
+        receive: NormalizedReceive,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if receive.content_kind != "dataMessage" {
+            return Ok(Vec::new());
+        }
+        let Some(signal_account) = receive.account.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let account = self
+            .store
+            .upsert_account_from_signal(signal_account, None)?;
+        let (kind, peer_key, title) = if let Some(group_id) = receive.group_id.as_deref() {
+            ("group", group_id.to_string(), "group".to_string())
+        } else if let Some(source) = receive.source.as_deref() {
+            ("direct", source.to_string(), mask_address(source))
+        } else {
+            return Ok(Vec::new());
+        };
+        let conversation = self
+            .store
+            .ensure_conversation(&account.id, kind, &peer_key, &title)?;
+        let sent_at = receive.timestamp.unwrap_or_else(now_ms);
+        let sender_id = stable_hash_id(&[&account.id, kind, &peer_key]);
+        let message_id = stable_hash_id(&[
+            &account.id,
+            &conversation.id,
+            "incoming",
+            &sent_at.to_string(),
+            &sender_id,
+            receive.text.as_deref().unwrap_or(""),
+        ]);
+        let message = MessageRecord {
+            id: message_id,
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id,
+            sent_at,
+            received_at: Some(now_ms()),
+            text: receive.text.clone(),
+            attachments: Vec::new(),
+            status: "delivered",
+            quote_message_id: None,
+        };
+        let preview = receive
+            .text
+            .as_deref()
+            .map(|text| text.chars().take(120).collect::<String>());
+        let inserted = self
+            .store
+            .insert_message(&message, None, preview.as_deref(), true)?;
+        if !inserted {
+            return Ok(Vec::new());
+        }
+        let mut events = vec![HostSideEvent::MessageUpserted(message)];
+        if let Some(conversation) = self.store.conversation_summary(&conversation.id)? {
+            events.push(HostSideEvent::ConversationChanged(conversation));
+        }
+        if let Some(account) = self.store.account_summary(&account.id)? {
+            events.push(HostSideEvent::AccountChanged(account));
+        }
+        Ok(events)
+    }
+
+    fn take_link_session(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<ActiveLinkSession, ServiceError> {
+        match self.link.as_ref() {
+            Some(session) if session.session_id == link_session_id => {
+                if session.is_expired(now_ms()) {
+                    self.link = None;
+                    return Err(ServiceError::Api(ApiError::new(
+                        "LINK_EXPIRED",
+                        "link session has expired",
+                        false,
+                    )));
+                }
+            }
+            Some(_) | None => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "LINK_NOT_FOUND",
+                    "link session was not found",
+                    false,
+                )));
+            }
+        }
+        Ok(self.link.take().expect("link session present"))
+    }
+}
+
+pub enum PreparedSend {
+    Existing(MessageRecord),
+    Dispatch {
+        pending_id: String,
+        account_id: String,
+        conversation_id: String,
+        params: Value,
+        pending_sent_at: u64,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkStartParams {
+    pub device_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkSessionParams {
+    pub link_session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationsListParams {
+    pub account_id: String,
+    pub cursor: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesListParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub before: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesSendTextParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub text: String,
+    pub client_request_id: String,
+    pub quote_message_id: Option<String>,
+}
+
+fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
+    if device_name.is_empty() || device_name.len() > MAX_DEVICE_NAME_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "deviceName must contain between 1 and 64 bytes",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text(text: &str) -> Result<(), ServiceError> {
+    if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "text must contain between 1 and 65536 bytes",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            format!("{field} must contain between 1 and 128 bytes"),
+            false,
+        )));
+    }
+    Ok(())
+}

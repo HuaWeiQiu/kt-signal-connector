@@ -100,6 +100,14 @@ pub struct NormalizedReceive {
     pub timestamp: Option<u64>,
     pub content_kind: &'static str,
     pub account_present: bool,
+    #[serde(skip)]
+    pub account: Option<String>,
+    #[serde(skip)]
+    pub source: Option<String>,
+    #[serde(skip)]
+    pub group_id: Option<String>,
+    #[serde(skip)]
+    pub text: Option<String>,
 }
 
 #[derive(Clone)]
@@ -201,6 +209,17 @@ impl EngineHandle {
         params: Value,
         class: CallClass,
     ) -> Result<Value, EngineError> {
+        self.call_with_timeout(method, params, class, self.request_timeout)
+            .await
+    }
+
+    pub async fn call_with_timeout(
+        &self,
+        method: &'static str,
+        params: Value,
+        class: CallClass,
+        request_timeout: Duration,
+    ) -> Result<Value, EngineError> {
         if self.is_terminal() {
             return Err(EngineError::NotRunning);
         }
@@ -218,7 +237,7 @@ impl EngineHandle {
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(EngineError::NotRunning),
         }
 
-        match timeout(self.request_timeout, response_rx).await {
+        match timeout(request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(EngineError::Exited),
             Err(_) => {
@@ -452,7 +471,8 @@ fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
         .get("envelope")
         .and_then(Value::as_object)
         .ok_or(EngineError::Protocol)?;
-    let content_kind = if envelope.contains_key("dataMessage") {
+    let data_message = envelope.get("dataMessage").and_then(Value::as_object);
+    let content_kind = if data_message.is_some() {
         "dataMessage"
     } else if envelope.contains_key("syncMessage") {
         "syncMessage"
@@ -463,10 +483,38 @@ fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
     } else {
         "other"
     };
+    let group_id = data_message.and_then(|message| {
+        message
+            .get("groupInfo")
+            .and_then(|info| info.get("groupId"))
+            .or_else(|| message.get("groupId"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let text = data_message
+        .and_then(|message| message.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(NormalizedReceive {
         timestamp: envelope.get("timestamp").and_then(Value::as_u64),
         content_kind,
         account_present: payload.get("account").is_some(),
+        account: payload
+            .get("account")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        source: envelope
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                envelope
+                    .get("sourceNumber")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+        group_id,
+        text,
     })
 }
 
@@ -532,7 +580,14 @@ mod tests {
         let encoded = serde_json::to_string(&normalized).unwrap();
         assert_eq!(normalized.timestamp, Some(42));
         assert_eq!(normalized.content_kind, "dataMessage");
+        assert_eq!(normalized.text.as_deref(), Some("private text"));
+        assert_eq!(normalized.account.as_deref(), Some("+15555550100"));
+        assert_eq!(normalized.source.as_deref(), Some("+15555550101"));
+        // Host-facing serialization must not include identity or body fields.
         assert!(!encoded.contains("private text"));
         assert!(!encoded.contains("+155"));
+        assert!(!encoded.contains("source"));
+        assert!(!encoded.contains("\"text\""));
+        assert!(encoded.contains("accountPresent"));
     }
 }

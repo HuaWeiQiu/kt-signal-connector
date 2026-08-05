@@ -19,8 +19,13 @@ use crate::auth::{BootstrapSecret, HandshakeParams, PendingChallenge};
 use crate::engine::{EngineError, EngineEvent};
 use crate::ipc::LocalListener;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
+use crate::service::{
+    ConversationsListParams, HostSideEvent, LinkSessionParams, LinkStartParams, MessagesListParams,
+    MessagesSendTextParams,
+};
+use crate::store::MAX_PAGE_LIMIT;
 use crate::supervisor::RuntimeSupervisor;
-use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT};
+use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const RECENT_REQUEST_IDS: usize = 128;
@@ -152,7 +157,7 @@ where
             json!({
                 "sessionId": random_identifier(),
                 "apiVersion": API_VERSION,
-                "capabilities": ["runtime.status", "runtime.start", "runtime.stop"]
+                "capabilities": PHASE2_CAPABILITIES,
             }),
         ),
     )
@@ -160,7 +165,8 @@ where
 
     let mut recent_ids = RecentRequestIds::default();
     recent_ids.insert(handshake_request_id);
-    let mut events = supervisor.subscribe();
+    let mut engine_events = supervisor.subscribe_engine();
+    let mut host_events = supervisor.subscribe_host();
     loop {
         tokio::select! {
             line = framed.next() => {
@@ -181,9 +187,40 @@ where
                 };
                 send_json(&mut framed, &response).await?;
             }
-            event = events.recv() => {
+            event = engine_events.recv() => {
                 match event {
-                    Ok(event) => send_engine_event(&mut framed, event).await?,
+                    Ok(EngineEvent::StateChanged(status)) => {
+                        send_json(&mut framed, &HostEvent::new("runtime.stateChanged", status)).await?;
+                    }
+                    Ok(EngineEvent::ProtocolWarning { kind }) => {
+                        send_json(
+                            &mut framed,
+                            &HostEvent::new(
+                                "runtime.protocolWarning",
+                                json!({ "kind": kind }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    Ok(EngineEvent::Receive(receive)) => {
+                        supervisor.ingest_receive(receive).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        send_json(
+                            &mut framed,
+                            &HostEvent::new(
+                                "runtime.protocolWarning",
+                                json!({ "kind": "eventBackpressure" }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            event = host_events.recv() => {
+                match event {
+                    Ok(event) => send_host_event(&mut framed, event).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         send_json(
                             &mut framed,
@@ -230,15 +267,135 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
                 false,
             ),
         ),
-        "accounts.list" | "link.start" | "link.finish" | "link.cancel" | "conversations.list"
-        | "messages.list" | "messages.sendText" => HostResponse::failure(
+        "accounts.list" if empty_params(&request.params) => {
+            match supervisor.list_accounts().await {
+                Ok(accounts) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(accounts).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            }
+        }
+        "accounts.list" => HostResponse::failure(
             request_id,
             ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "capability is not available in this connector phase",
+                "INVALID_REQUEST",
+                "this method requires empty params",
                 false,
             ),
         ),
+        "link.start" => match serde_json::from_value::<LinkStartParams>(request.params) {
+            Ok(params) => match supervisor.start_link(params.device_name).await {
+                Ok(result) => HostResponse::success(request_id, result),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid link.start params", false),
+            ),
+        },
+        "link.finish" => match serde_json::from_value::<LinkSessionParams>(request.params) {
+            Ok(params) => match supervisor.finish_link(params.link_session_id).await {
+                Ok(account) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(account).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid link.finish params", false),
+            ),
+        },
+        "link.cancel" => match serde_json::from_value::<LinkSessionParams>(request.params) {
+            Ok(params) => match supervisor.cancel_link(params.link_session_id).await {
+                Ok(result) => HostResponse::success(request_id, result),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid link.cancel params", false),
+            ),
+        },
+        "conversations.list" => {
+            match serde_json::from_value::<ConversationsListParams>(request.params) {
+                Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
+                    match supervisor
+                        .list_conversations(params.account_id, params.limit, params.cursor)
+                        .await
+                    {
+                        Ok(page) => HostResponse::success(
+                            request_id,
+                            serde_json::to_value(page).unwrap_or(Value::Null),
+                        ),
+                        Err(error) => HostResponse::failure(request_id, error.into_api()),
+                    }
+                }
+                Ok(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+                ),
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.list params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.list" => match serde_json::from_value::<MessagesListParams>(request.params) {
+            Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
+                match supervisor
+                    .list_messages(
+                        params.account_id,
+                        params.conversation_id,
+                        params.limit,
+                        params.before,
+                    )
+                    .await
+                {
+                    Ok(page) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(page).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                }
+            }
+            Ok(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+            ),
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid messages.list params", false),
+            ),
+        },
+        "messages.sendText" => {
+            match serde_json::from_value::<MessagesSendTextParams>(request.params) {
+                Ok(params) => match supervisor
+                    .send_text(
+                        params.account_id,
+                        params.conversation_id,
+                        params.text,
+                        params.client_request_id,
+                        params.quote_message_id,
+                    )
+                    .await
+                {
+                    Ok(message) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(message).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid messages.sendText params", false),
+                ),
+            }
+        }
         _ => HostResponse::failure(
             request_id,
             ApiError::new("METHOD_NOT_ALLOWED", "method is not allowed", false),
@@ -280,24 +437,34 @@ fn map_stop_error(error: EngineError) -> ApiError {
     }
 }
 
-async fn send_engine_event<S>(
+async fn send_host_event<S>(
     framed: &mut Framed<S, LinesCodec>,
-    event: EngineEvent,
+    event: HostSideEvent,
 ) -> Result<(), HostError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     match event {
-        EngineEvent::StateChanged(status) => {
-            send_json(framed, &HostEvent::new("runtime.stateChanged", status)).await
+        HostSideEvent::AccountChanged(account) => {
+            send_json(framed, &HostEvent::new("account.changed", account)).await
         }
-        EngineEvent::Receive(receive) => {
-            send_json(framed, &HostEvent::new("signal.receive", receive)).await
-        }
-        EngineEvent::ProtocolWarning { kind } => {
+        HostSideEvent::ConversationChanged(conversation) => {
             send_json(
                 framed,
-                &HostEvent::new("runtime.protocolWarning", json!({ "kind": kind })),
+                &HostEvent::new("conversation.changed", conversation),
+            )
+            .await
+        }
+        HostSideEvent::MessageUpserted(message) => {
+            send_json(framed, &HostEvent::new("message.upserted", message)).await
+        }
+        HostSideEvent::MessageStatusChanged { message_id, status } => {
+            send_json(
+                framed,
+                &HostEvent::new(
+                    "message.statusChanged",
+                    json!({ "messageId": message_id, "status": status }),
+                ),
             )
             .await
         }
@@ -352,11 +519,33 @@ mod tests {
     use hmac::{Hmac, Mac};
     use serde_json::Value;
     use sha2::Sha256;
+    use tempfile::TempDir;
     use tokio::io::duplex;
 
     use super::*;
     use crate::auth::BootstrapSecret;
     use crate::engine::SignalCliConfig;
+    use crate::store::Store;
+    use crate::supervisor::RuntimeSupervisor;
+
+    fn test_supervisor() -> Arc<RuntimeSupervisor> {
+        let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = Store::open(temp.path()).unwrap();
+        // Leak TempDir for unit test lifetime; path stays valid for process.
+        std::mem::forget(temp);
+        Arc::new(RuntimeSupervisor::new(
+            SignalCliConfig::new(
+                PathBuf::from("unused-signal-cli"),
+                PathBuf::from("/tmp/unused-signal-data"),
+            ),
+            store,
+        ))
+    }
 
     #[test]
     fn request_id_window_is_bounded_and_detects_replay() {
@@ -374,10 +563,7 @@ mod tests {
     async fn authenticated_session_can_query_status_and_rejects_replayed_id() {
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
-        let supervisor = Arc::new(RuntimeSupervisor::new(SignalCliConfig::new(
-            PathBuf::from("unused-signal-cli"),
-            PathBuf::from("unused-signal-data"),
-        )));
+        let supervisor = test_supervisor();
         let (server_stream, client_stream) = duplex(64 * 1024);
         let server = tokio::spawn(handle_connection(server_stream, secret, supervisor));
         let mut client = Framed::new(client_stream, LinesCodec::new());
@@ -403,6 +589,13 @@ mod tests {
             serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
         assert_eq!(handshake["requestId"], "handshake-1");
         assert_eq!(handshake["result"]["apiVersion"], API_VERSION);
+        assert!(
+            handshake["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "messages.sendText")
+        );
 
         client
             .send(
@@ -442,10 +635,7 @@ mod tests {
     #[tokio::test]
     async fn failed_authentication_returns_generic_error_and_closes() {
         let secret = Arc::new(BootstrapSecret::for_test([7_u8; 32]));
-        let supervisor = Arc::new(RuntimeSupervisor::new(SignalCliConfig::new(
-            PathBuf::from("unused-signal-cli"),
-            PathBuf::from("unused-signal-data"),
-        )));
+        let supervisor = test_supervisor();
         let (server_stream, client_stream) = duplex(64 * 1024);
         let server = tokio::spawn(handle_connection(server_stream, secret, supervisor));
         let mut client = Framed::new(client_stream, LinesCodec::new());

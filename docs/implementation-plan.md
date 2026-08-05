@@ -3,7 +3,7 @@
 ## 1. Status
 
 - Decision date: 2026-08-04
-- Current phase: Phase 1 local PoC implemented; real-runtime and additional-platform acceptance pending
+- Current phase: Phase 2 account linking and text channel (local fixture acceptance)
 - Target engine baseline: unmodified `signal-cli v0.14.7`
 - Target Java baseline: JRE 25
 - Initial platforms: Windows 10/11 x64, macOS x64, macOS arm64
@@ -140,7 +140,7 @@ unknown methods are rejected.
 
 ### 4.3 Initial allowlist
 
-Phase 1 exposes only:
+Phase 2 host methods:
 
 - `handshake`
 - `runtime.status`
@@ -156,9 +156,9 @@ Phase 1 exposes only:
 - normalized runtime/account/conversation/message events
 
 No generic `call`, `exec`, `jsonRpc`, file-read, URL-open, or raw-envelope endpoint is allowed.
-The machine-readable Phase 1 envelope contract is
-[`schemas/connector-api-v1.schema.json`](../schemas/connector-api-v1.schema.json). Methods listed for
-later phases return `CAPABILITY_UNAVAILABLE` until their implementation and tests land.
+The machine-readable Phase 2 envelope contract is
+[`schemas/connector-api-v1.schema.json`](../schemas/connector-api-v1.schema.json). Methods outside this
+allowlist return `METHOD_NOT_ALLOWED`. Media and bulk automation remain unavailable.
 
 ## 5. signal-cli Boundary
 

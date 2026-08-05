@@ -42,10 +42,10 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
     let mut client = Framed::new(stream, LinesCodec::new());
     authenticate(&mut client, &secret).await;
 
-    let initial = request(&mut client, "status-1", "runtime.status").await;
+    let initial = request(&mut client, "status-1", "runtime.status", json!({})).await;
     assert_eq!(initial["result"]["state"], "stopped");
 
-    let started = request(&mut client, "start-1", "runtime.start").await;
+    let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
     let first_engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
 
@@ -55,13 +55,13 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
     authenticate(&mut client, &secret).await;
-    let reconnected = request(&mut client, "status-2", "runtime.status").await;
+    let reconnected = request(&mut client, "status-2", "runtime.status", json!({})).await;
     assert_eq!(reconnected["result"]["state"], "stopped");
 
-    let restarted = request(&mut client, "start-2", "runtime.start").await;
+    let restarted = request(&mut client, "start-2", "runtime.start", json!({})).await;
     assert_eq!(restarted["result"]["state"], "running");
 
-    let stopped = request(&mut client, "stop-2", "runtime.stop").await;
+    let stopped = request(&mut client, "stop-2", "runtime.stop", json!({})).await;
     assert_eq!(stopped["result"]["state"], "stopped");
 
     drop(client);
@@ -71,6 +71,157 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
         .unwrap()
         .unwrap();
     assert!(!status.success());
+}
+
+#[tokio::test]
+async fn phase2_link_receive_send_and_idempotent_text() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [7_u8; 32];
+    fs::write(&secret_file, hex::encode(secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "link-1",
+        "link.start",
+        json!({ "deviceName": "KT-Test" }),
+    )
+    .await;
+    assert!(link["result"]["linkSessionId"].as_str().is_some());
+    assert!(
+        link["result"]["qrPayload"]
+            .as_str()
+            .unwrap()
+            .starts_with("sgnl://")
+    );
+    let link_session_id = link["result"]["linkSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let conflict = request(
+        &mut client,
+        "link-2",
+        "link.start",
+        json!({ "deviceName": "KT-Test-2" }),
+    )
+    .await;
+    assert_eq!(conflict["error"]["code"], "LINK_IN_PROGRESS");
+
+    let finished = request(
+        &mut client,
+        "link-3",
+        "link.finish",
+        json!({ "linkSessionId": link_session_id }),
+    )
+    .await;
+    assert_eq!(finished["result"]["state"], "ready");
+    assert!(finished["result"]["maskedAddress"].as_str().is_some());
+    assert!(
+        !finished["result"]["maskedAddress"]
+            .as_str()
+            .unwrap()
+            .contains("555555")
+    );
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    let accounts = request(&mut client, "accounts-1", "accounts.list", json!({})).await;
+    assert_eq!(accounts["result"].as_array().unwrap().len(), 1);
+
+    // Fixture finishLink emits one receive notification after the JSON-RPC result.
+    sleep(Duration::from_millis(50)).await;
+    let conversations = request(
+        &mut client,
+        "conv-2",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    assert_eq!(
+        conversations["result"]["items"].as_array().unwrap().len(),
+        1
+    );
+    let conversation_id = conversations["result"]["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(conversations["result"]["items"][0]["type"], "direct");
+
+    let messages = request(
+        &mut client,
+        "msg-1",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    assert_eq!(messages["result"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(messages["result"]["items"][0]["text"], "private text");
+    assert_eq!(messages["result"]["items"][0]["direction"], "incoming");
+
+    let sent = request(
+        &mut client,
+        "send-1",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "hello from kt",
+            "clientRequestId": "client-req-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    assert_eq!(sent["result"]["text"], "hello from kt");
+    let message_id = sent["result"]["id"].as_str().unwrap().to_string();
+
+    let sent_again = request(
+        &mut client,
+        "send-2",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "hello from kt",
+            "clientRequestId": "client-req-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent_again["result"]["id"], message_id);
+    assert_eq!(sent_again["result"]["status"], "sent");
+
+    let messages = request(
+        &mut client,
+        "msg-2",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    assert_eq!(messages["result"]["items"].as_array().unwrap().len(), 2);
+
+    drop(client);
+    connector.start_kill().unwrap();
+    let _ = timeout(Duration::from_secs(2), connector.wait()).await;
 }
 
 fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
@@ -84,6 +235,8 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
+        .arg("--state-dir")
+        .arg(root.join("state"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -158,6 +311,7 @@ async fn request(
     client: &mut Framed<UnixStream, LinesCodec>,
     request_id: &str,
     method: &str,
+    params: Value,
 ) -> Value {
     client
         .send(
@@ -165,7 +319,7 @@ async fn request(
                 "apiVersion": API_VERSION,
                 "requestId": request_id,
                 "method": method,
-                "params": {}
+                "params": params
             })
             .to_string(),
         )

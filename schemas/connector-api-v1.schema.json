@@ -16,6 +16,11 @@
       "minLength": 1,
       "maxLength": 128
     },
+    "opaqueId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
     "request": {
       "type": "object",
       "additionalProperties": false,
@@ -58,7 +63,7 @@
           "if": {
             "properties": {
               "method": {
-                "enum": ["runtime.status", "runtime.start", "runtime.stop"]
+                "enum": ["runtime.status", "runtime.start", "runtime.stop", "accounts.list"]
               }
             },
             "required": ["method"]
@@ -69,6 +74,63 @@
                 "type": "object",
                 "maxProperties": 0
               }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "link.start" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/linkStartParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "enum": ["link.finish", "link.cancel"] }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/linkSessionParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.list" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.list" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendText" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendTextParams" }
             }
           }
         }
@@ -87,6 +149,59 @@
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
         }
+      }
+    },
+    "linkStartParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deviceName"],
+      "properties": {
+        "deviceName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      }
+    },
+    "linkSessionParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["linkSessionId"],
+      "properties": {
+        "linkSessionId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "conversationsListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "limit"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "cursor": { "type": "string", "maxLength": 256 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "messagesListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "limit"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "before": { "$ref": "#/$defs/opaqueId" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "messagesSendTextParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "text", "clientRequestId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "response": {
@@ -121,7 +236,10 @@
             "runtime.challenge",
             "runtime.stateChanged",
             "runtime.protocolWarning",
-            "signal.receive"
+            "account.changed",
+            "conversation.changed",
+            "message.upserted",
+            "message.statusChanged"
           ]
         },
         "data": {
@@ -145,9 +263,15 @@
             "RUNTIME_NOT_RUNNING",
             "RUNTIME_START_FAILED",
             "RUNTIME_STOP_FAILED",
+            "LINK_IN_PROGRESS",
+            "LINK_NOT_FOUND",
+            "LINK_EXPIRED",
+            "ACCOUNT_NOT_FOUND",
+            "CONVERSATION_NOT_FOUND",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",
+            "UPSTREAM_ERROR",
             "SEND_OUTCOME_UNKNOWN",
             "INTERNAL_ERROR"
           ]
