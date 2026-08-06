@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 200;
 
@@ -119,6 +119,7 @@ impl Store {
               id TEXT PRIMARY KEY,
               signal_account TEXT NOT NULL UNIQUE,
               masked_address TEXT NOT NULL,
+              display_name TEXT,
               state TEXT NOT NULL,
               linked_at INTEGER,
               last_message_at INTEGER,
@@ -163,12 +164,7 @@ impl Store {
             ",
         )
         .map_err(|_| StoreError::Unavailable)?;
-        conn.execute(
-            "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![SCHEMA_VERSION.to_string()],
-        )
-        .map_err(|_| StoreError::Unavailable)?;
+        migrate_schema(&conn)?;
         Ok(Self { path, conn })
     }
 
@@ -197,8 +193,8 @@ impl Store {
         let masked = mask_address(signal_account);
         self.conn
             .execute(
-                "INSERT INTO accounts(id, signal_account, masked_address, state, linked_at, unread_count)
-                 VALUES(?1, ?2, ?3, 'ready', ?4, 0)",
+                "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count)
+                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0)",
                 params![id, signal_account, masked, linked_at.map(|v| v as i64)],
             )
             .map_err(|_| StoreError::Unavailable)?;
@@ -206,11 +202,30 @@ impl Store {
             .ok_or(StoreError::AccountNotFound)
     }
 
+    pub fn set_account_display_name(
+        &self,
+        account_id: &str,
+        display_name: Option<&str>,
+    ) -> Result<AccountSummary, StoreError> {
+        let name = display_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        self.conn
+            .execute(
+                "UPDATE accounts SET display_name=?2 WHERE id=?1",
+                params![account_id, name],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        self.account_summary(account_id)?
+            .ok_or(StoreError::AccountNotFound)
+    }
+
     pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, StoreError> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, masked_address, state, linked_at, last_message_at, unread_count
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count
                  FROM accounts ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|_| StoreError::Unavailable)?;
@@ -218,12 +233,12 @@ impl Store {
             .query_map([], |row| {
                 Ok(AccountSummary {
                     id: row.get(0)?,
-                    display_name: None,
                     masked_address: row.get(1)?,
-                    state: static_state(row.get::<_, String>(2)?),
-                    linked_at: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                    last_message_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                    unread_count: row.get::<_, i64>(5)? as u32,
+                    display_name: row.get(2)?,
+                    state: static_state(row.get::<_, String>(3)?),
+                    linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    unread_count: row.get::<_, i64>(6)? as u32,
                 })
             })
             .map_err(|_| StoreError::Unavailable)?;
@@ -269,23 +284,43 @@ impl Store {
     pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
         self.conn
             .query_row(
-                "SELECT id, masked_address, state, linked_at, last_message_at, unread_count
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count
                  FROM accounts WHERE id=?1",
                 params![account_id],
                 |row| {
                     Ok(AccountSummary {
                         id: row.get(0)?,
-                        display_name: None,
                         masked_address: row.get(1)?,
-                        state: static_state(row.get::<_, String>(2)?),
-                        linked_at: row.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                        last_message_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                        unread_count: row.get::<_, i64>(5)? as u32,
+                        display_name: row.get(2)?,
+                        state: static_state(row.get::<_, String>(3)?),
+                        linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                        last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        unread_count: row.get::<_, i64>(6)? as u32,
                     })
                 },
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Remove account and dependent rows from the connector store (local exit).
+    pub fn delete_account_cascade(&self, account_id: &str) -> Result<(), StoreError> {
+        if self.account_by_id(account_id)?.is_none() {
+            return Err(StoreError::AccountNotFound);
+        }
+        self.conn
+            .execute("DELETE FROM messages WHERE account_id=?1", params![account_id])
+            .map_err(|_| StoreError::Unavailable)?;
+        self.conn
+            .execute(
+                "DELETE FROM conversations WHERE account_id=?1",
+                params![account_id],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        self.conn
+            .execute("DELETE FROM accounts WHERE id=?1", params![account_id])
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
     }
 
     pub fn ensure_conversation(
@@ -296,6 +331,12 @@ impl Store {
         title: &str,
     ) -> Result<ConversationRow, StoreError> {
         if let Some(existing) = self.conversation_by_peer(account_id, kind, peer_key)? {
+            // Upgrade masked/placeholder titles when we learn a real display name.
+            if let Some(current) = self.conversation_title(&existing.id)? {
+                if title_should_upgrade(&current, title) {
+                    let _ = self.set_conversation_title(&existing.id, title);
+                }
+            }
             return Ok(existing);
         }
         let id = stable_hash_id(&[account_id, kind, peer_key]);
@@ -312,6 +353,53 @@ impl Store {
             kind: kind.to_string(),
             peer_key: peer_key.to_string(),
         })
+    }
+
+    pub fn conversation_title(&self, conversation_id: &str) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT title FROM conversations WHERE id=?1",
+                params![conversation_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    pub fn set_conversation_title(
+        &self,
+        conversation_id: &str,
+        title: &str,
+    ) -> Result<(), StoreError> {
+        let trimmed = title.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE conversations SET title=?2 WHERE id=?1",
+                params![conversation_id, trimmed],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+
+    pub fn set_conversation_title_for_peer(
+        &self,
+        account_id: &str,
+        kind: &str,
+        peer_key: &str,
+        title: &str,
+    ) -> Result<bool, StoreError> {
+        let Some(row) = self.conversation_by_peer(account_id, kind, peer_key)? else {
+            return Ok(false);
+        };
+        let current = self.conversation_title(&row.id)?.unwrap_or_default();
+        if !title_should_upgrade(&current, title) {
+            return Ok(false);
+        }
+        self.set_conversation_title(&row.id, title)?;
+        Ok(true)
     }
 
     pub fn conversation_by_id(
@@ -359,6 +447,33 @@ impl Store {
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
+    }
+
+    /// Direct chats that may still show a masked peer id as title.
+    pub fn list_direct_peers_needing_title(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<(String /* peer_key */, String /* title */)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT peer_key, title FROM conversations
+                 WHERE account_id=?1 AND kind='direct'",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (peer, title) = row.map_err(|_| StoreError::Unavailable)?;
+            if title.contains("***") || title.trim().is_empty() {
+                out.push((peer, title));
+            }
+        }
+        Ok(out)
     }
 
     pub fn list_conversations(
@@ -573,6 +688,45 @@ impl Store {
         Ok(true)
     }
 
+    /// Opening a chat: zero conversation unread and subtract from account total.
+    pub fn clear_conversation_unread(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<u32, StoreError> {
+        let prev: i64 = self
+            .conn
+            .query_row(
+                "SELECT unread_count FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?
+            .unwrap_or(0);
+        if prev <= 0 {
+            return Ok(0);
+        }
+        self.conn
+            .execute(
+                "UPDATE conversations SET unread_count=0 WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        self.conn
+            .execute(
+                "UPDATE accounts
+                 SET unread_count = CASE
+                     WHEN unread_count > ?2 THEN unread_count - ?2
+                     ELSE 0
+                 END
+                 WHERE id=?1",
+                params![account_id, prev],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(prev as u32)
+    }
+
     pub fn update_message_status(
         &self,
         message_id: &str,
@@ -658,6 +812,47 @@ fn prepare_state_dir(path: &Path) -> Result<(), StoreError> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
             .map_err(|_| StoreError::InvalidStateDir)?;
     }
+    Ok(())
+}
+
+/// Prefer real display names over masked peer ids / placeholders.
+fn title_should_upgrade(current: &str, candidate: &str) -> bool {
+    let cand = candidate.trim();
+    if cand.is_empty() {
+        return false;
+    }
+    let cur = current.trim();
+    if cur.is_empty() || cur == "group" || cur == "contact" {
+        return true;
+    }
+    // mask_address style: "8fc***e2" / "+86***50"
+    if cur.contains("***") && !cand.contains("***") {
+        return true;
+    }
+    false
+}
+
+fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
+    let current: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if current < 2 {
+        // Older DBs created before display_name column.
+        let _ = conn.execute(
+            "ALTER TABLE accounts ADD COLUMN display_name TEXT",
+            [],
+        );
+    }
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![SCHEMA_VERSION.to_string()],
+    )
+    .map_err(|_| StoreError::Unavailable)?;
     Ok(())
 }
 

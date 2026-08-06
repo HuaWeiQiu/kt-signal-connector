@@ -93,6 +93,10 @@ impl ConnectorService {
         Self { store, link: None }
     }
 
+    pub fn store_ref(&self) -> &Store {
+        &self.store
+    }
+
     pub fn clear_link(&mut self) {
         self.link = None;
     }
@@ -109,6 +113,28 @@ impl ConnectorService {
 
     pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
         Ok(self.store.list_accounts()?)
+    }
+
+    pub fn account_signal_number(&self, account_id: &str) -> Result<String, ServiceError> {
+        self.store
+            .account_by_id(account_id)?
+            .map(|row| row.signal_account)
+            .ok_or(ServiceError::Store(StoreError::AccountNotFound))
+    }
+
+    pub fn set_account_display_name(
+        &self,
+        account_id: &str,
+        display_name: Option<&str>,
+    ) -> Result<AccountSummary, ServiceError> {
+        Ok(self
+            .store
+            .set_account_display_name(account_id, display_name)?)
+    }
+
+    pub fn delete_account_local(&mut self, account_id: &str) -> Result<(), ServiceError> {
+        self.link = None;
+        Ok(self.store.delete_account_cascade(account_id)?)
     }
 
     pub fn begin_link(
@@ -135,6 +161,28 @@ impl ConnectorService {
         });
         self.link = Some(session);
         Ok(response)
+    }
+
+    /// Clone link credentials without clearing the session, so a timed-out finishLink can be retried.
+    pub fn peek_link_for_finish(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<(String, String), ServiceError> {
+        let session = self.require_active_link(link_session_id)?;
+        Ok((
+            session.device_name.clone(),
+            session.qr_payload().to_string(),
+        ))
+    }
+
+    pub fn clear_link_session(&mut self, link_session_id: &str) {
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|session| session.session_id == link_session_id)
+        {
+            self.link = None;
+        }
     }
 
     pub fn take_link_for_finish(
@@ -187,6 +235,10 @@ impl ConnectorService {
         {
             return Err(ServiceError::Store(StoreError::ConversationNotFound));
         }
+        // Viewing the thread marks it read (local badge only; no Signal receipt RPC yet).
+        let _ = self
+            .store
+            .clear_conversation_unread(account_id, conversation_id)?;
         Ok(self
             .store
             .list_messages(account_id, conversation_id, limit, before)?)
@@ -304,19 +356,44 @@ impl ConnectorService {
         &self,
         receive: NormalizedReceive,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        if receive.content_kind != "dataMessage" {
+        if receive.direction == "skip" {
             return Ok(Vec::new());
         }
-        let Some(signal_account) = receive.account.as_deref() else {
+        if !matches!(
+            receive.direction,
+            "incoming" | "outgoing" | "system"
+        ) {
             return Ok(Vec::new());
+        }
+        // signal-cli may omit `account` on single-account jsonRpc; fall back to sole store account.
+        let signal_account = match receive.account.as_deref().filter(|s| !s.is_empty()) {
+            Some(account) => account.to_string(),
+            None => {
+                let accounts = self.store.list_accounts()?;
+                if accounts.len() != 1 {
+                    return Ok(Vec::new());
+                }
+                match self.store.account_by_id(&accounts[0].id)? {
+                    Some(row) => row.signal_account,
+                    None => return Ok(Vec::new()),
+                }
+            }
         };
         let account = self
             .store
-            .upsert_account_from_signal(signal_account, None)?;
+            .upsert_account_from_signal(&signal_account, None)?;
         let (kind, peer_key, title) = if let Some(group_id) = receive.group_id.as_deref() {
             ("group", group_id.to_string(), "group".to_string())
-        } else if let Some(source) = receive.source.as_deref() {
-            ("direct", source.to_string(), mask_address(source))
+        } else if let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) {
+            // Prefer profile/contact label over masked peer id (e.g. 8fc***e2).
+            let label = receive
+                .peer_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| mask_address(peer));
+            ("direct", peer.to_string(), label)
         } else {
             return Ok(Vec::new());
         };
@@ -324,35 +401,55 @@ impl ConnectorService {
             .store
             .ensure_conversation(&account.id, kind, &peer_key, &title)?;
         let sent_at = receive.timestamp.unwrap_or_else(now_ms);
-        let sender_id = stable_hash_id(&[&account.id, kind, &peer_key]);
+        let direction = receive.direction;
+        let sender_id = if direction == "outgoing" {
+            account.id.clone()
+        } else {
+            stable_hash_id(&[&account.id, kind, &peer_key])
+        };
         let message_id = stable_hash_id(&[
             &account.id,
             &conversation.id,
-            "incoming",
+            direction,
             &sent_at.to_string(),
             &sender_id,
             receive.text.as_deref().unwrap_or(""),
         ]);
+        let status = match direction {
+            "outgoing" => "sent",
+            "system" => "system",
+            _ => "delivered",
+        };
         let message = MessageRecord {
             id: message_id,
             account_id: account.id.clone(),
             conversation_id: conversation.id.clone(),
-            direction: "incoming",
+            direction,
             sender_id,
             sent_at,
             received_at: Some(now_ms()),
             text: receive.text.clone(),
             attachments: Vec::new(),
-            status: "delivered",
+            status,
             quote_message_id: None,
         };
-        let preview = receive
-            .text
-            .as_deref()
-            .map(|text| text.chars().take(120).collect::<String>());
-        let inserted = self
-            .store
-            .insert_message(&message, None, preview.as_deref(), true)?;
+        let preview = match direction {
+            "system" => receive
+                .text
+                .as_deref()
+                .map(|text| text.chars().take(120).collect::<String>()),
+            _ => receive
+                .text
+                .as_deref()
+                .map(|text| text.chars().take(120).collect::<String>()),
+        };
+        let increment_unread = direction == "incoming";
+        let inserted = self.store.insert_message(
+            &message,
+            None,
+            preview.as_deref(),
+            increment_unread,
+        )?;
         if !inserted {
             return Ok(Vec::new());
         }
@@ -366,10 +463,10 @@ impl ConnectorService {
         Ok(events)
     }
 
-    fn take_link_session(
+    fn require_active_link(
         &mut self,
         link_session_id: &str,
-    ) -> Result<ActiveLinkSession, ServiceError> {
+    ) -> Result<&ActiveLinkSession, ServiceError> {
         match self.link.as_ref() {
             Some(session) if session.session_id == link_session_id => {
                 if session.is_expired(now_ms()) {
@@ -389,6 +486,14 @@ impl ConnectorService {
                 )));
             }
         }
+        Ok(self.link.as_ref().expect("link session present"))
+    }
+
+    fn take_link_session(
+        &mut self,
+        link_session_id: &str,
+    ) -> Result<ActiveLinkSession, ServiceError> {
+        let _ = self.require_active_link(link_session_id)?;
         Ok(self.link.take().expect("link session present"))
     }
 }
@@ -402,6 +507,12 @@ pub enum PreparedSend {
         params: Value,
         pending_sent_at: u64,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountIdParams {
+    pub account_id: String,
 }
 
 #[derive(Debug, Deserialize)]

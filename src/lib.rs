@@ -24,6 +24,7 @@ pub const PHASE2_CAPABILITIES: &[&str] = &[
     "runtime.start",
     "runtime.stop",
     "accounts.list",
+    "accounts.deleteLocalData",
     "link.start",
     "link.finish",
     "link.cancel",
