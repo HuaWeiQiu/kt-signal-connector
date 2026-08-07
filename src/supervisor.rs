@@ -2,7 +2,8 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast};
@@ -24,6 +25,8 @@ pub struct RuntimeSupervisor {
     service: Mutex<ConnectorService>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
+    /// unix ms of last listContacts title enrich (throttle hot list path)
+    last_title_enrich_ms: AtomicU64,
 }
 
 impl RuntimeSupervisor {
@@ -36,6 +39,7 @@ impl RuntimeSupervisor {
             service: Mutex::new(ConnectorService::new(store)),
             events,
             host_events,
+            last_title_enrich_ms: AtomicU64::new(0),
         }
     }
 
@@ -346,8 +350,9 @@ impl RuntimeSupervisor {
         limit: u32,
         cursor: Option<String>,
     ) -> Result<Page<ConversationSummary>, ServiceError> {
-        // Best-effort: replace masked peer titles with contact/profile names.
-        let _ = self.enrich_conversation_titles(&account_id).await;
+        // Best-effort title enrich only when masks remain — and at most every 60s
+        // so poll/UI refresh does not hammer listContacts on the single JVM queue.
+        let _ = self.enrich_conversation_titles_throttled(&account_id).await;
         self.service
             .lock()
             .await
@@ -355,7 +360,10 @@ impl RuntimeSupervisor {
     }
 
     /// Resolve human titles for direct chats still showing mask_address(peer).
-    async fn enrich_conversation_titles(&self, account_id: &str) -> Result<(), ServiceError> {
+    async fn enrich_conversation_titles_throttled(
+        &self,
+        account_id: &str,
+    ) -> Result<(), ServiceError> {
         let peers = {
             let service = self.service.lock().await;
             service
@@ -365,6 +373,15 @@ impl RuntimeSupervisor {
         if peers.is_empty() {
             return Ok(());
         }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_title_enrich_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 60_000 {
+            return Ok(());
+        }
+        self.last_title_enrich_ms.store(now_ms, Ordering::Relaxed);
         let engine = {
             let guard = self.engine.lock().await;
             guard.clone().ok_or(ServiceError::Engine(EngineError::NotRunning))?
