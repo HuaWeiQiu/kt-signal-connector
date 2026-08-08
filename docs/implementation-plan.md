@@ -447,7 +447,8 @@ Exit: target-platform resource gates and license delivery review pass.
 ### Phase 4: KT Desktop integration
 
 Local integration status (2026-08-09): merged in the separate `kt-desktop` worktree on
-`codex/signal-test-main-latest` at `5e18793c`. This does not satisfy the remaining Windows,
+`codex/signal-test-main-latest`; burst rendering and runtime recovery are at `c913bb06`, paired with
+connector resource monitoring at `8b08794`. This does not satisfy the remaining Windows,
 signed-distribution, 24/72-hour, or real multi-account production gates.
 
 Deliver in KT Desktop:
