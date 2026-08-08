@@ -686,4 +686,17 @@ mod tests {
         assert!(!service.delete_account_local(&account.id).unwrap());
         assert!(service.cancel_link(&link_session_id).is_ok());
     }
+
+    #[test]
+    fn text_limit_is_enforced_by_utf8_bytes() {
+        assert!(validate_text(&"a".repeat(MAX_TEXT_BYTES)).is_ok());
+        assert!(validate_text(&"a".repeat(MAX_TEXT_BYTES + 1)).is_err());
+
+        assert!(validate_text(&"界".repeat(21_845)).is_ok());
+        assert!(validate_text(&"界".repeat(21_846)).is_err());
+
+        assert!(validate_text(&"😀".repeat(16_384)).is_ok());
+        assert!(validate_text(&format!("{}a", "😀".repeat(16_384))).is_err());
+        assert!(validate_text("").is_err());
+    }
 }

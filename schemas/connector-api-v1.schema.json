@@ -220,7 +220,12 @@
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
-        "text": { "type": "string", "minLength": 1, "maxLength": 65536 },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Non-empty text; the service authoritatively enforces at most 65536 UTF-8 bytes."
+        },
         "clientRequestId": { "$ref": "#/$defs/opaqueId" },
         "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
       }

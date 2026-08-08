@@ -254,6 +254,20 @@ Every send has a KT `clientRequestId`. The connector inserts a pending record be
 signal-cli. A repeated request returns the same local record. Timeout or child death after dispatch
 produces `unknown`; it never automatically sends again.
 
+Text must be non-empty and at most 65,536 bytes after UTF-8 encoding. This follows the 64 KiB
+long-message body cap used by the official Signal clients, while signal-cli handles the native
+inline-versus-long-text attachment representation. The JSON schema character limit is only an early
+shape guard; the Rust service byte check is authoritative for CJK, emoji, and malformed input.
+Oversized text is rejected before creating the pending row or dispatching signal-cli and is never
+silently truncated, split, or automatically retried.
+
+Reference implementations (pinned links; no source is copied into this repository):
+
+- [Signal Desktop `longAttachment.std.ts`](https://github.com/signalapp/Signal-Desktop/blob/de8fe1e7084fbab9c4e9c667c2d0ec0f208d1adc/ts/util/longAttachment.std.ts)
+- [Signal Android `MessageUtil.kt`](https://github.com/signalapp/Signal-Android/blob/9b2c2ed66d854b7abb8ed1a29e976a516ab2ce67/app/src/main/java/org/thoughtcrime/securesms/util/MessageUtil.kt)
+  and [`ByteLimitInputFilter.kt`](https://github.com/signalapp/Signal-Android/blob/9b2c2ed66d854b7abb8ed1a29e976a516ab2ce67/core/util/src/main/java/org/signal/core/util/ByteLimitInputFilter.kt)
+- [Signal iOS `OWSMediaUtils.swift`](https://github.com/signalapp/Signal-iOS/blob/58cc49ec14da01e7afa89d6e603ba1ca79bcf9b4/SignalServiceKit/Messages/Attachments/OWSMediaUtils.swift)
+
 AI-generated and human messages use the same send method. Language policy and tenant capability are
 enforced by KT before the connector call, while connector ownership and idempotency checks remain
 mandatory.

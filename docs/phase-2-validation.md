@@ -23,7 +23,8 @@ or live Signal service behavior.
 - Incoming `dataMessage` receive events are persisted before host delivery.
 - `conversations.list` / `messages.list` read only connector SQLite state.
 - `messages.sendText` requires opaque account/conversation IDs, enforces
-  `clientRequestId` idempotency, and never auto-retries unknown mutating outcomes.
+  `clientRequestId` idempotency and the Signal 65,536-byte UTF-8 text boundary, and never
+  truncates, splits, or auto-retries unknown mutating outcomes.
 - Host events: `account.changed`, `conversation.changed`, `message.upserted`,
   `message.statusChanged`.
 - Connector state directory is owner-only and separate from the signal-cli data dir.
@@ -45,6 +46,7 @@ Notable integration coverage:
 - authenticated runtime lifecycle (Phase 1 regression)
 - Phase 2 host flow: link start conflict, finish, account list, receive ingest,
   conversation/message list, text send, and idempotent resend
+- UTF-8 text boundary coverage for ASCII, CJK, and supplementary emoji
 
 ## Not Yet Verified
 

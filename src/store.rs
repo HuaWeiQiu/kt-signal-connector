@@ -1261,7 +1261,12 @@ mod tests {
         let other_account = store
             .upsert_account_from_signal("+15555550101", Some(1))
             .unwrap();
-        let account_cursor = format!("v2:{}:0:20:{}", account.id, newer.id);
+        let (cursor_conversation, remaining_same_time) = if newer.id > same_time.id {
+            (&newer, &same_time)
+        } else {
+            (&same_time, &newer)
+        };
+        let account_cursor = format!("v2:{}:0:20:{}", account.id, cursor_conversation.id);
         assert!(matches!(
             store.list_conversations(&other_account.id, 1, Some(&account_cursor)),
             Err(StoreError::InvalidCursor),
@@ -1270,7 +1275,7 @@ mod tests {
         let changed = MessageRecord {
             id: "newer-message-2".into(),
             account_id: account.id.clone(),
-            conversation_id: newer.id.clone(),
+            conversation_id: cursor_conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
             sent_at: 30,
@@ -1286,7 +1291,7 @@ mod tests {
         let after_change = store
             .list_conversations(&account.id, 1, Some(&account_cursor))
             .unwrap();
-        assert_eq!(after_change.items[0].id, older.id);
+        assert_eq!(after_change.items[0].id, remaining_same_time.id);
     }
 
     #[test]
