@@ -57,11 +57,25 @@ async fn matches_success_and_normalizes_receive_without_private_fields() {
 #[tokio::test]
 async fn malformed_output_faults_runtime() {
     let (_temp, engine) = engine(Duration::from_secs(3)).await;
+    let running_pid = engine.status().pid;
+    let mut events = engine.subscribe();
     let result = engine
         .call("malformed", json!({}), CallClass::ReadOnly)
         .await;
     assert_eq!(result, Err(EngineError::Protocol));
     assert_eq!(engine.status().state, EngineState::Faulted);
+    let faulted = timeout(Duration::from_secs(1), async {
+        loop {
+            if let EngineEvent::StateChanged(status) = events.recv().await.unwrap()
+                && status.state == EngineState::Faulted
+            {
+                break status;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(faulted.pid, running_pid);
 }
 
 #[tokio::test]

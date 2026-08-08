@@ -447,6 +447,17 @@ where
                             break Err(error);
                         }
                     }
+                    Ok(EngineEvent::ResourcePressure { state, pid, rss_bytes }) => {
+                        if let Err(error) = send_shared(
+                            &writer,
+                            &HostEvent::new(
+                                "runtime.resourcePressure",
+                                json!({ "state": state, "pid": pid, "rssBytes": rss_bytes }),
+                            ),
+                        ).await {
+                            break Err(error);
+                        }
+                    }
                     Ok(EngineEvent::Receive(receive)) => {
                         supervisor.ingest_receive(receive).await;
                     }

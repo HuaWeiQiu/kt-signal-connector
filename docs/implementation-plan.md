@@ -344,10 +344,22 @@ increment above 350 MB or monotonic growth triggers profiling rather than a docu
 - event queue: 1,024 normalized events with pressure reporting.
 - current message page: default 100, maximum 200.
 - message text projection: 4 KiB per list/event row; persisted inbound body: 128 KiB maximum.
+- one signal-cli RSS sampler per shared engine, every 30 seconds. Pressure requires three consecutive
+  samples at or above 512 MiB; recovery requires two consecutive samples at or below 420 MiB.
+  Sampling emits only PID/RSS/state and exits immediately with the engine. RSS pressure never kills
+  or restarts the JVM automatically. macOS/Linux sample through a short-lived `ps`; Windows uses the
+  native process working-set API and never starts PowerShell for monitoring.
 - conversation cursors are opaque keyset cursors over `(last_message_at nullness,
   last_message_at, id)`; message cursors are exact message IDs over `(sent_at, id)`. Unknown or
   cross-account cursors fail closed instead of silently returning the first page.
 - reconnect attempts: exponential backoff with a circuit breaker.
+
+Desktop may restart a terminal engine only after its bounded request scheduler drains, with no
+request replay and a three-attempt circuit breaker. If an active mutation does not drain, recovery
+fails closed for explicit user action; resource pressure alone is not a restart trigger. Terminal
+events carry the exited PID so a delayed event cannot fault a newer engine, and an explicit Desktop
+stop always wins a concurrent recovery completion. A clean internal `stopped` to `running` transition
+is treated as a managed restart and must not trigger a second engine restart.
 
 Core persistence must not be dropped under event pressure. Non-critical enrichment is disabled first.
 

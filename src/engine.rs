@@ -15,8 +15,13 @@ use tokio::io::{AsyncWriteExt, sink};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
+use crate::resource::{
+    DEFAULT_RSS_PRESSURE_BYTES, DEFAULT_RSS_PRESSURE_SAMPLES, DEFAULT_RSS_RECOVERY_BYTES,
+    DEFAULT_RSS_RECOVERY_SAMPLES, ResourcePressureState, ResourcePressureTracker, sample_rss,
+};
 use crate::{DEFAULT_UPSTREAM_LINE_LIMIT, MAX_PENDING_UPSTREAM_REQUESTS};
 
 const COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -29,6 +34,7 @@ pub struct SignalCliConfig {
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
+    pub resource_sample_interval: Duration,
 }
 
 impl SignalCliConfig {
@@ -39,6 +45,7 @@ impl SignalCliConfig {
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
+            resource_sample_interval: Duration::from_secs(30),
         }
     }
 }
@@ -58,6 +65,9 @@ pub struct EngineStatus {
     pub state: EngineState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    pub resource_pressure: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,7 +100,14 @@ pub enum EngineError {
 pub enum EngineEvent {
     StateChanged(EngineStatus),
     Receive(NormalizedReceive),
-    ProtocolWarning { kind: &'static str },
+    ProtocolWarning {
+        kind: &'static str,
+    },
+    ResourcePressure {
+        state: ResourcePressureState,
+        pid: u32,
+        rss_bytes: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -123,6 +140,7 @@ pub struct EngineHandle {
     events: broadcast::Sender<EngineEvent>,
     next_id: Arc<AtomicU64>,
     request_timeout: Duration,
+    resource_status: watch::Receiver<(Option<u64>, bool)>,
 }
 
 impl EngineHandle {
@@ -132,6 +150,7 @@ impl EngineHandle {
     ) -> Result<Self, EngineError> {
         if !config.executable.is_absolute()
             || !std::fs::metadata(&config.executable).is_ok_and(|metadata| metadata.is_file())
+            || config.resource_sample_interval < Duration::from_secs(1)
         {
             return Err(EngineError::StartFailed);
         }
@@ -154,15 +173,18 @@ impl EngineHandle {
             .spawn()
             .map_err(|_| EngineError::StartFailed)?;
 
-        let pid = child.id();
+        let pid = child.id().ok_or(EngineError::StartFailed)?;
         let stdin = child.stdin.take().ok_or(EngineError::StartFailed)?;
         let stdout = child.stdout.take().ok_or(EngineError::StartFailed)?;
         let stderr = child.stderr.take().ok_or(EngineError::StartFailed)?;
         let initial_status = EngineStatus {
             state: EngineState::Running,
-            pid,
+            pid: Some(pid),
+            rss_bytes: None,
+            resource_pressure: false,
         };
         let (status_tx, status_rx) = watch::channel(initial_status.clone());
+        let (resource_tx, resource_rx) = watch::channel((None, false));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
 
         let _ = events.send(EngineEvent::StateChanged(initial_status));
@@ -187,6 +209,54 @@ impl EngineHandle {
             .await;
             stderr_drain.abort();
         });
+        let mut monitor_status = status_rx.clone();
+        let monitor_events = events.clone();
+        let sample_interval = config.resource_sample_interval;
+        tokio::spawn(async move {
+            let mut ticker = interval(sample_interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            ticker.tick().await;
+            let mut tracker = ResourcePressureTracker::new(
+                DEFAULT_RSS_PRESSURE_BYTES,
+                DEFAULT_RSS_RECOVERY_BYTES,
+                DEFAULT_RSS_PRESSURE_SAMPLES,
+                DEFAULT_RSS_RECOVERY_SAMPLES,
+            )
+            .expect("static resource policy is valid");
+            loop {
+                tokio::select! {
+                    changed = monitor_status.changed() => {
+                        if changed.is_err() || matches!(
+                            monitor_status.borrow().state,
+                            EngineState::Stopped | EngineState::Exited | EngineState::Faulted
+                        ) {
+                            let _ = resource_tx.send((None, false));
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let sample = tokio::task::spawn_blocking(move || sample_rss(pid)).await;
+                        let Ok(Ok(rss_bytes)) = sample else {
+                            continue;
+                        };
+                        let transition = tracker.observe(rss_bytes);
+                        let elevated = match transition {
+                            Some(ResourcePressureState::Elevated) => true,
+                            Some(ResourcePressureState::Recovered) => false,
+                            None => resource_tx.borrow().1,
+                        };
+                        let _ = resource_tx.send((Some(rss_bytes), elevated));
+                        if let Some(state) = transition {
+                            let _ = monitor_events.send(EngineEvent::ResourcePressure {
+                                state,
+                                pid,
+                                rss_bytes,
+                            });
+                        }
+                    }
+                }
+            }
+        });
 
         Ok(Self {
             commands: command_tx,
@@ -194,11 +264,16 @@ impl EngineHandle {
             events,
             next_id: Arc::new(AtomicU64::new(1)),
             request_timeout: config.request_timeout,
+            resource_status: resource_rx,
         })
     }
 
     pub fn status(&self) -> EngineStatus {
-        self.status.borrow().clone()
+        let mut status = self.status.borrow().clone();
+        let resource = *self.resource_status.borrow();
+        status.rss_bytes = resource.0;
+        status.resource_pressure = resource.1;
+        status
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -312,6 +387,7 @@ async fn run_actor(
     events: broadcast::Sender<EngineEvent>,
     limits: ActorLimits,
 ) {
+    let process_pid = child.id();
     let mut stdin = Some(stdin);
     let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(limits.line_limit));
     let mut pending = HashMap::<String, PendingRequest>::new();
@@ -406,9 +482,14 @@ async fn run_actor(
     let status = EngineStatus {
         state: terminal_state,
         pid: None,
+        rss_bytes: None,
+        resource_pressure: false,
     };
     let _ = status_tx.send(status.clone());
-    let _ = events.send(EngineEvent::StateChanged(status));
+    let _ = events.send(EngineEvent::StateChanged(EngineStatus {
+        pid: process_pid,
+        ..status
+    }));
     for (_, request) in pending {
         let failure = match request.class {
             CallClass::ReadOnly => readonly_failure.clone(),

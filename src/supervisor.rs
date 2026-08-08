@@ -67,6 +67,8 @@ impl RuntimeSupervisor {
             .unwrap_or(EngineStatus {
                 state: EngineState::Stopped,
                 pid: None,
+                rss_bytes: None,
+                resource_pressure: false,
             })
     }
 
@@ -96,6 +98,8 @@ impl RuntimeSupervisor {
         Ok(EngineStatus {
             state: EngineState::Stopped,
             pid: None,
+            rss_bytes: None,
+            resource_pressure: false,
         })
     }
 
