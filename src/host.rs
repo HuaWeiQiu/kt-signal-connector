@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::future::BoxFuture;
+use futures_util::stream::{FuturesUnordered, SplitSink};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use rand::RngCore;
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LinesCodec};
 
@@ -28,7 +30,123 @@ use crate::supervisor::RuntimeSupervisor;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HOST_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const RECENT_REQUEST_IDS: usize = 128;
+const MAX_PENDING_HOST_REQUESTS: usize = 128;
+const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
+const MAX_PENDING_HOST_BYTES: usize = 8 * 1024 * 1024;
+const CONTROL_CONCURRENCY: usize = 1;
+const READ_CONCURRENCY: usize = 4;
+const SEND_CONCURRENCY: usize = 2;
+
+type HostWriter<S> = Arc<Mutex<SplitSink<Framed<S, LinesCodec>, String>>>;
+type DispatchFuture = BoxFuture<'static, DispatchCompletion>;
+
+struct DispatchCompletion {
+    account_id: Option<String>,
+    request_bytes: usize,
+    write_result: Result<(), HostError>,
+}
+
+struct HostDispatchPermit {
+    _lane: OwnedSemaphorePermit,
+    _account: Option<OwnedMutexGuard<()>>,
+}
+
+struct HostDispatchLimits {
+    control: Arc<Semaphore>,
+    read: Arc<Semaphore>,
+    send: Arc<Semaphore>,
+    send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+}
+
+#[derive(Default)]
+struct HostPendingBudget {
+    total: usize,
+    bytes: usize,
+    by_account: HashMap<String, usize>,
+}
+
+impl HostPendingBudget {
+    fn try_admit(&mut self, account_id: Option<&str>, request_bytes: usize) -> bool {
+        let account_pending = account_id
+            .and_then(|account| self.by_account.get(account))
+            .copied()
+            .unwrap_or(0);
+        if self.total >= MAX_PENDING_HOST_REQUESTS
+            || account_pending >= MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT
+            || self.bytes.saturating_add(request_bytes) > MAX_PENDING_HOST_BYTES
+        {
+            return false;
+        }
+        self.total += 1;
+        self.bytes += request_bytes;
+        if let Some(account) = account_id {
+            *self.by_account.entry(account.to_string()).or_default() += 1;
+        }
+        true
+    }
+
+    fn complete(&mut self, account_id: Option<&str>, request_bytes: usize) {
+        self.total = self.total.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(request_bytes);
+        let Some(account_id) = account_id else {
+            return;
+        };
+        if let Some(count) = self.by_account.get_mut(account_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.by_account.remove(account_id);
+            }
+        }
+    }
+}
+
+impl HostDispatchLimits {
+    fn new() -> Self {
+        Self {
+            control: Arc::new(Semaphore::new(CONTROL_CONCURRENCY)),
+            read: Arc::new(Semaphore::new(READ_CONCURRENCY)),
+            send: Arc::new(Semaphore::new(SEND_CONCURRENCY)),
+            send_accounts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn acquire(&self, method: &str, account_id: Option<&str>) -> HostDispatchPermit {
+        if method == "messages.sendText" {
+            let account_key = account_id.unwrap_or("").to_string();
+            let account_lock = {
+                let mut accounts = self.send_accounts.lock().await;
+                accounts.retain(|_, lock| lock.strong_count() > 0);
+                if let Some(lock) = accounts.get(&account_key).and_then(Weak::upgrade) {
+                    lock
+                } else {
+                    let lock = Arc::new(Mutex::new(()));
+                    accounts.insert(account_key, Arc::downgrade(&lock));
+                    lock
+                }
+            };
+            // Account order is acquired before global send capacity so one busy
+            // account cannot occupy every send permit while waiting on itself.
+            let account = account_lock.lock_owned().await;
+            let lane = self.send.clone().acquire_owned().await.unwrap();
+            return HostDispatchPermit {
+                _lane: lane,
+                _account: Some(account),
+            };
+        }
+
+        let lane = if matches!(method, "conversations.list" | "messages.list") {
+            self.read.clone().acquire_owned().await.unwrap()
+        } else {
+            self.control.clone().acquire_owned().await.unwrap()
+        };
+        HostDispatchPermit {
+            _lane: lane,
+            _account: None,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -56,12 +174,20 @@ pub async fn serve(
                 return Ok(());
             }
         };
-        let connection = handle_connection(stream, secret.clone(), supervisor.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection = handle_connection_until_shutdown(
+            stream,
+            secret.clone(),
+            supervisor.clone(),
+            shutdown_rx,
+        );
+        tokio::pin!(connection);
         let connection_result = tokio::select! {
-            result = connection => Some(result),
+            result = &mut connection => result,
             signal = tokio::signal::ctrl_c() => {
                 signal?;
-                None
+                let _ = shutdown_tx.send(true);
+                connection.await
             }
         };
         supervisor
@@ -69,9 +195,9 @@ pub async fn serve(
             .await
             .map_err(|_| HostError::RuntimeShutdown)?;
         match connection_result {
-            None => return Ok(()),
-            Some(Ok(())) => {}
-            Some(Err(error)) => {
+            Ok(()) if *shutdown_tx.borrow() => return Ok(()),
+            Ok(()) => {}
+            Err(error) => {
                 if !matches!(error, HostError::Authentication | HostError::InvalidFrame) {
                     return Err(error);
                 }
@@ -80,13 +206,27 @@ pub async fn serve(
     }
 }
 
+#[cfg(test)]
 async fn handle_connection<S>(
     stream: S,
     secret: Arc<BootstrapSecret>,
     supervisor: Arc<RuntimeSupervisor>,
 ) -> Result<(), HostError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    handle_connection_until_shutdown(stream, secret, supervisor, shutdown_rx).await
+}
+
+async fn handle_connection_until_shutdown<S>(
+    stream: S,
+    secret: Arc<BootstrapSecret>,
+    supervisor: Arc<RuntimeSupervisor>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), HostError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let codec = LinesCodec::new_with_max_length(DEFAULT_HOST_FRAME_LIMIT);
     let mut framed = Framed::new(stream, codec);
@@ -97,11 +237,15 @@ where
     )
     .await?;
 
-    let handshake_line = timeout(HANDSHAKE_TIMEOUT, framed.next())
-        .await
-        .map_err(|_| HostError::Authentication)?
-        .ok_or(HostError::Authentication)?
-        .map_err(|_| HostError::InvalidFrame)?;
+    let handshake_line = tokio::select! {
+        line = timeout(HANDSHAKE_TIMEOUT, framed.next()) => {
+            line
+                .map_err(|_| HostError::Authentication)?
+                .ok_or(HostError::Authentication)?
+                .map_err(|_| HostError::InvalidFrame)?
+        }
+        _ = shutdown.changed() => return Ok(()),
+    };
     let handshake: HostRequest =
         serde_json::from_str(&handshake_line).map_err(|_| HostError::InvalidFrame)?;
     if let Err(error) = handshake.validate_envelope() {
@@ -163,79 +307,174 @@ where
     )
     .await?;
 
+    let (sink, mut stream) = framed.split();
+    let writer = Arc::new(Mutex::new(sink));
+    let limits = Arc::new(HostDispatchLimits::new());
+    let mut dispatches = FuturesUnordered::<DispatchFuture>::new();
+    let mut pending = HostPendingBudget::default();
     let mut recent_ids = RecentRequestIds::default();
     recent_ids.insert(handshake_request_id);
     let mut engine_events = supervisor.subscribe_engine();
     let mut host_events = supervisor.subscribe_host();
-    loop {
+    let connection_result = loop {
         tokio::select! {
-            line = framed.next() => {
+            line = stream.next() => {
                 let Some(line) = line else {
-                    return Ok(());
+                    break Ok(());
                 };
-                let line = line.map_err(|_| HostError::InvalidFrame)?;
-                let request: HostRequest = serde_json::from_str(&line).map_err(|_| HostError::InvalidFrame)?;
-                let response = if let Err(error) = request.validate_envelope() {
-                    HostResponse::failure(request.request_id, error)
-                } else if !recent_ids.insert(request.request_id.clone()) {
-                    HostResponse::failure(
+                let line = match line {
+                    Ok(line) => line,
+                    Err(_) => break Err(HostError::InvalidFrame),
+                };
+                let request_bytes = line.len();
+                let request: HostRequest = match serde_json::from_str(&line) {
+                    Ok(request) => request,
+                    Err(_) => break Err(HostError::InvalidFrame),
+                };
+                if let Err(error) = request.validate_envelope() {
+                    let response = HostResponse::failure(request.request_id, error);
+                    if let Err(error) = send_shared(&writer, &response).await {
+                        break Err(error);
+                    }
+                    continue;
+                }
+                if !recent_ids.insert(request.request_id.clone()) {
+                    let response = HostResponse::failure(
                         request.request_id,
                         ApiError::new("INVALID_REQUEST", "requestId was already used in this session", false),
-                    )
-                } else {
-                    dispatch(request, &supervisor).await
-                };
-                send_json(&mut framed, &response).await?;
+                    );
+                    if let Err(error) = send_shared(&writer, &response).await {
+                        break Err(error);
+                    }
+                    continue;
+                }
+
+                let account_id = request_account_id(&request);
+                if !pending.try_admit(account_id.as_deref(), request_bytes) {
+                    let response = HostResponse::failure(
+                        request.request_id,
+                        ApiError::new(
+                            "INTERNAL_ERROR",
+                            "connector request capacity exceeded",
+                            true,
+                        ),
+                    );
+                    if let Err(error) = send_shared(&writer, &response).await {
+                        break Err(error);
+                    }
+                    continue;
+                }
+
+                let method = request.method.clone();
+                let task_account = account_id.clone();
+                let task_supervisor = supervisor.clone();
+                let task_writer = writer.clone();
+                let task_limits = limits.clone();
+                dispatches.push(async move {
+                    let _permit = task_limits.acquire(&method, task_account.as_deref()).await;
+                    let response = dispatch(request, &task_supervisor).await;
+                    let write_result = send_shared(&task_writer, &response).await;
+                    DispatchCompletion {
+                        account_id: task_account,
+                        request_bytes,
+                        write_result,
+                    }
+                }.boxed());
+            }
+            completion = dispatches.next(), if !dispatches.is_empty() => {
+                if let Some(completion) = completion {
+                    pending.complete(
+                        completion.account_id.as_deref(),
+                        completion.request_bytes,
+                    );
+                    if let Err(error) = completion.write_result {
+                        break Err(error);
+                    }
+                }
+            }
+            _ = shutdown.changed() => {
+                break Ok(());
             }
             event = engine_events.recv() => {
                 match event {
                     Ok(EngineEvent::StateChanged(status)) => {
-                        send_json(&mut framed, &HostEvent::new("runtime.stateChanged", status)).await?;
+                        if let Err(error) = send_shared(
+                            &writer,
+                            &HostEvent::new("runtime.stateChanged", status),
+                        ).await {
+                            break Err(error);
+                        }
                     }
                     Ok(EngineEvent::ProtocolWarning { kind }) => {
-                        send_json(
-                            &mut framed,
+                        if let Err(error) = send_shared(
+                            &writer,
                             &HostEvent::new(
                                 "runtime.protocolWarning",
                                 json!({ "kind": kind }),
                             ),
-                        )
-                        .await?;
+                        ).await {
+                            break Err(error);
+                        }
                     }
                     Ok(EngineEvent::Receive(receive)) => {
                         supervisor.ingest_receive(receive).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        send_json(
-                            &mut framed,
+                        if let Err(error) = send_shared(
+                            &writer,
                             &HostEvent::new(
                                 "runtime.protocolWarning",
                                 json!({ "kind": "eventBackpressure" }),
                             ),
-                        )
-                        .await?;
+                        ).await {
+                            break Err(error);
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
             }
             event = host_events.recv() => {
                 match event {
-                    Ok(event) => send_host_event(&mut framed, event).await?,
+                    Ok(event) => {
+                        if let Err(error) = send_host_event(&writer, event).await {
+                            break Err(error);
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        send_json(
-                            &mut framed,
+                        if let Err(error) = send_shared(
+                            &writer,
                             &HostEvent::new(
                                 "runtime.protocolWarning",
                                 json!({ "kind": "eventBackpressure" }),
                             ),
-                        )
-                        .await?;
+                        ).await {
+                            break Err(error);
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
             }
         }
-    }
+    };
+
+    // Closing the authenticated host connection owns runtime shutdown. This
+    // resolves dispatched mutating calls as unknown before task futures drop.
+    let _ = supervisor.shutdown().await;
+    let _ = timeout(HOST_DISPATCH_DRAIN_TIMEOUT, async {
+        while let Some(completion) = dispatches.next().await {
+            pending.complete(completion.account_id.as_deref(), completion.request_bytes);
+        }
+    })
+    .await;
+    connection_result
+}
+
+fn request_account_id(request: &HostRequest) -> Option<String> {
+    request
+        .params
+        .get("accountId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostResponse {
@@ -453,30 +692,27 @@ fn map_stop_error(error: EngineError) -> ApiError {
     }
 }
 
-async fn send_host_event<S>(
-    framed: &mut Framed<S, LinesCodec>,
-    event: HostSideEvent,
-) -> Result<(), HostError>
+async fn send_host_event<S>(writer: &HostWriter<S>, event: HostSideEvent) -> Result<(), HostError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match event {
         HostSideEvent::AccountChanged(account) => {
-            send_json(framed, &HostEvent::new("account.changed", account)).await
+            send_shared(writer, &HostEvent::new("account.changed", account)).await
         }
         HostSideEvent::ConversationChanged(conversation) => {
-            send_json(
-                framed,
+            send_shared(
+                writer,
                 &HostEvent::new("conversation.changed", conversation),
             )
             .await
         }
         HostSideEvent::MessageUpserted(message) => {
-            send_json(framed, &HostEvent::new("message.upserted", message)).await
+            send_shared(writer, &HostEvent::new("message.upserted", message)).await
         }
         HostSideEvent::MessageStatusChanged { message_id, status } => {
-            send_json(
-                framed,
+            send_shared(
+                writer,
                 &HostEvent::new(
                     "message.statusChanged",
                     json!({ "messageId": message_id, "status": status }),
@@ -485,6 +721,20 @@ where
             .await
         }
     }
+}
+
+async fn send_shared<S, T>(writer: &HostWriter<S>, value: &T) -> Result<(), HostError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: Serialize,
+{
+    let encoded = serde_json::to_string(value).map_err(|_| HostError::InvalidFrame)?;
+    writer
+        .lock()
+        .await
+        .send(encoded)
+        .await
+        .map_err(|_| HostError::InvalidFrame)
 }
 
 async fn send_json<S, T>(framed: &mut Framed<S, LinesCodec>, value: &T) -> Result<(), HostError>
@@ -573,6 +823,28 @@ mod tests {
         }
         assert!(ids.set.len() <= RECENT_REQUEST_IDS);
         assert!(ids.insert("same".into()));
+    }
+
+    #[test]
+    fn pending_budget_bounds_global_account_and_bytes() {
+        let mut per_account = HostPendingBudget::default();
+        for _ in 0..MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT {
+            assert!(per_account.try_admit(Some("account-a"), 1));
+        }
+        assert!(!per_account.try_admit(Some("account-a"), 1));
+        assert!(per_account.try_admit(Some("account-b"), 1));
+        per_account.complete(Some("account-a"), 1);
+        assert!(per_account.try_admit(Some("account-a"), 1));
+
+        let mut global = HostPendingBudget::default();
+        for _ in 0..MAX_PENDING_HOST_REQUESTS {
+            assert!(global.try_admit(None, 1));
+        }
+        assert!(!global.try_admit(None, 1));
+
+        let mut bytes = HostPendingBudget::default();
+        assert!(bytes.try_admit(None, MAX_PENDING_HOST_BYTES));
+        assert!(!bytes.try_admit(None, 1));
     }
 
     #[tokio::test]

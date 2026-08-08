@@ -92,6 +92,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
 
     let link = request(
         &mut client,
@@ -219,6 +220,118 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     .await;
     assert_eq!(messages["result"]["items"].as_array().unwrap().len(), 2);
 
+    // Host dispatch is concurrent: a persisted read must not wait for a slow
+    // upstream send, while same-account sends retain request order.
+    send_request_frame(
+        &mut client,
+        "send-slow",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "[slow-host-test]",
+            "clientRequestId": "client-req-slow"
+        }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "send-after-slow",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "after slow",
+            "clientRequestId": "client-req-after-slow"
+        }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "msg-concurrent",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+
+    let mut response_order = Vec::new();
+    while response_order.len() < 3 {
+        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if let Some(request_id) = response.get("requestId").and_then(Value::as_str) {
+            if matches!(
+                request_id,
+                "send-slow" | "send-after-slow" | "msg-concurrent"
+            ) {
+                response_order.push(request_id.to_string());
+            }
+        }
+    }
+    assert_eq!(
+        response_order,
+        ["msg-concurrent", "send-slow", "send-after-slow"]
+    );
+
+    // Account-scoped host admission is bounded independently of frame input.
+    for index in 0..33 {
+        send_request_frame(
+            &mut client,
+            &format!("capacity-{index}"),
+            "messages.sendText",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "text": if index == 0 { "[slow-host-test]" } else { "queued" },
+                "clientRequestId": format!("capacity-client-{index}")
+            }),
+        )
+        .await;
+    }
+    loop {
+        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if response.get("requestId").and_then(Value::as_str) == Some("capacity-32") {
+            assert_eq!(response["error"]["code"], "INTERNAL_ERROR");
+            assert_eq!(
+                response["error"]["message"],
+                "connector request capacity exceeded"
+            );
+            break;
+        }
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+
+    // Disconnect shutdown must resolve a dispatched mutation to unknown before
+    // the connection task is dropped. Reconnect reads the persisted fact only;
+    // no retry or second send is issued.
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let after_disconnect = request(
+        &mut client,
+        "messages-after-disconnect",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let slow_statuses = after_disconnect["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["text"] == "[slow-host-test]")
+        .map(|message| message["status"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(slow_statuses.contains(&"sent"));
+    assert!(slow_statuses.contains(&"unknown"));
+
     drop(client);
     connector.start_kill().unwrap();
     let _ = timeout(Duration::from_secs(2), connector.wait()).await;
@@ -313,6 +426,21 @@ async fn request(
     method: &str,
     params: Value,
 ) -> Value {
+    send_request_frame(client, request_id, method, params).await;
+    loop {
+        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
+            return response;
+        }
+    }
+}
+
+async fn send_request_frame(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    request_id: &str,
+    method: &str,
+    params: Value,
+) {
     client
         .send(
             json!({
@@ -325,10 +453,4 @@ async fn request(
         )
         .await
         .unwrap();
-    loop {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
-            return response;
-        }
-    }
 }

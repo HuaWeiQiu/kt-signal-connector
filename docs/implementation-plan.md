@@ -273,7 +273,10 @@ increment above 350 MB or monotonic growth triggers profiling rather than a docu
 - host frame: default 1 MiB, configurable only downward in production policy.
 - signal-cli line: default 8 MiB for text PoC; media does not use this path.
 - host connections: one authenticated KT main process in Phase 1.
-- pending host requests: 128 global, 32 per account.
+- pending host requests: 128 global, 32 per account, and 8 MiB aggregate request bytes per
+  authenticated connection.
+- authenticated host dispatch: control 1, persisted reads 4, sends 2; sends remain ordered per
+  account and responses are correlated by `requestId`, not arrival order.
 - pending signal-cli requests: 128 global.
 - event queue: 1,024 normalized events with pressure reporting.
 - current message page: default 100, maximum 200.
