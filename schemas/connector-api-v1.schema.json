@@ -267,6 +267,7 @@
             "LINK_IN_PROGRESS",
             "LINK_NOT_FOUND",
             "LINK_EXPIRED",
+            "LINK_CANCELLED",
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
             "UPSTREAM_TIMEOUT",

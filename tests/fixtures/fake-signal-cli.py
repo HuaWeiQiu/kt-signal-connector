@@ -68,6 +68,8 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
+        if params.get("deviceName") == "[slow-link-test]":
+            continue
         result = {"number": LINKED_ACCOUNT}
         emit_receive_after = True
     elif method == "listAccounts":

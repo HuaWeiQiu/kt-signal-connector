@@ -36,6 +36,7 @@ const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
 const MAX_PENDING_HOST_BYTES: usize = 8 * 1024 * 1024;
 const CONTROL_CONCURRENCY: usize = 1;
+const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
 
@@ -43,6 +44,7 @@ type HostWriter<S> = Arc<Mutex<SplitSink<Framed<S, LinesCodec>, String>>>;
 type DispatchFuture = BoxFuture<'static, DispatchCompletion>;
 
 struct DispatchCompletion {
+    method: String,
     account_id: Option<String>,
     request_bytes: usize,
     write_result: Result<(), HostError>,
@@ -55,6 +57,7 @@ struct HostDispatchPermit {
 
 struct HostDispatchLimits {
     control: Arc<Semaphore>,
+    link_wait: Arc<Semaphore>,
     read: Arc<Semaphore>,
     send: Arc<Semaphore>,
     send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -106,6 +109,7 @@ impl HostDispatchLimits {
     fn new() -> Self {
         Self {
             control: Arc::new(Semaphore::new(CONTROL_CONCURRENCY)),
+            link_wait: Arc::new(Semaphore::new(LINK_WAIT_CONCURRENCY)),
             read: Arc::new(Semaphore::new(READ_CONCURRENCY)),
             send: Arc::new(Semaphore::new(SEND_CONCURRENCY)),
             send_accounts: Mutex::new(HashMap::new()),
@@ -136,7 +140,9 @@ impl HostDispatchLimits {
             };
         }
 
-        let lane = if matches!(method, "conversations.list" | "messages.list") {
+        let lane = if method == "link.finish" {
+            self.link_wait.clone().acquire_owned().await.unwrap()
+        } else if matches!(method, "conversations.list" | "messages.list") {
             self.read.clone().acquire_owned().await.unwrap()
         } else {
             self.control.clone().acquire_owned().await.unwrap()
@@ -312,6 +318,7 @@ where
     let limits = Arc::new(HostDispatchLimits::new());
     let mut dispatches = FuturesUnordered::<DispatchFuture>::new();
     let mut pending = HostPendingBudget::default();
+    let mut link_finish_pending = false;
     let mut recent_ids = RecentRequestIds::default();
     recent_ids.insert(handshake_request_id);
     let mut engine_events = supervisor.subscribe_engine();
@@ -349,6 +356,21 @@ where
                     continue;
                 }
 
+                let method = request.method.clone();
+                if method == "link.finish" && link_finish_pending {
+                    let response = HostResponse::failure(
+                        request.request_id,
+                        ApiError::new(
+                            "LINK_IN_PROGRESS",
+                            "a link finish request is already active",
+                            false,
+                        ),
+                    );
+                    if let Err(error) = send_shared(&writer, &response).await {
+                        break Err(error);
+                    }
+                    continue;
+                }
                 let account_id = request_account_id(&request);
                 if !pending.try_admit(account_id.as_deref(), request_bytes) {
                     let response = HostResponse::failure(
@@ -364,8 +386,10 @@ where
                     }
                     continue;
                 }
+                if method == "link.finish" {
+                    link_finish_pending = true;
+                }
 
-                let method = request.method.clone();
                 let task_account = account_id.clone();
                 let task_supervisor = supervisor.clone();
                 let task_writer = writer.clone();
@@ -375,6 +399,7 @@ where
                     let response = dispatch(request, &task_supervisor).await;
                     let write_result = send_shared(&task_writer, &response).await;
                     DispatchCompletion {
+                        method,
                         account_id: task_account,
                         request_bytes,
                         write_result,
@@ -383,6 +408,9 @@ where
             }
             completion = dispatches.next(), if !dispatches.is_empty() => {
                 if let Some(completion) = completion {
+                    if completion.method == "link.finish" {
+                        link_finish_pending = false;
+                    }
                     pending.complete(
                         completion.account_id.as_deref(),
                         completion.request_bytes,
@@ -845,6 +873,32 @@ mod tests {
         let mut bytes = HostPendingBudget::default();
         assert!(bytes.try_admit(None, MAX_PENDING_HOST_BYTES));
         assert!(!bytes.try_admit(None, 1));
+    }
+
+    #[tokio::test]
+    async fn phone_approval_wait_does_not_block_link_control() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let finish = limits.acquire("link.finish", None).await;
+
+        let cancel = timeout(
+            Duration::from_millis(50),
+            limits.acquire("link.cancel", None),
+        )
+        .await
+        .expect("link.cancel must use the independent control lane");
+
+        let second_finish = timeout(
+            Duration::from_millis(10),
+            limits.acquire("link.finish", None),
+        )
+        .await;
+        assert!(
+            second_finish.is_err(),
+            "link.finish capacity must stay bounded at one"
+        );
+
+        drop(cancel);
+        drop(finish);
     }
 
     #[tokio::test]

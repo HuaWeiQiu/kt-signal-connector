@@ -92,7 +92,74 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
-    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let slow_link = request(
+        &mut client,
+        "link-slow-start",
+        "link.start",
+        json!({ "deviceName": "[slow-link-test]" }),
+    )
+    .await;
+    let slow_link_session_id = slow_link["result"]["linkSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    send_request_frame(
+        &mut client,
+        "link-slow-finish",
+        "link.finish",
+        json!({ "linkSessionId": slow_link_session_id }),
+    )
+    .await;
+    let duplicate_finish = request(
+        &mut client,
+        "link-duplicate-finish",
+        "link.finish",
+        json!({ "linkSessionId": slow_link_session_id }),
+    )
+    .await;
+    assert_eq!(duplicate_finish["error"]["code"], "LINK_IN_PROGRESS");
+    send_request_frame(
+        &mut client,
+        "link-slow-cancel",
+        "link.cancel",
+        json!({ "linkSessionId": slow_link_session_id }),
+    )
+    .await;
+
+    let mut slow_finish_cancelled = false;
+    let mut slow_cancelled = false;
+    timeout(Duration::from_secs(3), async {
+        while !slow_finish_cancelled || !slow_cancelled {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            match response.get("requestId").and_then(Value::as_str) {
+                Some("link-slow-finish") => {
+                    assert_eq!(response["error"]["code"], "LINK_CANCELLED");
+                    slow_finish_cancelled = true;
+                }
+                Some("link-slow-cancel") => {
+                    assert!(response.get("result").is_some());
+                    slow_cancelled = true;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("link.cancel must not wait for phone approval");
+
+    wait_for_process_exit(engine_pid).await;
+    let after_cancel = request(
+        &mut client,
+        "status-after-link-cancel",
+        "runtime.status",
+        json!({}),
+    )
+    .await;
+    assert_eq!(after_cancel["result"]["state"], "running");
+    engine_pid = after_cancel["result"]["pid"].as_u64().unwrap() as u32;
 
     let link = request(
         &mut client,

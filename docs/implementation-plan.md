@@ -192,8 +192,20 @@ signed runtime-manifest verification before packaging acceptance.
 KT receives a short-lived session ID and the QR payload needed for display. `link.finish` resolves the
 session ID internally and calls `finishLink`; KT cannot supply or alter the raw URI.
 
-One profile permits one active link flow. Cancellation, timeout, client disconnect, or connector
-shutdown zeroizes and removes the state. QR data is never stored or logged.
+One profile permits one active link flow. `link.finish` uses its own single-capacity wait lane so a
+five-minute phone-approval wait cannot block runtime control, `link.start`, or `link.cancel`.
+Duplicate finish calls are rejected instead of accumulating pending requests.
+
+Cancellation is linearized before it returns: a cancelled or superseded finish result cannot create
+an account row or emit `account.changed`. The pinned signal-cli JSON-RPC API has no operation that
+cancels an already-dispatched `finishLink`; when `link.cancel` finds one in flight, the connector
+restarts the one shared signal-cli engine after clearing the link session. This does not delete or
+unlink existing accounts, but it can briefly pause every Signal account in the same local profile.
+KT must therefore reuse an unexpired QR and perform this restart only for an explicit replacement,
+not an automatic render retry.
+
+Cancellation, timeout, client disconnect, or connector shutdown zeroizes and removes the state. QR
+data is never stored or logged.
 
 ### 6.2 Receive
 
@@ -275,8 +287,10 @@ increment above 350 MB or monotonic growth triggers profiling rather than a docu
 - host connections: one authenticated KT main process in Phase 1.
 - pending host requests: 128 global, 32 per account, and 8 MiB aggregate request bytes per
   authenticated connection.
-- authenticated host dispatch: control 1, persisted reads 4, sends 2; sends remain ordered per
-  account and responses are correlated by `requestId`, not arrival order.
+- authenticated host dispatch: control 1, link wait 1, persisted reads 4, sends 2; sends remain
+  ordered per account and responses are correlated by `requestId`, not arrival order. The link-wait
+  lane admits at most one `link.finish` and is independent from link cancellation and lifecycle
+  control.
 - pending signal-cli requests: 128 global.
 - event queue: 1,024 normalized events with pressure reporting.
 - current message page: default 100, maximum 200.

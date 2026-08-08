@@ -163,6 +163,20 @@ impl ConnectorService {
         Ok(response)
     }
 
+    pub fn ensure_link_available(&mut self) -> Result<(), ServiceError> {
+        if let Some(existing) = self.link.as_ref() {
+            if !existing.is_expired(now_ms()) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "LINK_IN_PROGRESS",
+                    "a link session is already active",
+                    false,
+                )));
+            }
+            self.link = None;
+        }
+        Ok(())
+    }
+
     /// Clone link credentials without clearing the session, so a timed-out finishLink can be retried.
     pub fn peek_link_for_finish(
         &mut self,
@@ -175,27 +189,12 @@ impl ConnectorService {
         ))
     }
 
-    pub fn clear_link_session(&mut self, link_session_id: &str) {
-        if self
-            .link
-            .as_ref()
-            .is_some_and(|session| session.session_id == link_session_id)
-        {
-            self.link = None;
-        }
-    }
-
-    pub fn take_link_for_finish(
+    pub fn complete_link_session(
         &mut self,
         link_session_id: &str,
-    ) -> Result<(String, String), ServiceError> {
-        let mut session = self.take_link_session(link_session_id)?;
-        let device_name = session.device_name.clone();
-        let device_link_uri = session.take_device_link_uri();
-        Ok((device_name, device_link_uri))
-    }
-
-    pub fn complete_link(&self, number: &str) -> Result<AccountSummary, ServiceError> {
+        number: &str,
+    ) -> Result<AccountSummary, ServiceError> {
+        let _ = self.take_link_session(link_session_id)?;
         Ok(self
             .store
             .upsert_account_from_signal(number, Some(now_ms()))?)
@@ -585,4 +584,45 @@ fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn service() -> (TempDir, ConnectorService) {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        (temp, ConnectorService::new(store))
+    }
+
+    #[test]
+    fn cancelled_link_cannot_complete_or_create_an_account() {
+        let (_temp, mut service) = service();
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+
+        service.cancel_link(&link_session_id).unwrap();
+        let late = service.complete_link_session(&link_session_id, "+15555550100");
+
+        assert!(matches!(late, Err(ServiceError::Api(_))));
+        assert!(service.list_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn active_link_is_rejected_before_requesting_another_upstream_uri() {
+        let (_temp, mut service) = service();
+        service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+
+        assert!(matches!(
+            service.ensure_link_available(),
+            Err(ServiceError::Api(_))
+        ));
+    }
 }

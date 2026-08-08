@@ -23,6 +23,7 @@ pub struct RuntimeSupervisor {
     config: SignalCliConfig,
     engine: Mutex<Option<EngineHandle>>,
     service: Mutex<ConnectorService>,
+    active_link_finish: Mutex<Option<String>>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
@@ -37,6 +38,7 @@ impl RuntimeSupervisor {
             config,
             engine: Mutex::new(None),
             service: Mutex::new(ConnectorService::new(store)),
+            active_link_finish: Mutex::new(None),
             events,
             host_events,
             last_title_enrich_ms: AtomicU64::new(0),
@@ -84,6 +86,7 @@ impl RuntimeSupervisor {
             .take()
             .ok_or(EngineError::NotRunning)?;
         self.service.lock().await.clear_link();
+        *self.active_link_finish.lock().await = None;
         engine.shutdown().await?;
         Ok(EngineStatus {
             state: EngineState::Stopped,
@@ -94,6 +97,7 @@ impl RuntimeSupervisor {
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         let engine = self.engine.lock().await.take();
         self.service.lock().await.clear_link();
+        *self.active_link_finish.lock().await = None;
         if let Some(engine) = engine {
             engine.shutdown().await?;
         }
@@ -227,6 +231,7 @@ impl RuntimeSupervisor {
     }
 
     pub async fn start_link(&self, device_name: String) -> Result<Value, ServiceError> {
+        self.service.lock().await.ensure_link_available()?;
         let engine = self.running_engine().await?;
         let result = engine
             .call("startLink", json!({}), CallClass::ReadOnly)
@@ -253,12 +258,34 @@ impl RuntimeSupervisor {
         link_session_id: String,
     ) -> Result<AccountSummary, ServiceError> {
         let engine = self.running_engine().await?;
-        let (device_name, device_link_uri) = self
+        {
+            let mut active = self.active_link_finish.lock().await;
+            if active.is_some() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "LINK_IN_PROGRESS",
+                    "a link finish request is already active",
+                    false,
+                )));
+            }
+            *active = Some(link_session_id.clone());
+        }
+        let credentials = self
             .service
             .lock()
             .await
-            .peek_link_for_finish(&link_session_id)?;
-        let result = match engine
+            .peek_link_for_finish(&link_session_id);
+        let (device_name, device_link_uri) = match credentials {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                let mut active = self.active_link_finish.lock().await;
+                if active.as_deref() == Some(link_session_id.as_str()) {
+                    *active = None;
+                }
+                return Err(error);
+            }
+        };
+
+        let upstream = engine
             .call_with_timeout(
                 "finishLink",
                 json!({
@@ -268,8 +295,25 @@ impl RuntimeSupervisor {
                 CallClass::Mutating,
                 LINK_FINISH_TIMEOUT,
             )
-            .await
-        {
+            .await;
+        let still_current = {
+            let mut active = self.active_link_finish.lock().await;
+            if active.as_deref() == Some(link_session_id.as_str()) {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        };
+        if !still_current {
+            return Err(ServiceError::Api(ApiError::new(
+                "LINK_CANCELLED",
+                "link session was cancelled",
+                false,
+            )));
+        }
+
+        let result = match upstream {
             Ok(value) => value,
             Err(EngineError::Timeout) | Err(EngineError::UnknownOutcome) => {
                 return Err(ServiceError::Api(ApiError::new(
@@ -292,8 +336,7 @@ impl RuntimeSupervisor {
             })?;
         let mut account = {
             let mut service = self.service.lock().await;
-            service.clear_link_session(&link_session_id);
-            service.complete_link(number)?
+            service.complete_link_session(&link_session_id, number)?
         };
         // Refresh profile display name right after link (best-effort).
         if let Ok(engine) = self.running_engine().await {
@@ -315,7 +358,30 @@ impl RuntimeSupervisor {
     }
 
     pub async fn cancel_link(&self, link_session_id: String) -> Result<Value, ServiceError> {
-        self.service.lock().await.cancel_link(&link_session_id)
+        let cancelled_in_flight = {
+            let mut active = self.active_link_finish.lock().await;
+            if active.as_deref() == Some(link_session_id.as_str()) {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        };
+        let result = self.service.lock().await.cancel_link(&link_session_id);
+        if cancelled_in_flight {
+            self.restart_engine_after_link_cancel().await?;
+        }
+        result
+    }
+
+    async fn restart_engine_after_link_cancel(&self) -> Result<(), EngineError> {
+        let mut slot = self.engine.lock().await;
+        if let Some(engine) = slot.take() {
+            engine.shutdown().await?;
+        }
+        let engine = EngineHandle::start(self.config.clone(), self.events.clone()).await?;
+        *slot = Some(engine);
+        Ok(())
     }
 
     /// Clear local Signal account data (desktop exit). Not remote primary unregister.
