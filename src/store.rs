@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 200;
@@ -23,6 +23,8 @@ pub enum StoreError {
     AccountNotFound,
     #[error("conversation was not found")]
     ConversationNotFound,
+    #[error("message was not found")]
+    MessageNotFound,
     #[error("account delete operation conflicts with existing state")]
     OperationConflict,
     #[error("pagination cursor is invalid")]
@@ -74,6 +76,10 @@ pub struct MessageRecord {
     pub received_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_bytes: Option<u32>,
+    pub text_truncated: bool,
+    pub text_retrievable: bool,
     pub attachments: Vec<serde_json::Value>,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +168,8 @@ impl Store {
               sent_at INTEGER NOT NULL,
               received_at INTEGER,
               body TEXT,
+              body_bytes INTEGER,
+              body_truncated INTEGER NOT NULL DEFAULT 0,
               status TEXT NOT NULL,
               client_request_id TEXT,
               quote_message_id TEXT,
@@ -738,7 +746,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2
                    AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -755,21 +763,7 @@ impl Store {
                     before,
                     fetch as i64
                 ],
-                |row| {
-                    Ok(MessageRecord {
-                        id: row.get(0)?,
-                        account_id: row.get(1)?,
-                        conversation_id: row.get(2)?,
-                        direction: static_direction(row.get::<_, String>(3)?),
-                        sender_id: row.get(4)?,
-                        sent_at: row.get::<_, i64>(5)? as u64,
-                        received_at: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-                        text: row.get(7)?,
-                        attachments: Vec::new(),
-                        status: static_status(row.get::<_, String>(8)?),
-                        quote_message_id: row.get(9)?,
-                    })
-                },
+                message_record_from_row,
             )
             .map_err(|_| StoreError::Unavailable)?;
         let mut items = rows
@@ -792,24 +786,28 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
-                |row| {
-                    Ok(MessageRecord {
-                        id: row.get(0)?,
-                        account_id: row.get(1)?,
-                        conversation_id: row.get(2)?,
-                        direction: static_direction(row.get::<_, String>(3)?),
-                        sender_id: row.get(4)?,
-                        sent_at: row.get::<_, i64>(5)? as u64,
-                        received_at: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-                        text: row.get(7)?,
-                        attachments: Vec::new(),
-                        status: static_status(row.get::<_, String>(8)?),
-                        quote_message_id: row.get(9)?,
-                    })
-                },
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    pub fn message_by_id(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id
+                 FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id],
+                message_record_from_row,
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
@@ -827,8 +825,8 @@ impl Store {
             .execute(
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                    body, status, client_request_id, quote_message_id
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    body, body_bytes, body_truncated, status, client_request_id, quote_message_id
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     message.id,
                     message.account_id,
@@ -838,6 +836,8 @@ impl Store {
                     message.sent_at as i64,
                     message.received_at.map(|v| v as i64),
                     message.text,
+                    message.text_bytes.map(i64::from),
+                    i64::from(message.text_truncated && !message.text_retrievable),
                     message.status,
                     client_request_id,
                     message.quote_message_id,
@@ -932,24 +932,10 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id
                  FROM messages WHERE id=?1",
                 params![message_id],
-                |row| {
-                    Ok(MessageRecord {
-                        id: row.get(0)?,
-                        account_id: row.get(1)?,
-                        conversation_id: row.get(2)?,
-                        direction: static_direction(row.get::<_, String>(3)?),
-                        sender_id: row.get(4)?,
-                        sent_at: row.get::<_, i64>(5)? as u64,
-                        received_at: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-                        text: row.get(7)?,
-                        attachments: Vec::new(),
-                        status: static_status(row.get::<_, String>(8)?),
-                        quote_message_id: row.get(9)?,
-                    })
-                },
+                message_record_from_row,
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
@@ -1084,9 +1070,28 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             |row| row.get(0),
         )
         .unwrap_or(0);
+    if current > SCHEMA_VERSION {
+        return Err(StoreError::Unavailable);
+    }
     if current < 2 {
         // Older DBs created before display_name column.
-        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT", []);
+        if !table_has_column(conn, "accounts", "display_name")? {
+            conn.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT", [])
+                .map_err(|_| StoreError::Unavailable)?;
+        }
+    }
+    if current < 4 {
+        if !table_has_column(conn, "messages", "body_bytes")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN body_bytes INTEGER", [])
+                .map_err(|_| StoreError::Unavailable)?;
+        }
+        if !table_has_column(conn, "messages", "body_truncated")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN body_truncated INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        }
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -1095,6 +1100,28 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
     )
     .map_err(|_| StoreError::Unavailable)?;
     Ok(())
+}
+
+fn table_has_column(
+    conn: &Connection,
+    table: &str,
+    expected_column: &str,
+) -> Result<bool, StoreError> {
+    let sql = match table {
+        "accounts" => "PRAGMA table_info(accounts)",
+        "messages" => "PRAGMA table_info(messages)",
+        _ => return Err(StoreError::Unavailable),
+    };
+    let mut stmt = conn.prepare(sql).map_err(|_| StoreError::Unavailable)?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StoreError::Unavailable)?;
+    for column in columns {
+        if column.map_err(|_| StoreError::Unavailable)? == expected_column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn static_state(value: String) -> &'static str {
@@ -1133,6 +1160,34 @@ fn static_status(value: String) -> &'static str {
     }
 }
 
+fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
+    let text: Option<String> = row.get(7)?;
+    let text_bytes = row
+        .get::<_, Option<i64>>(8)?
+        .map(|value| value.max(0).min(u32::MAX as i64) as u32)
+        .or_else(|| {
+            text.as_ref()
+                .map(|value| value.len().min(u32::MAX as usize) as u32)
+        });
+    let persisted_truncated = row.get::<_, i64>(9)? != 0;
+    Ok(MessageRecord {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        conversation_id: row.get(2)?,
+        direction: static_direction(row.get::<_, String>(3)?),
+        sender_id: row.get(4)?,
+        sent_at: row.get::<_, i64>(5)? as u64,
+        received_at: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+        text_retrievable: text.is_some() && !persisted_truncated,
+        text,
+        text_bytes,
+        text_truncated: persisted_truncated,
+        attachments: Vec::new(),
+        status: static_status(row.get::<_, String>(10)?),
+        quote_message_id: row.get(11)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,6 +1217,9 @@ mod tests {
             sent_at: 10,
             received_at: None,
             text: Some("hello".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            text_retrievable: true,
             attachments: Vec::new(),
             status: "sent",
             quote_message_id: None,
@@ -1220,6 +1278,9 @@ mod tests {
                 sent_at,
                 received_at: Some(sent_at),
                 text: Some(id.into()),
+                text_bytes: Some(id.len() as u32),
+                text_truncated: false,
+                text_retrievable: true,
                 attachments: Vec::new(),
                 status: "delivered",
                 quote_message_id: None,
@@ -1281,6 +1342,9 @@ mod tests {
             sent_at: 30,
             received_at: Some(30),
             text: Some("changed after cursor".into()),
+            text_bytes: Some(20),
+            text_truncated: false,
+            text_retrievable: true,
             attachments: Vec::new(),
             status: "delivered",
             quote_message_id: None,
@@ -1316,6 +1380,9 @@ mod tests {
             sent_at: 10,
             received_at: Some(10),
             text: Some("other".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            text_retrievable: true,
             attachments: Vec::new(),
             status: "delivered",
             quote_message_id: None,
@@ -1365,6 +1432,9 @@ mod tests {
             sent_at: 10,
             received_at: Some(11),
             text: Some("delete me".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
             attachments: Vec::new(),
             status: "delivered",
             quote_message_id: None,
@@ -1471,5 +1541,60 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS);
+    }
+
+    #[test]
+    fn schema_v3_upgrade_adds_message_body_metadata_before_advancing_version() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '3');
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               body TEXT,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path()).unwrap();
+        assert!(table_has_column(&store.conn, "messages", "body_bytes").unwrap());
+        assert!(table_has_column(&store.conn, "messages", "body_truncated").unwrap());
+        let version: i64 = store
+            .conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn future_schema_version_fails_closed() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        store
+            .conn
+            .execute("UPDATE meta SET value='999' WHERE key='schema_version'", [])
+            .unwrap();
+        drop(store);
+
+        assert!(matches!(
+            Store::open(temp.path()),
+            Err(StoreError::Unavailable)
+        ));
     }
 }

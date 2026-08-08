@@ -554,6 +554,18 @@ impl RuntimeSupervisor {
         )
     }
 
+    pub async fn get_message_text(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<crate::service::MessageText, ServiceError> {
+        self.service
+            .lock()
+            .await
+            .get_message_text(&account_id, &conversation_id, &message_id)
+    }
+
     pub async fn send_text(
         &self,
         account_id: String,

@@ -30,5 +30,6 @@ pub const PHASE2_CAPABILITIES: &[&str] = &[
     "link.cancel",
     "conversations.list",
     "messages.list",
+    "messages.getText",
     "messages.sendText",
 ];

@@ -41,6 +41,7 @@
             "link.cancel",
             "conversations.list",
             "messages.list",
+            "messages.getText",
             "messages.sendText"
           ]
         },
@@ -145,6 +146,17 @@
               "params": { "$ref": "#/$defs/messagesSendTextParams" }
             }
           }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.getText" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messageGetTextParams" }
+            }
+          }
         }
       ]
     },
@@ -230,6 +242,16 @@
         "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "messageGetTextParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "response": {
       "type": "object",
       "additionalProperties": false,
@@ -295,6 +317,7 @@
             "LINK_CANCELLED",
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
+            "MESSAGE_NOT_FOUND",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",

@@ -155,6 +155,7 @@ Phase 2 host methods:
 - `link.cancel`
 - `conversations.list`
 - `messages.list`
+- `messages.getText`
 - `messages.sendText`
 - normalized runtime/account/conversation/message events
 
@@ -248,6 +249,13 @@ signal-cli receive notification
 
 Persistence happens before event delivery so KT reloads recover facts from the store.
 
+Incoming text is bounded twice after signal-cli parsing: Connector persistence accepts at most
+128 KiB, matching Signal iOS's legacy-compatible receive ceiling, while list/event projections carry
+at most a 4 KiB UTF-8 preview. Larger upstream bodies retain a stable message row, bounded preview,
+original byte count, and an explicit non-retrievable marker; the excess body is discarded before
+SQLite and Host event serialization. A user may fetch one complete persisted body through
+`messages.getText`; bulk/background fetch is not exposed.
+
 ### 6.4 Send
 
 Every send has a KT `clientRequestId`. The connector inserts a pending record before calling
@@ -335,6 +343,7 @@ increment above 350 MB or monotonic growth triggers profiling rather than a docu
 - pending signal-cli requests: 128 global.
 - event queue: 1,024 normalized events with pressure reporting.
 - current message page: default 100, maximum 200.
+- message text projection: 4 KiB per list/event row; persisted inbound body: 128 KiB maximum.
 - conversation cursors are opaque keyset cursors over `(last_message_at nullness,
   last_message_at, id)`; message cursors are exact message IDs over `(sent_at, id)`. Unknown or
   cross-account cursors fail closed instead of silently returning the first page.

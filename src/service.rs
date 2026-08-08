@@ -13,6 +13,8 @@ use crate::store::{
 };
 
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
+const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_DEVICE_NAME_BYTES: usize = 64;
 
 #[derive(Debug, Error)]
@@ -37,6 +39,9 @@ impl ServiceError {
                 "conversation was not found",
                 false,
             ),
+            ServiceError::Store(StoreError::MessageNotFound) => {
+                ApiError::new("MESSAGE_NOT_FOUND", "message was not found", false)
+            }
             ServiceError::Store(StoreError::OperationConflict) => ApiError::new(
                 "INVALID_REQUEST",
                 "account delete operation conflicts with existing state",
@@ -283,9 +288,49 @@ impl ConnectorService {
         let _ = self
             .store
             .clear_conversation_unread(account_id, conversation_id)?;
-        Ok(self
+        let mut page = self
             .store
-            .list_messages(account_id, conversation_id, limit, before)?)
+            .list_messages(account_id, conversation_id, limit, before)?;
+        page.items = page
+            .items
+            .into_iter()
+            .map(project_message_for_host)
+            .collect();
+        Ok(page)
+    }
+
+    pub fn get_message_text(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<MessageText, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        let message = self
+            .store
+            .message_by_id(account_id, conversation_id, message_id)?
+            .ok_or(StoreError::MessageNotFound)?;
+        if !message.text_retrievable {
+            return Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "complete message text is unavailable",
+                false,
+            )));
+        }
+        let text = message.text.ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "message has no text body",
+                false,
+            ))
+        })?;
+        Ok(MessageText {
+            message_id: message.id,
+            text_bytes: message.text_bytes.unwrap_or(text.len() as u32),
+            text,
+        })
     }
 
     pub fn prepare_send_text(
@@ -327,6 +372,9 @@ impl ConnectorService {
             sent_at: now_ms(),
             received_at: None,
             text: Some(text.to_string()),
+            text_bytes: Some(text.len() as u32),
+            text_truncated: false,
+            text_retrievable: true,
             attachments: Vec::new(),
             status: "pending",
             quote_message_id: quote_message_id.map(str::to_string),
@@ -372,7 +420,9 @@ impl ConnectorService {
             .store
             .update_message_status(pending_id, "sent", Some(sent_at))?
             .ok_or(StoreError::Unavailable)?;
-        let mut events = vec![HostSideEvent::MessageUpserted(updated.clone())];
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            updated.clone(),
+        ))];
         if let Some(conversation) = self.store.conversation_summary(conversation_id)? {
             events.push(HostSideEvent::ConversationChanged(conversation));
         }
@@ -456,6 +506,18 @@ impl ConnectorService {
             &sender_id,
             receive.text.as_deref().unwrap_or(""),
         ]);
+        let text_bytes = receive
+            .text
+            .as_ref()
+            .map(|text| text.len().min(u32::MAX as usize) as u32);
+        let text_complete = text_bytes.is_none_or(|bytes| bytes as usize <= MAX_INBOUND_TEXT_BYTES);
+        let stored_text = receive.text.map(|text| {
+            if text_complete {
+                text
+            } else {
+                truncate_utf8_bytes(&text, MAX_HOST_TEXT_PREVIEW_BYTES)
+            }
+        });
         let status = match direction {
             "outgoing" => "sent",
             "system" => "system",
@@ -469,21 +531,18 @@ impl ConnectorService {
             sender_id,
             sent_at,
             received_at: Some(now_ms()),
-            text: receive.text.clone(),
+            text: stored_text,
+            text_bytes,
+            text_truncated: !text_complete,
+            text_retrievable: text_complete,
             attachments: Vec::new(),
             status,
             quote_message_id: None,
         };
-        let preview = match direction {
-            "system" => receive
-                .text
-                .as_deref()
-                .map(|text| text.chars().take(120).collect::<String>()),
-            _ => receive
-                .text
-                .as_deref()
-                .map(|text| text.chars().take(120).collect::<String>()),
-        };
+        let preview = message
+            .text
+            .as_deref()
+            .map(|text| text.chars().take(120).collect::<String>());
         let increment_unread = direction == "incoming";
         let inserted =
             self.store
@@ -491,7 +550,9 @@ impl ConnectorService {
         if !inserted {
             return Ok(Vec::new());
         }
-        let mut events = vec![HostSideEvent::MessageUpserted(message)];
+        let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+            message,
+        ))];
         if let Some(conversation) = self.store.conversation_summary(&conversation.id)? {
             events.push(HostSideEvent::ConversationChanged(conversation));
         }
@@ -585,6 +646,22 @@ pub struct MessagesListParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MessageGetTextParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageText {
+    pub message_id: String,
+    pub text: String,
+    pub text_bytes: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MessagesSendTextParams {
     pub account_id: String,
     pub conversation_id: String,
@@ -617,6 +694,29 @@ fn validate_text(text: &str) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+fn project_message_for_host(mut message: MessageRecord) -> MessageRecord {
+    let Some(text) = message.text.as_deref() else {
+        return message;
+    };
+    if text.len() <= MAX_HOST_TEXT_PREVIEW_BYTES {
+        return message;
+    }
+    message.text = Some(truncate_utf8_bytes(text, MAX_HOST_TEXT_PREVIEW_BYTES));
+    message.text_truncated = true;
+    message
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
@@ -698,5 +798,106 @@ mod tests {
         assert!(validate_text(&"😀".repeat(16_384)).is_ok());
         assert!(validate_text(&format!("{}a", "😀".repeat(16_384))).is_err());
         assert!(validate_text("").is_err());
+    }
+
+    #[test]
+    fn inbound_long_text_is_projected_and_fetched_on_demand() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let full_text = "界".repeat(4_000);
+        let events = service
+            .ingest_receive(NormalizedReceive {
+                timestamp: Some(10),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some("+15555550101".into()),
+                peer_name: Some("Peer".into()),
+                group_id: None,
+                text: Some(full_text.clone()),
+            })
+            .unwrap();
+        let projected = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert!(projected.text.as_ref().unwrap().len() <= MAX_HOST_TEXT_PREVIEW_BYTES);
+        assert!(projected.text_truncated);
+        assert!(projected.text_retrievable);
+
+        let fetched = service
+            .get_message_text(&account.id, &projected.conversation_id, &projected.id)
+            .unwrap();
+        assert_eq!(fetched.text, full_text);
+        assert_eq!(fetched.text_bytes, 12_000);
+
+        let other_account = service
+            .sync_accounts_from_numbers(&["+15555550100".into(), "+15555550102".into()])
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id != account.id)
+            .unwrap();
+        assert!(matches!(
+            service.get_message_text(&other_account.id, &projected.conversation_id, &projected.id,),
+            Err(ServiceError::Store(StoreError::MessageNotFound))
+        ));
+        assert!(matches!(
+            service.get_message_text(&"x".repeat(129), "conversation", "message"),
+            Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
+        ));
+    }
+
+    #[test]
+    fn inbound_text_above_receive_ceiling_keeps_only_an_explicit_preview() {
+        let (_temp, service) = service();
+        service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap();
+        let oversized = "a".repeat(MAX_INBOUND_TEXT_BYTES + 1);
+        let events = service
+            .ingest_receive(NormalizedReceive {
+                timestamp: Some(11),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some("+15555550101".into()),
+                peer_name: None,
+                group_id: None,
+                text: Some(oversized),
+            })
+            .unwrap();
+        let projected = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            projected.text.as_ref().unwrap().len(),
+            MAX_HOST_TEXT_PREVIEW_BYTES
+        );
+        assert_eq!(
+            projected.text_bytes,
+            Some((MAX_INBOUND_TEXT_BYTES + 1) as u32)
+        );
+        assert!(projected.text_truncated);
+        assert!(!projected.text_retrievable);
+        assert!(matches!(
+            service.get_message_text(
+                &projected.account_id,
+                &projected.conversation_id,
+                &projected.id,
+            ),
+            Err(ServiceError::Api(error)) if error.code == "CAPABILITY_UNAVAILABLE"
+        ));
     }
 }

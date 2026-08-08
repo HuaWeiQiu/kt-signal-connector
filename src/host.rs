@@ -23,7 +23,7 @@ use crate::ipc::LocalListener;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::service::{
     AccountDeleteLocalDataParams, ConversationsListParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessagesListParams, MessagesSendTextParams,
+    LinkStartParams, MessageGetTextParams, MessagesListParams, MessagesSendTextParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::supervisor::RuntimeSupervisor;
@@ -142,7 +142,10 @@ impl HostDispatchLimits {
 
         let lane = if method == "link.finish" {
             self.link_wait.clone().acquire_owned().await.unwrap()
-        } else if matches!(method, "conversations.list" | "messages.list") {
+        } else if matches!(
+            method,
+            "conversations.list" | "messages.list" | "messages.getText"
+        ) {
             self.read.clone().acquire_owned().await.unwrap()
         } else {
             self.control.clone().acquire_owned().await.unwrap()
@@ -658,6 +661,24 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
                 ApiError::new("INVALID_REQUEST", "invalid messages.list params", false),
             ),
         },
+        "messages.getText" => {
+            match serde_json::from_value::<MessageGetTextParams>(request.params) {
+                Ok(params) => match supervisor
+                    .get_message_text(params.account_id, params.conversation_id, params.message_id)
+                    .await
+                {
+                    Ok(message) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(message).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid messages.getText params", false),
+                ),
+            }
+        }
         "messages.sendText" => {
             match serde_json::from_value::<MessagesSendTextParams>(request.params) {
                 Ok(params) => match supervisor
