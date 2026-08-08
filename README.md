@@ -9,15 +9,22 @@ keeps Signal account keys outside the KT renderer and feature runtime.
 
 ## Status
 
-Phases 1–3 are implemented for local development:
+Connector Phases 1–3 are implemented for local development:
 
 - Phase 1: process/protocol PoC
 - Phase 2: link, accounts, text channel, SQLite
 - Phase 3: unsigned local manifests, LKG stage/activate/rollback, resource smoke harness
 
+The Phase 4 KT Desktop integration is locally merged in the separate `kt-desktop` repository:
+
+- connector: `main` @ `6656f70` (`link.finish` uses an independent bounded wait lane)
+- desktop integration: `codex/signal-test-main-latest` @ merge `5e18793c`
+- source boundary: the Desktop launches this independent executable over authenticated local IPC;
+  connector source is not copied or linked into the Desktop repository
+
 The connector is not ready for production use. Local bundles are unsigned, Windows runtime
-acceptance is pending a Windows host, and real Signal account acceptance requires separate
-authorization.
+acceptance is pending a Windows host, no remote repository is configured, and the 24/72-hour and
+real multi-account capacity gates are still pending.
 
 The complete implementation and acceptance plan is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
@@ -33,6 +40,20 @@ Local packaging helpers:
 ./packaging/scripts/build-local-bundle.sh
 ./packaging/scripts/measure-local-resources.sh
 ```
+
+## Local generated files
+
+The repository audit on 2026-08-09 found no unreferenced tracked source modules. The following
+ignored paths are generated locally and are not release source:
+
+- `target/debug/` is rebuildable Rust debug output and can be removed when reclaiming disk space.
+- `packaging/out/local-bundle/` must be rebuilt before use; an older local bundle must not be treated
+  as the current `6656f70` acceptance artifact.
+- `target/release/kt-signal-connector` is currently used by the local KT Desktop integration. Keep it
+  until a replacement bundle or binary is built; recreate it with `cargo build --release` if removed.
+
+Phase validation documents and test fixtures remain intentional acceptance evidence and should not
+be removed as generated output.
 
 ## Non-goals
 

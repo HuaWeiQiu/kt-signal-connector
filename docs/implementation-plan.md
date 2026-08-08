@@ -3,7 +3,9 @@
 ## 1. Status
 
 - Decision date: 2026-08-04
-- Current phase: Phase 3 packaging and resource baseline (local unsigned manifests / LKG)
+- Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
+  integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.7`
 - Target Java baseline: JRE 25
 - Initial platforms: Windows 10/11 x64, macOS x64, macOS arm64
@@ -380,6 +382,10 @@ Deliver:
 Exit: target-platform resource gates and license delivery review pass.
 
 ### Phase 4: KT Desktop integration
+
+Local integration status (2026-08-09): merged in the separate `kt-desktop` worktree on
+`codex/signal-test-main-latest` at `5e18793c`. This does not satisfy the remaining Windows,
+signed-distribution, 24/72-hour, or real multi-account production gates.
 
 Deliver in KT Desktop:
 
