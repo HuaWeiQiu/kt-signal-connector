@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 200;
 
@@ -22,6 +23,8 @@ pub enum StoreError {
     AccountNotFound,
     #[error("conversation was not found")]
     ConversationNotFound,
+    #[error("account delete operation conflicts with existing state")]
+    OperationConflict,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -97,6 +100,15 @@ pub struct ConversationRow {
     pub peer_key: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountDeletePlan {
+    Completed,
+    Dispatch {
+        signal_account: String,
+        reconcile_first: bool,
+    },
+}
+
 pub struct Store {
     path: PathBuf,
     conn: Connection,
@@ -161,6 +173,16 @@ impl Store {
               ON messages(conversation_id, sent_at DESC, id DESC);
             CREATE INDEX IF NOT EXISTS conversations_account_last_message
               ON conversations(account_id, last_message_at DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS account_delete_operations (
+              operation_id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              state TEXT NOT NULL CHECK(state IN ('started', 'unknown', 'completed')),
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS account_delete_one_pending_per_account
+              ON account_delete_operations(account_id)
+              WHERE state != 'completed';
             ",
         )
         .map_err(|_| StoreError::Unavailable)?;
@@ -303,24 +325,159 @@ impl Store {
             .map_err(|_| StoreError::Unavailable)
     }
 
-    /// Remove account and dependent rows from the connector store (local exit).
-    pub fn delete_account_cascade(&self, account_id: &str) -> Result<(), StoreError> {
-        if self.account_by_id(account_id)?.is_none() {
-            return Err(StoreError::AccountNotFound);
-        }
-        self.conn
-            .execute("DELETE FROM messages WHERE account_id=?1", params![account_id])
+    pub fn prepare_account_delete(
+        &mut self,
+        account_id: &str,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<AccountDeletePlan, StoreError> {
+        let transaction = self
+            .conn
+            .transaction()
             .map_err(|_| StoreError::Unavailable)?;
-        self.conn
-            .execute(
-                "DELETE FROM conversations WHERE account_id=?1",
+        let existing = transaction
+            .query_row(
+                "SELECT account_id, state FROM account_delete_operations WHERE operation_id=?1",
+                params![operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        if let Some((existing_account_id, state)) = existing.as_ref() {
+            if existing_account_id != account_id {
+                return Err(StoreError::OperationConflict);
+            }
+            if state == "completed" {
+                transaction.commit().map_err(|_| StoreError::Unavailable)?;
+                return Ok(AccountDeletePlan::Completed);
+            }
+        }
+
+        let signal_account = transaction
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
                 params![account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        let Some(signal_account) = signal_account else {
+            transaction
+                .execute(
+                    "INSERT INTO account_delete_operations(
+                       operation_id, account_id, state, created_at, updated_at
+                     ) VALUES(?1, ?2, 'completed', ?3, ?3)
+                     ON CONFLICT(operation_id) DO UPDATE SET
+                       state='completed', updated_at=excluded.updated_at",
+                    params![operation_id, account_id, now_ms as i64],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            prune_completed_account_deletes(&transaction)?;
+            transaction.commit().map_err(|_| StoreError::Unavailable)?;
+            return Ok(AccountDeletePlan::Completed);
+        };
+
+        let reconcile_first = existing.is_some();
+        if existing.is_none() {
+            transaction
+                .execute(
+                    "INSERT INTO account_delete_operations(
+                       operation_id, account_id, state, created_at, updated_at
+                     ) VALUES(?1, ?2, 'started', ?3, ?3)",
+                    params![operation_id, account_id, now_ms as i64],
+                )
+                .map_err(|error| {
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                        StoreError::OperationConflict
+                    } else {
+                        StoreError::Unavailable
+                    }
+                })?;
+        }
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        Ok(AccountDeletePlan::Dispatch {
+            signal_account,
+            reconcile_first,
+        })
+    }
+
+    pub fn mark_account_delete_unknown(
+        &self,
+        operation_id: &str,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE account_delete_operations
+                 SET state='unknown', updated_at=?2
+                 WHERE operation_id=?1 AND state!='completed'",
+                params![operation_id, now_ms as i64],
             )
             .map_err(|_| StoreError::Unavailable)?;
-        self.conn
-            .execute("DELETE FROM accounts WHERE id=?1", params![account_id])
-            .map_err(|_| StoreError::Unavailable)?;
+        if changed == 0 {
+            return Err(StoreError::OperationConflict);
+        }
         Ok(())
+    }
+
+    /// Remove account and dependent rows from the connector store (local exit).
+    pub fn complete_account_delete(
+        &mut self,
+        account_id: &str,
+        operation_id: Option<&str>,
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .conn
+            .transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM accounts WHERE id=?1",
+                params![account_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?
+            .is_some();
+        if exists {
+            transaction
+                .execute(
+                    "DELETE FROM messages WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            transaction
+                .execute(
+                    "DELETE FROM conversations WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            transaction
+                .execute("DELETE FROM accounts WHERE id=?1", params![account_id])
+                .map_err(|_| StoreError::Unavailable)?;
+        }
+        if let Some(operation_id) = operation_id {
+            let changed = transaction
+                .execute(
+                    "UPDATE account_delete_operations
+                     SET state='completed', updated_at=?3
+                     WHERE operation_id=?1 AND account_id=?2",
+                    params![operation_id, account_id, now_ms as i64],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            if changed == 0 {
+                return Err(StoreError::OperationConflict);
+            }
+            prune_completed_account_deletes(&transaction)?;
+        }
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        Ok(exists)
+    }
+
+    pub fn delete_account_cascade(&mut self, account_id: &str) -> Result<bool, StoreError> {
+        self.complete_account_delete(account_id, None, 0)
     }
 
     pub fn ensure_conversation(
@@ -794,6 +951,24 @@ impl Store {
     }
 }
 
+fn prune_completed_account_deletes(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM account_delete_operations
+             WHERE state='completed' AND operation_id NOT IN (
+               SELECT operation_id FROM account_delete_operations
+               WHERE state='completed'
+               ORDER BY updated_at DESC, operation_id DESC
+               LIMIT ?1
+             )",
+            params![MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS],
+        )
+        .map_err(|_| StoreError::Unavailable)?;
+    Ok(())
+}
+
 fn prepare_state_dir(path: &Path) -> Result<(), StoreError> {
     if !path.is_absolute() {
         return Err(StoreError::InvalidStateDir);
@@ -842,10 +1017,7 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         .unwrap_or(0);
     if current < 2 {
         // Older DBs created before display_name column.
-        let _ = conn.execute(
-            "ALTER TABLE accounts ADD COLUMN display_name TEXT",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT", []);
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -944,5 +1116,132 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 10, None)
             .unwrap();
         assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn account_delete_is_atomic_cascading_and_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let message = MessageRecord {
+            id: "delete-message".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "+15555550101".into(),
+            sent_at: 10,
+            received_at: Some(11),
+            text: Some("delete me".into()),
+            attachments: Vec::new(),
+            status: "delivered",
+            quote_message_id: None,
+        };
+        store.insert_message(&message, None, None, false).unwrap();
+
+        assert!(store.delete_account_cascade(&account.id).unwrap());
+        assert!(!store.delete_account_cascade(&account.id).unwrap());
+        assert!(store.account_by_id(&account.id).unwrap().is_none());
+        assert!(store.list_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn account_delete_operation_survives_unknown_and_completes_atomically() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .prepare_account_delete(&account.id, "delete-op-1", 10)
+                .unwrap(),
+            AccountDeletePlan::Dispatch {
+                signal_account: "+15555550100".into(),
+                reconcile_first: false,
+            },
+        );
+        store
+            .mark_account_delete_unknown("delete-op-1", 11)
+            .unwrap();
+        assert_eq!(
+            store
+                .prepare_account_delete(&account.id, "delete-op-1", 12)
+                .unwrap(),
+            AccountDeletePlan::Dispatch {
+                signal_account: "+15555550100".into(),
+                reconcile_first: true,
+            },
+        );
+        assert!(
+            store
+                .complete_account_delete(&account.id, Some("delete-op-1"), 13)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .prepare_account_delete(&account.id, "delete-op-1", 14)
+                .unwrap(),
+            AccountDeletePlan::Completed,
+        );
+        assert!(store.account_by_id(&account.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn account_delete_operation_cannot_change_target_or_compete() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let other = store
+            .upsert_account_from_signal("+15555550101", Some(2))
+            .unwrap();
+        store
+            .prepare_account_delete(&account.id, "delete-op-1", 10)
+            .unwrap();
+
+        assert!(matches!(
+            store.prepare_account_delete(&other.id, "delete-op-1", 11),
+            Err(StoreError::OperationConflict),
+        ));
+        assert!(matches!(
+            store.prepare_account_delete(&account.id, "delete-op-2", 12),
+            Err(StoreError::OperationConflict),
+        ));
+    }
+
+    #[test]
+    fn completed_account_delete_operations_are_bounded() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+
+        for index in 0..300 {
+            assert_eq!(
+                store
+                    .prepare_account_delete(
+                        &format!("absent-account-{index}"),
+                        &format!("completed-operation-{index}"),
+                        index,
+                    )
+                    .unwrap(),
+                AccountDeletePlan::Completed,
+            );
+        }
+
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_delete_operations WHERE state='completed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS);
     }
 }

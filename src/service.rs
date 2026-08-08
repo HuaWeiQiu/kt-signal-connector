@@ -8,7 +8,9 @@ use crate::engine::{EngineError, NormalizedReceive};
 use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::protocol::ApiError;
-use crate::store::{AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError};
+use crate::store::{
+    AccountDeletePlan, AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
+};
 
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_DEVICE_NAME_BYTES: usize = 64;
@@ -33,6 +35,11 @@ impl ServiceError {
             ServiceError::Store(StoreError::ConversationNotFound) => ApiError::new(
                 "CONVERSATION_NOT_FOUND",
                 "conversation was not found",
+                false,
+            ),
+            ServiceError::Store(StoreError::OperationConflict) => ApiError::new(
+                "INVALID_REQUEST",
+                "account delete operation conflicts with existing state",
                 false,
             ),
             ServiceError::Store(_) => {
@@ -122,6 +129,16 @@ impl ConnectorService {
             .ok_or(ServiceError::Store(StoreError::AccountNotFound))
     }
 
+    pub fn account_signal_number_optional(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self
+            .store
+            .account_by_id(account_id)?
+            .map(|row| row.signal_account))
+    }
+
     pub fn set_account_display_name(
         &self,
         account_id: &str,
@@ -132,9 +149,34 @@ impl ConnectorService {
             .set_account_display_name(account_id, display_name)?)
     }
 
-    pub fn delete_account_local(&mut self, account_id: &str) -> Result<(), ServiceError> {
-        self.link = None;
+    pub fn delete_account_local(&mut self, account_id: &str) -> Result<bool, ServiceError> {
         Ok(self.store.delete_account_cascade(account_id)?)
+    }
+
+    pub fn prepare_account_delete(
+        &mut self,
+        account_id: &str,
+        operation_id: &str,
+    ) -> Result<AccountDeletePlan, ServiceError> {
+        Ok(self
+            .store
+            .prepare_account_delete(account_id, operation_id, now_ms())?)
+    }
+
+    pub fn mark_account_delete_unknown(&self, operation_id: &str) -> Result<(), ServiceError> {
+        Ok(self
+            .store
+            .mark_account_delete_unknown(operation_id, now_ms())?)
+    }
+
+    pub fn complete_account_delete(
+        &mut self,
+        account_id: &str,
+        operation_id: Option<&str>,
+    ) -> Result<bool, ServiceError> {
+        Ok(self
+            .store
+            .complete_account_delete(account_id, operation_id, now_ms())?)
     }
 
     pub fn begin_link(
@@ -358,10 +400,7 @@ impl ConnectorService {
         if receive.direction == "skip" {
             return Ok(Vec::new());
         }
-        if !matches!(
-            receive.direction,
-            "incoming" | "outgoing" | "system"
-        ) {
+        if !matches!(receive.direction, "incoming" | "outgoing" | "system") {
             return Ok(Vec::new());
         }
         // signal-cli may omit `account` on single-account jsonRpc; fall back to sole store account.
@@ -443,12 +482,9 @@ impl ConnectorService {
                 .map(|text| text.chars().take(120).collect::<String>()),
         };
         let increment_unread = direction == "incoming";
-        let inserted = self.store.insert_message(
-            &message,
-            None,
-            preview.as_deref(),
-            increment_unread,
-        )?;
+        let inserted =
+            self.store
+                .insert_message(&message, None, preview.as_deref(), increment_unread)?;
         if !inserted {
             return Ok(Vec::new());
         }
@@ -509,9 +545,10 @@ pub enum PreparedSend {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountIdParams {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountDeleteLocalDataParams {
     pub account_id: String,
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -562,6 +599,10 @@ fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+pub(crate) fn validate_account_delete_operation_id(operation_id: &str) -> Result<(), ServiceError> {
+    validate_opaque_id(operation_id, "operationId")
 }
 
 fn validate_text(text: &str) -> Result<(), ServiceError> {
@@ -624,5 +665,22 @@ mod tests {
             service.ensure_link_available(),
             Err(ServiceError::Api(_))
         ));
+    }
+
+    #[test]
+    fn deleting_an_account_does_not_cancel_another_session_link() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let started = service
+            .begin_link("KT-B".into(), "sgnl://link?second".into())
+            .unwrap();
+        let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
+
+        assert!(service.delete_account_local(&account.id).unwrap());
+        assert!(!service.delete_account_local(&account.id).unwrap());
+        assert!(service.cancel_link(&link_session_id).is_ok());
     }
 }

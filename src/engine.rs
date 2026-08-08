@@ -569,10 +569,7 @@ fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 });
-            let sent_ts = sent
-                .get("timestamp")
-                .and_then(Value::as_u64)
-                .or(timestamp);
+            let sent_ts = sent.get("timestamp").and_then(Value::as_u64).or(timestamp);
             if let Some(text) = text {
                 return Ok(make(
                     sent_ts,

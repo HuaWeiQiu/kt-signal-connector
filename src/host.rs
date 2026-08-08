@@ -22,8 +22,8 @@ use crate::engine::{EngineError, EngineEvent};
 use crate::ipc::LocalListener;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::service::{
-    AccountIdParams, ConversationsListParams, HostSideEvent, LinkSessionParams, LinkStartParams,
-    MessagesListParams, MessagesSendTextParams,
+    AccountDeleteLocalDataParams, ConversationsListParams, HostSideEvent, LinkSessionParams,
+    LinkStartParams, MessagesListParams, MessagesSendTextParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::supervisor::RuntimeSupervisor;
@@ -552,8 +552,11 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
             ),
         ),
         "accounts.deleteLocalData" => {
-            match serde_json::from_value::<AccountIdParams>(request.params) {
-                Ok(params) => match supervisor.delete_local_account(params.account_id).await {
+            match serde_json::from_value::<AccountDeleteLocalDataParams>(request.params) {
+                Ok(params) => match supervisor
+                    .delete_local_account(params.account_id, params.operation_id)
+                    .await
+                {
                     Ok(result) => HostResponse::success(request_id, result),
                     Err(error) => HostResponse::failure(request_id, error.into_api()),
                 },

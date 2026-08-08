@@ -399,13 +399,188 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     assert!(slow_statuses.contains(&"sent"));
     assert!(slow_statuses.contains(&"unknown"));
 
+    let restarted = request(&mut client, "start-for-delete", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+
+    let next_link = request(
+        &mut client,
+        "link-next-account",
+        "link.start",
+        json!({ "deviceName": "KT-Next" }),
+    )
+    .await;
+    let next_link_session_id = next_link["result"]["linkSessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let invalid_delete = request(
+        &mut client,
+        "delete-invalid-params",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_id, "unexpected": true }),
+    )
+    .await;
+    assert_eq!(invalid_delete["error"]["code"], "INVALID_REQUEST");
+
+    let compatible_delete = request(
+        &mut client,
+        "delete-v1-compatible",
+        "accounts.deleteLocalData",
+        json!({ "accountId": "already-absent-account" }),
+    )
+    .await;
+    assert!(compatible_delete.get("result").is_some());
+
+    let deleted = request(
+        &mut client,
+        "delete-account",
+        "accounts.deleteLocalData",
+        json!({
+            "accountId": account_id,
+            "operationId": "logout-operation-1"
+        }),
+    )
+    .await;
+    assert!(deleted.get("result").is_some());
+
+    let deleted_again = request(
+        &mut client,
+        "delete-account-again",
+        "accounts.deleteLocalData",
+        json!({
+            "accountId": account_id,
+            "operationId": "logout-operation-1"
+        }),
+    )
+    .await;
+    assert!(deleted_again.get("result").is_some());
+
+    let link_still_active = request(
+        &mut client,
+        "link-still-active",
+        "link.start",
+        json!({ "deviceName": "KT-Should-Wait" }),
+    )
+    .await;
+    assert_eq!(link_still_active["error"]["code"], "LINK_IN_PROGRESS");
+    let cancelled = request(
+        &mut client,
+        "link-next-cancel",
+        "link.cancel",
+        json!({ "linkSessionId": next_link_session_id }),
+    )
+    .await;
+    assert!(cancelled.get("result").is_some());
+    let after_delete = request(
+        &mut client,
+        "accounts-after-delete",
+        "accounts.list",
+        json!({}),
+    )
+    .await;
+    assert!(after_delete["result"].as_array().unwrap().is_empty());
+
+    drop(client);
+    connector.start_kill().unwrap();
+    let _ = timeout(Duration::from_secs(2), connector.wait()).await;
+}
+
+#[tokio::test]
+async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [8_u8; 32];
+    fs::write(&secret_file, hex::encode(secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut connector = spawn_connector_with_delete_mode(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        Some("crash_after_delete_once"),
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Delete-Recovery" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    let unknown = request(
+        &mut client,
+        "delete-unknown",
+        "accounts.deleteLocalData",
+        json!({
+            "accountId": account_id,
+            "operationId": "delete-recovery-operation"
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "ACCOUNT_DELETE_OUTCOME_UNKNOWN");
+
+    let restarted = request(&mut client, "restart", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let reconciled = request(
+        &mut client,
+        "delete-reconcile",
+        "accounts.deleteLocalData",
+        json!({
+            "accountId": account_id,
+            "operationId": "delete-recovery-operation"
+        }),
+    )
+    .await;
+    assert!(reconciled.get("result").is_some());
+    let idempotent = request(
+        &mut client,
+        "delete-completed",
+        "accounts.deleteLocalData",
+        json!({
+            "accountId": account_id,
+            "operationId": "delete-recovery-operation"
+        }),
+    )
+    .await;
+    assert!(idempotent.get("result").is_some());
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    assert!(accounts["result"].as_array().unwrap().is_empty());
+
     drop(client);
     connector.start_kill().unwrap();
     let _ = timeout(Duration::from_secs(2), connector.wait()).await;
 }
 
 fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
+    spawn_connector_with_delete_mode(root, endpoint, secret_file, None)
+}
+
+fn spawn_connector_with_delete_mode(
+    root: &Path,
+    endpoint: &Path,
+    secret_file: &Path,
+    delete_mode: Option<&str>,
+) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
         .arg("serve")
         .arg("--endpoint")
         .arg(endpoint)
@@ -420,9 +595,11 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap()
+        .kill_on_drop(true);
+    if let Some(delete_mode) = delete_mode {
+        command.env("KT_FAKE_DELETE_MODE", delete_mode);
+    }
+    command.spawn().unwrap()
 }
 
 fn fixture() -> PathBuf {

@@ -17,8 +17,9 @@ Connector Phases 1–3 are implemented for local development:
 
 The Phase 4 KT Desktop integration is locally merged in the separate `kt-desktop` repository:
 
-- connector: `main` @ `6656f70` (`link.finish` uses an independent bounded wait lane)
-- desktop integration: `codex/signal-test-main-latest` @ merge `5e18793c`
+- connector: local `main` HEAD (`link.finish` uses an independent bounded wait lane; account exit is
+  durable and idempotent)
+- desktop integration: `codex/signal-test-main-latest` local HEAD
 - source boundary: the Desktop launches this independent executable over authenticated local IPC;
   connector source is not copied or linked into the Desktop repository
 
@@ -48,7 +49,7 @@ ignored paths are generated locally and are not release source:
 
 - `target/debug/` is rebuildable Rust debug output and can be removed when reclaiming disk space.
 - `packaging/out/local-bundle/` must be rebuilt before use; an older local bundle must not be treated
-  as the current `6656f70` acceptance artifact.
+  as the current acceptance artifact.
 - `target/release/kt-signal-connector` is currently used by the local KT Desktop integration. Keep it
   until a replacement bundle or binary is built; recreate it with `cargo build --release` if removed.
 

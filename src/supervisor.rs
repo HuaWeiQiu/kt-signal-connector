@@ -13,8 +13,13 @@ use crate::engine::{
     NormalizedReceive, SignalCliConfig, event_channel,
 };
 use crate::protocol::ApiError;
-use crate::service::{ConnectorService, HostSideEvent, PreparedSend, ServiceError};
-use crate::store::{AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError};
+use crate::service::{
+    ConnectorService, HostSideEvent, PreparedSend, ServiceError,
+    validate_account_delete_operation_id,
+};
+use crate::store::{
+    AccountDeletePlan, AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
+};
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
 const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -384,29 +389,81 @@ impl RuntimeSupervisor {
         Ok(())
     }
 
-    /// Clear local Signal account data (desktop exit). Not remote primary unregister.
-    /// Tries signal-cli deleteLocalAccountData, then always purges connector store rows.
-    pub async fn delete_local_account(&self, account_id: String) -> Result<Value, ServiceError> {
-        let number = self
-            .service
+    /// Clear one local Signal account (desktop exit). Not remote primary unregister.
+    /// Local rows are removed only after signal-cli confirms success. Unknown outcomes
+    /// are surfaced without an automatic retry or local state loss.
+    pub async fn delete_local_account(
+        &self,
+        account_id: String,
+        operation_id: Option<String>,
+    ) -> Result<Value, ServiceError> {
+        if let Some(operation_id) = operation_id.as_deref() {
+            validate_account_delete_operation_id(operation_id)?;
+        }
+        let (number, reconcile_first) = match operation_id.as_deref() {
+            Some(operation_id) => match self
+                .service
+                .lock()
+                .await
+                .prepare_account_delete(&account_id, operation_id)?
+            {
+                AccountDeletePlan::Completed => return Ok(json!({})),
+                AccountDeletePlan::Dispatch {
+                    signal_account,
+                    reconcile_first,
+                } => (signal_account, reconcile_first),
+            },
+            None => match self
+                .service
+                .lock()
+                .await
+                .account_signal_number_optional(&account_id)?
+            {
+                Some(number) => (number, false),
+                None => return Ok(json!({})),
+            },
+        };
+        let engine = self.running_engine().await?;
+        if reconcile_first && !signal_account_present(&engine, &number).await? {
+            self.service
+                .lock()
+                .await
+                .complete_account_delete(&account_id, operation_id.as_deref())?;
+            return Ok(json!({}));
+        }
+        match engine
+            .call_with_timeout(
+                "deleteLocalAccountData",
+                json!({
+                    "account": number,
+                    "ignoreRegistered": true,
+                }),
+                CallClass::Mutating,
+                Duration::from_secs(60),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(EngineError::UnknownOutcome) => {
+                if let Some(operation_id) = operation_id.as_deref() {
+                    let _ = self
+                        .service
+                        .lock()
+                        .await
+                        .mark_account_delete_unknown(operation_id);
+                }
+                return Err(ServiceError::Api(ApiError::new(
+                    "ACCOUNT_DELETE_OUTCOME_UNKNOWN",
+                    "local account deletion has an unknown outcome",
+                    false,
+                )));
+            }
+            Err(error) => return Err(ServiceError::Engine(error)),
+        }
+        self.service
             .lock()
             .await
-            .account_signal_number(&account_id)?;
-        if let Ok(engine) = self.running_engine().await {
-            // Best-effort: ignore upstream errors so a half-broken local account can still exit.
-            let _ = engine
-                .call_with_timeout(
-                    "deleteLocalAccountData",
-                    json!({
-                        "account": number,
-                        "ignoreRegistered": true,
-                    }),
-                    CallClass::Mutating,
-                    Duration::from_secs(60),
-                )
-                .await;
-        }
-        self.service.lock().await.delete_account_local(&account_id)?;
+            .complete_account_delete(&account_id, operation_id.as_deref())?;
         Ok(json!({}))
     }
 
@@ -450,7 +507,9 @@ impl RuntimeSupervisor {
         self.last_title_enrich_ms.store(now_ms, Ordering::Relaxed);
         let engine = {
             let guard = self.engine.lock().await;
-            guard.clone().ok_or(ServiceError::Engine(EngineError::NotRunning))?
+            guard
+                .clone()
+                .ok_or(ServiceError::Engine(EngineError::NotRunning))?
         };
         let number = self
             .service
@@ -472,12 +531,9 @@ impl RuntimeSupervisor {
         let service = self.service.lock().await;
         for (peer_key, _title) in peers {
             if let Some(name) = find_contact_display_name(&items, &peer_key) {
-                let _ = service.store_ref().set_conversation_title_for_peer(
-                    account_id,
-                    "direct",
-                    &peer_key,
-                    &name,
-                );
+                let _ = service
+                    .store_ref()
+                    .set_conversation_title_for_peer(account_id, "direct", &peer_key, &name);
             }
         }
         Ok(())
@@ -569,6 +625,27 @@ impl RuntimeSupervisor {
             }
         }
     }
+}
+
+async fn signal_account_present(
+    engine: &EngineHandle,
+    signal_account: &str,
+) -> Result<bool, ServiceError> {
+    for _ in 0..2 {
+        let result = engine
+            .call("listAccounts", json!({}), CallClass::ReadOnly)
+            .await?;
+        let accounts = result
+            .as_array()
+            .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+        if accounts
+            .iter()
+            .any(|account| account.get("number").and_then(Value::as_str) == Some(signal_account))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn find_contact_display_name(items: &[Value], peer_key: &str) -> Option<String> {

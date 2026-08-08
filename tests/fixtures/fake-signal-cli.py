@@ -3,6 +3,7 @@
 
 import json
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -11,6 +12,20 @@ import time
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
 WRITE_LOCK = threading.Lock()
+
+
+def argument_value(name):
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+SIGNAL_DATA_DIR = Path(argument_value("--data-dir") or "/tmp/kt-signal-fixture")
+SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
+DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
+ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
 
 def emit_json(value):
@@ -70,10 +85,26 @@ for line in sys.stdin:
             continue
         if params.get("deviceName") == "[slow-link-test]":
             continue
+        ACCOUNT_LINKED = True
+        DELETED_MARKER.unlink(missing_ok=True)
         result = {"number": LINKED_ACCOUNT}
         emit_receive_after = True
     elif method == "listAccounts":
-        result = [{"number": LINKED_ACCOUNT}]
+        result = [{"number": LINKED_ACCOUNT}] if ACCOUNT_LINKED else []
+    elif method == "deleteLocalAccountData":
+        if DELETE_MODE == "crash_after_delete_once" and DELETED_MARKER.exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "delete was dispatched twice"},
+            }
+            emit_json(response)
+            continue
+        ACCOUNT_LINKED = False
+        DELETED_MARKER.touch()
+        if DELETE_MODE == "crash_after_delete_once":
+            os._exit(19)
+        result = {}
     elif method == "send":
         result = {"timestamp": 99, "results": []}
     elif method == "emitReceive":

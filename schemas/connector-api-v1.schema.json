@@ -80,6 +80,17 @@
         },
         {
           "if": {
+            "properties": { "method": { "const": "accounts.deleteLocalData" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountDeleteLocalDataParams" }
+            }
+          }
+        },
+        {
+          "if": {
             "properties": { "method": { "const": "link.start" } },
             "required": ["method"]
           },
@@ -162,6 +173,15 @@
           "minLength": 1,
           "maxLength": 64
         }
+      }
+    },
+    "accountDeleteLocalDataParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "linkSessionParams": {
@@ -274,6 +294,7 @@
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",
             "UPSTREAM_ERROR",
+            "ACCOUNT_DELETE_OUTCOME_UNKNOWN",
             "SEND_OUTCOME_UNKNOWN",
             "INTERNAL_ERROR"
           ]

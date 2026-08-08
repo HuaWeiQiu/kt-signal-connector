@@ -149,6 +149,7 @@ Phase 2 host methods:
 - `runtime.start`
 - `runtime.stop`
 - `accounts.list`
+- `accounts.deleteLocalData`
 - `link.start`
 - `link.finish`
 - `link.cancel`
@@ -179,7 +180,8 @@ Rules:
 - response IDs are matched to a bounded pending map.
 - `method=receive` is normalized as an event.
 - stderr is redacted diagnostic input, never protocol input.
-- read-only requests may be retried under policy; sends are never retried after an unknown outcome.
+- read-only requests may be retried under policy; mutating requests are never retried automatically
+  after an unknown outcome.
 - child shutdown is graceful first, then forced after a fixed deadline.
 
 During the local Phase 1 PoC, the trusted launcher supplies absolute executable and data-directory
@@ -209,7 +211,30 @@ not an automatic render retry.
 Cancellation, timeout, client disconnect, or connector shutdown zeroizes and removes the state. QR
 data is never stored or logged.
 
-### 6.2 Receive
+### 6.2 Local account exit
+
+`accounts.deleteLocalData` accepts an `accountId`; current KT versions also send a stable generated
+`operationId`. The field remains optional in API 1.0 so a Connector upgrade does not break an older
+Desktop, but new Desktop code must persist and reuse it. The operation removes only that account's
+signal-cli data and Connector rows; it must not clear or replace the profile's active link session.
+Connector row deletion is one SQLite transaction and is idempotent when the account row is already
+absent.
+
+For requests carrying `operationId`, the Connector persists only the random operation ID, opaque
+account ID, state, and timestamps. It does not retain the Signal address after account deletion.
+At most 256 completed operations are retained; one unfinished operation is allowed per account. On a
+later explicit user retry, an unfinished operation first performs two read-only `listAccounts`
+checks. If both confirm that the account is absent, the Connector atomically completes its local
+cleanup without issuing a second delete; otherwise that user action may dispatch the delete again.
+
+The Connector does not retry `deleteLocalAccountData` automatically. If signal-cli returns a
+definitive failure, local rows remain unchanged. If the process, transport, or timeout makes the
+result unknowable, the response is `ACCOUNT_DELETE_OUTCOME_UNKNOWN` with `retryable=false` and local
+rows also remain. KT keeps the binding and the same `operationId`; only a new explicit user action may
+repeat the idempotent exit operation. This avoids both silent local data loss and background repeats
+of a destructive operation.
+
+### 6.3 Receive
 
 ```text
 signal-cli receive notification
@@ -223,7 +248,7 @@ signal-cli receive notification
 
 Persistence happens before event delivery so KT reloads recover facts from the store.
 
-### 6.3 Send
+### 6.4 Send
 
 Every send has a KT `clientRequestId`. The connector inserts a pending record before calling
 signal-cli. A repeated request returns the same local record. Timeout or child death after dispatch
@@ -233,13 +258,13 @@ AI-generated and human messages use the same send method. Language policy and te
 enforced by KT before the connector call, while connector ownership and idempotency checks remain
 mandatory.
 
-### 6.4 History limitation
+### 6.5 History limitation
 
 The connector only promises history it has persisted. `sendSyncRequest` can synchronize contacts and
 groups but is not treated as complete phone/Desktop message-history backfill. Product UI must not
 promise pre-link history until a separately verified upstream capability exists.
 
-### 6.5 Media limitation
+### 6.6 Media limitation
 
 Phase 1 runs signal-cli with attachments, stories, and stickers ignored. Current signal-cli downloads
 non-ignored incoming attachments before it emits the receive notification, and `getAttachment`
