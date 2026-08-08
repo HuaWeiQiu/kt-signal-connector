@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[cfg(unix)]
 mod platform {
@@ -124,9 +127,24 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
     use std::sync::Mutex;
 
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SetFileSecurityW, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use super::*;
 
@@ -140,7 +158,7 @@ mod platform {
     impl LocalListener {
         pub fn bind(endpoint: &Path) -> io::Result<Self> {
             let name = normalize_pipe_name(endpoint)?;
-            let server = create_server(&name)?;
+            let server = create_server(&name, true)?;
             Ok(Self {
                 name,
                 server: Mutex::new(server),
@@ -155,7 +173,7 @@ mod platform {
                     .server
                     .lock()
                     .map_err(|_| io::Error::new(io::ErrorKind::Other, "pipe listener poisoned"))?;
-                let next = create_server(&self.name)?;
+                let next = create_server(&self.name, false)?;
                 std::mem::replace(&mut *slot, next)
             };
             server.connect().await?;
@@ -163,11 +181,143 @@ mod platform {
         }
     }
 
-    fn create_server(name: &str) -> io::Result<NamedPipeServer> {
-        ServerOptions::new()
-            .first_pipe_instance(false)
-            .reject_remote_clients(true)
-            .create(name)
+    fn create_server(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+        let sid = current_user_sid_string()?;
+        let descriptor = security_descriptor(&format!("D:P(A;;GA;;;{sid})"))?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(first)
+            .reject_remote_clients(true);
+        unsafe {
+            options.create_with_security_attributes_raw(
+                name,
+                &mut attributes as *mut SECURITY_ATTRIBUTES as *mut c_void,
+            )
+        }
+    }
+
+    pub fn harden_private_directory(path: &Path) -> io::Result<()> {
+        if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "private data path must be an existing directory",
+            ));
+        }
+        let sid = current_user_sid_string()?;
+        let descriptor = security_descriptor(&format!("D:P(A;OICI;GA;;;{sid})"))?;
+        let encoded_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let applied = unsafe {
+            SetFileSecurityW(
+                encoded_path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.0,
+            )
+        };
+        if applied == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn security_descriptor(sddl: &str) -> io::Result<OwnedLocalMemory> {
+        let encoded_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let mut descriptor_bytes = 0_u32;
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                encoded_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                &mut descriptor_bytes,
+            )
+        };
+        if converted == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(OwnedLocalMemory(descriptor))
+    }
+
+    fn current_user_sid_string() -> io::Result<String> {
+        let mut token: HANDLE = ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = OwnedHandle(token);
+        let mut required = 0_u32;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut required);
+        }
+        if required < size_of::<TOKEN_USER>() as u32 {
+            return Err(io::Error::last_os_error());
+        }
+        let word_bytes = size_of::<usize>();
+        let words = (required as usize).div_ceil(word_bytes);
+        let mut buffer = vec![0_usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let mut sid_text = ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid_text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid_text = OwnedLocalWideString(sid_text);
+        let mut length = 0_usize;
+        while length < 256 && unsafe { *sid_text.0.add(length) } != 0 {
+            length += 1;
+        }
+        if length == 256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current user SID is too long",
+            ));
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text.0, length) })
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "current user SID is invalid"))
+    }
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct OwnedLocalMemory(PSECURITY_DESCRIPTOR);
+
+    impl Drop for OwnedLocalMemory {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    struct OwnedLocalWideString(*mut u16);
+
+    impl Drop for OwnedLocalWideString {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
     }
 
     fn normalize_pipe_name(endpoint: &Path) -> io::Result<String> {
@@ -218,6 +368,9 @@ mod platform {
 }
 
 pub use platform::{LocalListener, LocalStream};
+
+#[cfg(windows)]
+pub use platform::harden_private_directory;
 
 /// Shared helper for packaging docs/tests: describe the platform endpoint shape.
 pub fn endpoint_kind() -> &'static str {

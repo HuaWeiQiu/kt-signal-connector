@@ -284,6 +284,7 @@
             "runtime.challenge",
             "runtime.stateChanged",
             "runtime.protocolWarning",
+            "runtime.storageChanged",
             "account.changed",
             "conversation.changed",
             "message.upserted",

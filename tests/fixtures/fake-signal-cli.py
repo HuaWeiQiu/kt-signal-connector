@@ -9,6 +9,18 @@ import threading
 import time
 
 
+expected_java_opts = os.environ.get("KT_FAKE_EXPECT_JAVA_OPTS")
+if expected_java_opts is not None:
+    if os.environ.get("JAVA_OPTS") != expected_java_opts:
+        sys.exit(91)
+    if any(os.environ.get(name) for name in ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS")):
+        sys.exit(92)
+
+expected_java_home = os.environ.get("KT_FAKE_EXPECT_JAVA_HOME")
+if expected_java_home is not None and os.environ.get("JAVA_HOME") != expected_java_home:
+    sys.exit(93)
+
+
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
 WRITE_LOCK = threading.Lock()

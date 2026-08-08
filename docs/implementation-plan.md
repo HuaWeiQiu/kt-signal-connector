@@ -106,10 +106,12 @@ architecture and license review, not a routine implementation detail.
 - No public listener and no fixed localhost HTTP/TCP port.
 - The renderer never receives the endpoint or the session secret.
 
-Electron Main creates a 256-bit random bootstrap secret in an owner-only temporary file, starts the
-connector with the file path, and the connector reads and deletes the file before accepting a
-client. The first frame performs a challenge-response handshake and negotiates API capabilities.
-The secret and endpoint are never logged.
+Electron Main creates a 256-bit random bootstrap secret. On macOS/Linux it writes an owner-only
+temporary file and the connector reads and deletes that file before accepting a client. On Windows
+Main writes the exact secret to the child process's inherited anonymous stdin pipe and closes it;
+the Windows connector refuses file bootstrap because POSIX mode bits do not prove a private DACL.
+The first frame performs a challenge-response handshake and negotiates API capabilities. The secret
+and endpoint are never logged, and their mutable buffers are zeroized after bootstrap/handshake.
 
 The secret file contains exactly 64 lowercase hexadecimal characters. The server sends a random
 32-byte hexadecimal `serverNonce`; KT answers with a random 32-byte hexadecimal `clientNonce` and:
@@ -240,14 +242,22 @@ of a destructive operation.
 ```text
 signal-cli receive notification
   -> bounded JSON parser
-  -> schema validation
+  -> schema validation + bounded projection
+  -> critical receive queue (bounded by count and bytes)
   -> normalize + stable message ID
   -> SQLite transaction + dedupe
-  -> bounded event queue
+  -> best-effort UI event queue
   -> KT event
 ```
 
-Persistence happens before event delivery so KT reloads recover facts from the store.
+The critical receive queue is independent from the lossy runtime/UI broadcast queue. Persistence of
+the message, conversation summary, and account unread summary is one transaction and always happens
+before event delivery, so a lagging or disconnected KT event consumer reloads facts from the store.
+If SQLite is unavailable, the Connector retains the current receive and applies bounded
+backpressure instead of acknowledging it internally or silently dropping it. It emits only an
+opaque `runtime.storageChanged` state (`unavailable` or `recovered`); Desktop pauses new operations
+while unavailable. Recovery retries persistence with bounded backoff and never replays a send,
+restarts signal-cli, deletes history, or exposes a path or message body.
 
 Incoming text is bounded twice after signal-cli parsing: Connector persistence accepts at most
 128 KiB, matching Signal iOS's legacy-compatible receive ceiling, while list/event projections carry
@@ -261,6 +271,18 @@ SQLite and Host event serialization. A user may fetch one complete persisted bod
 Every send has a KT `clientRequestId`. The connector inserts a pending record before calling
 signal-cli. A repeated request returns the same local record. Timeout or child death after dispatch
 produces `unknown`; it never automatically sends again.
+
+`clientRequestId` is persisted and returned as an optional field on that outgoing message so KT can
+reconcile an optimistic row and an unknown outcome exactly. It is not forwarded to Signal and is
+never used across accounts. Renderer and Connector must not reconcile by equal text: repeated text
+is valid user data. Signal receive dedupe uses the account, conversation, direction, sender, and the
+Signal-provided message timestamp; before inserting a new versioned stable ID, the store also checks
+that identity tuple so rows written by the legacy text-dependent ID remain idempotent.
+
+Receive normalization preserves the exact Signal text body, including leading/trailing whitespace.
+Only an empty string is body-less. A body-less envelope becomes a system row only for an explicit
+supported Signal control field; it is never guessed from the absence of attachments. `system`
+direction and status round-trip through SQLite unchanged.
 
 Text must be non-empty and at most 65,536 bytes after UTF-8 encoding. This follows the 64 KiB
 long-message body cap used by the official Signal clients, while signal-cli handles the native
@@ -326,14 +348,18 @@ Additional idle account budget: 20-80 MB while sharing the same JVM. An ordinary
 conversation should normally remain below 1-5 MB incremental UI state, with an acceptance hard limit
 of 20 MB relative to the Signal idle baseline.
 
-Initial JVM budget starts at `-Xms16m -Xmx384m`. JVM heap is not total RSS. Sustained idle Signal
-increment above 350 MB or monotonic growth triggers profiling rather than a documentation increase.
+The Connector enforces the initial JVM budget at `-Xms16m -Xmx384m` and removes Java's global
+option-injection variables before spawning signal-cli. JVM heap is not total RSS. Sustained idle
+Signal increment above 350 MB or monotonic growth triggers profiling rather than a documentation
+increase. RSS pressure still degrades admission and never kills a live JVM automatically.
 
 ### 7.3 Bounded structures
 
 - host frame: default 1 MiB, configurable only downward in production policy.
 - signal-cli line: default 8 MiB for text PoC; media does not use this path.
-- host connections: one authenticated KT main process in Phase 1.
+- host connections: exactly one successfully authenticated KT Main connection per Connector process.
+  Failed handshakes do not consume the process; closing the authenticated session shuts down the
+  engine and Connector, and reconnection starts a fresh process with a fresh one-use secret.
 - pending host requests: 128 global, 32 per account, and 8 MiB aggregate request bytes per
   authenticated connection.
 - authenticated host dispatch: control 1, link wait 1, persisted reads 4, sends 2; sends remain
@@ -341,7 +367,10 @@ increment above 350 MB or monotonic growth triggers profiling rather than a docu
   lane admits at most one `link.finish` and is independent from link cancellation and lifecycle
   control.
 - pending signal-cli requests: 128 global.
-- event queue: 1,024 normalized events with pressure reporting.
+- runtime/UI broadcast queue: 1,024 non-critical events with pressure reporting; lag is recoverable
+  from SQLite.
+- critical receive queue: 256 items and 2 MiB of normalized projected data. It backpressures the
+  signal-cli stdout reader at either limit and never routes receives through broadcast delivery.
 - current message page: default 100, maximum 200.
 - message text projection: 4 KiB per list/event row; persisted inbound body: 128 KiB maximum.
 - one signal-cli RSS sampler per shared engine, every 30 seconds. Pressure requires three consecutive
@@ -361,7 +390,9 @@ events carry the exited PID so a delayed event cannot fault a newer engine, and 
 stop always wins a concurrent recovery completion. A clean internal `stopped` to `running` transition
 is treated as a managed restart and must not trigger a second engine restart.
 
-Core persistence must not be dropped under event pressure. Non-critical enrichment is disabled first.
+Core persistence must not be dropped under event pressure. Non-critical enrichment is disabled
+first. SQLite write failure enters an explicit storage-degraded state; one failed receive remains at
+the head of the bounded queue until a transaction succeeds, after which a recovered state is emitted.
 
 ## 8. Security and Privacy
 
@@ -417,9 +448,12 @@ Deliver:
 
 Exit: fmt, unit/integration tests, clippy, release build, clean review, and local commit.
 
-The macOS implementation and tests use a private Unix socket. The Windows named-pipe module must be
-implemented and tested on Windows before Phase 3 packaging; a platform abstraction alone is not a
-claim that the Windows transport has passed acceptance.
+The macOS implementation and tests use a private Unix socket. The Windows implementation now uses a
+random per-start named pipe with a current-user-only DACL, rejects remote clients, protects the
+profile directories, bootstraps through inherited stdin, and watches the Electron parent so an
+orphan connector shuts down its JVM. The Windows-only Rust modules compile against
+`x86_64-pc-windows-msvc` in an isolated target check; native build and runtime acceptance on Windows
+hardware are still required before packaging. Cross-compilation alone is not an acceptance claim.
 
 ### Phase 2: account linking and text channel
 
@@ -435,6 +469,12 @@ may be inferred from a fixture.
 
 ### Phase 3: packaging and resource baseline
 
+Local hardening status (2026-08-09): the signed manifest, exact file verification, corresponding
+source/compliance gates, immutable stage/atomic pointers, production verification CLI and fixed JRE
+plumbing are implemented and automatically tested. Release keys, signed target bundles, native
+Windows packaging/runtime, and the long-duration resource gates below remain open; this phase is
+therefore not marked production-complete.
+
 Deliver:
 
 - signed connector, signal-cli, and JRE manifests for Windows x64 and macOS x64/arm64.
@@ -446,9 +486,10 @@ Exit: target-platform resource gates and license delivery review pass.
 
 ### Phase 4: KT Desktop integration
 
-Local integration status (2026-08-09): merged in the separate `kt-desktop` worktree on
-`codex/signal-test-main-latest`; burst rendering and runtime recovery are at `c913bb06`, paired with
-connector resource monitoring at `8b08794`. This does not satisfy the remaining Windows,
+Local integration status (2026-08-09): integrated in the separate `kt-desktop` worktree on
+`codex/signal-test-main-latest`. Main and Connector use the same per-start endpoint, Main performs a
+bounded connect retry instead of testing named-pipe existence, and eager challenge frames cannot be
+missed during listener setup. This does not satisfy the remaining native Windows,
 signed-distribution, 24/72-hour, or real multi-account production gates.
 
 Deliver in KT Desktop:

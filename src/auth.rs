@@ -108,9 +108,17 @@ pub fn load_bootstrap_secret(path: &Path) -> Result<BootstrapSecret, AuthError> 
     }
     let read_result = read_limited(file);
     let remove_result = fs::remove_file(path);
-    let mut encoded = read_result?;
+    let encoded = read_result?;
     remove_result.map_err(AuthError::Remove)?;
 
+    decode_bootstrap_secret(encoded)
+}
+
+pub fn load_bootstrap_secret_from_reader(reader: impl Read) -> Result<BootstrapSecret, AuthError> {
+    decode_bootstrap_secret(read_limited(reader)?)
+}
+
+fn decode_bootstrap_secret(mut encoded: Zeroizing<Vec<u8>>) -> Result<BootstrapSecret, AuthError> {
     if encoded.len() != HEX_SECRET_BYTES
         || encoded
             .iter()
@@ -126,9 +134,10 @@ pub fn load_bootstrap_secret(path: &Path) -> Result<BootstrapSecret, AuthError> 
     Ok(BootstrapSecret(secret))
 }
 
-fn read_limited(file: File) -> Result<Zeroizing<Vec<u8>>, AuthError> {
+fn read_limited(reader: impl Read) -> Result<Zeroizing<Vec<u8>>, AuthError> {
     let mut encoded = Zeroizing::new(Vec::with_capacity(HEX_SECRET_BYTES + 1));
-    file.take((HEX_SECRET_BYTES + 2) as u64)
+    reader
+        .take((HEX_SECRET_BYTES + 2) as u64)
         .read_to_end(&mut encoded)
         .map_err(AuthError::Read)?;
     Ok(encoded)
@@ -144,7 +153,9 @@ fn has_private_parent(path: &Path) -> bool {
 
 #[cfg(windows)]
 fn has_private_parent(_path: &Path) -> bool {
-    true
+    // Production Windows bootstrap uses an inherited anonymous pipe. Refuse the file loader
+    // rather than pretending POSIX mode bits prove a Windows DACL is private.
+    false
 }
 
 #[cfg(unix)]
@@ -183,9 +194,7 @@ fn has_private_permissions(metadata: &fs::Metadata) -> bool {
 
 #[cfg(windows)]
 fn has_private_permissions(_metadata: &fs::Metadata) -> bool {
-    // The Windows launcher creates this file with a current-user-only DACL. Phase 3 adds an
-    // explicit ACL verifier before Windows packaging is accepted.
-    true
+    false
 }
 
 #[cfg(test)]
@@ -276,5 +285,12 @@ mod tests {
             Err(AuthError::InvalidSecret)
         ));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn inherited_reader_accepts_exact_secret_and_rejects_extra_bytes() {
+        let encoded = hex::encode([5_u8; SECRET_BYTES]);
+        assert!(load_bootstrap_secret_from_reader(encoded.as_bytes()).is_ok());
+        assert!(load_bootstrap_secret_from_reader(format!("{encoded}\n").as_bytes()).is_err());
     }
 }

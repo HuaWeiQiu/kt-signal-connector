@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, sink};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -26,11 +26,17 @@ use crate::{DEFAULT_UPSTREAM_LINE_LIMIT, MAX_PENDING_UPSTREAM_REQUESTS};
 
 const COMMAND_QUEUE_CAPACITY: usize = 128;
 const EVENT_QUEUE_CAPACITY: usize = 1024;
+const RECEIVE_QUEUE_CAPACITY: usize = 256;
+const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
+const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
+const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
+const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
 
 #[derive(Clone, Debug)]
 pub struct SignalCliConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
+    pub java_home: Option<PathBuf>,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -42,6 +48,7 @@ impl SignalCliConfig {
         Self {
             executable,
             data_dir,
+            java_home: None,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
@@ -99,7 +106,6 @@ pub enum EngineError {
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
     StateChanged(EngineStatus),
-    Receive(NormalizedReceive),
     ProtocolWarning {
         kind: &'static str,
     },
@@ -131,6 +137,71 @@ pub struct NormalizedReceive {
     pub group_id: Option<String>,
     #[serde(skip)]
     pub text: Option<String>,
+    #[serde(skip)]
+    pub text_bytes: Option<u32>,
+    #[serde(skip)]
+    pub text_truncated: bool,
+}
+
+pub struct QueuedReceive {
+    receive: NormalizedReceive,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+impl QueuedReceive {
+    pub fn receive(&self) -> &NormalizedReceive {
+        &self.receive
+    }
+}
+
+#[derive(Clone)]
+pub struct ReceiveIngress {
+    sender: mpsc::Sender<QueuedReceive>,
+    byte_budget: Arc<Semaphore>,
+}
+
+impl ReceiveIngress {
+    pub(crate) async fn enqueue(&self, receive: NormalizedReceive) -> Result<(), EngineError> {
+        let weight = receive.estimated_bytes().max(1);
+        if weight > RECEIVE_QUEUE_BYTE_CAPACITY {
+            return Err(EngineError::Protocol);
+        }
+        let permit = self
+            .byte_budget
+            .clone()
+            .acquire_many_owned(weight as u32)
+            .await
+            .map_err(|_| EngineError::Exited)?;
+        self.sender
+            .send(QueuedReceive {
+                receive,
+                _byte_permit: permit,
+            })
+            .await
+            .map_err(|_| EngineError::Exited)
+    }
+}
+
+impl NormalizedReceive {
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.account.as_ref().map_or(0, String::len)
+            + self.source.as_ref().map_or(0, String::len)
+            + self.peer_name.as_ref().map_or(0, String::len)
+            + self.group_id.as_ref().map_or(0, String::len)
+            + self.text.as_ref().map_or(0, String::len)
+    }
+}
+
+pub fn receive_channel() -> (ReceiveIngress, mpsc::Receiver<QueuedReceive>) {
+    let (sender, receiver) = mpsc::channel(RECEIVE_QUEUE_CAPACITY);
+    (
+        ReceiveIngress {
+            sender,
+            byte_budget: Arc::new(Semaphore::new(RECEIVE_QUEUE_BYTE_CAPACITY)),
+        },
+        receiver,
+    )
 }
 
 #[derive(Clone)]
@@ -147,16 +218,25 @@ impl EngineHandle {
     pub async fn start(
         config: SignalCliConfig,
         events: broadcast::Sender<EngineEvent>,
+        receive_ingress: ReceiveIngress,
     ) -> Result<Self, EngineError> {
         if !config.executable.is_absolute()
             || !std::fs::metadata(&config.executable).is_ok_and(|metadata| metadata.is_file())
+            || config.java_home.as_ref().is_some_and(|java_home| {
+                !java_home.is_absolute()
+                    || !std::fs::symlink_metadata(java_home).is_ok_and(|metadata| {
+                        metadata.is_dir() && !metadata.file_type().is_symlink()
+                    })
+                    || !java_home.join("release").is_file()
+            })
             || config.resource_sample_interval < Duration::from_secs(1)
         {
             return Err(EngineError::StartFailed);
         }
         prepare_data_dir(&config.data_dir).map_err(|_| EngineError::StartFailed)?;
 
-        let mut child = Command::new(&config.executable)
+        let mut command = Command::new(&config.executable);
+        command
             .arg("--data-dir")
             .arg(&config.data_dir)
             .arg("jsonRpc")
@@ -169,9 +249,17 @@ impl EngineHandle {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| EngineError::StartFailed)?;
+            // Keep the documented text-runtime heap budget authoritative. Java's global
+            // injection variables are removed so a parent shell cannot silently defeat it.
+            .env("JAVA_OPTS", SIGNAL_CLI_JAVA_OPTS)
+            .env_remove("JAVA_TOOL_OPTIONS")
+            .env_remove("_JAVA_OPTIONS")
+            .env_remove("JDK_JAVA_OPTIONS")
+            .kill_on_drop(true);
+        if let Some(java_home) = &config.java_home {
+            command.env("JAVA_HOME", java_home);
+        }
+        let mut child = command.spawn().map_err(|_| EngineError::StartFailed)?;
 
         let pid = child.id().ok_or(EngineError::StartFailed)?;
         let stdin = child.stdin.take().ok_or(EngineError::StartFailed)?;
@@ -198,9 +286,12 @@ impl EngineHandle {
                 child,
                 stdin,
                 stdout,
-                command_rx,
-                status_tx,
-                actor_events,
+                ActorChannels {
+                    commands: command_rx,
+                    status: status_tx,
+                    events: actor_events,
+                    receive_ingress,
+                },
                 ActorLimits {
                     line_limit: config.line_limit,
                     shutdown_grace: config.shutdown_grace,
@@ -378,15 +469,26 @@ struct ActorLimits {
     shutdown_grace: Duration,
 }
 
+struct ActorChannels {
+    commands: mpsc::Receiver<EngineCommand>,
+    status: watch::Sender<EngineStatus>,
+    events: broadcast::Sender<EngineEvent>,
+    receive_ingress: ReceiveIngress,
+}
+
 async fn run_actor(
     mut child: Child,
     stdin: ChildStdin,
     stdout: tokio::process::ChildStdout,
-    mut commands: mpsc::Receiver<EngineCommand>,
-    status_tx: watch::Sender<EngineStatus>,
-    events: broadcast::Sender<EngineEvent>,
+    channels: ActorChannels,
     limits: ActorLimits,
 ) {
+    let ActorChannels {
+        mut commands,
+        status: status_tx,
+        events,
+        receive_ingress,
+    } = channels;
     let process_pid = child.id();
     let mut stdin = Some(stdin);
     let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(limits.line_limit));
@@ -453,7 +555,12 @@ async fn run_actor(
             line = lines.next() => {
                 match line {
                     Some(Ok(line)) => {
-                        if handle_upstream_line(&line, &mut pending, &events).is_err() {
+                        if handle_upstream_line(
+                            &line,
+                            &mut pending,
+                            &events,
+                            &receive_ingress,
+                        ).await.is_err() {
                             terminal_state = EngineState::Faulted;
                             break;
                         }
@@ -499,10 +606,11 @@ async fn run_actor(
     }
 }
 
-fn handle_upstream_line(
+async fn handle_upstream_line(
     line: &str,
     pending: &mut HashMap<String, PendingRequest>,
     events: &broadcast::Sender<EngineEvent>,
+    receive_ingress: &ReceiveIngress,
 ) -> Result<(), EngineError> {
     let message: Value = serde_json::from_str(line).map_err(|_| EngineError::Protocol)?;
     let object = message.as_object().ok_or(EngineError::Protocol)?;
@@ -517,7 +625,7 @@ fn handle_upstream_line(
         if method == "receive" {
             let params = object.get("params").ok_or(EngineError::Protocol)?;
             let normalized = normalize_receive(params)?;
-            let _ = events.send(EngineEvent::Receive(normalized));
+            receive_ingress.enqueue(normalized).await?;
         } else {
             let _ = events.send(EngineEvent::ProtocolWarning {
                 kind: "unknownNotification",
@@ -583,13 +691,46 @@ fn data_message_group_id(message: &serde_json::Map<String, Value>) -> Option<Str
         .map(str::to_string)
 }
 
-fn data_message_text(message: &serde_json::Map<String, Value>) -> Option<String> {
+#[derive(Clone, Debug)]
+struct NormalizedText {
+    value: String,
+    bytes: u32,
+    truncated: bool,
+}
+
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn normalized_text(text: &str) -> Option<NormalizedText> {
+    if text.is_empty() {
+        return None;
+    }
+    let bytes = text.len().min(u32::MAX as usize) as u32;
+    let truncated = text.len() > MAX_INBOUND_TEXT_BYTES;
+    Some(NormalizedText {
+        value: if truncated {
+            truncate_utf8_bytes(text, MAX_INBOUND_TEXT_PREVIEW_BYTES)
+        } else {
+            text.to_string()
+        },
+        bytes,
+        truncated,
+    })
+}
+
+fn data_message_text(message: &serde_json::Map<String, Value>) -> Option<NormalizedText> {
     message
         .get("message")
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .and_then(normalized_text)
 }
 
 fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
@@ -618,7 +759,7 @@ fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
                 source: Option<String>,
                 peer_name: Option<String>,
                 group_id: Option<String>,
-                text: Option<String>| NormalizedReceive {
+                text: Option<NormalizedText>| NormalizedReceive {
         timestamp,
         content_kind,
         direction,
@@ -627,7 +768,9 @@ fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
         source,
         peer_name,
         group_id,
-        text,
+        text: text.as_ref().map(|value| value.value.clone()),
+        text_bytes: text.as_ref().map(|value| value.bytes),
+        text_truncated: text.is_some_and(|value| value.truncated),
     };
 
     // Multi-device: phone/other linked device sent a text → show as our outgoing.
@@ -712,23 +855,7 @@ fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
                 peer_source,
                 peer_name,
                 group_id,
-                Some("已更新消息定时消失".to_string()),
-            ));
-        }
-        // Heuristic: empty control-only → system "已接受消息请求" when we have a peer
-        if peer_source.is_some()
-            && data_message.get("sticker").is_none()
-            && data_message.get("reaction").is_none()
-            && data_message.get("attachments").is_none()
-        {
-            return Ok(make(
-                timestamp,
-                "dataMessage",
-                "system",
-                peer_source,
-                peer_name,
-                group_id,
-                Some("已接受消息请求".to_string()),
+                normalized_text("已更新消息定时消失"),
             ));
         }
         return Ok(make(
@@ -838,6 +965,61 @@ mod tests {
     }
 
     #[test]
+    fn oversized_receive_text_is_projected_before_queueing() {
+        let input = json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 42,
+                "dataMessage": { "message": "a".repeat(MAX_INBOUND_TEXT_BYTES + 1) }
+            }
+        });
+        let normalized = normalize_receive(&input).unwrap();
+        assert_eq!(
+            normalized.text.as_ref().map(String::len),
+            Some(MAX_INBOUND_TEXT_PREVIEW_BYTES)
+        );
+        assert_eq!(
+            normalized.text_bytes,
+            Some((MAX_INBOUND_TEXT_BYTES + 1) as u32)
+        );
+        assert!(normalized.text_truncated);
+    }
+
+    #[tokio::test]
+    async fn receive_queue_enforces_byte_budget_and_releases_it_on_consume() {
+        let (ingress, mut receives) = receive_channel();
+        let receive = || NormalizedReceive {
+            timestamp: Some(42),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
+            text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
+            text_truncated: false,
+        };
+        let mut admitted = 0;
+        while matches!(
+            timeout(Duration::from_millis(10), ingress.enqueue(receive())).await,
+            Ok(Ok(()))
+        ) {
+            admitted += 1;
+        }
+        assert!(admitted > 1);
+        assert!(admitted < RECEIVE_QUEUE_CAPACITY);
+
+        drop(receives.recv().await.unwrap());
+        timeout(Duration::from_secs(1), ingress.enqueue(receive()))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
     fn receive_normalization_accepts_source_uuid_and_result_wrapper() {
         let input = json!({
             "subscription": 0,
@@ -898,8 +1080,8 @@ mod tests {
     }
 
     #[test]
-    fn receive_normalization_empty_data_message_becomes_system_or_skip() {
-        let system = normalize_receive(&json!({
+    fn receive_normalization_only_marks_explicit_controls_as_system() {
+        let empty = normalize_receive(&json!({
             "envelope": {
                 "source": "+15555550101",
                 "timestamp": 50,
@@ -907,17 +1089,43 @@ mod tests {
             }
         }))
         .unwrap();
+        assert_eq!(empty.direction, "skip");
+        assert!(empty.text.is_none());
+
+        let system = normalize_receive(&json!({
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 51,
+                "dataMessage": { "isExpirationUpdate": true }
+            }
+        }))
+        .unwrap();
         assert_eq!(system.direction, "system");
-        assert_eq!(system.text.as_deref(), Some("已接受消息请求"));
+        assert_eq!(system.text.as_deref(), Some("已更新消息定时消失"));
 
         let skip_sticker = normalize_receive(&json!({
             "envelope": {
                 "source": "+15555550101",
-                "timestamp": 51,
+                "timestamp": 52,
                 "dataMessage": { "sticker": { "packId": "x" } }
             }
         }))
         .unwrap();
         assert_eq!(skip_sticker.direction, "skip");
+    }
+
+    #[test]
+    fn receive_normalization_preserves_text_whitespace() {
+        let normalized = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 53,
+                "dataMessage": { "message": "  exact body\n" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(normalized.text.as_deref(), Some("  exact body\n"));
+        assert_eq!(normalized.text_bytes, Some(13));
     }
 }

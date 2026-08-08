@@ -9,11 +9,18 @@ keeps Signal account keys outside the KT renderer and feature runtime.
 
 ## Status
 
-Connector Phases 1–3 are implemented for local development:
+Connector Phases 1–4 are implemented for local development and Desktop integration:
 
 - Phase 1: process/protocol PoC
 - Phase 2: link, accounts, text channel, SQLite
 - Phase 3: unsigned local manifests, LKG stage/activate/rollback, resource smoke harness
+- Phase 4: private Desktop IPC, bounded lifecycle/recovery, multi-account text runtime
+
+Production runtime hardening is implemented but not release-provisioned: manifests use real
+Ed25519 signatures, cover the exact bundle file set, require corresponding source/SBOM/build and
+license records, use immutable staged versions with atomic active/LKG pointers, and pin the bundled
+JRE. The Desktop trust root is intentionally empty until a release public key is approved and
+compiled into the application.
 
 The Phase 4 KT Desktop integration is locally merged in the separate `kt-desktop` repository:
 
@@ -23,9 +30,9 @@ The Phase 4 KT Desktop integration is locally merged in the separate `kt-desktop
 - source boundary: the Desktop launches this independent executable over authenticated local IPC;
   connector source is not copied or linked into the Desktop repository
 
-The connector is not ready for production use. Local bundles are unsigned, Windows runtime
-acceptance is pending a Windows host, no remote repository is configured, and the 24/72-hour and
-real multi-account capacity gates are still pending.
+The connector is not ready for production use. Signed target bundles and release keys have not been
+provisioned, Windows runtime acceptance is pending a Windows host, no remote repository is
+configured, and the 24/72-hour and real multi-account capacity gates are still pending.
 
 The complete implementation and acceptance plan is in
 [`docs/implementation-plan.md`](docs/implementation-plan.md).
@@ -34,6 +41,7 @@ Local evidence:
 - [`docs/phase-1-validation.md`](docs/phase-1-validation.md)
 - [`docs/phase-2-validation.md`](docs/phase-2-validation.md)
 - [`docs/phase-3-validation.md`](docs/phase-3-validation.md)
+- [`docs/runtime-hardening-validation.md`](docs/runtime-hardening-validation.md)
 
 Local packaging helpers:
 

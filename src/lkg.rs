@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use ed25519_dalek::VerifyingKey;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -19,6 +21,8 @@ pub enum LkgError {
     InvalidLayout,
     #[error("version is not staged: {0}")]
     NotStaged(String),
+    #[error("runtime version already exists: {0}")]
+    VersionExists(String),
     #[error("no active runtime is available")]
     NoActive,
     #[error("no last-known-good runtime is available")]
@@ -60,37 +64,79 @@ impl RuntimeLayout {
     }
 
     pub fn stage_bundle(&self, version_id: &str, bundle_dir: &Path) -> Result<PathBuf, LkgError> {
-        if version_id.is_empty()
-            || version_id.contains('/')
-            || version_id.contains('\\')
-            || version_id.contains("..")
-        {
-            return Err(LkgError::InvalidLayout);
-        }
+        self.stage_bundle_with_policy(version_id, bundle_dir, None)
+    }
+
+    pub fn stage_production_bundle(
+        &self,
+        version_id: &str,
+        bundle_dir: &Path,
+        trusted_key_id: &str,
+        verifying_key: &VerifyingKey,
+    ) -> Result<PathBuf, LkgError> {
+        self.stage_bundle_with_policy(
+            version_id,
+            bundle_dir,
+            Some((trusted_key_id, verifying_key)),
+        )
+    }
+
+    fn stage_bundle_with_policy(
+        &self,
+        version_id: &str,
+        bundle_dir: &Path,
+        trust: Option<(&str, &VerifyingKey)>,
+    ) -> Result<PathBuf, LkgError> {
+        validate_version_id(version_id)?;
         self.ensure()?;
         let target = self.version_dir(version_id);
         if target.exists() {
-            fs::remove_dir_all(&target)?;
+            return Err(LkgError::VersionExists(version_id.into()));
         }
-        copy_dir_all(bundle_dir, &target)?;
-        let manifest = RuntimeManifest::load(&target.join("manifest.json"))?;
-        manifest.verify_artifacts(&target, false)?;
+        let staging = self
+            .versions_dir()
+            .join(format!(".staging-{version_id}-{}", random_suffix()));
+        let staged = (|| {
+            copy_dir_all(bundle_dir, &staging)?;
+            verify_version(&staging, trust)?;
+            fs::rename(&staging, &target)?;
+            Ok::<(), LkgError>(())
+        })();
+        if staged.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        staged?;
         write_pointer(&self.root.join("staged.json"), version_id)?;
         Ok(target)
     }
 
     pub fn activate_staged(&self) -> Result<RuntimePointer, LkgError> {
+        self.activate_staged_with_policy(None)
+    }
+
+    pub fn activate_staged_production(
+        &self,
+        trusted_key_id: &str,
+        verifying_key: &VerifyingKey,
+    ) -> Result<RuntimePointer, LkgError> {
+        self.activate_staged_with_policy(Some((trusted_key_id, verifying_key)))
+    }
+
+    fn activate_staged_with_policy(
+        &self,
+        trust: Option<(&str, &VerifyingKey)>,
+    ) -> Result<RuntimePointer, LkgError> {
         let staged = read_pointer(&self.root.join("staged.json"))?
             .ok_or_else(|| LkgError::NotStaged("staged".into()))?;
         let version_dir = self.version_dir(&staged.version_id);
-        if !version_dir.join("manifest.json").is_file() {
-            return Err(LkgError::NotStaged(staged.version_id));
-        }
-        let manifest = RuntimeManifest::load(&version_dir.join("manifest.json"))?;
-        manifest.verify_artifacts(&version_dir, false)?;
+        verify_version(&version_dir, trust)
+            .map_err(|_| LkgError::NotStaged(staged.version_id.clone()))?;
 
         if let Some(active) = read_pointer(&self.root.join("active.json"))? {
-            write_pointer(&self.root.join("lkg.json"), &active.version_id)?;
+            let active_dir = self.version_dir(&active.version_id);
+            if verify_version(&active_dir, trust).is_ok() {
+                write_pointer(&self.root.join("lkg.json"), &active.version_id)?;
+            }
         }
         write_pointer(&self.root.join("active.json"), &staged.version_id)?;
         let _ = fs::remove_file(self.root.join("staged.json"));
@@ -98,13 +144,24 @@ impl RuntimeLayout {
     }
 
     pub fn rollback_to_lkg(&self) -> Result<RuntimePointer, LkgError> {
+        self.rollback_to_lkg_with_policy(None)
+    }
+
+    pub fn rollback_to_lkg_production(
+        &self,
+        trusted_key_id: &str,
+        verifying_key: &VerifyingKey,
+    ) -> Result<RuntimePointer, LkgError> {
+        self.rollback_to_lkg_with_policy(Some((trusted_key_id, verifying_key)))
+    }
+
+    fn rollback_to_lkg_with_policy(
+        &self,
+        trust: Option<(&str, &VerifyingKey)>,
+    ) -> Result<RuntimePointer, LkgError> {
         let lkg = read_pointer(&self.root.join("lkg.json"))?.ok_or(LkgError::NoLkg)?;
         let version_dir = self.version_dir(&lkg.version_id);
-        if !version_dir.join("manifest.json").is_file() {
-            return Err(LkgError::NoLkg);
-        }
-        let manifest = RuntimeManifest::load(&version_dir.join("manifest.json"))?;
-        manifest.verify_artifacts(&version_dir, false)?;
+        verify_version(&version_dir, trust).map_err(|_| LkgError::NoLkg)?;
         write_pointer(&self.root.join("active.json"), &lkg.version_id)?;
         read_pointer(&self.root.join("active.json"))?.ok_or(LkgError::NoActive)
     }
@@ -123,6 +180,7 @@ impl RuntimeLayout {
 }
 
 fn write_pointer(path: &Path, version_id: &str) -> Result<(), LkgError> {
+    validate_version_id(version_id)?;
     let pointer = RuntimePointer {
         version_id: version_id.to_string(),
         updated_at_unix_ms: crate::link::now_ms(),
@@ -130,7 +188,22 @@ fn write_pointer(path: &Path, version_id: &str) -> Result<(), LkgError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_string_pretty(&pointer).unwrap())?;
+    let temporary = path.with_extension(format!("tmp-{}", random_suffix()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(
+        serde_json::to_string_pretty(&pointer)
+            .map_err(|_| LkgError::InvalidLayout)?
+            .as_bytes(),
+    )?;
+    file.sync_all()?;
+    drop(file);
+    if let Err(error) = replace_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -139,8 +212,74 @@ fn read_pointer(path: &Path) -> Result<Option<RuntimePointer>, LkgError> {
         return Ok(None);
     }
     let text = fs::read_to_string(path)?;
-    let pointer = serde_json::from_str(&text).map_err(|_| LkgError::InvalidLayout)?;
+    let pointer: RuntimePointer =
+        serde_json::from_str(&text).map_err(|_| LkgError::InvalidLayout)?;
+    validate_version_id(&pointer.version_id)?;
     Ok(Some(pointer))
+}
+
+fn verify_version(
+    version_dir: &Path,
+    trust: Option<(&str, &VerifyingKey)>,
+) -> Result<(), LkgError> {
+    if !version_dir.join("manifest.json").is_file() {
+        return Err(LkgError::InvalidLayout);
+    }
+    let manifest = RuntimeManifest::load(&version_dir.join("manifest.json"))?;
+    if let Some((key_id, key)) = trust {
+        manifest.verify_production(version_dir, key_id, key)?;
+    } else {
+        manifest.verify_artifacts(version_dir)?;
+    }
+    Ok(())
+}
+
+fn validate_version_id(version_id: &str) -> Result<(), LkgError> {
+    if version_id.is_empty()
+        || version_id.len() > 128
+        || !version_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || version_id == "."
+        || version_id == ".."
+    {
+        return Err(LkgError::InvalidLayout);
+    }
+    Ok(())
+}
+
+fn random_suffix() -> String {
+    let mut bytes = [0_u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+    fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), LkgError> {
@@ -220,5 +359,48 @@ mod tests {
         let rolled = layout.rollback_to_lkg().unwrap();
         assert_eq!(rolled.version_id, "v1");
         assert_eq!(layout.active().unwrap().unwrap().version_id, "v1");
+    }
+
+    #[test]
+    fn staging_is_immutable_and_rejects_corrupt_pointer_paths() {
+        let temp = TempDir::new().unwrap();
+        let layout = RuntimeLayout::new(temp.path().join("runtime"));
+        let bundle = temp.path().join("bundle");
+        write_bundle(&bundle);
+
+        let version = layout.stage_bundle("v1", &bundle).unwrap();
+        assert!(matches!(
+            layout.stage_bundle("v1", &bundle),
+            Err(LkgError::VersionExists(version)) if version == "v1"
+        ));
+        assert_eq!(
+            fs::read(version.join("connector.bin")).unwrap(),
+            b"connector-v1"
+        );
+
+        fs::write(
+            layout.root().join("active.json"),
+            r#"{"versionId":"../outside","updatedAtUnixMs":1}"#,
+        )
+        .unwrap();
+        assert!(matches!(layout.active(), Err(LkgError::InvalidLayout)));
+    }
+
+    #[test]
+    fn failed_stage_never_publishes_a_partial_version() {
+        let temp = TempDir::new().unwrap();
+        let layout = RuntimeLayout::new(temp.path().join("runtime"));
+        let bundle = temp.path().join("bad-bundle");
+        write_bundle(&bundle);
+        fs::write(bundle.join("connector.bin"), b"tampered").unwrap();
+
+        assert!(layout.stage_bundle("bad", &bundle).is_err());
+        assert!(!layout.version_dir("bad").exists());
+        assert!(layout.staged().unwrap().is_none());
+        let leftovers = fs::read_dir(layout.versions_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty());
     }
 }

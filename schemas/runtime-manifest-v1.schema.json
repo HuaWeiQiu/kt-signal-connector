@@ -10,6 +10,8 @@
     "createdAtUnixMs",
     "platform",
     "components",
+    "artifacts",
+    "signature",
     "licenses"
   ],
   "properties": {
@@ -28,6 +30,11 @@
         "signalCli": { "$ref": "#/$defs/component" },
         "jre": { "$ref": "#/$defs/component" }
       }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/artifact" }
     },
     "licenses": {
       "type": "array",
@@ -52,12 +59,39 @@
       "required": ["scheme", "value"],
       "properties": {
         "scheme": {
-          "enum": ["unsigned-local", "sha256-only", "minisign", "cosign"]
+          "enum": ["unsigned-local", "ed25519"]
+        },
+        "keyId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,64}$"
         },
         "value": { "type": "string" }
       }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "signature": {
+            "properties": { "scheme": { "const": "ed25519" } },
+            "required": ["scheme"]
+          }
+        }
+      },
+      "then": {
+        "required": ["sbomPath", "sourceArchive", "buildRecordPath"],
+        "properties": {
+          "platform": {
+            "enum": ["macos-arm64", "macos-x64", "windows-x64"]
+          },
+          "signature": {
+            "required": ["scheme", "keyId", "value"]
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "artifact": {
       "type": "object",

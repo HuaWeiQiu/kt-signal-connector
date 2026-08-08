@@ -13,6 +13,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -25,18 +26,19 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let endpoint = temp.path().join("connector.sock");
-    let secret_file = temp.path().join("bootstrap.secret");
     let secret = [7_u8; 32];
-    fs::write(&secret_file, hex::encode(secret)).unwrap();
-    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    let mut connector = spawn_connector_from_stdin(temp.path(), &endpoint, &secret).await;
     wait_for_path(&endpoint).await;
-    assert!(!secret_file.exists());
     assert_eq!(
         fs::metadata(&endpoint).unwrap().permissions().mode() & 0o777,
         0o600
     );
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut unauthenticated = Framed::new(stream, LinesCodec::new());
+    reject_authentication(&mut unauthenticated).await;
+    drop(unauthenticated);
 
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
@@ -51,10 +53,20 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
 
     drop(client);
     wait_for_process_exit(first_engine_pid).await;
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
 
+    let next_secret_file = temp.path().join("bootstrap-next.secret");
+    let next_secret = [8_u8; 32];
+    write_secret_file(&next_secret_file, &next_secret);
+    connector = spawn_connector(temp.path(), &endpoint, &next_secret_file);
+    wait_for_path(&endpoint).await;
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
-    authenticate(&mut client, &secret).await;
+    authenticate(&mut client, &next_secret).await;
     let reconnected = request(&mut client, "status-2", "runtime.status", json!({})).await;
     assert_eq!(reconnected["result"]["state"], "stopped");
 
@@ -65,12 +77,11 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
     assert_eq!(stopped["result"]["state"], "stopped");
 
     drop(client);
-    connector.start_kill().unwrap();
     let status = timeout(Duration::from_secs(2), connector.wait())
         .await
         .unwrap()
         .unwrap();
-    assert!(!status.success());
+    assert!(status.success());
 }
 
 #[tokio::test]
@@ -257,6 +268,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     .await;
     assert_eq!(sent["result"]["status"], "sent");
     assert_eq!(sent["result"]["text"], "hello from kt");
+    assert_eq!(sent["result"]["clientRequestId"], "client-req-1");
     let message_id = sent["result"]["id"].as_str().unwrap().to_string();
 
     let sent_again = request(
@@ -371,13 +383,23 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
 
     // Disconnect shutdown must resolve a dispatched mutation to unknown before
-    // the connection task is dropped. Reconnect reads the persisted fact only;
-    // no retry or second send is issued.
+    // the connection task is dropped. A fresh one-shot connector and secret read
+    // the persisted fact only; no retry or second send is issued.
+    let next_secret_file = temp.path().join("bootstrap-after-disconnect.secret");
+    let next_secret = [9_u8; 32];
+    write_secret_file(&next_secret_file, &next_secret);
+    connector = spawn_connector(temp.path(), &endpoint, &next_secret_file);
+    wait_for_path(&endpoint).await;
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
-    authenticate(&mut client, &secret).await;
+    authenticate(&mut client, &next_secret).await;
     let after_disconnect = request(
         &mut client,
         "messages-after-disconnect",
@@ -482,8 +504,11 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     assert!(after_delete["result"].as_array().unwrap().is_empty());
 
     drop(client);
-    connector.start_kill().unwrap();
-    let _ = timeout(Duration::from_secs(2), connector.wait()).await;
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
 }
 
 #[tokio::test]
@@ -565,12 +590,55 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     assert!(accounts["result"].as_array().unwrap().is_empty());
 
     drop(client);
-    connector.start_kill().unwrap();
-    let _ = timeout(Duration::from_secs(2), connector.wait()).await;
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+}
+
+fn write_secret_file(path: &Path, secret: &[u8; 32]) {
+    fs::write(path, hex::encode(secret)).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
     spawn_connector_with_delete_mode(root, endpoint, secret_file, None)
+}
+
+async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 32]) -> Child {
+    let java_home = root.join("jre");
+    fs::create_dir_all(&java_home).unwrap();
+    fs::write(java_home.join("release"), b"JAVA_VERSION=\"test\"\n").unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    let mut child = command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(endpoint)
+        .arg("--bootstrap-secret-stdin")
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(&java_home)
+        .arg("--signal-data-dir")
+        .arg(root.join("signal-data"))
+        .arg("--state-dir")
+        .arg(root.join("state"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
+        .env("KT_FAKE_EXPECT_JAVA_HOME", &java_home)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(hex::encode(secret).as_bytes())
+        .await
+        .unwrap();
+    stdin.shutdown().await.unwrap();
+    child
 }
 
 fn spawn_connector_with_delete_mode(
@@ -596,6 +664,11 @@ fn spawn_connector_with_delete_mode(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    command
+        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
+        .env("JAVA_TOOL_OPTIONS", "poison")
+        .env("_JAVA_OPTIONS", "poison")
+        .env("JDK_JAVA_OPTIONS", "poison");
     if let Some(delete_mode) = delete_mode {
         command.env("KT_FAKE_DELETE_MODE", delete_mode);
     }
@@ -662,6 +735,28 @@ async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8;
         .unwrap();
     let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
     assert_eq!(response["result"]["apiVersion"], API_VERSION);
+}
+
+async fn reject_authentication(client: &mut Framed<UnixStream, LinesCodec>) {
+    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    assert_eq!(challenge["event"], "runtime.challenge");
+    client
+        .send(
+            json!({
+                "apiVersion": API_VERSION,
+                "requestId": "bad-handshake",
+                "method": "handshake",
+                "params": {
+                    "clientNonce": hex::encode([9_u8; 32]),
+                    "proof": hex::encode([0_u8; 32])
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], "AUTHENTICATION_FAILED");
 }
 
 async fn request(

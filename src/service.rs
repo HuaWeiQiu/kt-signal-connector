@@ -89,10 +89,14 @@ impl ServiceError {
 
 #[derive(Clone, Debug)]
 pub enum HostSideEvent {
+    StorageChanged {
+        state: &'static str,
+    },
     AccountChanged(AccountSummary),
     ConversationChanged(ConversationSummary),
     MessageUpserted(MessageRecord),
     MessageStatusChanged {
+        account_id: String,
         message_id: String,
         status: &'static str,
     },
@@ -368,7 +372,7 @@ impl ConnectorService {
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
             direction: "outgoing",
-            sender_id: "self".into(),
+            sender_id: account_id.to_string(),
             sent_at: now_ms(),
             received_at: None,
             text: Some(text.to_string()),
@@ -377,6 +381,7 @@ impl ConnectorService {
             text_retrievable: true,
             attachments: Vec::new(),
             status: "pending",
+            client_request_id: Some(client_request_id.to_string()),
             quote_message_id: quote_message_id.map(str::to_string),
         };
         let inserted =
@@ -418,7 +423,7 @@ impl ConnectorService {
     ) -> Result<(MessageRecord, Vec<HostSideEvent>), ServiceError> {
         let updated = self
             .store
-            .update_message_status(pending_id, "sent", Some(sent_at))?
+            .complete_outgoing_send(pending_id, account_id, conversation_id, sent_at)?
             .ok_or(StoreError::Unavailable)?;
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             updated.clone(),
@@ -456,6 +461,11 @@ impl ConnectorService {
         if !matches!(receive.direction, "incoming" | "outgoing" | "system") {
             return Ok(Vec::new());
         }
+        // Signal's timestamp is part of the protocol identity. Inventing one locally would
+        // turn a replay into a second message after a restart or receive retry.
+        let Some(sent_at) = receive.timestamp else {
+            return Ok(Vec::new());
+        };
         // signal-cli may omit `account` on single-account jsonRpc; fall back to sole store account.
         let signal_account = match receive.account.as_deref().filter(|s| !s.is_empty()) {
             Some(account) => account.to_string(),
@@ -491,26 +501,51 @@ impl ConnectorService {
         let conversation = self
             .store
             .ensure_conversation(&account.id, kind, &peer_key, &title)?;
-        let sent_at = receive.timestamp.unwrap_or_else(now_ms);
         let direction = receive.direction;
+        let legacy_sender_id = stable_hash_id(&[&account.id, kind, &peer_key]);
         let sender_id = if direction == "outgoing" {
             account.id.clone()
         } else {
-            stable_hash_id(&[&account.id, kind, &peer_key])
+            stable_hash_id(&[
+                &account.id,
+                kind,
+                receive.source.as_deref().unwrap_or(&peer_key),
+            ])
         };
+        if self
+            .store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation.id,
+                direction,
+                sent_at,
+                &sender_id,
+                if direction == "outgoing" {
+                    "self"
+                } else {
+                    &legacy_sender_id
+                },
+            )?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
         let message_id = stable_hash_id(&[
+            "signal-message-v2",
             &account.id,
             &conversation.id,
             direction,
             &sent_at.to_string(),
             &sender_id,
-            receive.text.as_deref().unwrap_or(""),
         ]);
-        let text_bytes = receive
-            .text
-            .as_ref()
-            .map(|text| text.len().min(u32::MAX as usize) as u32);
-        let text_complete = text_bytes.is_none_or(|bytes| bytes as usize <= MAX_INBOUND_TEXT_BYTES);
+        let text_bytes = receive.text_bytes.or_else(|| {
+            receive
+                .text
+                .as_ref()
+                .map(|text| text.len().min(u32::MAX as usize) as u32)
+        });
+        let text_complete = !receive.text_truncated
+            && text_bytes.is_none_or(|bytes| bytes as usize <= MAX_INBOUND_TEXT_BYTES);
         let stored_text = receive.text.map(|text| {
             if text_complete {
                 text
@@ -537,6 +572,7 @@ impl ConnectorService {
             text_retrievable: text_complete,
             attachments: Vec::new(),
             status,
+            client_request_id: None,
             quote_message_id: None,
         };
         let preview = message
@@ -819,6 +855,8 @@ mod tests {
                 peer_name: Some("Peer".into()),
                 group_id: None,
                 text: Some(full_text.clone()),
+                text_bytes: None,
+                text_truncated: false,
             })
             .unwrap();
         let projected = events
@@ -872,6 +910,8 @@ mod tests {
                 peer_name: None,
                 group_id: None,
                 text: Some(oversized),
+                text_bytes: None,
+                text_truncated: false,
             })
             .unwrap();
         let projected = events
@@ -899,5 +939,144 @@ mod tests {
             ),
             Err(ServiceError::Api(error)) if error.code == "CAPABILITY_UNAVAILABLE"
         ));
+    }
+
+    #[test]
+    fn outgoing_sync_reconciles_by_signal_timestamp_and_client_request_id() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "same text is not identity",
+                "client-request-exact",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        let sync_receive = NormalizedReceive {
+            timestamp: Some(99),
+            content_kind: "syncMessage",
+            direction: "outgoing",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("same text is not identity".into()),
+            text_bytes: Some(25),
+            text_truncated: false,
+        };
+        service.ingest_receive(sync_receive.clone()).unwrap();
+        assert_eq!(
+            service
+                .list_messages(&account.id, &conversation.id, 10, None)
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+
+        let (sent, _) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 99)
+            .unwrap();
+        assert_eq!(
+            sent.client_request_id.as_deref(),
+            Some("client-request-exact")
+        );
+        let rows = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, pending_id);
+
+        assert!(service.ingest_receive(sync_receive).unwrap().is_empty());
+        assert_eq!(
+            service
+                .list_messages(&account.id, &conversation.id, 10, None)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn signal_identity_keeps_group_senders_distinct_and_dedupes_replay() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let receive = |source: &str, text: &str| NormalizedReceive {
+            timestamp: Some(200),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some(source.into()),
+            peer_name: None,
+            group_id: Some("group-one".into()),
+            text: Some(text.into()),
+            text_bytes: Some(text.len() as u32),
+            text_truncated: false,
+        };
+
+        let first = receive("peer-a", "first");
+        assert!(!service.ingest_receive(first.clone()).unwrap().is_empty());
+        assert!(
+            !service
+                .ingest_receive(receive("peer-b", "second"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(service.ingest_receive(first).unwrap().is_empty());
+
+        let conversation = service
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(
+            service
+                .list_messages(&account.id, &conversation.id, 10, None)
+                .unwrap()
+                .items
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn receive_without_signal_timestamp_has_no_persistence_side_effects() {
+        let (_temp, service) = service();
+        let receive = NormalizedReceive {
+            timestamp: None,
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("unstable identity".into()),
+            text_bytes: Some(17),
+            text_truncated: false,
+        };
+
+        assert!(service.ingest_receive(receive).unwrap().is_empty());
+        assert!(service.list_accounts().unwrap().is_empty());
     }
 }

@@ -6,11 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 use crate::engine::{
-    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
-    NormalizedReceive, SignalCliConfig, event_channel,
+    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus, QueuedReceive,
+    ReceiveIngress, SignalCliConfig, event_channel, receive_channel,
 };
 use crate::protocol::ApiError;
 use crate::service::{
@@ -23,14 +25,18 @@ use crate::store::{
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
 const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
+const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
 
 pub struct RuntimeSupervisor {
     config: SignalCliConfig,
     engine: Mutex<Option<EngineHandle>>,
-    service: Mutex<ConnectorService>,
+    service: Arc<Mutex<ConnectorService>>,
     active_link_finish: Mutex<Option<String>>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
+    receive_ingress: ReceiveIngress,
+    receive_worker: JoinHandle<()>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
 }
@@ -39,13 +45,22 @@ impl RuntimeSupervisor {
     pub fn new(config: SignalCliConfig, store: Store) -> Self {
         let (events, _) = event_channel();
         let (host_events, _) = broadcast::channel(1024);
+        let service = Arc::new(Mutex::new(ConnectorService::new(store)));
+        let (receive_ingress, receive_rx) = receive_channel();
+        let receive_worker = tokio::spawn(receive_persistence_loop(
+            receive_rx,
+            service.clone(),
+            host_events.clone(),
+        ));
         Self {
             config,
             engine: Mutex::new(None),
-            service: Mutex::new(ConnectorService::new(store)),
+            service,
             active_link_finish: Mutex::new(None),
             events,
             host_events,
+            receive_ingress,
+            receive_worker,
             last_title_enrich_ms: AtomicU64::new(0),
         }
     }
@@ -79,7 +94,12 @@ impl RuntimeSupervisor {
                 return Err(EngineError::Backpressure);
             }
         }
-        let engine = EngineHandle::start(self.config.clone(), self.events.clone()).await?;
+        let engine = EngineHandle::start(
+            self.config.clone(),
+            self.events.clone(),
+            self.receive_ingress.clone(),
+        )
+        .await?;
         let status = engine.status();
         *slot = Some(engine);
         Ok(status)
@@ -388,7 +408,12 @@ impl RuntimeSupervisor {
         if let Some(engine) = slot.take() {
             engine.shutdown().await?;
         }
-        let engine = EngineHandle::start(self.config.clone(), self.events.clone()).await?;
+        let engine = EngineHandle::start(
+            self.config.clone(),
+            self.events.clone(),
+            self.receive_ingress.clone(),
+        )
+        .await?;
         *slot = Some(engine);
         Ok(())
     }
@@ -632,12 +657,49 @@ impl RuntimeSupervisor {
             },
         }
     }
+}
 
-    pub async fn ingest_receive(&self, receive: NormalizedReceive) {
-        let events = self.service.lock().await.ingest_receive(receive);
-        if let Ok(events) = events {
-            for event in events {
-                let _ = self.host_events.send(event);
+impl Drop for RuntimeSupervisor {
+    fn drop(&mut self) {
+        self.receive_worker.abort();
+    }
+}
+
+async fn receive_persistence_loop(
+    mut receives: mpsc::Receiver<QueuedReceive>,
+    service: Arc<Mutex<ConnectorService>>,
+    host_events: broadcast::Sender<HostSideEvent>,
+) {
+    let mut storage_unavailable = false;
+    while let Some(queued) = receives.recv().await {
+        let mut retry_delay = RECEIVE_STORE_RETRY_MIN;
+        loop {
+            let result = service
+                .lock()
+                .await
+                .ingest_receive(queued.receive().clone());
+            match result {
+                Ok(events) => {
+                    for event in events {
+                        let _ = host_events.send(event);
+                    }
+                    if storage_unavailable {
+                        storage_unavailable = false;
+                        let _ =
+                            host_events.send(HostSideEvent::StorageChanged { state: "recovered" });
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if !storage_unavailable {
+                        storage_unavailable = true;
+                        let _ = host_events.send(HostSideEvent::StorageChanged {
+                            state: "unavailable",
+                        });
+                    }
+                    sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(RECEIVE_STORE_RETRY_MAX);
+                }
             }
         }
     }
@@ -736,18 +798,27 @@ pub fn open_supervisor(
     signal_cli: PathBuf,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
+    java_home: Option<PathBuf>,
 ) -> Result<Arc<RuntimeSupervisor>, StoreError> {
     let store = Store::open(&state_dir)?;
-    Ok(Arc::new(RuntimeSupervisor::new(
-        SignalCliConfig::new(signal_cli, signal_data_dir),
-        store,
-    )))
+    let mut config = SignalCliConfig::new(signal_cli, signal_data_dir);
+    config.java_home = java_home;
+    Ok(Arc::new(RuntimeSupervisor::new(config, store)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compose_contact_display_name;
+    use std::time::Duration;
+
+    use rusqlite::Connection;
     use serde_json::json;
+    use tempfile::TempDir;
+    use tokio::time::timeout;
+
+    use super::{RuntimeSupervisor, compose_contact_display_name};
+    use crate::engine::{NormalizedReceive, SignalCliConfig};
+    use crate::service::HostSideEvent;
+    use crate::store::Store;
 
     #[test]
     fn prefers_profile_given_and_family_name() {
@@ -761,6 +832,81 @@ mod tests {
             compose_contact_display_name(&item).as_deref(),
             Some("Ada Lovelace")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_receive_persistence_is_retained_and_recovers() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let recovery = Connection::open(store.path()).unwrap();
+        recovery
+            .execute_batch(
+                "CREATE TRIGGER fail_receive_insert
+                 BEFORE INSERT ON messages
+                 BEGIN SELECT RAISE(FAIL, 'controlled test failure'); END;",
+            )
+            .unwrap();
+        let supervisor = RuntimeSupervisor::new(
+            SignalCliConfig::new(
+                temp.path().join("unused-signal-cli"),
+                temp.path().join("unused-signal-data"),
+            ),
+            store,
+        );
+        let mut host_events = supervisor.subscribe_host();
+        supervisor
+            .receive_ingress
+            .enqueue(NormalizedReceive {
+                timestamp: Some(42),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some("+15555550101".into()),
+                peer_name: Some("Peer".into()),
+                group_id: None,
+                text: Some("persist me".into()),
+                text_bytes: Some(10),
+                text_truncated: false,
+            })
+            .await
+            .unwrap();
+
+        let unavailable = timeout(Duration::from_secs(1), host_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            unavailable,
+            HostSideEvent::StorageChanged {
+                state: "unavailable"
+            }
+        ));
+        recovery
+            .execute_batch("DROP TRIGGER fail_receive_insert;")
+            .unwrap();
+
+        let (saw_message, saw_recovered) = timeout(Duration::from_secs(2), async {
+            let mut saw_message = false;
+            loop {
+                match host_events.recv().await.unwrap() {
+                    HostSideEvent::MessageUpserted(message) => {
+                        saw_message = message.text.as_deref() == Some("persist me");
+                    }
+                    HostSideEvent::StorageChanged { state: "recovered" } => {
+                        break (saw_message, true);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(saw_message);
+        assert!(saw_recovered);
     }
 
     #[test]

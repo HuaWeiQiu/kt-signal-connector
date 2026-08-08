@@ -8,6 +8,7 @@ pub mod ipc;
 pub mod link;
 pub mod lkg;
 pub mod manifest;
+pub mod parent;
 pub mod protocol;
 pub mod resource;
 pub mod service;

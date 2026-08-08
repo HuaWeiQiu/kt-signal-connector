@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use kt_signal_connector::engine::{
     CallClass, EngineError, EngineEvent, EngineHandle, EngineState, SignalCliConfig, event_channel,
+    receive_channel,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -17,20 +18,28 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
 }
 
-async fn engine(request_timeout: Duration) -> (TempDir, EngineHandle) {
+async fn engine(
+    request_timeout: Duration,
+) -> (
+    TempDir,
+    EngineHandle,
+    tokio::sync::mpsc::Receiver<kt_signal_connector::engine::QueuedReceive>,
+) {
     let temp = TempDir::new().unwrap();
     let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = request_timeout;
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
-    let engine = EngineHandle::start(config, events).await.unwrap();
-    (temp, engine)
+    let (receive_ingress, receives) = receive_channel();
+    let engine = EngineHandle::start(config, events, receive_ingress)
+        .await
+        .unwrap();
+    (temp, engine, receives)
 }
 
 #[tokio::test]
 async fn matches_success_and_normalizes_receive_without_private_fields() {
-    let (_temp, engine) = engine(Duration::from_secs(1)).await;
-    let mut events = engine.subscribe();
+    let (_temp, engine, mut receives) = engine(Duration::from_secs(1)).await;
 
     let result = engine
         .call("emitReceive", json!({}), CallClass::ReadOnly)
@@ -38,15 +47,11 @@ async fn matches_success_and_normalizes_receive_without_private_fields() {
         .unwrap();
     assert_eq!(result, json!({ "method": "emitReceive" }));
 
-    let receive = timeout(Duration::from_secs(1), async {
-        loop {
-            if let EngineEvent::Receive(receive) = events.recv().await.unwrap() {
-                break receive;
-            }
-        }
-    })
-    .await
-    .unwrap();
+    let queued = timeout(Duration::from_secs(1), receives.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let receive = queued.receive();
     let encoded = serde_json::to_string(&receive).unwrap();
     assert_eq!(receive.timestamp, Some(42));
     assert!(!encoded.contains("private text"));
@@ -56,7 +61,7 @@ async fn matches_success_and_normalizes_receive_without_private_fields() {
 
 #[tokio::test]
 async fn malformed_output_faults_runtime() {
-    let (_temp, engine) = engine(Duration::from_secs(3)).await;
+    let (_temp, engine, _receives) = engine(Duration::from_secs(3)).await;
     let running_pid = engine.status().pid;
     let mut events = engine.subscribe();
     let result = engine
@@ -80,7 +85,7 @@ async fn malformed_output_faults_runtime() {
 
 #[tokio::test]
 async fn read_timeout_and_send_timeout_have_distinct_outcomes() {
-    let (_temp, engine) = engine(Duration::from_millis(50)).await;
+    let (_temp, engine, _receives) = engine(Duration::from_millis(50)).await;
     assert_eq!(
         engine.call("hang", json!({}), CallClass::ReadOnly).await,
         Err(EngineError::Timeout)
@@ -96,7 +101,7 @@ async fn read_timeout_and_send_timeout_have_distinct_outcomes() {
 
 #[tokio::test]
 async fn duplicate_response_is_reported_without_resolving_twice() {
-    let (_temp, engine) = engine(Duration::from_secs(1)).await;
+    let (_temp, engine, _receives) = engine(Duration::from_secs(1)).await;
     let mut events = engine.subscribe();
     let result = engine
         .call("duplicate", json!({}), CallClass::ReadOnly)
@@ -119,7 +124,7 @@ async fn duplicate_response_is_reported_without_resolving_twice() {
 
 #[tokio::test]
 async fn crash_exits_and_a_new_engine_can_start() {
-    let (temp, engine) = engine(Duration::from_secs(1)).await;
+    let (temp, engine, _receives) = engine(Duration::from_secs(1)).await;
     let result = engine.call("crash", json!({}), CallClass::ReadOnly).await;
     assert_eq!(result, Err(EngineError::Exited));
     assert_eq!(engine.status().state, EngineState::Exited);
@@ -127,7 +132,10 @@ async fn crash_exits_and_a_new_engine_can_start() {
     let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
-    let restarted = EngineHandle::start(config, events).await.unwrap();
+    let (receive_ingress, _receives) = receive_channel();
+    let restarted = EngineHandle::start(config, events, receive_ingress)
+        .await
+        .unwrap();
     let result = restarted
         .call("version", json!({}), CallClass::ReadOnly)
         .await
@@ -138,7 +146,7 @@ async fn crash_exits_and_a_new_engine_can_start() {
 
 #[tokio::test]
 async fn mutating_request_crash_is_an_unknown_outcome() {
-    let (_temp, engine) = engine(Duration::from_secs(3)).await;
+    let (_temp, engine, _receives) = engine(Duration::from_secs(3)).await;
     let result = engine
         .call("crashSend", json!({}), CallClass::Mutating)
         .await;
@@ -154,7 +162,10 @@ async fn oversized_output_faults_runtime() {
     config.request_timeout = Duration::from_secs(3);
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
-    let engine = EngineHandle::start(config, events).await.unwrap();
+    let (receive_ingress, _receives) = receive_channel();
+    let engine = EngineHandle::start(config, events, receive_ingress)
+        .await
+        .unwrap();
 
     let result = engine
         .call("oversized", json!({}), CallClass::ReadOnly)
@@ -165,7 +176,7 @@ async fn oversized_output_faults_runtime() {
 
 #[tokio::test]
 async fn pending_requests_apply_backpressure_at_the_hard_limit() {
-    let (_temp, engine) = engine(Duration::from_millis(250)).await;
+    let (_temp, engine, _receives) = engine(Duration::from_millis(250)).await;
     let mut tasks = JoinSet::new();
     for _ in 0..129 {
         let engine = engine.clone();

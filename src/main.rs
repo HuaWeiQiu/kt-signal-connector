@@ -5,13 +5,18 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use kt_signal_connector::auth::load_bootstrap_secret;
+use kt_signal_connector::auth::{load_bootstrap_secret, load_bootstrap_secret_from_reader};
 use kt_signal_connector::host::serve;
 use kt_signal_connector::ipc::LocalListener;
+#[cfg(windows)]
+use kt_signal_connector::ipc::harden_private_directory;
 use kt_signal_connector::lkg::RuntimeLayout;
 use kt_signal_connector::manifest::{
-    RuntimeManifest, build_local_unsigned_manifest, current_platform,
+    LicenseRef, RuntimeManifest, artifact_for_file, build_local_unsigned_manifest,
+    load_signing_key, load_verifying_key,
 };
+#[cfg(windows)]
+use kt_signal_connector::parent::wait_for_parent_exit;
 use kt_signal_connector::resource::{measure_child_idle, write_report};
 use kt_signal_connector::supervisor::open_supervisor;
 
@@ -28,10 +33,24 @@ enum CliCommand {
     Serve {
         #[arg(long)]
         endpoint: PathBuf,
+        #[arg(
+            long,
+            conflicts_with = "bootstrap_secret_stdin",
+            required_unless_present = "bootstrap_secret_stdin"
+        )]
+        bootstrap_secret_file: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "bootstrap_secret_file"
+        )]
+        bootstrap_secret_stdin: bool,
         #[arg(long)]
-        bootstrap_secret_file: PathBuf,
+        parent_pid: Option<u32>,
         #[arg(long)]
         signal_cli: PathBuf,
+        #[arg(long)]
+        java_home: Option<PathBuf>,
         #[arg(long)]
         signal_data_dir: PathBuf,
         #[arg(long)]
@@ -58,6 +77,8 @@ enum PackageCommand {
         signal_cli_version: String,
         #[arg(long, default_value = "25")]
         jre_version: String,
+        #[arg(long)]
+        platform: Option<String>,
         #[arg(long, default_value = "bin/kt-signal-connector")]
         connector_path: String,
         #[arg(long, default_value = "bin/signal-cli")]
@@ -65,9 +86,24 @@ enum PackageCommand {
         #[arg(long, default_value = "jre/release")]
         jre_path: String,
         #[arg(long)]
+        source_archive_path: Option<String>,
+        #[arg(long = "license", value_name = "COMPONENT:SPDX:PATH")]
+        licenses: Vec<String>,
+        #[arg(long)]
         output: PathBuf,
     },
-    /// Verify artifact hashes in a bundle. Production signatures remain optional until keys exist.
+    /// Apply an Ed25519 production signature to a complete manifest.
+    Sign {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        private_key_file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify artifact hashes and, when required, an Ed25519 production signature.
     Verify {
         #[arg(long)]
         bundle_dir: PathBuf,
@@ -75,6 +111,10 @@ enum PackageCommand {
         manifest: PathBuf,
         #[arg(long, default_value_t = false)]
         require_signature: bool,
+        #[arg(long)]
+        trusted_key_id: Option<String>,
+        #[arg(long)]
+        trusted_public_key_file: Option<PathBuf>,
     },
     /// Copy a verified bundle into runtime versions/ and mark it staged.
     Stage {
@@ -84,16 +124,34 @@ enum PackageCommand {
         version_id: String,
         #[arg(long)]
         bundle_dir: PathBuf,
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
+        #[arg(long)]
+        trusted_key_id: Option<String>,
+        #[arg(long)]
+        trusted_public_key_file: Option<PathBuf>,
     },
     /// Promote staged -> active and move previous active to LKG.
     Activate {
         #[arg(long)]
         runtime_root: PathBuf,
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
+        #[arg(long)]
+        trusted_key_id: Option<String>,
+        #[arg(long)]
+        trusted_public_key_file: Option<PathBuf>,
     },
     /// Point active back at LKG.
     Rollback {
         #[arg(long)]
         runtime_root: PathBuf,
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
+        #[arg(long)]
+        trusted_key_id: Option<String>,
+        #[arg(long)]
+        trusted_public_key_file: Option<PathBuf>,
     },
     /// Short idle RSS sample of an executable (smoke measurement, not a 24h gate).
     MeasureIdle {
@@ -108,6 +166,17 @@ enum PackageCommand {
     },
 }
 
+struct ServeOptions {
+    endpoint: PathBuf,
+    bootstrap_secret_file: Option<PathBuf>,
+    bootstrap_secret_stdin: bool,
+    parent_pid: Option<u32>,
+    signal_cli: PathBuf,
+    java_home: Option<PathBuf>,
+    signal_data_dir: PathBuf,
+    state_dir: PathBuf,
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -115,16 +184,22 @@ async fn main() {
         CliCommand::Serve {
             endpoint,
             bootstrap_secret_file,
+            bootstrap_secret_stdin,
+            parent_pid,
             signal_cli,
+            java_home,
             signal_data_dir,
             state_dir,
-        } => serve_command(
+        } => serve_command(ServeOptions {
             endpoint,
             bootstrap_secret_file,
+            bootstrap_secret_stdin,
+            parent_pid,
             signal_cli,
+            java_home,
             signal_data_dir,
             state_dir,
-        )
+        })
         .await
         .map_err(|error| error.to_string()),
         CliCommand::Package { command } => package_command(command),
@@ -135,16 +210,56 @@ async fn main() {
     }
 }
 
-async fn serve_command(
-    endpoint: PathBuf,
-    bootstrap_secret_file: PathBuf,
-    signal_cli: PathBuf,
-    signal_data_dir: PathBuf,
-    state_dir: PathBuf,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let secret = load_bootstrap_secret(&bootstrap_secret_file)?;
+async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let ServeOptions {
+        endpoint,
+        bootstrap_secret_file,
+        bootstrap_secret_stdin,
+        parent_pid,
+        signal_cli,
+        java_home,
+        signal_data_dir,
+        state_dir,
+    } = options;
+    if cfg!(windows) && !bootstrap_secret_stdin {
+        return Err("Windows requires the inherited bootstrap secret pipe".into());
+    }
+    if cfg!(windows) && parent_pid.is_none() {
+        return Err("Windows requires the parent process monitor".into());
+    }
+    let secret = if bootstrap_secret_stdin {
+        load_bootstrap_secret_from_reader(std::io::stdin().lock())?
+    } else {
+        load_bootstrap_secret(
+            bootstrap_secret_file
+                .as_deref()
+                .ok_or("bootstrap secret source is required")?,
+        )?
+    };
+    #[cfg(windows)]
+    {
+        let root = state_dir
+            .parent()
+            .ok_or("Windows state directory must have a profile root")?;
+        std::fs::create_dir_all(root)?;
+        std::fs::create_dir_all(&signal_data_dir)?;
+        std::fs::create_dir_all(&state_dir)?;
+        harden_private_directory(root)?;
+        harden_private_directory(&signal_data_dir)?;
+        harden_private_directory(&state_dir)?;
+    }
     let listener = LocalListener::bind(&endpoint)?;
-    let supervisor = open_supervisor(signal_cli, signal_data_dir, state_dir)?;
+    let supervisor = open_supervisor(signal_cli, signal_data_dir, state_dir, java_home)?;
+    #[cfg(windows)]
+    {
+        let parent_pid = parent_pid.expect("validated Windows parent PID");
+        let parent_supervisor = supervisor.clone();
+        tokio::spawn(async move {
+            let _ = wait_for_parent_exit(parent_pid).await;
+            let _ = parent_supervisor.shutdown().await;
+            std::process::exit(0);
+        });
+    }
     serve(listener, secret, supervisor).await?;
     Ok(())
 }
@@ -157,12 +272,15 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
             connector_version,
             signal_cli_version,
             jre_version,
+            platform,
             connector_path,
             signal_cli_path,
             jre_path,
+            source_archive_path,
+            licenses,
             output,
         } => {
-            let manifest = build_local_unsigned_manifest(
+            let mut manifest = build_local_unsigned_manifest(
                 &bundle_dir,
                 bundle_id,
                 connector_version,
@@ -173,10 +291,31 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
                 &jre_path,
             )
             .map_err(|error| error.to_string())?;
+            if let Some(platform) = platform {
+                if !matches!(
+                    platform.as_str(),
+                    "macos-arm64" | "macos-x64" | "windows-x64"
+                ) {
+                    return Err("unsupported production runtime platform".into());
+                }
+                manifest.platform = platform;
+            }
+            if let Some(source_archive_path) = source_archive_path {
+                manifest.source_archive = Some(
+                    artifact_for_file(&bundle_dir, &source_archive_path)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            if !licenses.is_empty() {
+                manifest.licenses = licenses
+                    .iter()
+                    .map(|value| parse_license_spec(&bundle_dir, value))
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             manifest.save(&output).map_err(|error| error.to_string())?;
             println!(
                 "wrote unsigned local manifest for {} at {}",
-                current_platform(),
+                manifest.platform,
                 output.display()
             );
             Ok(())
@@ -185,39 +324,108 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
             bundle_dir,
             manifest,
             require_signature,
+            trusted_key_id,
+            trusted_public_key_file,
         } => {
             let manifest = RuntimeManifest::load(&manifest).map_err(|error| error.to_string())?;
-            manifest
-                .verify_artifacts(&bundle_dir, require_signature)
-                .map_err(|error| error.to_string())?;
+            if require_signature {
+                let key_id = trusted_key_id
+                    .as_deref()
+                    .ok_or("--trusted-key-id is required with --require-signature")?;
+                let key_path = trusted_public_key_file
+                    .as_deref()
+                    .ok_or("--trusted-public-key-file is required with --require-signature")?;
+                let key = load_verifying_key(key_path).map_err(|error| error.to_string())?;
+                manifest
+                    .verify_production(&bundle_dir, key_id, &key)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                if trusted_key_id.is_some() || trusted_public_key_file.is_some() {
+                    return Err("trusted key options require --require-signature".into());
+                }
+                manifest
+                    .verify_artifacts(&bundle_dir)
+                    .map_err(|error| error.to_string())?;
+            }
             println!("manifest artifacts verified");
+            Ok(())
+        }
+        PackageCommand::Sign {
+            manifest,
+            key_id,
+            private_key_file,
+            output,
+        } => {
+            let bundle_dir = manifest
+                .parent()
+                .ok_or("manifest must have a bundle directory")?
+                .to_path_buf();
+            let mut manifest =
+                RuntimeManifest::load(&manifest).map_err(|error| error.to_string())?;
+            manifest
+                .verify_artifacts(&bundle_dir)
+                .map_err(|error| error.to_string())?;
+            let key = load_signing_key(&private_key_file).map_err(|error| error.to_string())?;
+            manifest
+                .sign_ed25519(key_id, &key)
+                .map_err(|error| error.to_string())?;
+            manifest.save(&output).map_err(|error| error.to_string())?;
+            println!("signed runtime manifest");
             Ok(())
         }
         PackageCommand::Stage {
             runtime_root,
             version_id,
             bundle_dir,
+            require_signature,
+            trusted_key_id,
+            trusted_public_key_file,
         } => {
             let layout = RuntimeLayout::new(runtime_root);
-            let path = layout
-                .stage_bundle(&version_id, &bundle_dir)
-                .map_err(|error| error.to_string())?;
+            let trust =
+                load_optional_trust(require_signature, trusted_key_id, trusted_public_key_file)?;
+            let path = if let Some((key_id, key)) = trust.as_ref() {
+                layout.stage_production_bundle(&version_id, &bundle_dir, key_id, key)
+            } else {
+                layout.stage_bundle(&version_id, &bundle_dir)
+            }
+            .map_err(|error| error.to_string())?;
             println!("staged {} at {}", version_id, path.display());
             Ok(())
         }
-        PackageCommand::Activate { runtime_root } => {
+        PackageCommand::Activate {
+            runtime_root,
+            require_signature,
+            trusted_key_id,
+            trusted_public_key_file,
+        } => {
             let layout = RuntimeLayout::new(runtime_root);
-            let active = layout
-                .activate_staged()
-                .map_err(|error| error.to_string())?;
+            let trust =
+                load_optional_trust(require_signature, trusted_key_id, trusted_public_key_file)?;
+            let active = if let Some((key_id, key)) = trust.as_ref() {
+                layout.activate_staged_production(key_id, key)
+            } else {
+                layout.activate_staged()
+            }
+            .map_err(|error| error.to_string())?;
             println!("activated {}", active.version_id);
             Ok(())
         }
-        PackageCommand::Rollback { runtime_root } => {
+        PackageCommand::Rollback {
+            runtime_root,
+            require_signature,
+            trusted_key_id,
+            trusted_public_key_file,
+        } => {
             let layout = RuntimeLayout::new(runtime_root);
-            let active = layout
-                .rollback_to_lkg()
-                .map_err(|error| error.to_string())?;
+            let trust =
+                load_optional_trust(require_signature, trusted_key_id, trusted_public_key_file)?;
+            let active = if let Some((key_id, key)) = trust.as_ref() {
+                layout.rollback_to_lkg_production(key_id, key)
+            } else {
+                layout.rollback_to_lkg()
+            }
+            .map_err(|error| error.to_string())?;
             println!("rolled back to {}", active.version_id);
             Ok(())
         }
@@ -243,4 +451,43 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn parse_license_spec(bundle_dir: &std::path::Path, value: &str) -> Result<LicenseRef, String> {
+    let mut parts = value.splitn(3, ':');
+    let component = parts.next().unwrap_or_default();
+    let spdx = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    if component.is_empty()
+        || component.len() > 128
+        || spdx.is_empty()
+        || spdx.len() > 128
+        || path.is_empty()
+    {
+        return Err("license must use COMPONENT:SPDX:PATH".into());
+    }
+    artifact_for_file(bundle_dir, path).map_err(|error| error.to_string())?;
+    Ok(LicenseRef {
+        component: component.into(),
+        spdx: spdx.into(),
+        path: path.into(),
+    })
+}
+
+fn load_optional_trust(
+    require_signature: bool,
+    trusted_key_id: Option<String>,
+    trusted_public_key_file: Option<PathBuf>,
+) -> Result<Option<(String, ed25519_dalek::VerifyingKey)>, String> {
+    if !require_signature {
+        if trusted_key_id.is_some() || trusted_public_key_file.is_some() {
+            return Err("trusted key options require --require-signature".into());
+        }
+        return Ok(None);
+    }
+    let key_id = trusted_key_id.ok_or("--trusted-key-id is required with --require-signature")?;
+    let key_path = trusted_public_key_file
+        .ok_or("--trusted-public-key-file is required with --require-signature")?;
+    let key = load_verifying_key(&key_path).map_err(|error| error.to_string())?;
+    Ok(Some((key_id, key)))
 }

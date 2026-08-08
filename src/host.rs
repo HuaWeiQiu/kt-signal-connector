@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -183,35 +184,36 @@ pub async fn serve(
                 return Ok(());
             }
         };
+        let authenticated = Arc::new(AtomicBool::new(false));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let connection = handle_connection_until_shutdown(
             stream,
             secret.clone(),
             supervisor.clone(),
             shutdown_rx,
+            authenticated.clone(),
         );
         tokio::pin!(connection);
+        let mut interrupted = false;
         let connection_result = tokio::select! {
             result = &mut connection => result,
             signal = tokio::signal::ctrl_c() => {
                 signal?;
+                interrupted = true;
                 let _ = shutdown_tx.send(true);
                 connection.await
             }
         };
-        supervisor
-            .shutdown()
-            .await
-            .map_err(|_| HostError::RuntimeShutdown)?;
-        match connection_result {
-            Ok(()) if *shutdown_tx.borrow() => return Ok(()),
-            Ok(()) => {}
-            Err(error) => {
-                if !matches!(error, HostError::Authentication | HostError::InvalidFrame) {
-                    return Err(error);
-                }
-            }
+        if interrupted || authenticated.load(Ordering::Acquire) {
+            supervisor
+                .shutdown()
+                .await
+                .map_err(|_| HostError::RuntimeShutdown)?;
+            return connection_result;
         }
+        // A malformed or unauthenticated local probe must not consume the process. The first
+        // successful authentication does: when that session ends, a fresh process and secret
+        // are required.
     }
 }
 
@@ -225,7 +227,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    handle_connection_until_shutdown(stream, secret, supervisor, shutdown_rx).await
+    handle_connection_until_shutdown(
+        stream,
+        secret,
+        supervisor,
+        shutdown_rx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
 }
 
 async fn handle_connection_until_shutdown<S>(
@@ -233,6 +242,7 @@ async fn handle_connection_until_shutdown<S>(
     secret: Arc<BootstrapSecret>,
     supervisor: Arc<RuntimeSupervisor>,
     mut shutdown: watch::Receiver<bool>,
+    authenticated: Arc<AtomicBool>,
 ) -> Result<(), HostError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -301,6 +311,7 @@ where
         .await?;
         return Err(HostError::Authentication);
     }
+    authenticated.store(true, Ordering::Release);
 
     let handshake_request_id = handshake.request_id;
     send_json(
@@ -457,9 +468,6 @@ where
                         ).await {
                             break Err(error);
                         }
-                    }
-                    Ok(EngineEvent::Receive(receive)) => {
-                        supervisor.ingest_receive(receive).await;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if let Err(error) = send_shared(
@@ -760,6 +768,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match event {
+        HostSideEvent::StorageChanged { state } => {
+            send_shared(
+                writer,
+                &HostEvent::new("runtime.storageChanged", json!({ "state": state })),
+            )
+            .await
+        }
         HostSideEvent::AccountChanged(account) => {
             send_shared(writer, &HostEvent::new("account.changed", account)).await
         }
@@ -773,12 +788,16 @@ where
         HostSideEvent::MessageUpserted(message) => {
             send_shared(writer, &HostEvent::new("message.upserted", message)).await
         }
-        HostSideEvent::MessageStatusChanged { message_id, status } => {
+        HostSideEvent::MessageStatusChanged {
+            account_id,
+            message_id,
+            status,
+        } => {
             send_shared(
                 writer,
                 &HostEvent::new(
                     "message.statusChanged",
-                    json!({ "messageId": message_id, "status": status }),
+                    json!({ "accountId": account_id, "messageId": message_id, "status": status }),
                 ),
             )
             .await

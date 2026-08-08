@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -83,6 +84,8 @@ pub struct MessageRecord {
     pub attachments: Vec<serde_json::Value>,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_message_id: Option<String>,
 }
 
@@ -127,6 +130,8 @@ impl Store {
         prepare_state_dir(state_dir)?;
         let path = state_dir.join("connector.sqlite3");
         let conn = Connection::open(&path).map_err(|_| StoreError::Unavailable)?;
+        conn.busy_timeout(Duration::from_millis(250))
+            .map_err(|_| StoreError::Unavailable)?;
         conn.execute_batch(
             "
             PRAGMA journal_mode=WAL;
@@ -181,6 +186,8 @@ impl Store {
               WHERE client_request_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS messages_conversation_sent_at
               ON messages(conversation_id, sent_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS messages_signal_identity_v2
+              ON messages(account_id, conversation_id, direction, sent_at, sender_id);
             CREATE INDEX IF NOT EXISTS conversations_account_last_message
               ON conversations(account_id, last_message_at DESC, id DESC);
             CREATE TABLE IF NOT EXISTS account_delete_operations (
@@ -746,7 +753,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2
                    AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -786,7 +793,7 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -804,13 +811,56 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
+    }
+
+    pub fn message_by_signal_identity(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        direction: &str,
+        sent_at: u64,
+        sender_id: &str,
+        legacy_sender_id: &str,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
+                   AND sender_id IN (?5, ?6)
+                 ORDER BY id ASC LIMIT 2",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut rows = stmt
+            .query_map(
+                params![
+                    account_id,
+                    conversation_id,
+                    direction,
+                    sent_at as i64,
+                    sender_id,
+                    legacy_sender_id,
+                ],
+                message_record_from_row,
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let first = rows
+            .next()
+            .transpose()
+            .map_err(|_| StoreError::Unavailable)?;
+        if rows.next().is_some() {
+            return Ok(None);
+        }
+        Ok(first)
     }
 
     pub fn insert_message(
@@ -820,8 +870,11 @@ impl Store {
         preview: Option<&str>,
         increment_unread: bool,
     ) -> Result<bool, StoreError> {
-        let inserted = self
+        let transaction = self
             .conn
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
@@ -845,9 +898,10 @@ impl Store {
             )
             .map_err(|_| StoreError::Unavailable)?;
         if inserted == 0 {
+            transaction.commit().map_err(|_| StoreError::Unavailable)?;
             return Ok(false);
         }
-        self.conn
+        let conversation_updated = transaction
             .execute(
                 "UPDATE conversations
                  SET last_message_preview=?2,
@@ -862,7 +916,10 @@ impl Store {
                 ],
             )
             .map_err(|_| StoreError::Unavailable)?;
-        self.conn
+        if conversation_updated != 1 {
+            return Err(StoreError::ConversationNotFound);
+        }
+        let account_updated = transaction
             .execute(
                 "UPDATE accounts
                  SET last_message_at=?2,
@@ -875,6 +932,10 @@ impl Store {
                 ],
             )
             .map_err(|_| StoreError::Unavailable)?;
+        if account_updated != 1 {
+            return Err(StoreError::AccountNotFound);
+        }
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
         Ok(true)
     }
 
@@ -884,8 +945,11 @@ impl Store {
         account_id: &str,
         conversation_id: &str,
     ) -> Result<u32, StoreError> {
-        let prev: i64 = self
+        let transaction = self
             .conn
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        let prev: i64 = transaction
             .query_row(
                 "SELECT unread_count FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
@@ -895,15 +959,19 @@ impl Store {
             .map_err(|_| StoreError::Unavailable)?
             .unwrap_or(0);
         if prev <= 0 {
+            transaction.commit().map_err(|_| StoreError::Unavailable)?;
             return Ok(0);
         }
-        self.conn
+        let conversation_updated = transaction
             .execute(
                 "UPDATE conversations SET unread_count=0 WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
             )
             .map_err(|_| StoreError::Unavailable)?;
-        self.conn
+        if conversation_updated != 1 {
+            return Err(StoreError::ConversationNotFound);
+        }
+        let account_updated = transaction
             .execute(
                 "UPDATE accounts
                  SET unread_count = CASE
@@ -914,6 +982,10 @@ impl Store {
                 params![account_id, prev],
             )
             .map_err(|_| StoreError::Unavailable)?;
+        if account_updated != 1 {
+            return Err(StoreError::AccountNotFound);
+        }
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
         Ok(prev as u32)
     }
 
@@ -932,13 +1004,83 @@ impl Store {
         self.conn
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
             )
             .optional()
             .map_err(|_| StoreError::Unavailable)
+    }
+
+    pub fn complete_outgoing_send(
+        &self,
+        message_id: &str,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: u64,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        let duplicate_ids = {
+            let mut stmt = transaction
+                .prepare(
+                    "SELECT id FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2 AND direction='outgoing'
+                       AND sent_at=?3 AND id<>?4 AND sender_id=?5
+                       AND client_request_id IS NULL
+                     ORDER BY id ASC LIMIT 2",
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        account_id,
+                        conversation_id,
+                        sent_at as i64,
+                        message_id,
+                        account_id,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| StoreError::Unavailable)?
+        };
+        if duplicate_ids.len() == 1 {
+            transaction
+                .execute(
+                    "DELETE FROM messages WHERE id=?1",
+                    params![duplicate_ids[0]],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE messages SET status='sent', sent_at=?2
+                 WHERE id=?1 AND account_id=?3 AND conversation_id=?4",
+                params![message_id, sent_at as i64, account_id, conversation_id],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        if updated != 1 {
+            return Ok(None);
+        }
+        transaction
+            .execute(
+                "UPDATE conversations SET last_message_at=?2 WHERE id=?1 AND account_id=?3",
+                params![conversation_id, sent_at as i64, account_id],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction
+            .execute(
+                "UPDATE accounts SET last_message_at=?2 WHERE id=?1",
+                params![account_id, sent_at as i64],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        self.message_by_id(account_id, conversation_id, message_id)
     }
 
     pub fn conversation_summary(
@@ -1145,6 +1287,7 @@ fn static_kind(value: String) -> &'static str {
 fn static_direction(value: String) -> &'static str {
     match value.as_str() {
         "outgoing" => "outgoing",
+        "system" => "system",
         _ => "incoming",
     }
 }
@@ -1156,6 +1299,7 @@ fn static_status(value: String) -> &'static str {
         "delivered" => "delivered",
         "read" => "read",
         "failed" => "failed",
+        "system" => "system",
         _ => "unknown",
     }
 }
@@ -1184,6 +1328,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         text_truncated: persisted_truncated,
         attachments: Vec::new(),
         status: static_status(row.get::<_, String>(10)?),
+        client_request_id: row.get(12)?,
         quote_message_id: row.get(11)?,
     })
 }
@@ -1222,6 +1367,7 @@ mod tests {
             text_retrievable: true,
             attachments: Vec::new(),
             status: "sent",
+            client_request_id: Some("client-1".into()),
             quote_message_id: None,
         };
         assert!(
@@ -1239,10 +1385,247 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(again.id, "m1");
+        assert_eq!(again.client_request_id.as_deref(), Some("client-1"));
         let page = store
             .list_messages(&account.id, &conversation.id, 10, None)
             .unwrap();
         assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn send_completion_removes_only_unclaimed_sync_duplicate() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut message = MessageRecord {
+            id: "pending".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sent_at: 1,
+            received_at: None,
+            text: Some("same".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "pending",
+            client_request_id: Some("request-pending".into()),
+            quote_message_id: None,
+        };
+        store
+            .insert_message(
+                &message,
+                message.client_request_id.as_deref(),
+                Some("same"),
+                false,
+            )
+            .unwrap();
+
+        message.id = "other-local-send".into();
+        message.sent_at = 99;
+        message.status = "sent";
+        message.client_request_id = Some("request-other".into());
+        store
+            .insert_message(
+                &message,
+                message.client_request_id.as_deref(),
+                Some("same"),
+                false,
+            )
+            .unwrap();
+
+        message.id = "sync-duplicate".into();
+        message.client_request_id = None;
+        store
+            .insert_message(&message, None, Some("same"), false)
+            .unwrap();
+
+        let completed = store
+            .complete_outgoing_send("pending", &account.id, &conversation.id, 99)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, "sent");
+        let ids = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"pending".to_string()));
+        assert!(ids.contains(&"other-local-send".to_string()));
+        assert!(!ids.contains(&"sync-duplicate".to_string()));
+    }
+
+    #[test]
+    fn message_insert_rolls_back_when_summary_update_fails() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_conversation_summary
+                 BEFORE UPDATE ON conversations
+                 BEGIN SELECT RAISE(FAIL, 'controlled test failure'); END;",
+            )
+            .unwrap();
+        let message = MessageRecord {
+            id: "atomic-message".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: 10,
+            received_at: Some(10),
+            text: Some("hello".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+
+        assert!(matches!(
+            store.insert_message(&message, None, Some("hello"), true),
+            Err(StoreError::Unavailable),
+        ));
+        assert!(
+            store
+                .message_by_id(&account.id, &conversation.id, &message.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap()
+                .unread_count,
+            0
+        );
+        assert_eq!(
+            store
+                .account_summary(&account.id)
+                .unwrap()
+                .unwrap()
+                .unread_count,
+            0
+        );
+    }
+
+    #[test]
+    fn unread_clear_rolls_back_when_account_update_fails() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let message = MessageRecord {
+            id: "unread-message".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: 10,
+            received_at: Some(10),
+            text: Some("hello".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("hello"), true)
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_account_unread
+                 BEFORE UPDATE ON accounts
+                 BEGIN SELECT RAISE(FAIL, 'controlled test failure'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.clear_conversation_unread(&account.id, &conversation.id),
+            Err(StoreError::Unavailable),
+        ));
+        assert_eq!(
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap()
+                .unread_count,
+            1
+        );
+        assert_eq!(
+            store
+                .account_summary(&account.id)
+                .unwrap()
+                .unwrap()
+                .unread_count,
+            1
+        );
+    }
+
+    #[test]
+    fn system_direction_and_status_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let message = MessageRecord {
+            id: "system-message".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "system",
+            sender_id: "peer".into(),
+            sent_at: 10,
+            received_at: Some(10),
+            text: Some("control notice".into()),
+            text_bytes: Some(14),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("control notice"), false)
+            .unwrap();
+
+        let reloaded = store
+            .message_by_id(&account.id, &conversation.id, &message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.direction, "system");
+        assert_eq!(reloaded.status, "system");
     }
 
     #[test]
@@ -1283,6 +1666,7 @@ mod tests {
                 text_retrievable: true,
                 attachments: Vec::new(),
                 status: "delivered",
+                client_request_id: None,
                 quote_message_id: None,
             };
             store
@@ -1347,6 +1731,7 @@ mod tests {
             text_retrievable: true,
             attachments: Vec::new(),
             status: "delivered",
+            client_request_id: None,
             quote_message_id: None,
         };
         store
@@ -1385,6 +1770,7 @@ mod tests {
             text_retrievable: true,
             attachments: Vec::new(),
             status: "delivered",
+            client_request_id: None,
             quote_message_id: None,
         };
         store
@@ -1437,6 +1823,7 @@ mod tests {
             text_retrievable: true,
             attachments: Vec::new(),
             status: "delivered",
+            client_request_id: None,
             quote_message_id: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
