@@ -42,6 +42,9 @@ impl ServiceError {
                 "account delete operation conflicts with existing state",
                 false,
             ),
+            ServiceError::Store(StoreError::InvalidCursor) => {
+                ApiError::new("INVALID_REQUEST", "pagination cursor is invalid", false)
+            }
             ServiceError::Store(_) => {
                 ApiError::new("INTERNAL_ERROR", "connector store failed", true)
             }

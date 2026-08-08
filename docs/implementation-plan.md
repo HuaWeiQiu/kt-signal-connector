@@ -321,6 +321,9 @@ increment above 350 MB or monotonic growth triggers profiling rather than a docu
 - pending signal-cli requests: 128 global.
 - event queue: 1,024 normalized events with pressure reporting.
 - current message page: default 100, maximum 200.
+- conversation cursors are opaque keyset cursors over `(last_message_at nullness,
+  last_message_at, id)`; message cursors are exact message IDs over `(sent_at, id)`. Unknown or
+  cross-account cursors fail closed instead of silently returning the first page.
 - reconnect attempts: exponential backoff with a circuit breaker.
 
 Core persistence must not be dropped under event pressure. Non-critical enrichment is disabled first.

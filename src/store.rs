@@ -25,6 +25,8 @@ pub enum StoreError {
     ConversationNotFound,
     #[error("account delete operation conflicts with existing state")]
     OperationConflict,
+    #[error("pagination cursor is invalid")]
+    InvalidCursor,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -641,6 +643,13 @@ impl Store {
     ) -> Result<Page<ConversationSummary>, StoreError> {
         let limit = limit.clamp(1, MAX_PAGE_LIMIT);
         let fetch = limit + 1;
+        let decoded = cursor
+            .map(|value| decode_conversation_cursor(value, account_id))
+            .transpose()?;
+        let cursor_present = i64::from(decoded.is_some());
+        let cursor_null = i64::from(decoded.as_ref().is_some_and(|value| value.0));
+        let cursor_sent_at = decoded.as_ref().and_then(|value| value.1);
+        let cursor_id = decoded.as_ref().map(|value| value.2.as_str());
         let mut stmt = self
             .conn
             .prepare(
@@ -648,32 +657,54 @@ impl Store {
                         unread_count, muted, pinned
                  FROM conversations
                  WHERE account_id=?1
-                   AND (?2 IS NULL OR id < ?2)
+                   AND (
+                     ?2=0
+                     OR (
+                       ?3=0 AND (
+                         last_message_at IS NULL
+                         OR last_message_at < ?4
+                         OR (last_message_at = ?4 AND id < ?5)
+                       )
+                     )
+                     OR (?3=1 AND last_message_at IS NULL AND id < ?5)
+                   )
                  ORDER BY last_message_at IS NULL, last_message_at DESC, id DESC
-                 LIMIT ?3",
+                 LIMIT ?6",
             )
             .map_err(|_| StoreError::Unavailable)?;
         let rows = stmt
-            .query_map(params![account_id, cursor, fetch as i64], |row| {
-                Ok(ConversationSummary {
-                    id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    kind: static_kind(row.get::<_, String>(2)?),
-                    title: row.get(3)?,
-                    last_message_preview: row.get(4)?,
-                    last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                    unread_count: row.get::<_, i64>(6)? as u32,
-                    muted: row.get::<_, i64>(7)? != 0,
-                    pinned: row.get::<_, i64>(8)? != 0,
-                })
-            })
+            .query_map(
+                params![
+                    account_id,
+                    cursor_present,
+                    cursor_null,
+                    cursor_sent_at,
+                    cursor_id,
+                    fetch as i64,
+                ],
+                |row| {
+                    Ok(ConversationSummary {
+                        id: row.get(0)?,
+                        account_id: row.get(1)?,
+                        kind: static_kind(row.get::<_, String>(2)?),
+                        title: row.get(3)?,
+                        last_message_preview: row.get(4)?,
+                        last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        unread_count: row.get::<_, i64>(6)? as u32,
+                        muted: row.get::<_, i64>(7)? != 0,
+                        pinned: row.get::<_, i64>(8)? != 0,
+                    })
+                },
+            )
             .map_err(|_| StoreError::Unavailable)?;
         let mut items = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| StoreError::Unavailable)?;
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
-            items.last().map(|item| item.id.clone())
+            items
+                .last()
+                .map(|item| encode_conversation_cursor(account_id, item))
         } else {
             None
         };
@@ -690,14 +721,16 @@ impl Store {
         let limit = limit.clamp(1, MAX_PAGE_LIMIT);
         let fetch = limit + 1;
         let before_sent_at: Option<i64> = if let Some(before_id) = before {
-            self.conn
+            let sent_at = self
+                .conn
                 .query_row(
                     "SELECT sent_at FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                     params![before_id, account_id, conversation_id],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|_| StoreError::Unavailable)?
+                .map_err(|_| StoreError::Unavailable)?;
+            Some(sent_at.ok_or(StoreError::InvalidCursor)?)
         } else {
             None
         };
@@ -969,6 +1002,42 @@ fn prune_completed_account_deletes(
     Ok(())
 }
 
+fn encode_conversation_cursor(account_id: &str, item: &ConversationSummary) -> String {
+    match item.last_message_at {
+        Some(last_message_at) => format!("v2:{account_id}:0:{last_message_at}:{}", item.id),
+        None => format!("v2:{account_id}:1:0:{}", item.id),
+    }
+}
+
+fn decode_conversation_cursor(
+    cursor: &str,
+    expected_account_id: &str,
+) -> Result<(bool, Option<i64>, String), StoreError> {
+    let mut parts = cursor.splitn(5, ':');
+    if parts.next() != Some("v2") {
+        return Err(StoreError::InvalidCursor);
+    }
+    let account_id = parts.next().ok_or(StoreError::InvalidCursor)?;
+    if account_id != expected_account_id {
+        return Err(StoreError::InvalidCursor);
+    }
+    let null_flag = parts.next().ok_or(StoreError::InvalidCursor)?;
+    let timestamp = parts
+        .next()
+        .ok_or(StoreError::InvalidCursor)?
+        .parse::<i64>()
+        .map_err(|_| StoreError::InvalidCursor)?;
+    let id = parts.next().ok_or(StoreError::InvalidCursor)?;
+    if timestamp < 0 || id.is_empty() || id.len() > 128 {
+        return Err(StoreError::InvalidCursor);
+    }
+    match null_flag {
+        "0" => Ok((false, Some(timestamp), id.to_string())),
+        "1" if timestamp == 0 => Ok((true, None, id.to_string())),
+        _ => Err(StoreError::InvalidCursor),
+    }
+}
+
 fn prepare_state_dir(path: &Path) -> Result<(), StoreError> {
     if !path.is_absolute() {
         return Err(StoreError::InvalidStateDir);
@@ -1116,6 +1185,160 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 10, None)
             .unwrap();
         assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn conversation_cursor_follows_full_sort_key_without_skips() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let older = store
+            .ensure_conversation(&account.id, "direct", "older", "Older")
+            .unwrap();
+        let newer = store
+            .ensure_conversation(&account.id, "direct", "newer", "Newer")
+            .unwrap();
+        let empty = store
+            .ensure_conversation(&account.id, "direct", "empty", "Empty")
+            .unwrap();
+        let same_time = store
+            .ensure_conversation(&account.id, "direct", "same-time", "Same time")
+            .unwrap();
+        for (conversation, id, sent_at) in [
+            (&older, "older-message", 10),
+            (&newer, "newer-message", 20),
+            (&same_time, "same-time-message", 20),
+        ] {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer".into(),
+                sent_at,
+                received_at: Some(sent_at),
+                text: Some(id.into()),
+                attachments: Vec::new(),
+                status: "delivered",
+                quote_message_id: None,
+            };
+            store
+                .insert_message(&message, None, Some(id), false)
+                .unwrap();
+        }
+
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store
+                .list_conversations(&account.id, 1, cursor.as_deref())
+                .unwrap();
+            ids.extend(page.items.into_iter().map(|item| item.id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        let mut same_timestamp_ids = [newer.id.clone(), same_time.id.clone()];
+        same_timestamp_ids.sort();
+        same_timestamp_ids.reverse();
+        assert_eq!(
+            ids,
+            [
+                same_timestamp_ids[0].clone(),
+                same_timestamp_ids[1].clone(),
+                older.id.clone(),
+                empty.id.clone(),
+            ],
+        );
+        assert!(matches!(
+            store.list_conversations(&account.id, 1, Some("bad-cursor")),
+            Err(StoreError::InvalidCursor),
+        ));
+        let other_account = store
+            .upsert_account_from_signal("+15555550101", Some(1))
+            .unwrap();
+        let account_cursor = format!("v2:{}:0:20:{}", account.id, newer.id);
+        assert!(matches!(
+            store.list_conversations(&other_account.id, 1, Some(&account_cursor)),
+            Err(StoreError::InvalidCursor),
+        ));
+
+        let changed = MessageRecord {
+            id: "newer-message-2".into(),
+            account_id: account.id.clone(),
+            conversation_id: newer.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: 30,
+            received_at: Some(30),
+            text: Some("changed after cursor".into()),
+            attachments: Vec::new(),
+            status: "delivered",
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&changed, None, Some("newer-message-2"), false)
+            .unwrap();
+        let after_change = store
+            .list_conversations(&account.id, 1, Some(&account_cursor))
+            .unwrap();
+        assert_eq!(after_change.items[0].id, older.id);
+    }
+
+    #[test]
+    fn message_cursor_must_exist_in_the_same_conversation() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "peer", "Peer")
+            .unwrap();
+        let other_conversation = store
+            .ensure_conversation(&account.id, "direct", "other-peer", "Other peer")
+            .unwrap();
+        let other_message = MessageRecord {
+            id: "other-message".into(),
+            account_id: account.id.clone(),
+            conversation_id: other_conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "other-peer".into(),
+            sent_at: 10,
+            received_at: Some(10),
+            text: Some("other".into()),
+            attachments: Vec::new(),
+            status: "delivered",
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&other_message, None, Some("other-message"), false)
+            .unwrap();
+        let other_account = store
+            .upsert_account_from_signal("+15555550101", Some(1))
+            .unwrap();
+
+        assert!(matches!(
+            store.list_messages(&account.id, &conversation.id, 10, Some("unknown-message")),
+            Err(StoreError::InvalidCursor),
+        ));
+        assert!(matches!(
+            store.list_messages(&account.id, &conversation.id, 10, Some("other-message")),
+            Err(StoreError::InvalidCursor),
+        ));
+        assert!(matches!(
+            store.list_messages(
+                &other_account.id,
+                &other_conversation.id,
+                10,
+                Some("other-message"),
+            ),
+            Err(StoreError::InvalidCursor),
+        ));
     }
 
     #[test]
