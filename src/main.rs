@@ -56,7 +56,7 @@ enum CliCommand {
         #[arg(long)]
         state_dir: PathBuf,
     },
-    /// Local packaging / LKG helpers (unsigned development manifests by default).
+    /// Local packaging / LKG helpers (production signatures required by default).
     Package {
         #[command(subcommand)]
         command: PackageCommand,
@@ -125,7 +125,7 @@ enum PackageCommand {
         #[arg(long)]
         bundle_dir: PathBuf,
         #[arg(long, default_value_t = false)]
-        require_signature: bool,
+        allow_unsigned: bool,
         #[arg(long)]
         trusted_key_id: Option<String>,
         #[arg(long)]
@@ -136,7 +136,7 @@ enum PackageCommand {
         #[arg(long)]
         runtime_root: PathBuf,
         #[arg(long, default_value_t = false)]
-        require_signature: bool,
+        allow_unsigned: bool,
         #[arg(long)]
         trusted_key_id: Option<String>,
         #[arg(long)]
@@ -147,7 +147,7 @@ enum PackageCommand {
         #[arg(long)]
         runtime_root: PathBuf,
         #[arg(long, default_value_t = false)]
-        require_signature: bool,
+        allow_unsigned: bool,
         #[arg(long)]
         trusted_key_id: Option<String>,
         #[arg(long)]
@@ -377,13 +377,13 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
             runtime_root,
             version_id,
             bundle_dir,
-            require_signature,
+            allow_unsigned,
             trusted_key_id,
             trusted_public_key_file,
         } => {
             let layout = RuntimeLayout::new(runtime_root);
             let trust =
-                load_optional_trust(require_signature, trusted_key_id, trusted_public_key_file)?;
+                load_optional_trust(allow_unsigned, trusted_key_id, trusted_public_key_file)?;
             let path = if let Some((key_id, key)) = trust.as_ref() {
                 layout.stage_production_bundle(&version_id, &bundle_dir, key_id, key)
             } else {
@@ -395,13 +395,13 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
         }
         PackageCommand::Activate {
             runtime_root,
-            require_signature,
+            allow_unsigned,
             trusted_key_id,
             trusted_public_key_file,
         } => {
             let layout = RuntimeLayout::new(runtime_root);
             let trust =
-                load_optional_trust(require_signature, trusted_key_id, trusted_public_key_file)?;
+                load_optional_trust(allow_unsigned, trusted_key_id, trusted_public_key_file)?;
             let active = if let Some((key_id, key)) = trust.as_ref() {
                 layout.activate_staged_production(key_id, key)
             } else {
@@ -413,13 +413,13 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
         }
         PackageCommand::Rollback {
             runtime_root,
-            require_signature,
+            allow_unsigned,
             trusted_key_id,
             trusted_public_key_file,
         } => {
             let layout = RuntimeLayout::new(runtime_root);
             let trust =
-                load_optional_trust(require_signature, trusted_key_id, trusted_public_key_file)?;
+                load_optional_trust(allow_unsigned, trusted_key_id, trusted_public_key_file)?;
             let active = if let Some((key_id, key)) = trust.as_ref() {
                 layout.rollback_to_lkg_production(key_id, key)
             } else {
@@ -475,19 +475,19 @@ fn parse_license_spec(bundle_dir: &std::path::Path, value: &str) -> Result<Licen
 }
 
 fn load_optional_trust(
-    require_signature: bool,
+    allow_unsigned: bool,
     trusted_key_id: Option<String>,
     trusted_public_key_file: Option<PathBuf>,
 ) -> Result<Option<(String, ed25519_dalek::VerifyingKey)>, String> {
-    if !require_signature {
+    if allow_unsigned {
         if trusted_key_id.is_some() || trusted_public_key_file.is_some() {
-            return Err("trusted key options require --require-signature".into());
+            return Err("trusted key options are not accepted with --allow-unsigned".into());
         }
         return Ok(None);
     }
-    let key_id = trusted_key_id.ok_or("--trusted-key-id is required with --require-signature")?;
+    let key_id = trusted_key_id.ok_or("--trusted-key-id is required unless --allow-unsigned")?;
     let key_path = trusted_public_key_file
-        .ok_or("--trusted-public-key-file is required with --require-signature")?;
+        .ok_or("--trusted-public-key-file is required unless --allow-unsigned")?;
     let key = load_verifying_key(&key_path).map_err(|error| error.to_string())?;
     Ok(Some((key_id, key)))
 }

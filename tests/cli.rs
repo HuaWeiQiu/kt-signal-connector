@@ -136,6 +136,60 @@ fn production_package_commands_generate_sign_and_verify_a_complete_bundle() {
 }
 
 #[test]
+fn package_stage_and_activate_reject_unsigned_bundles_unless_allowed() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    let temp = TempDir::new().unwrap();
+    let bundle = temp.path().join("bundle");
+    for directory in ["bin", "jre"] {
+        fs::create_dir_all(bundle.join(directory)).unwrap();
+    }
+    for (relative, body) in [
+        ("bin/kt-signal-connector", b"connector".as_slice()),
+        ("bin/signal-cli", b"signal-cli".as_slice()),
+        ("jre/release", b"JAVA_VERSION=\"25\"\n".as_slice()),
+    ] {
+        fs::write(bundle.join(relative), body).unwrap();
+    }
+    let manifest = bundle.join("manifest.json");
+    let generated = Command::new(binary)
+        .args(["package", "manifest", "--bundle-dir"])
+        .arg(&bundle)
+        .args(["--bundle-id", "test-unsigned", "--output"])
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{:?}", generated);
+
+    let runtime = temp.path().join("runtime");
+    let stage = |extra: &[&str]| {
+        let mut command = Command::new(binary);
+        command
+            .args(["package", "stage", "--runtime-root"])
+            .arg(&runtime)
+            .args(["--version-id", "v1", "--bundle-dir"])
+            .arg(&bundle)
+            .args(extra);
+        command.output().unwrap()
+    };
+    // Fail-closed: an unsigned bundle is rejected when no flag is passed.
+    assert!(!stage(&[]).status.success());
+    let staged = stage(&["--allow-unsigned"]);
+    assert!(staged.status.success(), "{:?}", staged);
+
+    let activate = |extra: &[&str]| {
+        let mut command = Command::new(binary);
+        command
+            .args(["package", "activate", "--runtime-root"])
+            .arg(&runtime)
+            .args(extra);
+        command.output().unwrap()
+    };
+    assert!(!activate(&[]).status.success());
+    let activated = activate(&["--allow-unsigned"]);
+    assert!(activated.status.success(), "{:?}", activated);
+}
+
+#[test]
 fn serve_requires_exactly_one_bootstrap_secret_source() {
     let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
     let required_args = [

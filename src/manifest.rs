@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,8 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MANIFEST_VERSION: &str = "1.0";
+
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +88,8 @@ pub enum ManifestError {
     Io(#[from] io::Error),
     #[error("manifest is invalid")]
     Invalid,
+    #[error("manifest exceeds the 1 MiB size limit")]
+    TooLarge,
     #[error("artifact hash mismatch for {0}")]
     HashMismatch(String),
     #[error("artifact is missing: {0}")]
@@ -102,6 +106,9 @@ pub enum ManifestError {
 
 impl RuntimeManifest {
     pub fn load(path: &Path) -> Result<Self, ManifestError> {
+        if fs::metadata(path)?.len() > MAX_MANIFEST_BYTES {
+            return Err(ManifestError::TooLarge);
+        }
         let text = fs::read_to_string(path)?;
         let manifest: Self = serde_json::from_str(&text).map_err(|_| ManifestError::Invalid)?;
         manifest.validate()?;
@@ -311,7 +318,7 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey, ManifestError> {
     if bytes.len() != 32 {
         return Err(ManifestError::InvalidKey);
     }
-    let mut key = [0_u8; 32];
+    let mut key = Zeroizing::new([0_u8; 32]);
     key.copy_from_slice(&bytes);
     bytes.zeroize();
     Ok(SigningKey::from_bytes(&key))
@@ -534,10 +541,6 @@ pub fn build_local_unsigned_manifest(
     })
 }
 
-pub fn resolve_under_root(root: &Path, relative: &str) -> PathBuf {
-    root.join(relative)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +670,17 @@ mod tests {
                 &SigningKey::from_bytes(&[8_u8; 32]).verifying_key()
             ),
             Err(ManifestError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn rejects_manifest_over_size_limit() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("manifest.json");
+        fs::write(&path, " ".repeat((MAX_MANIFEST_BYTES + 1) as usize)).unwrap();
+        assert!(matches!(
+            RuntimeManifest::load(&path),
+            Err(ManifestError::TooLarge)
         ));
     }
 

@@ -30,6 +30,7 @@ const RECEIVE_QUEUE_CAPACITY: usize = 256;
 const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
+const MAX_RECEIVE_ID_CHARS: usize = 256;
 const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
 
 #[derive(Clone, Debug)]
@@ -221,7 +222,8 @@ impl EngineHandle {
         receive_ingress: ReceiveIngress,
     ) -> Result<Self, EngineError> {
         if !config.executable.is_absolute()
-            || !std::fs::metadata(&config.executable).is_ok_and(|metadata| metadata.is_file())
+            || !std::fs::symlink_metadata(&config.executable)
+                .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
             || config.java_home.as_ref().is_some_and(|java_home| {
                 !java_home.is_absolute()
                     || !std::fs::symlink_metadata(java_home).is_ok_and(|metadata| {
@@ -624,8 +626,9 @@ async fn handle_upstream_line(
         }
         if method == "receive" {
             let params = object.get("params").ok_or(EngineError::Protocol)?;
-            let normalized = normalize_receive(params)?;
-            receive_ingress.enqueue(normalized).await?;
+            if let Some(normalized) = normalize_receive(params)? {
+                receive_ingress.enqueue(normalized).await?;
+            }
         } else {
             let _ = events.send(EngineEvent::ProtocolWarning {
                 kind: "unknownNotification",
@@ -733,7 +736,24 @@ fn data_message_text(message: &serde_json::Map<String, Value>) -> Option<Normali
         .and_then(normalized_text)
 }
 
-fn normalize_receive(params: &Value) -> Result<NormalizedReceive, EngineError> {
+fn normalize_receive(params: &Value) -> Result<Option<NormalizedReceive>, EngineError> {
+    let normalized = normalize_receive_fields(params)?;
+    // Identifier fields route conversations; an oversized one would exhaust the receive
+    // queue byte budget and fault the engine. Drop the notification instead of
+    // truncating the id (which would misroute) or killing the engine.
+    if normalized
+        .account
+        .iter()
+        .chain(normalized.source.iter())
+        .chain(normalized.group_id.iter())
+        .any(|id| id.chars().count() > MAX_RECEIVE_ID_CHARS)
+    {
+        return Ok(None);
+    }
+    Ok(Some(normalized))
+}
+
+fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineError> {
     let payload = params.get("result").unwrap_or(params);
     let envelope = payload
         .get("envelope")
@@ -947,7 +967,7 @@ mod tests {
                 "dataMessage": { "message": "private text" }
             }
         });
-        let normalized = normalize_receive(&input).unwrap();
+        let normalized = normalize_receive(&input).unwrap().unwrap();
         let encoded = serde_json::to_string(&normalized).unwrap();
         assert_eq!(normalized.timestamp, Some(42));
         assert_eq!(normalized.content_kind, "dataMessage");
@@ -974,7 +994,7 @@ mod tests {
                 "dataMessage": { "message": "a".repeat(MAX_INBOUND_TEXT_BYTES + 1) }
             }
         });
-        let normalized = normalize_receive(&input).unwrap();
+        let normalized = normalize_receive(&input).unwrap().unwrap();
         assert_eq!(
             normalized.text.as_ref().map(String::len),
             Some(MAX_INBOUND_TEXT_PREVIEW_BYTES)
@@ -1031,7 +1051,7 @@ mod tests {
                 }
             }
         });
-        let normalized = normalize_receive(&input).unwrap();
+        let normalized = normalize_receive(&input).unwrap().unwrap();
         assert_eq!(normalized.content_kind, "dataMessage");
         assert_eq!(normalized.direction, "incoming");
         assert_eq!(normalized.text.as_deref(), Some("uuid only"));
@@ -1057,7 +1077,7 @@ mod tests {
                 }
             }
         });
-        let normalized = normalize_receive(&input).unwrap();
+        let normalized = normalize_receive(&input).unwrap().unwrap();
         assert_eq!(normalized.direction, "outgoing");
         assert_eq!(normalized.text.as_deref(), Some("from phone"));
         assert_eq!(normalized.source.as_deref(), Some("+15555550101"));
@@ -1074,6 +1094,7 @@ mod tests {
                 "dataMessage": { "message": "hi" }
             }
         }))
+        .unwrap()
         .unwrap();
         assert_eq!(normalized.peer_name.as_deref(), Some("林菲菲"));
         assert_eq!(normalized.direction, "incoming");
@@ -1088,6 +1109,7 @@ mod tests {
                 "dataMessage": { "timestamp": 50 }
             }
         }))
+        .unwrap()
         .unwrap();
         assert_eq!(empty.direction, "skip");
         assert!(empty.text.is_none());
@@ -1099,6 +1121,7 @@ mod tests {
                 "dataMessage": { "isExpirationUpdate": true }
             }
         }))
+        .unwrap()
         .unwrap();
         assert_eq!(system.direction, "system");
         assert_eq!(system.text.as_deref(), Some("已更新消息定时消失"));
@@ -1110,6 +1133,7 @@ mod tests {
                 "dataMessage": { "sticker": { "packId": "x" } }
             }
         }))
+        .unwrap()
         .unwrap();
         assert_eq!(skip_sticker.direction, "skip");
     }
@@ -1124,8 +1148,104 @@ mod tests {
                 "dataMessage": { "message": "  exact body\n" }
             }
         }))
+        .unwrap()
         .unwrap();
         assert_eq!(normalized.text.as_deref(), Some("  exact body\n"));
         assert_eq!(normalized.text_bytes, Some(13));
+    }
+
+    #[test]
+    fn receive_normalization_drops_oversized_identifier_fields() {
+        let with_group = |group_id: String| {
+            json!({
+                "account": "+15555550100",
+                "envelope": {
+                    "source": "+15555550101",
+                    "timestamp": 42,
+                    "dataMessage": {
+                        "message": "group text",
+                        "groupInfo": { "groupId": group_id }
+                    }
+                }
+            })
+        };
+        assert!(
+            normalize_receive(&with_group("g".repeat(MAX_RECEIVE_ID_CHARS + 1)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            normalize_receive(&with_group("g".repeat(MAX_RECEIVE_ID_CHARS)))
+                .unwrap()
+                .is_some()
+        );
+
+        let oversized_source = json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "s".repeat(MAX_RECEIVE_ID_CHARS + 1),
+                "timestamp": 42,
+                "dataMessage": { "message": "hi" }
+            }
+        });
+        assert!(normalize_receive(&oversized_source).unwrap().is_none());
+
+        let oversized_account = json!({
+            "account": "a".repeat(MAX_RECEIVE_ID_CHARS + 1),
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 42,
+                "dataMessage": { "message": "hi" }
+            }
+        });
+        assert!(normalize_receive(&oversized_account).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_receive_notification_is_dropped_without_faulting() {
+        let (events, _unused) = event_channel();
+        let (ingress, mut receiver) = receive_channel();
+        let mut pending = HashMap::new();
+
+        let oversized = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "account": "+15555550100",
+                "envelope": {
+                    "source": "+15555550101",
+                    "timestamp": 1,
+                    "dataMessage": {
+                        "message": "oversized group",
+                        "groupInfo": { "groupId": "g".repeat(MAX_RECEIVE_ID_CHARS + 1) }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&oversized, &mut pending, &events, &ingress)
+            .await
+            .unwrap();
+
+        let well_formed = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "account": "+15555550100",
+                "envelope": {
+                    "source": "+15555550101",
+                    "timestamp": 2,
+                    "dataMessage": { "message": "after oversized" }
+                }
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&well_formed, &mut pending, &events, &ingress)
+            .await
+            .unwrap();
+
+        let queued = receiver.recv().await.unwrap();
+        assert_eq!(queued.receive().text.as_deref(), Some("after oversized"));
+        assert!(receiver.try_recv().is_err());
     }
 }

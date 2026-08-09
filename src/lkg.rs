@@ -126,16 +126,33 @@ impl RuntimeLayout {
         &self,
         trust: Option<(&str, &VerifyingKey)>,
     ) -> Result<RuntimePointer, LkgError> {
-        let staged = read_pointer(&self.root.join("staged.json"))?
-            .ok_or_else(|| LkgError::NotStaged("staged".into()))?;
+        let staged = match read_pointer(&self.root.join("staged.json"))? {
+            Some(staged) => staged,
+            None => {
+                // Crash replay: activation already completed and staged.json was removed.
+                let active = read_pointer(&self.root.join("active.json"))?
+                    .ok_or_else(|| LkgError::NotStaged("staged".into()))?;
+                verify_version(&self.version_dir(&active.version_id), trust)
+                    .map_err(|_| LkgError::NotStaged("staged".into()))?;
+                return Ok(active);
+            }
+        };
         let version_dir = self.version_dir(&staged.version_id);
         verify_version(&version_dir, trust)
             .map_err(|_| LkgError::NotStaged(staged.version_id.clone()))?;
 
         if let Some(active) = read_pointer(&self.root.join("active.json"))? {
-            let active_dir = self.version_dir(&active.version_id);
-            if verify_version(&active_dir, trust).is_ok() {
-                write_pointer(&self.root.join("lkg.json"), &active.version_id)?;
+            // Crash replay: active already points at the staged version, so the current
+            // LKG is still the real last-known-good and must not be overwritten.
+            if active.version_id != staged.version_id {
+                let active_dir = self.version_dir(&active.version_id);
+                if verify_version(&active_dir, trust).is_ok() {
+                    write_pointer(&self.root.join("lkg.json"), &active.version_id)?;
+                } else {
+                    eprintln!(
+                        "kt-signal-connector: previous active runtime failed verification; keeping existing LKG"
+                    );
+                }
             }
         }
         write_pointer(&self.root.join("active.json"), &staged.version_id)?;
@@ -204,12 +221,31 @@ fn write_pointer(path: &Path, version_id: &str) -> Result<(), LkgError> {
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
+    sync_parent_dir(path)?;
     Ok(())
 }
+
+#[cfg(not(windows))]
+fn sync_parent_dir(path: &Path) -> Result<(), LkgError> {
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_parent_dir(_path: &Path) -> Result<(), LkgError> {
+    Ok(())
+}
+
+const MAX_POINTER_BYTES: u64 = 64 * 1024;
 
 fn read_pointer(path: &Path) -> Result<Option<RuntimePointer>, LkgError> {
     if !path.exists() {
         return Ok(None);
+    }
+    if fs::metadata(path)?.len() > MAX_POINTER_BYTES {
+        return Err(LkgError::InvalidLayout);
     }
     let text = fs::read_to_string(path)?;
     let pointer: RuntimePointer =
@@ -359,6 +395,71 @@ mod tests {
         let rolled = layout.rollback_to_lkg().unwrap();
         assert_eq!(rolled.version_id, "v1");
         assert_eq!(layout.active().unwrap().unwrap().version_id, "v1");
+    }
+
+    #[test]
+    fn repeated_activate_of_the_same_version_is_idempotent() {
+        let temp = TempDir::new().unwrap();
+        let layout = RuntimeLayout::new(temp.path().join("runtime"));
+        let bundle = temp.path().join("bundle");
+        write_bundle(&bundle);
+
+        layout.stage_bundle("v1", &bundle).unwrap();
+        let first = layout.activate_staged().unwrap();
+        assert_eq!(first.version_id, "v1");
+        // staged.json is gone; a repeated activate completes idempotently.
+        let second = layout.activate_staged().unwrap();
+        assert_eq!(second.version_id, "v1");
+        assert!(layout.lkg().unwrap().is_none());
+    }
+
+    #[test]
+    fn replayed_activate_keeps_the_real_lkg() {
+        let temp = TempDir::new().unwrap();
+        let layout = RuntimeLayout::new(temp.path().join("runtime"));
+        let bundle_a = temp.path().join("bundle-a");
+        let bundle_b = temp.path().join("bundle-b");
+        write_bundle(&bundle_a);
+        write_bundle(&bundle_b);
+        fs::write(bundle_b.join("connector.bin"), b"connector-v2").unwrap();
+        let manifest = build_local_unsigned_manifest(
+            &bundle_b,
+            "bundle-2".into(),
+            "0.1.1".into(),
+            "0.14.7".into(),
+            "25".into(),
+            "connector.bin",
+            "signal-cli.bin",
+            "jre.bin",
+        )
+        .unwrap();
+        manifest.save(&bundle_b.join("manifest.json")).unwrap();
+
+        layout.stage_bundle("v1", &bundle_a).unwrap();
+        layout.activate_staged().unwrap();
+        layout.stage_bundle("v2", &bundle_b).unwrap();
+        layout.activate_staged().unwrap();
+        assert_eq!(layout.lkg().unwrap().unwrap().version_id, "v1");
+
+        // Simulate a crash after active.json was written but before staged.json was removed.
+        write_pointer(&layout.root().join("staged.json"), "v2").unwrap();
+        let replayed = layout.activate_staged().unwrap();
+        assert_eq!(replayed.version_id, "v2");
+        assert_eq!(layout.lkg().unwrap().unwrap().version_id, "v1");
+        assert!(layout.staged().unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_pointer_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        let layout = RuntimeLayout::new(temp.path().join("runtime"));
+        layout.ensure().unwrap();
+        fs::write(
+            layout.root().join("active.json"),
+            " ".repeat((MAX_POINTER_BYTES + 1) as usize),
+        )
+        .unwrap();
+        assert!(matches!(layout.active(), Err(LkgError::InvalidLayout)));
     }
 
     #[test]
