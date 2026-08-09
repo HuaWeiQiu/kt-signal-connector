@@ -79,6 +79,27 @@ Prerequisites:
 - Python 3 for the Unix fake-engine integration fixture.
 - A pinned, compatible `signal-cli` and JRE 25 bundle for real integration tests.
 
+### Desktop development setup (one command)
+
+`packaging/scripts/dev-setup.sh` provisions everything the KT Desktop development resolver
+needs: it builds the release connector, downloads the pinned `signal-cli` release (SHA-256
+verified), locates a JRE >= 21, runs the smoke check, and writes the `KT_SIGNAL_*` environment
+variables to `~/.kt-desktop-signal-dev/env.sh`.
+
+```bash
+./packaging/scripts/dev-setup.sh
+source ~/.kt-desktop-signal-dev/env.sh
+# then start the KT Desktop client from the same shell
+```
+
+The script is idempotent and never updates `signal-cli` on its own; upgrades follow
+[`docs/signal-cli-upgrade.md`](docs/signal-cli-upgrade.md).
+
+Platform support: macOS and Linux are verified. On Windows, run the script inside WSL2 —
+native Windows has no test host yet, and the full chain (Desktop spawning the connector, the
+connector spawning `signal-cli.bat`) remains unverified there; do not treat native Windows as
+supported until runtime acceptance has been executed on a Windows machine.
+
 Local checks:
 
 ```bash
