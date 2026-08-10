@@ -24,7 +24,8 @@ unmodified），bundle manifest 逐文件记录 SHA-256。升级 signal-cli 是�
    的协议解析。
 2. **存储格式变更**：账号数据目录格式迁移（一旦迁移，回退旧版本 signal-cli
    可能读不了新数据——rollback 成本变高，要在 §4 灰度时格外小心）。
-3. **JRE 要求变更**：0.14.7 要求 JRE 21+。若新版抬高要求，bundled runtime
+3. **JRE 要求变更**：0.14.7 要求 JRE 25+（实测：class file version 69.0，
+   JRE 21 会报 `UnsupportedClassVersionError`）。若新版抬高要求，bundled runtime
    和 system 解析策略都要同步升，否则 smoke 第 2 步（`--version`）就会挂。
 
 ## 2. 本地验证（新版本二进制）
