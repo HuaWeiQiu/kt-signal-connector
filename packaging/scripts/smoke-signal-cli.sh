@@ -70,10 +70,23 @@ done
 [ "$READY" = 1 ] || fail "daemon socket never appeared; see daemon log"
 
 PROBE_RESPONSE="$(SOCK="$SOCK" python3 - <<'PY'
-import json, os, socket
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(10)
-s.connect(os.environ["SOCK"])
+import json, os, socket, time
+# The socket file can exist before the listener accepts connections; retry
+# briefly instead of failing the whole smoke on that race.
+deadline = time.monotonic() + 10
+last_err = None
+while time.monotonic() < deadline:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(10)
+    try:
+        s.connect(os.environ["SOCK"])
+        break
+    except (ConnectionRefusedError, FileNotFoundError) as exc:
+        last_err = exc
+        s.close()
+        time.sleep(0.2)
+else:
+    raise SystemExit(f"daemon socket never accepted connections: {last_err}")
 s.sendall(b'{"jsonrpc":"2.0","method":"listAccounts","id":1,"params":{}}\n')
 data = b""
 while b"\n" not in data:
