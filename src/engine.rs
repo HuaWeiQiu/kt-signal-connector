@@ -40,6 +40,7 @@ pub struct SignalCliConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
     pub java_home: Option<PathBuf>,
+    pub proxy: Option<SocksProxy>,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -54,6 +55,7 @@ impl SignalCliConfig {
             executable,
             data_dir,
             java_home: None,
+            proxy: None,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
@@ -61,6 +63,65 @@ impl SignalCliConfig {
             watchdog_interval: Duration::from_secs(30),
             watchdog_min_restart_interval: Duration::from_secs(300),
         }
+    }
+}
+
+/// Optional SOCKS proxy for the signal-cli JVM. signal-cli does not read OS
+/// proxy settings, so the only way through a proxied network is injecting
+/// `-DsocksProxyHost/-DsocksProxyPort` into the JVM launch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SocksProxy {
+    pub host: String,
+    pub port: u16,
+}
+
+impl SocksProxy {
+    /// Parse `host:port`. The host must be non-empty, at most 253 bytes, and
+    /// free of whitespace and ':' (no IPv6 literals — JAVA_OPTS is
+    /// whitespace-split by the signal-cli launcher script); the port must be
+    /// 1-65535.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let (host, port) = value
+            .split_once(':')
+            .ok_or_else(|| "proxy must use host:port".to_string())?;
+        if host.is_empty()
+            || host.len() > 253
+            || host.chars().any(|c| c.is_whitespace() || c == ':')
+        {
+            return Err(
+                "proxy host must be non-empty and contain no whitespace or ':'".to_string(),
+            );
+        }
+        let port: u16 = port
+            .parse()
+            .map_err(|_| "proxy port must be a number between 1 and 65535".to_string())?;
+        if port == 0 {
+            return Err("proxy port must be a number between 1 and 65535".to_string());
+        }
+        Ok(Self {
+            host: host.to_string(),
+            port,
+        })
+    }
+}
+
+impl std::str::FromStr for SocksProxy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// JAVA_OPTS passed to the signal-cli launcher: the documented heap budget
+/// plus the SOCKS proxy flags when a proxy is configured.
+fn java_opts(proxy: Option<&SocksProxy>) -> String {
+    match proxy {
+        Some(proxy) => format!(
+            "{SIGNAL_CLI_JAVA_OPTS} -DsocksProxyHost={} -DsocksProxyPort={}",
+            proxy.host, proxy.port
+        ),
+        None => SIGNAL_CLI_JAVA_OPTS.to_string(),
     }
 }
 
@@ -260,7 +321,9 @@ impl EngineHandle {
             .stderr(Stdio::piped())
             // Keep the documented text-runtime heap budget authoritative. Java's global
             // injection variables are removed so a parent shell cannot silently defeat it.
-            .env("JAVA_OPTS", SIGNAL_CLI_JAVA_OPTS)
+            // A configured SOCKS proxy is injected here because signal-cli does not read
+            // OS proxy settings; watchdog restarts reuse the same config unchanged.
+            .env("JAVA_OPTS", java_opts(config.proxy.as_ref()))
             .env_remove("JAVA_TOOL_OPTIONS")
             .env_remove("_JAVA_OPTIONS")
             .env_remove("JDK_JAVA_OPTIONS")
@@ -988,6 +1051,59 @@ pub fn event_channel() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socks_proxy_parse_accepts_host_port() {
+        assert_eq!(
+            SocksProxy::parse("127.0.0.1:1080").unwrap(),
+            SocksProxy {
+                host: "127.0.0.1".into(),
+                port: 1080,
+            }
+        );
+        assert_eq!(SocksProxy::parse("proxy.local:7890").unwrap().port, 7890);
+    }
+
+    #[test]
+    fn socks_proxy_parse_rejects_malformed_values() {
+        for value in [
+            "",
+            "127.0.0.1",
+            "127.0.0.1:",
+            ":1080",
+            "127.0.0.1:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:abc",
+            "127. 0.0.1:1080",
+            "127.0.0.1:1080 ",
+            "::1:1080",
+            "fe80::1:1080",
+        ] {
+            assert!(
+                SocksProxy::parse(value).is_err(),
+                "proxy value must be rejected: {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_opts_only_carry_proxy_flags_when_configured() {
+        assert_eq!(java_opts(None), "-Xms16m -Xmx384m");
+        let proxy = SocksProxy {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        };
+        assert_eq!(
+            java_opts(Some(&proxy)),
+            "-Xms16m -Xmx384m -DsocksProxyHost=127.0.0.1 -DsocksProxyPort=1080"
+        );
+    }
+
+    #[test]
+    fn config_defaults_to_direct_connection() {
+        let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
+        assert_eq!(config.proxy, None);
+    }
 
     #[test]
     fn receive_normalization_does_not_expose_message_or_identity() {

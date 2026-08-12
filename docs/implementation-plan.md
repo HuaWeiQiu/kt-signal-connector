@@ -188,6 +188,11 @@ Rules:
 - read-only requests may be retried under policy; mutating requests are never retried automatically
   after an unknown outcome.
 - child shutdown is graceful first, then forced after a fixed deadline.
+- signal-cli does not read OS proxy settings. An optional SOCKS proxy reaches the JVM as
+  `-DsocksProxyHost/-DsocksProxyPort` appended to the pinned `JAVA_OPTS`; the launcher passes it via
+  the `KT_SIGNAL_SOCKS_PROXY=host:port` environment variable (preferred, so it stays off the process
+  command line) or `serve --socks-proxy host:port`. An invalid value aborts startup with a clear
+  error. The default is a direct connection, and watchdog restarts reuse the same proxy config.
 
 During the local Phase 1 PoC, the trusted launcher supplies absolute executable and data-directory
 paths as process arguments; neither is accepted over host IPC. Phase 3 replaces this bootstrap with

@@ -222,3 +222,40 @@ fn serve_requires_exactly_one_bootstrap_secret_source() {
         .expect("connector binary should reject conflicting secret sources");
     assert_eq!(conflicting.status.code(), Some(2));
 }
+
+#[test]
+fn serve_rejects_an_invalid_socks_proxy_before_starting() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    let required_args = [
+        "serve",
+        "--endpoint",
+        "unused-endpoint",
+        "--bootstrap-secret-stdin",
+        "--signal-cli",
+        "unused-signal-cli",
+        "--signal-data-dir",
+        "unused-signal-data",
+        "--state-dir",
+        "unused-state",
+    ];
+
+    // Environment variable form (the path Desktop uses).
+    let from_env = Command::new(binary)
+        .args(required_args)
+        .env("KT_SIGNAL_SOCKS_PROXY", "not a proxy")
+        .output()
+        .expect("connector binary should reject an invalid proxy env value");
+    assert_eq!(from_env.status.code(), Some(2));
+    let stderr = String::from_utf8(from_env.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("host:port"), "unexpected error: {stderr}");
+
+    // Explicit flag form, missing port.
+    let from_flag = Command::new(binary)
+        .args(required_args)
+        .args(["--socks-proxy", "127.0.0.1"])
+        .output()
+        .expect("connector binary should reject an invalid proxy flag value");
+    assert_eq!(from_flag.status.code(), Some(2));
+    let stderr = String::from_utf8(from_flag.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("host:port"), "unexpected error: {stderr}");
+}

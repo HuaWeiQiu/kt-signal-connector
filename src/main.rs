@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kt_signal_connector::auth::{load_bootstrap_secret, load_bootstrap_secret_from_reader};
+use kt_signal_connector::engine::SocksProxy;
 use kt_signal_connector::host::serve;
 use kt_signal_connector::ipc::LocalListener;
 #[cfg(windows)]
@@ -51,6 +52,11 @@ enum CliCommand {
         signal_cli: PathBuf,
         #[arg(long)]
         java_home: Option<PathBuf>,
+        /// SOCKS proxy for the signal-cli JVM as host:port (env:
+        /// KT_SIGNAL_SOCKS_PROXY, preferred so it stays off the process
+        /// command line).
+        #[arg(long, env = "KT_SIGNAL_SOCKS_PROXY", value_name = "HOST:PORT")]
+        socks_proxy: Option<SocksProxy>,
         #[arg(long)]
         signal_data_dir: PathBuf,
         #[arg(long)]
@@ -173,6 +179,7 @@ struct ServeOptions {
     parent_pid: Option<u32>,
     signal_cli: PathBuf,
     java_home: Option<PathBuf>,
+    socks_proxy: Option<SocksProxy>,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -188,6 +195,7 @@ async fn main() {
             parent_pid,
             signal_cli,
             java_home,
+            socks_proxy,
             signal_data_dir,
             state_dir,
         } => serve_command(ServeOptions {
@@ -197,6 +205,7 @@ async fn main() {
             parent_pid,
             signal_cli,
             java_home,
+            socks_proxy,
             signal_data_dir,
             state_dir,
         })
@@ -218,6 +227,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         parent_pid,
         signal_cli,
         java_home,
+        socks_proxy,
         signal_data_dir,
         state_dir,
     } = options;
@@ -249,7 +259,13 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         harden_private_directory(&state_dir)?;
     }
     let listener = LocalListener::bind(&endpoint)?;
-    let supervisor = open_supervisor(signal_cli, signal_data_dir, state_dir, java_home)?;
+    let supervisor = open_supervisor(
+        signal_cli,
+        signal_data_dir,
+        state_dir,
+        java_home,
+        socks_proxy,
+    )?;
     #[cfg(windows)]
     {
         let parent_pid = parent_pid.expect("validated Windows parent PID");

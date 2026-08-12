@@ -1293,10 +1293,12 @@ pub fn open_supervisor(
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
     java_home: Option<PathBuf>,
+    proxy: Option<crate::engine::SocksProxy>,
 ) -> Result<Arc<RuntimeSupervisor>, StoreError> {
     let store = Store::open(&state_dir)?;
     let mut config = SignalCliConfig::new(signal_cli, signal_data_dir);
     config.java_home = java_home;
+    config.proxy = proxy;
     let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
     supervisor.spawn_watchdog();
     Ok(supervisor)

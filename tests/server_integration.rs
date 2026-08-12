@@ -723,6 +723,61 @@ async fn contacts_sync_list_and_send_by_peer() {
 }
 
 #[tokio::test]
+async fn socks_proxy_env_is_forwarded_to_the_jvm() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [13_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // The fixture exits 91 immediately unless JAVA_OPTS carries exactly the
+    // heap budget plus the SOCKS proxy flags.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_SIGNAL_SOCKS_PROXY", "127.0.0.1:11080")
+        .env(
+            "KT_FAKE_EXPECT_JAVA_OPTS",
+            "-Xms16m -Xmx384m -DsocksProxyHost=127.0.0.1 -DsocksProxyPort=11080",
+        );
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    // A proxy-flag mismatch kills the fixture at JVM launch; a live answer
+    // after a settle delay proves the exact JAVA_OPTS reached the child.
+    sleep(Duration::from_millis(200)).await;
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    assert!(accounts.get("result").is_some());
+
+    drop(client);
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
 async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
