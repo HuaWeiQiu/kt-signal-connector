@@ -16,11 +16,12 @@ use crate::engine::{
 };
 use crate::protocol::ApiError;
 use crate::service::{
-    ConnectorService, HostSideEvent, PreparedSend, ServiceError,
-    validate_account_delete_operation_id,
+    ConnectorService, ContactsSyncOutcome, HostSideEvent, PeerTarget, PreparedSend, SendTarget,
+    ServiceError, validate_account_delete_operation_id,
 };
 use crate::store::{
-    AccountDeletePlan, AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
+    AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
+    Store, StoreError,
 };
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
@@ -29,6 +30,41 @@ const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
 const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
 const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
 const WATCHDOG_MAX_PING_FAILURES: u32 = 2;
+/// Maximum deferred (pending) restarts per failure episode before giving up.
+const WATCHDOG_MAX_PENDING_RETRIES: u32 = 3;
+
+/// What raised a restart request. Drives whether ping recovery may clear a
+/// pending restart: the REST ping says nothing about the receive WebSocket,
+/// so only an executed restart clears a stderr-sourced pending.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartSource {
+    Stderr,
+    Ping,
+}
+
+impl std::fmt::Display for RestartSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestartSource::Stderr => write!(f, "stderr"),
+            RestartSource::Ping => write!(f, "ping"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRestart {
+    source: RestartSource,
+    reason: &'static str,
+}
+
+/// One failure episode: restarts performed since the first trigger, and the
+/// last trigger time. A trigger-free gap longer than one throttle window
+/// resets the budget.
+#[derive(Default)]
+struct WatchdogEpisode {
+    restarts: u32,
+    last_trigger: Option<Instant>,
+}
 
 pub struct RuntimeSupervisor {
     config: SignalCliConfig,
@@ -399,6 +435,12 @@ impl RuntimeSupervisor {
                 }
             }
         }
+        // Best-effort initial contacts/groups sync right after link: signal-cli
+        // has already pulled them from the primary device, so this only reads
+        // them into the local cache. A failure must not fail the link flow.
+        if let Err(error) = self.sync_contacts(&account.id).await {
+            eprintln!("kt-signal-connector: initial contacts sync after link failed: {error}");
+        }
         let _ = self
             .host_events
             .send(HostSideEvent::AccountChanged(account.clone()));
@@ -450,6 +492,19 @@ impl RuntimeSupervisor {
         let mut stderr_pid: Option<u32> = None;
         let mut ping_failures = 0u32;
         let mut last_restart: Option<Instant> = None;
+        // A restart request that arrived inside the throttle window. It must
+        // not be dropped: a dead receive WebSocket produces no further stderr
+        // lines, and the REST ping (getUserStatus) does not cover the receive
+        // channel at all — a known structural blind spot. The pending retry is
+        // the only backstop for "can send but cannot receive".
+        let mut pending: Option<PendingRestart> = None;
+        // Bounded retry budget per failure episode: the first ("initial")
+        // restart plus at most WATCHDOG_MAX_PENDING_RETRIES further restarts.
+        // Once the budget is spent the watchdog gives up until the engine
+        // stays trigger-free for longer than one throttle window, which
+        // resets the episode. This caps restart churn when the network is
+        // genuinely dead and triggers keep arriving.
+        let mut episode = WatchdogEpisode::default();
         loop {
             let engine = self.engine.lock().await.clone();
             let current_pid = engine.as_ref().and_then(|e| e.status().pid);
@@ -466,8 +521,11 @@ impl RuntimeSupervisor {
                         Some(line) => {
                             if is_receive_fatal_stderr(&line)
                                 && self
-                                    .watchdog_restart(
+                                    .watchdog_request_restart(
                                         &mut last_restart,
+                                        &mut pending,
+                                        &mut episode,
+                                        RestartSource::Stderr,
                                         "receive WebSocket error on stderr",
                                     )
                                     .await
@@ -484,6 +542,43 @@ impl RuntimeSupervisor {
                     }
                 }
                 _ = ticker.tick() => {
+                    // Episode reset: no trigger for longer than one throttle
+                    // window means the engine is considered healthy again.
+                    if pending.is_none()
+                        && let Some(last_trigger) = episode.last_trigger
+                        && last_trigger.elapsed() > self.config.watchdog_min_restart_interval
+                    {
+                        episode = WatchdogEpisode::default();
+                    }
+                    // A deferred restart fires as soon as the throttle window
+                    // has passed. While a link flow is active it stays pending:
+                    // restarting would invalidate an in-flight deviceLinkUri.
+                    if let Some(deferred) = pending
+                        && !self.restart_throttled(&last_restart)
+                        && !self.link_flow_active().await
+                    {
+                        if episode.restarts > WATCHDOG_MAX_PENDING_RETRIES {
+                            eprintln!(
+                                "kt-signal-connector: watchdog giving up on pending restart (give-up: {}; episode retry budget exhausted)",
+                                deferred.reason
+                            );
+                            pending = None;
+                        } else {
+                            eprintln!(
+                                "kt-signal-connector: watchdog restarting signal-cli engine (pending-retry {}: {})",
+                                episode.restarts,
+                                deferred.reason
+                            );
+                            if self.restart_engine().await.is_ok() {
+                                last_restart = Some(Instant::now());
+                                episode.restarts += 1;
+                                pending = None;
+                                ping_failures = 0;
+                                stderr_rx = None;
+                                stderr_pid = None;
+                            }
+                        }
+                    }
                     let Some(engine) = engine.filter(|e| !e.is_terminal()) else {
                         continue;
                     };
@@ -502,13 +597,28 @@ impl RuntimeSupervisor {
                         )
                         .await;
                     match ping {
-                        Ok(_) => ping_failures = 0,
+                        Ok(_) => {
+                            ping_failures = 0;
+                            // Ping recovery clears only a ping-sourced pending
+                            // restart. A stderr-sourced one survives: REST
+                            // liveness does not prove the receive WebSocket is
+                            // alive (the blind spot above).
+                            if pending.is_some_and(|p| p.source == RestartSource::Ping) {
+                                eprintln!(
+                                    "kt-signal-connector: watchdog pending restart cleared (receive liveness ping recovered)"
+                                );
+                                pending = None;
+                            }
+                        }
                         Err(_) => {
                             ping_failures += 1;
                             if ping_failures >= WATCHDOG_MAX_PING_FAILURES
                                 && self
-                                    .watchdog_restart(
+                                    .watchdog_request_restart(
                                         &mut last_restart,
+                                        &mut pending,
+                                        &mut episode,
+                                        RestartSource::Ping,
                                         "receive liveness ping failed repeatedly",
                                     )
                                     .await
@@ -522,6 +632,15 @@ impl RuntimeSupervisor {
                 }
             }
         }
+    }
+
+    fn restart_throttled(&self, last_restart: &Option<Instant>) -> bool {
+        last_restart.is_some_and(|last| last.elapsed() < self.config.watchdog_min_restart_interval)
+    }
+
+    async fn link_flow_active(&self) -> bool {
+        self.active_link_finish.lock().await.is_some()
+            || self.service.lock().await.has_pending_link()
     }
 
     /// Ping target account, or None when pinging/restarting is unsafe: engine not
@@ -538,28 +657,67 @@ impl RuntimeSupervisor {
         service.any_signal_account_number().ok().flatten()
     }
 
-    /// Restart after a watchdog trigger. Returns true when a restart happened.
-    /// Suppressed while a link flow is active and throttled so a genuinely dead
-    /// network cannot spin the JVM in a restart loop. Logs carry no phone numbers.
-    async fn watchdog_restart(&self, last_restart: &mut Option<Instant>, reason: &str) -> bool {
-        if self.active_link_finish.lock().await.is_some()
-            || self.service.lock().await.has_pending_link()
+    /// Handle a watchdog restart trigger. Executes immediately unless a link
+    /// flow is active (suppressed) or the throttle window is still open — in
+    /// which case the request is recorded as pending instead of being dropped.
+    /// Restarts within one failure episode are bounded: the initial restart
+    /// plus at most WATCHDOG_MAX_PENDING_RETRIES retries; beyond that the
+    /// trigger is logged as give-up. Any executed restart also satisfies an
+    /// outstanding pending request. Returns true only when a restart happened
+    /// now. Logs carry no phone numbers.
+    async fn watchdog_request_restart(
+        &self,
+        last_restart: &mut Option<Instant>,
+        pending: &mut Option<PendingRestart>,
+        episode: &mut WatchdogEpisode,
+        source: RestartSource,
+        reason: &'static str,
+    ) -> bool {
+        // A quiet gap longer than one throttle window starts a fresh episode
+        // with a full retry budget.
+        if let Some(last_trigger) = episode.last_trigger
+            && last_trigger.elapsed() > self.config.watchdog_min_restart_interval
         {
+            episode.restarts = 0;
+        }
+        episode.last_trigger = Some(Instant::now());
+
+        if self.link_flow_active().await {
             eprintln!(
                 "kt-signal-connector: watchdog restart suppressed ({reason}); link in progress"
             );
             return false;
         }
-        if let Some(last) = last_restart
-            && last.elapsed() < self.config.watchdog_min_restart_interval
-        {
-            eprintln!("kt-signal-connector: watchdog restart throttled ({reason})");
+        if episode.restarts > WATCHDOG_MAX_PENDING_RETRIES {
+            eprintln!(
+                "kt-signal-connector: watchdog giving up (give-up: {reason}); episode retry budget exhausted"
+            );
             return false;
         }
-        eprintln!("kt-signal-connector: watchdog restarting signal-cli engine ({reason})");
+        if self.restart_throttled(last_restart) {
+            // stderr outranks ping: only an executed restart clears a
+            // stderr-sourced pending, while a ping-sourced one may also be
+            // cleared by ping recovery.
+            match pending {
+                Some(p) if p.source == RestartSource::Stderr => {}
+                _ => *pending = Some(PendingRestart { source, reason }),
+            }
+            eprintln!(
+                "kt-signal-connector: watchdog restart throttled ({reason}); recorded as pending ({source})"
+            );
+            return false;
+        }
+        let label = if episode.restarts == 0 {
+            "initial".to_string()
+        } else {
+            format!("pending-retry {}", episode.restarts)
+        };
+        eprintln!("kt-signal-connector: watchdog restarting signal-cli engine ({label}: {reason})");
         match self.restart_engine().await {
             Ok(()) => {
                 *last_restart = Some(Instant::now());
+                episode.restarts += 1;
+                *pending = None;
                 true
             }
             Err(_) => false,
@@ -746,19 +904,47 @@ impl RuntimeSupervisor {
     pub async fn send_text(
         &self,
         account_id: String,
-        conversation_id: String,
+        target: SendTarget,
         text: String,
         client_request_id: String,
         quote_message_id: Option<String>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
-        let prepared = self.service.lock().await.prepare_send_text(
-            &account_id,
-            &conversation_id,
-            &text,
-            &client_request_id,
-            quote_message_id.as_deref(),
-        )?;
+        let prepared = {
+            let service = self.service.lock().await;
+            match &target {
+                SendTarget::Conversation(conversation_id) => service.prepare_send_text(
+                    &account_id,
+                    conversation_id,
+                    &text,
+                    &client_request_id,
+                    quote_message_id.as_deref(),
+                )?,
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => service.prepare_send_text_to_peer(
+                    &account_id,
+                    &PeerTarget {
+                        kind,
+                        peer_key,
+                        peer_title: peer_title.as_deref(),
+                    },
+                    &text,
+                    &client_request_id,
+                    quote_message_id.as_deref(),
+                )?,
+            }
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
+    async fn dispatch_prepared(
+        &self,
+        engine: &EngineHandle,
+        prepared: PreparedSend,
+    ) -> Result<MessageRecord, ServiceError> {
         match prepared {
             PreparedSend::Existing(message) => Ok(message),
             PreparedSend::Dispatch {
@@ -804,6 +990,132 @@ impl RuntimeSupervisor {
                 }
             },
         }
+    }
+
+    /// Read-only view of the contacts cache; never triggers an upstream call.
+    pub async fn list_contacts(
+        &self,
+        account_id: String,
+        query: Option<String>,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Page<ContactSummary>, ServiceError> {
+        self.service.lock().await.list_contacts(
+            &account_id,
+            query.as_deref(),
+            limit,
+            cursor.as_deref(),
+        )
+    }
+
+    /// Pull the contacts/groups signal-cli already synced from the primary
+    /// device into the local cache. Both calls are ReadOnly on the single JVM
+    /// queue, so they cannot starve or corrupt mutating sends. A successful
+    /// sync less than 60s old short-circuits to the cached counts.
+    pub async fn sync_contacts(
+        &self,
+        account_id: &str,
+    ) -> Result<ContactsSyncOutcome, ServiceError> {
+        let now_ms = crate::link::now_ms();
+        {
+            let service = self.service.lock().await;
+            if let Some(synced_at) = service.contacts_synced_at(account_id)? {
+                if now_ms.saturating_sub(synced_at) < 60_000 {
+                    let (contact_count, group_count) = service.count_contacts(account_id)?;
+                    return Ok(ContactsSyncOutcome {
+                        contact_count,
+                        group_count,
+                        synced_at,
+                    });
+                }
+            }
+        }
+        let number = self
+            .service
+            .lock()
+            .await
+            .account_signal_number(account_id)?;
+        let engine = self.running_engine().await?;
+        // Contacts registered on the account only (no allRecipients walk).
+        let contacts_result = engine
+            .call(
+                "listContacts",
+                json!({ "account": number }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        let groups_result = engine
+            .call(
+                "listGroups",
+                json!({ "account": number }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+
+        let mut synced: Vec<(String, String, String, Option<String>)> = Vec::new();
+        let mut contact_count = 0_u64;
+        let mut group_count = 0_u64;
+        for item in contacts_result.as_array().cloned().unwrap_or_default() {
+            let peer_key = ["number", "uuid", "numberUuid"]
+                .iter()
+                .find_map(|field| item.get(field).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            let Some(peer_key) = peer_key else {
+                continue;
+            };
+            let title = compose_contact_display_name(&item)
+                .unwrap_or_else(|| crate::ids::mask_address(peer_key));
+            synced.push(("contact".to_string(), peer_key.to_string(), title, None));
+            contact_count += 1;
+        }
+        for item in groups_result.as_array().cloned().unwrap_or_default() {
+            // Only groups the linked account is still a member of.
+            if item.get("isMember").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            let Some(peer_key) = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let title = item
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.chars().take(64).collect::<String>())
+                .unwrap_or_else(|| "group".to_string());
+            let extra = item
+                .get("members")
+                .and_then(Value::as_array)
+                .map(|members| json!({ "memberCount": members.len() }).to_string());
+            synced.push(("group".to_string(), peer_key.to_string(), title, extra));
+            group_count += 1;
+        }
+
+        let service = self.service.lock().await;
+        for (kind, peer_key, title, extra) in synced {
+            service.upsert_synced_contact(
+                account_id,
+                &kind,
+                &peer_key,
+                &title,
+                extra.as_deref(),
+                now_ms,
+            )?;
+        }
+        service.set_contacts_synced_at(account_id, now_ms)?;
+        Ok(ContactsSyncOutcome {
+            contact_count,
+            group_count,
+            synced_at: now_ms,
+        })
     }
 }
 

@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 200;
@@ -87,6 +87,15 @@ pub struct MessageRecord {
     pub client_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactSummary {
+    pub id: String,
+    pub kind: &'static str,
+    pub peer_key: String,
+    pub title: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -200,6 +209,19 @@ impl Store {
             CREATE UNIQUE INDEX IF NOT EXISTS account_delete_one_pending_per_account
               ON account_delete_operations(account_id)
               WHERE state != 'completed';
+            CREATE TABLE IF NOT EXISTS contacts (
+              id TEXT PRIMARY KEY,
+              account_id TEXT NOT NULL,
+              kind TEXT NOT NULL CHECK(kind IN ('contact', 'group')),
+              peer_key TEXT NOT NULL,
+              title TEXT NOT NULL,
+              extra TEXT,
+              synced_at INTEGER NOT NULL,
+              UNIQUE(account_id, kind, peer_key),
+              FOREIGN KEY(account_id) REFERENCES accounts(id)
+            );
+            CREATE INDEX IF NOT EXISTS contacts_account_peer
+              ON contacts(account_id, kind, peer_key);
             ",
         )
         .map_err(|_| StoreError::Unavailable)?;
@@ -479,6 +501,18 @@ impl Store {
                 .execute(
                     "DELETE FROM conversations WHERE account_id=?1",
                     params![account_id],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            transaction
+                .execute(
+                    "DELETE FROM contacts WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            transaction
+                .execute(
+                    "DELETE FROM meta WHERE key=?1",
+                    params![format!("contacts_synced_at:{account_id}")],
                 )
                 .map_err(|_| StoreError::Unavailable)?;
             transaction
@@ -1120,6 +1154,158 @@ impl Store {
             .optional()
             .map_err(|_| StoreError::Unavailable)
     }
+
+    /// Cache one synced contact/group entry. `kind` is 'contact' or 'group';
+    /// `extra` is an optional JSON marker (e.g. member count) kept opaque.
+    pub fn upsert_contact(
+        &self,
+        account_id: &str,
+        kind: &str,
+        peer_key: &str,
+        title: &str,
+        extra: Option<&str>,
+        synced_at: u64,
+    ) -> Result<(), StoreError> {
+        let id = stable_hash_id(&[account_id, kind, peer_key]);
+        self.conn
+            .execute(
+                "INSERT INTO contacts(id, account_id, kind, peer_key, title, extra, synced_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(account_id, kind, peer_key) DO UPDATE SET
+                   title=excluded.title,
+                   extra=excluded.extra,
+                   synced_at=excluded.synced_at",
+                params![
+                    id,
+                    account_id,
+                    kind,
+                    peer_key,
+                    title,
+                    extra,
+                    synced_at as i64
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Read-only paged view of the contacts cache, ordered by (kind, peer_key).
+    /// `query` is an optional case-insensitive substring filter over title/peer_key.
+    pub fn list_contacts(
+        &self,
+        account_id: &str,
+        query: Option<&str>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Page<ContactSummary>, StoreError> {
+        let limit = limit.clamp(1, MAX_PAGE_LIMIT);
+        let fetch = limit + 1;
+        let decoded = cursor
+            .map(|value| decode_contact_cursor(value, account_id))
+            .transpose()?;
+        let cursor_present = i64::from(decoded.is_some());
+        let cursor_kind = decoded.as_ref().map(|value| value.0.as_str());
+        let cursor_peer_key = decoded.as_ref().map(|value| value.1.as_str());
+        let like = query.map(escape_like);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, kind, peer_key, title
+                 FROM contacts
+                 WHERE account_id=?1
+                   AND (
+                     ?2 IS NULL
+                     OR title LIKE '%'||?2||'%' ESCAPE '\\'
+                     OR peer_key LIKE '%'||?2||'%' ESCAPE '\\'
+                   )
+                   AND (
+                     ?3=0
+                     OR kind > ?4
+                     OR (kind = ?4 AND peer_key > ?5)
+                   )
+                 ORDER BY kind ASC, peer_key ASC
+                 LIMIT ?6",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    account_id,
+                    like,
+                    cursor_present,
+                    cursor_kind,
+                    cursor_peer_key,
+                    fetch as i64,
+                ],
+                |row| {
+                    Ok(ContactSummary {
+                        id: row.get(0)?,
+                        kind: static_contact_kind(row.get::<_, String>(1)?),
+                        peer_key: row.get(2)?,
+                        title: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut items = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::Unavailable)?;
+        let next_cursor = if items.len() as u32 > limit {
+            items.truncate(limit as usize);
+            items
+                .last()
+                .map(|item| encode_contact_cursor(account_id, item))
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    /// (contact_count, group_count) currently cached for the account.
+    pub fn count_contacts(&self, account_id: &str) -> Result<(u64, u64), StoreError> {
+        self.conn
+            .query_row(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN kind='contact' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN kind='group' THEN 1 ELSE 0 END), 0)
+                 FROM contacts WHERE account_id=?1",
+                params![account_id],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )
+            .map_err(|_| StoreError::Unavailable)
+    }
+
+    /// unix ms of the last successful contacts sync (meta-backed; survives restarts).
+    pub fn contacts_synced_at(&self, account_id: &str) -> Result<Option<u64>, StoreError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                params![format!("contacts_synced_at:{account_id}")],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(value.and_then(|value| value.parse::<u64>().ok()))
+    }
+
+    pub fn set_contacts_synced_at(
+        &self,
+        account_id: &str,
+        synced_at: u64,
+    ) -> Result<(), StoreError> {
+        self.conn
+            .execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![
+                    format!("contacts_synced_at:{account_id}"),
+                    synced_at.to_string()
+                ],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        Ok(())
+    }
 }
 
 fn prune_completed_account_deletes(
@@ -1145,6 +1331,42 @@ fn encode_conversation_cursor(account_id: &str, item: &ConversationSummary) -> S
         Some(last_message_at) => format!("v2:{account_id}:0:{last_message_at}:{}", item.id),
         None => format!("v2:{account_id}:1:0:{}", item.id),
     }
+}
+
+fn encode_contact_cursor(account_id: &str, item: &ContactSummary) -> String {
+    format!("c1:{account_id}:{}:{}", item.kind, item.peer_key)
+}
+
+fn decode_contact_cursor(
+    cursor: &str,
+    expected_account_id: &str,
+) -> Result<(String, String), StoreError> {
+    let mut parts = cursor.splitn(4, ':');
+    if parts.next() != Some("c1") {
+        return Err(StoreError::InvalidCursor);
+    }
+    let account_id = parts.next().ok_or(StoreError::InvalidCursor)?;
+    if account_id != expected_account_id {
+        return Err(StoreError::InvalidCursor);
+    }
+    let kind = parts.next().ok_or(StoreError::InvalidCursor)?;
+    if kind != "contact" && kind != "group" {
+        return Err(StoreError::InvalidCursor);
+    }
+    // Peer keys (numbers, uuids, base64 group ids) never contain ':'; splitn
+    // keeps any tail intact regardless.
+    let peer_key = parts.next().ok_or(StoreError::InvalidCursor)?;
+    if peer_key.is_empty() || peer_key.len() > 128 {
+        return Err(StoreError::InvalidCursor);
+    }
+    Ok((kind.to_string(), peer_key.to_string()))
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn decode_conversation_cursor(
@@ -1245,6 +1467,8 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|_| StoreError::Unavailable)?;
         }
     }
+    // Schema 5 adds the contacts cache table; it is created via
+    // CREATE TABLE IF NOT EXISTS above, so no data migration is needed.
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1291,6 +1515,13 @@ fn static_kind(value: String) -> &'static str {
     match value.as_str() {
         "group" => "group",
         _ => "direct",
+    }
+}
+
+fn static_contact_kind(value: String) -> &'static str {
+    match value.as_str() {
+        "group" => "group",
+        _ => "contact",
     }
 }
 
@@ -1993,5 +2224,145 @@ mod tests {
             Store::open(temp.path()),
             Err(StoreError::Unavailable)
         ));
+    }
+
+    fn open_store_with_contacts(temp: &TempDir) -> (Store, AccountSummary) {
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Alice", None, 10)
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "+15555550102", "Bob", None, 10)
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "ZmFrZS1ncm91cA==",
+                "Fixture Group",
+                Some("{\"memberCount\":3}"),
+                10,
+            )
+            .unwrap();
+        (store, account)
+    }
+
+    #[test]
+    fn contacts_upsert_list_filter_and_paginate() {
+        let temp = TempDir::new().unwrap();
+        let (store, account) = open_store_with_contacts(&temp);
+
+        // Upsert refreshes the title without duplicating the entry.
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Alice A.", None, 11)
+            .unwrap();
+        assert_eq!(store.count_contacts(&account.id).unwrap(), (2, 1));
+
+        let page = store.list_contacts(&account.id, None, 10, None).unwrap();
+        assert_eq!(page.items.len(), 3);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.items[0].kind, "contact");
+        assert_eq!(page.items[0].peer_key, "+15555550101");
+        assert_eq!(page.items[0].title, "Alice A.");
+        assert_eq!(page.items[2].kind, "group");
+        assert_eq!(page.items[2].title, "Fixture Group");
+
+        let filtered = store
+            .list_contacts(&account.id, Some("alice"), 10, None)
+            .unwrap();
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].peer_key, "+15555550101");
+        // LIKE metacharacters in the query are literal, not wildcards.
+        assert!(
+            store
+                .list_contacts(&account.id, Some("%"), 10, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        let first = store.list_contacts(&account.id, None, 1, None).unwrap();
+        assert_eq!(first.items.len(), 1);
+        let cursor = first.next_cursor.clone().unwrap();
+        let rest = store
+            .list_contacts(&account.id, None, 10, Some(&cursor))
+            .unwrap();
+        assert_eq!(rest.items.len(), 2);
+        assert!(rest.next_cursor.is_none());
+        assert!(rest.items.iter().all(|item| item.id != first.items[0].id));
+
+        assert!(matches!(
+            store.list_contacts(&account.id, None, 10, Some("bogus")),
+            Err(StoreError::InvalidCursor)
+        ));
+        assert!(matches!(
+            store.list_contacts(&account.id, None, 10, Some("c1:other-account:contact:+1")),
+            Err(StoreError::InvalidCursor)
+        ));
+    }
+
+    #[test]
+    fn contacts_synced_at_marker_roundtrips() {
+        let temp = TempDir::new().unwrap();
+        let (store, account) = open_store_with_contacts(&temp);
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), None);
+        store.set_contacts_synced_at(&account.id, 123).unwrap();
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), Some(123));
+        store.set_contacts_synced_at(&account.id, 456).unwrap();
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), Some(456));
+    }
+
+    #[test]
+    fn contacts_are_deleted_with_the_account() {
+        let temp = TempDir::new().unwrap();
+        let (mut store, account) = open_store_with_contacts(&temp);
+        store.set_contacts_synced_at(&account.id, 10).unwrap();
+        assert!(store.delete_account_cascade(&account.id).unwrap());
+        assert_eq!(store.count_contacts(&account.id).unwrap(), (0, 0));
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), None);
+        assert!(
+            store
+                .list_contacts(&account.id, None, 10, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn schema_v4_upgrade_creates_contacts_table_before_advancing_version() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE contacts;
+                 UPDATE meta SET value='4' WHERE key='schema_version';",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(temp.path()).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contacts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        let version: i64 = store
+            .conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 }

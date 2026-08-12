@@ -20,13 +20,20 @@ fn fixture() -> PathBuf {
 }
 
 fn watchdog_supervisor(temp: &TempDir) -> (Arc<RuntimeSupervisor>, PathBuf) {
+    watchdog_supervisor_with_throttle(temp, Duration::ZERO)
+}
+
+fn watchdog_supervisor_with_throttle(
+    temp: &TempDir,
+    min_restart_interval: Duration,
+) -> (Arc<RuntimeSupervisor>, PathBuf) {
     let store = Store::open(temp.path()).unwrap();
     let data_dir = temp.path().join("signal-data");
     let mut config = SignalCliConfig::new(fixture(), data_dir.clone());
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.watchdog_interval = Duration::from_millis(50);
-    config.watchdog_min_restart_interval = Duration::ZERO;
+    config.watchdog_min_restart_interval = min_restart_interval;
     let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
     supervisor.spawn_watchdog();
     (supervisor, data_dir)
@@ -118,5 +125,95 @@ async fn watchdog_leaves_a_healthy_engine_alone() {
     // Several watchdog ticks with successful pings: no restart.
     sleep(Duration::from_millis(500)).await;
     assert_eq!(supervisor.status().await.pid, Some(pid_before));
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A restart request landing inside the throttle window must not be dropped:
+/// the fixture keeps reporting a dead receive WebSocket, so the second trigger
+/// becomes pending and fires as soon as the window passes (pid changes again).
+#[tokio::test]
+async fn throttled_stderr_restart_is_retried_after_the_throttle_window() {
+    let temp = TempDir::new().unwrap();
+    let (supervisor, data_dir) =
+        watchdog_supervisor_with_throttle(&temp, Duration::from_millis(1000));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let marker = data_dir.join(".fixture-stderr-websocket-error");
+    std::fs::write(&marker, "").unwrap();
+
+    let pid_a = supervisor.start().await.unwrap().pid.unwrap();
+    // First stderr report: immediate ("initial") restart.
+    let pid_b = wait_for_pid_change(&supervisor, pid_a).await;
+    // The restarted engine reports the dead WebSocket again inside the
+    // throttle window; the request goes pending and is retried after it.
+    let pid_c = wait_for_pid_change(&supervisor, pid_b).await;
+    assert_ne!(pid_c, pid_b);
+
+    std::fs::remove_file(&marker).unwrap();
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A ping-sourced pending restart is cancelled when pings recover inside the
+/// throttle window: REST liveness recovering means the ping concern is gone.
+#[tokio::test]
+async fn ping_pending_restart_is_cleared_when_pings_recover() {
+    let temp = TempDir::new().unwrap();
+    {
+        let seed = Store::open(temp.path()).unwrap();
+        seed.upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+    }
+    let (supervisor, data_dir) =
+        watchdog_supervisor_with_throttle(&temp, Duration::from_millis(1000));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // Fail 6 getUserStatus pings: 2 trigger the initial restart, the next ones
+    // raise a ping-sourced pending restart, then pings recover and clear it.
+    std::fs::write(data_dir.join(".fixture-fail-user-status-count"), "6").unwrap();
+
+    let pid_a = supervisor.start().await.unwrap().pid.unwrap();
+    let pid_b = wait_for_pid_change(&supervisor, pid_a).await;
+
+    // Well past the throttle window: had the pending restart survived, the
+    // watchdog would have restarted the engine again.
+    sleep(Duration::from_millis(2000)).await;
+    assert_eq!(
+        supervisor.status().await.pid,
+        Some(pid_b),
+        "recovered pings must clear the ping-sourced pending restart"
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+/// Continuous failure triggers are bounded: one initial restart plus at most
+/// three pending retries per episode, then the watchdog gives up and the
+/// engine pid stays put even though stderr keeps reporting a dead WebSocket.
+#[tokio::test]
+async fn continuous_failures_exhaust_the_episode_retry_budget() {
+    let temp = TempDir::new().unwrap();
+    let (supervisor, data_dir) =
+        watchdog_supervisor_with_throttle(&temp, Duration::from_millis(1500));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let marker = data_dir.join(".fixture-stderr-websocket-error");
+    std::fs::write(&marker, "").unwrap();
+
+    let pid_a = supervisor.start().await.unwrap().pid.unwrap();
+    let mut pids = vec![pid_a];
+    let mut last = pid_a;
+    for _ in 0..4 {
+        last = wait_for_pid_change(&supervisor, last).await;
+        pids.push(last);
+    }
+    // initial + 3 pending retries = 4 restarts; the budget is now exhausted.
+    assert_eq!(pids.len(), 5);
+
+    // Beyond one full throttle window after the last restart: any further
+    // pending execution would show up as a pid change.
+    sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        supervisor.status().await.pid,
+        Some(last),
+        "episode retry budget must stop further restarts"
+    );
+
+    std::fs::remove_file(&marker).unwrap();
     supervisor.shutdown().await.unwrap();
 }

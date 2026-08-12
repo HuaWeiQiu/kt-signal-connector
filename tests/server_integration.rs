@@ -512,6 +512,217 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 }
 
 #[tokio::test]
+async fn contacts_sync_list_and_send_by_peer() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [11_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Contacts" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // finish_link already ran a best-effort sync; an explicit contacts.sync
+    // inside the 60s window returns the cached counts.
+    let synced = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(synced["result"]["contactCount"], 3);
+    assert_eq!(synced["result"]["groupCount"], 1);
+    assert!(synced["result"]["syncedAt"].as_u64().unwrap() > 0);
+
+    let listed = request(
+        &mut client,
+        "contacts-list",
+        "contacts.list",
+        json!({ "accountId": account_id, "limit": 10 }),
+    )
+    .await;
+    let items = listed["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 4);
+    let alice = items
+        .iter()
+        .find(|item| item["peerKey"] == "+15555550101")
+        .unwrap();
+    assert_eq!(alice["kind"], "contact");
+    assert_eq!(alice["title"], "Alice Example");
+    let group = items.iter().find(|item| item["kind"] == "group").unwrap();
+    assert_eq!(group["peerKey"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group["title"], "Fixture Group");
+
+    let filtered = request(
+        &mut client,
+        "contacts-filtered",
+        "contacts.list",
+        json!({ "accountId": account_id, "query": "alice", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(filtered["result"]["items"].as_array().unwrap().len(), 1);
+
+    let first_page = request(
+        &mut client,
+        "contacts-page-1",
+        "contacts.list",
+        json!({ "accountId": account_id, "limit": 2 }),
+    )
+    .await;
+    assert_eq!(first_page["result"]["items"].as_array().unwrap().len(), 2);
+    let cursor = first_page["result"]["nextCursor"].as_str().unwrap();
+    let second_page = request(
+        &mut client,
+        "contacts-page-2",
+        "contacts.list",
+        json!({ "accountId": account_id, "limit": 10, "cursor": cursor }),
+    )
+    .await;
+    assert_eq!(second_page["result"]["items"].as_array().unwrap().len(), 2);
+    assert!(second_page["result"].get("nextCursor").is_none());
+
+    // contacts.list is read-only: an unknown account is a cache miss, not an
+    // upstream lookup.
+    let unknown = request(
+        &mut client,
+        "contacts-unknown-account",
+        "contacts.list",
+        json!({ "accountId": "absent-account", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // Sending to a peer with no conversation yet creates it together with the
+    // first message (no empty conversation skeleton).
+    let sent = request(
+        &mut client,
+        "send-peer-1",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Fresh Peer",
+            "text": "first message",
+            "clientRequestId": "peer-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let conversations = request(
+        &mut client,
+        "conv-after-peer-send",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let created = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == conversation_id)
+        .unwrap();
+    assert_eq!(created["title"], "Fresh Peer");
+    assert_eq!(created["type"], "direct");
+
+    // A second send to the same peer reuses the same conversation.
+    let sent_again = request(
+        &mut client,
+        "send-peer-2",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "direct",
+            "peerKey": "+15555550103",
+            "text": "second message",
+            "clientRequestId": "peer-send-2"
+        }),
+    )
+    .await;
+    assert_eq!(sent_again["result"]["conversationId"], conversation_id);
+
+    // Ambiguous or missing targets are rejected before any upstream call.
+    let both = request(
+        &mut client,
+        "send-both-targets",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "text": "ambiguous",
+            "clientRequestId": "peer-send-both"
+        }),
+    )
+    .await;
+    assert_eq!(both["error"]["code"], "INVALID_REQUEST");
+    let neither = request(
+        &mut client,
+        "send-no-target",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "text": "no target",
+            "clientRequestId": "peer-send-none"
+        }),
+    )
+    .await;
+    assert_eq!(neither["error"]["code"], "INVALID_REQUEST");
+    let bad_kind = request(
+        &mut client,
+        "send-bad-kind",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "channel",
+            "peerKey": "+15555550103",
+            "text": "bad kind",
+            "clientRequestId": "peer-send-bad-kind"
+        }),
+    )
+    .await;
+    assert_eq!(bad_kind["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
 async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();

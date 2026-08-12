@@ -42,7 +42,9 @@
             "conversations.list",
             "messages.list",
             "messages.getText",
-            "messages.sendText"
+            "messages.sendText",
+            "contacts.sync",
+            "contacts.list"
           ]
         },
         "params": {
@@ -157,6 +159,28 @@
               "params": { "$ref": "#/$defs/messageGetTextParams" }
             }
           }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "contacts.sync" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/contactsSyncParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "contacts.list" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/contactsListParams" }
+            }
+          }
         }
       ]
     },
@@ -228,10 +252,28 @@
     "messagesSendTextParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["accountId", "conversationId", "text", "clientRequestId"],
+      "required": ["accountId", "text", "clientRequestId"],
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "direct", "group"],
+          "description": "Peer target kind; 'contact' and 'direct' both address a direct chat."
+        },
+        "peerKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Recipient number/uuid for direct chats, group id for groups."
+        },
+        "peerTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional display title used when the peer send creates a new conversation."
+        },
         "text": {
           "type": "string",
           "minLength": 1,
@@ -240,6 +282,30 @@
         },
         "clientRequestId": { "$ref": "#/$defs/opaqueId" },
         "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "contactsSyncParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "contactsListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "limit"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional case-insensitive substring filter over title and peerKey; read-only over the local cache."
+        },
+        "cursor": { "type": "string", "maxLength": 256 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
       }
     },
     "messageGetTextParams": {

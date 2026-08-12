@@ -159,6 +159,8 @@ Phase 2 host methods:
 - `messages.list`
 - `messages.getText`
 - `messages.sendText`
+- `contacts.sync`
+- `contacts.list`
 - normalized runtime/account/conversation/message events
 
 No generic `call`, `exec`, `jsonRpc`, file-read, URL-open, or raw-envelope endpoint is allowed.
@@ -302,13 +304,33 @@ AI-generated and human messages use the same send method. Language policy and te
 enforced by KT before the connector call, while connector ownership and idempotency checks remain
 mandatory.
 
-### 6.5 History limitation
+### 6.5 Contacts cache and peer-addressed send
+
+After link, signal-cli has already synchronized contacts and groups from the primary device.
+`contacts.sync` reads them via read-only `listContacts` (registered contacts only, no
+`allRecipients` walk) and `listGroups` (membership-filtered, `isMember=true`) on the single JVM
+queue and upserts them into a per-account `contacts` cache table keyed by
+`(account_id, kind, peer_key)`. A successful sync less than 60 seconds old returns the cached
+counts without touching the engine. `link.finish` runs one best-effort sync inline; its failure is
+logged and never fails the link flow. `contacts.list` serves the cache only (optional substring
+filter, cursor pagination) and never calls upstream, so the Desktop new-chat picker cannot starve
+the JVM queue. Contact rows and the sync marker are deleted with the account.
+
+`messages.sendText` accepts either `conversationId` or a peer target (`kind` + `peerKey`, optional
+`peerTitle`); exactly one form is required. A peer send resolves the conversation by
+`(account_id, kind, peer_key)` and, when absent, creates it together with the first outgoing
+message. The conversation therefore becomes an active conversation only once the first message is
+actually sent — no empty conversation skeletons are produced. `kind` accepts `contact`/`direct`
+(both a direct chat) or `group`; a missing `peerTitle` falls back to the masked peer address,
+never the raw number.
+
+### 6.6 History limitation
 
 The connector only promises history it has persisted. `sendSyncRequest` can synchronize contacts and
 groups but is not treated as complete phone/Desktop message-history backfill. Product UI must not
 promise pre-link history until a separately verified upstream capability exists.
 
-### 6.6 Media limitation
+### 6.7 Media limitation
 
 Phase 1 runs signal-cli with attachments, stories, and stickers ignored. Current signal-cli downloads
 non-ignored incoming attachments before it emits the receive notification, and `getAttachment`

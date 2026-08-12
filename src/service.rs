@@ -9,7 +9,8 @@ use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::protocol::ApiError;
 use crate::store::{
-    AccountDeletePlan, AccountSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
+    AccountDeletePlan, AccountRow, AccountSummary, ContactSummary, ConversationRow,
+    ConversationSummary, MessageRecord, Page, Store, StoreError,
 };
 
 const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -284,6 +285,55 @@ impl ConnectorService {
         Ok(self.store.list_conversations(account_id, limit, cursor)?)
     }
 
+    /// Read-only view of the contacts cache; never touches the upstream engine.
+    pub fn list_contacts(
+        &self,
+        account_id: &str,
+        query: Option<&str>,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Page<ContactSummary>, ServiceError> {
+        if self.store.account_by_id(account_id)?.is_none() {
+            return Err(ServiceError::Store(StoreError::AccountNotFound));
+        }
+        let query = query.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(query) = query {
+            validate_opaque_id(query, "query")?;
+        }
+        Ok(self.store.list_contacts(account_id, query, limit, cursor)?)
+    }
+
+    /// Upsert one synced contact/group into the cache.
+    pub fn upsert_synced_contact(
+        &self,
+        account_id: &str,
+        kind: &str,
+        peer_key: &str,
+        title: &str,
+        extra: Option<&str>,
+        synced_at: u64,
+    ) -> Result<(), ServiceError> {
+        Ok(self
+            .store
+            .upsert_contact(account_id, kind, peer_key, title, extra, synced_at)?)
+    }
+
+    pub fn contacts_synced_at(&self, account_id: &str) -> Result<Option<u64>, ServiceError> {
+        Ok(self.store.contacts_synced_at(account_id)?)
+    }
+
+    pub fn set_contacts_synced_at(
+        &self,
+        account_id: &str,
+        synced_at: u64,
+    ) -> Result<(), ServiceError> {
+        Ok(self.store.set_contacts_synced_at(account_id, synced_at)?)
+    }
+
+    pub fn count_contacts(&self, account_id: &str) -> Result<(u64, u64), ServiceError> {
+        Ok(self.store.count_contacts(account_id)?)
+    }
+
     pub fn list_messages(
         &self,
         account_id: &str,
@@ -377,7 +427,91 @@ impl ConnectorService {
             .store
             .conversation_by_id(account_id, conversation_id)?
             .ok_or(StoreError::ConversationNotFound)?;
+        self.dispatch_send(
+            &account,
+            &conversation,
+            text,
+            client_request_id,
+            quote_message_id,
+        )
+    }
 
+    /// Prepare a send addressed by peer (kind + peer_key) instead of an
+    /// existing conversation id. Intentional design: when no conversation for
+    /// the peer exists yet, it is created together with the first outgoing
+    /// message, so the conversation only becomes visible/active once the first
+    /// message is actually sent — no empty conversation skeletons are produced.
+    pub fn prepare_send_text_to_peer(
+        &self,
+        account_id: &str,
+        peer: &PeerTarget<'_>,
+        text: &str,
+        client_request_id: &str,
+        quote_message_id: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_text(text)?;
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if let Some(quote) = quote_message_id {
+            validate_opaque_id(quote, "quoteMessageId")?;
+        }
+        // contacts.list reports 'contact'; conversations use 'direct'. Both are
+        // accepted for the same direct-chat target.
+        let kind = match peer.kind {
+            "direct" | "contact" => "direct",
+            "group" => "group",
+            _ => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "kind must be 'contact', 'direct', or 'group'",
+                    false,
+                )));
+            }
+        };
+        validate_opaque_id(peer.peer_key, "peerKey")?;
+        let peer_title = peer
+            .peer_title
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|title| title.chars().take(64).collect::<String>());
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(existing));
+        }
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let title = peer_title.unwrap_or_else(|| {
+            if kind == "group" {
+                "group".to_string()
+            } else {
+                mask_address(peer.peer_key)
+            }
+        });
+        let conversation =
+            self.store
+                .ensure_conversation(account_id, kind, peer.peer_key, &title)?;
+        self.dispatch_send(
+            &account,
+            &conversation,
+            text,
+            client_request_id,
+            quote_message_id,
+        )
+    }
+
+    fn dispatch_send(
+        &self,
+        account: &AccountRow,
+        conversation: &ConversationRow,
+        text: &str,
+        client_request_id: &str,
+        quote_message_id: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        let account_id = account.id.as_str();
+        let conversation_id = conversation.id.as_str();
         let pending_id =
             stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
         let pending = MessageRecord {
@@ -657,6 +791,34 @@ pub enum PreparedSend {
     },
 }
 
+/// Target of an outgoing text send: either an existing conversation, or a peer
+/// (kind + peer_key) for which a conversation is resolved/created on demand.
+#[derive(Clone, Debug)]
+pub enum SendTarget {
+    Conversation(String),
+    Peer {
+        kind: String,
+        peer_key: String,
+        peer_title: Option<String>,
+    },
+}
+
+/// Borrowed peer addressing for a send, validated by the service.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerTarget<'a> {
+    pub kind: &'a str,
+    pub peer_key: &'a str,
+    pub peer_title: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactsSyncOutcome {
+    pub contact_count: u64,
+    pub group_count: u64,
+    pub synced_at: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountDeleteLocalDataParams {
@@ -713,10 +875,28 @@ pub struct MessageText {
 #[serde(rename_all = "camelCase")]
 pub struct MessagesSendTextParams {
     pub account_id: String,
-    pub conversation_id: String,
+    pub conversation_id: Option<String>,
+    pub kind: Option<String>,
+    pub peer_key: Option<String>,
+    pub peer_title: Option<String>,
     pub text: String,
     pub client_request_id: String,
     pub quote_message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactsSyncParams {
+    pub account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContactsListParams {
+    pub account_id: String,
+    pub query: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: u32,
 }
 
 fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
@@ -1091,5 +1271,207 @@ mod tests {
 
         assert!(service.ingest_receive(receive).unwrap().is_empty());
         assert!(service.list_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn send_by_peer_creates_conversation_once_and_reuses_it() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+
+        let first = match service
+            .prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "contact",
+                    peer_key: "+15555550109",
+                    peer_title: Some("New Peer"),
+                },
+                "hello peer",
+                "peer-req-1",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch {
+                conversation_id,
+                params,
+                ..
+            } => {
+                assert_eq!(params["recipient"], json!(["+15555550109"]));
+                conversation_id
+            }
+            PreparedSend::Existing(_) => panic!("first peer send must dispatch"),
+        };
+        // The conversation appears with the peer title only alongside this send.
+        let conversations = service.list_conversations(&account.id, 10, None).unwrap();
+        assert_eq!(conversations.items.len(), 1);
+        assert_eq!(conversations.items[0].id, first);
+        assert_eq!(conversations.items[0].title, "New Peer");
+
+        // A new client request to the same peer reuses the same conversation.
+        let second = match service
+            .prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "direct",
+                    peer_key: "+15555550109",
+                    peer_title: None,
+                },
+                "hello again",
+                "peer-req-2",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch {
+                conversation_id, ..
+            } => conversation_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        assert_eq!(second, first);
+        assert_eq!(
+            service
+                .list_conversations(&account.id, 10, None)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        // A repeated client request is idempotent regardless of the target form.
+        assert!(matches!(
+            service
+                .prepare_send_text_to_peer(
+                    &account.id,
+                    &PeerTarget {
+                        kind: "contact",
+                        peer_key: "+15555550109",
+                        peer_title: None,
+                    },
+                    "hello peer",
+                    "peer-req-1",
+                    None,
+                )
+                .unwrap(),
+            PreparedSend::Existing(_)
+        ));
+        assert!(matches!(
+            service
+                .prepare_send_text(&account.id, &first, "hello peer", "peer-req-1", None)
+                .unwrap(),
+            PreparedSend::Existing(_)
+        ));
+    }
+
+    #[test]
+    fn send_by_peer_validates_target_and_falls_back_to_masked_title() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+
+        assert!(matches!(
+            service.prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "channel",
+                    peer_key: "+15555550109",
+                    peer_title: None,
+                },
+                "text",
+                "req-bad-kind",
+                None,
+            ),
+            Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
+        ));
+        assert!(matches!(
+            service.prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "contact",
+                    peer_key: "",
+                    peer_title: None,
+                },
+                "text",
+                "req-empty-peer",
+                None,
+            ),
+            Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
+        ));
+        assert!(matches!(
+            service.prepare_send_text_to_peer(
+                "absent-account",
+                &PeerTarget {
+                    kind: "contact",
+                    peer_key: "+15555550109",
+                    peer_title: None,
+                },
+                "text",
+                "req-absent",
+                None,
+            ),
+            Err(ServiceError::Store(StoreError::AccountNotFound))
+        ));
+
+        match service
+            .prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "group",
+                    peer_key: "Z3JvdXAtaWQ=",
+                    peer_title: None,
+                },
+                "group hello",
+                "req-group",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => {
+                assert_eq!(params["groupId"], json!("Z3JvdXAtaWQ="));
+            }
+            PreparedSend::Existing(_) => panic!("group peer send must dispatch"),
+        }
+        let group = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "group", "Z3JvdXAtaWQ=")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            service.store_ref().conversation_title(&group.id).unwrap(),
+            Some("group".to_string())
+        );
+
+        match service
+            .prepare_send_text_to_peer(
+                &account.id,
+                &PeerTarget {
+                    kind: "direct",
+                    peer_key: "+15555550110",
+                    peer_title: None,
+                },
+                "masked hello",
+                "req-masked",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch {
+                conversation_id, ..
+            } => {
+                let title = service
+                    .store_ref()
+                    .conversation_title(&conversation_id)
+                    .unwrap()
+                    .unwrap();
+                assert!(title.contains("***"));
+                assert!(!title.contains("555555"));
+            }
+            PreparedSend::Existing(_) => panic!("direct peer send must dispatch"),
+        }
     }
 }

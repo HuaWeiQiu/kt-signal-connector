@@ -23,8 +23,9 @@ use crate::engine::{EngineError, EngineEvent};
 use crate::ipc::LocalListener;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::service::{
-    AccountDeleteLocalDataParams, ConversationsListParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessageGetTextParams, MessagesListParams, MessagesSendTextParams,
+    AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
+    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesListParams,
+    MessagesSendTextParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::supervisor::RuntimeSupervisor;
@@ -145,7 +146,11 @@ impl HostDispatchLimits {
             self.link_wait.clone().acquire_owned().await.unwrap()
         } else if matches!(
             method,
-            "conversations.list" | "messages.list" | "messages.getText"
+            "conversations.list"
+                | "messages.list"
+                | "messages.getText"
+                | "contacts.list"
+                | "contacts.sync"
         ) {
             self.read.clone().acquire_owned().await.unwrap()
         } else {
@@ -700,28 +705,90 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
         }
         "messages.sendText" => {
             match serde_json::from_value::<MessagesSendTextParams>(request.params) {
-                Ok(params) => match supervisor
-                    .send_text(
-                        params.account_id,
+                Ok(params) => {
+                    // Exactly one addressing form: an existing conversationId,
+                    // or a peer target (kind + peerKey, optional peerTitle).
+                    let target = match (
                         params.conversation_id,
-                        params.text,
-                        params.client_request_id,
-                        params.quote_message_id,
-                    )
-                    .await
-                {
-                    Ok(message) => HostResponse::success(
-                        request_id,
-                        serde_json::to_value(message).unwrap_or(Value::Null),
-                    ),
-                    Err(error) => HostResponse::failure(request_id, error.into_api()),
-                },
+                        params.kind,
+                        params.peer_key,
+                        params.peer_title,
+                    ) {
+                        (Some(conversation_id), None, None, None) => {
+                            Ok(SendTarget::Conversation(conversation_id))
+                        }
+                        (None, Some(kind), Some(peer_key), peer_title) => Ok(SendTarget::Peer {
+                            kind,
+                            peer_key,
+                            peer_title,
+                        }),
+                        _ => Err(ApiError::new(
+                            "INVALID_REQUEST",
+                            "exactly one of conversationId or kind+peerKey must be provided",
+                            false,
+                        )),
+                    };
+                    match target {
+                        Ok(target) => match supervisor
+                            .send_text(
+                                params.account_id,
+                                target,
+                                params.text,
+                                params.client_request_id,
+                                params.quote_message_id,
+                            )
+                            .await
+                        {
+                            Ok(message) => HostResponse::success(
+                                request_id,
+                                serde_json::to_value(message).unwrap_or(Value::Null),
+                            ),
+                            Err(error) => HostResponse::failure(request_id, error.into_api()),
+                        },
+                        Err(error) => HostResponse::failure(request_id, error),
+                    }
+                }
                 Err(_) => HostResponse::failure(
                     request_id,
                     ApiError::new("INVALID_REQUEST", "invalid messages.sendText params", false),
                 ),
             }
         }
+        "contacts.sync" => match serde_json::from_value::<ContactsSyncParams>(request.params) {
+            Ok(params) => match supervisor.sync_contacts(&params.account_id).await {
+                Ok(outcome) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(outcome).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid contacts.sync params", false),
+            ),
+        },
+        "contacts.list" => match serde_json::from_value::<ContactsListParams>(request.params) {
+            Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
+                match supervisor
+                    .list_contacts(params.account_id, params.query, params.limit, params.cursor)
+                    .await
+                {
+                    Ok(page) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(page).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                }
+            }
+            Ok(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "limit must be between 1 and 200", false),
+            ),
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid contacts.list params", false),
+            ),
+        },
         _ => HostResponse::failure(
             request_id,
             ApiError::new("METHOD_NOT_ALLOWED", "method is not allowed", false),

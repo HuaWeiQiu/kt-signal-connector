@@ -38,6 +38,7 @@ SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
 STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
 FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
+FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-count"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
@@ -58,12 +59,18 @@ def emit_stderr_websocket_error():
 
 
 # Watchdog fixture: with the marker present, report a dead receive WebSocket on
-# stderr shortly after startup (delayed so the watchdog has subscribed).
+# stderr repeatedly (every 0.5s, delayed so the watchdog has subscribed). The
+# loop re-checks the marker so a test can stop further emissions by deleting it;
+# each restarted engine process re-reads it at startup.
+def emit_stderr_while_marked():
+    while STDERR_MARKER.exists():
+        time.sleep(0.5)
+        if STDERR_MARKER.exists():
+            emit_stderr_websocket_error()
+
+
 if STDERR_MARKER.exists():
-    threading.Thread(
-        target=lambda: (time.sleep(0.5), emit_stderr_websocket_error()),
-        daemon=True,
-    ).start()
+    threading.Thread(target=emit_stderr_while_marked, daemon=True).start()
 
 
 def emit_receive():
@@ -124,6 +131,37 @@ for line in sys.stdin:
         emit_receive_after = True
     elif method == "listAccounts":
         result = [{"number": LINKED_ACCOUNT}] if ACCOUNT_LINKED else []
+    elif method == "listContacts":
+        result = [
+            {
+                "number": LINKED_ACCOUNT,
+                "profile": {"givenName": "Test", "familyName": "User"},
+            },
+            {
+                "number": "+15555550101",
+                "name": "Alice Contact",
+                "profile": {"givenName": "Alice", "familyName": "Example"},
+            },
+            {
+                "number": "+15555550102",
+                "profile": {"givenName": "Bob"},
+            },
+        ]
+    elif method == "listGroups":
+        result = [
+            {
+                "id": "ZmFrZS1ncm91cC0x",
+                "name": "Fixture Group",
+                "isMember": True,
+                "members": [{"number": LINKED_ACCOUNT}, {"number": "+15555550101"}],
+            },
+            {
+                "id": "bm90LWEtbWVtYmVy",
+                "name": "Former Group",
+                "isMember": False,
+                "members": [],
+            },
+        ]
     elif method == "deleteLocalAccountData":
         if DELETE_MODE == "crash_after_delete_once" and DELETED_MARKER.exists():
             response = {
@@ -154,6 +192,21 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
+        # Count-based failure: fail the next N getUserStatus calls, then recover.
+        if FAIL_USER_STATUS_COUNT_MARKER.exists():
+            try:
+                remaining = int(FAIL_USER_STATUS_COUNT_MARKER.read_text().strip() or "0")
+            except ValueError:
+                remaining = 0
+            if remaining > 0:
+                FAIL_USER_STATUS_COUNT_MARKER.write_text(str(remaining - 1))
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": "fixture getUserStatus counted failure"},
+                }
+                emit_json(response)
+                continue
         result = {"isRegistered": True}
     else:
         result = {"method": method}
