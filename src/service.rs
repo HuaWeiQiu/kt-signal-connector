@@ -259,6 +259,19 @@ impl ConnectorService {
         Ok(json!({}))
     }
 
+    /// True while a non-expired link session exists. Restarting signal-cli would
+    /// invalidate its deviceLinkUri, so the watchdog must not restart meanwhile.
+    pub fn has_pending_link(&self) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|session| !session.is_expired(now_ms()))
+    }
+
+    /// Signal number of any linked account, used as the watchdog ping target.
+    pub fn any_signal_account_number(&self) -> Result<Option<String>, ServiceError> {
+        Ok(self.store.any_signal_account_number()?)
+    }
+
     pub fn list_conversations(
         &self,
         account_id: &str,

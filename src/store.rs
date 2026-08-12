@@ -320,6 +320,16 @@ impl Store {
             .map_err(|_| StoreError::Unavailable)
     }
 
+    /// Signal number of any linked account, used as a read-only liveness probe target.
+    pub fn any_signal_account_number(&self) -> Result<Option<String>, StoreError> {
+        self.conn
+            .query_row("SELECT signal_account FROM accounts LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|_| StoreError::Unavailable)
+    }
+
     pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
         self.conn
             .query_row(

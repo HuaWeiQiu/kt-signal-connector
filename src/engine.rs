@@ -31,6 +31,8 @@ const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_RECEIVE_ID_CHARS: usize = 256;
+const STDERR_QUEUE_CAPACITY: usize = 64;
+const STDERR_LINE_LIMIT: usize = 4 * 1024;
 const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
 
 #[derive(Clone, Debug)]
@@ -42,6 +44,8 @@ pub struct SignalCliConfig {
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
     pub resource_sample_interval: Duration,
+    pub watchdog_interval: Duration,
+    pub watchdog_min_restart_interval: Duration,
 }
 
 impl SignalCliConfig {
@@ -54,6 +58,8 @@ impl SignalCliConfig {
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
             resource_sample_interval: Duration::from_secs(30),
+            watchdog_interval: Duration::from_secs(30),
+            watchdog_min_restart_interval: Duration::from_secs(300),
         }
     }
 }
@@ -213,6 +219,7 @@ pub struct EngineHandle {
     next_id: Arc<AtomicU64>,
     request_timeout: Duration,
     resource_status: watch::Receiver<(Option<u64>, bool)>,
+    stderr: broadcast::Sender<String>,
 }
 
 impl EngineHandle {
@@ -276,13 +283,32 @@ impl EngineHandle {
         let (status_tx, status_rx) = watch::channel(initial_status.clone());
         let (resource_tx, resource_rx) = watch::channel((None, false));
         let (command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE_CAPACITY);
+        let (stderr_tx, _) = broadcast::channel::<String>(STDERR_QUEUE_CAPACITY);
 
         let _ = events.send(EngineEvent::StateChanged(initial_status));
         let actor_events = events.clone();
+        let stderr_lines = stderr_tx.clone();
         tokio::spawn(async move {
-            let mut stderr = stderr;
             let stderr_drain = tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut stderr, &mut sink()).await;
+                // Forward signal-cli stderr line by line (bounded) so the watchdog can
+                // observe receive WebSocket failures. Send failures/lag are ignored;
+                // the drain must never panic or block the actor. If framing fails the
+                // remaining bytes are discarded so the child never blocks on a full pipe.
+                let mut lines =
+                    FramedRead::new(stderr, LinesCodec::new_with_max_length(STDERR_LINE_LIMIT));
+                loop {
+                    match lines.next().await {
+                        Some(Ok(line)) => {
+                            let _ = stderr_lines.send(line);
+                        }
+                        Some(Err(_)) => {
+                            let mut rest = lines.into_inner();
+                            let _ = tokio::io::copy(&mut rest, &mut sink()).await;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
             });
             run_actor(
                 child,
@@ -358,6 +384,7 @@ impl EngineHandle {
             next_id: Arc::new(AtomicU64::new(1)),
             request_timeout: config.request_timeout,
             resource_status: resource_rx,
+            stderr: stderr_tx,
         })
     }
 
@@ -378,6 +405,11 @@ impl EngineHandle {
 
     pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
         self.events.subscribe()
+    }
+
+    /// Line-based stream of the signal-cli stderr output (bounded, lossy under lag).
+    pub fn subscribe_stderr(&self) -> broadcast::Receiver<String> {
+        self.stderr.subscribe()
     }
 
     pub async fn call(

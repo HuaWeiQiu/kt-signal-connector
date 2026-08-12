@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::engine::{
     CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus, QueuedReceive,
@@ -27,6 +27,8 @@ use crate::store::{
 const LINK_FINISH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RECEIVE_STORE_RETRY_MIN: Duration = Duration::from_millis(100);
 const RECEIVE_STORE_RETRY_MAX: Duration = Duration::from_secs(5);
+const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
+const WATCHDOG_MAX_PING_FAILURES: u32 = 2;
 
 pub struct RuntimeSupervisor {
     config: SignalCliConfig,
@@ -37,6 +39,8 @@ pub struct RuntimeSupervisor {
     host_events: broadcast::Sender<HostSideEvent>,
     receive_ingress: ReceiveIngress,
     receive_worker: JoinHandle<()>,
+    /// Receive-liveness watchdog; never held across an await.
+    watchdog: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
 }
@@ -61,8 +65,23 @@ impl RuntimeSupervisor {
             host_events,
             receive_ingress,
             receive_worker,
+            watchdog: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Spawn the receive-liveness watchdog (idempotent). Detects a silently dead
+    /// receive path — signal-cli stays alive but its server WebSocket is gone —
+    /// via stderr error lines and periodic read-only pings, then restarts the engine.
+    pub fn spawn_watchdog(self: &Arc<Self>) {
+        let Ok(mut slot) = self.watchdog.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        *slot = Some(tokio::spawn(supervisor.watchdog_loop()));
     }
 
     pub fn subscribe_engine(&self) -> broadcast::Receiver<EngineEvent> {
@@ -404,6 +423,11 @@ impl RuntimeSupervisor {
     }
 
     async fn restart_engine_after_link_cancel(&self) -> Result<(), EngineError> {
+        self.restart_engine().await
+    }
+
+    /// Shared engine restart: shut the current engine down and start a fresh one.
+    async fn restart_engine(&self) -> Result<(), EngineError> {
         let mut slot = self.engine.lock().await;
         if let Some(engine) = slot.take() {
             engine.shutdown().await?;
@@ -416,6 +440,130 @@ impl RuntimeSupervisor {
         .await?;
         *slot = Some(engine);
         Ok(())
+    }
+
+    async fn watchdog_loop(self: Arc<Self>) {
+        let mut ticker = interval(self.config.watchdog_interval.max(Duration::from_millis(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // stderr subscription follows the current engine instance (tracked by pid).
+        let mut stderr_rx: Option<broadcast::Receiver<String>> = None;
+        let mut stderr_pid: Option<u32> = None;
+        let mut ping_failures = 0u32;
+        let mut last_restart: Option<Instant> = None;
+        loop {
+            let engine = self.engine.lock().await.clone();
+            let current_pid = engine.as_ref().and_then(|e| e.status().pid);
+            if current_pid != stderr_pid {
+                stderr_rx = engine
+                    .as_ref()
+                    .filter(|e| !e.is_terminal())
+                    .map(EngineHandle::subscribe_stderr);
+                stderr_pid = current_pid;
+            }
+            tokio::select! {
+                line = recv_stderr_line(stderr_rx.as_mut()) => {
+                    match line {
+                        Some(line) => {
+                            if is_receive_fatal_stderr(&line)
+                                && self
+                                    .watchdog_restart(
+                                        &mut last_restart,
+                                        "receive WebSocket error on stderr",
+                                    )
+                                    .await
+                            {
+                                ping_failures = 0;
+                                stderr_rx = None;
+                                stderr_pid = None;
+                            }
+                        }
+                        None => {
+                            stderr_rx = None;
+                            stderr_pid = None;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    let Some(engine) = engine.filter(|e| !e.is_terminal()) else {
+                        continue;
+                    };
+                    let Some(number) = self.watchdog_ping_target().await else {
+                        continue;
+                    };
+                    let ping = engine
+                        .call_with_timeout(
+                            "getUserStatus",
+                            json!({
+                                "account": number,
+                                "recipient": [number],
+                            }),
+                            CallClass::ReadOnly,
+                            WATCHDOG_PING_TIMEOUT,
+                        )
+                        .await;
+                    match ping {
+                        Ok(_) => ping_failures = 0,
+                        Err(_) => {
+                            ping_failures += 1;
+                            if ping_failures >= WATCHDOG_MAX_PING_FAILURES
+                                && self
+                                    .watchdog_restart(
+                                        &mut last_restart,
+                                        "receive liveness ping failed repeatedly",
+                                    )
+                                    .await
+                            {
+                                ping_failures = 0;
+                                stderr_rx = None;
+                                stderr_pid = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ping target account, or None when pinging/restarting is unsafe: engine not
+    /// usable, a finishLink is in flight, a link session is pending (restarting
+    /// would invalidate its deviceLinkUri), or no account exists yet.
+    async fn watchdog_ping_target(&self) -> Option<String> {
+        if self.active_link_finish.lock().await.is_some() {
+            return None;
+        }
+        let service = self.service.lock().await;
+        if service.has_pending_link() {
+            return None;
+        }
+        service.any_signal_account_number().ok().flatten()
+    }
+
+    /// Restart after a watchdog trigger. Returns true when a restart happened.
+    /// Suppressed while a link flow is active and throttled so a genuinely dead
+    /// network cannot spin the JVM in a restart loop. Logs carry no phone numbers.
+    async fn watchdog_restart(&self, last_restart: &mut Option<Instant>, reason: &str) -> bool {
+        if self.active_link_finish.lock().await.is_some()
+            || self.service.lock().await.has_pending_link()
+        {
+            eprintln!(
+                "kt-signal-connector: watchdog restart suppressed ({reason}); link in progress"
+            );
+            return false;
+        }
+        if let Some(last) = last_restart
+            && last.elapsed() < self.config.watchdog_min_restart_interval
+        {
+            eprintln!("kt-signal-connector: watchdog restart throttled ({reason})");
+            return false;
+        }
+        eprintln!("kt-signal-connector: watchdog restarting signal-cli engine ({reason})");
+        match self.restart_engine().await {
+            Ok(()) => {
+                *last_restart = Some(Instant::now());
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Clear one local Signal account (desktop exit). Not remote primary unregister.
@@ -662,7 +810,41 @@ impl RuntimeSupervisor {
 impl Drop for RuntimeSupervisor {
     fn drop(&mut self) {
         self.receive_worker.abort();
+        if let Ok(mut slot) = self.watchdog.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
     }
+}
+
+/// Receive one stderr line, skipping lag gaps; None means the stream closed.
+/// Pends forever when there is no subscription, so select! can ignore the branch.
+async fn recv_stderr_line(rx: Option<&mut broadcast::Receiver<String>>) -> Option<String> {
+    match rx {
+        Some(rx) => loop {
+            match rx.recv().await {
+                Ok(line) => return Some(line),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Heuristic over signal-cli stderr logs: true when the line indicates the
+/// receive WebSocket to the Signal server is dead (the silent-failure signature
+/// this watchdog exists for, since signal-cli does not reconnect on its own).
+/// Matches "websocketioexception" directly, or "websocket" together with a
+/// failure keyword; normal INFO logs must not match.
+fn is_receive_fatal_stderr(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.contains("websocketioexception")
+        || (lower.contains("websocket")
+            && ["error", "closed", "disconnected", "failed", "exception"]
+                .iter()
+                .any(|needle| lower.contains(needle)))
 }
 
 async fn receive_persistence_loop(
@@ -803,7 +985,9 @@ pub fn open_supervisor(
     let store = Store::open(&state_dir)?;
     let mut config = SignalCliConfig::new(signal_cli, signal_data_dir);
     config.java_home = java_home;
-    Ok(Arc::new(RuntimeSupervisor::new(config, store)))
+    let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
+    supervisor.spawn_watchdog();
+    Ok(supervisor)
 }
 
 #[cfg(test)]
@@ -815,7 +999,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::timeout;
 
-    use super::{RuntimeSupervisor, compose_contact_display_name};
+    use super::{RuntimeSupervisor, compose_contact_display_name, is_receive_fatal_stderr};
     use crate::engine::{NormalizedReceive, SignalCliConfig};
     use crate::service::HostSideEvent;
     use crate::store::Store;
@@ -920,5 +1104,44 @@ mod tests {
             compose_contact_display_name(&item).as_deref(),
             Some("signal.user")
         );
+    }
+
+    #[test]
+    fn fatal_stderr_matches_receive_websocket_failures() {
+        assert!(is_receive_fatal_stderr(
+            "WARN WebSocketConnection - WebSocket connection closed unexpectedly"
+        ));
+        assert!(is_receive_fatal_stderr(
+            "ERROR o.a.s.manager.internal.ReceiveConfig - websocket error while receiving"
+        ));
+        assert!(is_receive_fatal_stderr(
+            "org.asamk.signal.manager.WebSocketIOException: Connection reset"
+        ));
+        assert!(is_receive_fatal_stderr(
+            "websocket disconnected from server"
+        ));
+        assert!(is_receive_fatal_stderr(
+            "Failed to connect websocket, retrying"
+        ));
+        assert!(is_receive_fatal_stderr(
+            "Exception in websocket reader thread"
+        ));
+    }
+
+    #[test]
+    fn fatal_stderr_ignores_normal_log_lines() {
+        assert!(!is_receive_fatal_stderr(
+            "INFO App - Starting signal-cli daemon"
+        ));
+        assert!(!is_receive_fatal_stderr(
+            "INFO WebSocketConnection - Connected successfully"
+        ));
+        assert!(!is_receive_fatal_stderr(
+            "INFO ManagerImpl - Checking for new messages"
+        ));
+        assert!(!is_receive_fatal_stderr(
+            "WARN Scheduler - task failed to start" // no websocket context
+        ));
+        assert!(!is_receive_fatal_stderr(""));
     }
 }

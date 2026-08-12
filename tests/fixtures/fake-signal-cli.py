@@ -36,6 +36,8 @@ def argument_value(name):
 SIGNAL_DATA_DIR = Path(argument_value("--data-dir") or "/tmp/kt-signal-fixture")
 SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
+STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
+FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
@@ -43,6 +45,25 @@ ACCOUNT_LINKED = not DELETED_MARKER.exists()
 def emit_json(value):
     with WRITE_LOCK:
         print(json.dumps(value, separators=(",", ":")), flush=True)
+
+
+def emit_stderr_websocket_error():
+    # Mimics signal-cli logging a dead receive WebSocket to stderr.
+    with WRITE_LOCK:
+        print(
+            "ERROR WebSocketConnection - WebSocket connection closed unexpectedly",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+# Watchdog fixture: with the marker present, report a dead receive WebSocket on
+# stderr shortly after startup (delayed so the watchdog has subscribed).
+if STDERR_MARKER.exists():
+    threading.Thread(
+        target=lambda: (time.sleep(0.5), emit_stderr_websocket_error()),
+        daemon=True,
+    ).start()
 
 
 def emit_receive():
@@ -121,6 +142,19 @@ for line in sys.stdin:
         result = {"timestamp": 99, "results": []}
     elif method == "emitReceive":
         result = {"method": method}
+    elif method == "emitStderr":
+        emit_stderr_websocket_error()
+        result = {"method": method}
+    elif method == "getUserStatus":
+        if FAIL_USER_STATUS_MARKER.exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "fixture getUserStatus failure"},
+            }
+            emit_json(response)
+            continue
+        result = {"isRegistered": True}
     else:
         result = {"method": method}
 
