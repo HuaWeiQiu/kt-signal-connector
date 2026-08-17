@@ -27,9 +27,23 @@ mod platform {
     impl LocalListener {
         pub fn bind(endpoint: &Path) -> io::Result<Self> {
             let path = prepare_endpoint(endpoint)?;
-            let inner = UnixListener::bind(&path)?;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-            let metadata = fs::symlink_metadata(&path)?;
+            // Bind under a staging name and publish with a rename. Binding
+            // directly would make the endpoint visible with the umask's mode
+            // for as long as it takes to harden it, and the host connects as
+            // soon as the path appears, so that window is reachable.
+            let staging = staging_path(&path)?;
+            let _ = fs::remove_file(&staging);
+            let inner = UnixListener::bind(&staging)?;
+            let published = fs::set_permissions(&staging, fs::Permissions::from_mode(0o600))
+                .and_then(|()| fs::rename(&staging, &path))
+                .and_then(|()| fs::symlink_metadata(&path));
+            let metadata = match published {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let _ = fs::remove_file(&staging);
+                    return Err(error);
+                }
+            };
             Ok(Self {
                 inner,
                 path,
@@ -54,6 +68,27 @@ mod platform {
                 let _ = fs::remove_file(&self.path);
             }
         }
+    }
+
+    /// A sibling of the endpoint, in the same private directory so the rename
+    /// stays on one filesystem, and per-process so two starts cannot collide.
+    fn staging_path(path: &Path) -> io::Result<PathBuf> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "endpoint must include a socket file name",
+                )
+            })?;
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "endpoint must include a parent directory",
+            )
+        })?;
+        Ok(parent.join(format!(".{file_name}.{}.staging", std::process::id())))
     }
 
     fn prepare_endpoint(endpoint: &Path) -> io::Result<PathBuf> {
@@ -110,6 +145,29 @@ mod platform {
             );
             drop(listener);
             assert!(!endpoint.exists());
+        }
+
+        #[tokio::test]
+        async fn the_endpoint_is_only_ever_visible_as_a_private_socket() {
+            let temp = tempfile::TempDir::new().unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let endpoint = temp.path().join("connector.sock");
+
+            let listener = LocalListener::bind(&endpoint).unwrap();
+
+            // The host polls for this path and connects the moment it appears,
+            // so the very first thing anyone can observe must already be 0600.
+            let metadata = fs::symlink_metadata(&endpoint).unwrap();
+            assert!(metadata.file_type().is_socket());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            // Staging left nothing behind.
+            let leftovers: Vec<_> = fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .filter(|name| name != "connector.sock")
+                .collect();
+            assert!(leftovers.is_empty(), "unexpected leftovers: {leftovers:?}");
+            drop(listener);
         }
 
         #[test]

@@ -13,7 +13,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tempfile::TempDir;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -53,11 +53,7 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
 
     drop(client);
     wait_for_process_exit(first_engine_pid).await;
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 
     let next_secret_file = temp.path().join("bootstrap-next.secret");
     let next_secret = [8_u8; 32];
@@ -77,11 +73,7 @@ async fn binary_serves_authenticated_runtime_lifecycle() {
     assert_eq!(stopped["result"]["state"], "stopped");
 
     drop(client);
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 }
 
 #[tokio::test]
@@ -383,11 +375,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 
     // Disconnect shutdown must resolve a dispatched mutation to unknown before
     // the connection task is dropped. A fresh one-shot connector and secret read
@@ -504,11 +492,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     assert!(after_delete["result"].as_array().unwrap().is_empty());
 
     drop(client);
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 }
 
 #[tokio::test]
@@ -715,11 +699,7 @@ async fn contacts_sync_list_and_send_by_peer() {
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 }
 
 #[tokio::test]
@@ -770,11 +750,7 @@ async fn socks_proxy_env_is_forwarded_to_the_jvm() {
     assert!(accounts.get("result").is_some());
 
     drop(client);
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 }
 
 #[tokio::test]
@@ -815,11 +791,7 @@ async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_die
     assert_eq!(finished["error"]["retryable"], false);
 
     drop(client);
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 }
 
 #[tokio::test]
@@ -901,11 +873,7 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     assert!(accounts["result"].as_array().unwrap().is_empty());
 
     drop(client);
-    let status = timeout(Duration::from_secs(2), connector.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(status.success());
+    assert_clean_exit(&mut connector).await;
 }
 
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
@@ -988,6 +956,24 @@ fn spawn_connector_with_delete_mode(
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+}
+
+/// Wait for the connector to exit and require a clean status. The connector's
+/// own stderr is the only place the reason appears, so drain it into the panic
+/// rather than leaving a bare `false != true`.
+async fn assert_clean_exit(connector: &mut Child) {
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .expect("connector should exit after the host disconnects")
+        .unwrap();
+    if status.success() {
+        return;
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = connector.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr).await;
+    }
+    panic!("connector exited with {status:?}; stderr: {stderr}");
 }
 
 async fn wait_for_path(path: &Path) {

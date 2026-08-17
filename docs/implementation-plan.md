@@ -102,9 +102,13 @@ architecture and license review, not a routine implementation detail.
 ### 4.1 Transport
 
 - Windows: a random per-start named pipe restricted to the current user SID.
-- macOS/Linux: a socket in a profile-private directory with mode `0600`.
+- macOS/Linux: a socket in a profile-private directory with mode `0600`. The listener binds a
+  staging sibling, hardens it, then publishes it with a rename, because the host connects as
+  soon as the endpoint path appears and must never reach a socket that is still world-connectable.
 - No public listener and no fixed localhost HTTP/TCP port.
 - The renderer never receives the endpoint or the session secret.
+- A host that closes its connection abruptly ends the session exactly like a clean EOF: the
+  process still exits zero. Only an unparsable or oversized frame is a protocol failure.
 
 Electron Main creates a 256-bit random bootstrap secret. On macOS/Linux it writes an owner-only
 temporary file and the connector reads and deletes that file before accepting a client. On Windows

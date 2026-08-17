@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, watch};
 use tokio::time::timeout;
-use tokio_util::codec::{Framed, LinesCodec};
+use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::auth::{BootstrapSecret, HandshakeParams, PendingChallenge};
 use crate::engine::{EngineError, EngineEvent};
@@ -169,6 +169,10 @@ pub enum HostError {
     Io(#[from] io::Error),
     #[error("host frame is invalid")]
     InvalidFrame,
+    /// The peer vanished mid-frame. Internal only: it ends the session the same
+    /// way a clean EOF does and never reaches the exit status or the host.
+    #[error("host connection is gone")]
+    PeerGone,
     #[error("host authentication failed")]
     Authentication,
     #[error("signal-cli runtime could not be stopped")]
@@ -243,6 +247,26 @@ where
 }
 
 async fn handle_connection_until_shutdown<S>(
+    stream: S,
+    secret: Arc<BootstrapSecret>,
+    supervisor: Arc<RuntimeSupervisor>,
+    shutdown: watch::Receiver<bool>,
+    authenticated: Arc<AtomicBool>,
+) -> Result<(), HostError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // A host that closed the socket abruptly ended its session; it did not
+    // violate the protocol, and this process must still exit cleanly. Normalize
+    // here rather than at any single failure point, because every read and write
+    // in the session below can be the one that discovers the peer is gone.
+    match run_host_session(stream, secret, supervisor, shutdown, authenticated).await {
+        Err(HostError::PeerGone) => Ok(()),
+        other => other,
+    }
+}
+
+async fn run_host_session<S>(
     stream: S,
     secret: Arc<BootstrapSecret>,
     supervisor: Arc<RuntimeSupervisor>,
@@ -350,7 +374,7 @@ where
                 };
                 let line = match line {
                     Ok(line) => line,
-                    Err(_) => break Err(HostError::InvalidFrame),
+                    Err(error) => break Err(codec_failure(&error)),
                 };
                 let request_bytes = line.len();
                 let request: HostRequest = match serde_json::from_str(&line) {
@@ -522,6 +546,22 @@ where
     })
     .await;
     connection_result
+}
+
+/// Classify a codec failure: losing the peer is the end of a session, while a
+/// frame we could not parse or that broke the line limit is a protocol error.
+fn codec_failure(error: &LinesCodecError) -> HostError {
+    let LinesCodecError::Io(error) = error else {
+        return HostError::InvalidFrame;
+    };
+    match error.kind() {
+        io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::NotConnected => HostError::PeerGone,
+        _ => HostError::InvalidFrame,
+    }
 }
 
 fn request_account_id(request: &HostRequest) -> Option<String> {
@@ -883,7 +923,7 @@ where
         .await
         .send(encoded)
         .await
-        .map_err(|_| HostError::InvalidFrame)
+        .map_err(|error| codec_failure(&error))
 }
 
 async fn send_json<S, T>(framed: &mut Framed<S, LinesCodec>, value: &T) -> Result<(), HostError>
@@ -895,7 +935,7 @@ where
     framed
         .send(encoded)
         .await
-        .map_err(|_| HostError::InvalidFrame)
+        .map_err(|error| codec_failure(&error))
 }
 
 fn random_identifier() -> String {
@@ -960,6 +1000,36 @@ mod tests {
             ),
             store,
         ))
+    }
+
+    #[test]
+    fn a_vanished_host_ends_the_session_instead_of_failing_the_process() {
+        // The host closing its socket abruptly is how a session normally ends;
+        // reporting it as a bad frame makes the process exit non-zero and tells
+        // the user the protocol broke.
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert!(matches!(
+                codec_failure(&LinesCodecError::Io(io::Error::from(kind))),
+                HostError::PeerGone,
+            ));
+        }
+        // A frame we could not read is still a protocol error.
+        assert!(matches!(
+            codec_failure(&LinesCodecError::MaxLineLengthExceeded),
+            HostError::InvalidFrame,
+        ));
+        assert!(matches!(
+            codec_failure(&LinesCodecError::Io(io::Error::from(
+                io::ErrorKind::InvalidData
+            ))),
+            HostError::InvalidFrame,
+        ));
     }
 
     #[test]
@@ -1093,6 +1163,43 @@ mod tests {
 
         drop(client);
         assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_host_that_leaves_right_after_authenticating_still_ends_cleanly() {
+        let secret_bytes = [7_u8; 32];
+        let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
+        let supervisor = test_supervisor();
+        let (server_stream, client_stream) = duplex(64 * 1024);
+        let server = tokio::spawn(handle_connection(server_stream, secret, supervisor));
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let challenge: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
+        let client_nonce = hex::encode([9_u8; 32]);
+        let proof = client_proof(&secret_bytes, server_nonce, &client_nonce);
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": "handshake-1",
+                    "method": "handshake",
+                    "params": { "clientNonce": client_nonce, "proof": proof }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Leave without collecting the handshake reply, so the write that
+        // reports success is the one that finds the peer gone. This is a session
+        // that ended, not a protocol failure, and the process must exit cleanly.
+        drop(client);
+
+        assert!(
+            server.await.unwrap().is_ok(),
+            "a host that vanished must not fail the process"
+        );
     }
 
     #[tokio::test]
