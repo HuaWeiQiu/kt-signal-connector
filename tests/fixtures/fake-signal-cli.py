@@ -125,6 +125,10 @@ for line in sys.stdin:
             continue
         if params.get("deviceName") == "[slow-link-test]":
             continue
+        if params.get("deviceName") == "[crash-link-test]":
+            # Die with the mutating call in flight: the device may or may not
+            # have been linked upstream, which is the indeterminate case.
+            os._exit(21)
         ACCOUNT_LINKED = True
         DELETED_MARKER.unlink(missing_ok=True)
         result = {"number": LINKED_ACCOUNT}

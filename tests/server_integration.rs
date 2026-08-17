@@ -778,6 +778,51 @@ async fn socks_proxy_env_is_forwarded_to_the_jvm() {
 }
 
 #[tokio::test]
+async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_dies() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [9_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "[crash-link-test]" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+
+    // finishLink is Mutating, so a lost result must not be reported as a
+    // retryable timeout: re-running it could claim a second device slot.
+    assert_eq!(finished["error"]["code"], "LINK_OUTCOME_UNKNOWN");
+    assert_eq!(finished["error"]["retryable"], false);
+
+    drop(client);
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[tokio::test]
 async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();

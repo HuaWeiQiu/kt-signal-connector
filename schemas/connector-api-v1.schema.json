@@ -390,6 +390,7 @@
             "UPSTREAM_PROTOCOL_ERROR",
             "UPSTREAM_ERROR",
             "ACCOUNT_DELETE_OUTCOME_UNKNOWN",
+            "LINK_OUTCOME_UNKNOWN",
             "SEND_OUTCOME_UNKNOWN",
             "INTERNAL_ERROR"
           ]

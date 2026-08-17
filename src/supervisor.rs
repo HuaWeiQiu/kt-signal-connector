@@ -399,11 +399,22 @@ impl RuntimeSupervisor {
 
         let result = match upstream {
             Ok(value) => value,
-            Err(EngineError::Timeout) | Err(EngineError::UnknownOutcome) => {
+            Err(EngineError::Timeout) => {
                 return Err(ServiceError::Api(ApiError::new(
                     "UPSTREAM_TIMEOUT",
                     "finishLink timed out waiting for phone approval; retry after scanning",
                     true,
+                )));
+            }
+            // finishLink is Mutating, so this means the call was in flight when
+            // the engine died: the phone may already have linked the device.
+            // Retrying would claim a second device slot, so the host has to
+            // reconcile against the account list instead.
+            Err(EngineError::UnknownOutcome) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "LINK_OUTCOME_UNKNOWN",
+                    "finishLink outcome is unknown; check linked devices before retrying",
+                    false,
                 )));
             }
             Err(error) => return Err(ServiceError::Engine(error)),
