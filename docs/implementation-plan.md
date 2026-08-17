@@ -356,12 +356,34 @@ exposure. Failure to prove the limit leaves the media capability disabled.
 | Data | Owner | Cleanup |
 | --- | --- | --- |
 | Signal keys and protocol account DB | signal-cli private data directory | explicit destructive action only |
-| normalized messages, conversations, contacts, cursors | connector SQLite | product retention policy |
+| normalized messages, conversations, contacts, cursors | connector SQLite | retention pass, see 7.1.1 |
 | current 100-200 message window | KT UI | release on navigation/unmount |
 | media cache | connector | TTL/LRU after media approval |
 | link URI | connector memory | timeout/cancel immediately |
 
 The signal-cli data directory is never a cache and must be explicitly excluded from cleanup code.
+
+### 7.1.1 Message retention
+
+Stored history is bounded so a long-lived install cannot grow without limit. One retention pass runs
+per process start, in the background, and deletes messages that are both outside a safety window and
+selected by one of two rules: older than 90 days, or beyond the newest 2000 rows of their
+conversation. It never repeats on a timer; whatever is left is expired on the next start.
+
+- Age is measured on `messages.stored_at`, the local time this connector first stored the row, never
+ on `sent_at`. A peer with a wrong clock must not be able to decide when local history disappears.
+ Rows written before schema 6 have no `stored_at` and are dated by `received_at` instead; the upgrade
+ deliberately does not rewrite the table, because that would delay the startup handshake.
+- Nothing inside a 7-day floor is pruned, and neither is any send whose outcome is still `pending` or
+ `unknown`. Receive dedupe and send idempotency both answer from stored rows.
+- Conversations, contacts and accounts survive an empty history, so titles, pins and the link itself
+ are never lost to retention. Summaries of conversations that lost rows are recomputed in the same
+ transaction, and an unread badge is clamped to the incoming rows still stored.
+- Each transaction deletes a bounded batch and releases the store lock between batches, so a large
+ first pass cannot stall inbound receives.
+- Deleted pages do not break a caller mid-scroll: message cursors carry their own `(sent_at, id)`
+ sort key, so a page still resolves after the row it pointed at is gone.
+
 
 ### 7.2 Memory budget before measurement
 
@@ -410,8 +432,11 @@ increase. RSS pressure still degrades admission and never kills a live JVM autom
   or restarts the JVM automatically. macOS/Linux sample through a short-lived `ps`; Windows uses the
   native process working-set API and never starts PowerShell for monitoring.
 - conversation cursors are opaque keyset cursors over `(last_message_at nullness,
-  last_message_at, id)`; message cursors are exact message IDs over `(sent_at, id)`. Unknown or
-  cross-account cursors fail closed instead of silently returning the first page.
+  last_message_at, id)`; message cursors are opaque keyset cursors over `(sent_at, id)` bound to one
+  account and conversation, so a page still resolves after retention removed the row it pointed at.
+  Unknown, malformed or cross-account/cross-conversation cursors fail closed instead of silently
+  returning the first page. A bare message id is still accepted, for cursors a running host obtained
+  before the connector was upgraded.
 - reconnect attempts: exponential backoff with a circuit breaker.
 
 Desktop may restart a terminal engine only after its bounded request scheduler drains, with no

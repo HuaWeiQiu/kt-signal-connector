@@ -9,8 +9,20 @@ use thiserror::Error;
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
+/// Retention: newest rows a conversation keeps regardless of age.
+const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
+/// Retention: age past which a message is no longer kept.
+const MESSAGE_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
+/// Preview length ingest stores for a conversation's newest message.
+const PREVIEW_CHARS: i64 = 120;
+/// Marks a message cursor that carries its own sort key.
+const MESSAGE_CURSOR_PREFIX: &str = "m1:";
+/// Retention floor. Receive dedupe and send idempotency both answer from stored
+/// rows, so recent history is never pruned no matter which rule selected it:
+/// signal-cli may still replay an envelope, and a resend may still arrive.
+const RETENTION_SAFETY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 200;
 
@@ -120,6 +132,13 @@ pub struct ConversationRow {
     pub peer_key: String,
 }
 
+/// What one retention pass removed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryPruneOutcome {
+    pub messages_deleted: u64,
+    pub conversations_repaired: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountDeletePlan {
     Completed,
@@ -181,6 +200,7 @@ impl Store {
               sender_id TEXT NOT NULL,
               sent_at INTEGER NOT NULL,
               received_at INTEGER,
+              stored_at INTEGER,
               body TEXT,
               body_bytes INTEGER,
               body_truncated INTEGER NOT NULL DEFAULT 0,
@@ -779,20 +799,34 @@ impl Store {
     ) -> Result<Page<MessageRecord>, StoreError> {
         let limit = limit.clamp(1, MAX_PAGE_LIMIT);
         let fetch = limit + 1;
-        let before_sent_at: Option<i64> = if let Some(before_id) = before {
-            let sent_at = self
-                .conn
-                .query_row(
-                    "SELECT sent_at FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
-                    params![before_id, account_id, conversation_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|_| StoreError::Unavailable)?;
-            Some(sent_at.ok_or(StoreError::InvalidCursor)?)
-        } else {
-            None
+        // A cursor carries its own sort key so a page still resolves after the
+        // row it pointed at is gone — retention and account deletes both remove
+        // history a caller may still be paging through.
+        let anchor: Option<(i64, String)> = match before {
+            Some(cursor) if cursor.starts_with(MESSAGE_CURSOR_PREFIX) => {
+                Some(decode_message_cursor(cursor, account_id, conversation_id)?)
+            }
+            // Cursors handed out before this format, still held by a live host.
+            Some(message_id) => {
+                let sent_at: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT sent_at FROM messages
+                          WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                        params![message_id, account_id, conversation_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| StoreError::Unavailable)?;
+                Some((
+                    sent_at.ok_or(StoreError::InvalidCursor)?,
+                    message_id.to_string(),
+                ))
+            }
+            None => None,
         };
+        let before_sent_at = anchor.as_ref().map(|value| value.0);
+        let before_id = anchor.as_ref().map(|value| value.1.as_str());
         let mut stmt = self
             .conn
             .prepare(
@@ -811,7 +845,7 @@ impl Store {
                     account_id,
                     conversation_id,
                     before_sent_at,
-                    before,
+                    before_id,
                     fetch as i64
                 ],
                 message_record_from_row,
@@ -822,7 +856,9 @@ impl Store {
             .map_err(|_| StoreError::Unavailable)?;
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
-            items.last().map(|item| item.id.clone())
+            items
+                .last()
+                .map(|item| encode_message_cursor(account_id, conversation_id, item))
         } else {
             None
         };
@@ -922,8 +958,9 @@ impl Store {
             .execute(
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                    body, body_bytes, body_truncated, status, client_request_id, quote_message_id
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    stored_at, body, body_bytes, body_truncated, status, client_request_id,
+                    quote_message_id
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     message.id,
                     message.account_id,
@@ -938,6 +975,9 @@ impl Store {
                     message.status,
                     client_request_id,
                     message.quote_message_id,
+                    // Retention counts how long this machine has kept a row, so
+                    // it reads our clock here and never a peer's claimed time.
+                    crate::link::now_ms() as i64,
                 ],
             )
             .map_err(|_| StoreError::Unavailable)?;
@@ -1306,6 +1346,125 @@ impl Store {
             .map_err(|_| StoreError::Unavailable)?;
         Ok(())
     }
+
+    /// Drop history past what the product promises to keep: every conversation
+    /// keeps its newest [`MAX_MESSAGES_PER_CONVERSATION`] rows plus everything
+    /// this machine has held for less than [`MESSAGE_RETENTION_MS`]. Age comes
+    /// from `stored_at`, never from `sent_at`, so a peer with a wrong clock
+    /// cannot decide when our history disappears. Rows inside the safety window
+    /// and rows whose send has not resolved stay regardless, because dedupe and
+    /// idempotency read them. Conversations, contacts and accounts survive an
+    /// empty history so titles, pins and the link itself are never lost here.
+    ///
+    /// One call deletes at most `max_messages` rows and repairs the summaries it
+    /// disturbed, so the caller keeps the store lock for a bounded time; call it
+    /// again while it reports a full batch.
+    pub fn prune_history(
+        &self,
+        now_ms: u64,
+        max_messages: u32,
+    ) -> Result<HistoryPruneOutcome, StoreError> {
+        let now = now_ms as i64;
+        let expired_before = now.saturating_sub(MESSAGE_RETENTION_MS);
+        let keep_after = now.saturating_sub(RETENTION_SAFETY_WINDOW_MS);
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|_| StoreError::Unavailable)?;
+        let mut touched_conversations = std::collections::BTreeSet::new();
+        let mut messages_deleted = 0_u64;
+        {
+            let mut delete = transaction
+                .prepare(
+                    "DELETE FROM messages WHERE id IN (
+                       SELECT id FROM (
+                         SELECT id, status,
+                                COALESCE(stored_at, received_at, sent_at) AS held_since,
+                                ROW_NUMBER() OVER (
+                                  PARTITION BY conversation_id ORDER BY sent_at DESC, id DESC
+                                ) AS recency
+                         FROM messages
+                       )
+                       WHERE held_since < ?1
+                         AND status NOT IN ('pending', 'unknown')
+                         AND (held_since < ?2 OR recency > ?3)
+                       ORDER BY held_since
+                       LIMIT ?4
+                     )
+                     RETURNING conversation_id",
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            let deleted = delete
+                .query_map(
+                    params![
+                        keep_after,
+                        expired_before,
+                        MAX_MESSAGES_PER_CONVERSATION,
+                        max_messages
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| StoreError::Unavailable)?;
+            for conversation_id in deleted {
+                touched_conversations.insert(conversation_id.map_err(|_| StoreError::Unavailable)?);
+                messages_deleted += 1;
+            }
+        }
+        if touched_conversations.is_empty() {
+            transaction.commit().map_err(|_| StoreError::Unavailable)?;
+            return Ok(HistoryPruneOutcome::default());
+        }
+        // A summary may outlive the row it was copied from: age is measured on
+        // our clock while recency follows the sender's, so the newest-looking row
+        // can be the one that expired. Recompute from whatever each conversation
+        // still holds — including the unread badge, which may never promise more
+        // mail than the history behind it. Only conversations that lost a row are
+        // touched, so untouched previews keep exactly what ingest normalized.
+        let mut repair = transaction
+            .prepare(
+                "UPDATE conversations
+                    SET last_message_at = (
+                          SELECT MAX(sent_at) FROM messages WHERE conversation_id=?1
+                        ),
+                        last_message_preview = (
+                          SELECT substr(body, 1, ?2) FROM messages
+                           WHERE conversation_id=?1
+                           ORDER BY sent_at DESC, id DESC
+                           LIMIT 1
+                        ),
+                        unread_count = MIN(unread_count, (
+                          SELECT COUNT(*) FROM messages
+                           WHERE conversation_id=?1 AND direction='incoming'
+                        ))
+                  WHERE id=?1",
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        for conversation_id in &touched_conversations {
+            repair
+                .execute(params![conversation_id, PREVIEW_CHARS])
+                .map_err(|_| StoreError::Unavailable)?;
+        }
+        drop(repair);
+        transaction
+            .execute(
+                "UPDATE accounts
+                    SET unread_count = COALESCE((
+                          SELECT SUM(unread_count) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        ), 0),
+                        last_message_at = (
+                          SELECT MAX(last_message_at) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        )",
+                [],
+            )
+            .map_err(|_| StoreError::Unavailable)?;
+        transaction.commit().map_err(|_| StoreError::Unavailable)?;
+        Ok(HistoryPruneOutcome {
+            messages_deleted,
+            conversations_repaired: touched_conversations.len() as u64,
+        })
+    }
 }
 
 fn prune_completed_account_deletes(
@@ -1324,6 +1483,43 @@ fn prune_completed_account_deletes(
         )
         .map_err(|_| StoreError::Unavailable)?;
     Ok(())
+}
+
+fn encode_message_cursor(account_id: &str, conversation_id: &str, item: &MessageRecord) -> String {
+    format!(
+        "{MESSAGE_CURSOR_PREFIX}{account_id}:{conversation_id}:{}:{}",
+        item.sent_at, item.id
+    )
+}
+
+/// Returns the `(sent_at, id)` sort key a page should resume below. The cursor
+/// is bound to one account and conversation, so a cursor from elsewhere is
+/// refused rather than silently paging the wrong thread.
+fn decode_message_cursor(
+    cursor: &str,
+    expected_account_id: &str,
+    expected_conversation_id: &str,
+) -> Result<(i64, String), StoreError> {
+    let mut parts = cursor
+        .strip_prefix(MESSAGE_CURSOR_PREFIX)
+        .ok_or(StoreError::InvalidCursor)?
+        .splitn(4, ':');
+    if parts.next() != Some(expected_account_id) {
+        return Err(StoreError::InvalidCursor);
+    }
+    if parts.next() != Some(expected_conversation_id) {
+        return Err(StoreError::InvalidCursor);
+    }
+    let sent_at = parts
+        .next()
+        .ok_or(StoreError::InvalidCursor)?
+        .parse::<i64>()
+        .map_err(|_| StoreError::InvalidCursor)?;
+    let id = parts.next().ok_or(StoreError::InvalidCursor)?;
+    if sent_at < 0 || id.is_empty() || id.len() > 128 {
+        return Err(StoreError::InvalidCursor);
+    }
+    Ok((sent_at, id.to_string()))
 }
 
 fn encode_conversation_cursor(account_id: &str, item: &ConversationSummary) -> String {
@@ -1469,6 +1665,14 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
     }
     // Schema 5 adds the contacts cache table; it is created via
     // CREATE TABLE IF NOT EXISTS above, so no data migration is needed.
+    if current < 6 && !table_has_column(conn, "messages", "stored_at")? {
+        // Metadata-only: history written before this column is left NULL rather
+        // than backfilled, because rewriting a whole table here would delay the
+        // startup handshake. Retention dates those rows by their receive time
+        // instead, so nothing reads the missing value as the epoch.
+        conn.execute("ALTER TABLE messages ADD COLUMN stored_at INTEGER", [])
+            .map_err(|_| StoreError::Unavailable)?;
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2029,6 +2233,30 @@ mod tests {
             store.list_messages(&account.id, &conversation.id, 10, Some("other-message")),
             Err(StoreError::InvalidCursor),
         ));
+        // Same rule for a self-describing cursor: it is bound to the thread and
+        // account that issued it, whatever sort key it claims.
+        let other_cursor = encode_message_cursor(&account.id, &other_conversation.id, &{
+            let mut record = other_message.clone();
+            record.direction = "incoming";
+            record
+        });
+        assert!(matches!(
+            store.list_messages(&account.id, &conversation.id, 10, Some(&other_cursor)),
+            Err(StoreError::InvalidCursor),
+        ));
+        assert!(matches!(
+            store.list_messages(
+                &other_account.id,
+                &other_conversation.id,
+                10,
+                Some(&other_cursor)
+            ),
+            Err(StoreError::InvalidCursor),
+        ));
+        assert!(matches!(
+            store.list_messages(&account.id, &conversation.id, 10, Some("m1:broken")),
+            Err(StoreError::InvalidCursor),
+        ));
         assert!(matches!(
             store.list_messages(
                 &other_account.id,
@@ -2364,5 +2592,586 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn message_pages_resume_after_retention_removed_the_anchor() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let (account, conversation, ids) =
+            seed_history(&store, now, &[100 * day, 200 * day, 300 * day]);
+
+        let first = store
+            .list_messages(&account.id, &conversation.id, 1, None)
+            .unwrap();
+        assert_eq!(first.items[0].id, ids[0]);
+        let cursor = first.next_cursor.unwrap();
+        // Everything the caller has seen and its anchor expire underneath it.
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap().messages_deleted,
+            3
+        );
+
+        // The page still resolves; it is simply empty now that the tail is gone.
+        let next = store
+            .list_messages(&account.id, &conversation.id, 10, Some(&cursor))
+            .unwrap();
+        assert!(next.items.is_empty());
+        assert!(next.next_cursor.is_none());
+    }
+
+    #[test]
+    fn retention_repairs_a_preview_whose_anchor_shared_a_timestamp() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut message = MessageRecord {
+            id: "kept".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: now - 10 * day,
+            received_at: Some(now - 10 * day),
+            text: Some("kept body".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("kept body"), true)
+            .unwrap();
+        backdate(&store, "kept", now - 8 * day);
+        // Same timestamp as the row that stays, so a timestamp-only check would
+        // conclude the summary is still anchored and leave a deleted preview.
+        message.id = "expired".into();
+        message.text = Some("expired body".into());
+        store
+            .insert_message(&message, None, Some("expired body"), true)
+            .unwrap();
+        backdate(&store, "expired", now - 400 * day);
+
+        assert_eq!(
+            store
+                .prune_history(now, u32::MAX)
+                .unwrap()
+                .conversations_repaired,
+            1
+        );
+
+        let summary = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(summary.last_message_at, Some(now - 10 * day));
+        assert_eq!(summary.last_message_preview.as_deref(), Some("kept body"));
+    }
+
+    #[test]
+    fn retention_dates_history_written_before_the_stored_at_column() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let message = MessageRecord {
+            id: "before-upgrade".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            // Sender clock claims the epoch; we received it yesterday.
+            sent_at: 5_000,
+            received_at: Some(now - day),
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("body"), true)
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE messages DROP COLUMN stored_at;
+                 UPDATE meta SET value='5' WHERE key='schema_version';",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(temp.path()).unwrap();
+
+        // The upgrade only adds the column; rewriting the table would delay the
+        // startup handshake. Retention instead dates such a row by the time we
+        // received it, so pre-upgrade history is not read as instantly expired.
+        let stored_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT stored_at FROM messages WHERE id='before-upgrade'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_at, None);
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap().messages_deleted,
+            0
+        );
+        assert_eq!(stored_message_ids(&store, &conversation.id).len(), 1);
+        let version: i64 = store
+            .conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Seed one conversation with messages at the given ages, newest first in
+    /// the returned ids. `now` is the wall clock the retention pass will see.
+    fn seed_history(
+        store: &Store,
+        now: u64,
+        ages_ms: &[u64],
+    ) -> (AccountSummary, ConversationRow, Vec<String>) {
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let ids = ages_ms
+            .iter()
+            .enumerate()
+            .map(|(index, age)| {
+                let id = format!("message-{index}");
+                let message = MessageRecord {
+                    id: id.clone(),
+                    account_id: account.id.clone(),
+                    conversation_id: conversation.id.clone(),
+                    direction: "incoming",
+                    sender_id: "peer".into(),
+                    sent_at: now - age,
+                    received_at: Some(now - age),
+                    text: Some("body".into()),
+                    text_bytes: Some(4),
+                    text_truncated: false,
+                    text_retrievable: true,
+                    attachments: Vec::new(),
+                    status: "delivered",
+                    client_request_id: None,
+                    quote_message_id: None,
+                };
+                store
+                    .insert_message(&message, None, Some("body"), true)
+                    .unwrap();
+                backdate(store, &id, now - age);
+                id
+            })
+            .collect();
+        (account, conversation, ids)
+    }
+
+    /// Pretend the store has held a row since `stored_at`; inserts always stamp
+    /// the real clock, which no test can wait out.
+    fn backdate(store: &Store, message_id: &str, stored_at: u64) {
+        let updated = store
+            .conn
+            .execute(
+                "UPDATE messages SET stored_at=?2 WHERE id=?1",
+                params![message_id, stored_at as i64],
+            )
+            .unwrap();
+        assert_eq!(updated, 1);
+    }
+
+    fn stored_message_ids(store: &Store, conversation_id: &str) -> Vec<String> {
+        let mut stmt = store
+            .conn
+            .prepare("SELECT id FROM messages WHERE conversation_id=?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn retention_drops_expired_history_and_keeps_the_rest() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let (account, conversation, ids) =
+            seed_history(&store, now, &[day, 89 * day, 91 * day, 400 * day]);
+
+        let outcome = store.prune_history(now, u32::MAX).unwrap();
+
+        assert_eq!(outcome.messages_deleted, 2);
+        let remaining = stored_message_ids(&store, &conversation.id);
+        assert_eq!(remaining, vec![ids[0].clone(), ids[1].clone()]);
+        // The seed inserted the oldest row last, so it owned the summary; the
+        // repair moves the summary to the newest row still stored.
+        assert_eq!(outcome.conversations_repaired, 1);
+        let summary = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(summary.last_message_at, Some(now - day));
+    }
+
+    #[test]
+    fn retention_keeps_recent_history_beyond_the_per_conversation_cap() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        // More rows than the cap allows, all inside the safety window: replay
+        // dedupe and send idempotency still need every one of them.
+        let ages = (0..(MAX_MESSAGES_PER_CONVERSATION as u64 + 5))
+            .map(|index| index + 1)
+            .collect::<Vec<_>>();
+        let (_account, conversation, _ids) = seed_history(&store, now, &ages);
+
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap().messages_deleted,
+            0
+        );
+        assert_eq!(
+            stored_message_ids(&store, &conversation.id).len(),
+            ages.len()
+        );
+    }
+
+    #[test]
+    fn retention_enforces_the_per_conversation_cap_outside_the_safety_window() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let over_cap = 3;
+        // Old enough to prune, young enough that only the cap can select them.
+        let ages = (0..(MAX_MESSAGES_PER_CONVERSATION as u64 + over_cap))
+            .map(|index| 8 * day + index)
+            .collect::<Vec<_>>();
+        let (_account, conversation, ids) = seed_history(&store, now, &ages);
+
+        let outcome = store.prune_history(now, u32::MAX).unwrap();
+
+        assert_eq!(outcome.messages_deleted, over_cap);
+        let remaining = stored_message_ids(&store, &conversation.id);
+        assert_eq!(remaining.len(), MAX_MESSAGES_PER_CONVERSATION as usize);
+        // The oldest rows go; the newest are what the cap keeps.
+        for id in ids.iter().take(MAX_MESSAGES_PER_CONVERSATION as usize) {
+            assert!(remaining.contains(id));
+        }
+        for id in ids.iter().skip(MAX_MESSAGES_PER_CONVERSATION as usize) {
+            assert!(!remaining.contains(id));
+        }
+    }
+
+    #[test]
+    fn retention_never_drops_a_send_that_has_not_resolved() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut message = MessageRecord {
+            id: "in-flight".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sent_at: now - 400 * day,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "pending",
+            client_request_id: Some("request-pending".into()),
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, Some("request-pending"), Some("body"), false)
+            .unwrap();
+        message.id = "outcome-unknown".into();
+        message.status = "unknown";
+        message.client_request_id = Some("request-unknown".into());
+        store
+            .insert_message(&message, Some("request-unknown"), Some("body"), false)
+            .unwrap();
+        backdate(&store, "in-flight", now - 400 * day);
+        backdate(&store, "outcome-unknown", now - 400 * day);
+
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap().messages_deleted,
+            0
+        );
+        assert_eq!(
+            store
+                .message_by_client_request(&account.id, "request-pending")
+                .unwrap()
+                .map(|row| row.id),
+            Some("in-flight".to_string())
+        );
+        assert_eq!(
+            store
+                .message_by_client_request(&account.id, "request-unknown")
+                .unwrap()
+                .map(|row| row.id),
+            Some("outcome-unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn retention_repairs_the_summaries_of_a_conversation_it_emptied() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let (account, conversation, _ids) = seed_history(&store, now, &[300 * day, 400 * day]);
+        // Second conversation stays inside retention so the account keeps a
+        // last-message time and an unread badge of its own.
+        let kept = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
+            .unwrap();
+        let recent = MessageRecord {
+            id: "recent".into(),
+            account_id: account.id.clone(),
+            conversation_id: kept.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: now - day,
+            received_at: Some(now - day),
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&recent, None, Some("body"), true)
+            .unwrap();
+
+        let outcome = store.prune_history(now, u32::MAX).unwrap();
+
+        assert_eq!(outcome.messages_deleted, 2);
+        assert_eq!(outcome.conversations_repaired, 1);
+        let conversations = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items;
+        let emptied = conversations
+            .iter()
+            .find(|item| item.id == conversation.id)
+            .unwrap();
+        // The conversation survives so its title and pins do, but it may not
+        // advertise a preview, a time or unread mail that no longer exists.
+        assert_eq!(emptied.last_message_at, None);
+        assert_eq!(emptied.last_message_preview, None);
+        assert_eq!(emptied.unread_count, 0);
+        let accounts = store.list_accounts().unwrap();
+        let summary = accounts.iter().find(|item| item.id == account.id).unwrap();
+        assert_eq!(summary.last_message_at, Some(now - day));
+        assert_eq!(summary.unread_count, 1);
+    }
+
+    #[test]
+    fn retention_repoints_a_summary_whose_newest_row_expired() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut message = MessageRecord {
+            id: "kept".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: now - 20 * day,
+            received_at: Some(now - 20 * day),
+            text: Some("kept body".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("kept body"), true)
+            .unwrap();
+        backdate(&store, "kept", now - 8 * day);
+        // A peer clock running ahead makes this the newest row by sent_at, so the
+        // conversation summary points at it, yet we have held it long enough to
+        // expire. Pruning it must not leave the summary on a deleted row.
+        message.id = "skewed".into();
+        message.sent_at = now - 10 * day;
+        message.text = Some("skewed body".into());
+        store
+            .insert_message(&message, None, Some("skewed body"), true)
+            .unwrap();
+        backdate(&store, "skewed", now - 400 * day);
+
+        let outcome = store.prune_history(now, u32::MAX).unwrap();
+
+        assert_eq!(outcome.messages_deleted, 1);
+        assert_eq!(outcome.conversations_repaired, 1);
+        let summary = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(summary.last_message_at, Some(now - 20 * day));
+        assert_eq!(summary.last_message_preview.as_deref(), Some("kept body"));
+        let accounts = store.list_accounts().unwrap();
+        assert_eq!(accounts[0].last_message_at, Some(now - 20 * day));
+    }
+
+    #[test]
+    fn retention_caps_unread_by_the_incoming_mail_it_kept() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut message = MessageRecord {
+            id: "unread-incoming".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: now - 300 * day,
+            received_at: Some(now - 300 * day),
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("body"), true)
+            .unwrap();
+        backdate(&store, "unread-incoming", now - 300 * day);
+        // Our own reply keeps the conversation anchored, so only the unread cap
+        // is under test here, and replies were never unread mail.
+        message.id = "own-reply".into();
+        message.direction = "outgoing";
+        message.sender_id = account.id.clone();
+        message.received_at = None;
+        message.sent_at = now - day;
+        store
+            .insert_message(&message, None, Some("body"), false)
+            .unwrap();
+
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap().messages_deleted,
+            1
+        );
+
+        let summary = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(summary.unread_count, 0);
+        assert_eq!(store.list_accounts().unwrap()[0].unread_count, 0);
+    }
+
+    #[test]
+    fn retention_deletes_at_most_one_batch_per_call() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let (_account, conversation, _ids) =
+            seed_history(&store, now, &[300 * day, 350 * day, 400 * day]);
+
+        assert_eq!(store.prune_history(now, 2).unwrap().messages_deleted, 2);
+        assert_eq!(stored_message_ids(&store, &conversation.id).len(), 1);
+        assert_eq!(store.prune_history(now, 2).unwrap().messages_deleted, 1);
+        assert!(stored_message_ids(&store, &conversation.id).is_empty());
+    }
+
+    #[test]
+    fn retention_is_idempotent_and_quiet_when_nothing_expired() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        let (account, conversation, _ids) = seed_history(&store, now, &[day, 400 * day]);
+
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap().messages_deleted,
+            1
+        );
+        let before = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(
+            store.prune_history(now, u32::MAX).unwrap(),
+            HistoryPruneOutcome::default()
+        );
+        let after = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before[0].unread_count, after[0].unread_count);
+        assert_eq!(before[0].last_message_at, after[0].last_message_at);
+        assert_eq!(stored_message_ids(&store, &conversation.id).len(), 1);
     }
 }

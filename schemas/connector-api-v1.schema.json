@@ -245,7 +245,7 @@
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
-        "before": { "$ref": "#/$defs/opaqueId" },
+        "before": { "type": "string", "maxLength": 256 },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
       }
     },

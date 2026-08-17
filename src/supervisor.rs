@@ -32,6 +32,11 @@ const WATCHDOG_PING_TIMEOUT: Duration = Duration::from_secs(15);
 const WATCHDOG_MAX_PING_FAILURES: u32 = 2;
 /// Maximum deferred (pending) restarts per failure episode before giving up.
 const WATCHDOG_MAX_PENDING_RETRIES: u32 = 3;
+/// Rows one retention transaction may delete, keeping each one short.
+const RETENTION_BATCH_MESSAGES: u32 = 2_000;
+/// Breathing room between retention batches so receives and host requests get
+/// the store lock while a large history is being pruned.
+const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(50);
 
 /// What raised a restart request. Drives whether ping recovery may clear a
 /// pending restart: the REST ping says nothing about the receive WebSocket,
@@ -77,6 +82,8 @@ pub struct RuntimeSupervisor {
     receive_worker: JoinHandle<()>,
     /// Receive-liveness watchdog; never held across an await.
     watchdog: StdMutex<Option<JoinHandle<()>>>,
+    /// One-shot history retention pass; never held across an await.
+    retention: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
 }
@@ -102,6 +109,7 @@ impl RuntimeSupervisor {
             receive_ingress,
             receive_worker,
             watchdog: StdMutex::new(None),
+            retention: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
         }
     }
@@ -118,6 +126,52 @@ impl RuntimeSupervisor {
         }
         let supervisor = Arc::clone(self);
         *slot = Some(tokio::spawn(supervisor.watchdog_loop()));
+    }
+
+    /// Apply history retention once per process start (idempotent).
+    ///
+    /// It runs in the background rather than on the startup path because the
+    /// host only waits a few seconds for the handshake, and it takes the store
+    /// lock one bounded batch at a time because inbound receives need that same
+    /// lock. It does not repeat on a timer: nothing here is time-critical, and a
+    /// long-lived process simply defers the rest to the next start.
+    pub fn spawn_history_retention(self: &Arc<Self>) {
+        let Ok(mut slot) = self.retention.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let service = Arc::clone(&self.service);
+        *slot = Some(tokio::spawn(async move {
+            let now = crate::link::now_ms();
+            let mut removed = 0_u64;
+            loop {
+                let outcome = service
+                    .lock()
+                    .await
+                    .store_ref()
+                    .prune_history(now, RETENTION_BATCH_MESSAGES);
+                match outcome {
+                    Ok(outcome) => {
+                        removed += outcome.messages_deleted;
+                        if outcome.messages_deleted < u64::from(RETENTION_BATCH_MESSAGES) {
+                            break;
+                        }
+                        sleep(RETENTION_BATCH_PAUSE).await;
+                    }
+                    // Storage trouble surfaces on the paths the host is waiting
+                    // on; retention leaves the rest for the next start.
+                    Err(_) => {
+                        eprintln!("kt-signal-connector: retention stopped, store unavailable");
+                        break;
+                    }
+                }
+            }
+            if removed > 0 {
+                eprintln!("kt-signal-connector: retention removed {removed} message(s)");
+            }
+        }));
     }
 
     pub fn subscribe_engine(&self) -> broadcast::Receiver<EngineEvent> {
@@ -1138,6 +1192,11 @@ impl Drop for RuntimeSupervisor {
         {
             handle.abort();
         }
+        if let Ok(mut slot) = self.retention.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -1312,6 +1371,7 @@ pub fn open_supervisor(
     config.proxy = proxy;
     let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
     supervisor.spawn_watchdog();
+    supervisor.spawn_history_retention();
     Ok(supervisor)
 }
 
@@ -1321,13 +1381,15 @@ mod tests {
 
     use rusqlite::Connection;
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::TempDir;
-    use tokio::time::timeout;
+
+    use tokio::time::{sleep, timeout};
 
     use super::{RuntimeSupervisor, compose_contact_display_name, is_receive_fatal_stderr};
     use crate::engine::{NormalizedReceive, SignalCliConfig};
     use crate::service::HostSideEvent;
-    use crate::store::Store;
+    use crate::store::{MessageRecord, Store};
 
     #[test]
     fn prefers_profile_given_and_family_name() {
@@ -1341,6 +1403,86 @@ mod tests {
             compose_contact_display_name(&item).as_deref(),
             Some("Ada Lovelace")
         );
+    }
+
+    #[tokio::test]
+    async fn history_retention_runs_once_per_start_in_the_background() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1))
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let expired_at = crate::link::now_ms() - 400 * 24 * 60 * 60 * 1_000;
+        let mut expired = MessageRecord {
+            id: "expired".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: expired_at,
+            received_at: Some(expired_at),
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            attachments: Vec::new(),
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&expired, None, Some("body"), true)
+            .unwrap();
+        let observer = Connection::open(store.path()).unwrap();
+        let backdate = |id: &str| {
+            observer
+                .execute(
+                    "UPDATE messages SET stored_at=?2 WHERE id=?1",
+                    rusqlite::params![id, expired_at as i64],
+                )
+                .unwrap();
+        };
+        backdate("expired");
+        let stored = || {
+            observer
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            SignalCliConfig::new(
+                temp.path().join("unused-signal-cli"),
+                temp.path().join("unused-signal-data"),
+            ),
+            store,
+        ));
+
+        supervisor.spawn_history_retention();
+        timeout(Duration::from_secs(2), async {
+            while stored() != 0 {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("retention should drop expired history");
+
+        // Asking again is a no-op for the life of the process.
+        expired.id = "expired-later".into();
+        supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .insert_message(&expired, None, Some("body"), true)
+            .unwrap();
+        backdate("expired-later");
+        supervisor.spawn_history_retention();
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(stored(), 1);
     }
 
     #[tokio::test]
