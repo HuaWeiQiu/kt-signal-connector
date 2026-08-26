@@ -117,7 +117,17 @@ the Windows connector refuses file bootstrap because POSIX mode bits do not prov
 The first frame performs a challenge-response handshake and negotiates API capabilities. The secret
 and endpoint are never logged, and their mutable buffers are zeroized after bootstrap/handshake.
 
-The secret file contains exactly 64 lowercase hexadecimal characters. The server sends a random
+The bootstrap payload is two lines (Phase 3 key contract, 2026-08-26): line 1 is the bootstrap
+secret, exactly 64 lowercase hexadecimal characters, unchanged; line 2 is the 32-byte store key,
+also exactly 64 lowercase hexadecimal characters, generated once by the desktop and persisted via
+Electron `safeStorage`. Read-and-delete (file) and zeroization (memory) cover both lines. The store
+key never crosses the socket, never enters the wire protocol or the schema, and is never logged;
+the connector holds it in `Zeroizing` memory only. `KT_SIGNAL_STORE_KEY` is a dev/test override and
+never set in production. A single-line legacy payload is still parsed, but without a store key the
+connector fails closed: an existing plaintext store is never opened without a key, and with no
+store at all startup is refused until the desktop generates and delivers the key (first run).
+
+The server sends a random
 32-byte hexadecimal `serverNonce`; KT answers with a random 32-byte hexadecimal `clientNonce` and:
 
 ```text
@@ -201,6 +211,17 @@ Rules:
   the `KT_SIGNAL_SOCKS_PROXY=host:port` environment variable (preferred, so it stays off the process
   command line) or `serve --socks-proxy host:port`. An invalid value aborts startup with a clear
   error. The default is a direct connection, and watchdog restarts reuse the same proxy config.
+- Phase 5 adds a GraalVM native-image mode, selected explicitly with `serve --signal-cli-native`
+  or `KT_SIGNAL_CLI_NATIVE=1` (explicit flag, not file-type probing: packaging controls what it
+  ships, and a wrong heuristic guess would silently drop the JVM heap budget). The CLI arguments
+  are identical to the JVM launcher shape. Native mode skips `JAVA_HOME` validation/forwarding and
+  `JAVA_OPTS` injection; a configured SOCKS proxy is prepended to argv as
+  `-DsocksProxyHost/-DsocksProxyPort`, which the GraalVM native-image launcher applies as runtime
+  system properties (verified against signal-cli 0.14.7 native: SOCKS5 CONNECT with remote DNS,
+  staging provisioning round-trip through a local relay). The trade-off is that the proxy host:port
+  appears on the child command line; the JVM mode keeps it in the environment. Every other
+  supervision guarantee (absolute-path non-symlink executable check, stdio JSON-RPC, receive-mode,
+  kill-on-drop, watchdog, RSS sampling) is identical across modes.
 
 During the local Phase 1 PoC, the trusted launcher supplies absolute executable and data-directory
 paths as process arguments; neither is accepted over host IPC. Phase 3 replaces this bootstrap with
@@ -360,7 +381,8 @@ exposure. Failure to prove the limit leaves the media capability disabled.
 | Data | Owner | Cleanup |
 | --- | --- | --- |
 | Signal keys and protocol account DB | signal-cli private data directory | explicit destructive action only |
-| normalized messages, conversations, contacts, cursors | connector SQLite | retention pass, see 7.1.1 |
+| normalized messages, conversations, contacts, cursors | connector SQLCipher store | retention pass, see 7.1.1 |
+| plaintext migration backup | connector store directory | 7-day retention, see 7.1.2 |
 | current 100-200 message window | KT UI | release on navigation/unmount |
 | media cache | connector | TTL/LRU after media approval |
 | link URI | connector memory | timeout/cancel immediately |
@@ -387,6 +409,18 @@ conversation. It never repeats on a timer; whatever is left is expired on the ne
  first pass cannot stall inbound receives.
 - Deleted pages do not break a caller mid-scroll: message cursors carry their own `(sent_at, id)`
  sort key, so a page still resolves after the row it pointed at is gone.
+
+### 7.1.2 Store encryption at rest
+
+The connector store is SQLCipher (rusqlite `bundled-sqlcipher`), keyed with the 32-byte store key
+from the bootstrap payload; the blast radius of the encryption boundary is `Store::open`. A store
+file starting with the plaintext `SQLite format 3` header is migrated on first start: the plaintext
+WAL is checkpointed, one consistent plaintext backup (`connector.sqlite3.plaintext-backup`) is
+written for rollback, the data is exported online into a fresh encrypted file via
+`sqlcipher_export`, and the encrypted file is atomically swapped in. Migration failure fails closed
+— the connector never silently serves plaintext — and no plaintext copy lands anywhere but the
+backup. The backup is pruned after 7 days through the same once-per-start retention pass as
+history (7.1.1). A keyed open that the store rejects fails closed as well.
 
 
 ### 7.2 Memory budget before measurement

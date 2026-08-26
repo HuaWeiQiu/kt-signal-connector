@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kt_signal_connector::engine::{
-    CallClass, EngineHandle, SignalCliConfig, event_channel, receive_channel,
+    CallClass, EngineEvent, EngineHandle, SignalCliConfig, event_channel, receive_channel,
 };
-use kt_signal_connector::store::Store;
+use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use serde_json::json;
 use tempfile::TempDir;
@@ -17,6 +17,12 @@ use tokio::time::{sleep, timeout};
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+}
+
+/// All watchdog-test stores are encrypted with one fixed key (Phase 3), so a
+/// seeded store and the supervisor's own open see the same database.
+fn test_store(dir: &std::path::Path) -> Store {
+    Store::open(dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap()
 }
 
 fn watchdog_supervisor(temp: &TempDir) -> (Arc<RuntimeSupervisor>, PathBuf) {
@@ -27,7 +33,7 @@ fn watchdog_supervisor_with_throttle(
     temp: &TempDir,
     min_restart_interval: Duration,
 ) -> (Arc<RuntimeSupervisor>, PathBuf) {
-    let store = Store::open(temp.path()).unwrap();
+    let store = test_store(temp.path());
     let data_dir = temp.path().join("signal-data");
     let mut config = SignalCliConfig::new(fixture(), data_dir.clone());
     config.request_timeout = Duration::from_secs(1);
@@ -79,6 +85,60 @@ async fn engine_stderr_lines_are_broadcast_to_subscribers() {
     engine.shutdown().await.unwrap();
 }
 
+/// Phase 1a regression: with the receive queue full and its consumer not
+/// draining (storage keeps failing every persist, so the persistence loop
+/// retries the queue head forever), a shutdown request must still complete
+/// within a bounded time. Before the fix the actor parked on an unbounded
+/// enqueue wait, starved its command lane, and shutdown hung forever. Also
+/// asserts the degradation surfaces as the engine-side storage event.
+#[tokio::test]
+async fn shutdown_completes_when_the_receive_queue_is_full_and_storage_is_down() {
+    let temp = TempDir::new().unwrap();
+    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    config.request_timeout = Duration::from_secs(1);
+    config.shutdown_grace = Duration::from_millis(100);
+    config.receive_enqueue_timeout = Duration::from_millis(50);
+    let (events, _) = event_channel();
+    let (receive_ingress, receives) = receive_channel();
+    let engine = EngineHandle::start(config, events, receive_ingress)
+        .await
+        .unwrap();
+    let mut engine_events = engine.subscribe();
+
+    // Hold the receiver without ever draining it: exactly what the engine
+    // sees while storage is down and the persistence loop retries the head.
+    let _undrained = receives;
+    // Overfill the bounded receive queue (message capacity 256).
+    for _ in 0..(256 + 20) {
+        engine
+            .call("emitReceive", json!({}), CallClass::ReadOnly)
+            .await
+            .unwrap();
+    }
+
+    // Once the queue stays full past the enqueue timeout, receives are
+    // dropped and the engine reports degraded storage exactly once.
+    timeout(Duration::from_secs(15), async {
+        loop {
+            if let EngineEvent::StorageChanged {
+                state: "unavailable",
+            } = engine_events.recv().await.unwrap()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("a saturated receive queue must surface as degraded storage");
+
+    // The core assertion: shutdown answers within its internal budget
+    // (grace + margin, here ~2.1s) instead of hanging behind a parked actor.
+    timeout(Duration::from_secs(10), engine.shutdown())
+        .await
+        .expect("shutdown must not hang behind receive backpressure")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn watchdog_restarts_engine_on_fatal_receive_stderr() {
     let temp = TempDir::new().unwrap();
@@ -97,7 +157,7 @@ async fn watchdog_restarts_engine_after_repeated_ping_failures() {
     let temp = TempDir::new().unwrap();
     // Seed one linked account so the watchdog has a ping target.
     {
-        let seed = Store::open(temp.path()).unwrap();
+        let seed = test_store(temp.path());
         seed.upsert_account_from_signal("+15555550100", Some(1))
             .unwrap();
     }
@@ -115,7 +175,7 @@ async fn watchdog_restarts_engine_after_repeated_ping_failures() {
 async fn watchdog_leaves_a_healthy_engine_alone() {
     let temp = TempDir::new().unwrap();
     {
-        let seed = Store::open(temp.path()).unwrap();
+        let seed = test_store(temp.path());
         seed.upsert_account_from_signal("+15555550100", Some(1))
             .unwrap();
     }
@@ -158,7 +218,7 @@ async fn throttled_stderr_restart_is_retried_after_the_throttle_window() {
 async fn ping_pending_restart_is_cleared_when_pings_recover() {
     let temp = TempDir::new().unwrap();
     {
-        let seed = Store::open(temp.path()).unwrap();
+        let seed = test_store(temp.path());
         seed.upsert_account_from_signal("+15555550100", Some(1))
             .unwrap();
     }

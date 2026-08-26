@@ -224,6 +224,18 @@ fn serve_requires_exactly_one_bootstrap_secret_source() {
 }
 
 #[test]
+fn serve_help_lists_the_native_signal_cli_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
+        .args(["serve", "--help"])
+        .output()
+        .expect("connector binary should run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("--signal-cli-native"));
+    assert!(stdout.contains("KT_SIGNAL_CLI_NATIVE"));
+}
+
+#[test]
 fn serve_rejects_an_invalid_socks_proxy_before_starting() {
     let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
     let required_args = [

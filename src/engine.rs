@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, sink};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::codec::{FramedRead, LinesCodec};
@@ -28,6 +28,15 @@ const COMMAND_QUEUE_CAPACITY: usize = 128;
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 const RECEIVE_QUEUE_CAPACITY: usize = 256;
 const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
+/// How long receive admission may wait on queue capacity before the receive
+/// is dropped instead of parking the engine actor. Healthy persistence drains
+/// the queue in milliseconds; a queue that stays full for this long means
+/// storage is not draining, and the actor must stay responsive to its command
+/// lane (including shutdown) instead of backpressuring forever.
+const RECEIVE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Slack over the child graceful-exit budget after which an unanswered
+/// shutdown request is considered stuck and the child is killed directly.
+const SHUTDOWN_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_RECEIVE_ID_CHARS: usize = 256;
@@ -35,15 +44,37 @@ const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
 
+/// How the configured signal-cli executable is launched.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SignalCliMode {
+    /// The upstream launcher script: a JVM is started and the heap budget and
+    /// SOCKS proxy reach it through the `JAVA_OPTS` environment variable.
+    #[default]
+    Jvm,
+    /// A GraalVM native-image single-file binary (Phase 5): spawned directly
+    /// with identical CLI arguments. There is no JVM, so `JAVA_HOME` is not
+    /// validated or forwarded and no `JAVA_OPTS` are injected; a configured
+    /// SOCKS proxy is passed as leading `-DsocksProxyHost/-DsocksProxyPort`
+    /// argv entries, which the native-image launcher applies as runtime
+    /// system properties (verified against signal-cli 0.14.7 native on
+    /// 2026-08-26: the binary spoke SOCKS5 to a local relay and completed a
+    /// staging provisioning round-trip through it). Note this necessarily
+    /// puts proxy host:port on the child command line; the JVM mode keeps it
+    /// in the environment.
+    Native,
+}
+
 #[derive(Clone, Debug)]
 pub struct SignalCliConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
+    pub mode: SignalCliMode,
     pub java_home: Option<PathBuf>,
     pub proxy: Option<SocksProxy>,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
+    pub receive_enqueue_timeout: Duration,
     pub resource_sample_interval: Duration,
     pub watchdog_interval: Duration,
     pub watchdog_min_restart_interval: Duration,
@@ -54,11 +85,13 @@ impl SignalCliConfig {
         Self {
             executable,
             data_dir,
+            mode: SignalCliMode::Jvm,
             java_home: None,
             proxy: None,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
+            receive_enqueue_timeout: RECEIVE_ENQUEUE_TIMEOUT,
             resource_sample_interval: Duration::from_secs(30),
             watchdog_interval: Duration::from_secs(30),
             watchdog_min_restart_interval: Duration::from_secs(300),
@@ -66,9 +99,12 @@ impl SignalCliConfig {
     }
 }
 
-/// Optional SOCKS proxy for the signal-cli JVM. signal-cli does not read OS
-/// proxy settings, so the only way through a proxied network is injecting
-/// `-DsocksProxyHost/-DsocksProxyPort` into the JVM launch.
+/// Optional SOCKS proxy for the signal-cli child. signal-cli does not read OS
+/// proxy settings in either mode: in JVM mode the proxy is injected into the
+/// launcher via `-DsocksProxyHost/-DsocksProxyPort` inside `JAVA_OPTS`; in
+/// native mode the same properties are passed as leading argv entries, which
+/// the GraalVM native-image launcher applies at runtime (see
+/// [`SignalCliMode::Native`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SocksProxy {
     pub host: String,
@@ -114,7 +150,7 @@ impl std::str::FromStr for SocksProxy {
 }
 
 /// JAVA_OPTS passed to the signal-cli launcher: the documented heap budget
-/// plus the SOCKS proxy flags when a proxy is configured.
+/// plus the SOCKS proxy flags when a proxy is configured. JVM mode only.
 fn java_opts(proxy: Option<&SocksProxy>) -> String {
     match proxy {
         Some(proxy) => format!(
@@ -123,6 +159,35 @@ fn java_opts(proxy: Option<&SocksProxy>) -> String {
         ),
         None => SIGNAL_CLI_JAVA_OPTS.to_string(),
     }
+}
+
+/// signal-cli CLI arguments, identical in both modes except that native mode
+/// prepends the SOCKS proxy as runtime system properties for the GraalVM
+/// native-image launcher. The launcher consumes `-D` entries anywhere on the
+/// command line before the app parses its own arguments; leading position is
+/// convention, not requirement.
+fn signal_cli_args(
+    mode: SignalCliMode,
+    proxy: Option<&SocksProxy>,
+    data_dir: &Path,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if mode == SignalCliMode::Native
+        && let Some(proxy) = proxy
+    {
+        args.push(format!("-DsocksProxyHost={}", proxy.host).into());
+        args.push(format!("-DsocksProxyPort={}", proxy.port).into());
+    }
+    args.push("--data-dir".into());
+    args.push(data_dir.as_os_str().into());
+    args.push("jsonRpc".into());
+    // Explicit: pull server messages as soon as the daemon is up.
+    args.push("--receive-mode".into());
+    args.push("on-start".into());
+    args.push("--ignore-attachments".into());
+    args.push("--ignore-stories".into());
+    args.push("--ignore-stickers".into());
+    args
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -171,6 +236,30 @@ pub enum EngineError {
     Upstream,
 }
 
+impl EngineError {
+    /// Log-safe variant classification: the variants are deliberately
+    /// content-free, and logs carry this class rather than any detail.
+    fn class(&self) -> &'static str {
+        match self {
+            EngineError::StartFailed => "start_failed",
+            EngineError::NotRunning => "not_running",
+            EngineError::Backpressure => "backpressure",
+            EngineError::Timeout => "timeout",
+            EngineError::UnknownOutcome => "unknown_outcome",
+            EngineError::Exited => "exited",
+            EngineError::Protocol => "protocol",
+            EngineError::Upstream => "upstream",
+        }
+    }
+}
+
+fn call_class_label(class: CallClass) -> &'static str {
+    match class {
+        CallClass::ReadOnly => "read",
+        CallClass::Mutating => "mutating",
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum EngineEvent {
     StateChanged(EngineStatus),
@@ -181,6 +270,14 @@ pub enum EngineEvent {
         state: ResourcePressureState,
         pid: u32,
         rss_bytes: u64,
+    },
+    /// The receive queue could not be drained for a full enqueue timeout, so
+    /// receives are being dropped: local persistence is degraded even though
+    /// the engine process itself is alive. `state` is `unavailable` on the
+    /// first drop and `recovered` when admission succeeds again; the host
+    /// serializes it as the existing `runtime.storageChanged` event.
+    StorageChanged {
+        state: &'static str,
     },
 }
 
@@ -222,31 +319,61 @@ impl QueuedReceive {
     }
 }
 
+/// Outcome of one receive admission attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnqueueOutcome {
+    Enqueued,
+    /// The queue stayed full for the whole enqueue timeout, so the receive
+    /// was dropped instead of parking the engine actor. This is the degraded
+    /// path for a store that stopped draining the queue; the persistence
+    /// loop reports `runtime.storageChanged` for the underlying failure.
+    Dropped,
+}
+
 #[derive(Clone)]
 pub struct ReceiveIngress {
     sender: mpsc::Sender<QueuedReceive>,
     byte_budget: Arc<Semaphore>,
+    enqueue_timeout: Duration,
 }
 
 impl ReceiveIngress {
-    pub(crate) async fn enqueue(&self, receive: NormalizedReceive) -> Result<(), EngineError> {
+    pub(crate) async fn enqueue(
+        &self,
+        receive: NormalizedReceive,
+    ) -> Result<EnqueueOutcome, EngineError> {
         let weight = receive.estimated_bytes().max(1);
         if weight > RECEIVE_QUEUE_BYTE_CAPACITY {
             return Err(EngineError::Protocol);
         }
-        let permit = self
-            .byte_budget
-            .clone()
-            .acquire_many_owned(weight as u32)
-            .await
-            .map_err(|_| EngineError::Exited)?;
-        self.sender
-            .send(QueuedReceive {
+        // Both waits are bounded. While storage is down the persistence loop
+        // keeps retrying the head of the queue, so an unbounded wait here
+        // would park the engine actor and starve its command lane (including
+        // shutdown). Both futures are cancel-safe, so a timeout cannot lose a
+        // half-acquired permit; the permit taken by a timed-out send drops
+        // with it and releases its budget.
+        let acquire = self.byte_budget.clone().acquire_many_owned(weight as u32);
+        let permit = match timeout(self.enqueue_timeout, acquire).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(EngineError::Exited),
+            Err(_) => return Ok(EnqueueOutcome::Dropped),
+        };
+        match timeout(
+            self.enqueue_timeout,
+            self.sender.send(QueuedReceive {
                 receive,
                 _byte_permit: permit,
-            })
-            .await
-            .map_err(|_| EngineError::Exited)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                crate::metrics::receive_queue_enqueued();
+                Ok(EnqueueOutcome::Enqueued)
+            }
+            Ok(Err(_)) => Err(EngineError::Exited),
+            Err(_) => Ok(EnqueueOutcome::Dropped),
+        }
     }
 }
 
@@ -267,6 +394,7 @@ pub fn receive_channel() -> (ReceiveIngress, mpsc::Receiver<QueuedReceive>) {
         ReceiveIngress {
             sender,
             byte_budget: Arc::new(Semaphore::new(RECEIVE_QUEUE_BYTE_CAPACITY)),
+            enqueue_timeout: RECEIVE_ENQUEUE_TIMEOUT,
         },
         receiver,
     )
@@ -279,6 +407,13 @@ pub struct EngineHandle {
     events: broadcast::Sender<EngineEvent>,
     next_id: Arc<AtomicU64>,
     request_timeout: Duration,
+    /// Total budget for a graceful shutdown answer before the child is killed
+    /// directly. Derived from the graceful-exit budget plus a fixed margin.
+    shutdown_timeout: Duration,
+    /// Shared with the actor so a stuck actor cannot veto killing the child:
+    /// the actor only locks it briefly inside `stop_child`, never while
+    /// parked on queue backpressure.
+    child: Arc<Mutex<Child>>,
     resource_status: watch::Receiver<(Option<u64>, bool)>,
     stderr: broadcast::Sender<String>,
 }
@@ -292,44 +427,50 @@ impl EngineHandle {
         if !config.executable.is_absolute()
             || !std::fs::symlink_metadata(&config.executable)
                 .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-            || config.java_home.as_ref().is_some_and(|java_home| {
-                !java_home.is_absolute()
-                    || !std::fs::symlink_metadata(java_home).is_ok_and(|metadata| {
-                        metadata.is_dir() && !metadata.file_type().is_symlink()
-                    })
-                    || !java_home.join("release").is_file()
-            })
+            || (config.mode == SignalCliMode::Jvm
+                && config.java_home.as_ref().is_some_and(|java_home| {
+                    !java_home.is_absolute()
+                        || !std::fs::symlink_metadata(java_home).is_ok_and(|metadata| {
+                            metadata.is_dir() && !metadata.file_type().is_symlink()
+                        })
+                        || !java_home.join("release").is_file()
+                }))
             || config.resource_sample_interval < Duration::from_secs(1)
         {
             return Err(EngineError::StartFailed);
         }
         prepare_data_dir(&config.data_dir).map_err(|_| EngineError::StartFailed)?;
+        if config.mode == SignalCliMode::Native && config.java_home.is_some() {
+            tracing::warn!("native signal-cli mode ignores the configured JAVA_HOME");
+        }
 
         let mut command = Command::new(&config.executable);
         command
-            .arg("--data-dir")
-            .arg(&config.data_dir)
-            .arg("jsonRpc")
-            // Explicit: pull server messages as soon as the daemon is up.
-            .arg("--receive-mode")
-            .arg("on-start")
-            .arg("--ignore-attachments")
-            .arg("--ignore-stories")
-            .arg("--ignore-stickers")
+            .args(signal_cli_args(
+                config.mode,
+                config.proxy.as_ref(),
+                &config.data_dir,
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // The dev/test store-key override must never leak into the child's
+            // environment (Phase 3: keys travel the bootstrap channel only).
+            .env_remove(crate::store::STORE_KEY_ENV)
+            .kill_on_drop(true);
+        if config.mode == SignalCliMode::Jvm {
             // Keep the documented text-runtime heap budget authoritative. Java's global
             // injection variables are removed so a parent shell cannot silently defeat it.
             // A configured SOCKS proxy is injected here because signal-cli does not read
             // OS proxy settings; watchdog restarts reuse the same config unchanged.
-            .env("JAVA_OPTS", java_opts(config.proxy.as_ref()))
-            .env_remove("JAVA_TOOL_OPTIONS")
-            .env_remove("_JAVA_OPTIONS")
-            .env_remove("JDK_JAVA_OPTIONS")
-            .kill_on_drop(true);
-        if let Some(java_home) = &config.java_home {
-            command.env("JAVA_HOME", java_home);
+            command
+                .env("JAVA_OPTS", java_opts(config.proxy.as_ref()))
+                .env_remove("JAVA_TOOL_OPTIONS")
+                .env_remove("_JAVA_OPTIONS")
+                .env_remove("JDK_JAVA_OPTIONS");
+            if let Some(java_home) = &config.java_home {
+                command.env("JAVA_HOME", java_home);
+            }
         }
         let mut child = command.spawn().map_err(|_| EngineError::StartFailed)?;
 
@@ -337,6 +478,13 @@ impl EngineHandle {
         let stdin = child.stdin.take().ok_or(EngineError::StartFailed)?;
         let stdout = child.stdout.take().ok_or(EngineError::StartFailed)?;
         let stderr = child.stderr.take().ok_or(EngineError::StartFailed)?;
+        let child = Arc::new(Mutex::new(child));
+        // The configured enqueue timeout is authoritative for every engine
+        // started from this config, regardless of how the ingress was built.
+        let receive_ingress = ReceiveIngress {
+            enqueue_timeout: config.receive_enqueue_timeout,
+            ..receive_ingress
+        };
         let initial_status = EngineStatus {
             state: EngineState::Running,
             pid: Some(pid),
@@ -351,6 +499,7 @@ impl EngineHandle {
         let _ = events.send(EngineEvent::StateChanged(initial_status));
         let actor_events = events.clone();
         let stderr_lines = stderr_tx.clone();
+        let actor_child = Arc::clone(&child);
         tokio::spawn(async move {
             let stderr_drain = tokio::spawn(async move {
                 // Forward signal-cli stderr line by line (bounded) so the watchdog can
@@ -374,7 +523,7 @@ impl EngineHandle {
                 }
             });
             run_actor(
-                child,
+                actor_child,
                 stdin,
                 stdout,
                 ActorChannels {
@@ -440,12 +589,15 @@ impl EngineHandle {
             }
         });
 
+        tracing::info!(pid, "signal-cli engine started");
         Ok(Self {
             commands: command_tx,
             status: status_rx,
             events,
             next_id: Arc::new(AtomicU64::new(1)),
             request_timeout: config.request_timeout,
+            shutdown_timeout: config.shutdown_grace + SHUTDOWN_TIMEOUT_MARGIN,
+            child,
             resource_status: resource_rx,
             stderr: stderr_tx,
         })
@@ -495,6 +647,7 @@ impl EngineHandle {
         if self.is_terminal() {
             return Err(EngineError::NotRunning);
         }
+        let started = Instant::now();
         let id = format!("kt-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (response_tx, response_rx) = oneshot::channel();
         match self.commands.try_send(EngineCommand::Request {
@@ -509,7 +662,7 @@ impl EngineHandle {
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(EngineError::NotRunning),
         }
 
-        match timeout(request_timeout, response_rx).await {
+        let outcome = match timeout(request_timeout, response_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(EngineError::Exited),
             Err(_) => {
@@ -522,21 +675,61 @@ impl EngineHandle {
                     CallClass::Mutating => Err(EngineError::UnknownOutcome),
                 }
             }
+        };
+        // signal-cli method names are fixed crate-internal literals; only the
+        // classified error variant is logged, never upstream error content.
+        match &outcome {
+            Ok(_) => tracing::debug!(
+                upstream_method = method,
+                call_class = call_class_label(class),
+                duration_ms = started.elapsed().as_millis() as u64,
+                result = "ok",
+                "signal-cli call completed"
+            ),
+            Err(error) => tracing::warn!(
+                upstream_method = method,
+                call_class = call_class_label(class),
+                duration_ms = started.elapsed().as_millis() as u64,
+                error_class = error.class(),
+                "signal-cli call failed"
+            ),
         }
+        outcome
     }
 
+    /// Graceful stop with a total timeout. The command lane can be starved
+    /// when the actor is parked outside its `select!` (e.g. on receive-queue
+    /// backpressure while storage is down), so an unanswered shutdown kills
+    /// the child directly instead of waiting forever. The kill is the same
+    /// forced-stop step `stop_child` falls back to after its grace period;
+    /// the actor then observes the closed pipes and unwinds on its own.
     pub async fn shutdown(&self) -> Result<(), EngineError> {
         if self.is_terminal() {
             return Ok(());
         }
         let (response_tx, response_rx) = oneshot::channel();
-        self.commands
-            .send(EngineCommand::Shutdown {
-                response: response_tx,
-            })
-            .await
-            .map_err(|_| EngineError::Exited)?;
-        response_rx.await.map_err(|_| EngineError::Exited)
+        let graceful = async {
+            self.commands
+                .send(EngineCommand::Shutdown {
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| EngineError::Exited)?;
+            response_rx.await.map_err(|_| EngineError::Exited)
+        };
+        match timeout(self.shutdown_timeout, graceful).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = self.shutdown_timeout.as_millis() as u64,
+                    "engine shutdown unanswered; killing signal-cli process"
+                );
+                // The actor only holds this lock briefly inside `stop_child`,
+                // so a parked actor cannot block the kill.
+                let _ = self.child.lock().await.start_kill();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -574,7 +767,7 @@ struct ActorChannels {
 }
 
 async fn run_actor(
-    mut child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: tokio::process::ChildStdout,
     channels: ActorChannels,
@@ -586,10 +779,13 @@ async fn run_actor(
         events,
         receive_ingress,
     } = channels;
-    let process_pid = child.id();
+    let process_pid = child.lock().await.id();
     let mut stdin = Some(stdin);
     let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(limits.line_limit));
     let mut pending = HashMap::<String, PendingRequest>::new();
+    // Whether dropped receives have been reported as degraded storage; reset
+    // when admission succeeds again so a `recovered` state is emitted once.
+    let mut receive_degraded = false;
     let terminal_state;
 
     loop {
@@ -636,14 +832,14 @@ async fn run_actor(
                     }
                     Some(EngineCommand::Shutdown { response }) => {
                         stdin.take();
-                        stop_child(&mut child, limits.shutdown_grace).await;
+                        stop_child(&child, limits.shutdown_grace).await;
                         let _ = response.send(());
                         terminal_state = EngineState::Stopped;
                         break;
                     }
                     None => {
                         stdin.take();
-                        stop_child(&mut child, limits.shutdown_grace).await;
+                        stop_child(&child, limits.shutdown_grace).await;
                         terminal_state = EngineState::Stopped;
                         break;
                     }
@@ -657,6 +853,7 @@ async fn run_actor(
                             &mut pending,
                             &events,
                             &receive_ingress,
+                            &mut receive_degraded,
                         ).await.is_err() {
                             terminal_state = EngineState::Faulted;
                             break;
@@ -675,9 +872,29 @@ async fn run_actor(
         }
     }
 
+    let terminal_class = match terminal_state {
+        EngineState::Stopped => "stopped",
+        EngineState::Exited => "exited",
+        EngineState::Faulted => "faulted",
+        // The loop only breaks on a terminal state; this arm is unreachable.
+        EngineState::Running => "running",
+    };
+    if matches!(terminal_state, EngineState::Stopped) {
+        tracing::info!(
+            state = terminal_class,
+            pid = process_pid,
+            "signal-cli engine stopped"
+        );
+    } else {
+        tracing::warn!(
+            state = terminal_class,
+            pid = process_pid,
+            "signal-cli engine terminated without a shutdown request"
+        );
+    }
     if !matches!(terminal_state, EngineState::Stopped) {
         stdin.take();
-        stop_child(&mut child, limits.shutdown_grace).await;
+        stop_child(&child, limits.shutdown_grace).await;
     }
     let readonly_failure = match terminal_state {
         EngineState::Faulted => EngineError::Protocol,
@@ -708,6 +925,7 @@ async fn handle_upstream_line(
     pending: &mut HashMap<String, PendingRequest>,
     events: &broadcast::Sender<EngineEvent>,
     receive_ingress: &ReceiveIngress,
+    receive_degraded: &mut bool,
 ) -> Result<(), EngineError> {
     let message: Value = serde_json::from_str(line).map_err(|_| EngineError::Protocol)?;
     let object = message.as_object().ok_or(EngineError::Protocol)?;
@@ -722,7 +940,34 @@ async fn handle_upstream_line(
         if method == "receive" {
             let params = object.get("params").ok_or(EngineError::Protocol)?;
             if let Some(normalized) = normalize_receive(params)? {
-                receive_ingress.enqueue(normalized).await?;
+                match receive_ingress.enqueue(normalized).await? {
+                    EnqueueOutcome::Enqueued => {
+                        if *receive_degraded {
+                            *receive_degraded = false;
+                            tracing::info!(
+                                state = "recovered",
+                                "receive queue admission recovered"
+                            );
+                            let _ = events.send(EngineEvent::StorageChanged { state: "recovered" });
+                        }
+                    }
+                    EnqueueOutcome::Dropped => {
+                        // Storage is not draining the queue; drop the receive
+                        // rather than park the actor. No payload or identity
+                        // is logged. The persistence loop reports the
+                        // underlying store failure on the same event; this
+                        // transition covers a saturated queue whose head the
+                        // store has not even failed on yet.
+                        crate::metrics::record_receive_drop();
+                        tracing::warn!("receive queue saturated; dropping a receive");
+                        if !*receive_degraded {
+                            *receive_degraded = true;
+                            let _ = events.send(EngineEvent::StorageChanged {
+                                state: "unavailable",
+                            });
+                        }
+                    }
+                }
             }
         } else {
             let _ = events.send(EngineEvent::ProtocolWarning {
@@ -1004,7 +1249,8 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
     ))
 }
 
-async fn stop_child(child: &mut Child, grace: Duration) {
+async fn stop_child(child: &Mutex<Child>, grace: Duration) {
+    let mut child = child.lock().await;
     if timeout(grace, child.wait()).await.is_err() {
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -1106,6 +1352,59 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_to_jvm_mode() {
+        let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
+        assert_eq!(config.mode, SignalCliMode::Jvm);
+    }
+
+    #[test]
+    fn signal_cli_args_match_the_jvm_launcher_shape() {
+        let proxy = SocksProxy {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        };
+        let expected: Vec<std::ffi::OsString> = [
+            "--data-dir",
+            "/data",
+            "jsonRpc",
+            "--receive-mode",
+            "on-start",
+            "--ignore-attachments",
+            "--ignore-stories",
+            "--ignore-stickers",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        // JVM mode: proxy travels in JAVA_OPTS, never on the command line.
+        assert_eq!(
+            signal_cli_args(SignalCliMode::Jvm, Some(&proxy), Path::new("/data")),
+            expected
+        );
+        assert_eq!(
+            signal_cli_args(SignalCliMode::Native, None, Path::new("/data")),
+            expected
+        );
+    }
+
+    #[test]
+    fn native_mode_prepends_socks_proxy_properties_to_args() {
+        let proxy = SocksProxy {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        };
+        let args = signal_cli_args(SignalCliMode::Native, Some(&proxy), Path::new("/data"));
+        assert_eq!(
+            args[..2],
+            [
+                std::ffi::OsString::from("-DsocksProxyHost=127.0.0.1"),
+                std::ffi::OsString::from("-DsocksProxyPort=1080"),
+            ]
+        );
+        assert_eq!(args[2], "--data-dir");
+    }
+
+    #[test]
     fn receive_normalization_does_not_expose_message_or_identity() {
         let input = json!({
             "account": "+15555550100",
@@ -1173,7 +1472,7 @@ mod tests {
         let mut admitted = 0;
         while matches!(
             timeout(Duration::from_millis(10), ingress.enqueue(receive())).await,
-            Ok(Ok(()))
+            Ok(Ok(EnqueueOutcome::Enqueued))
         ) {
             admitted += 1;
         }
@@ -1354,6 +1653,7 @@ mod tests {
         let (events, _unused) = event_channel();
         let (ingress, mut receiver) = receive_channel();
         let mut pending = HashMap::new();
+        let mut degraded = false;
 
         let oversized = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
@@ -1371,7 +1671,7 @@ mod tests {
             }
         }))
         .unwrap();
-        handle_upstream_line(&oversized, &mut pending, &events, &ingress)
+        handle_upstream_line(&oversized, &mut pending, &events, &ingress, &mut degraded)
             .await
             .unwrap();
 
@@ -1388,12 +1688,123 @@ mod tests {
             }
         }))
         .unwrap();
-        handle_upstream_line(&well_formed, &mut pending, &events, &ingress)
+        handle_upstream_line(&well_formed, &mut pending, &events, &ingress, &mut degraded)
             .await
             .unwrap();
 
         let queued = receiver.recv().await.unwrap();
         assert_eq!(queued.receive().text.as_deref(), Some("after oversized"));
         assert!(receiver.try_recv().is_err());
+        assert!(!degraded);
+    }
+
+    /// The regression at the heart of the liveness fix: a receive queue that
+    /// never drains must turn admission into a bounded wait plus a drop, not
+    /// into a permanently parked engine actor.
+    #[tokio::test]
+    async fn receive_enqueue_drops_instead_of_blocking_when_the_queue_stays_full() {
+        let (mut ingress, mut receives) = receive_channel();
+        ingress.enqueue_timeout = Duration::from_millis(50);
+        let receive = || NormalizedReceive {
+            timestamp: Some(42),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
+            text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
+            text_truncated: false,
+        };
+        let mut admitted = 0;
+        while matches!(
+            ingress.enqueue(receive()).await,
+            Ok(EnqueueOutcome::Enqueued)
+        ) {
+            admitted += 1;
+        }
+        assert!(admitted > 1);
+
+        // Once the budget frees up, admission works again.
+        drop(receives.recv().await.unwrap());
+        assert_eq!(
+            ingress.enqueue(receive()).await.unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+    }
+
+    /// A dropped receive flips the engine-side degraded storage signal to
+    /// `unavailable` once; the next admitted receive reports `recovered`.
+    #[tokio::test]
+    async fn receive_backpressure_reports_storage_degraded_and_recovers() {
+        let (events, mut event_rx) = event_channel();
+        let (mut ingress, mut receiver) = receive_channel();
+        ingress.enqueue_timeout = Duration::from_millis(50);
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        // Fill the byte budget so the next receive cannot be admitted.
+        let filler = NormalizedReceive {
+            timestamp: Some(42),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
+            text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
+            text_truncated: false,
+        };
+        while matches!(
+            ingress.enqueue(filler.clone()).await,
+            Ok(EnqueueOutcome::Enqueued)
+        ) {}
+
+        // The probe receives must be as heavy as the filler: the fill loop
+        // stops as soon as one filler no longer fits, leaving up to one
+        // filler-weight of byte budget free — a small message would still be
+        // admitted and never exercise the drop path.
+        let heavy = "a".repeat(MAX_INBOUND_TEXT_BYTES);
+        let line = |timestamp: u64| {
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": "+15555550100",
+                    "envelope": {
+                        "source": "+15555550101",
+                        "timestamp": timestamp,
+                        "dataMessage": { "message": heavy.as_str() }
+                    }
+                }
+            }))
+            .unwrap()
+        };
+
+        handle_upstream_line(&line(1), &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+        assert!(degraded);
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::StorageChanged {
+                state: "unavailable"
+            }
+        ));
+
+        // Drain the queue: admission succeeds again and reports recovery once.
+        while receiver.try_recv().is_ok() {}
+        handle_upstream_line(&line(2), &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+        assert!(!degraded);
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::StorageChanged { state: "recovered" }
+        ));
     }
 }

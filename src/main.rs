@@ -5,8 +5,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use kt_signal_connector::auth::{load_bootstrap_secret, load_bootstrap_secret_from_reader};
-use kt_signal_connector::engine::SocksProxy;
+use kt_signal_connector::auth::{load_bootstrap_payload, load_bootstrap_payload_from_reader};
+use kt_signal_connector::engine::{SignalCliMode, SocksProxy};
 use kt_signal_connector::host::serve;
 use kt_signal_connector::ipc::LocalListener;
 #[cfg(windows)]
@@ -19,6 +19,7 @@ use kt_signal_connector::manifest::{
 #[cfg(windows)]
 use kt_signal_connector::parent::wait_for_parent_exit;
 use kt_signal_connector::resource::{measure_child_idle, write_report};
+use kt_signal_connector::store::store_key_from_env;
 use kt_signal_connector::supervisor::open_supervisor;
 
 #[derive(Debug, Parser)]
@@ -50,11 +51,26 @@ enum CliCommand {
         parent_pid: Option<u32>,
         #[arg(long)]
         signal_cli: PathBuf,
+        /// The signal-cli executable is a GraalVM native binary, not the JVM
+        /// launcher script (env: KT_SIGNAL_CLI_NATIVE=1, the form Desktop
+        /// uses). Native mode skips JAVA_HOME validation and JAVA_OPTS
+        /// injection and passes a configured SOCKS proxy as `-D` argv
+        /// properties instead.
+        #[arg(
+            long,
+            env = "KT_SIGNAL_CLI_NATIVE",
+            num_args = 0..=1,
+            default_value_t = false,
+            default_missing_value = "true",
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        signal_cli_native: bool,
         #[arg(long)]
         java_home: Option<PathBuf>,
-        /// SOCKS proxy for the signal-cli JVM as host:port (env:
-        /// KT_SIGNAL_SOCKS_PROXY, preferred so it stays off the process
-        /// command line).
+        /// SOCKS proxy for the signal-cli child as host:port (env:
+        /// KT_SIGNAL_SOCKS_PROXY, preferred so it stays off the connector
+        /// command line). JVM mode forwards it via JAVA_OPTS; native mode
+        /// passes it to the child as `-D` argv properties.
         #[arg(long, env = "KT_SIGNAL_SOCKS_PROXY", value_name = "HOST:PORT")]
         socks_proxy: Option<SocksProxy>,
         #[arg(long)]
@@ -178,14 +194,31 @@ struct ServeOptions {
     bootstrap_secret_stdin: bool,
     parent_pid: Option<u32>,
     signal_cli: PathBuf,
+    signal_cli_native: bool,
     java_home: Option<PathBuf>,
     socks_proxy: Option<SocksProxy>,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
 }
 
+/// Diagnostics go through `tracing` (AGENTS.md log discipline: no message
+/// bodies, numbers, contacts, QR payloads, secrets, tokens, or key paths).
+/// The final sink is stderr, same as the previous `eprintln!` output. Level
+/// defaults to INFO; KT_SIGNAL_LOG overrides it (e.g. "debug").
+fn init_tracing() {
+    let level = std::env::var("KT_SIGNAL_LOG")
+        .ok()
+        .and_then(|value| value.parse::<tracing::Level>().ok())
+        .unwrap_or(tracing::Level::INFO);
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .try_init();
+}
+
 #[tokio::main]
 async fn main() {
+    init_tracing();
     let cli = Cli::parse();
     let result = match cli.command {
         CliCommand::Serve {
@@ -194,6 +227,7 @@ async fn main() {
             bootstrap_secret_stdin,
             parent_pid,
             signal_cli,
+            signal_cli_native,
             java_home,
             socks_proxy,
             signal_data_dir,
@@ -204,6 +238,7 @@ async fn main() {
             bootstrap_secret_stdin,
             parent_pid,
             signal_cli,
+            signal_cli_native,
             java_home,
             socks_proxy,
             signal_data_dir,
@@ -214,7 +249,9 @@ async fn main() {
         CliCommand::Package { command } => package_command(command),
     };
     if let Err(error) = result {
-        eprintln!("kt-signal-connector: {error}");
+        // The final exit diagnostic: `error` is the classified message of the
+        // failing error type (Display is content-free across this crate).
+        tracing::error!(%error, "connector exiting with an error");
         std::process::exit(1);
     }
 }
@@ -226,6 +263,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         bootstrap_secret_stdin,
         parent_pid,
         signal_cli,
+        signal_cli_native,
         java_home,
         socks_proxy,
         signal_data_dir,
@@ -237,14 +275,22 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     if cfg!(windows) && parent_pid.is_none() {
         return Err("Windows requires the parent process monitor".into());
     }
-    let secret = if bootstrap_secret_stdin {
-        load_bootstrap_secret_from_reader(std::io::stdin().lock())?
+    let payload = if bootstrap_secret_stdin {
+        load_bootstrap_payload_from_reader(std::io::stdin().lock())?
     } else {
-        load_bootstrap_secret(
+        load_bootstrap_payload(
             bootstrap_secret_file
                 .as_deref()
                 .ok_or("bootstrap secret source is required")?,
         )?
+    };
+    // Phase 3 key contract: the desktop delivers the 32-byte store key as
+    // bootstrap payload line 2; KT_SIGNAL_STORE_KEY is the dev/test override
+    // and wins when set. The key never crosses the socket, never enters the
+    // wire protocol, and is never logged.
+    let store_key = match store_key_from_env()? {
+        Some(key) => Some(key),
+        None => payload.store_key,
     };
     #[cfg(windows)]
     {
@@ -259,12 +305,19 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         harden_private_directory(&state_dir)?;
     }
     let listener = LocalListener::bind(&endpoint)?;
+    let signal_cli_mode = if signal_cli_native {
+        SignalCliMode::Native
+    } else {
+        SignalCliMode::Jvm
+    };
     let supervisor = open_supervisor(
         signal_cli,
         signal_data_dir,
         state_dir,
         java_home,
         socks_proxy,
+        store_key,
+        signal_cli_mode,
     )?;
     #[cfg(windows)]
     {
@@ -276,7 +329,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
             std::process::exit(0);
         });
     }
-    serve(listener, secret, supervisor).await?;
+    serve(listener, payload.secret, supervisor).await?;
     Ok(())
 }
 

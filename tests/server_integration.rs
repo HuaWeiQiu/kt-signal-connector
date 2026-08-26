@@ -21,6 +21,16 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 const API_VERSION: &str = "1.0";
 
+/// Phase 3 contract: every spawned connector gets its store key as bootstrap
+/// payload line 2. One fixed test key keeps respawns against the same state
+/// directory compatible with the database the first spawn encrypted.
+const TEST_STORE_KEY: [u8; 32] = [0x5A; 32];
+
+/// The two-line bootstrap payload: line 1 handshake secret, line 2 store key.
+fn bootstrap_payload(secret: &[u8; 32]) -> String {
+    format!("{}\n{}", hex::encode(secret), hex::encode(TEST_STORE_KEY))
+}
+
 #[tokio::test]
 async fn binary_serves_authenticated_runtime_lifecycle() {
     let temp = TempDir::new().unwrap();
@@ -83,7 +93,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     let endpoint = temp.path().join("connector.sock");
     let secret_file = temp.path().join("bootstrap.secret");
     let secret = [7_u8; 32];
-    fs::write(&secret_file, hex::encode(secret)).unwrap();
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
     fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
 
     let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
@@ -702,6 +712,295 @@ async fn contacts_sync_list_and_send_by_peer() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Phase 0 happy-path smoke gap (docs/optimization-plan.md): the existing
+/// phase2 test proves receive persistence through `messages.list`, but nothing
+/// asserted the normalized host event stream, and `messages.getText` had no
+/// end-to-end coverage. The fixture emits one receive notification right after
+/// its finishLink result; the connector must persist it and deliver
+/// message.upserted -> conversation.changed -> account.changed on the
+/// authenticated host stream, and getText must return the full stored body.
+#[tokio::test]
+async fn receive_delivers_host_events_and_get_text_returns_the_full_body() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [17_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Events" }),
+    )
+    .await;
+
+    // The fixture emits one receive notification right after its finishLink
+    // result; the connector may deliver the resulting host events before the
+    // finish response reaches the socket, so collect both in one read loop
+    // instead of discarding frames inside `request`.
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut finished: Option<Value> = None;
+    let mut upserted: Option<Value> = None;
+    let mut conversation_changed: Option<Value> = None;
+    let mut account_changed: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while finished.is_none()
+            || upserted.is_none()
+            || conversation_changed.is_none()
+            || account_changed.is_none()
+        {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                finished = Some(frame);
+                continue;
+            }
+            match frame.get("event").and_then(Value::as_str) {
+                Some("message.upserted") => upserted = Some(frame),
+                Some("conversation.changed") => conversation_changed = Some(frame),
+                // The link flow itself also emits account.changed; keep the one
+                // that carries the receive's unread increment.
+                Some("account.changed") if frame["data"]["unreadCount"] == 1 => {
+                    account_changed = Some(frame);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("receive must deliver message/conversation/account host events");
+    let account_id = finished.unwrap()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let upserted = upserted.unwrap();
+    assert_eq!(upserted["apiVersion"], API_VERSION);
+    let message = &upserted["data"];
+    assert_eq!(message["accountId"], account_id);
+    assert_eq!(message["direction"], "incoming");
+    assert_eq!(message["text"], "private text");
+    assert_eq!(message["status"], "delivered");
+    // attachments was removed from MessageRecord in optimization-plan Phase 2
+    // (the engine runs signal-cli with --ignore-attachments); the field must
+    // not reappear on the wire.
+    assert!(message.get("attachments").is_none());
+    let conversation_id = message["conversationId"].as_str().unwrap().to_string();
+    let message_id = message["id"].as_str().unwrap().to_string();
+
+    let conversation_changed = conversation_changed.unwrap();
+    assert_eq!(conversation_changed["data"]["id"], conversation_id);
+    assert_eq!(conversation_changed["data"]["type"], "direct");
+    assert_eq!(conversation_changed["data"]["unreadCount"], 1);
+
+    let account_changed = account_changed.unwrap();
+    assert_eq!(account_changed["data"]["unreadCount"], 1);
+
+    // messages.getText returns the complete persisted body for that message.
+    let fetched = request(
+        &mut client,
+        "get-text",
+        "messages.getText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": message_id
+        }),
+    )
+    .await;
+    assert_eq!(fetched["result"]["messageId"], message_id);
+    assert_eq!(fetched["result"]["text"], "private text");
+    assert_eq!(fetched["result"]["textBytes"], "private text".len() as u64);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Phase 2 (docs/optimization-plan.md): quoteMessageId is delivered upstream
+/// as signal-cli's quoteTimestamp/quoteAuthor send params, send completion
+/// emits message.statusChanged, and an unknown quote target is a deterministic
+/// validation rejection that leaves no pending row behind.
+#[tokio::test]
+async fn quote_is_delivered_upstream_and_status_change_is_emitted() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [23_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Quote" }),
+    )
+    .await;
+    // The fixture emits one receive notification after finishLink; the frames
+    // can interleave with the finish response, so drain until both arrive.
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut finished: Option<Value> = None;
+    let mut upserted: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while finished.is_none() || upserted.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                finished = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted") {
+                upserted = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("link finish must persist the fixture's receive notification");
+    let account_id = finished.unwrap()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The fixture's receive: source +15555550101, envelope timestamp 42.
+    let upserted = upserted.unwrap();
+    let quoted_message_id = upserted["data"]["id"].as_str().unwrap().to_string();
+    let conversation_id = upserted["data"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A quoted send resolves the local quoteMessageId to the upstream quote
+    // parameters and completes with a message.statusChanged event.
+    send_request_frame(
+        &mut client,
+        "send-quote",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "quoting inbound",
+            "clientRequestId": "quote-req-1",
+            "quoteMessageId": quoted_message_id
+        }),
+    )
+    .await;
+    let mut sent: Option<Value> = None;
+    let mut status_changed: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while sent.is_none() || status_changed.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("send-quote") {
+                sent = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.statusChanged") {
+                status_changed = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("send must answer and emit message.statusChanged");
+    let sent = sent.unwrap();
+    assert_eq!(sent["result"]["status"], "sent");
+    assert_eq!(sent["result"]["quoteMessageId"], quoted_message_id);
+    let status_changed = status_changed.unwrap();
+    assert_eq!(status_changed["apiVersion"], API_VERSION);
+    assert_eq!(status_changed["data"]["accountId"], account_id);
+    assert_eq!(
+        status_changed["data"]["messageId"],
+        sent["result"]["id"].as_str().unwrap()
+    );
+    assert_eq!(status_changed["data"]["status"], "sent");
+
+    // The fake signal-cli logged the exact JSON-RPC send params it received.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log send params");
+    let quoted_send: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params["message"] == "quoting inbound")
+        .expect("the quoted send must reach the upstream");
+    assert_eq!(quoted_send["quoteTimestamp"], 42);
+    assert_eq!(quoted_send["quoteAuthor"], "+15555550101");
+    assert_eq!(quoted_send["recipient"], json!(["+15555550101"]));
+    assert_eq!(quoted_send["account"], "+15555550100");
+
+    // A quote pointing at a message that does not exist is rejected during
+    // validation — before any upstream call or pending row.
+    let rejected = request(
+        &mut client,
+        "send-quote-missing",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "quote of nothing",
+            "clientRequestId": "quote-req-missing",
+            "quoteMessageId": "no-such-message"
+        }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], "MESSAGE_NOT_FOUND");
+    assert_eq!(rejected["error"]["retryable"], false);
+
+    // No pending row was left behind: the same clientRequestId re-validates as
+    // a fresh request instead of replaying a stuck pending record.
+    let retried = request(
+        &mut client,
+        "send-quote-retry",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "text": "quote of nothing",
+            "clientRequestId": "quote-req-missing"
+        }),
+    )
+    .await;
+    assert_eq!(retried["result"]["status"], "sent");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn socks_proxy_env_is_forwarded_to_the_jvm() {
     let temp = TempDir::new().unwrap();
@@ -745,6 +1044,61 @@ async fn socks_proxy_env_is_forwarded_to_the_jvm() {
     assert_eq!(started["result"]["state"], "running");
     // A proxy-flag mismatch kills the fixture at JVM launch; a live answer
     // after a settle delay proves the exact JAVA_OPTS reached the child.
+    sleep(Duration::from_millis(200)).await;
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    assert!(accounts.get("result").is_some());
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn native_mode_serves_without_a_jvm_environment() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [14_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // Native mode via the environment variable (the form Desktop uses), with
+    // a JAVA_HOME that JVM mode would reject: it must be ignored entirely.
+    // A SOCKS proxy stays configured to prove native+proxy starts; the proxy
+    // reaches a real native binary as `-D` argv properties (the fixture
+    // ignores argv; the argv shape is unit-tested in engine.rs). The fixture
+    // exits 94 immediately if JAVA_OPTS or JAVA_HOME leak into its env.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_SIGNAL_CLI_NATIVE", "1")
+        .env("KT_SIGNAL_SOCKS_PROXY", "127.0.0.1:11080")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    // A JAVA_* leak kills the fixture at spawn; a live answer after a settle
+    // delay proves the native spawn path serves requests without a JVM env.
     sleep(Duration::from_millis(200)).await;
     let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
     assert!(accounts.get("result").is_some());
@@ -801,7 +1155,7 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     let endpoint = temp.path().join("connector.sock");
     let secret_file = temp.path().join("bootstrap.secret");
     let secret = [8_u8; 32];
-    fs::write(&secret_file, hex::encode(secret)).unwrap();
+    fs::write(&secret_file, bootstrap_payload(&secret)).unwrap();
     fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
 
     let mut connector = spawn_connector_with_delete_mode(
@@ -876,8 +1230,214 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Regression for the delete/send race (optimization-plan Phase 1b): without
+/// the drain barrier, a delete on the control lane could clear the account
+/// rows while an upstream send on the send lane was still in flight — the
+/// message went out but the completion found no pending row. With the barrier
+/// the in-flight send completes fully before the delete runs, and a send that
+/// arrives during the delete is rejected. Linearization point: the per-account
+/// dispatch mutex, held across the whole dispatch including the completion
+/// write and the host response.
+#[tokio::test]
+async fn account_delete_drains_in_flight_send_and_rejects_new_sends() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [13_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Delete-Race" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The fixture answers a "[slow-host-test]" send after ~350ms, so this send
+    // is upstream-in-flight when the delete arrives.
+    send_request_frame(
+        &mut client,
+        "race-send-slow",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "[slow-host-test]",
+            "clientRequestId": "race-slow"
+        }),
+    )
+    .await;
+    // Let the send reach the upstream wait before the delete arrives.
+    sleep(Duration::from_millis(100)).await;
+    send_request_frame(
+        &mut client,
+        "race-delete",
+        "accounts.deleteLocalData",
+        json!({
+            "accountId": account_id,
+            "operationId": "race-delete-operation"
+        }),
+    )
+    .await;
+    // The delete marks the account before draining, so a send issued now is
+    // rejected instead of queueing behind the delete.
+    sleep(Duration::from_millis(50)).await;
+    send_request_frame(
+        &mut client,
+        "race-send-during-delete",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "must never reach the upstream",
+            "clientRequestId": "race-during-delete"
+        }),
+    )
+    .await;
+
+    let mut order = Vec::new();
+    let mut slow = None;
+    let mut delete = None;
+    let mut during = None;
+    while slow.is_none() || delete.is_none() || during.is_none() {
+        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        match response.get("requestId").and_then(Value::as_str) {
+            Some("race-send-slow") => {
+                order.push("race-send-slow");
+                slow = Some(response);
+            }
+            Some("race-delete") => {
+                order.push("race-delete");
+                delete = Some(response);
+            }
+            Some("race-send-during-delete") => {
+                order.push("race-send-during-delete");
+                during = Some(response);
+            }
+            _ => {}
+        }
+    }
+
+    // The drained send completed and was answered before the delete: its
+    // completion write (and response) happened strictly ahead of the delete's
+    // upstream call, so no "sent but locally rowless" message can exist.
+    let slow = slow.unwrap();
+    assert_eq!(slow["result"]["status"], "sent");
+    let delete = delete.unwrap();
+    assert!(delete.get("result").is_some());
+    let send_pos = order.iter().position(|id| *id == "race-send-slow").unwrap();
+    let delete_pos = order.iter().position(|id| *id == "race-delete").unwrap();
+    assert!(
+        send_pos < delete_pos,
+        "the delete must answer only after the drained send: {order:?}"
+    );
+
+    // The send issued during the delete never reached the upstream.
+    let during = during.unwrap();
+    assert_eq!(during["error"]["code"], "ACCOUNT_NOT_FOUND");
+    assert_eq!(during["error"]["retryable"], false);
+
+    let accounts = request(&mut client, "accounts-after", "accounts.list", json!({})).await;
+    assert!(accounts["result"].as_array().unwrap().is_empty());
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Phase 3 dev/test override: a legacy single-line payload plus the
+/// KT_SIGNAL_STORE_KEY environment variable serves normally, and the store on
+/// disk is encrypted (no plaintext SQLite header).
+#[tokio::test]
+async fn store_key_env_override_unlocks_a_secret_only_payload() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [31_u8; 32];
+    // Line 1 only: no store key in the payload, so the env override provides it.
+    fs::write(&secret_file, hex::encode(secret)).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let store_key = hex::encode([0xA5_u8; 32]);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_SIGNAL_STORE_KEY", store_key.as_str())],
+    );
+    wait_for_path(&endpoint).await;
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+
+    let db = temp.path().join("state").join("connector.sqlite3");
+    let mut header = [0_u8; 16];
+    std::io::Read::read_exact(&mut fs::File::open(&db).unwrap(), &mut header).unwrap();
+    assert_ne!(&header, b"SQLite format 3\0");
+}
+
+/// Phase 3 fail closed: with no store key anywhere (single-line payload, no
+/// env override), the connector exits with a classified error before serving
+/// and never creates a database.
+#[tokio::test]
+async fn missing_store_key_fails_closed_before_serving() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    fs::write(&secret_file, hex::encode([41_u8; 32])).unwrap();
+    fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    let status = timeout(Duration::from_secs(5), connector.wait())
+        .await
+        .expect("a connector without a store key should exit promptly")
+        .unwrap();
+    assert!(!status.success());
+    let mut stderr = String::new();
+    if let Some(mut pipe) = connector.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr).await;
+    }
+    assert!(
+        stderr.contains("store key is required"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        !temp.path().join("state").join("connector.sqlite3").exists(),
+        "fail closed means no database is created"
+    );
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
-    fs::write(path, hex::encode(secret)).unwrap();
+    fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
@@ -913,7 +1473,7 @@ async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin
-        .write_all(hex::encode(secret).as_bytes())
+        .write_all(bootstrap_payload(secret).as_bytes())
         .await
         .unwrap();
     stdin.shutdown().await.unwrap();
@@ -925,6 +1485,16 @@ fn spawn_connector_with_delete_mode(
     endpoint: &Path,
     secret_file: &Path,
     delete_mode: Option<&str>,
+) -> Child {
+    spawn_connector_with(root, endpoint, secret_file, delete_mode, &[])
+}
+
+fn spawn_connector_with(
+    root: &Path,
+    endpoint: &Path,
+    secret_file: &Path,
+    delete_mode: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
     command
@@ -950,6 +1520,9 @@ fn spawn_connector_with_delete_mode(
         .env("JDK_JAVA_OPTIONS", "poison");
     if let Some(delete_mode) = delete_mode {
         command.env("KT_FAKE_DELETE_MODE", delete_mode);
+    }
+    for (name, value) in extra_env {
+        command.env(name, value);
     }
     command.spawn().unwrap()
 }

@@ -20,6 +20,12 @@ expected_java_home = os.environ.get("KT_FAKE_EXPECT_JAVA_HOME")
 if expected_java_home is not None and os.environ.get("JAVA_HOME") != expected_java_home:
     sys.exit(93)
 
+# Native-mode guard: a GraalVM binary has no JVM, so the engine must not set
+# JAVA_OPTS or forward JAVA_HOME to the child at all.
+if os.environ.get("KT_FAKE_EXPECT_NO_JAVA") is not None:
+    if os.environ.get("JAVA_OPTS") is not None or os.environ.get("JAVA_HOME") is not None:
+        sys.exit(94)
+
 
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
@@ -39,6 +45,7 @@ DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
 STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
 FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
 FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-count"
+SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
@@ -181,6 +188,11 @@ for line in sys.stdin:
             os._exit(19)
         result = {}
     elif method == "send":
+        # Record the exact JSON-RPC params so tests can assert what the
+        # connector dispatched upstream (e.g. quoteTimestamp/quoteAuthor).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
         result = {"timestamp": 99, "results": []}
     elif method == "emitReceive":
         result = {"method": method}

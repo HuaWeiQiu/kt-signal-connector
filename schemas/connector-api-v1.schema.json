@@ -351,6 +351,7 @@
             "runtime.stateChanged",
             "runtime.protocolWarning",
             "runtime.storageChanged",
+            "runtime.resourcePressure",
             "account.changed",
             "conversation.changed",
             "message.upserted",
@@ -360,7 +361,52 @@
         "data": {
           "type": "object"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "event": { "const": "runtime.resourcePressure" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["state", "pid", "rssBytes"],
+                "properties": {
+                  "state": { "enum": ["elevated", "recovered"] },
+                  "pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+                  "rssBytes": { "type": "integer", "minimum": 0 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.statusChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "messageId", "status"],
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "messageId": { "$ref": "#/$defs/opaqueId" },
+                  "status": {
+                    "enum": ["sent", "unknown", "failed"],
+                    "description": "Terminal state one outgoing message transitioned to; emitted only on a real transition (pending -> sent/unknown/failed), never replayed."
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "error": {
       "type": "object",

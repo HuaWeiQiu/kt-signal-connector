@@ -10,7 +10,7 @@ use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::protocol::ApiError;
 use crate::store::{
     AccountDeletePlan, AccountRow, AccountSummary, ContactSummary, ConversationRow,
-    ConversationSummary, MessageRecord, Page, Store, StoreError,
+    ConversationSummary, MessageRecord, Page, Store, StoreError, SyncedContact,
 };
 
 const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -29,6 +29,16 @@ pub enum ServiceError {
 }
 
 impl ServiceError {
+    /// Log-safe classification: variant category only, never any content the
+    /// error may carry. Logs use this instead of the Display text.
+    pub fn class(&self) -> &'static str {
+        match self {
+            ServiceError::Store(_) => "store",
+            ServiceError::Engine(_) => "engine",
+            ServiceError::Api(_) => "api",
+        }
+    }
+
     pub fn into_api(self) -> ApiError {
         match self {
             ServiceError::Api(error) => error,
@@ -303,31 +313,21 @@ impl ConnectorService {
         Ok(self.store.list_contacts(account_id, query, limit, cursor)?)
     }
 
-    /// Upsert one synced contact/group into the cache.
-    pub fn upsert_synced_contact(
+    /// Cache one full contacts sync atomically: all rows and the sync marker
+    /// commit in a single transaction, so a failed batch leaves nothing behind.
+    pub fn upsert_synced_contacts(
         &self,
         account_id: &str,
-        kind: &str,
-        peer_key: &str,
-        title: &str,
-        extra: Option<&str>,
+        entries: &[SyncedContact<'_>],
         synced_at: u64,
     ) -> Result<(), ServiceError> {
         Ok(self
             .store
-            .upsert_contact(account_id, kind, peer_key, title, extra, synced_at)?)
+            .upsert_synced_contacts(account_id, entries, synced_at)?)
     }
 
     pub fn contacts_synced_at(&self, account_id: &str) -> Result<Option<u64>, ServiceError> {
         Ok(self.store.contacts_synced_at(account_id)?)
-    }
-
-    pub fn set_contacts_synced_at(
-        &self,
-        account_id: &str,
-        synced_at: u64,
-    ) -> Result<(), ServiceError> {
-        Ok(self.store.set_contacts_synced_at(account_id, synced_at)?)
     }
 
     pub fn count_contacts(&self, account_id: &str) -> Result<(u64, u64), ServiceError> {
@@ -512,6 +512,12 @@ impl ConnectorService {
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
+        // Quote resolution is part of send validation and runs before the
+        // pending row exists: a rejected quote leaves nothing behind, so the
+        // same clientRequestId stays a fresh (re-validated) request.
+        let quote = quote_message_id
+            .map(|id| self.resolve_quote(account, conversation, id))
+            .transpose()?;
         let pending_id =
             stable_hash_id(&[account_id, conversation_id, "outgoing", client_request_id]);
         let pending = MessageRecord {
@@ -526,7 +532,6 @@ impl ConnectorService {
             text_bytes: Some(text.len() as u32),
             text_truncated: false,
             text_retrievable: true,
-            attachments: Vec::new(),
             status: "pending",
             client_request_id: Some(client_request_id.to_string()),
             quote_message_id: quote_message_id.map(str::to_string),
@@ -552,6 +557,13 @@ impl ConnectorService {
         } else {
             params["recipient"] = json!([conversation.peer_key]);
         }
+        // signal-cli JSON-RPC send quote parameters (verified against the
+        // pinned 0.14.7 distribution): quoteTimestamp is the quoted message's
+        // Signal timestamp, quoteAuthor its author's number — both required.
+        if let Some((quote_timestamp, quote_author)) = quote {
+            params["quoteTimestamp"] = json!(quote_timestamp);
+            params["quoteAuthor"] = json!(quote_author);
+        }
         Ok(PreparedSend::Dispatch {
             pending_id,
             account_id: account_id.to_string(),
@@ -561,6 +573,43 @@ impl ConnectorService {
         })
     }
 
+    /// Resolve a local quoteMessageId to the upstream (quoteTimestamp,
+    /// quoteAuthor) pair. A quote targets a message in the same conversation;
+    /// an unknown target is MESSAGE_NOT_FOUND, and a target whose Signal
+    /// author/timestamp is not established is a deterministic INVALID_REQUEST
+    /// — never a silently dropped or mis-addressed quote upstream.
+    fn resolve_quote(
+        &self,
+        account: &AccountRow,
+        conversation: &ConversationRow,
+        quote_message_id: &str,
+    ) -> Result<(u64, String), ServiceError> {
+        let quoted = self
+            .store
+            .message_by_id(&account.id, &conversation.id, quote_message_id)?
+            .ok_or(StoreError::MessageNotFound)?;
+        let author = match quoted.direction {
+            // We authored it: the author is the linked account itself. Only a
+            // completed send carries the upstream timestamp Signal quotes
+            // match on; pending/failed/unknown rows would misquote.
+            "outgoing" if quoted.status == "sent" => account.signal_account.clone(),
+            // In a direct chat the only other possible author is the peer.
+            // Incoming rows store the envelope timestamp, which is the
+            // protocol identity a quote references.
+            "incoming" if conversation.kind == "direct" => conversation.peer_key.clone(),
+            // Group messages do not persist the member address (only a local
+            // sender hash), and system rows have no author at all.
+            _ => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "quoted message author is not resolvable",
+                    false,
+                )));
+            }
+        };
+        Ok((quoted.sent_at, author))
+    }
+
     pub fn complete_send_success(
         &self,
         pending_id: &str,
@@ -568,13 +617,28 @@ impl ConnectorService {
         conversation_id: &str,
         sent_at: u64,
     ) -> Result<(MessageRecord, Vec<HostSideEvent>), ServiceError> {
-        let updated = self
+        // A missing pending row at this point means the local state vanished
+        // underneath a send that already completed upstream (e.g. the account's
+        // rows were deleted in a race): the message may well be delivered, so
+        // the outcome is final and must never be auto-retried. The schema has
+        // no dedicated code for this; the closest existing one is
+        // SEND_OUTCOME_UNKNOWN with retryable=false.
+        let (updated, status_transitioned) = self
             .store
             .complete_outgoing_send(pending_id, account_id, conversation_id, sent_at)?
-            .ok_or(StoreError::Unavailable)?;
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "SEND_OUTCOME_UNKNOWN",
+                    "send completed upstream but the local pending record is gone",
+                    false,
+                ))
+            })?;
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             updated.clone(),
         ))];
+        if status_transitioned {
+            events.push(status_changed_event(&updated));
+        }
         if let Some(conversation) = self.store.conversation_summary(conversation_id)? {
             events.push(HostSideEvent::ConversationChanged(conversation));
         }
@@ -584,18 +648,24 @@ impl ConnectorService {
         Ok((updated, events))
     }
 
-    pub fn complete_send_unknown(&self, pending_id: &str) -> Result<(), ServiceError> {
-        let _ = self
-            .store
-            .update_message_status(pending_id, "unknown", None)?;
-        Ok(())
+    pub fn complete_send_unknown(
+        &self,
+        pending_id: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(status_change_events(
+            self.store
+                .update_message_status(pending_id, "unknown", None)?,
+        ))
     }
 
-    pub fn complete_send_failed(&self, pending_id: &str) -> Result<(), ServiceError> {
-        let _ = self
-            .store
-            .update_message_status(pending_id, "failed", None)?;
-        Ok(())
+    pub fn complete_send_failed(
+        &self,
+        pending_id: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(status_change_events(
+            self.store
+                .update_message_status(pending_id, "failed", None)?,
+        ))
     }
 
     pub fn ingest_receive(
@@ -717,7 +787,6 @@ impl ConnectorService {
             text_bytes,
             text_truncated: !text_complete,
             text_retrievable: text_complete,
-            attachments: Vec::new(),
             status,
             client_request_id: None,
             quote_message_id: None,
@@ -780,6 +849,7 @@ impl ConnectorService {
     }
 }
 
+#[derive(Debug)]
 pub enum PreparedSend {
     Existing(MessageRecord),
     Dispatch {
@@ -925,6 +995,25 @@ fn validate_text(text: &str) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// One message.statusChanged event for a record whose status just moved.
+fn status_changed_event(record: &MessageRecord) -> HostSideEvent {
+    HostSideEvent::MessageStatusChanged {
+        account_id: record.account_id.clone(),
+        message_id: record.id.clone(),
+        status: record.status,
+    }
+}
+
+/// Emit a status event only for a real transition: a replayed terminal write
+/// (store reports `false`) or a vanished row produces nothing, so the host
+/// never sees a duplicate or phantom status change.
+fn status_change_events(updated: Option<(MessageRecord, bool)>) -> Vec<HostSideEvent> {
+    match updated {
+        Some((record, true)) => vec![status_changed_event(&record)],
+        _ => Vec::new(),
+    }
+}
+
 fn project_message_for_host(mut message: MessageRecord) -> MessageRecord {
     let Some(text) = message.text.as_deref() else {
         return message;
@@ -964,10 +1053,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::store::StoreKey;
 
     fn service() -> (TempDir, ConnectorService) {
         let temp = TempDir::new().unwrap();
-        let store = Store::open(temp.path()).unwrap();
+        let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
         (temp, ConnectorService::new(store))
     }
 
@@ -1204,6 +1294,52 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Regression: the pending row can be gone when an upstream send completes
+    /// (the account's rows were deleted in a race). The message may already be
+    /// delivered, so the completion must surface a final, non-retryable state —
+    /// never INTERNAL_ERROR with retryable=true on a mutating operation.
+    #[test]
+    fn missing_pending_row_at_send_completion_is_final_not_retryable() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(&account.id, &conversation.id, "in flight", "req-race", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+
+        // The deletion race: the account rows disappear while the upstream
+        // send is still in flight.
+        assert!(service.delete_account_local(&account.id).unwrap());
+
+        let error = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 100)
+            .unwrap_err();
+        let ServiceError::Api(api) = error else {
+            panic!("missing pending row must be an API error, got {error:?}");
+        };
+        assert_eq!(api.code, "SEND_OUTCOME_UNKNOWN");
+        assert!(!api.retryable);
+
+        // A pending id that never existed lands on the same non-retryable path.
+        let error =
+            match service.complete_send_success("absent", &account.id, &conversation.id, 100) {
+                Err(ServiceError::Api(api)) => api,
+                other => panic!("missing pending row must fail, got {other:?}"),
+            };
+        assert_eq!(error.code, "SEND_OUTCOME_UNKNOWN");
+        assert!(!error.retryable);
     }
 
     #[test]
@@ -1473,5 +1609,334 @@ mod tests {
             }
             PreparedSend::Existing(_) => panic!("direct peer send must dispatch"),
         }
+    }
+
+    /// Phase 2 (docs/optimization-plan.md): quoteMessageId is delivered
+    /// upstream. A quote of an incoming direct-chat message resolves to
+    /// signal-cli's quoteTimestamp (the envelope timestamp, which is the
+    /// protocol identity) and quoteAuthor (the peer number).
+    #[test]
+    fn quote_of_incoming_direct_message_becomes_upstream_quote_params() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let events = service
+            .ingest_receive(NormalizedReceive {
+                timestamp: Some(777),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some("+15555550101".into()),
+                peer_name: None,
+                group_id: None,
+                text: Some("quoted text".into()),
+                text_bytes: Some(11),
+                text_truncated: false,
+            })
+            .unwrap();
+        let quoted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+
+        match service
+            .prepare_send_text(
+                &account.id,
+                &quoted.conversation_id,
+                "reply with quote",
+                "req-quote-1",
+                Some(&quoted.id),
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => {
+                assert_eq!(params["quoteTimestamp"], json!(777));
+                assert_eq!(params["quoteAuthor"], json!("+15555550101"));
+                assert_eq!(params["recipient"], json!(["+15555550101"]));
+                assert_eq!(params["account"], json!("+15555550100"));
+            }
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        }
+
+        // The local record keeps the opaque quoteMessageId for the renderer.
+        let stored = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-quote-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.quote_message_id.as_deref(), Some(quoted.id.as_str()));
+    }
+
+    /// A quote of our own completed send resolves the author to the linked
+    /// account and the timestamp to the upstream-assigned one.
+    #[test]
+    fn quote_of_own_sent_message_uses_account_number_and_upstream_timestamp() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "original",
+                "req-original",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 4242)
+            .unwrap();
+
+        match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "quote own",
+                "req-quote-own",
+                Some(&pending_id),
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => {
+                assert_eq!(params["quoteTimestamp"], json!(4242));
+                assert_eq!(params["quoteAuthor"], json!("+15555550100"));
+            }
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        }
+    }
+
+    /// Deterministic rejections at validation time: unknown target, own
+    /// not-yet-sent message, group message (member address is not persisted),
+    /// and a message from another conversation. None of them may leave a
+    /// pending row behind — the same clientRequestId must re-validate as new.
+    #[test]
+    fn unresolvable_quotes_are_rejected_before_any_pending_row_exists() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // Unknown quote target -> MESSAGE_NOT_FOUND, non-retryable.
+        let api = service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "reply",
+                "req-quote-missing",
+                Some("no-such-message"),
+            )
+            .unwrap_err()
+            .into_api();
+        assert_eq!(api.code, "MESSAGE_NOT_FOUND");
+        assert!(!api.retryable);
+
+        // The rejection left no pending row: the same clientRequestId is a
+        // fresh dispatch, not an idempotent replay of a stuck pending record.
+        assert!(matches!(
+            service
+                .prepare_send_text(
+                    &account.id,
+                    &conversation.id,
+                    "reply",
+                    "req-quote-missing",
+                    None
+                )
+                .unwrap(),
+            PreparedSend::Dispatch { .. }
+        ));
+
+        // Quoting our own still-pending message would misquote upstream (its
+        // sent_at is a local clock value until the send completes).
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "in flight",
+                "req-pending",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        assert!(matches!(
+            service.prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "quote pending",
+                "req-quote-pending",
+                Some(&pending_id),
+            ),
+            Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
+        ));
+
+        // A group incoming message's author address is not persisted (only a
+        // local sender hash), so the quote cannot be constructed upstream.
+        let group_events = service
+            .ingest_receive(NormalizedReceive {
+                timestamp: Some(900),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some("+15555550105".into()),
+                peer_name: None,
+                group_id: Some("group-one".into()),
+                text: Some("group text".into()),
+                text_bytes: Some(10),
+                text_truncated: false,
+            })
+            .unwrap();
+        let group_message = group_events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(
+            service.prepare_send_text(
+                &account.id,
+                &group_message.conversation_id,
+                "quote group",
+                "req-quote-group",
+                Some(&group_message.id),
+            ),
+            Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
+        ));
+
+        // A message from another conversation is not a valid quote target here.
+        assert!(matches!(
+            service.prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "cross quote",
+                "req-quote-cross",
+                Some(&group_message.id),
+            ),
+            Err(ServiceError::Store(StoreError::MessageNotFound))
+        ));
+    }
+
+    /// message.statusChanged is produced on real transitions only: sent after
+    /// completion, unknown/failed on terminal resolution — and never twice for
+    /// a replayed write or a vanished row.
+    #[test]
+    fn status_changed_events_fire_once_per_real_transition() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let status_events = |events: &[HostSideEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    HostSideEvent::MessageStatusChanged {
+                        account_id,
+                        message_id,
+                        status,
+                    } => Some((account_id.clone(), message_id.clone(), *status)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "status flow",
+                "req-status",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+
+        let (_, events) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 55)
+            .unwrap();
+        assert_eq!(
+            status_events(&events),
+            vec![(account.id.clone(), pending_id.clone(), "sent")]
+        );
+
+        // A replayed completion reports no transition -> no duplicate event.
+        let (_, replayed) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 55)
+            .unwrap();
+        assert!(status_events(&replayed).is_empty());
+
+        // Terminal failure paths emit exactly once as well.
+        let failed_id = match service
+            .prepare_send_text(&account.id, &conversation.id, "will fail", "req-fail", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        let failed = service.complete_send_failed(&failed_id).unwrap();
+        assert_eq!(
+            status_events(&failed),
+            vec![(account.id.clone(), failed_id.clone(), "failed")]
+        );
+        assert!(service.complete_send_failed(&failed_id).unwrap().is_empty());
+
+        let unknown_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "will vanish",
+                "req-unknown",
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        let unknown = service.complete_send_unknown(&unknown_id).unwrap();
+        assert_eq!(
+            status_events(&unknown),
+            vec![(account.id.clone(), unknown_id.clone(), "unknown")]
+        );
+        assert!(
+            service
+                .complete_send_unknown(&unknown_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A row that never existed produces no phantom event.
+        assert!(service.complete_send_unknown("absent").unwrap().is_empty());
     }
 }

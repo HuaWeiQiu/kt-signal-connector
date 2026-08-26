@@ -21,7 +21,7 @@ use crate::service::{
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
-    Store, StoreError,
+    Store, StoreError, SyncedContact,
 };
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
@@ -162,14 +162,33 @@ impl RuntimeSupervisor {
                     }
                     // Storage trouble surfaces on the paths the host is waiting
                     // on; retention leaves the rest for the next start.
-                    Err(_) => {
-                        eprintln!("kt-signal-connector: retention stopped, store unavailable");
+                    Err(error) => {
+                        tracing::warn!(
+                            error_class = error.class(),
+                            "history retention stopped: store unavailable"
+                        );
                         break;
                     }
                 }
             }
             if removed > 0 {
-                eprintln!("kt-signal-connector: retention removed {removed} message(s)");
+                tracing::info!(removed, "history retention removed expired messages");
+            }
+            // Phase 3: the one-time plaintext migration backup has its own
+            // 7-day retention budget, pruned through this same once-per-start
+            // batch pass.
+            match service
+                .lock()
+                .await
+                .store_ref()
+                .prune_expired_plaintext_backup(now)
+            {
+                Ok(true) => tracing::info!("expired plaintext store backup removed"),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    error_class = error.class(),
+                    "plaintext store backup cleanup failed"
+                ),
             }
         }));
     }
@@ -385,10 +404,13 @@ impl RuntimeSupervisor {
                 ))
             })?
             .to_string();
-        self.service
+        let result = self
+            .service
             .lock()
             .await
-            .begin_link(device_name, device_link_uri)
+            .begin_link(device_name, device_link_uri)?;
+        tracing::info!("link session started");
+        Ok(result)
     }
 
     pub async fn finish_link(
@@ -504,11 +526,16 @@ impl RuntimeSupervisor {
         // has already pulled them from the primary device, so this only reads
         // them into the local cache. A failure must not fail the link flow.
         if let Err(error) = self.sync_contacts(&account.id).await {
-            eprintln!("kt-signal-connector: initial contacts sync after link failed: {error}");
+            tracing::warn!(
+                error_class = error.class(),
+                account_id = %account.id,
+                "initial contacts sync after link failed"
+            );
         }
         let _ = self
             .host_events
             .send(HostSideEvent::AccountChanged(account.clone()));
+        tracing::info!(account_id = %account.id, "link finished");
         Ok(account)
     }
 
@@ -534,6 +561,9 @@ impl RuntimeSupervisor {
     }
 
     /// Shared engine restart: shut the current engine down and start a fresh one.
+    /// `EngineHandle::shutdown` is internally bounded (total timeout, then a
+    /// direct child kill), so a watchdog restart cannot hang here even when the
+    /// old engine's actor is parked on receive backpressure.
     async fn restart_engine(&self) -> Result<(), EngineError> {
         let mut slot = self.engine.lock().await;
         if let Some(engine) = slot.take() {
@@ -623,18 +653,19 @@ impl RuntimeSupervisor {
                         && !self.link_flow_active().await
                     {
                         if episode.restarts > WATCHDOG_MAX_PENDING_RETRIES {
-                            eprintln!(
-                                "kt-signal-connector: watchdog giving up on pending restart (give-up: {}; episode retry budget exhausted)",
-                                deferred.reason
+                            tracing::warn!(
+                                reason = deferred.reason,
+                                "watchdog giving up on pending restart: episode retry budget exhausted"
                             );
                             pending = None;
                         } else {
-                            eprintln!(
-                                "kt-signal-connector: watchdog restarting signal-cli engine (pending-retry {}: {})",
-                                episode.restarts,
-                                deferred.reason
+                            tracing::warn!(
+                                attempt = episode.restarts,
+                                reason = deferred.reason,
+                                "watchdog restarting signal-cli engine (pending retry)"
                             );
                             if self.restart_engine().await.is_ok() {
+                                crate::metrics::record_watchdog_restart();
                                 last_restart = Some(Instant::now());
                                 episode.restarts += 1;
                                 pending = None;
@@ -669,8 +700,8 @@ impl RuntimeSupervisor {
                             // liveness does not prove the receive WebSocket is
                             // alive (the blind spot above).
                             if pending.is_some_and(|p| p.source == RestartSource::Ping) {
-                                eprintln!(
-                                    "kt-signal-connector: watchdog pending restart cleared (receive liveness ping recovered)"
+                                tracing::info!(
+                                    "watchdog pending restart cleared: receive liveness ping recovered"
                                 );
                                 pending = None;
                             }
@@ -748,15 +779,11 @@ impl RuntimeSupervisor {
         episode.last_trigger = Some(Instant::now());
 
         if self.link_flow_active().await {
-            eprintln!(
-                "kt-signal-connector: watchdog restart suppressed ({reason}); link in progress"
-            );
+            tracing::warn!(reason, "watchdog restart suppressed: link in progress");
             return false;
         }
         if episode.restarts > WATCHDOG_MAX_PENDING_RETRIES {
-            eprintln!(
-                "kt-signal-connector: watchdog giving up (give-up: {reason}); episode retry budget exhausted"
-            );
+            tracing::warn!(reason, "watchdog giving up: episode retry budget exhausted");
             return false;
         }
         if self.restart_throttled(last_restart) {
@@ -767,8 +794,10 @@ impl RuntimeSupervisor {
                 Some(p) if p.source == RestartSource::Stderr => {}
                 _ => *pending = Some(PendingRestart { source, reason }),
             }
-            eprintln!(
-                "kt-signal-connector: watchdog restart throttled ({reason}); recorded as pending ({source})"
+            tracing::warn!(
+                reason,
+                source = %source,
+                "watchdog restart throttled; recorded as pending"
             );
             return false;
         }
@@ -777,9 +806,10 @@ impl RuntimeSupervisor {
         } else {
             format!("pending-retry {}", episode.restarts)
         };
-        eprintln!("kt-signal-connector: watchdog restarting signal-cli engine ({label}: {reason})");
+        tracing::warn!(%label, reason, "watchdog restarting signal-cli engine");
         match self.restart_engine().await {
             Ok(()) => {
+                crate::metrics::record_watchdog_restart();
                 *last_restart = Some(Instant::now());
                 episode.restarts += 1;
                 *pending = None;
@@ -1036,10 +1066,14 @@ impl RuntimeSupervisor {
                     Ok(message)
                 }
                 Err(EngineError::UnknownOutcome) => {
-                    self.service
+                    let events = self
+                        .service
                         .lock()
                         .await
                         .complete_send_unknown(&pending_id)?;
+                    for event in events {
+                        let _ = self.host_events.send(event);
+                    }
                     Err(ServiceError::Api(ApiError::new(
                         "SEND_OUTCOME_UNKNOWN",
                         "mutating request has an unknown outcome",
@@ -1047,10 +1081,14 @@ impl RuntimeSupervisor {
                     )))
                 }
                 Err(error) => {
-                    self.service
+                    let events = self
+                        .service
                         .lock()
                         .await
                         .complete_send_failed(&pending_id)?;
+                    for event in events {
+                        let _ = self.host_events.send(event);
+                    }
                     Err(ServiceError::Engine(error))
                 }
             },
@@ -1164,18 +1202,22 @@ impl RuntimeSupervisor {
             group_count += 1;
         }
 
-        let service = self.service.lock().await;
-        for (kind, peer_key, title, extra) in synced {
-            service.upsert_synced_contact(
-                account_id,
-                &kind,
-                &peer_key,
-                &title,
-                extra.as_deref(),
-                now_ms,
-            )?;
-        }
-        service.set_contacts_synced_at(account_id, now_ms)?;
+        let entries: Vec<SyncedContact<'_>> = synced
+            .iter()
+            .map(|(kind, peer_key, title, extra)| SyncedContact {
+                kind: kind.as_str(),
+                peer_key: peer_key.as_str(),
+                title: title.as_str(),
+                extra: extra.as_deref(),
+            })
+            .collect();
+        // One transaction for the whole batch plus the sync marker: the store
+        // lock is held once instead of per contact, and a partial sync is
+        // never visible (a failed entry rolls back the rows and the marker).
+        self.service
+            .lock()
+            .await
+            .upsert_synced_contacts(account_id, &entries, now_ms)?;
         Ok(ContactsSyncOutcome {
             contact_count,
             group_count,
@@ -1236,6 +1278,7 @@ async fn receive_persistence_loop(
 ) {
     let mut storage_unavailable = false;
     while let Some(queued) = receives.recv().await {
+        crate::metrics::receive_queue_drained();
         let mut retry_delay = RECEIVE_STORE_RETRY_MIN;
         loop {
             let result = service
@@ -1249,14 +1292,22 @@ async fn receive_persistence_loop(
                     }
                     if storage_unavailable {
                         storage_unavailable = false;
+                        tracing::info!(state = "recovered", "receive persistence recovered");
                         let _ =
                             host_events.send(HostSideEvent::StorageChanged { state: "recovered" });
                     }
                     break;
                 }
-                Err(_) => {
+                Err(error) => {
                     if !storage_unavailable {
                         storage_unavailable = true;
+                        // Classification only: the store error may carry a
+                        // source chain now, and none of it is logged.
+                        tracing::warn!(
+                            state = "unavailable",
+                            error_class = error.class(),
+                            "receive persistence failed; retrying"
+                        );
                         let _ = host_events.send(HostSideEvent::StorageChanged {
                             state: "unavailable",
                         });
@@ -1364,11 +1415,14 @@ pub fn open_supervisor(
     state_dir: PathBuf,
     java_home: Option<PathBuf>,
     proxy: Option<crate::engine::SocksProxy>,
+    store_key: Option<crate::store::StoreKey>,
+    signal_cli_mode: crate::engine::SignalCliMode,
 ) -> Result<Arc<RuntimeSupervisor>, StoreError> {
-    let store = Store::open(&state_dir)?;
+    let store = Store::open(&state_dir, store_key)?;
     let mut config = SignalCliConfig::new(signal_cli, signal_data_dir);
     config.java_home = java_home;
     config.proxy = proxy;
+    config.mode = signal_cli_mode;
     let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
     supervisor.spawn_watchdog();
     supervisor.spawn_history_retention();
@@ -1389,7 +1443,25 @@ mod tests {
     use super::{RuntimeSupervisor, compose_contact_display_name, is_receive_fatal_stderr};
     use crate::engine::{NormalizedReceive, SignalCliConfig};
     use crate::service::HostSideEvent;
-    use crate::store::{MessageRecord, Store};
+    use crate::store::{MessageRecord, Store, StoreKey};
+
+    /// Every test store is encrypted (Phase 3); secondary observer connections
+    /// to the same file must present the same key.
+    const TEST_KEY_BYTES: [u8; 32] = [0x5A; 32];
+
+    fn test_store(dir: &std::path::Path) -> Store {
+        Store::open(dir, Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap()
+    }
+
+    fn keyed_observer(store: &Store) -> Connection {
+        let conn = Connection::open(store.path()).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{}'\"",
+            hex::encode(TEST_KEY_BYTES)
+        ))
+        .unwrap();
+        conn
+    }
 
     #[test]
     fn prefers_profile_given_and_family_name() {
@@ -1408,7 +1480,7 @@ mod tests {
     #[tokio::test]
     async fn history_retention_runs_once_per_start_in_the_background() {
         let temp = TempDir::new().unwrap();
-        let store = Store::open(temp.path()).unwrap();
+        let store = test_store(temp.path());
         let account = store
             .upsert_account_from_signal("+15555550100", Some(1))
             .unwrap();
@@ -1428,7 +1500,6 @@ mod tests {
             text_bytes: Some(4),
             text_truncated: false,
             text_retrievable: true,
-            attachments: Vec::new(),
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
@@ -1436,7 +1507,7 @@ mod tests {
         store
             .insert_message(&expired, None, Some("body"), true)
             .unwrap();
-        let observer = Connection::open(store.path()).unwrap();
+        let observer = keyed_observer(&store);
         let backdate = |id: &str| {
             observer
                 .execute(
@@ -1488,11 +1559,11 @@ mod tests {
     #[tokio::test]
     async fn failed_receive_persistence_is_retained_and_recovers() {
         let temp = TempDir::new().unwrap();
-        let store = Store::open(temp.path()).unwrap();
+        let store = test_store(temp.path());
         store
             .upsert_account_from_signal("+15555550100", Some(1))
             .unwrap();
-        let recovery = Connection::open(store.path()).unwrap();
+        let recovery = keyed_observer(&store);
         recovery
             .execute_batch(
                 "CREATE TRIGGER fail_receive_insert

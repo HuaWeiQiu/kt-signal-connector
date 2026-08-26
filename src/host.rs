@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, SplitSink};
@@ -15,12 +15,13 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, broadcast, watch};
-use tokio::time::timeout;
+use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::auth::{BootstrapSecret, HandshakeParams, PendingChallenge};
 use crate::engine::{EngineError, EngineEvent};
 use crate::ipc::LocalListener;
+use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
@@ -33,6 +34,14 @@ use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the redacted in-process metrics (src/metrics.rs) are logged.
+const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+/// Outer bound for runtime shutdown during host teardown. The engine shutdown
+/// is already bounded internally (grace period, then a direct kill); this
+/// covers everything around it (e.g. a store lock held by a wedged
+/// persistence write) so a single stuck component cannot keep the process
+/// alive. Must exceed the engine-internal shutdown budget.
+const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_REQUEST_IDS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
@@ -55,6 +64,29 @@ struct DispatchCompletion {
 struct HostDispatchPermit {
     _lane: OwnedSemaphorePermit,
     _account: Option<OwnedMutexGuard<()>>,
+    _deleting: Option<DeletingAccountGuard>,
+}
+
+/// Marks an account as having a delete in progress for the whole dispatch
+/// (refcounted, so overlapping deletes of the same account stay marked until
+/// the last one finishes). Never held across an await in the guard itself.
+struct DeletingAccountGuard {
+    accounts: Arc<StdMutex<HashMap<String, usize>>>,
+    account_key: String,
+}
+
+impl Drop for DeletingAccountGuard {
+    fn drop(&mut self) {
+        let Ok(mut accounts) = self.accounts.lock() else {
+            return;
+        };
+        if let Some(count) = accounts.get_mut(&self.account_key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                accounts.remove(&self.account_key);
+            }
+        }
+    }
 }
 
 struct HostDispatchLimits {
@@ -63,6 +95,10 @@ struct HostDispatchLimits {
     read: Arc<Semaphore>,
     send: Arc<Semaphore>,
     send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// Accounts with a delete in progress (refcounted). New mutating work for
+    /// these accounts is rejected instead of queueing behind the delete.
+    /// std mutex: only ever locked for a lookup/insert, never across an await.
+    deleting_accounts: Arc<StdMutex<HashMap<String, usize>>>,
 }
 
 #[derive(Default)]
@@ -89,12 +125,14 @@ impl HostPendingBudget {
         if let Some(account) = account_id {
             *self.by_account.entry(account.to_string()).or_default() += 1;
         }
+        metrics::set_host_pending(self.total);
         true
     }
 
     fn complete(&mut self, account_id: Option<&str>, request_bytes: usize) {
         self.total = self.total.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(request_bytes);
+        metrics::set_host_pending(self.total);
         let Some(account_id) = account_id else {
             return;
         };
@@ -115,12 +153,60 @@ impl HostDispatchLimits {
             read: Arc::new(Semaphore::new(READ_CONCURRENCY)),
             send: Arc::new(Semaphore::new(SEND_CONCURRENCY)),
             send_accounts: Mutex::new(HashMap::new()),
+            deleting_accounts: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
-    async fn acquire(&self, method: &str, account_id: Option<&str>) -> HostDispatchPermit {
-        if method == "messages.sendText" {
+    /// Acquire the dispatch permit for one host request.
+    ///
+    /// Mutating, account-scoped methods (`messages.sendText`, `contacts.sync`,
+    /// `accounts.deleteLocalData`) share one per-account mutex, which doubles
+    /// as the delete drain barrier:
+    ///
+    /// - A delete first marks the account as deleting (new sends/syncs are
+    ///   rejected with `ACCOUNT_NOT_FOUND` instead of queueing), then waits on
+    ///   the account mutex until every already-admitted send/sync for that
+    ///   account has fully finished — including its completion write to the
+    ///   store and its response write to the host. Only then does the upstream
+    ///   `deleteLocalAccountData` and the local row cascade run. A "sent
+    ///   upstream but locally rowless" message is therefore impossible.
+    /// - The deleting mark is checked before taking the mutex, so a send that
+    ///   raced past the check can still queue behind the delete; it then fails
+    ///   deterministically at send preparation because the account row is
+    ///   gone. Either interleaving linearizes the send strictly before or
+    ///   strictly after the delete.
+    async fn acquire(
+        &self,
+        method: &str,
+        account_id: Option<&str>,
+    ) -> Result<HostDispatchPermit, ApiError> {
+        if matches!(
+            method,
+            "messages.sendText" | "contacts.sync" | "accounts.deleteLocalData"
+        ) {
             let account_key = account_id.unwrap_or("").to_string();
+            let deleting = if method == "accounts.deleteLocalData" {
+                let mut accounts = self.deleting_accounts.lock().unwrap();
+                *accounts.entry(account_key.clone()).or_insert(0) += 1;
+                Some(DeletingAccountGuard {
+                    accounts: Arc::clone(&self.deleting_accounts),
+                    account_key: account_key.clone(),
+                })
+            } else {
+                if self
+                    .deleting_accounts
+                    .lock()
+                    .unwrap()
+                    .contains_key(&account_key)
+                {
+                    return Err(ApiError::new(
+                        "ACCOUNT_NOT_FOUND",
+                        "account is being deleted",
+                        false,
+                    ));
+                }
+                None
+            };
             let account_lock = {
                 let mut accounts = self.send_accounts.lock().await;
                 accounts.retain(|_, lock| lock.strong_count() > 0);
@@ -132,34 +218,39 @@ impl HostDispatchLimits {
                     lock
                 }
             };
-            // Account order is acquired before global send capacity so one busy
-            // account cannot occupy every send permit while waiting on itself.
+            // Account order is acquired before global lane capacity so one busy
+            // account cannot occupy every lane permit while waiting on itself.
             let account = account_lock.lock_owned().await;
-            let lane = self.send.clone().acquire_owned().await.unwrap();
-            return HostDispatchPermit {
+            let lane = match method {
+                "messages.sendText" => self.send.clone(),
+                "contacts.sync" => self.read.clone(),
+                _ => self.control.clone(),
+            }
+            .acquire_owned()
+            .await
+            .unwrap();
+            return Ok(HostDispatchPermit {
                 _lane: lane,
                 _account: Some(account),
-            };
+                _deleting: deleting,
+            });
         }
 
         let lane = if method == "link.finish" {
             self.link_wait.clone().acquire_owned().await.unwrap()
         } else if matches!(
             method,
-            "conversations.list"
-                | "messages.list"
-                | "messages.getText"
-                | "contacts.list"
-                | "contacts.sync"
+            "conversations.list" | "messages.list" | "messages.getText" | "contacts.list"
         ) {
             self.read.clone().acquire_owned().await.unwrap()
         } else {
             self.control.clone().acquire_owned().await.unwrap()
         };
-        HostDispatchPermit {
+        Ok(HostDispatchPermit {
             _lane: lane,
             _account: None,
-        }
+            _deleting: None,
+        })
     }
 }
 
@@ -185,6 +276,7 @@ pub async fn serve(
     supervisor: Arc<RuntimeSupervisor>,
 ) -> Result<(), HostError> {
     let secret = Arc::new(secret);
+    spawn_metrics_log();
     loop {
         let stream = tokio::select! {
             accepted = listener.accept() => accepted?,
@@ -214,10 +306,15 @@ pub async fn serve(
             }
         };
         if interrupted || authenticated.load(Ordering::Acquire) {
-            supervisor
-                .shutdown()
-                .await
-                .map_err(|_| HostError::RuntimeShutdown)?;
+            match timeout(HOST_SHUTDOWN_TIMEOUT, supervisor.shutdown()).await {
+                Ok(result) => result.map_err(|_| HostError::RuntimeShutdown)?,
+                // A stuck teardown must not keep the process alive: log and
+                // exit with the connection outcome.
+                Err(_) => tracing::warn!(
+                    budget_ms = HOST_SHUTDOWN_TIMEOUT.as_millis() as u64,
+                    "runtime shutdown exceeded the teardown budget"
+                ),
+            }
             return connection_result;
         }
         // A malformed or unauthenticated local probe must not consume the process. The first
@@ -416,6 +513,12 @@ where
                 }
                 let account_id = request_account_id(&request);
                 if !pending.try_admit(account_id.as_deref(), request_bytes) {
+                    tracing::warn!(
+                        method_class = metrics::method_class(&method),
+                        account_id = account_id.as_deref().unwrap_or("-"),
+                        request_bytes,
+                        "host request rejected: capacity exceeded"
+                    );
                     let response = HostResponse::failure(
                         request.request_id,
                         ApiError::new(
@@ -438,8 +541,27 @@ where
                 let task_writer = writer.clone();
                 let task_limits = limits.clone();
                 dispatches.push(async move {
-                    let _permit = task_limits.acquire(&method, task_account.as_deref()).await;
-                    let response = dispatch(request, &task_supervisor).await;
+                    // A rejected acquire (mutating work on an account whose
+                    // delete is draining) never reaches dispatch; it is
+                    // answered directly with the non-retryable error.
+                    let started = Instant::now();
+                    let response = match task_limits.acquire(&method, task_account.as_deref()).await
+                    {
+                        Ok(_permit) => dispatch(request, &task_supervisor).await,
+                        Err(error) => HostResponse::failure(request.request_id, error),
+                    };
+                    let elapsed = started.elapsed();
+                    let method_class = metrics::method_class(&method);
+                    let result_class = metrics::result_class(response.error.as_ref());
+                    metrics::record_request(method_class, result_class, elapsed);
+                    log_dispatch(
+                        method_class,
+                        result_class,
+                        response.error.as_ref().map(|error| error.code),
+                        task_account.as_deref(),
+                        request_bytes,
+                        elapsed,
+                    );
                     let write_result = send_shared(&task_writer, &response).await;
                     DispatchCompletion {
                         method,
@@ -498,6 +620,17 @@ where
                             break Err(error);
                         }
                     }
+                    Ok(EngineEvent::StorageChanged { state }) => {
+                        if let Err(error) = send_shared(
+                            &writer,
+                            &HostEvent::new(
+                                "runtime.storageChanged",
+                                json!({ "state": state }),
+                            ),
+                        ).await {
+                            break Err(error);
+                        }
+                    }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if let Err(error) = send_shared(
                             &writer,
@@ -538,7 +671,18 @@ where
 
     // Closing the authenticated host connection owns runtime shutdown. This
     // resolves dispatched mutating calls as unknown before task futures drop.
-    let _ = supervisor.shutdown().await;
+    // Teardown is bounded: the engine shutdown has its own timeout-plus-kill
+    // path, and this outer budget covers the rest, so a stuck component
+    // cannot keep the process alive after its host is gone.
+    if timeout(HOST_SHUTDOWN_TIMEOUT, supervisor.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            budget_ms = HOST_SHUTDOWN_TIMEOUT.as_millis() as u64,
+            "runtime shutdown exceeded the teardown budget"
+        );
+    }
     let _ = timeout(HOST_DISPATCH_DRAIN_TIMEOUT, async {
         while let Some(completion) = dispatches.next().await {
             pending.complete(completion.account_id.as_deref(), completion.request_bytes);
@@ -570,6 +714,65 @@ fn request_account_id(request: &HostRequest) -> Option<String> {
         .get("accountId")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// Periodic redacted metrics dump (plan §8): one structured log line per
+/// series. Process-lifetime task; nothing is exported over any socket.
+fn spawn_metrics_log() {
+    tokio::spawn(async move {
+        let mut ticker = interval(METRICS_LOG_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Skip the immediate first tick so startup stays quiet.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            metrics::log_snapshot();
+        }
+    });
+}
+
+/// One completed host dispatch, classified and redacted (plan §8): method
+/// category, opaque account id, request size, duration, and result class. A
+/// successful read/control poll stays at debug level so the default output
+/// shows mutating work and failures only.
+fn log_dispatch(
+    method_class: &'static str,
+    result_class: &'static str,
+    error_code: Option<&'static str>,
+    account_id: Option<&str>,
+    request_bytes: usize,
+    duration: Duration,
+) {
+    let account_id = account_id.unwrap_or("-");
+    let error_code = error_code.unwrap_or("-");
+    let duration_ms = duration.as_millis() as u64;
+    match result_class {
+        "ok" if matches!(method_class, "read" | "control") => tracing::debug!(
+            method_class,
+            result_class,
+            account_id,
+            request_bytes,
+            duration_ms,
+            "host request completed"
+        ),
+        "ok" => tracing::info!(
+            method_class,
+            result_class,
+            account_id,
+            request_bytes,
+            duration_ms,
+            "host request completed"
+        ),
+        _ => tracing::warn!(
+            method_class,
+            result_class,
+            error_code,
+            account_id,
+            request_bytes,
+            duration_ms,
+            "host request failed"
+        ),
+    }
 }
 
 async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostResponse {
@@ -980,7 +1183,7 @@ mod tests {
     use super::*;
     use crate::auth::BootstrapSecret;
     use crate::engine::SignalCliConfig;
-    use crate::store::Store;
+    use crate::store::{Store, StoreKey};
     use crate::supervisor::RuntimeSupervisor;
 
     fn test_supervisor() -> Arc<RuntimeSupervisor> {
@@ -990,7 +1193,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let store = Store::open(temp.path()).unwrap();
+        let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
         // Leak TempDir for unit test lifetime; path stays valid for process.
         std::mem::forget(temp);
         Arc::new(RuntimeSupervisor::new(
@@ -1069,14 +1272,15 @@ mod tests {
     #[tokio::test]
     async fn phone_approval_wait_does_not_block_link_control() {
         let limits = Arc::new(HostDispatchLimits::new());
-        let finish = limits.acquire("link.finish", None).await;
+        let finish = limits.acquire("link.finish", None).await.unwrap();
 
         let cancel = timeout(
             Duration::from_millis(50),
             limits.acquire("link.cancel", None),
         )
         .await
-        .expect("link.cancel must use the independent control lane");
+        .expect("link.cancel must use the independent control lane")
+        .unwrap();
 
         let second_finish = timeout(
             Duration::from_millis(10),
@@ -1090,6 +1294,137 @@ mod tests {
 
         drop(cancel);
         drop(finish);
+    }
+
+    /// The account delete drain barrier: a delete marks the account, then waits
+    /// for the in-flight send holding the per-account mutex; sends/syncs that
+    /// arrive during the delete are rejected instead of queueing; once the
+    /// delete dispatch ends, the mark is gone. Linearization point is the
+    /// per-account mutex: a send either completes fully before the delete's
+    /// upstream call, or it never reaches the upstream at all.
+    #[tokio::test]
+    async fn account_delete_drains_in_flight_send_and_rejects_new_mutations() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let send = limits
+            .acquire("messages.sendText", Some("account-a"))
+            .await
+            .unwrap();
+
+        // Spawn the delete: it marks the account immediately, then parks on
+        // the account mutex while the send is still in flight.
+        let delete_task = {
+            let limits = Arc::clone(&limits);
+            tokio::spawn(async move {
+                limits
+                    .acquire("accounts.deleteLocalData", Some("account-a"))
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !delete_task.is_finished(),
+            "delete must wait for the in-flight send to drain"
+        );
+        assert!(
+            limits
+                .deleting_accounts
+                .lock()
+                .unwrap()
+                .contains_key("account-a"),
+            "delete marks the account before waiting for the drain"
+        );
+
+        // New mutating work for the deleting account is rejected, not queued.
+        let rejected_send = limits
+            .acquire("messages.sendText", Some("account-a"))
+            .await
+            .err()
+            .expect("acquire must reject mutating work on a deleting account");
+        assert_eq!(rejected_send.code, "ACCOUNT_NOT_FOUND");
+        assert!(!rejected_send.retryable);
+        let rejected_sync = limits
+            .acquire("contacts.sync", Some("account-a"))
+            .await
+            .err()
+            .expect("acquire must reject mutating work on a deleting account");
+        assert_eq!(rejected_sync.code, "ACCOUNT_NOT_FOUND");
+
+        // Other accounts and read-only methods are unaffected.
+        limits
+            .acquire("messages.sendText", Some("account-b"))
+            .await
+            .unwrap();
+        limits
+            .acquire("messages.list", Some("account-a"))
+            .await
+            .unwrap();
+
+        // Once the send drains, the delete proceeds; while it runs the mark
+        // stays, and once the dispatch permit drops the mark is cleared so a
+        // later send is admitted again (it then fails at preparation if the
+        // account row is really gone).
+        drop(send);
+        let delete = timeout(Duration::from_secs(1), delete_task)
+            .await
+            .expect("delete must proceed once the send drained")
+            .unwrap()
+            .unwrap();
+        let still_rejected = limits
+            .acquire("messages.sendText", Some("account-a"))
+            .await
+            .err()
+            .expect("acquire must reject mutating work on a deleting account");
+        assert_eq!(still_rejected.code, "ACCOUNT_NOT_FOUND");
+        drop(delete);
+        assert!(
+            limits.deleting_accounts.lock().unwrap().is_empty(),
+            "a finished delete clears the mark"
+        );
+        limits
+            .acquire("messages.sendText", Some("account-a"))
+            .await
+            .unwrap();
+    }
+
+    /// Overlapping deletes of the same account serialize on the account mutex,
+    /// a delete whose wait is cancelled (timeout/dropped future) does not leave
+    /// a stale mark, and an active delete keeps rejecting sends until it ends.
+    #[tokio::test]
+    async fn overlapping_deletes_keep_the_mark_until_the_last_one_finishes() {
+        let limits = Arc::new(HostDispatchLimits::new());
+        let first = limits
+            .acquire("accounts.deleteLocalData", Some("account-a"))
+            .await
+            .unwrap();
+        // A second delete marks too, then waits on the account mutex; when its
+        // wait is cancelled, its mark is rolled back with the dropped future.
+        let second_pending = timeout(
+            Duration::from_millis(20),
+            limits.acquire("accounts.deleteLocalData", Some("account-a")),
+        )
+        .await;
+        assert!(second_pending.is_err());
+        drop(first);
+        assert!(
+            limits.deleting_accounts.lock().unwrap().is_empty(),
+            "a cancelled delete wait must not leave a stale mark"
+        );
+
+        let second = limits
+            .acquire("accounts.deleteLocalData", Some("account-a"))
+            .await
+            .unwrap();
+        let rejected = limits
+            .acquire("messages.sendText", Some("account-a"))
+            .await
+            .err()
+            .expect("acquire must reject mutating work on a deleting account");
+        assert_eq!(rejected.code, "ACCOUNT_NOT_FOUND");
+        drop(second);
+        limits
+            .acquire("messages.sendText", Some("account-a"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

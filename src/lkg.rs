@@ -149,8 +149,8 @@ impl RuntimeLayout {
                 if verify_version(&active_dir, trust).is_ok() {
                     write_pointer(&self.root.join("lkg.json"), &active.version_id)?;
                 } else {
-                    eprintln!(
-                        "kt-signal-connector: previous active runtime failed verification; keeping existing LKG"
+                    tracing::warn!(
+                        "previous active runtime failed verification; keeping existing LKG"
                     );
                 }
             }
