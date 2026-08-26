@@ -271,3 +271,76 @@ fn serve_rejects_an_invalid_socks_proxy_before_starting() {
     let stderr = String::from_utf8(from_flag.stderr).expect("error output should be UTF-8");
     assert!(stderr.contains("host:port"), "unexpected error: {stderr}");
 }
+
+/// Phase 4 startup validation: proxy-group specs are checked before the
+/// bootstrap payload is read, so a malformed launch fails with exit code 1
+/// (not clap's usage exit 2) and diagnostics never echo any endpoint (R10).
+#[test]
+fn proxy_group_specs_fail_closed_before_bootstrap_is_read() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    // The secret file is never read: group validation fails first (that is
+    // the point under test), so an unreadable path doubles as a tripwire.
+    let base = [
+        "serve",
+        "--endpoint",
+        "unused-endpoint",
+        "--bootstrap-secret-file",
+        "/nonexistent/bootstrap.secret",
+        "--signal-cli",
+        "unused-signal-cli",
+        "--signal-data-dir",
+        "unused-signal-data",
+        "--state-dir",
+        "unused-state",
+    ];
+
+    // A malformed spec (no ID=HOST:PORT split) aborts the launch.
+    let malformed = Command::new(binary)
+        .args(base)
+        .args(["--proxy-group", "team-a"])
+        .output()
+        .expect("connector binary should reject a malformed group spec");
+    assert_eq!(malformed.status.code(), Some(1));
+    assert!(malformed.stdout.is_empty());
+    let stderr = String::from_utf8(malformed.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("proxy group"), "unexpected error: {stderr}");
+
+    // The implicit default group is reserved and cannot be redefined.
+    let reserved = Command::new(binary)
+        .args(base)
+        .args(["--proxy-group", "default=10.20.30.40:1080"])
+        .output()
+        .expect("connector binary should reject a default redefinition");
+    assert_eq!(reserved.status.code(), Some(1));
+    let stderr = String::from_utf8(reserved.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("reserved"), "unexpected error: {stderr}");
+    assert!(
+        !stderr.contains("10.20.30.40"),
+        "diagnostics must not echo proxy endpoints"
+    );
+
+    // More than MAX_PROXY_GROUPS entries in total (implicit default plus
+    // eight explicit ones) exceeds the hard ceiling, via the env source.
+    let mut env_spec = String::new();
+    for index in 0..8 {
+        if index > 0 {
+            env_spec.push(',');
+        }
+        env_spec.push_str(&format!("team-{index}=10.20.30.{index}:1080"));
+    }
+    let ceiling = Command::new(binary)
+        .args(base)
+        .env("KT_SIGNAL_PROXY_GROUPS", &env_spec)
+        .output()
+        .expect("connector binary should reject an over-ceiling plan");
+    assert_eq!(ceiling.status.code(), Some(1));
+    let stderr = String::from_utf8(ceiling.stderr).expect("error output should be UTF-8");
+    assert!(
+        stderr.contains("too many proxy groups"),
+        "unexpected error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("10.20.30."),
+        "diagnostics must not echo proxy endpoints"
+    );
+}

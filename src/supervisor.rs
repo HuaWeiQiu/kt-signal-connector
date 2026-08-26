@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -21,7 +20,7 @@ use crate::service::{
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
-    Store, StoreError, SyncedContact,
+    Store, SyncedContact,
 };
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
@@ -71,8 +70,15 @@ struct WatchdogEpisode {
     last_trigger: Option<Instant>,
 }
 
+/// One proxy group's supervised runtime: its own engine slot, watchdog,
+/// receive pipeline and link state, over the shared per-profile store
+/// (ADR 0001 R4/R5). The group id is the opaque wire identity; the proxy
+/// endpoint stays inside the launcher-provided config.
 pub struct RuntimeSupervisor {
     config: SignalCliConfig,
+    /// Opaque group id (launcher-defined, ADR 0001 R1). Appears on the wire
+    /// and in logs; the group's proxy endpoint never does.
+    pub(crate) group_id: String,
     engine: Mutex<Option<EngineHandle>>,
     service: Arc<Mutex<ConnectorService>>,
     active_link_finish: Mutex<Option<String>>,
@@ -89,7 +95,7 @@ pub struct RuntimeSupervisor {
 }
 
 impl RuntimeSupervisor {
-    pub fn new(config: SignalCliConfig, store: Store) -> Self {
+    pub fn new(config: SignalCliConfig, store: Arc<Store>, group_id: String) -> Self {
         let (events, _) = event_channel();
         let (host_events, _) = broadcast::channel(1024);
         let service = Arc::new(Mutex::new(ConnectorService::new(store)));
@@ -98,9 +104,11 @@ impl RuntimeSupervisor {
             receive_rx,
             service.clone(),
             host_events.clone(),
+            group_id.clone(),
         ));
         Self {
             config,
+            group_id,
             engine: Mutex::new(None),
             service,
             active_link_finish: Mutex::new(None),
@@ -112,6 +120,16 @@ impl RuntimeSupervisor {
             retention: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
         }
+    }
+
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+
+    /// Shared service handle. The registry uses it for cross-group routing
+    /// lookups and account counts over the single shared store.
+    pub(crate) fn service(&self) -> &Arc<Mutex<ConnectorService>> {
+        &self.service
     }
 
     /// Spawn the receive-liveness watchdog (idempotent). Detects a silently dead
@@ -272,13 +290,19 @@ impl RuntimeSupervisor {
     }
 
     pub async fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
-        // Prefer live signal-cli numbers. On engine error fall back to store so a
-        // flaky listAccounts after link does not hard-fail the host. When the
-        // engine is healthy and returns an empty list, do NOT surface store-only
-        // "ghost" ready accounts from a partial/failed link.
+        // Prefer live signal-cli numbers of THIS group's engine. On engine error fall
+        // back to this group's store rows so a flaky listAccounts after link does not
+        // hard-fail the host. When the engine is healthy and returns an empty list, do
+        // NOT surface store-only "ghost" ready accounts from a partial/failed link.
         let engine = match self.running_engine().await {
             Ok(engine) => engine,
-            Err(_) => return self.service.lock().await.list_accounts(),
+            Err(_) => {
+                return self
+                    .service
+                    .lock()
+                    .await
+                    .list_accounts_in_group(&self.group_id);
+            }
         };
         let numbers = match engine
             .call("listAccounts", json!({}), CallClass::ReadOnly)
@@ -298,7 +322,11 @@ impl RuntimeSupervisor {
                 })
                 .unwrap_or_default(),
             Err(_) => {
-                return self.service.lock().await.list_accounts();
+                return self
+                    .service
+                    .lock()
+                    .await
+                    .list_accounts_in_group(&self.group_id);
             }
         };
         if numbers.is_empty() {
@@ -311,7 +339,7 @@ impl RuntimeSupervisor {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&numbers)?;
+            .sync_accounts_from_numbers(&numbers, &self.group_id)?;
         let _ = engine;
         Ok(accounts)
     }
@@ -319,7 +347,11 @@ impl RuntimeSupervisor {
     /// Optional profile refresh (not on the hot listAccounts path).
     pub async fn refresh_account_profiles(&self) -> Result<Vec<AccountSummary>, ServiceError> {
         let engine = self.running_engine().await?;
-        let accounts = self.service.lock().await.list_accounts()?;
+        let accounts = self
+            .service
+            .lock()
+            .await
+            .list_accounts_in_group(&self.group_id)?;
         let mut enriched = Vec::with_capacity(accounts.len());
         for account in accounts {
             let number = match self.service.lock().await.account_signal_number(&account.id) {
@@ -404,11 +436,14 @@ impl RuntimeSupervisor {
                 ))
             })?
             .to_string();
-        let result = self
+        let mut result = self
             .service
             .lock()
             .await
             .begin_link(device_name, device_link_uri)?;
+        // The wire result echoes the selected group (implementation-plan §4.4);
+        // this supervisor IS the selected group.
+        result["proxyGroup"] = json!(self.group_id);
         tracing::info!("link session started");
         Ok(result)
     }
@@ -507,7 +542,7 @@ impl RuntimeSupervisor {
             })?;
         let mut account = {
             let mut service = self.service.lock().await;
-            service.complete_link_session(&link_session_id, number)?
+            service.complete_link_session(&link_session_id, number, &self.group_id)?
         };
         // Refresh profile display name right after link (best-effort).
         if let Ok(engine) = self.running_engine().await {
@@ -750,7 +785,11 @@ impl RuntimeSupervisor {
         if service.has_pending_link() {
             return None;
         }
-        service.any_signal_account_number().ok().flatten()
+        // Only an account of this group's own engine is a valid probe target.
+        service
+            .any_signal_account_number_in_group(&self.group_id)
+            .ok()
+            .flatten()
     }
 
     /// Handle a watchdog restart trigger. Executes immediately unless a link
@@ -1275,6 +1314,7 @@ async fn receive_persistence_loop(
     mut receives: mpsc::Receiver<QueuedReceive>,
     service: Arc<Mutex<ConnectorService>>,
     host_events: broadcast::Sender<HostSideEvent>,
+    owner_group: String,
 ) {
     let mut storage_unavailable = false;
     while let Some(queued) = receives.recv().await {
@@ -1284,7 +1324,7 @@ async fn receive_persistence_loop(
             let result = service
                 .lock()
                 .await
-                .ingest_receive(queued.receive().clone());
+                .ingest_receive(queued.receive().clone(), &owner_group);
             match result {
                 Ok(events) => {
                     for event in events {
@@ -1409,26 +1449,6 @@ fn compose_contact_display_name(item: &Value) -> Option<String> {
         .map(|s| s.chars().take(64).collect())
 }
 
-pub fn open_supervisor(
-    signal_cli: PathBuf,
-    signal_data_dir: PathBuf,
-    state_dir: PathBuf,
-    java_home: Option<PathBuf>,
-    proxy: Option<crate::engine::SocksProxy>,
-    store_key: Option<crate::store::StoreKey>,
-    signal_cli_mode: crate::engine::SignalCliMode,
-) -> Result<Arc<RuntimeSupervisor>, StoreError> {
-    let store = Store::open(&state_dir, store_key)?;
-    let mut config = SignalCliConfig::new(signal_cli, signal_data_dir);
-    config.java_home = java_home;
-    config.proxy = proxy;
-    config.mode = signal_cli_mode;
-    let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
-    supervisor.spawn_watchdog();
-    supervisor.spawn_history_retention();
-    Ok(supervisor)
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1441,6 +1461,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{RuntimeSupervisor, compose_contact_display_name, is_receive_fatal_stderr};
+    use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
     use crate::service::HostSideEvent;
     use crate::store::{MessageRecord, Store, StoreKey};
@@ -1482,7 +1503,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = test_store(temp.path());
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -1529,7 +1550,8 @@ mod tests {
                 temp.path().join("unused-signal-cli"),
                 temp.path().join("unused-signal-data"),
             ),
-            store,
+            Arc::new(store),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
         ));
 
         supervisor.spawn_history_retention();
@@ -1561,7 +1583,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = test_store(temp.path());
         store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let recovery = keyed_observer(&store);
         recovery
@@ -1576,7 +1598,8 @@ mod tests {
                 temp.path().join("unused-signal-cli"),
                 temp.path().join("unused-signal-data"),
             ),
-            store,
+            Arc::new(store),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
         );
         let mut host_events = supervisor.subscribe_host();
         supervisor

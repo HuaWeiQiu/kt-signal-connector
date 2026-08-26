@@ -450,7 +450,10 @@ async fn phase2_link_receive_send_and_idempotent_text() {
         json!({ "accountId": "already-absent-account" }),
     )
     .await;
-    assert!(compatible_delete.get("result").is_some());
+    assert!(
+        compatible_delete.get("result").is_some(),
+        "v1-compatible delete response: {compatible_delete:?}"
+    );
 
     let deleted = request(
         &mut client,
@@ -1222,7 +1225,10 @@ async fn account_delete_unknown_is_reconciled_only_on_explicit_retry() {
         }),
     )
     .await;
-    assert!(idempotent.get("result").is_some());
+    assert!(
+        idempotent.get("result").is_some(),
+        "idempotent delete response: {idempotent:?}"
+    );
     let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
     assert!(accounts["result"].as_array().unwrap().is_empty());
 

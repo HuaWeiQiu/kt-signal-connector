@@ -19,17 +19,16 @@ use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::auth::{BootstrapSecret, HandshakeParams, PendingChallenge};
-use crate::engine::{EngineError, EngineEvent};
 use crate::ipc::LocalListener;
 use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
+use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
     HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesListParams,
     MessagesSendTextParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
-use crate::supervisor::RuntimeSupervisor;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -47,6 +46,9 @@ const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
 const MAX_PENDING_HOST_BYTES: usize = 8 * 1024 * 1024;
 const CONTROL_CONCURRENCY: usize = 1;
+/// Per-group `link.finish` capacity (ADR 0001 R3): phone-approval waits for
+/// different groups never block each other, while a second concurrent finish
+/// inside one group is rejected instead of queueing.
 const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
@@ -55,7 +57,6 @@ type HostWriter<S> = Arc<Mutex<SplitSink<Framed<S, LinesCodec>, String>>>;
 type DispatchFuture = BoxFuture<'static, DispatchCompletion>;
 
 struct DispatchCompletion {
-    method: String,
     account_id: Option<String>,
     request_bytes: usize,
     write_result: Result<(), HostError>,
@@ -91,10 +92,12 @@ impl Drop for DeletingAccountGuard {
 
 struct HostDispatchLimits {
     control: Arc<Semaphore>,
-    link_wait: Arc<Semaphore>,
     read: Arc<Semaphore>,
     send: Arc<Semaphore>,
     send_accounts: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// One bounded lane per proxy group for `link.finish` (ADR 0001 R3).
+    /// Same weak-handle discipline as `send_accounts`.
+    link_lanes: Mutex<HashMap<String, Weak<Semaphore>>>,
     /// Accounts with a delete in progress (refcounted). New mutating work for
     /// these accounts is rejected instead of queueing behind the delete.
     /// std mutex: only ever locked for a lookup/insert, never across an await.
@@ -149,10 +152,10 @@ impl HostDispatchLimits {
     fn new() -> Self {
         Self {
             control: Arc::new(Semaphore::new(CONTROL_CONCURRENCY)),
-            link_wait: Arc::new(Semaphore::new(LINK_WAIT_CONCURRENCY)),
             read: Arc::new(Semaphore::new(READ_CONCURRENCY)),
             send: Arc::new(Semaphore::new(SEND_CONCURRENCY)),
             send_accounts: Mutex::new(HashMap::new()),
+            link_lanes: Mutex::new(HashMap::new()),
             deleting_accounts: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -179,6 +182,7 @@ impl HostDispatchLimits {
         &self,
         method: &str,
         account_id: Option<&str>,
+        lane_key: Option<&str>,
     ) -> Result<HostDispatchPermit, ApiError> {
         if matches!(
             method,
@@ -236,9 +240,46 @@ impl HostDispatchLimits {
             });
         }
 
-        let lane = if method == "link.finish" {
-            self.link_wait.clone().acquire_owned().await.unwrap()
-        } else if matches!(
+        if method == "link.finish" {
+            // Dispatch resolves the owning group first; a finish without a
+            // resolvable session is answered before any lane is taken, so a
+            // missing key here means the caller skipped that step.
+            let Some(group_key) = lane_key else {
+                return Err(ApiError::new(
+                    "LINK_NOT_FOUND",
+                    "link session was not found",
+                    false,
+                ));
+            };
+            let lane = {
+                let mut lanes = self.link_lanes.lock().await;
+                lanes.retain(|_, lane| lane.strong_count() > 0);
+                if let Some(lane) = lanes.get(group_key).and_then(Weak::upgrade) {
+                    lane.clone()
+                } else {
+                    let lane = Arc::new(Semaphore::new(LINK_WAIT_CONCURRENCY));
+                    lanes.insert(group_key.to_string(), Arc::downgrade(&lane));
+                    lane
+                }
+            };
+            // Contention inside one group rejects immediately (the wire
+            // contract answers the second concurrent finish with
+            // LINK_IN_PROGRESS); another group's lane is untouched.
+            let permit = lane.try_acquire_owned().map_err(|_| {
+                ApiError::new(
+                    "LINK_IN_PROGRESS",
+                    "a link finish request is already active for this proxy group",
+                    false,
+                )
+            })?;
+            return Ok(HostDispatchPermit {
+                _lane: permit,
+                _account: None,
+                _deleting: None,
+            });
+        }
+
+        let lane = if matches!(
             method,
             "conversations.list" | "messages.list" | "messages.getText" | "contacts.list"
         ) {
@@ -273,7 +314,7 @@ pub enum HostError {
 pub async fn serve(
     listener: LocalListener,
     secret: BootstrapSecret,
-    supervisor: Arc<RuntimeSupervisor>,
+    runtime: Arc<ProxyGroupRuntime>,
 ) -> Result<(), HostError> {
     let secret = Arc::new(secret);
     spawn_metrics_log();
@@ -290,7 +331,7 @@ pub async fn serve(
         let connection = handle_connection_until_shutdown(
             stream,
             secret.clone(),
-            supervisor.clone(),
+            runtime.clone(),
             shutdown_rx,
             authenticated.clone(),
         );
@@ -306,7 +347,7 @@ pub async fn serve(
             }
         };
         if interrupted || authenticated.load(Ordering::Acquire) {
-            match timeout(HOST_SHUTDOWN_TIMEOUT, supervisor.shutdown()).await {
+            match timeout(HOST_SHUTDOWN_TIMEOUT, runtime.shutdown()).await {
                 Ok(result) => result.map_err(|_| HostError::RuntimeShutdown)?,
                 // A stuck teardown must not keep the process alive: log and
                 // exit with the connection outcome.
@@ -327,7 +368,7 @@ pub async fn serve(
 async fn handle_connection<S>(
     stream: S,
     secret: Arc<BootstrapSecret>,
-    supervisor: Arc<RuntimeSupervisor>,
+    runtime: Arc<ProxyGroupRuntime>,
 ) -> Result<(), HostError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -336,7 +377,7 @@ where
     handle_connection_until_shutdown(
         stream,
         secret,
-        supervisor,
+        runtime,
         shutdown_rx,
         Arc::new(AtomicBool::new(false)),
     )
@@ -346,7 +387,7 @@ where
 async fn handle_connection_until_shutdown<S>(
     stream: S,
     secret: Arc<BootstrapSecret>,
-    supervisor: Arc<RuntimeSupervisor>,
+    runtime: Arc<ProxyGroupRuntime>,
     shutdown: watch::Receiver<bool>,
     authenticated: Arc<AtomicBool>,
 ) -> Result<(), HostError>
@@ -357,7 +398,7 @@ where
     // violate the protocol, and this process must still exit cleanly. Normalize
     // here rather than at any single failure point, because every read and write
     // in the session below can be the one that discovers the peer is gone.
-    match run_host_session(stream, secret, supervisor, shutdown, authenticated).await {
+    match run_host_session(stream, secret, runtime, shutdown, authenticated).await {
         Err(HostError::PeerGone) => Ok(()),
         other => other,
     }
@@ -366,7 +407,7 @@ where
 async fn run_host_session<S>(
     stream: S,
     secret: Arc<BootstrapSecret>,
-    supervisor: Arc<RuntimeSupervisor>,
+    runtime: Arc<ProxyGroupRuntime>,
     mut shutdown: watch::Receiver<bool>,
     authenticated: Arc<AtomicBool>,
 ) -> Result<(), HostError>
@@ -458,11 +499,10 @@ where
     let limits = Arc::new(HostDispatchLimits::new());
     let mut dispatches = FuturesUnordered::<DispatchFuture>::new();
     let mut pending = HostPendingBudget::default();
-    let mut link_finish_pending = false;
     let mut recent_ids = RecentRequestIds::default();
     recent_ids.insert(handshake_request_id);
-    let mut engine_events = supervisor.subscribe_engine();
-    let mut host_events = supervisor.subscribe_host();
+    let mut registry_events = runtime.subscribe();
+    let mut host_events = runtime.subscribe_host();
     let connection_result = loop {
         tokio::select! {
             line = stream.next() => {
@@ -497,20 +537,6 @@ where
                 }
 
                 let method = request.method.clone();
-                if method == "link.finish" && link_finish_pending {
-                    let response = HostResponse::failure(
-                        request.request_id,
-                        ApiError::new(
-                            "LINK_IN_PROGRESS",
-                            "a link finish request is already active",
-                            false,
-                        ),
-                    );
-                    if let Err(error) = send_shared(&writer, &response).await {
-                        break Err(error);
-                    }
-                    continue;
-                }
                 let account_id = request_account_id(&request);
                 if !pending.try_admit(account_id.as_deref(), request_bytes) {
                     tracing::warn!(
@@ -532,22 +558,59 @@ where
                     }
                     continue;
                 }
-                if method == "link.finish" {
-                    link_finish_pending = true;
-                }
 
                 let task_account = account_id.clone();
-                let task_supervisor = supervisor.clone();
+                let task_runtime = runtime.clone();
                 let task_writer = writer.clone();
                 let task_limits = limits.clone();
                 dispatches.push(async move {
                     // A rejected acquire (mutating work on an account whose
-                    // delete is draining) never reaches dispatch; it is
-                    // answered directly with the non-retryable error.
+                    // delete is draining, a second concurrent finish in one
+                    // group) never reaches dispatch; it is answered directly
+                    // with the non-retryable error.
                     let started = Instant::now();
-                    let response = match task_limits.acquire(&method, task_account.as_deref()).await
-                    {
-                        Ok(_permit) => dispatch(request, &task_supervisor).await,
+                    // `link.finish` routes through the lane of the group that
+                    // owns the session (ADR 0001 R3); a session that no longer
+                    // exists anywhere fails closed without occupying any lane.
+                    // Unparseable finish params fall through to dispatch so its
+                    // own parse produces the INVALID_REQUEST answer.
+                    let link_params = if method == "link.finish" {
+                        serde_json::from_value::<LinkSessionParams>(request.params.clone()).ok()
+                    } else {
+                        None
+                    };
+                    // The permit itself must stay bound for the whole
+                    // dispatch: dropping it early (e.g. by reducing the
+                    // acquire result to its error) would release the account
+                    // mutex, the delete barrier and the lane before the work
+                    // has run, letting same-account requests interleave.
+                    let acquired: Result<HostDispatchPermit, ApiError> = async {
+                        match &link_params {
+                            Some(params) => {
+                                let Some(group) = task_runtime
+                                    .resolve_link_session(&params.link_session_id)
+                                    .await
+                                else {
+                                    return Err(ApiError::new(
+                                        "LINK_NOT_FOUND",
+                                        "link session was not found",
+                                        false,
+                                    ));
+                                };
+                                task_limits
+                                    .acquire(&method, task_account.as_deref(), Some(&group))
+                                    .await
+                            }
+                            None => {
+                                task_limits
+                                    .acquire(&method, task_account.as_deref(), None)
+                                    .await
+                            }
+                        }
+                    }
+                    .await;
+                    let response = match acquired {
+                        Ok(_permit) => dispatch(request, &task_runtime).await,
                         Err(error) => HostResponse::failure(request.request_id, error),
                     };
                     let elapsed = started.elapsed();
@@ -564,7 +627,6 @@ where
                     );
                     let write_result = send_shared(&task_writer, &response).await;
                     DispatchCompletion {
-                        method,
                         account_id: task_account,
                         request_bytes,
                         write_result,
@@ -573,9 +635,6 @@ where
             }
             completion = dispatches.next(), if !dispatches.is_empty() => {
                 if let Some(completion) = completion {
-                    if completion.method == "link.finish" {
-                        link_finish_pending = false;
-                    }
                     pending.complete(
                         completion.account_id.as_deref(),
                         completion.request_bytes,
@@ -588,46 +647,49 @@ where
             _ = shutdown.changed() => {
                 break Ok(());
             }
-            event = engine_events.recv() => {
+            event = registry_events.recv() => {
                 match event {
-                    Ok(EngineEvent::StateChanged(status)) => {
-                        if let Err(error) = send_shared(
-                            &writer,
-                            &HostEvent::new("runtime.stateChanged", status),
-                        ).await {
-                            break Err(error);
-                        }
-                    }
-                    Ok(EngineEvent::ProtocolWarning { kind }) => {
-                        if let Err(error) = send_shared(
-                            &writer,
-                            &HostEvent::new(
+                    Ok(event) => {
+                        let wire: HostEvent<Value> = match event {
+                            // The aggregate keeps the pre-Phase-4 shape exactly.
+                            RegistryEvent::AggregateStateChanged(status) => {
+                                HostEvent::new(
+                                    "runtime.stateChanged",
+                                    serde_json::to_value(status).unwrap_or(Value::Null),
+                                )
+                            }
+                            RegistryEvent::GroupStateChanged { group_id, status } => {
+                                let mut payload = serde_json::to_value(&status)
+                                    .unwrap_or(Value::Null);
+                                if let Some(object) = payload.as_object_mut() {
+                                    object.insert("groupId".into(), json!(group_id));
+                                }
+                                HostEvent::new("proxyGroup.stateChanged", payload)
+                            }
+                            RegistryEvent::ResourcePressure {
+                                state,
+                                pid,
+                                rss_bytes,
+                                group_id,
+                            } => HostEvent::new(
+                                "runtime.resourcePressure",
+                                json!({
+                                    "state": state,
+                                    "pid": pid,
+                                    "rssBytes": rss_bytes,
+                                    "groupId": group_id
+                                }),
+                            ),
+                            RegistryEvent::ProtocolWarning { kind } => HostEvent::new(
                                 "runtime.protocolWarning",
                                 json!({ "kind": kind }),
                             ),
-                        ).await {
-                            break Err(error);
-                        }
-                    }
-                    Ok(EngineEvent::ResourcePressure { state, pid, rss_bytes }) => {
-                        if let Err(error) = send_shared(
-                            &writer,
-                            &HostEvent::new(
-                                "runtime.resourcePressure",
-                                json!({ "state": state, "pid": pid, "rssBytes": rss_bytes }),
-                            ),
-                        ).await {
-                            break Err(error);
-                        }
-                    }
-                    Ok(EngineEvent::StorageChanged { state }) => {
-                        if let Err(error) = send_shared(
-                            &writer,
-                            &HostEvent::new(
+                            RegistryEvent::StorageChanged { state } => HostEvent::new(
                                 "runtime.storageChanged",
                                 json!({ "state": state }),
                             ),
-                        ).await {
+                        };
+                        if let Err(error) = send_shared(&writer, &wire).await {
                             break Err(error);
                         }
                     }
@@ -671,10 +733,10 @@ where
 
     // Closing the authenticated host connection owns runtime shutdown. This
     // resolves dispatched mutating calls as unknown before task futures drop.
-    // Teardown is bounded: the engine shutdown has its own timeout-plus-kill
+    // Teardown is bounded: each engine shutdown has its own timeout-plus-kill
     // path, and this outer budget covers the rest, so a stuck component
     // cannot keep the process alive after its host is gone.
-    if timeout(HOST_SHUTDOWN_TIMEOUT, supervisor.shutdown())
+    if timeout(HOST_SHUTDOWN_TIMEOUT, runtime.shutdown())
         .await
         .is_err()
     {
@@ -775,26 +837,26 @@ fn log_dispatch(
     }
 }
 
-async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostResponse {
+async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResponse {
     let request_id = request.request_id;
     match request.method.as_str() {
         "runtime.status" if empty_params(&request.params) => HostResponse::success(
             request_id,
-            serde_json::to_value(supervisor.status().await).unwrap_or(Value::Null),
+            serde_json::to_value(runtime.status().await).unwrap_or(Value::Null),
         ),
-        "runtime.start" if empty_params(&request.params) => match supervisor.start().await {
+        "runtime.start" if empty_params(&request.params) => match runtime.start().await {
             Ok(status) => HostResponse::success(
                 request_id,
                 serde_json::to_value(status).unwrap_or(Value::Null),
             ),
-            Err(error) => HostResponse::failure(request_id, map_start_error(error)),
+            Err(failure) => HostResponse::failure(request_id, map_start_failure(failure)),
         },
-        "runtime.stop" if empty_params(&request.params) => match supervisor.stop().await {
+        "runtime.stop" if empty_params(&request.params) => match runtime.stop().await {
             Ok(status) => HostResponse::success(
                 request_id,
                 serde_json::to_value(status).unwrap_or(Value::Null),
             ),
-            Err(error) => HostResponse::failure(request_id, map_stop_error(error)),
+            Err(failure) => HostResponse::failure(request_id, map_stop_failure(failure)),
         },
         "runtime.status" | "runtime.start" | "runtime.stop" => HostResponse::failure(
             request_id,
@@ -804,15 +866,13 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
                 false,
             ),
         ),
-        "accounts.list" if empty_params(&request.params) => {
-            match supervisor.list_accounts().await {
-                Ok(accounts) => HostResponse::success(
-                    request_id,
-                    serde_json::to_value(accounts).unwrap_or(Value::Null),
-                ),
-                Err(error) => HostResponse::failure(request_id, error.into_api()),
-            }
-        }
+        "accounts.list" if empty_params(&request.params) => match runtime.list_accounts().await {
+            Ok(accounts) => HostResponse::success(
+                request_id,
+                serde_json::to_value(accounts).unwrap_or(Value::Null),
+            ),
+            Err(error) => HostResponse::failure(request_id, error.into_api()),
+        },
         "accounts.list" => HostResponse::failure(
             request_id,
             ApiError::new(
@@ -823,7 +883,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
         ),
         "accounts.deleteLocalData" => {
             match serde_json::from_value::<AccountDeleteLocalDataParams>(request.params) {
-                Ok(params) => match supervisor
+                Ok(params) => match runtime
                     .delete_local_account(params.account_id, params.operation_id)
                     .await
                 {
@@ -841,17 +901,22 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
             }
         }
         "link.start" => match serde_json::from_value::<LinkStartParams>(request.params) {
-            Ok(params) => match supervisor.start_link(params.device_name).await {
-                Ok(result) => HostResponse::success(request_id, result),
-                Err(error) => HostResponse::failure(request_id, error.into_api()),
-            },
+            Ok(params) => {
+                match runtime
+                    .start_link(params.device_name, params.proxy_group)
+                    .await
+                {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                }
+            }
             Err(_) => HostResponse::failure(
                 request_id,
                 ApiError::new("INVALID_REQUEST", "invalid link.start params", false),
             ),
         },
         "link.finish" => match serde_json::from_value::<LinkSessionParams>(request.params) {
-            Ok(params) => match supervisor.finish_link(params.link_session_id).await {
+            Ok(params) => match runtime.finish_link(params.link_session_id).await {
                 Ok(account) => HostResponse::success(
                     request_id,
                     serde_json::to_value(account).unwrap_or(Value::Null),
@@ -864,7 +929,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
             ),
         },
         "link.cancel" => match serde_json::from_value::<LinkSessionParams>(request.params) {
-            Ok(params) => match supervisor.cancel_link(params.link_session_id).await {
+            Ok(params) => match runtime.cancel_link(params.link_session_id).await {
                 Ok(result) => HostResponse::success(request_id, result),
                 Err(error) => HostResponse::failure(request_id, error.into_api()),
             },
@@ -876,7 +941,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
         "conversations.list" => {
             match serde_json::from_value::<ConversationsListParams>(request.params) {
                 Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
-                    match supervisor
+                    match runtime
                         .list_conversations(params.account_id, params.limit, params.cursor)
                         .await
                     {
@@ -903,7 +968,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
         }
         "messages.list" => match serde_json::from_value::<MessagesListParams>(request.params) {
             Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
-                match supervisor
+                match runtime
                     .list_messages(
                         params.account_id,
                         params.conversation_id,
@@ -930,7 +995,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
         },
         "messages.getText" => {
             match serde_json::from_value::<MessageGetTextParams>(request.params) {
-                Ok(params) => match supervisor
+                Ok(params) => match runtime
                     .get_message_text(params.account_id, params.conversation_id, params.message_id)
                     .await
                 {
@@ -972,7 +1037,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
                         )),
                     };
                     match target {
-                        Ok(target) => match supervisor
+                        Ok(target) => match runtime
                             .send_text(
                                 params.account_id,
                                 target,
@@ -998,7 +1063,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
             }
         }
         "contacts.sync" => match serde_json::from_value::<ContactsSyncParams>(request.params) {
-            Ok(params) => match supervisor.sync_contacts(&params.account_id).await {
+            Ok(params) => match runtime.sync_contacts(&params.account_id).await {
                 Ok(outcome) => HostResponse::success(
                     request_id,
                     serde_json::to_value(outcome).unwrap_or(Value::Null),
@@ -1012,7 +1077,7 @@ async fn dispatch(request: HostRequest, supervisor: &RuntimeSupervisor) -> HostR
         },
         "contacts.list" => match serde_json::from_value::<ContactsListParams>(request.params) {
             Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
-                match supervisor
+                match runtime
                     .list_contacts(params.account_id, params.query, params.limit, params.cursor)
                     .await
                 {
@@ -1043,14 +1108,14 @@ fn empty_params(params: &Value) -> bool {
     params.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
-fn map_start_error(error: EngineError) -> ApiError {
-    match error {
-        EngineError::Backpressure => ApiError::new(
+fn map_start_failure(failure: StartFailure) -> ApiError {
+    match failure {
+        StartFailure::AlreadyRunning => ApiError::new(
             "RUNTIME_ALREADY_RUNNING",
             "signal-cli runtime is already running",
             false,
         ),
-        _ => ApiError::new(
+        StartFailure::StartFailed => ApiError::new(
             "RUNTIME_START_FAILED",
             "signal-cli runtime could not be started",
             true,
@@ -1058,14 +1123,14 @@ fn map_start_error(error: EngineError) -> ApiError {
     }
 }
 
-fn map_stop_error(error: EngineError) -> ApiError {
-    match error {
-        EngineError::NotRunning => ApiError::new(
+fn map_stop_failure(failure: StopFailure) -> ApiError {
+    match failure {
+        StopFailure::NotRunning => ApiError::new(
             "RUNTIME_NOT_RUNNING",
             "signal-cli runtime is not running",
             false,
         ),
-        _ => ApiError::new(
+        StopFailure::StopFailed => ApiError::new(
             "RUNTIME_STOP_FAILED",
             "signal-cli runtime could not be stopped",
             true,
@@ -1201,8 +1266,18 @@ mod tests {
                 PathBuf::from("unused-signal-cli"),
                 PathBuf::from("/tmp/unused-signal-data"),
             ),
-            store,
+            Arc::new(store),
+            crate::DEFAULT_PROXY_GROUP_ID.to_string(),
         ))
+    }
+
+    /// A single-group runtime assembled the same way the launcher assembles
+    /// multi-group plans; field-for-field identical on the wire.
+    fn test_runtime() -> Arc<ProxyGroupRuntime> {
+        ProxyGroupRuntime::new(vec![crate::registry::ProxyGroupSlot::new(
+            crate::DEFAULT_PROXY_GROUP_ID.to_string(),
+            test_supervisor(),
+        )])
     }
 
     #[test]
@@ -1272,28 +1347,45 @@ mod tests {
     #[tokio::test]
     async fn phone_approval_wait_does_not_block_link_control() {
         let limits = Arc::new(HostDispatchLimits::new());
-        let finish = limits.acquire("link.finish", None).await.unwrap();
+        let finish = limits
+            .acquire("link.finish", None, Some("default"))
+            .await
+            .unwrap();
 
         let cancel = timeout(
             Duration::from_millis(50),
-            limits.acquire("link.cancel", None),
+            limits.acquire("link.cancel", None, None),
         )
         .await
         .expect("link.cancel must use the independent control lane")
         .unwrap();
 
-        let second_finish = timeout(
-            Duration::from_millis(10),
-            limits.acquire("link.finish", None),
+        // A second concurrent finish inside the SAME group is rejected with
+        // the wire-contract code instead of queueing (ADR 0001 R3).
+        let second_finish = limits
+            .acquire("link.finish", None, Some("default"))
+            .await
+            .err()
+            .expect("a second finish in one group must be rejected");
+        assert_eq!(second_finish.code, "LINK_IN_PROGRESS");
+        assert!(!second_finish.retryable);
+
+        // Another group's lane is untouched by the first group's wait.
+        timeout(
+            Duration::from_millis(50),
+            limits.acquire("link.finish", None, Some("team-b")),
         )
-        .await;
-        assert!(
-            second_finish.is_err(),
-            "link.finish capacity must stay bounded at one"
-        );
+        .await
+        .expect("a different group's finish lane must stay free")
+        .unwrap();
 
         drop(cancel);
         drop(finish);
+        // Once the first finish drains, its group's lane is free again.
+        limits
+            .acquire("link.finish", None, Some("default"))
+            .await
+            .unwrap();
     }
 
     /// The account delete drain barrier: a delete marks the account, then waits
@@ -1306,7 +1398,7 @@ mod tests {
     async fn account_delete_drains_in_flight_send_and_rejects_new_mutations() {
         let limits = Arc::new(HostDispatchLimits::new());
         let send = limits
-            .acquire("messages.sendText", Some("account-a"))
+            .acquire("messages.sendText", Some("account-a"), None)
             .await
             .unwrap();
 
@@ -1316,7 +1408,7 @@ mod tests {
             let limits = Arc::clone(&limits);
             tokio::spawn(async move {
                 limits
-                    .acquire("accounts.deleteLocalData", Some("account-a"))
+                    .acquire("accounts.deleteLocalData", Some("account-a"), None)
                     .await
             })
         };
@@ -1336,14 +1428,14 @@ mod tests {
 
         // New mutating work for the deleting account is rejected, not queued.
         let rejected_send = limits
-            .acquire("messages.sendText", Some("account-a"))
+            .acquire("messages.sendText", Some("account-a"), None)
             .await
             .err()
             .expect("acquire must reject mutating work on a deleting account");
         assert_eq!(rejected_send.code, "ACCOUNT_NOT_FOUND");
         assert!(!rejected_send.retryable);
         let rejected_sync = limits
-            .acquire("contacts.sync", Some("account-a"))
+            .acquire("contacts.sync", Some("account-a"), None)
             .await
             .err()
             .expect("acquire must reject mutating work on a deleting account");
@@ -1351,11 +1443,11 @@ mod tests {
 
         // Other accounts and read-only methods are unaffected.
         limits
-            .acquire("messages.sendText", Some("account-b"))
+            .acquire("messages.sendText", Some("account-b"), None)
             .await
             .unwrap();
         limits
-            .acquire("messages.list", Some("account-a"))
+            .acquire("messages.list", Some("account-a"), None)
             .await
             .unwrap();
 
@@ -1370,7 +1462,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let still_rejected = limits
-            .acquire("messages.sendText", Some("account-a"))
+            .acquire("messages.sendText", Some("account-a"), None)
             .await
             .err()
             .expect("acquire must reject mutating work on a deleting account");
@@ -1381,7 +1473,7 @@ mod tests {
             "a finished delete clears the mark"
         );
         limits
-            .acquire("messages.sendText", Some("account-a"))
+            .acquire("messages.sendText", Some("account-a"), None)
             .await
             .unwrap();
     }
@@ -1393,14 +1485,14 @@ mod tests {
     async fn overlapping_deletes_keep_the_mark_until_the_last_one_finishes() {
         let limits = Arc::new(HostDispatchLimits::new());
         let first = limits
-            .acquire("accounts.deleteLocalData", Some("account-a"))
+            .acquire("accounts.deleteLocalData", Some("account-a"), None)
             .await
             .unwrap();
         // A second delete marks too, then waits on the account mutex; when its
         // wait is cancelled, its mark is rolled back with the dropped future.
         let second_pending = timeout(
             Duration::from_millis(20),
-            limits.acquire("accounts.deleteLocalData", Some("account-a")),
+            limits.acquire("accounts.deleteLocalData", Some("account-a"), None),
         )
         .await;
         assert!(second_pending.is_err());
@@ -1411,18 +1503,18 @@ mod tests {
         );
 
         let second = limits
-            .acquire("accounts.deleteLocalData", Some("account-a"))
+            .acquire("accounts.deleteLocalData", Some("account-a"), None)
             .await
             .unwrap();
         let rejected = limits
-            .acquire("messages.sendText", Some("account-a"))
+            .acquire("messages.sendText", Some("account-a"), None)
             .await
             .err()
             .expect("acquire must reject mutating work on a deleting account");
         assert_eq!(rejected.code, "ACCOUNT_NOT_FOUND");
         drop(second);
         limits
-            .acquire("messages.sendText", Some("account-a"))
+            .acquire("messages.sendText", Some("account-a"), None)
             .await
             .unwrap();
     }
@@ -1431,9 +1523,9 @@ mod tests {
     async fn authenticated_session_can_query_status_and_rejects_replayed_id() {
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
-        let supervisor = test_supervisor();
+        let runtime = test_runtime();
         let (server_stream, client_stream) = duplex(64 * 1024);
-        let server = tokio::spawn(handle_connection(server_stream, secret, supervisor));
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
         let mut client = Framed::new(client_stream, LinesCodec::new());
 
         let challenge: Value =
@@ -1504,9 +1596,9 @@ mod tests {
     async fn a_host_that_leaves_right_after_authenticating_still_ends_cleanly() {
         let secret_bytes = [7_u8; 32];
         let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
-        let supervisor = test_supervisor();
+        let runtime = test_runtime();
         let (server_stream, client_stream) = duplex(64 * 1024);
-        let server = tokio::spawn(handle_connection(server_stream, secret, supervisor));
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
         let mut client = Framed::new(client_stream, LinesCodec::new());
         let challenge: Value =
             serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
@@ -1540,9 +1632,9 @@ mod tests {
     #[tokio::test]
     async fn failed_authentication_returns_generic_error_and_closes() {
         let secret = Arc::new(BootstrapSecret::for_test([7_u8; 32]));
-        let supervisor = test_supervisor();
+        let runtime = test_runtime();
         let (server_stream, client_stream) = duplex(64 * 1024);
-        let server = tokio::spawn(handle_connection(server_stream, secret, supervisor));
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
         let mut client = Framed::new(client_stream, LinesCodec::new());
         let _challenge = client.next().await.unwrap().unwrap();
         client

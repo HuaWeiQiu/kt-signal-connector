@@ -21,8 +21,8 @@ fn fixture() -> PathBuf {
 
 /// All watchdog-test stores are encrypted with one fixed key (Phase 3), so a
 /// seeded store and the supervisor's own open see the same database.
-fn test_store(dir: &std::path::Path) -> Store {
-    Store::open(dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap()
+fn test_store(dir: &std::path::Path) -> Arc<Store> {
+    Arc::new(Store::open(dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap())
 }
 
 fn watchdog_supervisor(temp: &TempDir) -> (Arc<RuntimeSupervisor>, PathBuf) {
@@ -40,7 +40,11 @@ fn watchdog_supervisor_with_throttle(
     config.shutdown_grace = Duration::from_millis(100);
     config.watchdog_interval = Duration::from_millis(50);
     config.watchdog_min_restart_interval = min_restart_interval;
-    let supervisor = Arc::new(RuntimeSupervisor::new(config, store));
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        config,
+        store,
+        kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
+    ));
     supervisor.spawn_watchdog();
     (supervisor, data_dir)
 }
@@ -158,8 +162,12 @@ async fn watchdog_restarts_engine_after_repeated_ping_failures() {
     // Seed one linked account so the watchdog has a ping target.
     {
         let seed = test_store(temp.path());
-        seed.upsert_account_from_signal("+15555550100", Some(1))
-            .unwrap();
+        seed.upsert_account_from_signal(
+            "+15555550100",
+            Some(1),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap();
     }
     let (supervisor, data_dir) = watchdog_supervisor(&temp);
     std::fs::create_dir_all(&data_dir).unwrap();
@@ -176,8 +184,12 @@ async fn watchdog_leaves_a_healthy_engine_alone() {
     let temp = TempDir::new().unwrap();
     {
         let seed = test_store(temp.path());
-        seed.upsert_account_from_signal("+15555550100", Some(1))
-            .unwrap();
+        seed.upsert_account_from_signal(
+            "+15555550100",
+            Some(1),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap();
     }
     let (supervisor, _data_dir) = watchdog_supervisor(&temp);
 
@@ -219,8 +231,12 @@ async fn ping_pending_restart_is_cleared_when_pings_recover() {
     let temp = TempDir::new().unwrap();
     {
         let seed = test_store(temp.path());
-        seed.upsert_account_from_signal("+15555550100", Some(1))
-            .unwrap();
+        seed.upsert_account_from_signal(
+            "+15555550100",
+            Some(1),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap();
     }
     let (supervisor, data_dir) =
         watchdog_supervisor_with_throttle(&temp, Duration::from_millis(1000));

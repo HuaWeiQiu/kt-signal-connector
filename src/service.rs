@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -114,12 +116,12 @@ pub enum HostSideEvent {
 }
 
 pub struct ConnectorService {
-    store: Store,
+    store: Arc<Store>,
     link: Option<ActiveLinkSession>,
 }
 
 impl ConnectorService {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Arc<Store>) -> Self {
         Self { store, link: None }
     }
 
@@ -131,18 +133,42 @@ impl ConnectorService {
         self.link = None;
     }
 
+    /// Sync live signal-cli numbers of ONE group's engine into the store. New
+    /// numbers bind to that group (R3); known numbers keep their immutable
+    /// binding. Returns the accounts visible in this group.
     pub fn sync_accounts_from_numbers(
         &self,
         numbers: &[String],
+        proxy_group: &str,
     ) -> Result<Vec<AccountSummary>, ServiceError> {
         for number in numbers {
-            let _ = self.store.upsert_account_from_signal(number, None)?;
+            let _ = self
+                .store
+                .upsert_account_from_signal(number, None, proxy_group)?;
         }
-        Ok(self.store.list_accounts()?)
+        Ok(self.store.list_accounts_in_group(proxy_group)?)
     }
 
-    pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, ServiceError> {
-        Ok(self.store.list_accounts()?)
+    pub fn list_accounts_in_group(
+        &self,
+        proxy_group: &str,
+    ) -> Result<Vec<AccountSummary>, ServiceError> {
+        Ok(self.store.list_accounts_in_group(proxy_group)?)
+    }
+
+    /// Proxy group an account is bound to, or ACCOUNT_NOT_FOUND. The routing
+    /// key for every account-addressed host method (implementation-plan §4.4).
+    pub fn account_proxy_group(&self, account_id: &str) -> Result<String, ServiceError> {
+        self.store
+            .account_by_id(account_id)?
+            .map(|row| row.proxy_group)
+            .ok_or(ServiceError::Store(StoreError::AccountNotFound))
+    }
+
+    /// Best-effort `accountCount` for one runtime group entry: a store hiccup
+    /// degrades the status field to 0 rather than failing the status report.
+    pub fn count_accounts_in_group_lossy(&self, proxy_group: &str) -> u64 {
+        self.store.count_accounts_in_group(proxy_group).unwrap_or(0)
     }
 
     pub fn account_signal_number(&self, account_id: &str) -> Result<String, ServiceError> {
@@ -258,11 +284,14 @@ impl ConnectorService {
         &mut self,
         link_session_id: &str,
         number: &str,
+        proxy_group: &str,
     ) -> Result<AccountSummary, ServiceError> {
         let _ = self.take_link_session(link_session_id)?;
+        // The binding is fixed here, at link.finish success, and immutable for
+        // the life of the account (ADR 0001 R3).
         Ok(self
             .store
-            .upsert_account_from_signal(number, Some(now_ms()))?)
+            .upsert_account_from_signal(number, Some(now_ms()), proxy_group)?)
     }
 
     pub fn cancel_link(&mut self, link_session_id: &str) -> Result<Value, ServiceError> {
@@ -276,6 +305,23 @@ impl ConnectorService {
         self.link
             .as_ref()
             .is_some_and(|session| !session.is_expired(now_ms()))
+    }
+
+    /// Whether this group's service owns the link session, expired or not:
+    /// routing a finish/cancel to its owning group must preserve the distinct
+    /// LINK_EXPIRED answer an expired session produces at dispatch time.
+    pub fn has_link_session(&self, link_session_id: &str) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|session| session.session_id == link_session_id)
+    }
+
+    /// Signal number of any account bound to this group; the watchdog ping target.
+    pub fn any_signal_account_number_in_group(
+        &self,
+        proxy_group: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self.store.any_signal_account_number_in_group(proxy_group)?)
     }
 
     /// Signal number of any linked account, used as the watchdog ping target.
@@ -668,9 +714,14 @@ impl ConnectorService {
         ))
     }
 
+    /// Persist one normalized receive from ONE group's engine. The owning
+    /// group scopes the single-account fallback: signal-cli may omit
+    /// `account`, and with several engines the fallback must never cross
+    /// group boundaries.
     pub fn ingest_receive(
         &self,
         receive: NormalizedReceive,
+        owner_group: &str,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
         if receive.direction == "skip" {
             return Ok(Vec::new());
@@ -683,11 +734,12 @@ impl ConnectorService {
         let Some(sent_at) = receive.timestamp else {
             return Ok(Vec::new());
         };
-        // signal-cli may omit `account` on single-account jsonRpc; fall back to sole store account.
+        // signal-cli may omit `account` on single-account jsonRpc; fall back to the
+        // sole account bound to the receiving engine's own group.
         let signal_account = match receive.account.as_deref().filter(|s| !s.is_empty()) {
             Some(account) => account.to_string(),
             None => {
-                let accounts = self.store.list_accounts()?;
+                let accounts = self.store.list_accounts_in_group(owner_group)?;
                 if accounts.len() != 1 {
                     return Ok(Vec::new());
                 }
@@ -699,7 +751,7 @@ impl ConnectorService {
         };
         let account = self
             .store
-            .upsert_account_from_signal(&signal_account, None)?;
+            .upsert_account_from_signal(&signal_account, None, owner_group)?;
         let (kind, peer_key, title) = if let Some(group_id) = receive.group_id.as_deref() {
             ("group", group_id.to_string(), "group".to_string())
         } else if let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) {
@@ -897,9 +949,13 @@ pub struct AccountDeleteLocalDataParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LinkStartParams {
     pub device_name: String,
+    /// Optional target proxy group (ADR 0001 R3). Absent means `default`; an
+    /// unknown id fails with PROXY_GROUP_NOT_FOUND at the registry. Groups are
+    /// selected here, never created or reconfigured over IPC (R1).
+    pub proxy_group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1058,7 +1114,7 @@ mod tests {
     fn service() -> (TempDir, ConnectorService) {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
-        (temp, ConnectorService::new(store))
+        (temp, ConnectorService::new(Arc::new(store)))
     }
 
     #[test]
@@ -1070,10 +1126,19 @@ mod tests {
         let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
 
         service.cancel_link(&link_session_id).unwrap();
-        let late = service.complete_link_session(&link_session_id, "+15555550100");
+        let late = service.complete_link_session(
+            &link_session_id,
+            "+15555550100",
+            crate::DEFAULT_PROXY_GROUP_ID,
+        );
 
         assert!(matches!(late, Err(ServiceError::Api(_))));
-        assert!(service.list_accounts().unwrap().is_empty());
+        assert!(
+            service
+                .list_accounts_in_group(crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1093,7 +1158,7 @@ mod tests {
     fn deleting_an_account_does_not_cancel_another_session_link() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let started = service
@@ -1123,24 +1188,27 @@ mod tests {
     fn inbound_long_text_is_projected_and_fetched_on_demand() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let full_text = "界".repeat(4_000);
         let events = service
-            .ingest_receive(NormalizedReceive {
-                timestamp: Some(10),
-                content_kind: "dataMessage",
-                direction: "incoming",
-                account_present: true,
-                account: Some("+15555550100".into()),
-                source: Some("+15555550101".into()),
-                peer_name: Some("Peer".into()),
-                group_id: None,
-                text: Some(full_text.clone()),
-                text_bytes: None,
-                text_truncated: false,
-            })
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(10),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: Some("Peer".into()),
+                    group_id: None,
+                    text: Some(full_text.clone()),
+                    text_bytes: None,
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let projected = events
             .iter()
@@ -1160,7 +1228,10 @@ mod tests {
         assert_eq!(fetched.text_bytes, 12_000);
 
         let other_account = service
-            .sync_accounts_from_numbers(&["+15555550100".into(), "+15555550102".into()])
+            .sync_accounts_from_numbers(
+                &["+15555550100".into(), "+15555550102".into()],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .into_iter()
             .find(|candidate| candidate.id != account.id)
@@ -1179,23 +1250,26 @@ mod tests {
     fn inbound_text_above_receive_ceiling_keeps_only_an_explicit_preview() {
         let (_temp, service) = service();
         service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let oversized = "a".repeat(MAX_INBOUND_TEXT_BYTES + 1);
         let events = service
-            .ingest_receive(NormalizedReceive {
-                timestamp: Some(11),
-                content_kind: "dataMessage",
-                direction: "incoming",
-                account_present: true,
-                account: Some("+15555550100".into()),
-                source: Some("+15555550101".into()),
-                peer_name: None,
-                group_id: None,
-                text: Some(oversized),
-                text_bytes: None,
-                text_truncated: false,
-            })
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(11),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some(oversized),
+                    text_bytes: None,
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let projected = events
             .iter()
@@ -1228,7 +1302,7 @@ mod tests {
     fn outgoing_sync_reconciles_by_signal_timestamp_and_client_request_id() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = service
@@ -1261,7 +1335,9 @@ mod tests {
             text_bytes: Some(25),
             text_truncated: false,
         };
-        service.ingest_receive(sync_receive.clone()).unwrap();
+        service
+            .ingest_receive(sync_receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
         assert_eq!(
             service
                 .list_messages(&account.id, &conversation.id, 10, None)
@@ -1285,7 +1361,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, pending_id);
 
-        assert!(service.ingest_receive(sync_receive).unwrap().is_empty());
+        assert!(
+            service
+                .ingest_receive(sync_receive, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             service
                 .list_messages(&account.id, &conversation.id, 10, None)
@@ -1304,7 +1385,7 @@ mod tests {
     fn missing_pending_row_at_send_completion_is_final_not_retryable() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = service
@@ -1346,7 +1427,7 @@ mod tests {
     fn signal_identity_keeps_group_senders_distinct_and_dedupes_replay() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let receive = |source: &str, text: &str| NormalizedReceive {
@@ -1364,14 +1445,24 @@ mod tests {
         };
 
         let first = receive("peer-a", "first");
-        assert!(!service.ingest_receive(first.clone()).unwrap().is_empty());
         assert!(
             !service
-                .ingest_receive(receive("peer-b", "second"))
+                .ingest_receive(first.clone(), crate::DEFAULT_PROXY_GROUP_ID)
                 .unwrap()
                 .is_empty()
         );
-        assert!(service.ingest_receive(first).unwrap().is_empty());
+        assert!(
+            !service
+                .ingest_receive(receive("peer-b", "second"), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .ingest_receive(first, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
 
         let conversation = service
             .list_conversations(&account.id, 10, None)
@@ -1405,15 +1496,25 @@ mod tests {
             text_truncated: false,
         };
 
-        assert!(service.ingest_receive(receive).unwrap().is_empty());
-        assert!(service.list_accounts().unwrap().is_empty());
+        assert!(
+            service
+                .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .list_accounts_in_group(crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn send_by_peer_creates_conversation_once_and_reuses_it() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
 
@@ -1506,7 +1607,7 @@ mod tests {
     fn send_by_peer_validates_target_and_falls_back_to_masked_title() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
 
@@ -1619,23 +1720,26 @@ mod tests {
     fn quote_of_incoming_direct_message_becomes_upstream_quote_params() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let events = service
-            .ingest_receive(NormalizedReceive {
-                timestamp: Some(777),
-                content_kind: "dataMessage",
-                direction: "incoming",
-                account_present: true,
-                account: Some("+15555550100".into()),
-                source: Some("+15555550101".into()),
-                peer_name: None,
-                group_id: None,
-                text: Some("quoted text".into()),
-                text_bytes: Some(11),
-                text_truncated: false,
-            })
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(777),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("quoted text".into()),
+                    text_bytes: Some(11),
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let quoted = events
             .iter()
@@ -1679,7 +1783,7 @@ mod tests {
     fn quote_of_own_sent_message_uses_account_number_and_upstream_timestamp() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = service
@@ -1729,7 +1833,7 @@ mod tests {
     fn unresolvable_quotes_are_rejected_before_any_pending_row_exists() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = service
@@ -1795,19 +1899,22 @@ mod tests {
         // A group incoming message's author address is not persisted (only a
         // local sender hash), so the quote cannot be constructed upstream.
         let group_events = service
-            .ingest_receive(NormalizedReceive {
-                timestamp: Some(900),
-                content_kind: "dataMessage",
-                direction: "incoming",
-                account_present: true,
-                account: Some("+15555550100".into()),
-                source: Some("+15555550105".into()),
-                peer_name: None,
-                group_id: Some("group-one".into()),
-                text: Some("group text".into()),
-                text_bytes: Some(10),
-                text_truncated: false,
-            })
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(900),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550105".into()),
+                    peer_name: None,
+                    group_id: Some("group-one".into()),
+                    text: Some("group text".into()),
+                    text_bytes: Some(10),
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let group_message = group_events
             .iter()
@@ -1847,7 +1954,7 @@ mod tests {
     fn status_changed_events_fire_once_per_real_transition() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()])
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = service

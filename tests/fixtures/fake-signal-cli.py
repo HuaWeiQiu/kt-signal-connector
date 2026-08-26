@@ -11,7 +11,10 @@ import time
 
 expected_java_opts = os.environ.get("KT_FAKE_EXPECT_JAVA_OPTS")
 if expected_java_opts is not None:
-    if os.environ.get("JAVA_OPTS") != expected_java_opts:
+    # Phase 4: group engines carry their SOCKS proxy as extra `-D` properties
+    # appended to the documented heap budget, so the expectation is a prefix
+    # match; the memory flags themselves must still lead the value.
+    if not os.environ.get("JAVA_OPTS", "").startswith(expected_java_opts):
         sys.exit(91)
     if any(os.environ.get(name) for name in ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS")):
         sys.exit(92)
@@ -41,6 +44,15 @@ def argument_value(name):
 
 SIGNAL_DATA_DIR = Path(argument_value("--data-dir") or "/tmp/kt-signal-fixture")
 SIGNAL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Phase 4: every group engine shares the connector's environment, so group
+# identity can only come from the data directory each engine is launched with.
+# A non-default group answers with a distinct number, otherwise two engines
+# would both report (and the store would UNIQUE-collide on) +15555550100.
+LINKED_ACCOUNT = (
+    "+15555550101"
+    if str(SIGNAL_DATA_DIR).endswith(str(Path("proxy-groups") / "team-a"))
+    else "+15555550100"
+)
 DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
 STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
 FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"

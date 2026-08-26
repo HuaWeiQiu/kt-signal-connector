@@ -2,6 +2,7 @@
 
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
@@ -11,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   state TEXT NOT NULL,
   linked_at INTEGER,
   last_message_at INTEGER,
-  unread_count INTEGER NOT NULL DEFAULT 0
+  unread_count INTEGER NOT NULL DEFAULT 0,
+  proxy_group TEXT NOT NULL DEFAULT 'default'
 );
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
@@ -256,6 +258,10 @@ pub struct AccountSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<u64>,
     pub unread_count: u32,
+    /// Proxy group the account is bound to (ADR 0001 R3). Always present on
+    /// the wire; accounts linked before Phase 4 read as `default`. The binding
+    /// is fixed when link.finish succeeds and never changes afterwards.
+    pub proxy_group: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -330,6 +336,7 @@ pub struct Page<T: Serialize> {
 pub struct AccountRow {
     pub id: String,
     pub signal_account: String,
+    pub proxy_group: String,
 }
 
 #[derive(Clone, Debug)]
@@ -358,7 +365,7 @@ pub enum AccountDeletePlan {
 
 pub struct Store {
     path: PathBuf,
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl Store {
@@ -392,11 +399,30 @@ impl Store {
         conn.execute_batch(SCHEMA_DDL)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         migrate_schema(&conn)?;
-        Ok(Self { path, conn })
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The store is one `Arc` shared by every proxy-group runtime, so all
+    /// access takes a short-lived lock on the single connection (rusqlite
+    /// connections are not `Sync`). A poisoned lock means a panic mid-statement:
+    /// report it with the same unavailable classification as any other
+    /// storage failure.
+    fn lock_conn(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        self.conn.lock().map_err(|_| StoreError::Unavailable(None))
+    }
+
+    /// Direct connection access for tests that install fault-injection
+    /// triggers or assert on raw rows.
+    #[cfg(test)]
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
     }
 
     /// Phase 3 retention: the plaintext migration backup is kept for
@@ -431,9 +457,13 @@ impl Store {
         &self,
         signal_account: &str,
         linked_at: Option<u64>,
+        proxy_group: &str,
     ) -> Result<AccountSummary, StoreError> {
         if let Some(existing) = self.account_by_signal(signal_account)? {
-            self.conn
+            // The proxy-group binding is fixed at link time and immutable for
+            // the life of the link (ADR 0001 R3): a re-sync of a known number
+            // never moves it between groups.
+            self.lock_conn()?
                 .execute(
                     "UPDATE accounts SET state='ready', linked_at=COALESCE(linked_at, ?2)
                      WHERE id=?1",
@@ -446,11 +476,17 @@ impl Store {
         }
         let id = random_id();
         let masked = mask_address(signal_account);
-        self.conn
+        self.lock_conn()?
             .execute(
-                "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count)
-                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0)",
-                params![id, signal_account, masked, linked_at.map(|v| v as i64)],
+                "INSERT INTO accounts(id, signal_account, masked_address, display_name, state, linked_at, unread_count, proxy_group)
+                 VALUES(?1, ?2, ?3, NULL, 'ready', ?4, 0, ?5)",
+                params![
+                    id,
+                    signal_account,
+                    masked,
+                    linked_at.map(|v| v as i64),
+                    proxy_group
+                ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         self.account_summary(&id)?
@@ -466,7 +502,7 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        self.conn
+        self.lock_conn()?
             .execute(
                 "UPDATE accounts SET display_name=?2 WHERE id=?1",
                 params![account_id, name],
@@ -477,10 +513,10 @@ impl Store {
     }
 
     pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group
                  FROM accounts ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -494,6 +530,7 @@ impl Store {
                     linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                     last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                     unread_count: row.get::<_, i64>(6)? as u32,
+                    proxy_group: row.get(7)?,
                 })
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -501,15 +538,62 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
-    pub fn account_by_id(&self, account_id: &str) -> Result<Option<AccountRow>, StoreError> {
-        self.conn
+    /// Accounts bound to one proxy group, in the same order as
+    /// [`Store::list_accounts`]. The per-group fallback view used when that
+    /// group's engine cannot answer.
+    pub fn list_accounts_in_group(
+        &self,
+        proxy_group: &str,
+    ) -> Result<Vec<AccountSummary>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group
+                 FROM accounts WHERE proxy_group=?1
+                 ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![proxy_group], |row| {
+                Ok(AccountSummary {
+                    id: row.get(0)?,
+                    masked_address: row.get(1)?,
+                    display_name: row.get(2)?,
+                    state: static_state(row.get::<_, String>(3)?),
+                    linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    unread_count: row.get::<_, i64>(6)? as u32,
+                    proxy_group: row.get(7)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Number of accounts bound to a proxy group; the `accountCount` field of
+    /// the runtime `proxyGroups[]` entries (implementation-plan §4.4).
+    pub fn count_accounts_in_group(&self, proxy_group: &str) -> Result<u64, StoreError> {
+        self.lock_conn()?
             .query_row(
-                "SELECT id, signal_account FROM accounts WHERE id=?1",
+                "SELECT COUNT(*) FROM accounts WHERE proxy_group=?1",
+                params![proxy_group],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    pub fn account_by_id(&self, account_id: &str) -> Result<Option<AccountRow>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT id, signal_account, proxy_group FROM accounts WHERE id=?1",
                 params![account_id],
                 |row| {
                     Ok(AccountRow {
                         id: row.get(0)?,
                         signal_account: row.get(1)?,
+                        proxy_group: row.get(2)?,
                     })
                 },
             )
@@ -521,14 +605,15 @@ impl Store {
         &self,
         signal_account: &str,
     ) -> Result<Option<AccountRow>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
-                "SELECT id, signal_account FROM accounts WHERE signal_account=?1",
+                "SELECT id, signal_account, proxy_group FROM accounts WHERE signal_account=?1",
                 params![signal_account],
                 |row| {
                     Ok(AccountRow {
                         id: row.get(0)?,
                         signal_account: row.get(1)?,
+                        proxy_group: row.get(2)?,
                     })
                 },
             )
@@ -538,7 +623,7 @@ impl Store {
 
     /// Signal number of any linked account, used as a read-only liveness probe target.
     pub fn any_signal_account_number(&self) -> Result<Option<String>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row("SELECT signal_account FROM accounts LIMIT 1", [], |row| {
                 row.get(0)
             })
@@ -546,10 +631,26 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
-    pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
-        self.conn
+    /// Group-scoped watchdog ping target: only an account of this group's own
+    /// engine can serve as its liveness probe.
+    pub fn any_signal_account_number_in_group(
+        &self,
+        proxy_group: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.lock_conn()?
             .query_row(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count
+                "SELECT signal_account FROM accounts WHERE proxy_group=?1 LIMIT 1",
+                params![proxy_group],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group
                  FROM accounts WHERE id=?1",
                 params![account_id],
                 |row| {
@@ -561,6 +662,7 @@ impl Store {
                         linked_at: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
+                        proxy_group: row.get(7)?,
                     })
                 },
             )
@@ -569,13 +671,13 @@ impl Store {
     }
 
     pub fn prepare_account_delete(
-        &mut self,
+        &self,
         account_id: &str,
         operation_id: &str,
         now_ms: u64,
     ) -> Result<AccountDeletePlan, StoreError> {
-        let transaction = self
-            .conn
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
             .transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let existing = transaction
@@ -656,7 +758,7 @@ impl Store {
         now_ms: u64,
     ) -> Result<(), StoreError> {
         let changed = self
-            .conn
+            .lock_conn()?
             .execute(
                 "UPDATE account_delete_operations
                  SET state='unknown', updated_at=?2
@@ -672,13 +774,13 @@ impl Store {
 
     /// Remove account and dependent rows from the connector store (local exit).
     pub fn complete_account_delete(
-        &mut self,
+        &self,
         account_id: &str,
         operation_id: Option<&str>,
         now_ms: u64,
     ) -> Result<bool, StoreError> {
-        let transaction = self
-            .conn
+        let mut conn = self.lock_conn()?;
+        let transaction = conn
             .transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let exists = transaction
@@ -739,7 +841,7 @@ impl Store {
         Ok(exists)
     }
 
-    pub fn delete_account_cascade(&mut self, account_id: &str) -> Result<bool, StoreError> {
+    pub fn delete_account_cascade(&self, account_id: &str) -> Result<bool, StoreError> {
         self.complete_account_delete(account_id, None, 0)
     }
 
@@ -760,7 +862,7 @@ impl Store {
             return Ok(existing);
         }
         let id = stable_hash_id(&[account_id, kind, peer_key]);
-        self.conn
+        self.lock_conn()?
             .execute(
                 "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
                  VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0)",
@@ -776,7 +878,7 @@ impl Store {
     }
 
     pub fn conversation_title(&self, conversation_id: &str) -> Result<Option<String>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT title FROM conversations WHERE id=?1",
                 params![conversation_id],
@@ -795,7 +897,7 @@ impl Store {
         if trimmed.is_empty() {
             return Ok(());
         }
-        self.conn
+        self.lock_conn()?
             .execute(
                 "UPDATE conversations SET title=?2 WHERE id=?1",
                 params![conversation_id, trimmed],
@@ -827,7 +929,7 @@ impl Store {
         account_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationRow>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, kind, peer_key FROM conversations
                  WHERE id=?1 AND account_id=?2",
@@ -851,7 +953,7 @@ impl Store {
         kind: &str,
         peer_key: &str,
     ) -> Result<Option<ConversationRow>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, kind, peer_key FROM conversations
                  WHERE account_id=?1 AND kind=?2 AND peer_key=?3",
@@ -874,8 +976,8 @@ impl Store {
         &self,
         account_id: &str,
     ) -> Result<Vec<(String /* peer_key */, String /* title */)>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT peer_key, title FROM conversations
                  WHERE account_id=?1 AND kind='direct'",
@@ -911,8 +1013,8 @@ impl Store {
         let cursor_null = i64::from(decoded.as_ref().is_some_and(|value| value.0));
         let cursor_sent_at = decoded.as_ref().and_then(|value| value.1);
         let cursor_id = decoded.as_ref().map(|value| value.2.as_str());
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, muted, pinned
@@ -991,7 +1093,7 @@ impl Store {
             // Cursors handed out before this format, still held by a live host.
             Some(message_id) => {
                 let sent_at: Option<i64> = self
-                    .conn
+                    .lock_conn()?
                     .query_row(
                         "SELECT sent_at FROM messages
                           WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
@@ -1009,8 +1111,8 @@ impl Store {
         };
         let before_sent_at = anchor.as_ref().map(|value| value.0);
         let before_id = anchor.as_ref().map(|value| value.1.as_str());
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id
@@ -1052,7 +1154,7 @@ impl Store {
         account_id: &str,
         client_request_id: &str,
     ) -> Result<Option<MessageRecord>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id
@@ -1070,7 +1172,7 @@ impl Store {
         conversation_id: &str,
         message_id: &str,
     ) -> Result<Option<MessageRecord>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id
@@ -1091,8 +1193,8 @@ impl Store {
         sender_id: &str,
         legacy_sender_id: &str,
     ) -> Result<Option<MessageRecord>, StoreError> {
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id
@@ -1132,8 +1234,8 @@ impl Store {
         preview: Option<&str>,
         increment_unread: bool,
     ) -> Result<bool, StoreError> {
-        let transaction = self
-            .conn
+        let conn = self.lock_conn()?;
+        let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let inserted = transaction
@@ -1215,8 +1317,8 @@ impl Store {
         account_id: &str,
         conversation_id: &str,
     ) -> Result<u32, StoreError> {
-        let transaction = self
-            .conn
+        let conn = self.lock_conn()?;
+        let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let prev: i64 = transaction
@@ -1274,7 +1376,7 @@ impl Store {
         sent_at: Option<u64>,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
         let changed = self
-            .conn
+            .lock_conn()?
             .execute(
                 "UPDATE messages SET status=?2, sent_at=COALESCE(?3, sent_at)
                  WHERE id=?1 AND status<>?2",
@@ -1282,7 +1384,7 @@ impl Store {
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let record = self
-            .conn
+            .lock_conn()?
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id
@@ -1305,8 +1407,8 @@ impl Store {
         conversation_id: &str,
         sent_at: u64,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
-        let transaction = self
-            .conn
+        let conn = self.lock_conn()?;
+        let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let previous_status: Option<String> = transaction
@@ -1377,6 +1479,9 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The connection guard must be released before any other store method
+        // runs: every one of them takes the same mutex.
+        drop(conn);
         Ok(self
             .message_by_id(account_id, conversation_id, message_id)?
             .map(|record| (record, status_transitioned)))
@@ -1386,7 +1491,7 @@ impl Store {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationSummary>, StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, muted, pinned
@@ -1422,8 +1527,8 @@ impl Store {
         entries: &[SyncedContact<'_>],
         synced_at: u64,
     ) -> Result<(), StoreError> {
-        let transaction = self
-            .conn
+        let conn = self.lock_conn()?;
+        let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         {
@@ -1479,7 +1584,7 @@ impl Store {
         synced_at: u64,
     ) -> Result<(), StoreError> {
         let id = stable_hash_id(&[account_id, kind, peer_key]);
-        self.conn
+        self.lock_conn()?
             .execute(
                 "INSERT INTO contacts(id, account_id, kind, peer_key, title, extra, synced_at)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1519,8 +1624,8 @@ impl Store {
         let cursor_kind = decoded.as_ref().map(|value| value.0.as_str());
         let cursor_peer_key = decoded.as_ref().map(|value| value.1.as_str());
         let like = query.map(escape_like);
-        let mut stmt = self
-            .conn
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
             .prepare(
                 "SELECT id, kind, peer_key, title
                  FROM contacts
@@ -1575,7 +1680,7 @@ impl Store {
 
     /// (contact_count, group_count) currently cached for the account.
     pub fn count_contacts(&self, account_id: &str) -> Result<(u64, u64), StoreError> {
-        self.conn
+        self.lock_conn()?
             .query_row(
                 "SELECT
                    COALESCE(SUM(CASE WHEN kind='contact' THEN 1 ELSE 0 END), 0),
@@ -1590,7 +1695,7 @@ impl Store {
     /// unix ms of the last successful contacts sync (meta-backed; survives restarts).
     pub fn contacts_synced_at(&self, account_id: &str) -> Result<Option<u64>, StoreError> {
         let value = self
-            .conn
+            .lock_conn()?
             .query_row(
                 "SELECT value FROM meta WHERE key=?1",
                 params![format!("contacts_synced_at:{account_id}")],
@@ -1606,7 +1711,7 @@ impl Store {
         account_id: &str,
         synced_at: u64,
     ) -> Result<(), StoreError> {
-        self.conn
+        self.lock_conn()?
             .execute(
                 "INSERT INTO meta(key, value) VALUES(?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1639,8 +1744,8 @@ impl Store {
         let now = now_ms as i64;
         let expired_before = now.saturating_sub(MESSAGE_RETENTION_MS);
         let keep_after = now.saturating_sub(RETENTION_SAFETY_WINDOW_MS);
-        let transaction = self
-            .conn
+        let conn = self.lock_conn()?;
+        let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut touched_conversations = std::collections::BTreeSet::new();
@@ -2104,6 +2209,17 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         conn.execute("ALTER TABLE messages ADD COLUMN stored_at INTEGER", [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 7 && !table_has_column(conn, "accounts", "proxy_group")? {
+        // Phase 4 (ADR 0001 R4): every pre-Phase-4 account belongs to the
+        // reserved `default` group, so the additive column defaults to it and
+        // no backfill pass is needed. The column carries a NOT NULL default so
+        // rows written by older binaries (rollback scenario) still read.
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN proxy_group TEXT NOT NULL DEFAULT 'default'",
+            [],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2213,6 +2329,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DEFAULT_PROXY_GROUP_ID;
     use tempfile::TempDir;
 
     /// Every unit-test store is encrypted: the fixture key exercises the same
@@ -2245,7 +2362,7 @@ mod tests {
         }
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -2294,7 +2411,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -2374,13 +2491,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
         store
-            .conn
+            .conn()
             .execute_batch(
                 "CREATE TRIGGER fail_conversation_summary
                  BEFORE UPDATE ON conversations
@@ -2438,7 +2555,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -2464,7 +2581,7 @@ mod tests {
             .insert_message(&message, None, Some("hello"), true)
             .unwrap();
         store
-            .conn
+            .conn()
             .execute_batch(
                 "CREATE TRIGGER fail_account_unread
                  BEFORE UPDATE ON accounts
@@ -2499,7 +2616,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -2538,7 +2655,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let older = store
             .ensure_conversation(&account.id, "direct", "older", "Older")
@@ -2608,7 +2725,7 @@ mod tests {
             Err(StoreError::InvalidCursor),
         ));
         let other_account = store
-            .upsert_account_from_signal("+15555550101", Some(1))
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let (cursor_conversation, remaining_same_time) = if newer.id > same_time.id {
             (&newer, &same_time)
@@ -2652,7 +2769,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "peer", "Peer")
@@ -2681,7 +2798,7 @@ mod tests {
             .insert_message(&other_message, None, Some("other-message"), false)
             .unwrap();
         let other_account = store
-            .upsert_account_from_signal("+15555550101", Some(1))
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
 
         assert!(matches!(
@@ -2730,9 +2847,9 @@ mod tests {
     #[test]
     fn account_delete_is_atomic_cascading_and_idempotent() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -2765,9 +2882,9 @@ mod tests {
     #[test]
     fn account_delete_operation_survives_unknown_and_completes_atomically() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
 
         assert_eq!(
@@ -2808,12 +2925,12 @@ mod tests {
     #[test]
     fn account_delete_operation_cannot_change_target_or_compete() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let other = store
-            .upsert_account_from_signal("+15555550101", Some(2))
+            .upsert_account_from_signal("+15555550101", Some(2), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         store
             .prepare_account_delete(&account.id, "delete-op-1", 10)
@@ -2832,7 +2949,7 @@ mod tests {
     #[test]
     fn completed_account_delete_operations_are_bounded() {
         let temp = TempDir::new().unwrap();
-        let mut store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
 
         for index in 0..300 {
             assert_eq!(
@@ -2848,7 +2965,7 @@ mod tests {
         }
 
         let count: i64 = store
-            .conn
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM account_delete_operations WHERE state='completed'",
                 [],
@@ -2884,10 +3001,10 @@ mod tests {
         drop(conn);
 
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
-        assert!(table_has_column(&store.conn, "messages", "body_bytes").unwrap());
-        assert!(table_has_column(&store.conn, "messages", "body_truncated").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "body_bytes").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "body_truncated").unwrap());
         let version: i64 = store
-            .conn
+            .conn()
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
                 [],
@@ -2902,7 +3019,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         store
-            .conn
+            .conn()
             .execute("UPDATE meta SET value='999' WHERE key='schema_version'", [])
             .unwrap();
         drop(store);
@@ -2913,10 +3030,94 @@ mod tests {
         ));
     }
 
+    /// Phase 4 (ADR 0001 R4): a pre-Phase-4 database (accounts without the
+    /// proxy_group column) migrates in place; existing rows read as `default`
+    /// and no data migration pass is needed.
+    #[test]
+    fn schema_v7_upgrade_adds_proxy_group_reading_old_rows_as_default() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '6');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO accounts(id, signal_account, masked_address, state, linked_at)
+               VALUES('legacy-1', '+15555550100', '8fc***e2', 'ready', 1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "accounts", "proxy_group").unwrap());
+        let summary = store.account_summary("legacy-1").unwrap().unwrap();
+        assert_eq!(summary.proxy_group, "default");
+
+        // A fresh account binds to its configured group.
+        let grouped = store
+            .upsert_account_from_signal("+15555550101", Some(1), "team-a")
+            .unwrap();
+        assert_eq!(grouped.proxy_group, "team-a");
+        assert_eq!(store.count_accounts_in_group("team-a").unwrap(), 1);
+        assert_eq!(
+            store
+                .any_signal_account_number_in_group("team-a")
+                .unwrap()
+                .as_deref(),
+            Some("+15555550101")
+        );
+
+        // Re-syncing a known number never moves it between groups (R3).
+        let resynced = store
+            .upsert_account_from_signal("+15555550101", None, DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(resynced.id, grouped.id);
+        assert_eq!(resynced.proxy_group, "team-a");
+    }
+
+    /// Group-scoped views partition the account list exactly by binding;
+    /// unknown groups report zero without error.
+    #[test]
+    fn group_scoped_account_views_partition_by_binding() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        store
+            .upsert_account_from_signal("+15555550100", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_account_from_signal("+15555550101", Some(1), "team-a")
+            .unwrap();
+
+        assert_eq!(store.list_accounts().unwrap().len(), 2);
+        let default_accounts = store
+            .list_accounts_in_group(DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(default_accounts.len(), 1);
+        assert_eq!(default_accounts[0].proxy_group, "default");
+        let team_a = store.list_accounts_in_group("team-a").unwrap();
+        assert_eq!(team_a.len(), 1);
+        // Newer linked_at first, mirroring the global order rule.
+        assert_eq!(default_accounts[0].linked_at, Some(2));
+        assert_eq!(store.count_accounts_in_group("missing").unwrap(), 0);
+        assert_eq!(
+            store.any_signal_account_number_in_group("missing").unwrap(),
+            None
+        );
+    }
+
     fn open_store_with_contacts(temp: &TempDir) -> (Store, AccountSummary) {
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         store
             .upsert_contact(&account.id, "contact", "+15555550101", "Alice", None, 10)
@@ -3005,7 +3206,7 @@ mod tests {
     #[test]
     fn contacts_are_deleted_with_the_account() {
         let temp = TempDir::new().unwrap();
-        let (mut store, account) = open_store_with_contacts(&temp);
+        let (store, account) = open_store_with_contacts(&temp);
         store.set_contacts_synced_at(&account.id, 10).unwrap();
         assert!(store.delete_account_cascade(&account.id).unwrap());
         assert_eq!(store.count_contacts(&account.id).unwrap(), (0, 0));
@@ -3028,7 +3229,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let observer = keyed_observer(&store);
         observer
@@ -3105,7 +3306,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let keys: Vec<String> = (0..5_000)
             .map(|index| format!("+1555556{index:04}"))
@@ -3139,7 +3340,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         store
-            .conn
+            .conn()
             .execute_batch(
                 "DROP TABLE contacts;
                  UPDATE meta SET value='4' WHERE key='schema_version';",
@@ -3149,7 +3350,7 @@ mod tests {
 
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let count: i64 = store
-            .conn
+            .conn()
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='contacts'",
                 [],
@@ -3158,7 +3359,7 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         let version: i64 = store
-            .conn
+            .conn()
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
                 [],
@@ -3203,7 +3404,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -3260,7 +3461,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -3289,7 +3490,7 @@ mod tests {
             .insert_message(&message, None, Some("body"), true)
             .unwrap();
         store
-            .conn
+            .conn()
             .execute_batch(
                 "ALTER TABLE messages DROP COLUMN stored_at;
                  UPDATE meta SET value='5' WHERE key='schema_version';",
@@ -3303,7 +3504,7 @@ mod tests {
         // startup handshake. Retention instead dates such a row by the time we
         // received it, so pre-upgrade history is not read as instantly expired.
         let stored_at: Option<i64> = store
-            .conn
+            .conn()
             .query_row(
                 "SELECT stored_at FROM messages WHERE id='before-upgrade'",
                 [],
@@ -3317,7 +3518,7 @@ mod tests {
         );
         assert_eq!(stored_message_ids(&store, &conversation.id).len(), 1);
         let version: i64 = store
-            .conn
+            .conn()
             .query_row(
                 "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
                 [],
@@ -3335,7 +3536,7 @@ mod tests {
         ages_ms: &[u64],
     ) -> (AccountSummary, ConversationRow, Vec<String>) {
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -3375,7 +3576,7 @@ mod tests {
     /// the real clock, which no test can wait out.
     fn backdate(store: &Store, message_id: &str, stored_at: u64) {
         let updated = store
-            .conn
+            .conn()
             .execute(
                 "UPDATE messages SET stored_at=?2 WHERE id=?1",
                 params![message_id, stored_at as i64],
@@ -3385,8 +3586,8 @@ mod tests {
     }
 
     fn stored_message_ids(store: &Store, conversation_id: &str) -> Vec<String> {
-        let mut stmt = store
-            .conn
+        let conn = store.conn();
+        let mut stmt = conn
             .prepare("SELECT id FROM messages WHERE conversation_id=?1 ORDER BY id")
             .unwrap();
         stmt.query_map(params![conversation_id], |row| row.get::<_, String>(0))
@@ -3476,7 +3677,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -3593,7 +3794,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -3652,7 +3853,7 @@ mod tests {
         let now = 40 * 365 * 24 * 60 * 60 * 1_000;
         let day = 24 * 60 * 60 * 1_000;
         let account = store
-            .upsert_account_from_signal("+15555550100", Some(1))
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         let conversation = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
@@ -3828,9 +4029,9 @@ mod tests {
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
 
         assert_eq!(db_file_state(&db_path).unwrap(), DbFileState::Encrypted);
-        assert_eq!(table_counts(&store.conn), before);
+        assert_eq!(table_counts(&store.conn()), before);
         let probe_after: String = store
-            .conn
+            .conn()
             .query_row("SELECT body FROM messages WHERE id='m1'", [], |row| {
                 row.get(0)
             })
@@ -3846,7 +4047,7 @@ mod tests {
         // The migrated store is durable: a fresh keyed open sees every row.
         drop(store);
         let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
-        assert_eq!(table_counts(&reopened.conn), before);
+        assert_eq!(table_counts(&reopened.conn()), before);
     }
 
     #[test]
@@ -3882,7 +4083,7 @@ mod tests {
         {
             let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
             store
-                .upsert_account_from_signal("+15555550100", Some(1))
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
                 .unwrap();
         }
         assert!(matches!(
@@ -3897,7 +4098,7 @@ mod tests {
         {
             let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
             store
-                .upsert_account_from_signal("+15555550100", Some(1))
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
                 .unwrap();
         }
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
@@ -3910,7 +4111,7 @@ mod tests {
         {
             let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
             store
-                .upsert_account_from_signal("+15555550100", Some(1))
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
                 .unwrap();
         }
         let wrong = StoreKey::from_bytes([0x11; STORE_KEY_BYTES]);

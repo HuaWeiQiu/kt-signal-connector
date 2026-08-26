@@ -7,6 +7,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use kt_signal_connector::auth::{load_bootstrap_payload, load_bootstrap_payload_from_reader};
 use kt_signal_connector::engine::{SignalCliMode, SocksProxy};
+use kt_signal_connector::groups;
 use kt_signal_connector::host::serve;
 use kt_signal_connector::ipc::LocalListener;
 #[cfg(windows)]
@@ -18,9 +19,9 @@ use kt_signal_connector::manifest::{
 };
 #[cfg(windows)]
 use kt_signal_connector::parent::wait_for_parent_exit;
+use kt_signal_connector::registry::open_group_runtime;
 use kt_signal_connector::resource::{measure_child_idle, write_report};
 use kt_signal_connector::store::store_key_from_env;
-use kt_signal_connector::supervisor::open_supervisor;
 
 #[derive(Debug, Parser)]
 #[command(name = "kt-signal-connector", version, about)]
@@ -73,6 +74,11 @@ enum CliCommand {
         /// passes it to the child as `-D` argv properties.
         #[arg(long, env = "KT_SIGNAL_SOCKS_PROXY", value_name = "HOST:PORT")]
         socks_proxy: Option<SocksProxy>,
+        /// Additional proxy group as ID=HOST:PORT; may be repeated (env:
+        /// KT_SIGNAL_PROXY_GROUPS adds comma-separated entries). The implicit
+        /// `default` group keeps this legacy SOCKS proxy and data directory.
+        #[arg(long = "proxy-group", value_name = "ID=HOST:PORT")]
+        proxy_group: Vec<String>,
         #[arg(long)]
         signal_data_dir: PathBuf,
         #[arg(long)]
@@ -197,6 +203,7 @@ struct ServeOptions {
     signal_cli_native: bool,
     java_home: Option<PathBuf>,
     socks_proxy: Option<SocksProxy>,
+    proxy_group: Vec<String>,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -230,6 +237,7 @@ async fn main() {
             signal_cli_native,
             java_home,
             socks_proxy,
+            proxy_group,
             signal_data_dir,
             state_dir,
         } => serve_command(ServeOptions {
@@ -241,6 +249,7 @@ async fn main() {
             signal_cli_native,
             java_home,
             socks_proxy,
+            proxy_group,
             signal_data_dir,
             state_dir,
         })
@@ -266,6 +275,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         signal_cli_native,
         java_home,
         socks_proxy,
+        proxy_group,
         signal_data_dir,
         state_dir,
     } = options;
@@ -275,6 +285,18 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     if cfg!(windows) && parent_pid.is_none() {
         return Err("Windows requires the parent process monitor".into());
     }
+    // Proxy-group configuration is validated before anything else touches
+    // the filesystem or the bootstrap payload: a malformed spec must fail the
+    // launch without leaking any endpoint into diagnostics (ADR 0001 R10).
+    // Flag entries come first in launcher order, then environment entries;
+    // duplicates across the two sources are rejected rather than merged.
+    let env_spec = std::env::var("KT_SIGNAL_PROXY_GROUPS").ok();
+    let plan = groups::build_group_plan(
+        &proxy_group,
+        env_spec.as_deref(),
+        socks_proxy,
+        &signal_data_dir,
+    )?;
     let payload = if bootstrap_secret_stdin {
         load_bootstrap_payload_from_reader(std::io::stdin().lock())?
     } else {
@@ -310,26 +332,25 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     } else {
         SignalCliMode::Jvm
     };
-    let supervisor = open_supervisor(
+    let runtime = open_group_runtime(
+        plan,
         signal_cli,
-        signal_data_dir,
-        state_dir,
+        &state_dir,
         java_home,
-        socks_proxy,
         store_key,
         signal_cli_mode,
     )?;
     #[cfg(windows)]
     {
         let parent_pid = parent_pid.expect("validated Windows parent PID");
-        let parent_supervisor = supervisor.clone();
+        let parent_runtime = runtime.clone();
         tokio::spawn(async move {
             let _ = wait_for_parent_exit(parent_pid).await;
-            let _ = parent_supervisor.shutdown().await;
+            let _ = parent_runtime.shutdown().await;
             std::process::exit(0);
         });
     }
-    serve(listener, payload.secret, supervisor).await?;
+    serve(listener, payload.secret, runtime).await?;
     Ok(())
 }
 
