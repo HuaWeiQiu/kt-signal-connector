@@ -38,13 +38,16 @@ Per local KT profile the fixed process count is:
 
 ```text
 1 x kt-signal-connector
-1 x signal-cli JVM
+G x signal-cli engines (JVM or native), one per proxy group (G >= 1, hard ceiling 8)
 N x Signal accounts
 M x conversations
 ```
 
-Accounts and conversations do not create processes. One ordinary text conversation is expected to
-add only its bounded UI/message window in KT; it does not consume a separate JVM or 1 GB of memory.
+Accounts and conversations do not create processes, and accounts do not create engines either: an
+account joins one launcher-defined proxy group at link time and shares that group's engine (ADR
+0001, see 4.4). The default single-group deployment (G = 1) is exactly the original model. One
+ordinary text conversation is expected to add only its bounded UI/message window in KT; it does not
+consume a separate engine or 1 GB of memory.
 
 ## 3. Ownership Boundaries
 
@@ -182,6 +185,56 @@ The machine-readable Phase 2 envelope contract is
 [`schemas/connector-api-v1.schema.json`](../schemas/connector-api-v1.schema.json). Methods outside this
 allowlist return `METHOD_NOT_ALLOWED`. Media and bulk automation remain unavailable.
 
+### 4.4 Proxy groups (Phase 4 contract, 2026-08-26; ADR 0001)
+
+Proxy groups evolve API `1.0` in place; the apiVersion handshake binding is unchanged. Every change
+is additive for a caller that never names a group: such a caller gets exactly the pre-Phase-4
+behavior, with all of its accounts in the reserved `default` group.
+
+- Groups are launcher input, never IPC input: repeatable `serve --proxy-group <id>=<host:port>` or
+  the `KT_SIGNAL_PROXY_GROUPS` comma-separated equivalent, governed by the signed runtime manifest
+  like every other process input (see 5). Group ids match `^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`;
+  `default` is reserved and always exists. The legacy global `--socks-proxy` /
+  `KT_SIGNAL_SOCKS_PROXY` configures the `default` group's proxy and must not be redefined in the
+  group list. More than 8 groups, a malformed id, or a malformed proxy value aborts startup with a
+  clear error.
+- `link.start` params gain an optional `proxyGroup` (opaque id). Absent means `default`. An unknown
+  id fails with `PROXY_GROUP_NOT_FOUND` (`retryable=false`). The result gains a `proxyGroup` field
+  echoing the selected group. The binding is fixed when `link.finish` succeeds and is immutable for
+  the life of the account; moving an account means `accounts.deleteLocalData` plus a fresh link.
+- Link flows are per group: `LINK_IN_PROGRESS` applies within one group only, the `link.finish`
+  wait lane is per group, and a `link.cancel` that must restart an engine restarts only that
+  group's engine (see 6.1).
+- `accounts.list` result items, the `link.finish` result, and `account.changed` event data gain a
+  `proxyGroup` field (always present; accounts linked before Phase 4 read as `default`).
+- `runtime.status`, `runtime.start`, and `runtime.stop` results gain `proxyGroups`: an array in
+  launcher config order with one entry per group,
+  `{groupId, state, pid?, rssBytes?, resourcePressure, accountCount}`, where `state` is
+  `running|stopped|exited|faulted` and `accountCount` counts the accounts bound to the group. The
+  top-level aggregate is preserved for existing callers with a pinned rule: `state` is `running`
+  if any group is running, else `faulted` if any is faulted, else `exited` if any is exited, else
+  `stopped`; `rssBytes` is the sum of live group samples; `resourcePressure` is true when any
+  group is in pressure; the top-level `pid` is present only when exactly one group exists. For a
+  single-group deployment this aggregate is field-for-field identical to the pre-Phase-4 result.
+  `runtime.start` fails with `RUNTIME_START_FAILED` only when no group engine started.
+- New event `proxyGroup.stateChanged` with data `{groupId, state, pid?, rssBytes?,
+  resourcePressure}` on every group engine transition. `runtime.stateChanged` keeps carrying the
+  top-level aggregate with its shape unchanged. `runtime.resourcePressure` event data gains a
+  required `groupId` (`default` in single-group deployments). Unknown event names and unknown
+  fields are ignored by existing hosts; this follows the precedent of `message.statusChanged`
+  gaining a producer while older hosts only routed it.
+- Account-addressed methods (`messages.*`, `conversations.list`, `contacts.*`,
+  `accounts.deleteLocalData`) route by `accountId` to the account's group engine; their request
+  and response shapes are unchanged.
+- Deliberately absent from the wire: group creation/reconfiguration/deletion, group reassignment,
+  per-group `runtime.start`/`runtime.stop`, and proxy endpoints. The desktop allocated the local
+  proxy ports and already knows the group-to-proxy mapping; the wire carries opaque group ids only,
+  and error messages never contain a proxy host:port.
+- Version skew: a group-aware host detects support by the presence of `proxyGroups` in the
+  `runtime.status` result before ever sending `proxyGroup`; against a pre-Phase-4 connector the
+  unknown param is rejected with `INVALID_REQUEST` (`deny_unknown_fields`) and fails closed, never
+  silently landing the account in the wrong egress.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -211,6 +264,10 @@ Rules:
   the `KT_SIGNAL_SOCKS_PROXY=host:port` environment variable (preferred, so it stays off the process
   command line) or `serve --socks-proxy host:port`. An invalid value aborts startup with a clear
   error. The default is a direct connection, and watchdog restarts reuse the same proxy config.
+  Phase 4 (ADR 0001) generalizes this per proxy group: each group's engine receives its own
+  group's proxy through exactly this mechanism (`KT_SIGNAL_PROXY_GROUPS` / repeated
+  `serve --proxy-group`), the legacy global option configures the `default` group, and each
+  group's watchdog restarts reuse that group's config unchanged.
 - Phase 5 adds a GraalVM native-image mode, selected explicitly with `serve --signal-cli-native`
   or `KT_SIGNAL_CLI_NATIVE=1` (explicit flag, not file-type probing: packaging controls what it
   ships, and a wrong heuristic guess would silently drop the JVM heap budget). The CLI arguments
@@ -235,15 +292,18 @@ signed runtime-manifest verification before packaging acceptance.
 KT receives a short-lived session ID and the QR payload needed for display. `link.finish` resolves the
 session ID internally and calls `finishLink`; KT cannot supply or alter the raw URI.
 
-One profile permits one active link flow. `link.finish` uses its own single-capacity wait lane so a
+One proxy group permits one active link flow; different groups may hold independent link flows in
+parallel (Phase 4, ADR 0001 — a single-group profile keeps the original global behavior). Within a
+group, `link.finish` uses its own single-capacity wait lane so a
 five-minute phone-approval wait cannot block runtime control, `link.start`, or `link.cancel`.
 Duplicate finish calls are rejected instead of accumulating pending requests.
 
 Cancellation is linearized before it returns: a cancelled or superseded finish result cannot create
 an account row or emit `account.changed`. The pinned signal-cli JSON-RPC API has no operation that
 cancels an already-dispatched `finishLink`; when `link.cancel` finds one in flight, the connector
-restarts the one shared signal-cli engine after clearing the link session. This does not delete or
-unlink existing accounts, but it can briefly pause every Signal account in the same local profile.
+restarts that link session's group engine after clearing the link session. This does not delete or
+unlink existing accounts, but it can briefly pause every Signal account bound to that group (in a
+single-group profile, every account in the profile).
 KT must therefore reuse an unexpired QR and perform this restart only for an explicit replacement,
 not an automatic render retry.
 
@@ -342,8 +402,8 @@ mandatory.
 
 After link, signal-cli has already synchronized contacts and groups from the primary device.
 `contacts.sync` reads them via read-only `listContacts` (registered contacts only, no
-`allRecipients` walk) and `listGroups` (membership-filtered, `isMember=true`) on the single JVM
-queue and upserts them into a per-account `contacts` cache table keyed by
+`allRecipients` walk) and `listGroups` (membership-filtered, `isMember=true`) on the account's
+group engine queue and upserts them into a per-account `contacts` cache table keyed by
 `(account_id, kind, peer_key)`. A successful sync less than 60 seconds old returns the cached
 counts without touching the engine. `link.finish` runs one best-effort sync inline; its failure is
 logged and never fails the link flow. `contacts.list` serves the cache only (optional substring
@@ -435,7 +495,10 @@ history (7.1.1). A keyed open that the store rejects fails closed as well.
 These are capacity budgets, not measurements or promises. Phase 3 records actual process RSS on each
 target platform and replaces the estimates.
 
-Additional idle account budget: 20-80 MB while sharing the same JVM. An ordinary open text
+Additional idle account budget: 20-80 MB while sharing the same JVM. Each additional proxy group
+(Phase 4, ADR 0001) adds one full engine at 140-280 MB idle RSS; the group count is capped at 8 by
+the connector and at a product default of 4 by desktop policy, so the worst-case idle Signal
+increment is bounded by configuration rather than by account growth. An ordinary open text
 conversation should normally remain below 1-5 MB incremental UI state, with an acceptance hard limit
 of 20 MB relative to the Signal idle baseline.
 
@@ -455,19 +518,21 @@ increase. RSS pressure still degrades admission and never kills a live JVM autom
   authenticated connection.
 - authenticated host dispatch: control 1, link wait 1, persisted reads 4, sends 2; sends remain
   ordered per account and responses are correlated by `requestId`, not arrival order. The link-wait
-  lane admits at most one `link.finish` and is independent from link cancellation and lifecycle
-  control.
-- pending signal-cli requests: 128 global.
+  lane admits at most one `link.finish` per proxy group and is independent from link cancellation
+  and lifecycle control.
+- pending signal-cli requests: 128 per group engine (Phase 4: each proxy group's engine keeps its
+  own bounded queue; host-side limits stay global on the single authenticated connection).
 - runtime/UI broadcast queue: 1,024 non-critical events with pressure reporting; lag is recoverable
   from SQLite.
 - critical receive queue: 256 items and 2 MiB of normalized projected data. It backpressures the
   signal-cli stdout reader at either limit and never routes receives through broadcast delivery.
 - current message page: default 100, maximum 200.
 - message text projection: 4 KiB per list/event row; persisted inbound body: 128 KiB maximum.
-- one signal-cli RSS sampler per shared engine, every 30 seconds. Pressure requires three consecutive
+- one signal-cli RSS sampler per group engine, every 30 seconds. Pressure requires three consecutive
   samples at or above 512 MiB; recovery requires two consecutive samples at or below 420 MiB.
   Sampling emits only PID/RSS/state and exits immediately with the engine. RSS pressure never kills
-  or restarts the JVM automatically. macOS/Linux sample through a short-lived `ps`; Windows uses the
+  or restarts the JVM automatically. Pressure events identify their group by `groupId` (see 4.4).
+  macOS/Linux sample through a short-lived `ps`; Windows uses the
   native process working-set API and never starts PowerShell for monitoring.
 - conversation cursors are opaque keyset cursors over `(last_message_at nullness,
   last_message_at, id)`; message cursors are opaque keyset cursors over `(sent_at, id)` bound to one

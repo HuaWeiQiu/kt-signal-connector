@@ -21,6 +21,12 @@
       "minLength": 1,
       "maxLength": 128
     },
+    "proxyGroupId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Proxy group identifier (ADR 0001, Phase 4). 'default' is the reserved, always-present group; additional groups are defined by the trusted launcher at connector spawn and are never created over IPC. An omitted proxyGroup means 'default'."
+    },
     "request": {
       "type": "object",
       "additionalProperties": false,
@@ -208,6 +214,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 64
+        },
+        "proxyGroup": {
+          "$ref": "#/$defs/proxyGroupId",
+          "description": "Optional target proxy group for the account being linked; fixed for the life of the link once link.finish succeeds. An unknown group fails with PROXY_GROUP_NOT_FOUND. A pre-Phase-4 connector rejects this field with INVALID_REQUEST (deny_unknown_fields), so hosts must feature-detect via runtime.status first."
         }
       }
     },
@@ -352,6 +362,7 @@
             "runtime.protocolWarning",
             "runtime.storageChanged",
             "runtime.resourcePressure",
+            "proxyGroup.stateChanged",
             "account.changed",
             "conversation.changed",
             "message.upserted",
@@ -373,11 +384,38 @@
               "data": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["state", "pid", "rssBytes"],
+                "required": ["state", "pid", "rssBytes", "groupId"],
                 "properties": {
                   "state": { "enum": ["elevated", "recovered"] },
                   "pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-                  "rssBytes": { "type": "integer", "minimum": 0 }
+                  "rssBytes": { "type": "integer", "minimum": 0 },
+                  "groupId": {
+                    "$ref": "#/$defs/proxyGroupId",
+                    "description": "Group whose engine sampled the pressure transition; 'default' in single-group deployments (ADR 0001)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "proxyGroup.stateChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["groupId", "state", "resourcePressure"],
+                "description": "One proxy group's engine transition (ADR 0001). runtime.stateChanged keeps carrying the top-level aggregate; this event carries per-group detail.",
+                "properties": {
+                  "groupId": { "$ref": "#/$defs/proxyGroupId" },
+                  "state": { "enum": ["running", "stopped", "exited", "faulted"] },
+                  "pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+                  "rssBytes": { "type": "integer", "minimum": 0 },
+                  "resourcePressure": { "type": "boolean" }
                 }
               }
             }
@@ -431,6 +469,7 @@
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
             "MESSAGE_NOT_FOUND",
+            "PROXY_GROUP_NOT_FOUND",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",

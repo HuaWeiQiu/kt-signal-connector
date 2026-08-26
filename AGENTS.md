@@ -21,8 +21,14 @@ Before implementation changes, read:
 - Use only the pinned public `signal-cli` JSON-RPC interface.
 - Never expose raw JSON-RPC methods, account keys, the signal-cli data directory, raw envelopes, or
   arbitrary file paths to a caller.
-- One connector and one signal-cli JVM serve all accounts and conversations in one local profile.
-- Never spawn one JVM per account, conversation, or feature.
+- One connector process serves one local profile; inside it, one signal-cli engine (JVM or
+  native) per proxy group. Proxy groups are bounded (hard ceiling 8, product default 4), are
+  defined by the trusted launcher at spawn, and are never created, reconfigured, or reassigned
+  over IPC (ADR 0001).
+- An account's proxy group is fixed when the account is linked and immutable for the life of
+  that link; moving an account means deleting its local data and linking it again.
+- Never spawn one engine per account, conversation, or feature: accounts that share a proxy
+  group share its engine, data directory, watchdog, and RSS budget.
 - Do not use fixed HTTP/TCP ports. Prefer a private Unix socket or Windows named pipe.
 - Do not log message bodies, phone numbers, contacts, QR payloads, secrets, tokens, or key paths.
 - An unknown send outcome must not be retried automatically.
