@@ -1,0 +1,52 @@
+# Action version baseline verified 2026-08-26 via `gh api repos/<action>/releases/latest`:
+#   actions/checkout v7.0.1, actions/upload-artifact v7.0.1
+# (KT policy: latest stable major only; see skill cicd-action-version-policy)
+name: Build · signal-cli Native
+
+run-name: >-
+  ${{ github.event_name == 'push'
+      && format('Build | signal-cli native | {0}', github.ref_name)
+      || format('Build | signal-cli native | manual by {0}', github.actor) }}
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'signal-cli-native-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: Build native signal-cli (macOS arm64)
+    # Apple Silicon runner: the pinned GraalVM tarball is macos-aarch64.
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned inputs (signal-cli tag, GraalVM version, both SHA256) live in the
+      # build script so local reruns and CI execute the exact same steps.
+      - name: Build native signal-cli
+        run: |
+          packaging/scripts/build-signal-cli-native.sh --out dist
+          source dist/build-info.env
+          echo "SIGNAL_CLI_VERSION=$SIGNAL_CLI_VERSION" >> "$GITHUB_ENV"
+
+      - name: Smoke (--version + live JSON-RPC probe)
+        run: |
+          packaging/scripts/smoke-signal-cli.sh \
+            --bin "$PWD/dist/signal-cli" \
+            --expect-version "$SIGNAL_CLI_VERSION"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: signal-cli-${{ env.SIGNAL_CLI_VERSION }}-native-macos-aarch64
+          path: |
+            dist/signal-cli
+            dist/SHA256SUMS.txt
+            dist/build-info.env
+          if-no-files-found: error
+          retention-days: 30
