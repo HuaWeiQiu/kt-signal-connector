@@ -196,8 +196,11 @@ behavior, with all of its accounts in the reserved `default` group.
   like every other process input (see 5). Group ids match `^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`;
   `default` is reserved and always exists. The legacy global `--socks-proxy` /
   `KT_SIGNAL_SOCKS_PROXY` configures the `default` group's proxy and must not be redefined in the
-  group list. More than 8 groups, a malformed id, or a malformed proxy value aborts startup with a
-  clear error.
+  group list. When the flag and the environment variable are given together they merge into one
+  launcher-ordered list (flag entries first, then environment entries); a group id that appears in
+  both sources — or twice anywhere — aborts startup: ambiguity is refused fail-closed and never
+  resolved by precedence, and neither source may name `default` itself. More than 8 groups, a
+  malformed id, or a malformed proxy value aborts startup with a clear error.
 - `link.start` params gain an optional `proxyGroup` (opaque id). Absent means `default`. An unknown
   id fails with `PROXY_GROUP_NOT_FOUND` (`retryable=false`). The result gains a `proxyGroup` field
   echoing the selected group. The binding is fixed when `link.finish` succeeds and is immutable for
@@ -226,6 +229,16 @@ behavior, with all of its accounts in the reserved `default` group.
 - Account-addressed methods (`messages.*`, `conversations.list`, `contacts.*`,
   `accounts.deleteLocalData`) route by `accountId` to the account's group engine; their request
   and response shapes are unchanged.
+- Dormant groups: an account whose stored `proxyGroup` is not part of this launch plan stays
+  intact but unreachable. Every account-addressed method naming it fails with
+  `CAPABILITY_UNAVAILABLE` (`retryable=false`; the message carries the group id, never an
+  endpoint), and the account does not appear in `accounts.list`, which unions configured groups
+  only. The connector deliberately never auto-starts a group outside the launch plan: a group's
+  proxy exists only as launcher input (above), so inventing one at runtime could route the
+  account through the wrong or missing egress and break anti-association (ADR 0001 R1).
+  Restoring the group to the launch plan makes its accounts reachable again unchanged; the
+  store-level delete-replay closure in 6.2 is the one deliberate exception that survives a
+  vanished group.
 - Deliberately absent from the wire: group creation/reconfiguration/deletion, group reassignment,
   per-group `runtime.start`/`runtime.stop`, and proxy endpoints. The desktop allocated the local
   proxy ports and already knows the group-to-proxy mapping; the wire carries opaque group ids only,
@@ -298,6 +311,14 @@ group, `link.finish` uses its own single-capacity wait lane so a
 five-minute phone-approval wait cannot block runtime control, `link.start`, or `link.cancel`.
 Duplicate finish calls are rejected instead of accumulating pending requests.
 
+Expired sessions keep their attribution: a `link.finish` (or `link.cancel`) for a session that has
+already expired is still routed to its owning group's wait lane and answered there with the
+definite `LINK_EXPIRED` (`retryable=false`, matching every other definite finish failure) instead
+of the unknown-session `LINK_NOT_FOUND`. Answering expiry consumes the session, so any later call
+for the same id reports `LINK_NOT_FOUND`; only a session the connector no longer knows at all is
+`LINK_NOT_FOUND` on the first attempt. If the owning group's runtime is stopped, the ordinary
+`RUNTIME_NOT_RUNNING` answer precedes dispatch, as for any finish.
+
 Cancellation is linearized before it returns: a cancelled or superseded finish result cannot create
 an account row or emit `account.changed`. The pinned signal-cli JSON-RPC API has no operation that
 cancels an already-dispatched `finishLink`; when `link.cancel` finds one in flight, the connector
@@ -325,6 +346,18 @@ At most 256 completed operations are retained; one unfinished operation is allow
 later explicit user retry, an unfinished operation first performs two read-only `listAccounts`
 checks. If both confirm that the account is absent, the Connector atomically completes its local
 cleanup without issuing a second delete; otherwise that user action may dispatch the delete again.
+
+Delete completion is a store-level fact, and a replay must not depend on the owning proxy group
+being reachable (Phase 4, ADR 0001). Routing consults the account row only to find the owning
+engine; when the row is already gone — an idempotent replay, or a v1-compatible delete of an
+absent account — the shared operation ledger completes the operation entirely inside the store,
+served through any supervisor (all groups share one store) without contacting any engine, even
+when the account's group is not part of this launch plan. Conversely, a first attempt interrupted
+between upstream deletion and local commit leaves the row in place: the replay routes normally to
+the owning group, where the reconcile-first check above completes locally once the upstream no
+longer lists the account; re-dispatching the upstream delete there is safe because it is
+idempotent. Replay therefore never requires the owning group to be alive and never resurrects
+local rows on its own.
 
 The Connector does not retry `deleteLocalAccountData` automatically. If signal-cli returns a
 definitive failure, local rows remain unchanged. If the process, transport, or timeout makes the

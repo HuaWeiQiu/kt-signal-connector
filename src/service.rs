@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -314,6 +316,25 @@ impl ConnectorService {
         self.link
             .as_ref()
             .is_some_and(|session| session.session_id == link_session_id)
+    }
+
+    /// Test-only: plant a link session with an explicit TTL so registry and
+    /// service tests can pin expired-session routing without waiting out the
+    /// real five-minute [`LINK_SESSION_TTL`].
+    #[cfg(test)]
+    pub(crate) fn plant_link_session_for_test(
+        &mut self,
+        device_name: &str,
+        ttl: Duration,
+    ) -> String {
+        let session =
+            ActiveLinkSession::new(device_name.to_string(), "sgnl://link?test".into(), ttl);
+        self.link = Some(session);
+        self.link
+            .as_ref()
+            .expect("session planted")
+            .session_id
+            .clone()
     }
 
     /// Signal number of any account bound to this group; the watchdog ping target.
@@ -1152,6 +1173,34 @@ mod tests {
             service.ensure_link_available(),
             Err(ServiceError::Api(_))
         ));
+    }
+
+    /// An expired session answers the definite LINK_EXPIRED (retryable=false,
+    /// same class as every other definite finish failure) and is consumed by
+    /// that answer; only afterwards does the id read back as LINK_NOT_FOUND.
+    #[test]
+    fn expired_finish_answers_link_expired_once_then_reports_not_found() {
+        let (_temp, mut service) = service();
+        let link_session_id = service.plant_link_session_for_test("KT-Expired", Duration::ZERO);
+
+        let error = service.peek_link_for_finish(&link_session_id).unwrap_err();
+        let ServiceError::Api(api) = error else {
+            panic!("expected an api error for the expired finish");
+        };
+        assert_eq!(api.code, "LINK_EXPIRED");
+        assert!(!api.retryable);
+
+        let again = service.peek_link_for_finish(&link_session_id).unwrap_err();
+        let ServiceError::Api(api) = again else {
+            panic!("expected an api error for the consumed session");
+        };
+        assert_eq!(api.code, "LINK_NOT_FOUND");
+
+        // begin_link over an expired session must also succeed (expiry frees
+        // the slot), keeping one deterministic terminal state per session.
+        service
+            .begin_link("KT-Again".into(), "sgnl://link?next".into())
+            .expect("an expired session must not block a fresh link");
     }
 
     #[test]

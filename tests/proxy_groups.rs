@@ -41,8 +41,17 @@ fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-fn spawn_two_group_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
+/// Spawn a connector whose launch plan is `default` plus `extra_groups`
+/// (`id=host:port` each). The endpoints are allocation placeholders: the fake
+/// signal-cli never dials them.
+fn spawn_group_connector(
+    root: &Path,
+    endpoint: &Path,
+    secret_file: &Path,
+    extra_groups: &[&str],
+) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
         .arg("serve")
         .arg("--endpoint")
         .arg(endpoint)
@@ -53,11 +62,11 @@ fn spawn_two_group_connector(root: &Path, endpoint: &Path, secret_file: &Path) -
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
         .arg("--state-dir")
-        .arg(root.join("state"))
-        .arg("--proxy-group")
-        .arg("team-a=127.0.0.1:9050")
-        .arg("--proxy-group")
-        .arg("team-b=127.0.0.1:9051")
+        .arg(root.join("state"));
+    for spec in extra_groups {
+        command.arg("--proxy-group").arg(spec);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -70,14 +79,47 @@ fn spawn_two_group_connector(root: &Path, endpoint: &Path, secret_file: &Path) -
         .unwrap()
 }
 
-async fn wait_for_path(path: &Path) {
-    timeout(Duration::from_secs(3), async {
+fn spawn_two_group_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
+    spawn_group_connector(
+        root,
+        endpoint,
+        secret_file,
+        &["team-a=127.0.0.1:9050", "team-b=127.0.0.1:9051"],
+    )
+}
+
+async fn wait_for_path(path: &Path, connector: &mut Child) {
+    let appeared = timeout(Duration::from_secs(3), async {
         while !path.exists() {
+            // Surface an early startup crash (e.g. rejected bootstrap input)
+            // instead of waiting out the clock.
+            assert!(
+                connector
+                    .try_wait()
+                    .expect("connector process state")
+                    .is_none(),
+                "connector exited before opening {path:?}: {}",
+                drain_stderr(connector).await
+            );
             sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("connector socket should appear");
+    .await;
+    if appeared.is_err() {
+        panic!(
+            "connector socket should appear at {path:?}; stderr: {}",
+            drain_stderr(connector).await
+        );
+    }
+}
+
+async fn drain_stderr(connector: &mut Child) -> String {
+    let mut stderr = String::new();
+    if let Some(mut pipe) = connector.stderr.take() {
+        use tokio::io::AsyncReadExt;
+        let _ = pipe.read_to_string(&mut stderr).await;
+    }
+    stderr
 }
 
 async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8; 32]) {
@@ -169,6 +211,22 @@ fn group_pid(groups: &[Value], group_id: &str) -> Option<u32> {
         .map(|pid| pid as u32)
 }
 
+/// The connector must exit zero once the only host disconnects; on failure the
+/// buffered stderr is surfaced.
+async fn assert_clean_exit(connector: &mut Child) {
+    let status = timeout(Duration::from_secs(2), connector.wait())
+        .await
+        .expect("connector should exit after the host disconnects")
+        .unwrap();
+    if status.success() {
+        return;
+    }
+    panic!(
+        "connector exited with {status:?}; stderr: {}",
+        drain_stderr(connector).await
+    );
+}
+
 #[tokio::test]
 async fn proxy_groups_launch_route_and_fail_closed_end_to_end() {
     let temp = TempDir::new().unwrap();
@@ -179,7 +237,7 @@ async fn proxy_groups_launch_route_and_fail_closed_end_to_end() {
     write_secret_file(&secret_file, &secret);
 
     let mut connector = spawn_two_group_connector(temp.path(), &endpoint, &secret_file);
-    wait_for_path(&endpoint).await;
+    wait_for_path(&endpoint, &mut connector).await;
 
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
@@ -360,4 +418,210 @@ async fn proxy_groups_launch_route_and_fail_closed_end_to_end() {
         conn_status.success(),
         "connector must exit cleanly after full teardown"
     );
+}
+
+/// Dormant groups (implementation-plan §4.4): an account bound to a group the
+/// launcher did not configure stays intact but unreachable. Account-addressed
+/// methods fail closed with CAPABILITY_UNAVAILABLE naming only the group id,
+/// and no engine is invented for the missing group — auto-starting one without
+/// its launcher-provided proxy could route the account through the wrong
+/// egress, which R1 forbids.
+#[tokio::test]
+async fn dormant_group_accounts_fail_closed_without_their_engine() {
+    // Phase 1: link an account into team-a so the store carries its binding.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [9_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_group_connector(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        &["team-a=127.0.0.1:9050"],
+    );
+    wait_for_path(&endpoint, &mut connector).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Dormant", "proxyGroup": "team-a" }),
+    )
+    .await;
+    assert!(
+        link["result"]["linkSessionId"].is_string(),
+        "team-a link.start failed: {link}"
+    );
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert_eq!(finished["result"]["proxyGroup"], "team-a");
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+
+    // Phase 2: relaunch WITHOUT team-a. The binding survives in the store, but
+    // the runtime is never started here — any engine touch would answer
+    // RUNTIME_NOT_RUNNING instead of the pinned capability error.
+    // The bootstrap secret file is consumed on read, so write a fresh one.
+    let endpoint_two = temp.path().join("c2.sock");
+    let secret_file_two = temp.path().join("bootstrap.secret.2");
+    write_secret_file(&secret_file_two, &secret);
+    let mut relaunched = spawn_group_connector(temp.path(), &endpoint_two, &secret_file_two, &[]);
+    wait_for_path(&endpoint_two, &mut relaunched).await;
+    let stream = UnixStream::connect(&endpoint_two).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let conversations = request(
+        &mut client,
+        "conv-dormant",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 20 }),
+    )
+    .await;
+    assert_eq!(conversations["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    assert_eq!(conversations["error"]["retryable"], false);
+    let message = conversations["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("team-a"),
+        "the error must name the missing group: {message}"
+    );
+    assert!(
+        !conversations["error"].to_string().contains("127.0.0.1"),
+        "diagnostics never echo proxy endpoints (R10)"
+    );
+
+    // accounts.list unions configured groups only: a dormant account stays
+    // invisible until its group is configured again.
+    let accounts = request(&mut client, "accounts-dormant", "accounts.list", json!({})).await;
+    assert!(
+        accounts["result"].as_array().unwrap().is_empty(),
+        "dormant accounts must not appear in accounts.list: {accounts}"
+    );
+
+    drop(client);
+    assert_clean_exit(&mut relaunched).await;
+}
+
+/// Delete replay is a store-level fact (implementation-plan §6.2): once the
+/// account rows are gone, a replayed operationId resolves through the shared
+/// ledger entirely in the store — through any supervisor, since all groups
+/// share one store — without contacting any engine, even when the owning
+/// group is not part of this launch plan.
+#[tokio::test]
+async fn delete_replay_completes_in_store_even_when_owner_group_is_gone() {
+    // Phase 1: link into team-a and delete with a stable operationId.
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [11_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_group_connector(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        &["team-a=127.0.0.1:9050"],
+    );
+    wait_for_path(&endpoint, &mut connector).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Replay", "proxyGroup": "team-a" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    let deleted = request(
+        &mut client,
+        "delete-1",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_id, "operationId": "replay-op-1" }),
+    )
+    .await;
+    assert!(
+        deleted.get("result").is_some(),
+        "the first delete must succeed: {deleted}"
+    );
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+
+    // Phase 2: relaunch default-only and keep the runtime stopped — if the
+    // replay tried to reach any engine it would fail with RUNTIME_NOT_RUNNING.
+    // The bootstrap secret file is consumed on read, so write a fresh one.
+    let endpoint_two = temp.path().join("c3.sock");
+    let secret_file_two = temp.path().join("bootstrap.secret.2");
+    write_secret_file(&secret_file_two, &secret);
+    let mut relaunched = spawn_group_connector(temp.path(), &endpoint_two, &secret_file_two, &[]);
+    wait_for_path(&endpoint_two, &mut relaunched).await;
+    let stream = UnixStream::connect(&endpoint_two).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let replay = request(
+        &mut client,
+        "delete-replay",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_id, "operationId": "replay-op-1" }),
+    )
+    .await;
+    assert!(
+        replay.get("result").is_some(),
+        "a replayed completed operation must resolve in the store: {replay}"
+    );
+
+    // A fresh operationId over absent rows closes in the store too (v1
+    // compatibility): deleting an already-absent account just succeeds.
+    let fresh = request(
+        &mut client,
+        "delete-fresh",
+        "accounts.deleteLocalData",
+        json!({ "accountId": account_id, "operationId": "replay-op-2" }),
+    )
+    .await;
+    assert!(
+        fresh.get("result").is_some(),
+        "an absent-account delete must succeed without an engine: {fresh}"
+    );
+
+    let accounts = request(&mut client, "accounts-replay", "accounts.list", json!({})).await;
+    assert!(accounts["result"].as_array().unwrap().is_empty());
+
+    drop(client);
+    assert_clean_exit(&mut relaunched).await;
 }

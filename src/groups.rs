@@ -262,6 +262,35 @@ mod tests {
         assert!(error.contains("more than once"), "{error}");
     }
 
+    /// Flag/env precedence contract (implementation-plan §4.4): both sources
+    /// merge into one launcher-ordered list; the same id across sources is a
+    /// startup failure, never resolved by precedence; and `default` cannot be
+    /// redefined from either source — its proxy comes only from the legacy
+    /// global setting.
+    #[test]
+    fn flag_and_env_merge_is_fail_closed_on_duplicate_ids_and_default() {
+        let error = build_group_plan(
+            &["collide=127.0.0.1:1".to_string()],
+            Some("collide=127.0.0.1:2"),
+            None,
+            Path::new("/data"),
+        )
+        .unwrap_err();
+        assert!(error.contains("more than once"), "{error}");
+
+        let error = build_group_plan(&[], Some("default=127.0.0.1:3"), None, Path::new("/data"))
+            .unwrap_err();
+        assert!(error.contains("'default' is reserved"), "{error}");
+
+        // The legacy global proxy stays the only way to give default an
+        // endpoint; group specs always name non-default groups.
+        let plan = build_group_plan(&[], None, proxy("127.0.0.1", 9), Path::new("/data"))
+            .expect("legacy-only configuration is valid");
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].id, "default");
+        assert_eq!(plan.groups[0].proxy, proxy("127.0.0.1", 9));
+    }
+
     #[test]
     fn group_count_is_hard_capped_at_eight_including_default() {
         let specs: Vec<String> = (1..=7)

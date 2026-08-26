@@ -650,3 +650,74 @@ pub fn open_group_runtime(
     );
     Ok(runtime)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::store::StoreKey;
+
+    /// One supervisor per group over a single shared store, mirroring
+    /// `open_group_runtime` without spawning real engines.
+    fn two_group_runtime() -> Arc<ProxyGroupRuntime> {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap());
+        let slot = |id: &str| {
+            ProxyGroupSlot::new(
+                id.to_string(),
+                Arc::new(RuntimeSupervisor::new(
+                    SignalCliConfig::new(
+                        PathBuf::from("unused-signal-cli"),
+                        PathBuf::from("/tmp/unused-signal-data"),
+                    ),
+                    store.clone(),
+                    id.to_string(),
+                )),
+            )
+        };
+        let runtime = ProxyGroupRuntime::new(vec![slot("default"), slot("team-b")]);
+        // Leak the TempDir for the test lifetime so the store path stays valid
+        // (same discipline as the host unit tests).
+        std::mem::forget(temp);
+        runtime
+    }
+
+    /// Routing contract for expired link sessions (implementation-plan §6.1):
+    /// ownership survives expiry — an expired-but-known session still resolves
+    /// to its owning group so its finish answers LINK_EXPIRED there instead of
+    /// degrading to LINK_NOT_FOUND from the router.
+    #[tokio::test]
+    async fn expired_link_sessions_still_route_to_their_owning_group() {
+        let runtime = two_group_runtime();
+        let owner = &runtime.groups[1];
+        // One group owns one session at a time, so each session is asserted
+        // while it is the group's current one.
+        let expired = owner
+            .supervisor
+            .service()
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Expired", Duration::ZERO);
+        assert_eq!(
+            runtime.resolve_link_session(&expired).await.as_deref(),
+            Some("team-b"),
+            "an expired session must keep its owning group"
+        );
+
+        let live = owner
+            .supervisor
+            .service()
+            .lock()
+            .await
+            .plant_link_session_for_test("KT-Live", Duration::from_secs(300));
+        assert_eq!(
+            runtime.resolve_link_session(&live).await.as_deref(),
+            Some("team-b")
+        );
+        assert_eq!(runtime.resolve_link_session("never-started").await, None);
+    }
+}

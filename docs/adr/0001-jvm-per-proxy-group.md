@@ -59,11 +59,15 @@ network egress. One connector process per local profile supervises all groups.
 
 R1. **Groups are launcher input, never IPC input.** The set of groups and their proxies is
     defined at connector spawn by the trusted launcher (repeatable `serve --proxy-group
-    <id>=<host:port>` or the `KT_SIGNAL_PROXY_GROUPS` comma-separated equivalent), governed by
-    the signed runtime manifest like every other process input (implementation-plan §5). The
-    wire protocol can only *select* an existing group at link time and *observe* group state;
-    it cannot create, reconfigure, or delete groups. Group ids match
-    `^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$` so they are filesystem-safe; `default` is reserved.
+    <id>=<host:port>`, the `KT_SIGNAL_PROXY_GROUPS` comma-separated equivalent, or both at
+    once — the entries then form one launcher-ordered list with flag entries first and
+    environment entries in order), governed by the signed runtime manifest like every other
+    process input (implementation-plan §5). The same group id appearing twice — across the
+    two sources or within either one — aborts startup: an ambiguous egress assignment is a
+    configuration error and is never resolved by precedence. The wire protocol can only
+    *select* an existing group at link time and *observe* group state; it cannot create,
+    reconfigure, or delete groups. Group ids match `^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$` so
+    they are filesystem-safe; `default` is reserved.
 
 R2. **The default group is the compatibility anchor.** With no group configuration the
     connector runs exactly one group, `default`, with a direct connection — byte-identical to
