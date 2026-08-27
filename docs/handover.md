@@ -14,7 +14,7 @@ P0 real-device acceptance: all machine-checkable items pass (§3.3).**
 | Phase 4 design | committed | connector `1749ed3` (ADR 0001, §4.4, schema additive) |
 | Phase 4 implementation | committed | connector `7996828` (one engine per proxy group) |
 | A · contract pinning | committed | connector `c742fc9`; desktop `387400c5` (contract 1.5) |
-| B · soak tier-1 (8 engines, no real accounts) | **running** since 2026-08-26 20:44 +08:00, planned 24 h | `/tmp/kt-soak-8g/` (driver.log, rss.csv); see §3.2 |
+| B · soak tier-1 (8 engines, no real accounts) | **re-run in progress** since 2026-08-27 20:52 +08:00 (run 1: INCOMPLETE at ~4.7/24 h, host teardown, window healthy) | `/tmp/kt-soak-8g/`; see §3.2 |
 | B · soak tier-2 (real accounts) | **blocked** — needs a 2nd real account + phone | §6 |
 | C · P0 real-device acceptance | **machine-checkable items all pass** (2026-08-27 probe round: items 1-4 pass, 5 chain pass + ASR needs-human, 6 blocked on product decision); smoke 11 pass / 0 fail / 1 skip | §3.3 |
 | D · push both repos | authorized by owner, **waits for C to pass** | §3.4 |
@@ -67,7 +67,37 @@ from the design docs; Phase 4 is now complete on both repos:
 - desktop `387400c5` formalizes the new error codes and dormant-group UI copy;
   host contract bumped to **1.5** (`contracts/signal-host-adapter.md`).
 
-### 3.2 B · 24h soak — tier-1 running, tier-2 blocked
+### 3.2 B · 24h soak — tier-1 **INCOMPLETE (host teardown, observed window healthy)**, tier-2 blocked
+
+**Result of the 2026-08-27 20:37 check:** the soak did **not** reach 24 h. All
+processes (driver, connector pid 86084, engines 86092–86099) are gone; the last
+sample is **2026-08-27 01:24 +08:00**, i.e. **~4.7 h of the planned 24 h**.
+Nothing in the data indicates a product failure — the interruption matches a
+host/session teardown (this also killed the originating AI session and its
+cron; a successor session ran this check by hand, cron id
+`01M0ZFRPFTRKPKG754Y7SDYB9E`). The 24 h gate is therefore **not met** and the
+soak must be re-run to count.
+
+Observed window (20:44 → 01:24) was healthy on every criterion:
+
+- Every `driver.log` status line: 8/8 engines `state=running`,
+  `resourcePressure=False`, aggregate RSS steady ≈ 1.32 GiB. Two sampling gaps
+  (22:49→23:16, 00:12→00:32) are consistent with brief host sleep, not engine
+  trouble.
+- Per-engine RSS over 240 samples each, first→last / max MiB: default
+  161→172/173, g1 170→170/170, g2 170→182/182, g3 144→152/152, g4
+  179→179/179, g5 176→175/176, g6 156→167/168, g7 151→150/151 — flat or
+  plateau, **no monotonic climb**, no pressure event.
+
+**Re-run started 2026-08-27 20:52 +08:00** — connector pid 14497, engines
+14501–14508, handshake ok, 8/8 `running` at launch. This time the driver and
+connector are guarded by `caffeinate -dims -w <pid>` (pids 15259/15260) so an
+idle-sleeping host cannot silently end the run; run-1 artifacts are archived
+under `/tmp/kt-soak-8g/run1/`. One-shot check cron `01M11MKQ8METJ1W79QNF32RRS4`
+fires 2026-08-28 21:07 +08:00 (session-local — if this session is gone, check
+by hand with the commands below).
+
+<details><summary>Original run record (2026-08-26)</summary>
 
 Tier-1 (no real Signal accounts; 8 signal-cli engines at the group ceiling,
 lifecycle + RSS only):
@@ -100,6 +130,8 @@ EOF
 Pass criteria: all 8 engines `running` in every status line; per-engine RSS
 without unbounded growth (flat or plateau, no monotonic climb); no
 `resourcePressure=True`.
+
+</details>
 
 Tier-2 (real accounts, real traffic) is **blocked**: needs a second real
 Signal account and a phone to approve linking. Do not fake this with the
