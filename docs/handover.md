@@ -1,9 +1,9 @@
 # Signal Integration — Handover
 
-Date: 2026-08-26 (updated 22:10 +08:00). Owner: KT AI engineering.
+Date: 2026-08-26 (updated 2026-08-27 00:30 +08:00). Owner: KT AI engineering.
 Status: **Phase 4 (JVM-per-proxy-group) resumed, implemented and contract-pinned
-locally; nothing pushed. 8-engine soak running; P0 real-device acceptance in
-progress.**
+locally; nothing pushed. 8-engine soak running (ends ~2026-08-27 20:44 +08:00);
+P0 real-device acceptance: all machine-checkable items pass (§3.3).**
 
 ---
 
@@ -16,7 +16,7 @@ progress.**
 | A · contract pinning | committed | connector `c742fc9`; desktop `387400c5` (contract 1.5) |
 | B · soak tier-1 (8 engines, no real accounts) | **running** since 2026-08-26 20:44 +08:00, planned 24 h | `/tmp/kt-soak-8g/` (driver.log, rss.csv); see §3.2 |
 | B · soak tier-2 (real accounts) | **blocked** — needs a 2nd real account + phone | §6 |
-| C · P0 real-device acceptance | **in progress** — smoke 11 pass / 0 fail / 1 skip; dispatch-path analysis done; UI probes remain | §3.3 |
+| C · P0 real-device acceptance | **machine-checkable items all pass** (2026-08-27 probe round: items 1-4 pass, 5 chain pass + ASR needs-human, 6 blocked on product decision); smoke 11 pass / 0 fail / 1 skip | §3.3 |
 | D · push both repos | authorized by owner, **waits for C to pass** | §3.4 |
 
 Working trees: connector `main` is **clean** at `c742fc9`. Desktop
@@ -105,7 +105,44 @@ Tier-2 (real accounts, real traffic) is **blocked**: needs a second real
 Signal account and a phone to approve linking. Do not fake this with the
 single existing test account — it has no peer that replies (see §5).
 
-### 3.3 C · P0 real-device acceptance — in progress
+### 3.3 C · P0 real-device acceptance — machine-checkable items all pass (2026-08-27)
+
+**Probe round 2026-08-27** (dev client from `/tmp/kt-p0-test`, Vite 3355 / CDP 9336,
+page `http://localhost:3355`; driven via CDP `Runtime.evaluate` DOM events +
+`Input.dispatchMouseEvent`; the stop-channel `window.confirm` was accepted via
+`Page.handleJavaScriptDialog`; probe scripts `p0-probe1/2/3/4/5.mjs` in the
+worktree root):
+
+1. **Text quick-reply dblclick — PASS.** QuickReply panel 「文本」entry dblclick →
+   new outgoing bubble (`data-total-items` 18→19), draft cleared, no warning
+   toast; real send to 「菲菲 林」. No `send2webview` on the Signal path.
+2. **Media quick-reply rejection — PASS (QuickReply path).** Video entry dblclick
+   → toast「Signal 暂不支持发送图片、语音或文件快捷回复」, total unchanged,
+   draft marker byte-identical. SmartReply panel had **no media entries** (AI
+   replies text-only in this profile) — the string-type media path has no
+   on-machine data source and remains covered by the `signalQuickReply`
+   whitelist unit tests only.
+3. **Stopped-channel rejection — PASS.** Stop via menu → confirm dialog →
+   「通道已停止」banner + disabled composer; dblclick text entry →
+   toast「当前 Signal 会话无法发送，请确认已选择聊天且通道可用」, total and
+   draft unchanged; start channel → 「已连接 · +86***50」, draft intact.
+4. **AI / toUpScreen — PASS.** SmartReply AI round-trip (typed question → AI
+   bubble) then send-arrow on own bubble → text landed in composer only,
+   `data-total-items` unchanged, nothing sent.
+5. **Voice refill — chain PASS, capture+ASR needs-human.** `.sg-voice` click
+   (trusted coords) → `#/record` window opened and cancelled cleanly, main
+   composer untouched. Record window shows「无配额-请联系管理员」— the ASR
+   backend has no quota, so mic capture → recognition → refill is
+   **needs-human + needs quota**. Cross-conversation draft isolation is
+   untestable on this profile: only one conversation exists.
+6. **KT remark — still blocked** (WIP replaced the L1 UI; product decision
+   pending, see below).
+
+Environment note: the dev client is left **running** with the channel **ready**
+(`bx y · +86***50`, conversation 「菲菲 林」, draft cleared, total 19 = +1 real
+probe send from item 1).
+
+<details><summary>Previous state (2026-08-26): analysis phase</summary>
 
 Environment (keep alive until C finishes):
 
@@ -185,6 +222,8 @@ store, `util.saveContacts`, and a `if (!isSignalSession)` guard before any
 - Do not "fix" this by editing the WIP files — they are byte-frozen (§5).
 - Product decision needed: L1 local remark vs WIP friend-remark — keep both,
   merge, or drop one. Recorded as an open item in §6.
+
+</details>
 
 ### 3.4 D · push — authorized, runs after C passes
 
