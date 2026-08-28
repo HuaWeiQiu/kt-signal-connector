@@ -97,6 +97,12 @@ under `/tmp/kt-soak-8g/run1/`. One-shot check cron `01M11MKQ8METJ1W79QNF32RRS4`
 fires 2026-08-28 21:07 +08:00 (session-local — if this session is gone, check
 by hand with the commands below).
 
+**Mid-run snapshot 2026-08-28 15:55 (+08:00, ~19 h in):** 8/8 engines
+`state=running`, `resourcePressure=False`, aggregate RSS steady ≈ 1.44 GiB
+(1530871808 B) — slightly above run 1's 1.32 GiB plateau, flat across the last
+several 5-min lines, no climb. On track to complete ~20:52 today; the one-shot
+cron above will record the final verdict.
+
 <details><summary>Original run record (2026-08-26)</summary>
 
 Tier-1 (no real Signal accounts; 8 signal-cli engines at the group ceiling,
@@ -170,9 +176,16 @@ worktree root):
 6. **KT remark — still blocked** (WIP replaced the L1 UI; product decision
    pending, see below).
 
-Environment note: the dev client is left **running** with the channel **ready**
-(`bx y · +86***50`, conversation 「菲菲 林」, draft cleared, total 19 = +1 real
-probe send from item 1).
+**Environment note (2026-08-28 15:55 check):** the P0 dev client is **down** —
+the Vite process exited cleanly at ~2026-08-27 01:00 (+08:00), ~1 h 48 min
+uptime (`/tmp/kt-signal-dev.log` ends `Done in 6461.34s.`, no crash, same host
+teardown window that ended soak run 1). Items ①–④ results above stand (they
+were validated 2026-08-27 00:2x–01:0x). To finish the remaining human-facing items
+(⑤ voice ASR, ⑥ KT remark) the dev client must be restarted from
+`/tmp/kt-p0-test` with the §5 env vars. Channel state: was left ready
+(`bx y · +86***50`, 「菲菲 林」, draft cleared, total 19 = +1 real probe send
+from item 1) — the connector/JVM exited with the client, so a fresh start
+re-links the existing account.
 
 <details><summary>Previous state (2026-08-26): analysis phase</summary>
 
