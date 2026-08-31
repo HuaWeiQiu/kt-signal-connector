@@ -1,8 +1,9 @@
 # Signal Integration — Handover
 
-Date: 2026-08-26 (updated 2026-08-27 00:30 +08:00). Owner: KT AI engineering.
+Date: 2026-08-26 (updated 2026-09-01 02:55 +08:00). Owner: KT AI engineering.
 Status: **Phase 4 (JVM-per-proxy-group) resumed, implemented and contract-pinned
-locally; nothing pushed. 8-engine soak running (ends ~2026-08-27 20:44 +08:00);
+locally; nothing pushed. Tier-1 24 h soak PASSED (run 2 completed 24 h
+wall-clock on 2026-08-28 20:52 +08:00; host slept ≈13 h cumulative — §3.2);
 P0 real-device acceptance: all machine-checkable items pass (§3.3).**
 
 ---
@@ -14,7 +15,7 @@ P0 real-device acceptance: all machine-checkable items pass (§3.3).**
 | Phase 4 design | committed | connector `1749ed3` (ADR 0001, §4.4, schema additive) |
 | Phase 4 implementation | committed | connector `7996828` (one engine per proxy group) |
 | A · contract pinning | committed | connector `c742fc9`; desktop `387400c5` (contract 1.5) |
-| B · soak tier-1 (8 engines, no real accounts) | **re-run in progress** since 2026-08-27 20:52 +08:00 (run 1: INCOMPLETE at ~4.7/24 h, host teardown, window healthy) | `/tmp/kt-soak-8g/`; see §3.2 |
+| B · soak tier-1 (8 engines, no real accounts) | **PASSED** — run 2 completed 24 h wall-clock (2026-08-27 20:52 → 2026-08-28 20:52 +08:00), all criteria green; host slept ≈13 h cumulative, effective active ≈10.7 h — see §3.2 caveat | `/tmp/kt-soak-8g/run2/`; see §3.2 |
 | B · soak tier-2 (real accounts) | **blocked** — needs a 2nd real account + phone | §6 |
 | C · P0 real-device acceptance | **machine-checkable items all pass** (2026-08-27 probe round: items 1-4 pass, 5 chain pass + ASR needs-human, 6 blocked on product decision); smoke 11 pass / 0 fail / 1 skip | §3.3 |
 | D · push both repos | authorized by owner, **waits for C to pass** | §3.4 |
@@ -67,7 +68,46 @@ from the design docs; Phase 4 is now complete on both repos:
 - desktop `387400c5` formalizes the new error codes and dormant-group UI copy;
   host contract bumped to **1.5** (`contracts/signal-host-adapter.md`).
 
-### 3.2 B · 24h soak — tier-1 **INCOMPLETE (host teardown, observed window healthy)**, tier-2 blocked
+### 3.2 B · 24h soak — tier-1 **PASSED (run 2, 24 h wall-clock — see the active-time caveat below)**, tier-2 blocked
+
+**Final verdict (checked by hand 2026-09-01 02:55 +08:00):** run 2 completed the
+planned 24 h — `driver.log` ends with `soak duration complete` at
+**2026-08-28 20:52:49 +08:00** after starting 2026-08-27 20:52:01. Pass
+criteria all green:
+
+- **144/144 status lines** all `state=running`, `resourcePressure=False`, zero
+  bad lines.
+- **One process set for the whole run**: `rss.csv` shows a single pid per role
+  across all 654 samples — connector 14497, engines 14501–14508; nothing
+  restarted or crashed.
+- Per-engine RSS over 654 samples each, first→last/max MiB: default 184→196/196,
+  g1 196→196/196, g2 181→192/192, g3 191→191/191, g4 176→188/188, g5 176→187/187,
+  g6 149→161/161, g7 143→147/147 — flat or plateau, **no monotonic climb**.
+  Connector RSS flat at 13 MiB; aggregate RSS ≈ 1.43 GiB (1,532,182,528 B at
+  the end), slightly above run 1's 1.32 GiB plateau, flat across the window.
+- **Active-time caveat (read before citing this run)**: despite
+  `caffeinate -dims -w`, the host slept repeatedly — 16 status-line gaps
+  > 10 min totalling ≈ 13.3 h (longest: the overnight 00:51 → 08:26 block,
+  ≈ 7.6 h; lid-close sleep bypasses `-dims`, and an early guard death cannot
+  be ruled out either). Engines were suspended, not killed — every post-gap
+  sample resumed `running` with the same pids — but effective non-suspended
+  soak time is only ≈ 10.7 h of the 24 h wall-clock window. The driver's own
+  gate (24 h wall-clock, every recorded sample green) is met; a stricter
+  "24 h continuously awake" reading is not. Re-running with the lid open /
+  display kept awake (or `caffeinate -s` on AC) is cheap if the owner wants
+  the strict reading.
+- Artifacts archived under `/tmp/kt-soak-8g/run2/` (`driver.log`,
+  `driver-stdout.log`, `rss.csv`, `connector.log`). Run 1's archive (`run1/`)
+  was found emptied on 2026-09-01 (macOS /tmp cleanup); run-1 numbers survive
+  in the 2026-08-27 handover update (git history) and its observed window was
+  healthy before the host teardown.
+
+Tier-1 gate is met on the stated criteria (wall-clock; see the active-time
+caveat above). Tier-2 (real accounts, real traffic) remains **blocked**: needs
+a second real Signal account and a phone to approve linking. Do not fake this
+with the single existing test account — it has no peer that replies (see §5).
+
+#### History: run 1 INCOMPLETE + run 2 start (kept for the record)
 
 **Result of the 2026-08-27 20:37 check:** the soak did **not** reach 24 h. All
 processes (driver, connector pid 86084, engines 86092–86099) are gone; the last
@@ -91,17 +131,17 @@ Observed window (20:44 → 01:24) was healthy on every criterion:
 
 **Re-run started 2026-08-27 20:52 +08:00** — connector pid 14497, engines
 14501–14508, handshake ok, 8/8 `running` at launch. This time the driver and
-connector are guarded by `caffeinate -dims -w <pid>` (pids 15259/15260) so an
-idle-sleeping host cannot silently end the run; run-1 artifacts are archived
-under `/tmp/kt-soak-8g/run1/`. One-shot check cron `01M11MKQ8METJ1W79QNF32RRS4`
-fires 2026-08-28 21:07 +08:00 (session-local — if this session is gone, check
-by hand with the commands below).
+connector were guarded by `caffeinate -dims -w <pid>` (pids 15259/15260);
+run-1 artifacts were archived under `/tmp/kt-soak-8g/run1/` (since wiped by
+/tmp cleanup). One-shot check cron `01M11MKQ8METJ1W79QNF32RRS4` was set for
+2026-08-28 21:07 +08:00 (session-local); its session died before the fire
+time, so the final verdict was checked by hand (see the verdict block at the
+top of this section).
 
 **Mid-run snapshot 2026-08-28 15:55 (+08:00, ~19 h in):** 8/8 engines
 `state=running`, `resourcePressure=False`, aggregate RSS steady ≈ 1.44 GiB
 (1530871808 B) — slightly above run 1's 1.32 GiB plateau, flat across the last
-several 5-min lines, no climb. On track to complete ~20:52 today; the one-shot
-cron above will record the final verdict.
+several 5-min lines, no climb. The run went on to complete on schedule.
 
 <details><summary>Original run record (2026-08-26)</summary>
 
@@ -176,7 +216,8 @@ worktree root):
 6. **KT remark — still blocked** (WIP replaced the L1 UI; product decision
    pending, see below).
 
-**Environment note (2026-08-28 15:55 check):** the P0 dev client is **down** —
+**Environment note (checked 2026-08-28 15:55; re-checked 2026-09-01 02:55 —
+still down, port 3355 silent):** the P0 dev client is **down** —
 the Vite process exited cleanly at ~2026-08-27 01:00 (+08:00), ~1 h 48 min
 uptime (`/tmp/kt-signal-dev.log` ends `Done in 6461.34s.`, no crash, same host
 teardown window that ended soak run 1). Items ①–④ results above stand (they
@@ -325,8 +366,8 @@ both repos.
   suspected real-machine feel issue — P0 to verify by hand.
 - **link QR / quote UI / `unknown`/`failed` status values** not exercised on
   machine.
-- **Phase 4 long-run soak**: tier-1 running (§3.2); multi-group RSS curve at
-  the 8-group ceiling will be answered by it; tier-2 blocked.
+- **Phase 4 long-run soak**: tier-1 **passed** on 2026-08-28 (run 2, 24 h
+  wall-clock — but see the active-time caveat in §3.2); tier-2 blocked.
 - **Native long-run soak**: only ~1 min window observed.
 - **`scripts/signal-real-e2e-cdp.mjs`** and the `.tmp/` probes are test
   scaffolding; `.command` files are hand-edited per run. `/tmp/kt-p0-test`
@@ -357,7 +398,7 @@ both repos.
 - Desktop handover (long-form): `docs/plan/signal-handoff-next-owner.md` in
   the desktop worktree — its §6.27 mirrors this file's §3.
 
-## 8. Exact git state (2026-08-26 22:10 +08:00)
+## 8. Exact git state (2026-08-26 22:10 +08:00; docs-only commits after this — see note at end)
 
 ### connector — `main`, working tree clean, not pushed
 
@@ -385,3 +426,6 @@ d4de1d24 docs(signal): record the shutdown race as found and fixed
 ```
 
 Uncommitted: **only** the frozen WIP listed in §5 (6 modified + 2 untracked).
+Docs commits since this snapshot: connector `e0f8057`/`b1d7c01`/`2002ba7`/
+`7316dc7`, desktop `456211d8`/`60fe8bc3`/`185aa4e6`/`c2171a0c` — handover
+records only (soak runs, P0 probe round, env status); **no code changes**.
