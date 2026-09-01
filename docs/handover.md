@@ -317,6 +317,8 @@ store, `util.saveContacts`, and a `if (!isSignalSession)` guard before any
   while the WIP sits in the tree. Either stash the WIP to test the L1 UI, or
   accept that the remark feature is now the WIP author's deliverable.
 - Do not "fix" this by editing the WIP files — they are byte-frozen (§5).
+  **Update 2026-09-01 20:55: the owner lifted the freeze; the WIP landed as
+  desktop commit `f40ae70f` (see §5 and §8).**
 - Product decision needed: L1 local remark vs WIP friend-remark — keep both,
   merge, or drop one. Recorded as an open item in §6.
 
@@ -360,15 +362,21 @@ both repos.
 
 ## 5. Known open items
 
-- **Someone else's WIP in the desktop worktree — frozen, never commit, never
-  edit:** `src/view/signal/signalFriendRemark.ts`,
+- **Former someone-else's WIP in the desktop worktree — landed 2026-09-01 as
+  desktop `84641905` (baseline adaptation: `QueryOptions.target`,
+  `xRemarkFailureOwnerGuard` AppType mock) + `f40ae70f` (the feature itself,
+  8 files, +709/−73; includes the mock typing fix that closed the last
+  `typecheck:signal` red):** `src/view/signal/signalFriendRemark.ts`,
   `tests/unit/signalFriendRemark.spec.ts`, `src/apis/friendApis.ts`,
   `src/libs/AppType.ts`, `src/view/home/Home.vue`,
   `src/view/home/components/FriendEditModal.vue`,
   `tests/unit/signalQuickReplyComponent.spec.ts`, plus the remark hunks inside
   `SignalWorkspace.vue` (remark-entry button, remarkRows card, openRemark
-  series, sg-remark CSS). They cause the 2 `typecheck:signal` reds and 1
-  `test:unit` red that are baseline and not ours. **They also replaced the L1
+  series, sg-remark CSS). Gates after landing: unit 153 files / 1412 tests
+  green, `typecheck:signal` green, production build green, `git diff --check`
+  clean. P0 ⑥ KT-remark acceptance now targets this deliverable and still
+  needs the dev client; the L1-vs-WIP remark product call is no longer a
+  blocker for the landed code. **They also replaced the L1
   KT-remark title-bar UI — see §3.3.**
 - **Receive inbound rendering** never verified end-to-end: the only linked
   test account's peer does not reply, and there is no Note to Self to
@@ -440,7 +448,8 @@ ca2d2465 feat(signal): 本地存储落盘加密与 store key 托管
 d4de1d24 docs(signal): record the shutdown race as found and fixed
 ```
 
-Uncommitted: **only** the frozen WIP listed in §5 (6 modified + 2 untracked).
+Uncommitted: **nothing** — the frozen WIP listed in §5 landed on 2026-09-01 as
+desktop `84641905` + `f40ae70f` (first code commits of this work stream).
 Docs commits since this snapshot: connector `e0f8057`/`b1d7c01`/`2002ba7`/
 `7316dc7`, desktop `456211d8`/`60fe8bc3`/`185aa4e6`/`c2171a0c` — handover
 records only (soak runs, P0 probe round, env status); **no code changes**.
