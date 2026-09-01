@@ -1,6 +1,6 @@
 # Signal Integration — Handover
 
-Date: 2026-08-26 (updated 2026-09-01 02:55 +08:00). Owner: KT AI engineering.
+Date: 2026-08-26 (updated 2026-09-01 20:01 +08:00). Owner: KT AI engineering.
 Status: **Phase 4 (JVM-per-proxy-group) resumed, implemented and contract-pinned
 locally; nothing pushed. Tier-1 24 h soak PASSED (run 2 completed 24 h
 wall-clock on 2026-08-28 20:52 +08:00; host slept ≈13 h cumulative — §3.2);
@@ -20,9 +20,10 @@ P0 real-device acceptance: all machine-checkable items pass (§3.3).**
 | C · P0 real-device acceptance | **machine-checkable items all pass** (2026-08-27 probe round: items 1-4 pass, 5 chain pass + ASR needs-human, 6 blocked on product decision); smoke 11 pass / 0 fail / 1 skip | §3.3 |
 | D · push both repos | authorized by owner, **waits for C to pass** | §3.4 |
 
-Working trees: connector `main` is **clean** at `c742fc9`. Desktop
-`codex/signal-test-main-latest` HEAD is `387400c5`; the only uncommitted files
-are **someone else's WIP** (see §5) — do not commit them.
+Working trees: connector `main` is **clean** at `d9f9071` (docs-only commits
+after `c742fc9` — see §8). Desktop `codex/signal-test-main-latest` HEAD is
+`f6599a02` (docs-only commits after `387400c5` — see §8); the only uncommitted
+files are **someone else's WIP** (see §5) — do not commit them.
 
 ## 1. What was done before Phase 4 (unchanged record)
 
@@ -88,8 +89,9 @@ criteria all green:
 - **Active-time caveat (read before citing this run)**: despite
   `caffeinate -dims -w`, the host slept repeatedly — 16 status-line gaps
   > 10 min totalling ≈ 13.3 h (longest: the overnight 00:51 → 08:26 block,
-  ≈ 7.6 h; lid-close sleep bypasses `-dims`, and an early guard death cannot
-  be ruled out either). Engines were suspended, not killed — every post-gap
+  8 consecutive gaps totalling ≈ 7.6 h; the longest single gap is ≈ 106 min,
+  06:39 → 08:26; lid-close sleep bypasses `-dims`, and an early guard death
+  cannot be ruled out either). Engines were suspended, not killed — every post-gap
   sample resumed `running` with the same pids — but effective non-suspended
   soak time is only ≈ 10.7 h of the 24 h wall-clock window. The driver's own
   gate (24 h wall-clock, every recorded sample green) is met; a stricter
@@ -100,7 +102,10 @@ criteria all green:
   `driver-stdout.log`, `rss.csv`, `connector.log`). Run 1's archive (`run1/`)
   was found emptied on 2026-09-01 (macOS /tmp cleanup); run-1 numbers survive
   in the 2026-08-27 handover update (git history) and its observed window was
-  healthy before the host teardown.
+  healthy before the host teardown. The run-2 artifacts were copied on
+  2026-09-01 to `/Users/tanye/test/kt/soak-archives/run2-20260828/`
+  (byte-identical to `/tmp/kt-soak-8g/run2`); cite the archive copy — /tmp is
+  periodically cleaned.
 
 Tier-1 gate is met on the stated criteria (wall-clock; see the active-time
 caveat above). Tier-2 (real accounts, real traffic) remains **blocked**: needs
@@ -227,6 +232,12 @@ were validated 2026-08-27 00:2x–01:0x). To finish the remaining human-facing i
 (`bx y · +86***50`, 「菲菲 林」, draft cleared, total 19 = +1 real probe send
 from item 1) — the connector/JVM exited with the client, so a fresh start
 re-links the existing account.
+
+**Damage note (2026-09-01):** `/tmp/kt-p0-test` has since been corrupted by
+the periodic /tmp cleanup — `.git` and `package.json` were deleted
+(`git worktree list` marks the worktree prunable) and the probe scripts
+`p0-probe1~5.mjs` are all gone; rebuild the worktree before restarting the
+dev client from that directory as described above.
 
 <details><summary>Previous state (2026-08-26): analysis phase</summary>
 
@@ -378,6 +389,10 @@ both repos.
 
 1. **Phase 4 rollout scope** — default 4 groups; what happens when a customer
    exceeds it (reject new group with a Chinese message, or raise the ceiling)?
+   *2026-09-01 audit note:* "product default 4" is so far only an ADR 0001 /
+   docs convention — no desktop tenant-policy implementation code was found in
+   either repo's source; the hard ceiling 8 is implemented as
+   `MAX_PROXY_GROUPS` in `src/groups.rs`.
 2. **Dormant-group visibility & deletion semantics** — two suggested behavior
    changes came out of the contract-pinning review (whether dormant groups
    should be listed, and whether deleting a group with dormant accounts should
@@ -429,3 +444,5 @@ Uncommitted: **only** the frozen WIP listed in §5 (6 modified + 2 untracked).
 Docs commits since this snapshot: connector `e0f8057`/`b1d7c01`/`2002ba7`/
 `7316dc7`, desktop `456211d8`/`60fe8bc3`/`185aa4e6`/`c2171a0c` — handover
 records only (soak runs, P0 probe round, env status); **no code changes**.
+2026-09-01 final-verdict commits: connector `d9f9071`, desktop `f6599a02` —
+handover records only; this correction commit itself cannot be self-listed.
