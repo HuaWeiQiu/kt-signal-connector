@@ -26,7 +26,7 @@ use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailur
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
     HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesListParams,
-    MessagesRemoteDeleteParams, MessagesSendTextParams, SendTarget,
+    MessagesRemoteDeleteParams, MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -188,6 +188,7 @@ impl HostDispatchLimits {
             method,
             "messages.sendText"
                 | "messages.remoteDelete"
+                | "messages.sendReaction"
                 | "contacts.sync"
                 | "accounts.deleteLocalData"
         ) {
@@ -229,7 +230,9 @@ impl HostDispatchLimits {
             // account cannot occupy every lane permit while waiting on itself.
             let account = account_lock.lock_owned().await;
             let lane = match method {
-                "messages.sendText" | "messages.remoteDelete" => self.send.clone(),
+                "messages.sendText" | "messages.remoteDelete" | "messages.sendReaction" => {
+                    self.send.clone()
+                }
                 "contacts.sync" => self.read.clone(),
                 _ => self.control.clone(),
             }
@@ -1081,6 +1084,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "messages.sendReaction" => {
+            match serde_json::from_value::<MessagesSendReactionParams>(request.params) {
+                Ok(params) => match runtime.send_reaction(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendReaction params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "contacts.sync" => match serde_json::from_value::<ContactsSyncParams>(request.params) {
             Ok(params) => match runtime.sync_contacts(&params.account_id).await {
                 Ok(outcome) => HostResponse::success(
@@ -1548,9 +1567,10 @@ mod tests {
             .unwrap();
     }
 
-    /// remoteDelete is a mutating, account-scoped method: it shares the send
-    /// lane and the per-account mutex with sendText, so two same-account
-    /// mutations can never interleave (docs/remote-delete-l2-plan.md §3.4).
+    /// remoteDelete and sendReaction are mutating, account-scoped methods:
+    /// they share the send lane and the per-account mutex with sendText, so
+    /// two same-account mutations can never interleave
+    /// (docs/remote-delete-l2-plan.md §3.4).
     #[tokio::test]
     async fn remote_delete_and_send_text_serialize_per_account() {
         let limits = Arc::new(HostDispatchLimits::new());
@@ -1579,6 +1599,25 @@ mod tests {
         )
         .await
         .expect("another account's remoteDelete must not serialize behind account-a")
+        .unwrap();
+
+        // sendReaction joins the same mutating set: same-account serialized,
+        // other-account unaffected.
+        let pending_reaction = timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.sendReaction", Some("account-a"), None),
+        )
+        .await;
+        assert!(
+            pending_reaction.is_err(),
+            "sendReaction must wait for the in-flight same-account send"
+        );
+        timeout(
+            Duration::from_millis(50),
+            limits.acquire("messages.sendReaction", Some("account-c"), None),
+        )
+        .await
+        .expect("another account's sendReaction must not serialize behind account-a")
         .unwrap();
 
         drop(send);

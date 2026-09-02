@@ -7,6 +7,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{EngineError, NormalizedReceive};
 use crate::ids::{mask_address, stable_hash_id};
@@ -21,6 +22,7 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_DEVICE_NAME_BYTES: usize = 64;
+const MAX_EMOJI_BYTES: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -733,6 +735,103 @@ impl ConnectorService {
         })
     }
 
+    /// Pure local validation for `messages.sendReaction`
+    /// (docs/remote-delete-l2-plan.md §3.2 shape, upstream `sendReaction`):
+    /// resolve the target row and build the exact upstream jsonRpc params.
+    /// A reaction targets a message that already exists in the local history,
+    /// so both directions are addressable — an own outgoing row qualifies in
+    /// the terminal state `sent` (its `sent_at` is the upstream Signal
+    /// timestamp, same precedent as `resolve_quote`/`prepare_remote_delete`),
+    /// an incoming row carries the envelope timestamp. The target author
+    /// follows the direction: the linked account's own number for outgoing
+    /// rows, the conversation peer for incoming rows. Outgoing rows without a
+    /// terminal `sent` state carry no protocol identity and answer
+    /// `MESSAGE_NOT_FOUND`; group incoming rows persist only a local sender
+    /// hash, not the member's number, so their author is not resolvable
+    /// (deterministic `INVALID_REQUEST`). Nothing is written locally and no
+    /// event is emitted.
+    pub fn prepare_send_reaction(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        emoji: &str,
+        remove: bool,
+    ) -> Result<PreparedSendReaction, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        validate_emoji(emoji)?;
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let conversation = self
+            .store
+            .conversation_by_id(account_id, conversation_id)?
+            .ok_or(StoreError::ConversationNotFound)?;
+        let message = self
+            .store
+            .message_by_id(account_id, conversation_id, message_id)?
+            .ok_or(StoreError::MessageNotFound)?;
+        // signal-cli JSON-RPC sendReaction parameters (verified against the
+        // pinned 0.14.7 distribution: SendReactionCommand dests `emoji`
+        // (required, "should be a single unicode grapheme cluster"),
+        // `target-author`, `target-timestamp` (required Long), `remove`
+        // (storeTrue) and `recipient`/`group-id`/`username`/`note-to-self`;
+        // JsonRpcNamespace.get falls back to
+        // Util.dashSeparatedToCamelCaseString, so jsonRpc carries camelCase
+        // keys): `targetTimestamp` is the reacted-to message's Signal
+        // timestamp, `targetAuthor` its author's number, and
+        // `recipient`/`groupId` address the receiving side — the same
+        // addressing shape as `send`/`remoteDelete`.
+        let target_author = match message.direction {
+            // We authored it: the author is the linked account itself. Only a
+            // completed send carries the upstream timestamp Signal reactions
+            // match on; pending/failed/unknown rows would mis-target.
+            "outgoing" if message.status == "sent" => account.signal_account.clone(),
+            // An outgoing row without the terminal `sent` state carries no
+            // upstream protocol identity (its sent_at is a local clock value)
+            // and is indistinguishable from a missing row (remoteDelete
+            // precedent).
+            "outgoing" => return Err(StoreError::MessageNotFound.into()),
+            // In a direct chat the only other possible author is the peer.
+            // Incoming rows store the envelope timestamp, which is the
+            // protocol identity a reaction references (same precedent as
+            // quote resolution).
+            "incoming" if conversation.kind == "direct" => conversation.peer_key.clone(),
+            // Group messages do not persist the member address (only a local
+            // sender hash), and system rows have no author at all: reacting
+            // cannot be addressed upstream, so it fails deterministically
+            // instead of mis-targeting (quote-resolution precedent).
+            _ => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "reaction target author is not resolvable",
+                    false,
+                )));
+            }
+        };
+        let mut params = json!({
+            "account": account.signal_account,
+            "emoji": emoji,
+            "remove": remove,
+            "targetAuthor": target_author,
+            "targetTimestamp": message.sent_at,
+        });
+        if conversation.kind == "group" {
+            params["groupId"] = json!(conversation.peer_key);
+        } else {
+            params["recipient"] = json!([conversation.peer_key]);
+        }
+        Ok(PreparedSendReaction {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            params,
+        })
+    }
+
     pub fn complete_send_success(
         &self,
         pending_id: &str,
@@ -1000,6 +1099,16 @@ pub struct PreparedRemoteDelete {
     pub params: Value,
 }
 
+/// Everything the supervisor needs to run one upstream `sendReaction` call,
+/// produced by the pure local `prepare_send_reaction` validation.
+#[derive(Debug)]
+pub struct PreparedSendReaction {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub params: Value,
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -1107,6 +1216,18 @@ pub struct MessagesRemoteDeleteParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendReactionParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub emoji: String,
+    #[serde(default)]
+    pub remove: bool,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactsSyncParams {
     pub account_id: String,
@@ -1141,6 +1262,29 @@ fn validate_text(text: &str) -> Result<(), ServiceError> {
         return Err(ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
             "text must contain between 1 and 65536 bytes",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// The reaction must be exactly one unicode grapheme cluster of at most 32
+/// UTF-8 bytes — the pinned signal-cli requirement ("should be a single
+/// unicode grapheme cluster", SendReactionCommand --emoji). Grapheme clusters
+/// keep multi-codepoint emoji (ZWJ sequences, skin-tone modifiers, flags)
+/// valid while rejecting multi-emoji strings.
+fn validate_emoji(emoji: &str) -> Result<(), ServiceError> {
+    if emoji.is_empty() || emoji.len() > MAX_EMOJI_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "emoji must contain between 1 and 32 bytes",
+            false,
+        )));
+    }
+    if emoji.graphemes(true).count() != 1 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "emoji must be a single unicode grapheme cluster",
             false,
         )));
     }
@@ -2228,6 +2372,249 @@ mod tests {
                 .code,
             "ACCOUNT_NOT_FOUND"
         );
+    }
+
+    /// messages.sendReaction resolves the local row to the upstream
+    /// addressing: the target author follows the row direction — the linked
+    /// account's own number for a `sent` outgoing row, the peer for an
+    /// incoming direct row — and the conversation's kind selects `recipient`
+    /// vs `groupId` (docs/remote-delete-l2-plan.md §3.2 shape, contract
+    /// revision 1.7). remove passes through as an explicit boolean.
+    #[test]
+    fn send_reaction_maps_rows_to_the_direction_derived_target_author() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // Outgoing `sent` row: targetAuthor is the linked account itself.
+        let sent_id = match service
+            .prepare_send_text(&account.id, &direct.id, "react to me", "req-sr-1", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&sent_id, &account.id, &direct.id, 777)
+            .unwrap();
+        let prepared = service
+            .prepare_send_reaction(&account.id, &direct.id, &sent_id, "👍", false)
+            .unwrap();
+        assert_eq!(prepared.params["account"], json!("+15555550100"));
+        assert_eq!(prepared.params["emoji"], json!("👍"));
+        assert_eq!(prepared.params["remove"], json!(false));
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(777));
+        assert_eq!(prepared.params["recipient"], json!(["+15555550101"]));
+        assert!(prepared.params.get("groupId").is_none());
+        assert_eq!(prepared.account_id, account.id);
+        assert_eq!(prepared.conversation_id, direct.id);
+        assert_eq!(prepared.message_id, sent_id);
+
+        // Incoming row (direct chat): targetAuthor is the peer and the
+        // envelope timestamp is the protocol identity.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(50),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("peer text".into()),
+                    text_bytes: Some(9),
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let incoming = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        let prepared = service
+            .prepare_send_reaction(&account.id, &direct.id, &incoming.id, "🎉", true)
+            .unwrap();
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550101"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(50));
+        assert_eq!(prepared.params["remove"], json!(true));
+
+        // Group conversation: groupId addressing, no recipient.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
+            .unwrap();
+        let group_message_id = match service
+            .prepare_send_text(&account.id, &group.id, "group react", "req-sr-2", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&group_message_id, &account.id, &group.id, 888)
+            .unwrap();
+        let prepared = service
+            .prepare_send_reaction(&account.id, &group.id, &group_message_id, "👍", false)
+            .unwrap();
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(888));
+        assert_eq!(prepared.params["groupId"], json!("Z3JvdXAtaWQ="));
+        assert!(prepared.params.get("recipient").is_none());
+    }
+
+    /// The eligibility guard is deterministic and local: rows without a
+    /// resolvable protocol identity (missing, pending/failed/unknown, system)
+    /// answer MESSAGE_NOT_FOUND, and a group incoming row's author address is
+    /// not persisted at all — a deterministic INVALID_REQUEST, never a
+    /// mis-addressed upstream reaction (quote-resolution precedent).
+    #[test]
+    fn send_reaction_rejects_rows_without_a_resolvable_target_author() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(&account.id, &conversation.id, "in flight", "req-sr-p", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        for status in ["pending", "failed", "unknown"] {
+            service
+                .store_ref()
+                .update_message_status(&pending_id, status, None)
+                .unwrap();
+            let error = service
+                .prepare_send_reaction(&account.id, &conversation.id, &pending_id, "👍", false)
+                .unwrap_err();
+            assert_eq!(
+                error.into_api().code,
+                "MESSAGE_NOT_FOUND",
+                "a {status} row must not be reactable"
+            );
+        }
+
+        // A group incoming message's author address is not persisted (only a
+        // local sender hash), so the reaction cannot be addressed upstream.
+        service
+            .sync_accounts_from_numbers(&["+15555550101".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-one", "group")
+            .unwrap();
+        let group_events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(900),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550105".into()),
+                    peer_name: None,
+                    group_id: Some("group-one".into()),
+                    text: Some("group text".into()),
+                    text_bytes: Some(10),
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let group_message = group_events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .prepare_send_reaction(&account.id, &group.id, &group_message.id, "👍", false)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "INVALID_REQUEST"
+        );
+
+        // A never-existing row, conversation, or account answer their own
+        // deterministic codes.
+        assert_eq!(
+            service
+                .prepare_send_reaction(&account.id, &conversation.id, "absent-message", "👍", false)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "MESSAGE_NOT_FOUND"
+        );
+        assert_eq!(
+            service
+                .prepare_send_reaction(&account.id, "absent-conversation", "anything", "👍", false)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "CONVERSATION_NOT_FOUND"
+        );
+        assert_eq!(
+            service
+                .prepare_send_reaction(
+                    "absent-account",
+                    "absent-conversation",
+                    "anything",
+                    "👍",
+                    false
+                )
+                .unwrap_err()
+                .into_api()
+                .code,
+            "ACCOUNT_NOT_FOUND"
+        );
+    }
+
+    /// The emoji guard enforces the pinned signal-cli contract locally:
+    /// exactly one unicode grapheme cluster, 1-32 UTF-8 bytes. Multi-codepoint
+    /// clusters (ZWJ family emoji, skin-tone modifiers) stay valid.
+    #[test]
+    fn emoji_validation_accepts_single_clusters_and_rejects_the_rest() {
+        assert!(validate_emoji("👍").is_ok());
+        assert!(validate_emoji("❤️").is_ok());
+        assert!(validate_emoji("👍🏽").is_ok());
+        assert!(validate_emoji("👨‍👩‍👧‍👦").is_ok());
+        // One 32-byte ZWJ cluster: the byte bound, still a single grapheme.
+        assert!(validate_emoji("👨‍👩‍👧‍👦‍👍").is_ok());
+
+        for bad in [
+            "",
+            "ab",
+            "👍👍",
+            &"x".repeat(33),
+            "👨‍👩‍👧‍👦‍👍🏽",             // 36 bytes in one cluster: over the bound
+            &"👍".repeat(17), // 68 bytes: over the bound
+        ] {
+            assert!(
+                validate_emoji(bad).is_err(),
+                "emoji {bad:?} must be rejected"
+            );
+        }
     }
 
     /// message.statusChanged is produced on real transitions only: sent after

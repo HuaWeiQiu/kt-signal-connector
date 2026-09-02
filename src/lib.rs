@@ -42,6 +42,7 @@ pub const PHASE2_CAPABILITIES: &[&str] = &[
     "messages.getText",
     "messages.sendText",
     "messages.remoteDelete",
+    "messages.sendReaction",
     "contacts.sync",
     "contacts.list",
 ];

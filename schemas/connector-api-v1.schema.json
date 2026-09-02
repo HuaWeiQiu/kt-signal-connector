@@ -50,6 +50,7 @@
             "messages.getText",
             "messages.sendText",
             "messages.remoteDelete",
+            "messages.sendReaction",
             "contacts.sync",
             "contacts.list"
           ]
@@ -175,6 +176,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesRemoteDeleteParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendReaction" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendReactionParams" }
             }
           }
         },
@@ -349,6 +361,29 @@
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "messageId": { "$ref": "#/$defs/opaqueId" },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesSendReactionParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId", "emoji"],
+      "description": "Send or remove a reaction to one message that already exists in the local history. Targeting is by conversationId only. A local outgoing row qualifies in the terminal state 'sent' (its sentAt is the upstream Signal timestamp); an incoming row carries the envelope timestamp, so both directions are addressable. The target author follows the row direction: the linked account's own number for outgoing rows, the conversation peer for incoming rows. Rows without a resolvable protocol identity (missing, pending/failed/unknown outgoing, system) answer MESSAGE_NOT_FOUND; a group incoming row persists only a local sender hash, so its author is not resolvable and the request fails with a deterministic INVALID_REQUEST. The result is {status: 'sent'} when signal-cli confirmed the reaction, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. remove=true removes a previously sent reaction (upstream best effort).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "emoji": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "The reaction; a single unicode grapheme cluster of at most 32 UTF-8 bytes, mirroring the pinned signal-cli requirement."
+        },
+        "remove": {
+          "type": "boolean",
+          "default": false,
+          "description": "True removes a previously sent reaction; the emoji must still identify the reaction to remove."
+        },
         "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },

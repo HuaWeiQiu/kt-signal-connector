@@ -286,6 +286,58 @@ through the handshake `capabilities` array — calling it against an older conne
   mutex (same-account `sendText`/`remoteDelete`/`contacts.sync`/`deleteLocalData` serialize), the
   delete drain barrier, and the per-account request budget. Metrics classify it as `send`.
 
+### 4.6 messages.sendReaction (contract revision 1.7, 2026-09-03)
+
+API `1.0` evolves in place again (§4.5 precedent); the apiVersion handshake binding is unchanged.
+The method is additive: a host that never calls it sees no change, and a host must detect support
+through the handshake `capabilities` array — calling it against an older connector answers
+`METHOD_NOT_ALLOWED`. It follows the `messages.remoteDelete` (§4.5) implementation shape end to
+end; design rationale and the upstream-verification notes live in `docs/remote-delete-l2-plan.md`
+§3.2.
+
+- `messages.sendReaction` sends or removes a reaction on one message that already exists in the
+  local history. Params: `accountId`, `conversationId`, `messageId`, `emoji` (all required; the
+  first three opaque ids) plus an optional `remove` (boolean, default `false`) and an optional
+  `operationId` that the connector validates by shape but never persists — there is no operation
+  ledger and no store migration. Addressing is by `conversationId` only: the target must already
+  exist in the local history.
+- `emoji` must be a single unicode grapheme cluster of 1–32 UTF-8 bytes — the pinned signal-cli
+  requirement (SendReactionCommand `--emoji` help text, verified via `javap` against the pinned
+  0.14.7 distribution). Grapheme clustering keeps multi-codepoint emoji (ZWJ sequences,
+  skin-tone modifiers, flags) valid while rejecting multi-emoji strings; the service enforces the
+  rule deterministically.
+- Eligibility and target identity: an own outgoing row qualifies in the terminal state `sent`
+  (its `sentAt` was overwritten with the send response's upstream Signal timestamp); an incoming
+  row carries the envelope timestamp, so it is addressable too. The upstream `targetAuthor`
+  follows the row direction — the linked account's own number for outgoing rows, the conversation
+  peer for incoming direct rows (the quote-resolution precedent). Pending/failed/unknown rows
+  carry no protocol identity and answer `MESSAGE_NOT_FOUND`; a group incoming row persists only a
+  local sender hash, never the member's number, so its author is not resolvable and the request
+  fails with a deterministic `INVALID_REQUEST` instead of a mis-addressed upstream reaction. The
+  conversation's kind selects the addressing: `recipient: [peerKey]` for direct chats,
+  `groupId: peerKey` for groups (signal-cli jsonRpc `sendReaction` params
+  `account`/`emoji`/`remove`/`targetAuthor`/`targetTimestamp`/`recipient`/`groupId`, verified
+  against the pinned 0.14.7 distribution).
+- Result: `{"status": "sent"}` when signal-cli confirmed the reaction, or `{"status": "unknown"}`
+  when the outcome of the mutating upstream call is indeterminate. The `unknown` semantics equal
+  every `*_OUTCOME_UNKNOWN` error: the connector never retries automatically; a host may
+  explicitly re-send with a fresh requestId and the same `operationId`. `remove=true` removes a
+  previously sent reaction (upstream best effort); the emoji must still identify the reaction to
+  remove.
+- Error mapping reuses existing codes only (zero new codes): `ACCOUNT_NOT_FOUND`,
+  `CONVERSATION_NOT_FOUND`, `MESSAGE_NOT_FOUND` (missing or ineligible row), `RUNTIME_NOT_RUNNING`,
+  `INVALID_REQUEST` (shape, emoji, or unresolvable group-incoming author), `UPSTREAM_EXITED`, and
+  `UPSTREAM_ERROR` for an explicit upstream rejection (unknown target, unregistered recipient,
+  reaction not found) — its `retryable=true` is the global mapping, and hosts must not auto-retry
+  reactions on it.
+- Known behavior boundaries: the local `messages` row is intentionally left unchanged on a
+  successful reaction; incoming reaction envelopes from peers are not yet converged into a
+  rendered-reaction state locally; nothing is emitted to `message.statusChanged` by this method.
+- Dispatch inherits the mutating infrastructure unchanged: the write lane with the per-account
+  mutex (same-account `sendText`/`remoteDelete`/`sendReaction`/`contacts.sync`/`deleteLocalData`
+  serialize), the delete drain barrier, and the per-account request budget. Metrics classify it
+  as `send`.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

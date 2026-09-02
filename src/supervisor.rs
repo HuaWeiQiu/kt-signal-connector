@@ -1161,6 +1161,41 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// Best-effort reaction add/remove for one message with a resolvable
+    /// protocol identity (contract revision 1.7): local prepare under the
+    /// service lock, upstream `sendReaction` call without it — the same shape
+    /// as `send_text` and `remote_delete`. No local row is created or changed
+    /// and no event is emitted; an indeterminate mutating outcome maps to the
+    /// explicit `{"status":"unknown"}` response, never to an automatic retry.
+    pub async fn send_reaction(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        remove: bool,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_send_reaction(
+                &account_id,
+                &conversation_id,
+                &message_id,
+                &emoji,
+                remove,
+            )?
+        };
+        match engine
+            .call("sendReaction", prepared.params, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Read-only view of the contacts cache; never triggers an upstream call.
     pub async fn list_contacts(
         &self,
@@ -1818,6 +1853,96 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, "sent");
         assert_eq!(row.sent_at, 421);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// The engine runs the real fake-signal-cli fixture: its `sendReaction`
+    /// handler exits with the mutating call in flight (targetTimestamp 423),
+    /// so the upstream result is lost mid-call. The supervisor must surface
+    /// that as the explicit `unknown` response — not a retryable error — and
+    /// never re-issue the call. The local row is untouched: reactions change
+    /// nothing locally (contract revision 1.7).
+    #[tokio::test]
+    async fn send_reaction_with_a_lost_upstream_result_answers_unknown() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match supervisor
+            .service
+            .lock()
+            .await
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "react to me",
+                "req-sr-crash",
+                None,
+            )
+            .unwrap()
+        {
+            crate::service::PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            crate::service::PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        supervisor
+            .service
+            .lock()
+            .await
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 423)
+            .unwrap();
+
+        assert_eq!(
+            supervisor
+                .send_reaction(
+                    account.id.clone(),
+                    conversation.id.clone(),
+                    pending_id.clone(),
+                    "👍".to_string(),
+                    false
+                )
+                .await
+                .unwrap(),
+            "unknown",
+            "a lost mutating result must answer unknown, never retry"
+        );
+
+        // The local row is untouched and no statusChanged event was emitted:
+        // sendReaction changes nothing locally (contract revision 1.7).
+        let row = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "sent");
+        assert_eq!(row.sent_at, 423);
         supervisor.shutdown().await.unwrap();
     }
 }

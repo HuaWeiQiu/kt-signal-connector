@@ -591,6 +591,22 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn send_reaction(
+        &self,
+        params: crate::service::MessagesSendReactionParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_reaction(
+                params.account_id,
+                params.conversation_id,
+                params.message_id,
+                params.emoji,
+                params.remove,
+            )
+            .await
+    }
+
     pub async fn sync_contacts(
         &self,
         account_id: &str,

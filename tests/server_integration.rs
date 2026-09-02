@@ -1188,6 +1188,251 @@ async fn remote_delete_maps_the_sent_row_and_answers_upstream_outcome() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// messages.sendReaction (contract revision 1.7, docs/remote-delete-l2-plan.md
+/// §3.2 shape): reactions on a sent outgoing row and on an incoming row both
+/// answer {"status":"sent"} with the direction-derived targetAuthor and the
+/// conversation-kind addressing; unknown params fail with INVALID_REQUEST; a
+/// missing message is MESSAGE_NOT_FOUND without touching the upstream; a
+/// multi-grapheme emoji is rejected by shape before any local lookup.
+#[tokio::test]
+async fn send_reaction_maps_row_direction_and_answers_upstream_outcome() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [29_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Send-Reaction" }),
+    )
+    .await;
+    // The fixture emits one receive notification after finishLink; the frames
+    // can interleave with the finish response, so drain until both arrive.
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut finished: Option<Value> = None;
+    let mut upserted: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while finished.is_none() || upserted.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                finished = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted") {
+                upserted = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("link finish must persist the fixture's receive notification");
+    let account_id = finished.unwrap()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The fixture's receive: source +15555550101, envelope timestamp 42.
+    let upserted = upserted.unwrap();
+    let incoming_id = upserted["data"]["id"].as_str().unwrap().to_string();
+    let conversation_id = upserted["data"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // React to the incoming row: targetAuthor is the peer, targetTimestamp is
+    // the envelope timestamp, remove defaults to false.
+    let reacted = request(
+        &mut client,
+        "sr-incoming",
+        "messages.sendReaction",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": incoming_id,
+            "emoji": "👍",
+            "operationId": "sr-operation-in"
+        }),
+    )
+    .await;
+    assert_eq!(reacted["result"]["status"], "sent");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log sendReaction params");
+    let reaction_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the sendReaction must reach the upstream");
+    assert_eq!(reaction_call["account"], "+15555550100");
+    assert_eq!(reaction_call["emoji"], "👍");
+    assert_eq!(reaction_call["remove"], false);
+    assert_eq!(reaction_call["targetAuthor"], "+15555550101");
+    assert_eq!(reaction_call["targetTimestamp"], 42);
+    assert_eq!(reaction_call["recipient"], json!(["+15555550101"]));
+
+    // Outgoing `sent` row: targetAuthor is the linked account itself, and
+    // remove=true passes through as an explicit boolean.
+    let sent = request(
+        &mut client,
+        "send-1",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "react to me",
+            "clientRequestId": "sr-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let removed = request(
+        &mut client,
+        "sr-outgoing",
+        "messages.sendReaction",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": sent["result"]["id"],
+            "emoji": "🎉",
+            "remove": true
+        }),
+    )
+    .await;
+    assert_eq!(removed["result"]["status"], "sent");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap();
+    let remove_call: Value = send_log
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the reaction remove must reach the upstream");
+    assert_eq!(remove_call["emoji"], "🎉");
+    assert_eq!(remove_call["remove"], true);
+    assert_eq!(remove_call["targetAuthor"], "+15555550100");
+    assert_eq!(remove_call["targetTimestamp"], 99);
+
+    // Unknown params are rejected by shape before any local lookup.
+    let invalid = request(
+        &mut client,
+        "sr-invalid",
+        "messages.sendReaction",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": incoming_id,
+            "emoji": "👍",
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+
+    // More than one grapheme cluster is rejected by shape (the schema bounds
+    // length; the service enforces the cluster rule deterministically).
+    let multi = request(
+        &mut client,
+        "sr-multi",
+        "messages.sendReaction",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": incoming_id,
+            "emoji": "👍👍"
+        }),
+    )
+    .await;
+    assert_eq!(multi["error"]["code"], "INVALID_REQUEST");
+
+    // A missing message answers MESSAGE_NOT_FOUND without an upstream call.
+    let missing = request(
+        &mut client,
+        "sr-missing",
+        "messages.sendReaction",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": "no-such-message",
+            "emoji": "👍"
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "MESSAGE_NOT_FOUND");
+    assert_eq!(missing["error"]["retryable"], false);
+
+    // A group send resolves groupId addressing instead of recipient.
+    let group_sent = request(
+        &mut client,
+        "send-group",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "text": "group react to me",
+            "clientRequestId": "sr-send-group"
+        }),
+    )
+    .await;
+    assert_eq!(group_sent["result"]["status"], "sent");
+    let group_reacted = request(
+        &mut client,
+        "sr-group",
+        "messages.sendReaction",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_sent["result"]["conversationId"],
+            "messageId": group_sent["result"]["id"],
+            "emoji": "👍"
+        }),
+    )
+    .await;
+    assert_eq!(group_reacted["result"]["status"], "sent");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap();
+    let group_call: Value = send_log
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the group sendReaction must reach the upstream");
+    assert_eq!(group_call["groupId"], json!("ZmFrZS1ncm91cC0x"));
+    assert!(group_call.get("recipient").is_none());
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn socks_proxy_env_is_forwarded_to_the_jvm() {
     let temp = TempDir::new().unwrap();

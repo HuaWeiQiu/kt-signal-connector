@@ -228,6 +228,28 @@ for line in sys.stdin:
         if params.get("targetTimestamp") == 421:
             os._exit(23)
         result = {}
+    elif method == "sendReaction":
+        # Same dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests can assert targetAuthor/targetTimestamp/remove.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # Slow answer: the result lands after a short connector request
+        # timeout, so the mutating outcome is indeterminate (timeout path).
+        if params.get("targetTimestamp") == 351:
+            response = {"jsonrpc": "2.0", "id": request_id, "result": {}}
+            threading.Thread(
+                target=emit_json_after,
+                args=(response, 0.35),
+                daemon=True,
+            ).start()
+            continue
+        # One-shot crash with the mutating call in flight: the reaction may
+        # or may not have reached the server, which is the indeterminate
+        # case (engine-exit path).
+        if params.get("targetTimestamp") == 423:
+            os._exit(23)
+        result = {}
     elif method == "emitReceive":
         result = {"method": method}
     elif method == "emitStderr":
