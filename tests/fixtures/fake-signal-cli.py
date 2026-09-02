@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -255,6 +256,44 @@ for line in sys.stdin:
     elif method == "emitStderr":
         emit_stderr_websocket_error()
         result = {"method": method}
+    elif method == "getAttachment":
+        # Same dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests can assert the attachment id. Mimics the pinned
+        # signal-cli behavior: a missing attachment file answers the
+        # UserErrorException jsonRpc error (UPSTREAM_ERROR at the connector),
+        # a present one returns {"data": base64}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        attachment_id = str(params.get("id") or "")
+        # The upstream AttachmentStore.sanitizeId refuses path separators; the
+        # fixture mirrors that so a bad id answers the not-found error instead
+        # of escaping the attachments directory.
+        if (
+            not attachment_id
+            or "/" in attachment_id
+            or "\\" in attachment_id
+            or ".." in attachment_id
+        ):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "Could not find attachment with ID."},
+            }
+            emit_json(response)
+            continue
+        attachment_file = SIGNAL_DATA_DIR / "attachments" / attachment_id
+        if not attachment_file.is_file():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "Could not find attachment with ID."},
+            }
+            emit_json(response)
+            continue
+        result = {
+            "data": base64.b64encode(attachment_file.read_bytes()).decode("ascii"),
+        }
     elif method == "getUserStatus":
         if FAIL_USER_STATUS_MARKER.exists():
             response = {

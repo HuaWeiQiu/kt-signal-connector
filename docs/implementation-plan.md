@@ -338,6 +338,57 @@ end; design rationale and the upstream-verification notes live in `docs/remote-d
   serialize), the delete drain barrier, and the per-account request budget. Metrics classify it
   as `send`.
 
+### 4.7 messages.attachments.get (contract revision 1.8, 2026-09-03)
+
+API `1.0` evolves in place again (§4.5/§4.6 precedent); the apiVersion handshake binding is
+unchanged. The method is additive and advertised through the handshake `capabilities` array —
+calling it against an older connector answers `METHOD_NOT_ALLOWED`.
+
+- `messages.attachments.get` returns one attachment that is **already downloaded** into the
+  pinned signal-cli data directory as base64. Params: `accountId`, `conversationId`,
+  `messageId`, `attachmentId`, `sizeBytes` (all required). `attachmentId` is the upstream
+  attachment id from the received message's attachment metadata (the pinned signal-cli jsonRpc
+  receive field `id`); `sizeBytes` is the size the caller expects from that metadata.
+- PoC downgrade, recorded per the task contract: the streaming design was evaluated and
+  **rejected for this revision** — it would thread a second stream through `host.rs` frame
+  accounting, pending budgets, and engine shutdown semantics, well past the allowed intrusion.
+  The response is `{"attachmentId", "data"}` — `data` is the base64 payload mirroring the
+  upstream `getAttachment` jsonRpc response (`JsonAttachmentData` of the pinned 0.14.7
+  distribution, verified in source), and `attachmentId` echoes the request so a caller can
+  correlate parallel fetches. The connector adds nothing it does not have: no receive-time
+  attachment metadata is persisted locally this revision, so there is no `contentType`/
+  `filename` to serve. The local `messages` row is never modified and no event is emitted.
+- Why the limit is 5 MiB and not the 10 MiB task ceiling: the task explicitly allowed the
+  downgrade only up to 10 MiB, but the pinned engine reads upstream stdout lines with an 8 MiB
+  limit (`DEFAULT_UPSTREAM_LINE_LIMIT`, `src/engine.rs`) and a longer line faults the shared
+  engine with the existing oversized-output semantics, killing every account in the proxy group.
+  10 MiB of raw bytes is ~13.7 MiB of base64 — incompatible. The connector therefore enforces
+  5 MiB raw (5,242,880 bytes), which encodes to at most 6,990,508 base64 characters, a
+  deliberate margin under the line limit. `sizeBytes` is the caller's declared budget, verified
+  against the actual decoded size before anything is returned to the host; a mismatch answers
+  `INVALID_REQUEST`. The engine line limit remains the hard backstop: the connector persists no
+  attachment metadata locally (receive normalization keeps none), so a caller that declares a
+  small size for a genuinely larger attachment still trips the upstream fault — a known PoC
+  boundary, and one more reason full media enablement stays future work under §6.7.
+- Downloading is out of scope and stays out: the connector keeps starting signal-cli with
+  `--ignore-attachments` (§6.7), so `getAttachment` is a pure local read of an
+  already-downloaded file (`AttachmentStore.retrieveAttachment`, verified in source — no
+  upstream fetch, no network call). An attachment signal-cli has not downloaded answers
+  `UPSTREAM_ERROR` (the upstream `FileNotFoundException` → `UserErrorException` jsonRpc error),
+  and the row in the local history carries no attachment metadata this revision (receive
+  normalization keeps none), so the caller learns attachment ids out of band. This is the
+  explicit PoC boundary: it proves the bounded token-for-bytes path end to end; enabling
+  downloads and streaming remain future work under §6.7.
+- Error mapping reuses existing codes only (zero new codes): `ACCOUNT_NOT_FOUND`,
+  `CONVERSATION_NOT_FOUND`, `MESSAGE_NOT_FOUND` (missing conversation/message row), `INVALID_REQUEST`
+  (shape, oversized `sizeBytes`, or a size mismatch), `RUNTIME_NOT_RUNNING`, `UPSTREAM_EXITED`,
+  `UPSTREAM_TIMEOUT`, and `UPSTREAM_ERROR` for the explicit upstream rejection (attachment not
+  downloaded, or the upstream call failed) — its `retryable=true` is the global mapping.
+- Dispatch: the upstream call is read-only against signal-cli, but the response writes a large
+  frame, so the method joins the **read lane** (`conversations.list`/`messages.list`/`getText`
+  semantics, `READ_CONCURRENCY`), with the per-account pending budget unchanged. Metrics
+  classify it as `read`.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

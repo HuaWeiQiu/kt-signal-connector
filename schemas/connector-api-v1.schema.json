@@ -51,6 +51,7 @@
             "messages.sendText",
             "messages.remoteDelete",
             "messages.sendReaction",
+            "messages.attachments.get",
             "contacts.sync",
             "contacts.list"
           ]
@@ -187,6 +188,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendReactionParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.attachments.get" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesAttachmentsGetParams" }
             }
           }
         },
@@ -385,6 +397,29 @@
           "description": "True removes a previously sent reaction; the emoji must still identify the reaction to remove."
         },
         "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesAttachmentsGetParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId", "attachmentId", "sizeBytes"],
+      "description": "PoC (contract revision 1.8): fetch one attachment that is already stored in the local signal-cli data directory and return it base64-encoded in the response, the token-for-bytes downgrade the media PoC contract allows when streaming is not implemented. The connector downloads nothing: it never enables attachment fetching upstream, and an attachment signal-cli has not downloaded answers UPSTREAM_ERROR. Because the payload crosses the JSON-RPC host frame, the attachment must be at most 5 MiB (5242880 bytes) — a deliberate margin under the 10 MiB task cap, bounded by the pinned signal-cli stdout line limit (8 MiB, src/engine.rs) that faults a shared engine when a response line exceeds it. The caller must pass the size it expects from the message metadata; a mismatch answers INVALID_REQUEST instead of returning a payload the host did not budget for. The response is {attachmentId, data}; the local messages row is never modified and no event is emitted.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "attachmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The upstream attachment id from the received message's attachment metadata (the pinned signal-cli jsonRpc receive field `id`)."
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5242880,
+          "description": "The attachment size the caller expects, from the message attachment metadata. Enforced deterministically before any upstream read: a different actual size answers INVALID_REQUEST."
+        }
       }
     },
     "response": {

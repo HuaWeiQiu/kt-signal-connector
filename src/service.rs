@@ -4,7 +4,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
@@ -23,6 +23,18 @@ const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_DEVICE_NAME_BYTES: usize = 64;
 const MAX_EMOJI_BYTES: usize = 32;
+/// Media PoC bound (contract revision 1.8, implementation-plan §4.7): 5 MiB
+/// raw is the largest size whose standard base64 encoding stays a deliberate
+/// margin under the engine's 8 MiB upstream stdout line limit — a longer
+/// line faults the shared engine (oversized-output semantics). The task
+/// allowed up to 10 MiB, but 10 MiB raw is ~13.7 MiB base64: incompatible.
+pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+/// Encoded length of [`MAX_ATTACHMENT_BYTES`]: 4 * ceil(n / 3), the exact
+/// padded-base64 length java.util.Base64 emits.
+const MAX_ATTACHMENT_BASE64_CHARS: usize = 4 * MAX_ATTACHMENT_BYTES.div_ceil(3);
+/// An upstream attachment id (receive-time metadata field `id`); Signal ids
+/// stay far below this, the bound only rejects absurd values early.
+const MAX_ATTACHMENT_ID_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -832,6 +844,67 @@ impl ConnectorService {
         })
     }
 
+    /// Pure local validation for `messages.attachments.get`
+    /// (docs/implementation-plan.md §4.7, upstream `getAttachment`): resolve
+    /// the addressed rows and build the exact upstream jsonRpc params. The
+    /// connector persists no attachment metadata this revision, so the
+    /// attachment id cannot be validated against the message row — the caller
+    /// learns ids out of band (PoC boundary, §4.7). The row lookups keep the
+    /// addressing honest: a bogus conversation or message answers
+    /// CONVERSATION_NOT_FOUND / MESSAGE_NOT_FOUND before any upstream call.
+    pub fn prepare_get_attachment(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        size_bytes: u64,
+    ) -> Result<PreparedGetAttachment, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId must contain between 1 and 256 bytes",
+                false,
+            )));
+        }
+        if size_bytes == 0 || size_bytes as usize > MAX_ATTACHMENT_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "sizeBytes must be between 1 and 5242880",
+                false,
+            )));
+        }
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        self.store
+            .conversation_by_id(account_id, conversation_id)?
+            .ok_or(StoreError::ConversationNotFound)?;
+        self.store
+            .message_by_id(account_id, conversation_id, message_id)?
+            .ok_or(StoreError::MessageNotFound)?;
+        // signal-cli JSON-RPC getAttachment parameters (verified against the
+        // pinned 0.14.7 distribution: GetAttachmentCommand reads only `id` in
+        // jsonRpc mode — the CLI-side recipient/group-id flags never reach the
+        // local-command handler — and AttachmentStore.retrieveAttachment is a
+        // pure local file read): `account` is consumed by the upstream
+        // multi-account dispatcher, `id` addresses the already-downloaded file.
+        Ok(PreparedGetAttachment {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            attachment_id: attachment_id.to_string(),
+            params: json!({
+                "account": account.signal_account,
+                "id": attachment_id,
+            }),
+        })
+    }
+
     pub fn complete_send_success(
         &self,
         pending_id: &str,
@@ -1109,6 +1182,28 @@ pub struct PreparedSendReaction {
     pub params: Value,
 }
 
+/// Everything the supervisor needs to run one upstream `getAttachment` call,
+/// produced by the pure local `prepare_get_attachment` validation.
+#[derive(Debug)]
+pub struct PreparedGetAttachment {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub params: Value,
+}
+
+/// The attachment payload the host receives (contract revision 1.8): the
+/// upstream base64 passthrough, verified against the declared size. The
+/// upstream jsonRpc response is exactly `{"data": "<base64>"}` (JsonAttachmentData);
+/// `attachmentId` echoes the request so a caller can correlate parallel fetches.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentPayload {
+    pub attachment_id: String,
+    pub data: String,
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -1228,6 +1323,16 @@ pub struct MessagesSendReactionParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesGetAttachmentParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactsSyncParams {
     pub account_id: String,
@@ -1338,6 +1443,40 @@ fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
         return Err(ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
             format!("{field} must contain between 1 and 128 bytes"),
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// The upstream base64 must decode to exactly the size the caller declared
+/// (contract revision 1.8): anything else means the host budgeted for a
+/// different payload. Encoding length is checked first so a hostile upstream
+/// response cannot inflate memory before the byte budget is confirmed.
+pub fn validate_attachment_payload(
+    base64_data: &str,
+    expected_size_bytes: u64,
+) -> Result<(), ServiceError> {
+    if base64_data.is_empty() {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachment payload is empty",
+            false,
+        )));
+    }
+    if base64_data.len() > MAX_ATTACHMENT_BASE64_CHARS {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachment exceeds the 5242880-byte PoC limit",
+            false,
+        )));
+    }
+    let padding = base64_data.len() - base64_data.trim_end_matches('=').len();
+    let decoded_len = (base64_data.len() / 4 * 3).saturating_sub(padding);
+    if decoded_len as u64 != expected_size_bytes {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachment size does not match the declared sizeBytes",
             false,
         )));
     }
@@ -2715,5 +2854,124 @@ mod tests {
 
         // A row that never existed produces no phantom event.
         assert!(service.complete_send_unknown("absent").unwrap().is_empty());
+    }
+
+    /// messages.attachments.get prepare (contract revision 1.8): the upstream
+    /// params are exactly `account` + `id`; the addressed conversation and
+    /// message rows must exist (deterministic NOT_FOUND answers before any
+    /// upstream call); the declared size and the attachment id shape are
+    /// bounded before anything is dispatched (implementation-plan §4.7).
+    #[test]
+    fn prepare_get_attachment_builds_upstream_params_and_enforces_bounds() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let sent_id = match service
+            .prepare_send_text(&account.id, &direct.id, "has attachment", "req-att-1", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&sent_id, &account.id, &direct.id, 800)
+            .unwrap();
+
+        let prepared = service
+            .prepare_get_attachment(&account.id, &direct.id, &sent_id, "att-1", 24)
+            .unwrap();
+        assert_eq!(prepared.params["account"], json!("+15555550100"));
+        assert_eq!(prepared.params["id"], json!("att-1"));
+        assert_eq!(prepared.attachment_id, "att-1");
+        assert_eq!(prepared.conversation_id, direct.id);
+        assert_eq!(prepared.message_id, sent_id);
+
+        // Missing rows answer deterministically before any upstream call.
+        for (conversation_id, message_id, expected) in [
+            (
+                "no-such-conversation",
+                sent_id.as_str(),
+                "CONVERSATION_NOT_FOUND",
+            ),
+            (direct.id.as_str(), "no-such-message", "MESSAGE_NOT_FOUND"),
+        ] {
+            let error = service
+                .prepare_get_attachment(&account.id, conversation_id, message_id, "att-1", 24)
+                .unwrap_err()
+                .into_api();
+            assert_eq!(error.code, expected);
+        }
+        let error = service
+            .prepare_get_attachment("no-such-account", &direct.id, &sent_id, "att-1", 24)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
+
+        // Shape bounds: attachment id, declared size.
+        for (attachment_id, size_bytes) in [
+            ("", 24_u64),
+            (&"a".repeat(257), 24),
+            ("att-1", 0),
+            ("att-1", (MAX_ATTACHMENT_BYTES + 1) as u64),
+        ] {
+            let error = service
+                .prepare_get_attachment(
+                    &account.id,
+                    &direct.id,
+                    &sent_id,
+                    attachment_id,
+                    size_bytes,
+                )
+                .unwrap_err()
+                .into_api();
+            assert_eq!(
+                error.code, "INVALID_REQUEST",
+                "{attachment_id} {size_bytes}"
+            );
+            assert!(!error.retryable);
+        }
+    }
+    /// The returned payload must be standard padded base64 decoding to
+    /// exactly the declared size (contract revision 1.8): the encoded length
+    /// is bounded before any allocation, and the padding arithmetic matches
+    /// the sizes java.util.Base64 emits (implementation-plan §4.7).
+    #[test]
+    fn validate_attachment_payload_checks_declared_size_exactly() {
+        // 3n and 3n+1 / 3n+2 byte payloads with their padded encodings.
+        for (decoded, encoded) in [
+            (0_u64, ""), // rejected: empty is never a valid attachment
+            (24, "Zml4dHVyZSBhdHRhY2htZW50IGJ5dGVz"),
+            (1, "YQ=="),
+            (2, "YWI="),
+            (3, "YWJj"),
+            (
+                (MAX_ATTACHMENT_BYTES - 2) as u64, // largest 3-divisible size at the bound
+                &"QUJD".repeat(MAX_ATTACHMENT_BYTES / 3),
+            ),
+        ] {
+            let outcome = validate_attachment_payload(encoded, decoded);
+            assert_eq!(
+                outcome.is_ok(),
+                decoded > 0,
+                "decoded {decoded} via {encoded}"
+            );
+        }
+
+        // A mismatch between the declared and the actual size is rejected.
+        let error =
+            validate_attachment_payload("Zml4dHVyZSBhdHRhY2htZW50IGJ5dGVz", 23).unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // An encoded length over the contract bound is rejected even before
+        // the size arithmetic runs.
+        let oversized = "A".repeat(MAX_ATTACHMENT_BASE64_CHARS + 4);
+        let error = validate_attachment_payload(&oversized, 24).unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
     }
 }

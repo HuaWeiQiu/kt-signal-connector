@@ -607,6 +607,22 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn get_attachment(
+        &self,
+        params: crate::service::MessagesGetAttachmentParams,
+    ) -> Result<crate::service::AttachmentPayload, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .get_attachment(
+                params.account_id,
+                params.conversation_id,
+                params.message_id,
+                params.attachment_id,
+                params.size_bytes,
+            )
+            .await
+    }
+
     pub async fn sync_contacts(
         &self,
         account_id: &str,

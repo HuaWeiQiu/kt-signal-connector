@@ -25,8 +25,9 @@ use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
-    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesListParams,
-    MessagesRemoteDeleteParams, MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
+    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessagesGetAttachmentParams, MessagesListParams, MessagesRemoteDeleteParams,
+    MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -287,7 +288,11 @@ impl HostDispatchLimits {
 
         let lane = if matches!(
             method,
-            "conversations.list" | "messages.list" | "messages.getText" | "contacts.list"
+            "conversations.list"
+                | "messages.list"
+                | "messages.getText"
+                | "messages.attachments.get"
+                | "contacts.list"
         ) {
             self.read.clone().acquire_owned().await.unwrap()
         } else {
@@ -1095,6 +1100,25 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.sendReaction params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.attachments.get" => {
+            match serde_json::from_value::<MessagesGetAttachmentParams>(request.params) {
+                Ok(params) => match runtime.get_attachment(params).await {
+                    Ok(payload) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(payload).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.attachments.get params",
                         false,
                     ),
                 ),
