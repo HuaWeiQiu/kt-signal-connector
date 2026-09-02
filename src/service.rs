@@ -677,6 +677,62 @@ impl ConnectorService {
         Ok((quoted.sent_at, author))
     }
 
+    /// Pure local validation for `messages.remoteDelete` (docs/remote-delete-l2-plan.md §3.2):
+    /// resolve the target row and build the exact upstream jsonRpc params. Only an
+    /// outgoing row in the terminal state `sent` carries a real Signal protocol identity
+    /// — its `sent_at` was overwritten with the send response's upstream timestamp by
+    /// `complete_outgoing_send`, the same precedent as quote resolution
+    /// (`resolve_quote`). Pending/failed/unknown rows hold a local clock value there,
+    /// so they are indistinguishable from a missing row and answer `MESSAGE_NOT_FOUND`.
+    /// Nothing is written locally and no event is emitted: the connector does not
+    /// mutate the local `messages` row on a remote delete (plan §3.6).
+    pub fn prepare_remote_delete(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<PreparedRemoteDelete, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let conversation = self
+            .store
+            .conversation_by_id(account_id, conversation_id)?
+            .ok_or(StoreError::ConversationNotFound)?;
+        let message = self
+            .store
+            .message_by_id(account_id, conversation_id, message_id)?
+            .ok_or(StoreError::MessageNotFound)?;
+        if message.direction != "outgoing" || message.status != "sent" {
+            return Err(StoreError::MessageNotFound.into());
+        }
+        // signal-cli JSON-RPC remoteDelete parameters (verified against the pinned
+        // 0.14.7 distribution: RemoteDeleteCommand dests `target-timestamp` /
+        // `recipient` / `group-id` / `note-to-self`, and JsonRpcNamespace maps
+        // dash-separated dests to camelCase JSON keys): `targetTimestamp` is the
+        // deleted message's Signal timestamp, `recipient`/`groupId` address the
+        // receiving side — the same addressing shape as `send`.
+        let mut params = json!({
+            "account": account.signal_account,
+            "targetTimestamp": message.sent_at,
+        });
+        if conversation.kind == "group" {
+            params["groupId"] = json!(conversation.peer_key);
+        } else {
+            params["recipient"] = json!([conversation.peer_key]);
+        }
+        Ok(PreparedRemoteDelete {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            params,
+        })
+    }
+
     pub fn complete_send_success(
         &self,
         pending_id: &str,
@@ -934,6 +990,16 @@ pub enum PreparedSend {
     },
 }
 
+/// Everything the supervisor needs to run one upstream `remoteDelete` call,
+/// produced by the pure local `prepare_remote_delete` validation.
+#[derive(Debug)]
+pub struct PreparedRemoteDelete {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub params: Value,
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -1029,6 +1095,15 @@ pub struct MessagesSendTextParams {
     pub text: String,
     pub client_request_id: String,
     pub quote_message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesRemoteDeleteParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1994,6 +2069,165 @@ mod tests {
             ),
             Err(ServiceError::Store(StoreError::MessageNotFound))
         ));
+    }
+
+    /// messages.remoteDelete resolves the local row to the upstream addressing:
+    /// only an own outgoing `sent` row qualifies, its upstream-assigned
+    /// `sent_at` becomes `targetTimestamp`, and the conversation's kind
+    /// selects `recipient` (direct) vs `groupId` (group) — the same addressing
+    /// shape as `send` (docs/remote-delete-l2-plan.md §3.2).
+    #[test]
+    fn remote_delete_maps_sent_outgoing_rows_to_upstream_params() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        // Direct conversation: recipient = [peer_key].
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let direct_id = match service
+            .prepare_send_text(&account.id, &direct.id, "delete me", "req-rd-1", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&direct_id, &account.id, &direct.id, 777)
+            .unwrap();
+        let prepared = service
+            .prepare_remote_delete(&account.id, &direct.id, &direct_id)
+            .unwrap();
+        assert_eq!(prepared.params["account"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(777));
+        assert_eq!(prepared.params["recipient"], json!(["+15555550101"]));
+        assert!(prepared.params.get("groupId").is_none());
+        assert_eq!(prepared.account_id, account.id);
+        assert_eq!(prepared.conversation_id, direct.id);
+        assert_eq!(prepared.message_id, direct_id);
+
+        // Group conversation: groupId = peer_key, no recipient.
+        service
+            .sync_accounts_from_numbers(&["+15555550101".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
+            .unwrap();
+        let group_message_id = match service
+            .prepare_send_text(&account.id, &group.id, "group delete", "req-rd-2", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&group_message_id, &account.id, &group.id, 888)
+            .unwrap();
+        let prepared = service
+            .prepare_remote_delete(&account.id, &group.id, &group_message_id)
+            .unwrap();
+        assert_eq!(prepared.params["targetTimestamp"], json!(888));
+        assert_eq!(prepared.params["groupId"], json!("Z3JvdXAtaWQ="));
+        assert!(prepared.params.get("recipient").is_none());
+    }
+
+    /// The eligibility guard is deterministic and local: pending, failed and
+    /// unknown rows (their sent_at is a local clock value, not a protocol
+    /// identity) and incoming rows all answer MESSAGE_NOT_FOUND before any
+    /// upstream call — the same rule as quote resolution.
+    #[test]
+    fn remote_delete_rejects_rows_without_a_protocol_identity() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(&account.id, &conversation.id, "in flight", "req-rd-p", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        for status in ["pending", "failed", "unknown"] {
+            service
+                .store_ref()
+                .update_message_status(&pending_id, status, None)
+                .unwrap();
+            assert!(
+                service
+                    .prepare_remote_delete(&account.id, &conversation.id, &pending_id)
+                    .is_err(),
+                "a {status} row must not be deletable"
+            );
+        }
+
+        // The incoming row of the same conversation is not deletable either.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(50),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("peer text".into()),
+                    text_bytes: Some(9),
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let incoming = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        let incoming_error = service
+            .prepare_remote_delete(&account.id, &conversation.id, &incoming.id)
+            .unwrap_err();
+        assert_eq!(incoming_error.into_api().code, "MESSAGE_NOT_FOUND");
+
+        // A never-existing row, conversation, or account answer their own
+        // deterministic codes.
+        assert_eq!(
+            service
+                .prepare_remote_delete(&account.id, &conversation.id, "absent-message")
+                .unwrap_err()
+                .into_api()
+                .code,
+            "MESSAGE_NOT_FOUND"
+        );
+        assert_eq!(
+            service
+                .prepare_remote_delete(&account.id, "absent-conversation", "anything")
+                .unwrap_err()
+                .into_api()
+                .code,
+            "CONVERSATION_NOT_FOUND"
+        );
+        assert_eq!(
+            service
+                .prepare_remote_delete("absent-account", "absent-conversation", "anything")
+                .unwrap_err()
+                .into_api()
+                .code,
+            "ACCOUNT_NOT_FOUND"
+        );
     }
 
     /// message.statusChanged is produced on real transitions only: sent after

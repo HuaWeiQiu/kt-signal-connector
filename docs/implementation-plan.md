@@ -248,6 +248,44 @@ behavior, with all of its accounts in the reserved `default` group.
   unknown param is rejected with `INVALID_REQUEST` (`deny_unknown_fields`) and fails closed, never
   silently landing the account in the wrong egress.
 
+### 4.5 messages.remoteDelete (contract revision 1.6, 2026-09-02)
+
+API `1.0` evolves in place again (§4.4 precedent); the apiVersion handshake binding is unchanged.
+The method is additive: a host that never calls it sees no change, and a host must detect support
+through the handshake `capabilities` array — calling it against an older connector answers
+`METHOD_NOT_ALLOWED`. Design and rationale: `docs/remote-delete-l2-plan.md`.
+
+- `messages.remoteDelete` remotely deletes ("Delete for everyone") one message the linked account
+  itself sent. Params: `accountId`, `conversationId`, `messageId` (all required, opaque ids) and an
+  optional `operationId` that the connector validates by shape but never persists — there is no
+  operation ledger and no store migration. Addressing is by `conversationId` only: the target must
+  already exist in the local history.
+- Eligibility: only a local outgoing row in the terminal state `sent` qualifies; its `sentAt` was
+  overwritten with the send response's upstream Signal timestamp and becomes the delete's protocol
+  identity. Pending/failed/unknown rows carry only a local clock value, and incoming rows are not
+  the account's own messages — all of them answer `MESSAGE_NOT_FOUND`, exactly like quote
+  resolution. The conversation's kind selects the upstream addressing: `recipient: [peerKey]` for
+  direct chats, `groupId: peerKey` for groups (signal-cli jsonRpc `remoteDelete` params
+  `account`/`targetTimestamp`/`recipient`/`groupId`, verified against the pinned 0.14.7
+  distribution).
+- Result: `{"status": "deleted"}` when signal-cli confirmed the delete, or
+  `{"status": "unknown"}` when the outcome of the mutating upstream call is indeterminate. The
+  `unknown` semantics equal every `*_OUTCOME_UNKNOWN` error: the connector never retries
+  automatically; a host may explicitly re-send with a fresh requestId and the same `operationId`,
+  and the real outcome is whatever the peer's rendering shows (best effort, 24h upstream window).
+- Error mapping reuses existing codes only (zero new codes): `ACCOUNT_NOT_FOUND`,
+  `CONVERSATION_NOT_FOUND`, `MESSAGE_NOT_FOUND` (missing or ineligible row), `RUNTIME_NOT_RUNNING`,
+  `INVALID_REQUEST`, `UPSTREAM_EXITED`, and `UPSTREAM_ERROR` for an explicit upstream rejection
+  (expired window, already deleted, not deletable) — its `retryable=true` is the global mapping,
+  and hosts must not auto-retry deletes on it.
+- Known behavior boundaries: the local `messages` row is intentionally left unchanged on a
+  successful delete (presentation/bookkeeping belongs to the desktop, which receives
+  `status: "deleted"`); deletion events from peers or the account's other devices are not yet
+  converged locally; nothing is emitted to `message.statusChanged` by this method.
+- Dispatch inherits the mutating infrastructure unchanged: the write lane with the per-account
+  mutex (same-account `sendText`/`remoteDelete`/`contacts.sync`/`deleteLocalData` serialize), the
+  delete drain barrier, and the per-account request budget. Metrics classify it as `send`.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

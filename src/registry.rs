@@ -581,6 +581,16 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn remote_delete(
+        &self,
+        params: crate::service::MessagesRemoteDeleteParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .remote_delete(params.account_id, params.conversation_id, params.message_id)
+            .await
+    }
+
     pub async fn sync_contacts(
         &self,
         account_id: &str,

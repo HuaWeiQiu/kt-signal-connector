@@ -199,6 +199,42 @@ async fn mutating_request_crash_is_an_unknown_outcome() {
     assert_eq!(engine.status().state, EngineState::Exited);
 }
 
+/// remoteDelete is Mutating on both indeterminate paths: a slow answer past
+/// the request timeout (fixture targetTimestamp 350, answered after 0.35s)
+/// and a one-shot crash mid-call (fixture targetTimestamp 421) each resolve
+/// to UnknownOutcome — never to a retryable timeout — so the supervisor can
+/// surface the explicit `{"status":"unknown"}` response.
+#[tokio::test]
+async fn remote_delete_slow_answer_and_crash_are_unknown_outcomes() {
+    let (_temp, slow_engine, _receives) = engine(Duration::from_millis(100)).await;
+    assert_eq!(
+        slow_engine
+            .call(
+                "remoteDelete",
+                json!({ "targetTimestamp": 350 }),
+                CallClass::Mutating
+            )
+            .await,
+        Err(EngineError::UnknownOutcome)
+    );
+    // The late fixture answer must not resolve anything afterwards.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    slow_engine.shutdown().await.unwrap();
+
+    let (_temp, crashed_engine, _receives) = engine(Duration::from_secs(3)).await;
+    assert_eq!(
+        crashed_engine
+            .call(
+                "remoteDelete",
+                json!({ "targetTimestamp": 421 }),
+                CallClass::Mutating
+            )
+            .await,
+        Err(EngineError::UnknownOutcome)
+    );
+    assert_eq!(crashed_engine.status().state, EngineState::Exited);
+}
+
 #[tokio::test]
 async fn oversized_output_faults_runtime() {
     let temp = TempDir::new().unwrap();

@@ -30,7 +30,7 @@ pub fn method_class(method: &str) -> &'static str {
         "accounts.list" | "accounts.deleteLocalData" => "accounts",
         "link.start" | "link.finish" | "link.cancel" => "link",
         "conversations.list" | "messages.list" | "messages.getText" => "read",
-        "messages.sendText" => "send",
+        "messages.sendText" | "messages.remoteDelete" => "send",
         "contacts.sync" | "contacts.list" => "contacts",
         _ => "unknown",
     }
@@ -188,6 +188,7 @@ mod tests {
             ("messages.list", "read"),
             ("messages.getText", "read"),
             ("messages.sendText", "send"),
+            ("messages.remoteDelete", "send"),
             ("contacts.sync", "contacts"),
             ("contacts.list", "contacts"),
         ] {

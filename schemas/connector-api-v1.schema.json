@@ -49,6 +49,7 @@
             "messages.list",
             "messages.getText",
             "messages.sendText",
+            "messages.remoteDelete",
             "contacts.sync",
             "contacts.list"
           ]
@@ -163,6 +164,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messageGetTextParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.remoteDelete" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesRemoteDeleteParams" }
             }
           }
         },
@@ -326,6 +338,18 @@
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "messageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesRemoteDeleteParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "description": "Remotely delete (Delete for everyone) one message the linked account itself sent. Only a local outgoing row in the terminal state 'sent' qualifies: its sentAt is the upstream Signal timestamp addressed by the delete; pending/failed/unknown rows carry no protocol identity and answer MESSAGE_NOT_FOUND. Best effort upstream semantics (24h window, quoted/replying messages are not removed). Targeting is by conversationId only — the target must already exist in the local history. The result is {status: 'deleted'} when signal-cli confirmed the delete, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "response": {

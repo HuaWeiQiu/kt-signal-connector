@@ -1004,6 +1004,190 @@ async fn quote_is_delivered_upstream_and_status_change_is_emitted() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// messages.remoteDelete (contract revision 1.6, docs/remote-delete-l2-plan.md):
+/// the happy path answers {"status":"deleted"} with the exact upstream params
+/// (targetTimestamp from the sent row, recipient/groupId by conversation kind);
+/// unknown params fail with INVALID_REQUEST; a nonexistent message is
+/// MESSAGE_NOT_FOUND without touching the upstream.
+#[tokio::test]
+async fn remote_delete_maps_the_sent_row_and_answers_upstream_outcome() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [19_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Remote-Delete" }),
+    )
+    .await;
+    // The fixture emits one receive after finishLink; drain both frames.
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut finished: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while finished.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                finished = Some(frame);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let account_id = finished.unwrap()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Direct chat: send, then delete the sent message.
+    let sent = request(
+        &mut client,
+        "send-1",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "delete me",
+            "clientRequestId": "rd-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    // The connector overwrites sentAt with the send response's upstream
+    // timestamp (99 in the fixture); the delete must address exactly it.
+    let message_id = sent["result"]["id"].as_str().unwrap().to_string();
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let deleted = request(
+        &mut client,
+        "rd-1",
+        "messages.remoteDelete",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": message_id,
+            "operationId": "rd-operation-1"
+        }),
+    )
+    .await;
+    assert_eq!(deleted["result"]["status"], "deleted");
+
+    // The exact upstream dispatch was recorded by the fixture.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log remoteDelete params");
+    let delete_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the remoteDelete must reach the upstream");
+    assert_eq!(delete_call["account"], "+15555550100");
+    assert_eq!(delete_call["targetTimestamp"], 99);
+    assert_eq!(delete_call["recipient"], json!(["+15555550101"]));
+
+    // Unknown params are rejected by shape before any local lookup.
+    let invalid = request(
+        &mut client,
+        "rd-invalid",
+        "messages.remoteDelete",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": message_id,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+
+    // A missing message answers MESSAGE_NOT_FOUND without an upstream call.
+    let missing = request(
+        &mut client,
+        "rd-missing",
+        "messages.remoteDelete",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": "no-such-message"
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "MESSAGE_NOT_FOUND");
+    assert_eq!(missing["error"]["retryable"], false);
+
+    // A group send resolves groupId addressing instead of recipient.
+    let group_sent = request(
+        &mut client,
+        "send-group",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "text": "group delete me",
+            "clientRequestId": "rd-send-group"
+        }),
+    )
+    .await;
+    assert_eq!(group_sent["result"]["status"], "sent");
+    let group_deleted = request(
+        &mut client,
+        "rd-group",
+        "messages.remoteDelete",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_sent["result"]["conversationId"],
+            "messageId": group_sent["result"]["id"]
+        }),
+    )
+    .await;
+    assert_eq!(group_deleted["result"]["status"], "deleted");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap();
+    let group_call: Value = send_log
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the group remoteDelete must reach the upstream");
+    assert_eq!(group_call["groupId"], json!("ZmFrZS1ncm91cC0x"));
+    assert!(group_call.get("recipient").is_none());
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn socks_proxy_env_is_forwarded_to_the_jvm() {
     let temp = TempDir::new().unwrap();
