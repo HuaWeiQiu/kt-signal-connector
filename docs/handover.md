@@ -1,6 +1,6 @@
 # Signal Integration — Handover
 
-Date: 2026-08-26 (updated 2026-09-01 20:01 +08:00). Owner: KT AI engineering.
+Date: 2026-08-26 (updated 2026-09-02 19:32 +08:00). Owner: KT AI engineering.
 Status: **Phase 4 (JVM-per-proxy-group) resumed, implemented and contract-pinned
 locally; nothing pushed. Tier-1 24 h soak PASSED (run 2 completed 24 h
 wall-clock on 2026-08-28 20:52 +08:00; host slept ≈13 h cumulative — §3.2);
@@ -14,14 +14,15 @@ P0 real-device acceptance: all machine-checkable items pass (§3.3).**
 | --- | --- | --- |
 | Phase 4 design | committed | connector `1749ed3` (ADR 0001, §4.4, schema additive) |
 | Phase 4 implementation | committed | connector `7996828` (one engine per proxy group) |
+| L2 · messages.remoteDelete (contract revision 1.6) | **implemented** — connector `09b48d9`, the first L2 code commit (capabilities 14→15, apiVersion stays 1.0, zero new error codes / store migrations); desktop `Main` wiring in progress by a separate task; on-device acceptance pending — see §3.5 | connector `09b48d9`; 185 tests green |
 | A · contract pinning | committed | connector `c742fc9`; desktop `387400c5` (contract 1.5) |
 | B · soak tier-1 (8 engines, no real accounts) | **PASSED** — run 2 completed 24 h wall-clock (2026-08-27 20:52 → 2026-08-28 20:52 +08:00), all criteria green; host slept ≈13 h cumulative, effective active ≈10.7 h — see §3.2 caveat | `/tmp/kt-soak-8g/run2/`; see §3.2 |
 | B · soak tier-2 (real accounts) | **blocked** — needs a 2nd real account + phone | §6 |
 | C · P0 real-device acceptance | **machine-checkable items all pass** (2026-08-27 probe round: items 1-4 pass, 5 chain pass + ASR needs-human, 6 blocked on product decision); smoke 11 pass / 0 fail / 1 skip | §3.3 |
 | D · push both repos | authorized by owner, **waits for C to pass** | §3.4 |
 
-Working trees: connector `main` is **clean** at `d9f9071` (docs-only commits
-after `c742fc9` — see §8). Desktop `codex/signal-test-main-latest` HEAD is
+Working trees: connector `main` is **clean** at `09b48d9` (the first L2 code
+commit after `c742fc9`; docs-only commits between — see §8). Desktop `codex/signal-test-main-latest` HEAD is
 `f6599a02` (docs-only commits after `387400c5` — see §8); the only uncommitted
 files are **someone else's WIP** (see §5) — do not commit them.
 
@@ -335,6 +336,67 @@ Order matters (AGPL: source availability precedes any binary distribution):
    versioned socket/JSON IPC only.
 3. After push, update both handover docs with the remote refs.
 
+### 3.5 L2 · messages.remoteDelete（2026-09-02）— connector 已实现（契约 revision 1.6）
+
+**动机。** 负责人产品决策：发送失败/结局 unknown 的消息需要处置手段，host 侧应能对已发出
+（或已确认送达）的消息做远端撤回。这是 L2 层（连接器新方法）的第一个落地方法，按既定纪律
+"一次只加一个方法"执行（设计文档 `docs/remote-delete-l2-plan.md`）。
+
+**官方语义。** 与 Signal 官方 "Delete for everyone" 一一对应：只能删除本账号自己发出的消息，
+上游窗口为发送后 24 小时内，best effort（不保证对端移除）；引用该消息的其它消息不会被删除
+（上游语义，契约原文照录）。
+
+**契约变更摘要（contract revision 1.6）。**
+
+- 方法：`messages.remoteDelete`，params 为 `accountId` / `conversationId` / `messageId`
+  （全部必填、opaque id）+ 可选 `operationId`（连接器只验形状、不持久化——无操作账本、
+  零存储迁移）。寻址只接受 `conversationId`：目标必须已存在于本地历史。
+- 响应：`{"status":"deleted"}`（signal-cli 确认删除）或 `{"status":"unknown"}`（变异上游调用
+  结局不可判定）；`unknown` 复用现行 `*_OUTCOME_UNKNOWN` 语义——连接器绝不自动重试，
+  host 只能用新 requestId + 同 operationId 显式重发。
+- 错误码零新增：复用 `ACCOUNT_NOT_FOUND` / `CONVERSATION_NOT_FOUND` /
+  `MESSAGE_NOT_FOUND`（行不存在或资格不符）/ `RUNTIME_NOT_RUNNING` / `INVALID_REQUEST` /
+  `UPSTREAM_EXITED` / `UPSTREAM_ERROR`（超窗、已删、不可删等上游明确拒绝；其
+  `retryable=true` 是全局既有映射，host 不得据此自动重试删除）。
+- `apiVersion` 保持 `1.0`（原地加法演进，§4.4 先例）；handshake `capabilities` 由 14 增至
+  **15**，host 须凭 capabilities 探测后再调用（旧连接器答 `METHOD_NOT_ALLOWED`）。
+- schema/契约文本：`schemas/connector-api-v1.schema.json`（方法枚举 + if/then 分支 +
+  `messagesRemoteDeleteParams`）、`docs/implementation-plan.md` §4.5。
+
+**实现要点（connector `09b48d9`）。**
+
+- 资格守卫：仅本地 outgoing 且终态 `sent` 的行放行——其 `sent_at` 已被发送响应的上游
+  Signal 时间戳覆盖（`complete_outgoing_send` 先例），成为删除的协议身份
+  （`targetTimestamp`）；pending/failed/unknown 行只有本地时钟值、incoming 行非本人消息，
+  一律答 `MESSAGE_NOT_FOUND`（与引用解析同型）。
+- 上游 jsonRpc 参数名经 javap 探活对照 pinned 0.14.7 发行版核实：
+  `account` / `targetTimestamp` / `recipient`（direct，数组）/ `groupId`（群聊）；
+  会话 kind 决定二选一（`src/service.rs` `prepare_remote_delete` 注释）。
+- 成功删除**不改本地行**、不发任何事件（呈现/记账归 desktop）；对端/其它设备的删除事件
+  本版本不回推本地（入站无正文 dataMessage 仍为 skip，后续契约版本另立项）。
+- 调度完全复用变异基础设施：写 lane 与同账号互斥（同账号
+  `sendText`/`remoteDelete`/`contacts.sync`/`deleteLocalData` 串行）+ 删除排空屏障
+  （`deleting_accounts` 期间新变异一律 `ACCOUNT_NOT_FOUND` 拒绝）+ 每账号请求预算；
+  metrics 归类 `send`。
+
+**测试。** `cargo test` **185 项全绿**（lib 138 + cli 9 + engine_integration 11 +
+proxy_groups 3 + schema_consistency 3 + server_integration 13 + supervisor_watchdog 8）；
+`tests/schema_consistency.rs` 机械强制 schema 枚举 ↔ `PHASE2_CAPABILITIES` ↔ dispatch
+四向一致。`fake-signal-cli` 夹具新增 `remoteDelete` handler（记录上游入参供断言）并注入
+两条不确定性路径——慢响应（触发 Mutating 超时）与一次性 crash（请求在途引擎退出）——
+两者均收敛为 `{"status":"unknown"}` 且上游调用恰一次（无自动重试）、本地行未动；端到端
+集成测试覆盖 happy path（`{"status":"deleted"}` + 上游入参断言）与 direct（`recipient`）/
+group（`groupId`）双寻址。
+
+**待办。**
+
+1. desktop `Main` 接线（调用入口、错误文案映射）**进行中，由另一任务完成**；本仓库侧无
+   阻塞。desktop host 合同文档同步由该任务承载。
+2. 实机 soak 冒烟需**双账号**（删除需对端在场才能点验对端侧移除）——与 tier-2 soak 同一
+   前置（§3.2），单账号无法自验。
+3. 实机点验（24h 窗口边界、对端呈现、引用不删）待负责人执行；本仓库门禁已全绿
+   （fmt/clippy/test/build 同 `09b48d9` 提交前跑过）。
+
 ## 4. How to verify (per repo)
 
 Connector:
@@ -421,7 +483,7 @@ both repos.
 - Desktop handover (long-form): `docs/plan/signal-handoff-next-owner.md` in
   the desktop worktree — its §6.27 mirrors this file's §3.
 
-## 8. Exact git state (2026-08-26 22:10 +08:00; docs-only commits after this — see note at end)
+## 8. Exact git state (2026-08-26 22:10 +08:00 snapshot; docs-only commits after it until 2026-09-02 — see note at end)
 
 ### connector — `main`, working tree clean, not pushed
 
@@ -452,6 +514,13 @@ Uncommitted: **nothing** — the frozen WIP listed in §5 landed on 2026-09-01 a
 desktop `84641905` + `f40ae70f` (first code commits of this work stream).
 Docs commits since this snapshot: connector `e0f8057`/`b1d7c01`/`2002ba7`/
 `7316dc7`, desktop `456211d8`/`60fe8bc3`/`185aa4e6`/`c2171a0c` — handover
-records only (soak runs, P0 probe round, env status); **no code changes**.
-2026-09-01 final-verdict commits: connector `d9f9071`, desktop `f6599a02` —
-handover records only; this correction commit itself cannot be self-listed.
+records only (soak runs, P0 probe round, env status); **no code changes**
+(through 2026-09-01). 2026-09-01 final-verdict commits: connector `d9f9071`,
+desktop `f6599a02` — handover records only; that correction commit itself
+cannot be self-listed.
+
+**2026-09-02 — the "docs-only since this snapshot" era ended:** connector
+`09b48d9` is the **first L2 code commit** of this work stream
+(`messages.remoteDelete`, contract revision 1.6 — see §3.5). The code blocks
+above keep the 2026-08-26 snapshot as written; connector `main` HEAD is now
+`09b48d9`.
