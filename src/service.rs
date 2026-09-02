@@ -23,6 +23,11 @@ const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 const MAX_DEVICE_NAME_BYTES: usize = 64;
 const MAX_EMOJI_BYTES: usize = 32;
+/// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
+/// short display name, not a free-form profile field — 128 bytes matches the
+/// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
+/// trivially small.
+const MAX_ALIAS_BYTES: usize = 128;
 /// Media PoC bound (contract revision 1.8, implementation-plan §4.7): 5 MiB
 /// raw is the largest size whose standard base64 encoding stays a deliberate
 /// margin under the engine's 8 MiB upstream stdout line limit — a longer
@@ -429,6 +434,53 @@ impl ConnectorService {
             member_count,
             synced_at,
         })
+    }
+
+    /// contacts.setLocalAlias (contract revision 1.10, implementation-plan
+    /// §4.9): resolve the rename locally, then build the upstream
+    /// `updateContact` dispatch. The peer must already be known to the
+    /// account — a cached `kind='contact'` contacts row or the peer of an
+    /// existing direct conversation — so a bogus peerKey answers a
+    /// deterministic INVALID_REQUEST before any upstream call.
+    pub fn prepare_set_local_alias(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+        alias: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(peer_key, "peerKey")?;
+        validate_alias(alias)?;
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let known = self
+            .store
+            .contact_by_peer(account_id, "contact", peer_key)?
+            .is_some()
+            || self
+                .store
+                .conversation_by_peer(account_id, "direct", peer_key)?
+                .is_some();
+        if !known {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "peerKey must name a known contact or direct conversation peer",
+                false,
+            )));
+        }
+        // signal-cli JSON-RPC updateContact parameters (verified against the
+        // pinned 0.14.7 distribution: UpdateContactCommand reads `recipient`
+        // with ns.getString — a single string, not an array; the earlier
+        // feasibility note's `recipient: [peerKey]` would ClassCastException
+        // into an upstream INTERNAL_ERROR): `account` is consumed by the
+        // multi-account dispatcher, `name` is the new alias.
+        Ok(json!({
+            "account": account.signal_account,
+            "recipient": peer_key,
+            "name": alias,
+        }))
     }
 
     /// Cache one full contacts sync atomically: all rows and the sync marker
@@ -1404,11 +1456,32 @@ pub struct GroupsGetParams {
     pub group_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactsSetLocalAliasParams {
+    pub account_id: String,
+    pub peer_key: String,
+    pub alias: String,
+    pub operation_id: Option<String>,
+}
+
 fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
     if device_name.is_empty() || device_name.len() > MAX_DEVICE_NAME_BYTES {
         return Err(ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
             "deviceName must contain between 1 and 64 bytes",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// contacts.setLocalAlias bound (§4.9): a non-empty, short display name.
+fn validate_alias(alias: &str) -> Result<(), ServiceError> {
+    if alias.is_empty() || alias.len() > MAX_ALIAS_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "alias must contain between 1 and 128 bytes",
             false,
         )));
     }
@@ -3109,5 +3182,73 @@ mod tests {
 
         let malformed = service.get_group(&account.id, "").unwrap_err();
         assert_eq!(malformed.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// contacts.setLocalAlias prepare (contract revision 1.10, §4.9): the
+    /// upstream params are exactly `account` + a single-string `recipient` +
+    /// `name`; the peer must already be known (cached contact row or direct
+    /// conversation peer); a bogus peer, group key, or alias answers
+    /// INVALID_REQUEST without any upstream call.
+    #[test]
+    fn prepare_set_local_alias_builds_upstream_params_and_resolves_the_peer() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        // Known via the direct conversation peer.
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        // Known via the cached contacts row.
+        service
+            .store_ref()
+            .upsert_contact(&account.id, "contact", "+15555550102", "Bob", None, 9)
+            .unwrap();
+
+        let via_conversation = service
+            .prepare_set_local_alias(&account.id, &direct.peer_key, "Alice K.")
+            .unwrap();
+        assert_eq!(
+            via_conversation,
+            json!({
+                "account": "+15555550100",
+                "recipient": "+15555550101",
+                "name": "Alice K."
+            })
+        );
+
+        let via_contact_row = service
+            .prepare_set_local_alias(&account.id, "+15555550102", "Bob B.")
+            .unwrap();
+        assert_eq!(via_contact_row["recipient"], "+15555550102");
+        assert_eq!(via_contact_row["name"], "Bob B.");
+
+        // A group key is not a contact: rejected before any upstream call.
+        let group_key = service
+            .prepare_set_local_alias(&account.id, "ZmFrZS1ncm91cC0x", "G")
+            .unwrap_err();
+        assert_eq!(group_key.into_api().code, "INVALID_REQUEST");
+
+        let unknown_peer = service
+            .prepare_set_local_alias(&account.id, "+15555559999", "Nobody")
+            .unwrap_err();
+        assert_eq!(unknown_peer.into_api().code, "INVALID_REQUEST");
+
+        let absent_account = service
+            .prepare_set_local_alias("no-such-account", "+15555550101", "A")
+            .unwrap_err();
+        assert_eq!(absent_account.into_api().code, "ACCOUNT_NOT_FOUND");
+
+        // Shape bounds: empty and oversized aliases.
+        let empty = service
+            .prepare_set_local_alias(&account.id, "+15555550101", "")
+            .unwrap_err();
+        assert_eq!(empty.into_api().code, "INVALID_REQUEST");
+        let oversized = service
+            .prepare_set_local_alias(&account.id, "+15555550101", &"x".repeat(129))
+            .unwrap_err();
+        assert_eq!(oversized.into_api().code, "INVALID_REQUEST");
     }
 }

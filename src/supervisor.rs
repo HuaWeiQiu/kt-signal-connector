@@ -1255,6 +1255,33 @@ impl RuntimeSupervisor {
         )
     }
 
+    /// contacts.setLocalAlias (contract revision 1.10, implementation-plan
+    /// §4.9): rename one contact via the mutating upstream `updateContact`.
+    /// The alias lives in upstream account data — no local row is written and
+    /// no event is emitted; the next contacts.sync brings the new name into
+    /// the cache. An indeterminate mutating outcome answers "unknown" and is
+    /// never retried automatically.
+    pub async fn set_local_alias(
+        &self,
+        account_id: String,
+        peer_key: String,
+        alias: String,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_set_local_alias(&account_id, &peer_key, &alias)?
+        };
+        match engine
+            .call("updateContact", params, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("updated"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Read-only projection of one cached group row (§4.8); served from the
     /// contacts cache with no upstream call, so it answers even while the
     /// engine is stopped.
@@ -1997,6 +2024,70 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, "sent");
         assert_eq!(row.sent_at, 423);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// The fixture's `updateContact` handler exits with the mutating call in
+    /// flight (alias "[fixture-crash-alias]"), so the upstream result is lost
+    /// mid-call. setLocalAlias must answer the explicit `unknown` — never a
+    /// retryable error, never an automatic retry — and write nothing locally
+    /// (contract revision 1.10).
+    #[tokio::test]
+    async fn set_local_alias_with_a_lost_upstream_result_answers_unknown() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        assert_eq!(
+            supervisor
+                .set_local_alias(
+                    account.id.clone(),
+                    conversation.peer_key.clone(),
+                    "[fixture-crash-alias]".to_string()
+                )
+                .await
+                .unwrap(),
+            "unknown",
+            "a lost mutating result must answer unknown, never retry"
+        );
+
+        // The direct conversation row is untouched by the rename: the alias
+        // lives in upstream account data and returns via contacts.sync.
+        let row = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_by_id(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.peer_key, "+15555550101");
         supervisor.shutdown().await.unwrap();
     }
 }

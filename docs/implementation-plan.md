@@ -415,6 +415,32 @@ The result is `{peerKey, title, memberCount?, syncedAt}`: `title` is the synced 
   the host-side rename method is `contacts.setLocalAlias`, which does not touch this cache
   either (it renames upstream, via `updateContact`).
 
+### 4.9 contacts.setLocalAlias (contract revision 1.10, 2026-09-03)
+
+Rename one contact as the linked account sees it. Params: `{accountId, peerKey, alias,
+operationId?}` — `alias` is 1..128 UTF-8 bytes, `operationId` is an optional host correlation
+id (validated, never persisted; same semantics as §4.5/§4.6). The upstream call is the
+mutating `updateContact` jsonRpc command with parameters `{"account", "recipient", "name"}`:
+`recipient` is the peer key as a **single string** (verified against the pinned 0.14.7
+`UpdateContactCommand`, which reads it with `ns.getString("recipient")` — passing an array
+would throw a ClassCastException and surface as UPSTREAM_ERROR; this corrects the earlier
+feasibility note that wrote `recipient: [peerKey]`), and `name` is the new alias.
+
+- Targeting: `peerKey` must resolve to a peer the account already knows — an existing
+  `contacts` row with `kind='contact'`, or an existing `direct` conversation peer. Anything
+  else (unknown number, a group key, an unsynced contact) answers `INVALID_REQUEST` before
+  any upstream call; no new error code is registered for this method.
+- Outcome semantics (sendReaction precedent): upstream `Ok` answers `{status: "updated"}`;
+  an indeterminate mutating outcome (`EngineError::UnknownOutcome` — engine exit or timeout
+  with the call in flight) answers `{status: "unknown"}`. `unknown` is never retried
+  automatically by the connector; the host may re-send with a fresh requestId.
+- Dispatch: mutating, so the method joins the **send lane** with the per-account mutex and
+  the delete barrier (`sendText`/`remoteDelete`/`sendReaction` semantics); same-account
+  mutations serialize. Metrics classify it as `send`. No local row is modified — the alias
+  lives in the upstream account data and comes back through the next `contacts.sync`, so
+  the response status is the only authoritative answer. No event is emitted (the local
+  history carries no contact row to transition).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

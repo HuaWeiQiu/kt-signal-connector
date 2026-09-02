@@ -24,10 +24,10 @@ use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
-    AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
-    GroupsGetParams, HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessagesGetAttachmentParams, MessagesListParams, MessagesRemoteDeleteParams,
-    MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
+    AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
+    ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
+    LinkStartParams, MessageGetTextParams, MessagesGetAttachmentParams, MessagesListParams,
+    MessagesRemoteDeleteParams, MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -191,6 +191,7 @@ impl HostDispatchLimits {
                 | "messages.remoteDelete"
                 | "messages.sendReaction"
                 | "contacts.sync"
+                | "contacts.setLocalAlias"
                 | "accounts.deleteLocalData"
         ) {
             let account_key = account_id.unwrap_or("").to_string();
@@ -231,9 +232,10 @@ impl HostDispatchLimits {
             // account cannot occupy every lane permit while waiting on itself.
             let account = account_lock.lock_owned().await;
             let lane = match method {
-                "messages.sendText" | "messages.remoteDelete" | "messages.sendReaction" => {
-                    self.send.clone()
-                }
+                "messages.sendText"
+                | "messages.remoteDelete"
+                | "messages.sendReaction"
+                | "contacts.setLocalAlias" => self.send.clone(),
                 "contacts.sync" => self.read.clone(),
                 _ => self.control.clone(),
             }
@@ -1173,6 +1175,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid groups.get params", false),
             ),
         },
+        "contacts.setLocalAlias" => {
+            match serde_json::from_value::<ContactsSetLocalAliasParams>(request.params) {
+                Ok(params) => match runtime.set_local_alias(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid contacts.setLocalAlias params",
+                        false,
+                    ),
+                ),
+            }
+        }
         _ => HostResponse::failure(
             request_id,
             ApiError::new("METHOD_NOT_ALLOWED", "method is not allowed", false),
@@ -1656,6 +1674,26 @@ mod tests {
         )
         .await
         .expect("another account's sendReaction must not serialize behind account-a")
+        .unwrap();
+
+        // contacts.setLocalAlias joins the same mutating set (contract
+        // revision 1.10): same-account serialized against the send, and it
+        // rides the send lane rather than the control lane.
+        let pending_alias = timeout(
+            Duration::from_millis(50),
+            limits.acquire("contacts.setLocalAlias", Some("account-a"), None),
+        )
+        .await;
+        assert!(
+            pending_alias.is_err(),
+            "setLocalAlias must wait for the in-flight same-account send"
+        );
+        timeout(
+            Duration::from_millis(50),
+            limits.acquire("contacts.setLocalAlias", Some("account-c"), None),
+        )
+        .await
+        .expect("another account's setLocalAlias must not serialize behind account-a")
         .unwrap();
 
         drop(send);

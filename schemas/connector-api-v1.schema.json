@@ -54,7 +54,8 @@
             "messages.attachments.get",
             "contacts.sync",
             "contacts.list",
-            "groups.get"
+            "groups.get",
+            "contacts.setLocalAlias"
           ]
         },
         "params": {
@@ -233,6 +234,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/groupsGetParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "contacts.setLocalAlias" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/contactsSetLocalAliasParams" }
             }
           }
         }
@@ -447,6 +459,28 @@
           "maxLength": 128,
           "description": "The upstream group id, exactly the peerKey of the cached kind='group' contacts row."
         }
+      }
+    },
+    "contactsSetLocalAliasParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "peerKey", "alias"],
+      "description": "Rename one contact as the linked account sees it (contract revision 1.10): the mutating upstream updateContact carries {account, recipient, name}, where recipient is the peer key as a single string (the pinned UpdateContactCommand reads it with getString — an array would fail upstream). peerKey must resolve to a locally known contact (a cached kind='contact' row or a direct conversation peer); anything else answers INVALID_REQUEST. The result is {status: 'updated'} when signal-cli confirmed the rename, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. No local row is modified: the alias lives in upstream account data and returns through the next contacts.sync; no event is emitted.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "peerKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The contact's number/uuid; must already be known to this account."
+        },
+        "alias": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The new display name, at most 128 UTF-8 bytes."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "response": {

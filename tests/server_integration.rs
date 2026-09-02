@@ -2201,6 +2201,133 @@ async fn groups_get_projects_the_synced_group_cache() {
     assert_clean_exit(&mut connector).await;
 }
 
+#[tokio::test]
+async fn contacts_set_local_alias_renames_a_locally_known_peer() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Set-Alias" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The best-effort sync at finish cached the fixture contacts, so the
+    // linked account's peer (+15555550101) is a known contact.
+    let renamed = request(
+        &mut client,
+        "alias-happy",
+        "contacts.setLocalAlias",
+        json!({
+            "accountId": account_id,
+            "peerKey": "+15555550101",
+            "alias": "Alice Renamed",
+            "operationId": "alias-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(renamed["result"]["status"], "updated");
+    // The upstream call carries recipient as a single string — the pinned
+    // UpdateContactCommand reads it with getString (§4.9).
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log updateContact params");
+    let update_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("name") == Some(&json!("Alice Renamed")))
+        .expect("the updateContact must reach the upstream");
+    assert_eq!(update_call["account"], "+15555550100");
+    assert_eq!(update_call["recipient"], "+15555550101");
+    assert!(update_call["recipient"].is_string());
+
+    // An unknown peer is rejected locally before any upstream call.
+    let unknown_peer = request(
+        &mut client,
+        "alias-unknown-peer",
+        "contacts.setLocalAlias",
+        json!({
+            "accountId": account_id,
+            "peerKey": "+15555559999",
+            "alias": "Nobody"
+        }),
+    )
+    .await;
+    assert_eq!(unknown_peer["error"]["code"], "INVALID_REQUEST");
+
+    // A 129-byte alias is rejected by shape.
+    let oversized = request(
+        &mut client,
+        "alias-oversized",
+        "contacts.setLocalAlias",
+        json!({
+            "accountId": account_id,
+            "peerKey": "+15555550101",
+            "alias": "x".repeat(129)
+        }),
+    )
+    .await;
+    assert_eq!(oversized["error"]["code"], "INVALID_REQUEST");
+
+    // Unknown params are rejected by shape.
+    let invalid = request(
+        &mut client,
+        "alias-invalid",
+        "contacts.setLocalAlias",
+        json!({
+            "accountId": account_id,
+            "peerKey": "+15555550101",
+            "alias": "Still Alice",
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+
+    // An unknown account is answered without touching the upstream.
+    let absent_account = request(
+        &mut client,
+        "alias-absent-account",
+        "contacts.setLocalAlias",
+        json!({
+            "accountId": "no-such-account",
+            "peerKey": "+15555550101",
+            "alias": "Alice"
+        }),
+    )
+    .await;
+    assert_eq!(absent_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();

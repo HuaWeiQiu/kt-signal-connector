@@ -251,6 +251,18 @@ for line in sys.stdin:
         if params.get("targetTimestamp") == 423:
             os._exit(23)
         result = {}
+    elif method == "updateContact":
+        # Same dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests can assert the single-string recipient contract.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # One-shot crash with the mutating call in flight: the rename may or
+        # may not have reached the server, which is the indeterminate case
+        # (engine-exit path).
+        if params.get("name") == "[fixture-crash-alias]":
+            os._exit(25)
+        result = {}
     elif method == "emitReceive":
         result = {"method": method}
     elif method == "emitStderr":

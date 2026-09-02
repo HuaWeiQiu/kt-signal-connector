@@ -653,6 +653,16 @@ impl ProxyGroupRuntime {
             .get_group(params.account_id, params.group_key)
             .await
     }
+
+    pub async fn set_local_alias(
+        &self,
+        params: crate::service::ContactsSetLocalAliasParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .set_local_alias(params.account_id, params.peer_key, params.alias)
+            .await
+    }
 }
 
 impl Drop for ProxyGroupRuntime {

@@ -47,4 +47,5 @@ pub const PHASE2_CAPABILITIES: &[&str] = &[
     "contacts.sync",
     "contacts.list",
     "groups.get",
+    "contacts.setLocalAlias",
 ];
