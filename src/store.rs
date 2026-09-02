@@ -1606,6 +1606,36 @@ impl Store {
         Ok(())
     }
 
+    /// Read one cached contact/group row by its natural key. `kind` is
+    /// 'contact' or 'group'; `extra` is the opaque JSON marker stored by the
+    /// sync batch (e.g. memberCount for groups), `synced_at` the row's last
+    /// sync timestamp. `groups.get` (§4.8) projects the `kind='group'` rows.
+    pub fn contact_by_peer(
+        &self,
+        account_id: &str,
+        kind: &str,
+        peer_key: &str,
+    ) -> Result<Option<(String, Option<String>, u64)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let row = conn
+            .query_row(
+                "SELECT title, extra, synced_at
+                 FROM contacts
+                 WHERE account_id=?1 AND kind=?2 AND peer_key=?3",
+                params![account_id, kind, peer_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(row)
+    }
+
     /// Read-only paged view of the contacts cache, ordered by (kind, peer_key).
     /// `query` is an optional case-insensitive substring filter over title/peer_key.
     pub fn list_contacts(

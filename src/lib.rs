@@ -46,4 +46,5 @@ pub const PHASE2_CAPABILITIES: &[&str] = &[
     "messages.attachments.get",
     "contacts.sync",
     "contacts.list",
+    "groups.get",
 ];

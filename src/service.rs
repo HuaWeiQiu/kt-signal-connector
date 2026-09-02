@@ -394,6 +394,43 @@ impl ConnectorService {
         Ok(self.store.list_contacts(account_id, query, limit, cursor)?)
     }
 
+    /// Read-only projection of one cached group row (contract revision 1.9,
+    /// implementation-plan §4.8): served entirely from the contacts cache
+    /// written by contacts.sync — the upstream is never called, so an unsynced
+    /// or departed group answers a deterministic GROUP_NOT_FOUND instead of a
+    /// listGroups round trip. `syncedAt` lets the host judge staleness itself;
+    /// the connector adds no second cache layer.
+    pub fn get_group(
+        &self,
+        account_id: &str,
+        group_key: &str,
+    ) -> Result<GroupDetails, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(group_key, "groupKey")?;
+        if self.store.account_by_id(account_id)?.is_none() {
+            return Err(ServiceError::Store(StoreError::AccountNotFound));
+        }
+        let Some((title, extra, synced_at)) =
+            self.store.contact_by_peer(account_id, "group", group_key)?
+        else {
+            return Err(ServiceError::Api(ApiError::new(
+                "GROUP_NOT_FOUND",
+                "no cached group row for this accountId and groupKey",
+                false,
+            )));
+        };
+        let member_count = extra
+            .as_deref()
+            .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+            .and_then(|extra| extra.get("memberCount").and_then(Value::as_u64));
+        Ok(GroupDetails {
+            peer_key: group_key.to_string(),
+            title,
+            member_count,
+            synced_at,
+        })
+    }
+
     /// Cache one full contacts sync atomically: all rows and the sync marker
     /// commit in a single transaction, so a failed batch leaves nothing behind.
     pub fn upsert_synced_contacts(
@@ -1204,6 +1241,19 @@ pub struct AttachmentPayload {
     pub data: String,
 }
 
+/// The groups.get response (contract revision 1.9): the cached kind='group'
+/// contacts row projected for the host. `member_count` is absent when the
+/// sync batch captured no member list; `synced_at` is the row's last sync
+/// timestamp — the response is exactly as fresh as that sync, nothing more.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupDetails {
+    pub peer_key: String,
+    pub title: String,
+    pub member_count: Option<u64>,
+    pub synced_at: u64,
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -1339,12 +1389,19 @@ pub struct ContactsSyncParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContactsListParams {
     pub account_id: String,
     pub query: Option<String>,
     pub cursor: Option<String>,
     pub limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsGetParams {
+    pub account_id: String,
+    pub group_key: String,
 }
 
 fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
@@ -2973,5 +3030,84 @@ mod tests {
         let oversized = "A".repeat(MAX_ATTACHMENT_BASE64_CHARS + 4);
         let error = validate_attachment_payload(&oversized, 24).unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// groups.get (contract revision 1.9, implementation-plan §4.8): a pure
+    /// cache projection. Synced groups answer with their stored title and
+    /// memberCount; anything else — a contact peer key, an unsynced group, a
+    /// missing account, a malformed key — answers its deterministic error
+    /// without any upstream call.
+    #[test]
+    fn get_group_projects_the_cached_group_row() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "ZmFrZS1ncm91cC0x",
+                "Fixture Group",
+                Some("{\"memberCount\":2}"),
+                1725300000,
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550101",
+                "Alice Contact",
+                None,
+                1725300000,
+            )
+            .unwrap();
+
+        let group = service.get_group(&account.id, "ZmFrZS1ncm91cC0x").unwrap();
+        assert_eq!(group.peer_key, "ZmFrZS1ncm91cC0x");
+        assert_eq!(group.title, "Fixture Group");
+        assert_eq!(group.member_count, Some(2));
+        assert_eq!(group.synced_at, 1725300000);
+
+        // A group row without a captured member list omits memberCount.
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Z3JvdXAtbm8tbWVtYmVycw",
+                "No Members",
+                None,
+                7,
+            )
+            .unwrap();
+        let bare = service
+            .get_group(&account.id, "Z3JvdXAtbm8tbWVtYmVycw")
+            .unwrap();
+        assert_eq!(bare.title, "No Members");
+        assert_eq!(bare.member_count, None);
+        assert_eq!(bare.synced_at, 7);
+
+        // A contact peer key is not a group row: deterministic GROUP_NOT_FOUND.
+        let contact = service.get_group(&account.id, "+15555550101").unwrap_err();
+        assert_eq!(contact.into_api().code, "GROUP_NOT_FOUND");
+
+        // An unsynced group id is a GROUP_NOT_FOUND, never a listGroups call.
+        let unsynced = service
+            .get_group(&account.id, "bm90LWEtbWVtYmVy")
+            .unwrap_err();
+        assert_eq!(unsynced.into_api().code, "GROUP_NOT_FOUND");
+
+        let absent_account = service
+            .get_group("no-such-account", "ZmFrZS1ncm91cC0x")
+            .unwrap_err();
+        assert_eq!(absent_account.into_api().code, "ACCOUNT_NOT_FOUND");
+
+        let malformed = service.get_group(&account.id, "").unwrap_err();
+        assert_eq!(malformed.into_api().code, "INVALID_REQUEST");
     }
 }

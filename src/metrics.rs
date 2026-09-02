@@ -34,7 +34,7 @@ pub fn method_class(method: &str) -> &'static str {
         | "messages.getText"
         | "messages.attachments.get" => "read",
         "messages.sendText" | "messages.remoteDelete" | "messages.sendReaction" => "send",
-        "contacts.sync" | "contacts.list" => "contacts",
+        "contacts.sync" | "contacts.list" | "groups.get" => "contacts",
         _ => "unknown",
     }
 }
@@ -196,6 +196,7 @@ mod tests {
             ("messages.sendReaction", "send"),
             ("contacts.sync", "contacts"),
             ("contacts.list", "contacts"),
+            ("groups.get", "contacts"),
         ] {
             assert_eq!(method_class(method), expected, "method {method}");
         }

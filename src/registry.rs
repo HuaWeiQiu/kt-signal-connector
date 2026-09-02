@@ -643,6 +643,16 @@ impl ProxyGroupRuntime {
             .list_contacts(account_id, query, limit, cursor)
             .await
     }
+
+    pub async fn get_group(
+        &self,
+        params: crate::service::GroupsGetParams,
+    ) -> Result<crate::service::GroupDetails, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .get_group(params.account_id, params.group_key)
+            .await
+    }
 }
 
 impl Drop for ProxyGroupRuntime {

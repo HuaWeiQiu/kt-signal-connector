@@ -15,8 +15,8 @@ use crate::engine::{
 };
 use crate::protocol::ApiError;
 use crate::service::{
-    AttachmentPayload, ConnectorService, ContactsSyncOutcome, HostSideEvent, PeerTarget,
-    PreparedSend, SendTarget, ServiceError, validate_account_delete_operation_id,
+    AttachmentPayload, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
+    PeerTarget, PreparedSend, SendTarget, ServiceError, validate_account_delete_operation_id,
     validate_attachment_payload,
 };
 use crate::store::{
@@ -1253,6 +1253,17 @@ impl RuntimeSupervisor {
             limit,
             cursor.as_deref(),
         )
+    }
+
+    /// Read-only projection of one cached group row (§4.8); served from the
+    /// contacts cache with no upstream call, so it answers even while the
+    /// engine is stopped.
+    pub async fn get_group(
+        &self,
+        account_id: String,
+        group_key: String,
+    ) -> Result<GroupDetails, ServiceError> {
+        self.service.lock().await.get_group(&account_id, &group_key)
     }
 
     /// Pull the contacts/groups signal-cli already synced from the primary

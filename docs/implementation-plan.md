@@ -389,6 +389,32 @@ calling it against an older connector answers `METHOD_NOT_ALLOWED`.
   semantics, `READ_CONCURRENCY`), with the per-account pending budget unchanged. Metrics
   classify it as `read`.
 
+### 4.8 groups.get (contract revision 1.9, 2026-09-03)
+
+Read-only projection of the local contacts cache for one group. Params:
+`{accountId, groupKey}` — `groupKey` is the upstream group id (`opaqueId` shape, 1..128 bytes).
+The result is `{peerKey, title, memberCount?, syncedAt}`: `title` is the synced group name,
+`memberCount` is present when the sync batch captured a member count (`extra` JSON
+`memberCount`), and `syncedAt` is the cache row's sync timestamp.
+
+- Data source and staleness: `groups.get` is served from the rows written by `contacts.sync`, The sync path short-circuits
+  batches younger than 60 seconds and best-effort sync runs on `link.finish`, so a fresh link
+  can read without an explicit sync; beyond that the row is exactly as stale as the last sync.
+  The response carries `syncedAt` so the host can judge staleness itself — the connector adds
+  no second cache layer.
+- Errors (one new code, registered in the schema error enum): `ACCOUNT_NOT_FOUND` for an
+  unknown account; `INVALID_REQUEST` for a malformed `groupKey`; `GROUP_NOT_FOUND` when no
+  `kind='group'` contacts row exists for `(accountId, groupKey)` — this covers a group the
+  account has left (the sync filters `isMember=false`, so departed groups are never cached),
+  a peer key that names a contact instead of a group, and a never-synced group. The method
+  never calls the upstream: an unsynced cache is a `GROUP_NOT_FOUND`, not a `listGroups` call.
+- Dispatch: no upstream call and no event emission; served under the **read lane** together
+  with `contacts.list` (no upstream work, but the same bounded concurrency). Metrics classify
+  it as `contacts`.
+- Local alias is out of scope here: contact titles in the cache are upstream display names;
+  the host-side rename method is `contacts.setLocalAlias`, which does not touch this cache
+  either (it renames upstream, via `updateContact`).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

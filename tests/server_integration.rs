@@ -2080,6 +2080,127 @@ async fn get_attachment_answers_base64_data_or_contract_errors() {
     assert_clean_exit(&mut connector).await;
 }
 
+#[tokio::test]
+async fn groups_get_projects_the_synced_group_cache() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [37_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Groups" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // finish_link already ran a best-effort sync; the explicit sync inside the
+    // 60s window returns the cached counts and guarantees the cache is warm.
+    let synced = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(synced["result"]["groupCount"], 1);
+
+    // The membership-filtered cache holds exactly one group: the fixture's
+    // isMember=true entry with its member count.
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group["result"]["title"], "Fixture Group");
+    assert_eq!(group["result"]["memberCount"], 2);
+    assert!(group["result"]["syncedAt"].as_u64().unwrap() > 0);
+
+    // A group the account has left is filtered out of the cache at sync time
+    // (isMember=false), so it answers the deterministic cache miss.
+    let departed = request(
+        &mut client,
+        "groups-departed",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "bm90LWEtbWVtYmVy"
+        }),
+    )
+    .await;
+    assert_eq!(departed["error"]["code"], "GROUP_NOT_FOUND");
+    assert_eq!(departed["error"]["retryable"], false);
+
+    // A contact peer key is not a group row.
+    let contact_key = request(
+        &mut client,
+        "groups-contact-key",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "+15555550101"
+        }),
+    )
+    .await;
+    assert_eq!(contact_key["error"]["code"], "GROUP_NOT_FOUND");
+
+    // Unknown params are rejected by shape before any cache lookup.
+    let invalid = request(
+        &mut client,
+        "groups-invalid",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x",
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+
+    // Read-only: an unknown account is a cache miss, not an upstream lookup.
+    let unknown_account = request(
+        &mut client,
+        "groups-unknown-account",
+        "groups.get",
+        json!({
+            "accountId": "absent-account",
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();

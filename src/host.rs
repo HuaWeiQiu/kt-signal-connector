@@ -25,7 +25,7 @@ use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSyncParams, ConversationsListParams,
-    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    GroupsGetParams, HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
     MessagesGetAttachmentParams, MessagesListParams, MessagesRemoteDeleteParams,
     MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
 };
@@ -293,6 +293,7 @@ impl HostDispatchLimits {
                 | "messages.getText"
                 | "messages.attachments.get"
                 | "contacts.list"
+                | "groups.get"
         ) {
             self.read.clone().acquire_owned().await.unwrap()
         } else {
@@ -1157,6 +1158,19 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             Err(_) => HostResponse::failure(
                 request_id,
                 ApiError::new("INVALID_REQUEST", "invalid contacts.list params", false),
+            ),
+        },
+        "groups.get" => match serde_json::from_value::<GroupsGetParams>(request.params) {
+            Ok(params) => match runtime.get_group(params).await {
+                Ok(details) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(details).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid groups.get params", false),
             ),
         },
         _ => HostResponse::failure(

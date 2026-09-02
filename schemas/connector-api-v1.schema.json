@@ -53,7 +53,8 @@
             "messages.sendReaction",
             "messages.attachments.get",
             "contacts.sync",
-            "contacts.list"
+            "contacts.list",
+            "groups.get"
           ]
         },
         "params": {
@@ -221,6 +222,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/contactsListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.get" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsGetParams" }
             }
           }
         }
@@ -422,6 +434,21 @@
         }
       }
     },
+    "groupsGetParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "groupKey"],
+      "description": "Read-only projection (contract revision 1.9) of the local contacts cache for one group: {peerKey, title, memberCount?, syncedAt}. Served entirely from the rows written by contacts.sync — the connector never calls the upstream for this method, so an unsynced or departed group (the sync filters isMember=false) answers GROUP_NOT_FOUND; syncedAt lets the host judge staleness itself. Metrics classify it as contacts; no event is emitted.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "groupKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The upstream group id, exactly the peerKey of the cached kind='group' contacts row."
+        }
+      }
+    },
     "response": {
       "type": "object",
       "additionalProperties": false,
@@ -563,6 +590,7 @@
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
             "MESSAGE_NOT_FOUND",
+            "GROUP_NOT_FOUND",
             "PROXY_GROUP_NOT_FOUND",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
