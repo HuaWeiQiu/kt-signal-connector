@@ -20,6 +20,7 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::auth::{BootstrapSecret, HandshakeParams, PendingChallenge};
 use crate::ipc::LocalListener;
+use crate::methods;
 use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
@@ -47,6 +48,11 @@ const RECENT_REQUEST_IDS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
 const MAX_PENDING_HOST_BYTES: usize = 8 * 1024 * 1024;
+/// Dispatch lane capacities (CONTROL/READ/SEND below). They hand-mirror the
+/// desktop client's `requestScheduler.ts` lane limits (optimization-plan
+/// §5.2 B2): a capacity change must be applied on both sides in the same
+/// change, or the two schedulers diverge. Lane membership per method lives
+/// in `methods::METHODS`.
 const CONTROL_CONCURRENCY: usize = 1;
 /// Per-group `link.finish` capacity (ADR 0001 R3): phone-approval waits for
 /// different groups never block each other, while a second concurrent finish
@@ -162,10 +168,21 @@ impl HostDispatchLimits {
         }
     }
 
+    /// The global semaphore bounding one dispatch lane (capacities above;
+    /// lane membership per method in `methods::METHODS`).
+    fn lane_semaphore(&self, lane: methods::Lane) -> Arc<Semaphore> {
+        match lane {
+            methods::Lane::Control => self.control.clone(),
+            methods::Lane::Read => self.read.clone(),
+            methods::Lane::Send => self.send.clone(),
+        }
+    }
+
     /// Acquire the dispatch permit for one host request.
     ///
     /// Mutating, account-scoped methods (`messages.sendText`,
-    /// `messages.remoteDelete`, `contacts.sync`, `accounts.deleteLocalData`)
+    /// `messages.remoteDelete`, `contacts.sync`, `accounts.deleteLocalData`;
+    /// membership comes from the single method table, `methods::METHODS`)
     /// share one per-account mutex, which doubles as the delete drain barrier:
     ///
     /// - A delete first marks the account as deleting (new sends/syncs are
@@ -186,16 +203,7 @@ impl HostDispatchLimits {
         account_id: Option<&str>,
         lane_key: Option<&str>,
     ) -> Result<HostDispatchPermit, ApiError> {
-        if matches!(
-            method,
-            "messages.sendText"
-                | "messages.remoteDelete"
-                | "messages.sendReaction"
-                | "contacts.sync"
-                | "contacts.setLocalAlias"
-                | "presence.setTypingMessage"
-                | "accounts.deleteLocalData"
-        ) {
+        if methods::is_account_scoped_mutating(method) {
             let account_key = account_id.unwrap_or("").to_string();
             let deleting = if method == "accounts.deleteLocalData" {
                 let mut accounts = self.deleting_accounts.lock().unwrap();
@@ -233,18 +241,11 @@ impl HostDispatchLimits {
             // Account order is acquired before global lane capacity so one busy
             // account cannot occupy every lane permit while waiting on itself.
             let account = account_lock.lock_owned().await;
-            let lane = match method {
-                "messages.sendText"
-                | "messages.remoteDelete"
-                | "messages.sendReaction"
-                | "contacts.setLocalAlias"
-                | "presence.setTypingMessage" => self.send.clone(),
-                "contacts.sync" => self.read.clone(),
-                _ => self.control.clone(),
-            }
-            .acquire_owned()
-            .await
-            .unwrap();
+            let lane = self
+                .lane_semaphore(methods::lane(method))
+                .acquire_owned()
+                .await
+                .unwrap();
             return Ok(HostDispatchPermit {
                 _lane: lane,
                 _account: Some(account),
@@ -291,19 +292,11 @@ impl HostDispatchLimits {
             });
         }
 
-        let lane = if matches!(
-            method,
-            "conversations.list"
-                | "messages.list"
-                | "messages.getText"
-                | "messages.attachments.get"
-                | "contacts.list"
-                | "groups.get"
-        ) {
-            self.read.clone().acquire_owned().await.unwrap()
-        } else {
-            self.control.clone().acquire_owned().await.unwrap()
-        };
+        let lane = self
+            .lane_semaphore(methods::lane(method))
+            .acquire_owned()
+            .await
+            .unwrap();
         Ok(HostDispatchPermit {
             _lane: lane,
             _account: None,

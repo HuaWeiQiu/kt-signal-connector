@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::methods;
 use crate::protocol::ApiError;
 
 /// Coarse host-method categories (plan §8 "method categories"). The raw method
@@ -24,23 +25,11 @@ pub const METHOD_CLASSES: [&str; 7] = [
 /// `unknown` (a mutating call whose outcome cannot be determined).
 pub const RESULT_CLASSES: [&str; 4] = ["ok", "rejected", "failed", "unknown"];
 
+/// Fixed metrics label for one method (plan §8 "method categories"),
+/// derived from the single method table (`methods::METHODS`). The raw method
+/// string comes from the peer and is never used as a label.
 pub fn method_class(method: &str) -> &'static str {
-    match method {
-        "runtime.status" | "runtime.start" | "runtime.stop" => "control",
-        "accounts.list" | "accounts.deleteLocalData" => "accounts",
-        "link.start" | "link.finish" | "link.cancel" => "link",
-        "conversations.list"
-        | "messages.list"
-        | "messages.getText"
-        | "messages.attachments.get" => "read",
-        "messages.sendText"
-        | "messages.remoteDelete"
-        | "messages.sendReaction"
-        | "contacts.setLocalAlias"
-        | "presence.setTypingMessage" => "send",
-        "contacts.sync" | "contacts.list" | "groups.get" => "contacts",
-        _ => "unknown",
-    }
+    methods::metrics_class(method)
 }
 
 pub fn result_class(error: Option<&ApiError>) -> &'static str {

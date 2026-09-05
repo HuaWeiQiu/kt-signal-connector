@@ -9,6 +9,7 @@ pub mod ipc;
 pub mod link;
 pub mod lkg;
 pub mod manifest;
+pub mod methods;
 pub mod metrics;
 pub mod parent;
 pub mod protocol;
@@ -28,25 +29,7 @@ pub const MAX_PENDING_UPSTREAM_REQUESTS: usize = 128;
 /// of this group.
 pub const DEFAULT_PROXY_GROUP_ID: &str = "default";
 
-pub const PHASE2_CAPABILITIES: &[&str] = &[
-    "runtime.status",
-    "runtime.start",
-    "runtime.stop",
-    "accounts.list",
-    "accounts.deleteLocalData",
-    "link.start",
-    "link.finish",
-    "link.cancel",
-    "conversations.list",
-    "messages.list",
-    "messages.getText",
-    "messages.sendText",
-    "messages.remoteDelete",
-    "messages.sendReaction",
-    "messages.attachments.get",
-    "contacts.sync",
-    "contacts.list",
-    "groups.get",
-    "contacts.setLocalAlias",
-    "presence.setTypingMessage",
-];
+/// Advertised capability list, derived from the single method table
+/// (`methods::METHOD_NAMES`) and never hand-written (optimization-plan §5.2
+/// B1).
+pub const PHASE2_CAPABILITIES: &[&str] = &methods::METHOD_NAMES;
