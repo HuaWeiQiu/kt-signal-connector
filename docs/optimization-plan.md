@@ -1,8 +1,8 @@
 # Signal Integration Optimization Plan
 
-Date: 2026-08-25. Last updated: 2026-08-26. Scope: `kt-signal-connector` (this repo) +
+Date: 2026-08-25. Last updated: 2026-09-06. Scope: `kt-signal-connector` (this repo) +
 KT Desktop Signal integration (worktree `.worktrees/signal-test-main-latest`,
-branch `codex/signal-test-main-latest` @ d4de1d24).
+branch `codex/signal-test-main-latest` @ a7e203be; this repo @ 77f94b6).
 
 This plan follows the 2026-08-25 architecture review of both sides plus an open-source
 ecosystem survey (signal-cli v0.14.7, presage, libsignal-client v0.101.0, mautrix-signal,
@@ -23,6 +23,10 @@ Both repos are committed locally (connector 3 commits, desktop 4 commits) and no
 Phase 4 implementation was interrupted by a subagent gateway outage (502/503) on 2026-08-26;
 resumption resumes the two agents in place, no rework. Desktop side is typecheck-clean
 (3 TS errors in `sessionHost.ts` fixed before handover). See `docs/handover.md`.
+
+> **2026-09-06 更新**：Phase 4 已于后续批次双侧落地（connector `proxy_group` 实现遍布
+> src/，desktop 见 handoff §6.27 及其后的四阶段 L2 交付），上表快照保留作历史记录。
+> **当前进行中的工作见 §5 —— 2026-09-06 全链路重构与优化提案（批次 A/B/C，已批全量执行）。**
 
 ## 0. Conclusions that frame the plan
 
@@ -238,3 +242,94 @@ Per phase, in order; stop at the first failure:
 
 Report format per phase: Build / Types / Lint / Tests / Security / Diff →
 READY or NOT READY, with an explicit issue list.
+
+---
+
+## 5. 2026-09-06 全链路重构与优化提案（批次 A/B/C 终稿 · 已批全量执行）
+
+来源：四路并行调研合并——① connector 冗余与纪律审查 ② desktop 冗余盘点 ③ 外部开源/文献调研
+（Signal-Desktop、TanStack、SQLCipher 等）④ desktop 架构与算法审查，结论均复核到 file:line。
+desktop 侧注册指针：`.worktrees/signal-test-main-latest/docs/plan/signal-handoff-next-owner.md` §6.28。
+基线：desktop `a7e203be` / connector `77f94b6`，两仓工作区干净，全部本地未 push。
+
+### 5.0 已核实的发布风险（先于一切批次）
+
+worktree 打包 runtime `signal-runtime/macos-arm64/bin/kt-signal-connector` 为 08-10 构建（3.6 MB）。
+strings 验证：`presence.setTypingMessage` / `messages.sendReaction` / `messages.remoteDelete` /
+`messages.attachments.get` 全部缺失——四阶段 L2 方法一个都不在包里（`messages.sendReceipts`
+则本就不实现，见契约 1.12）。dev client 走本地新构建，实机验收不受影响；但正式发布链路若直接取
+仓内 runtime，用户机器将静默降级。**处置：全部批次完成后用 connector 终态重出二进制入库
+（B5 门禁防复发）。**
+
+### 5.1 批次 A — 低风险，先行（约 4–5 人日）
+
+Desktop（A1/A2 同文件，仓内串行 A1→A2→A3→A4）：
+
+| # | 事项 | 依据 | 量级/风险 |
+| --- | --- | --- | --- |
+| A1 | 删除送达回执死链路整链（~500 行/14 处/5 文件）。三方证据闭环：渲染端 flag 默认关；connector 无 `messages.sendReceipts`（源码与契约 1.12 均确认上游无 delivery 发送通道）；打包二进制亦无。步骤：①断渲染端进料（`noteDeliveryReceiptCandidates` + watch 钩子 + scheduler 实例/dispose/rebuild）②删 `signalDeliveryReceipts.ts` + spec + typing wiring spec 中 receipts 部分（**typing 部分保留**）③删 `signalHost.sendSessionReceipts` ④删 Main 侧 registerIpc handler / `sessionHost.sendSessionReceipts` / `hostAdapter.sendDeliveryReceipts` + allowlist / `classifySignalRequest` 分支 ⑤desktop 契约 `signal-host-adapter.md` §5.4/1.8 登记撤销（保留 revision 历史）⑥清 `SessionFeatureId.SIGNAL_DELIVERY_RECEIPTS` | `signalDeliveryReceipts.ts` 全文件；SignalWorkspace.vue:4702,4127-4140,3107-3109,4685,4985；signalHost.ts:174-179；sessionHost.ts:851-889；hostAdapter.ts:406-419；requestScheduler.ts:249 | 0.5–1d / 极低（链路本不通，TS 保证删序） |
+| A2 | 消息批量 merge 优化：`applyMessageEventBatch` 整批一次 merge（现状批内逐条全量 merge：B×(克隆 200+排序 200)）；`mergeBoundedSignalMessages` 未变化行保旧引用（现状每行新对象→200 行全 re-diff）。必须逐条保持 dedupe（clientRequestId 折叠）与 preserveIds 溢出语义 | SignalWorkspace.vue:3075-3089；signalPageWindow.ts:33,48-50,61-88 | 0.5–1d / 低（signalPageWindow.spec 兜底，补批量用例） |
+| A3 | 修用户可见破图：blob LRU 逐出只 revoke URL 不清 `attachmentUrls`，回翻 >12 张图渲染破图；加 `onEvict` 回调同步删 ref | signalAttachment.ts:126-131；SignalWorkspace.vue:1439-1442 | ~10 行 / 极低（补 spec 用例） |
+| A4 | 杂项清理：删 `signalStorageRetainedSessions`（3 行）；删死 i18n key（grep 复核后删，调研计数 6 个）；SIGNAL_TYPING 是活代码等 UI 开关——只修不实注释、不删（去留待产品）；契约 §5.3 漂移修正；`account_delete_pending` 契约登记；20 个在用 key 补登记 en.ts | — | 0.5d / 极低 |
+
+Connector（A5–A9，合计 <300 行）：
+
+| # | 事项 | 依据 | 量级 |
+| --- | --- | --- | --- |
+| A5 | attachmentId 长度统一 128（schema 128 vs 代码 256） | service.rs:42 | ~5 行 |
+| A6 | `update_message_status` 双取锁 TOCTOU → 单事务（unchecked_transaction） | store.rs:1372-1398 | ~10 行 |
+| A7 | stdin `write_all` 内联阻塞互堵窗口：写拆独立 task 或加超时 | engine.rs:819 | ~30 行 |
+| A8 | `schema_consistency.rs` 补数值边界 diff（长度/上限类约束入一致性门禁，防 A5 类漂移复发） | tests/schema_consistency.rs | 30–50 行 |
+| A9 | `prune_history` 全表窗口扫描优化（90 天/2000 条界内减少全表扫） | store.rs:1784-1803 | 小 |
+
+### 5.2 批次 B — 中型结构化（约 4–6 人日）
+
+| # | 仓 | 事项 | 依据 | 量级 |
+| --- | --- | --- | --- | --- |
+| B1 | connector | 方法→车道单一事实源：4 处重复分类表收敛为 1 处，新增方法触点 6→3 | host.rs:189-198,236-243,294-301；metrics.rs:27-44；lib.rs:31-52 | ~60 行 |
+| B2 | 双侧 | `contacts.sync` 车道归位：Main 侧 classify 无分支落 control（并发 1），慢同步挤 `listAccounts` 致账号状态抖动 → 归 read；两侧 limits 镜像注释（Main requestScheduler 与 host.rs CONTROL/READ/SEND_CONCURRENCY 改动需同动） | requestScheduler.ts classify；host.rs:194,242 | ~5 行+注释 |
+| B3 | connector | `prepare_*` 七函数收敛 `resolve_target` | service.rs prepare_* 族 | ~90 行净减 |
+| B4 | desktop | 样板收敛打包：registerIpc 表驱动（200→50 行）；wire 类型下沉 `shared/`（~120 行双写消除）；UNKNOWN_OUTCOME_PATTERN 下沉 shared；reaction/remoteDelete 乐观骨架共享（省 60–90 行）。注意：发送链路不是同类重复，不并入 | registerIpc.ts；类型双写处；SignalWorkspace.vue reaction/remoteDelete 骨架 | ~2d |
+| B5 | desktop | release 门禁：runtime 二进制方法清单 × 契约 revision 配对校验（strings/符号比对，防 §5.0 漂移复发）+ connector 终态重出二进制入库 | §5.0 | 0.5–1d |
+
+### 5.3 批次 C — 大重构，最后（约 6–10 人日）
+
+- **C1** `SignalWorkspace.vue`（6706 行）拆 composable，四刀依次、每刀一 commit、行为纯搬移：
+  ①`useSignalLinkFlow`（~900 行，耦合最小先切：:1115-1120,1267-1274,1549-1640,1741-1848,3333-3720,4618-4649）
+  ②`useSignalAttachments`（:1373-1449，核心已在 signalAttachment.ts）
+  ③`useSignalMessageActions`（:1352-1371,2500-2754，菜单/reaction/引用/删除确认）
+  ④`useSignalOptimisticSend`（:2438-2500,2958-3317,4197-4325,4420-4576，最后拆、回归面最大）。
+  每刀先补 characterization 测试再搬移；`viewAlive + sessionUid/accountId/conversationId` 四重
+  防串话守卫随行。
+- **C2** Pinia store 化 + store 层窗口化：外部调研证实 Signal-Desktop 官方 Timeline 不用虚拟列表库，
+  靠 store 窗口化（messageIds+lookup、discardMessages 裁剪、IntersectionObserver 驱动已读/翻页/贴底、
+  四锚滚动定位）。我们已有 DynamicScroller + 200 封顶已达标；C2 真正收益 = 状态机脱离单体获得真单测能力。
+- **C3** 融进 C1/C2 的官方设计（不单独立项）：reaction 去重键
+  `(targetAuthorAci,targetTimestamp,fromId,emoji)`；quote 按作者 ACI+sentAt 双键；send 返回
+  timestamp 作乐观 ack 对齐；backoff（上游已停更）换 backon + full jitter。
+
+### 5.4 明确不做（四路调研一致结论，防过度工程）
+
+`Map<id,index>` 替代 findIndex（n≤200 非瓶颈）；恢复退避 × Rust watchdog 协议级去重（跨仓协议
+变更破坏半升级兼容，现状 Backpressure→收敛已有界自愈）；虚拟滚动换库/增强；requestScheduler 重写
+（FIFO+超时+queue_full 语义正确，双侧同构限流是手工镜像——B2 补注释即可）；connector phf
+dispatch、宏化 prepare_*、jsonschema 热路径；redux 样板 / jsonrpsee 直配 stdio / sqlx+SQLCipher /
+XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去留待产品）。
+
+### 5.5 执行纪律与状态回填
+
+- 两仓可并行、同仓内严格串行（A1/A2 同文件；B1/B2 注释同文件）。
+- 不 push（延续现状）；中文 commit；大提交为主提交、属其一部分的小改动并入（既定口径）。
+- 门禁全绿才 commit：desktop `yarn typecheck:signal` + `yarn vitest run`（proxy groups 两个
+  spawn 用例为基线 flaky，已在 a7e203be 放宽预算——若再红先重跑甄别）；connector `cargo fmt` +
+  `cargo clippy -- -D warnings` + `cargo test` + `cargo build --release`。
+- dev client（Vite 3355 / CDP 9336）常驻在跑：不得杀其进程；vitest 与 Vite 互不干扰。
+
+| 批次 | 状态 | commit 回填 |
+| --- | --- | --- |
+| A-desktop | 待执行 | |
+| A-connector | 待执行 | |
+| B-connector | 待执行 | |
+| B-desktop（B2/B4） | 待执行 | |
+| B5 + 二进制重出 | 待执行 | |
+| C（四刀 + store 化） | 待执行 | |
