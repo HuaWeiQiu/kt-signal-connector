@@ -327,8 +327,8 @@ XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去�
 
 | 批次 | 状态 | commit 回填 |
 | --- | --- | --- |
-| A-desktop | 待执行 | |
-| A-connector | 待执行 | |
+| A-desktop | ✅ 完成（2026-09-06） | f31fe121（A1 删回执链，净 -502 行，契约 v1.11 撤销）；0af585d7（A2 批量 merge）；6bcf2084（A3 onEvict + A4 杂项，契约 v1.12 勘误 §5.3 并登记 account_delete_pending 错误码）。门禁：typecheck 0 错、vitest 160 文件/1485 用例全过。偏差：未登记 en.ts key 实为 8 个（12 个候选是裸 CJK 键早已登记）；account_delete_pending 是错误码非事件 |
+| A-connector | ✅ 完成（2026-09-06） | 278131d（A5/A6/A7：attachmentId+MAX_RECEIVE_ID_CHARS 对齐 128、update_message_status 单事务、stdin 独立写者任务+有界 channel）；58c749f（A8/A9：schema 16 组数值边界门禁+红检验证、prune_history 表达式索引分支删除+EXPLAIN 守卫）。门禁：clippy 0 警、test 206 过 0 败、release build 成功 |
 | B-connector | 待执行 | |
 | B-desktop（B2/B4） | 待执行 | |
 | B5 + 二进制重出 | 待执行 | |
