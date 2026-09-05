@@ -252,14 +252,23 @@ READY or NOT READY, with an explicit issue list.
 desktop 侧注册指针：`.worktrees/signal-test-main-latest/docs/plan/signal-handoff-next-owner.md` §6.28。
 基线：desktop `a7e203be` / connector `77f94b6`，两仓工作区干净，全部本地未 push。
 
-### 5.0 已核实的发布风险（先于一切批次）
+### 5.0 已核实的发布风险（先于一切批次）——已闭环（2026-09-06）
 
 worktree 打包 runtime `signal-runtime/macos-arm64/bin/kt-signal-connector` 为 08-10 构建（3.6 MB）。
 strings 验证：`presence.setTypingMessage` / `messages.sendReaction` / `messages.remoteDelete` /
 `messages.attachments.get` 全部缺失——四阶段 L2 方法一个都不在包里（`messages.sendReceipts`
 则本就不实现，见契约 1.12）。dev client 走本地新构建，实机验收不受影响；但正式发布链路若直接取
-仓内 runtime，用户机器将静默降级。**处置：全部批次完成后用 connector 终态重出二进制入库
-（B5 门禁防复发）。**
+仓内 runtime，用户机器将静默降级。
+
+**闭环结果（B5 实测与处置）**：新增方法面配对门禁对旧包留证 FAIL——实缺 **8** 个方法（上述 5 个
+L2 之外，`contacts.sync` / `contacts.list` / `groups.get` / `contacts.setLocalAlias` 亦缺席，旧包比
+预想更旧）。勘误：`signal-runtime/` 整目录被 gitignore，**bundle 非 git 入库物**，正确重出路径为
+`KT_SIGNAL_CONNECTOR_REPO=<connector 仓> yarn prepare:signal-runtime`（全量重建 + dev key 重签 +
+manifest 校验；手工覆盖 bin/ 会破坏 sha256 校验导致 bundled resolver fail closed）。已从 connector
+`6e567ae` 重出（bin 3657520→4451408 字节，bundleId desktop-dev-20260810093708→
+desktop-dev-20260905202618），`verify:signal-runtime`（需 KT_SIGNAL_CONNECTOR_VERIFY_BIN 指向
+connector target/release 二进制）与 `verify:signal-runtime-methods`（20/20）双 PASS。生产分发链路
+（signal-ci-packages / trust root）仍归 handoff §6.21 既定边界，不在本提案范围。
 
 ### 5.1 批次 A — 低风险，先行（约 4–5 人日）
 
@@ -306,7 +315,9 @@ Connector（A5–A9，合计 <300 行）：
   四锚滚动定位）。我们已有 DynamicScroller + 200 封顶已达标；C2 真正收益 = 状态机脱离单体获得真单测能力。
 - **C3** 融进 C1/C2 的官方设计（不单独立项）：reaction 去重键
   `(targetAuthorAci,targetTimestamp,fromId,emoji)`；quote 按作者 ACI+sentAt 双键；send 返回
-  timestamp 作乐观 ack 对齐；backoff（上游已停更）换 backon + full jitter。
+  timestamp 作乐观 ack 对齐。~~backoff（已停更）换 backon + full jitter~~——查证后不适用：
+  connector 的 Cargo.toml/lock/src 均无 backoff 依赖（外部调研的通用建议，非本仓现状），desktop
+  侧为固定恢复梯 [1s,5s,15s]，无需引入。
 
 ### 5.4 明确不做（四路调研一致结论，防过度工程）
 
@@ -329,15 +340,19 @@ XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去�
 | --- | --- | --- |
 | A-desktop | ✅ 完成（2026-09-06） | f31fe121（A1 删回执链，净 -502 行，契约 v1.11 撤销）；0af585d7（A2 批量 merge）；6bcf2084（A3 onEvict + A4 杂项，契约 v1.12 勘误 §5.3 并登记 account_delete_pending 错误码）。门禁：typecheck 0 错、vitest 160 文件/1485 用例全过。偏差：未登记 en.ts key 实为 8 个（12 个候选是裸 CJK 键早已登记）；account_delete_pending 是错误码非事件 |
 | A-connector | ✅ 完成（2026-09-06） | 278131d（A5/A6/A7：attachmentId+MAX_RECEIVE_ID_CHARS 对齐 128、update_message_status 单事务、stdin 独立写者任务+有界 channel）；58c749f（A8/A9：schema 16 组数值边界门禁+红检验证、prune_history 表达式索引分支删除+EXPLAIN 守卫）。门禁：clippy 0 警、test 206 过 0 败、release build 成功 |
-| B-connector | 待执行 | |
-| B-desktop（B2/B4） | 待执行 | |
-| B5 + 二进制重出 | 待执行 | |
+| B-connector | ✅ 完成（2026-09-06） | 23a3d0a（B1 方法→车道收敛 src/methods.rs 单源 + B2 注释，新增 2 守卫测试）；6e567ae（B3 prepare_* 收敛 resolve_target，重复 100% 收敛、净 +5）。门禁：clippy 0 警、test 208 过 0 败。新增方法触点 6→3 |
+| B-desktop（B2/B4） | ✅ 完成（2026-09-06） | 6401f3ac（wire 类型下沉 shared/signalWire 单源，渲染端 signalTypes.ts 删除，UNKNOWN_OUTCOME_PATTERN 收敛）；139d9e29（registerIpc 表驱动 299→247 + reaction/remoteDelete 乐观骨架共享，SignalWorkspace 6706→6686）；3e1dfee5（B2 contacts.sync 归位 read + 镜像说明 + spec 断言）。门禁：typecheck 双段过、vitest 160 文件/1485 用例 0 败 |
+| B5 + 二进制重出 | ✅ 完成（2026-09-06） | aee13ae7（spawn 用例 connect 失败模式确定性修复，见下方根因更新）；ad5fb1e9（verify:signal-runtime-methods 门禁 + prepare:signal-runtime 重出 bundle，双门禁 PASS，详见 §5.0 闭环结果） |
 | C（四刀 + store 化） | 待执行 | |
 
-> **批次 A 验证补记（2026-09-06 03:41–03:51）**：一轮环境负载窗口内 desktop
-> `signalConnectorProxyGroups` 两个 spawn 用例 0/30 确定性红（argv 文件未落盘，waitForFile 10s×5
-> 全超时）；经 83049f95 / f31fe121 / 0af585d7 / 6bcf2084 四点二分 + 双 worktree 交叉对照
-> （03:48 后同一 HEAD 双处全绿）判定为负载放大的既有 harness 竞速（a7e203be 已登记），**批次 A
-> 无回归**。后续批次若再遇该二用例红：先隔离重跑甄别，持续红才升级。根治候选（未列入本批，待拍板）：
-> supervisor 对首次 connect 失败的即拆毁加最小宽限——真实 connector 冷启需数秒，零宽限拆毁对
-> 慢启动子进程有产品风险。
+> **根因更新（2026-09-06，取代下方补记的「负载竞速」归因与 supervisor 宽限候选）**：spawn 类
+> 用例红的真根因 = endpoint 超过 macOS `sun_path` ~104 字节上限 → 首连 EINVAL 同步快败（不可
+> 重试）→ `stop()` ~50ms 内 SIGKILL child，而宿主 exec 变慢（本机实测 0.5-2s）写不出 argv。
+> aee13ae7 对症分流修复：proxyGroups 两用例 mkdtemp 基座换 /tmp（走 ENOENT 5s 重试窗口），
+> store-key 用例反向垫长 userDataDir 保 EINVAL 快败；双 TMPDIR 环境 28/28 确定性绿，全量
+> 1485/1485。supervisor 零宽限拆毁的产品语义未动（EINVAL 属永久性配置错误，快败正确），原
+> 「最小宽限」根治候选撤销。
+>
+> **批次 A 验证补记（2026-09-06 03:41–03:51，历史记录，归因已被上方根因更新取代）**：一轮环境
+> 窗口内 desktop `signalConnectorProxyGroups` 两个 spawn 用例 0/30 确定性红（argv 文件未落盘）；
+> 经 83049f95 / f31fe121 / 0af585d7 / 6bcf2084 四点二分 + 双 worktree 交叉对照判定「批次 A 无回归」。
