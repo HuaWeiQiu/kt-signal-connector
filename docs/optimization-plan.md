@@ -333,3 +333,11 @@ XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去�
 | B-desktop（B2/B4） | 待执行 | |
 | B5 + 二进制重出 | 待执行 | |
 | C（四刀 + store 化） | 待执行 | |
+
+> **批次 A 验证补记（2026-09-06 03:41–03:51）**：一轮环境负载窗口内 desktop
+> `signalConnectorProxyGroups` 两个 spawn 用例 0/30 确定性红（argv 文件未落盘，waitForFile 10s×5
+> 全超时）；经 83049f95 / f31fe121 / 0af585d7 / 6bcf2084 四点二分 + 双 worktree 交叉对照
+> （03:48 后同一 HEAD 双处全绿）判定为负载放大的既有 harness 竞速（a7e203be 已登记），**批次 A
+> 无回归**。后续批次若再遇该二用例红：先隔离重跑甄别，持续红才升级。根治候选（未列入本批，待拍板）：
+> supervisor 对首次 connect 失败的即拆毁加最小宽限——真实 connector 冷启需数秒，零宽限拆毁对
+> 慢启动子进程有产品风险。
