@@ -113,6 +113,12 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE INDEX IF NOT EXISTS contacts_account_peer
   ON contacts(account_id, kind, peer_key);
 ";
+/// DDL that must run after [`migrate_schema`], not in [`SCHEMA_DDL`], because
+/// it references columns that older stores only gain through a migration.
+const POST_MIGRATION_SCHEMA_DDL: &str = "
+CREATE INDEX IF NOT EXISTS messages_held_since
+  ON messages(COALESCE(stored_at, received_at, sent_at));
+";
 /// Retention: newest rows a conversation keeps regardless of age.
 const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
 /// Retention: age past which a message is no longer kept.
@@ -399,6 +405,12 @@ impl Store {
         conn.execute_batch(SCHEMA_DDL)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         migrate_schema(&conn)?;
+        // The held-since expression index (retention cost fix, prune_history)
+        // references stored_at, which stores older than schema 6 only gain
+        // inside migrate_schema; creating it after the migrations keeps the
+        // opening DDL valid against every schema version from v0 up.
+        conn.execute_batch(POST_MIGRATION_SCHEMA_DDL)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -1776,6 +1788,18 @@ impl Store {
     /// One call deletes at most `max_messages` rows and repairs the summaries it
     /// disturbed, so the caller keeps the store lock for a bounded time; call it
     /// again while it reports a full batch.
+    ///
+    /// Cost, not semantics (optimization-plan A9): a row qualifies either by
+    /// age alone (`held_since < expired_before` — branch 1) or by falling past
+    /// the per-conversation cap while out of the safety window (branch 2).
+    /// Every branch-1 row is strictly older than every branch-2 row, so
+    /// deleting branch 1 first and spending the batch budget there yields the
+    /// exact rows the old single windowed scan picked, in the same
+    /// oldest-first order. Branch 1 is an index range scan over
+    /// `messages_held_since` (the expression index on the age key) instead of
+    /// a full-table window pass; branch 2 runs the window only over messages
+    /// of conversations that actually exceed the cap, so the steady state
+    /// (no conversation over cap) never walks the table.
     pub fn prune_history(
         &self,
         now_ms: u64,
@@ -1790,7 +1814,38 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut touched_conversations = std::collections::BTreeSet::new();
         let mut messages_deleted = 0_u64;
+        // Branch 1, age rule: no recency is involved, so the expression index
+        // answers both the filter and the oldest-first order directly.
         {
+            let mut delete = transaction
+                .prepare(
+                    "DELETE FROM messages WHERE id IN (
+                       SELECT id FROM messages
+                       WHERE COALESCE(stored_at, received_at, sent_at) < ?1
+                         AND status NOT IN ('pending', 'unknown')
+                       ORDER BY COALESCE(stored_at, received_at, sent_at)
+                       LIMIT ?2
+                     )
+                     RETURNING conversation_id",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let deleted = delete
+                .query_map(params![expired_before, max_messages], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for conversation_id in deleted {
+                touched_conversations
+                    .insert(conversation_id.map_err(|error| StoreError::Unavailable(Some(error)))?);
+                messages_deleted += 1;
+            }
+        }
+        // Branch 2, per-conversation cap rule: only rows too young for branch 1
+        // but out of the safety window can still qualify, and only in
+        // conversations holding more than the cap — the window ranks every row
+        // of exactly those conversations.
+        if messages_deleted < max_messages as u64 {
+            let remaining = (max_messages as u64 - messages_deleted) as i64;
             let mut delete = transaction
                 .prepare(
                     "DELETE FROM messages WHERE id IN (
@@ -1801,10 +1856,16 @@ impl Store {
                                   PARTITION BY conversation_id ORDER BY sent_at DESC, id DESC
                                 ) AS recency
                          FROM messages
+                         WHERE conversation_id IN (
+                           SELECT conversation_id FROM messages
+                           GROUP BY conversation_id
+                           HAVING COUNT(*) > ?1
+                         )
                        )
-                       WHERE held_since < ?1
+                       WHERE held_since >= ?2
+                         AND held_since < ?3
                          AND status NOT IN ('pending', 'unknown')
-                         AND (held_since < ?2 OR recency > ?3)
+                         AND recency > ?1
                        ORDER BY held_since
                        LIMIT ?4
                      )
@@ -1814,10 +1875,10 @@ impl Store {
             let deleted = delete
                 .query_map(
                     params![
-                        keep_after,
-                        expired_before,
                         MAX_MESSAGES_PER_CONVERSATION,
-                        max_messages
+                        expired_before,
+                        keep_after,
+                        remaining
                     ],
                     |row| row.get::<_, String>(0),
                 )
@@ -3594,7 +3655,11 @@ mod tests {
         store
             .conn()
             .execute_batch(
-                "ALTER TABLE messages DROP COLUMN stored_at;
+                // The held-since index is younger than schema 6, so a store
+                // being reverted to its schema-5 shape cannot carry it — and
+                // SQLite refuses to drop an indexed column.
+                "DROP INDEX IF EXISTS messages_held_since;
+                 ALTER TABLE messages DROP COLUMN stored_at;
                  UPDATE meta SET value='5' WHERE key='schema_version';",
             )
             .unwrap();
@@ -4019,6 +4084,74 @@ mod tests {
         assert_eq!(stored_message_ids(&store, &conversation.id).len(), 1);
         assert_eq!(store.prune_history(now, 2).unwrap().messages_deleted, 1);
         assert!(stored_message_ids(&store, &conversation.id).is_empty());
+    }
+
+    #[test]
+    fn retention_prune_plans_stay_index_driven() {
+        // Guard for the A9 cost fix: the age branch must seek through the
+        // messages_held_since expression index, and no step of either prune
+        // branch may degenerate into an unindexed full walk of the messages
+        // table. The statements below mirror the two prune_history DELETEs
+        // verbatim; the plans are checked with data present so the planner
+        // chooses the same shape it will choose in production.
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let now = 40 * 365 * 24 * 60 * 60 * 1_000;
+        let day = 24 * 60 * 60 * 1_000;
+        seed_history(&store, now, &[day, 400 * day]);
+
+        let query_plan = |sql: String| -> Vec<String> {
+            let conn = store.conn();
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(3)).unwrap();
+            rows.map(|row| row.unwrap()).collect()
+        };
+        let age_branch = query_plan(
+            "DELETE FROM messages WHERE id IN (
+               SELECT id FROM messages
+               WHERE COALESCE(stored_at, received_at, sent_at) < 5
+                 AND status NOT IN ('pending', 'unknown')
+               ORDER BY COALESCE(stored_at, received_at, sent_at)
+               LIMIT 10
+             ) RETURNING conversation_id"
+                .to_string(),
+        );
+        assert!(
+            age_branch
+                .iter()
+                .any(|line| line.contains("messages_held_since")),
+            "age branch must use the held-since expression index: {age_branch:?}"
+        );
+
+        let cap_branch = query_plan(
+            "DELETE FROM messages WHERE id IN (
+               SELECT id FROM (
+                 SELECT id, status,
+                        COALESCE(stored_at, received_at, sent_at) AS held_since,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY conversation_id ORDER BY sent_at DESC, id DESC
+                        ) AS recency
+                 FROM messages
+                 WHERE conversation_id IN (
+                   SELECT conversation_id FROM messages
+                   GROUP BY conversation_id
+                   HAVING COUNT(*) > 2000
+                 )
+               )
+               WHERE held_since >= 5 AND held_since < 10
+                 AND status NOT IN ('pending', 'unknown')
+                 AND recency > 2000
+               ORDER BY held_since
+               LIMIT 10
+             ) RETURNING conversation_id"
+                .to_string(),
+        );
+        for line in age_branch.iter().chain(cap_branch.iter()) {
+            assert!(
+                !line.starts_with("SCAN messages") || line.contains("USING"),
+                "prune step degenerated into a full table walk: {line}"
+            );
+        }
     }
 
     #[test]

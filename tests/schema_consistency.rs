@@ -12,6 +12,10 @@
 //! - events: every `HostEvent::new("<name>", ...)` literal in src/ (the wire
 //!   serializer is the emission boundary).
 //! - error codes: every `ApiError::new("<CODE>", ...)` literal in src/.
+//! - numeric bounds: every schema length/numeric constraint the code also
+//!   enforces through a named constant (optimization-plan A8; this is the
+//!   gate that keeps A5-class drift — schema 128 vs code 256 — from
+//!   recurring).
 //!
 //! Known drift is encoded in the explicit allowlists below, each with a reason
 //! and the phase that resolves it. Any drift outside an allowlist fails.
@@ -25,6 +29,12 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
+use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
+use kt_signal_connector::service::{
+    MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_DEVICE_NAME_BYTES,
+    MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_TEXT_BYTES,
+};
+use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
 /// Events the code emits but the schema event enum does not declare. Currently
 /// none: `runtime.resourcePressure` (emitted by the RSS sampler bridge,
@@ -222,4 +232,113 @@ fn schema_events_match_emitted_events_within_allowlist() {
         "schema declares events the code never emits, outside the allowlist (or an \
          allowlisted drift was fixed — remove its entry): {schema_only:?}"
     );
+}
+
+/// The integer a schema constraint declares at `pointer` under `key`
+/// (`maxLength`, `maximum`, ...). A missing constraint panics: every bound
+/// listed below is part of the host contract and must stay declared.
+fn schema_bound(pointer: &str, key: &str) -> u64 {
+    schema()
+        .pointer(pointer)
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("schema must declare {key} at {pointer}"))
+}
+
+/// Numeric bounds the schema declares and the code enforces through a named
+/// constant must be equal (A8). The schema is the host-facing contract, the
+/// constants are the connector's enforcement; either side drifting changes
+/// what hosts may send versus what the connector accepts. This is the gate
+/// that would have caught A5 (schema attachmentId maxLength 128 while the
+/// code enforced 256).
+///
+/// Pairs cover every code constant that enforces a schema constraint.
+/// Schema-only bounds without a code constant (cursor/before 256, error
+/// message 256, proxyGroupId 128 — launcher ids are validated tighter at 32)
+/// and code-only bounds (inbound text projections, receive queue budgets) are
+/// deliberately not diffed here.
+#[test]
+fn schema_numeric_bounds_match_code_constants() {
+    let pairs: &[(&str, &str, u64)] = &[
+        ("/$defs/requestId", "maxLength", MAX_REQUEST_ID_BYTES as u64),
+        ("/$defs/opaqueId", "maxLength", MAX_OPAQUE_ID_BYTES as u64),
+        (
+            "/$defs/linkStartParams/properties/deviceName",
+            "maxLength",
+            MAX_DEVICE_NAME_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/text",
+            "maxLength",
+            MAX_TEXT_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/peerKey",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/peerTitle",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/contactsListParams/properties/query",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/groupsGetParams/properties/groupKey",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/contactsSetLocalAliasParams/properties/peerKey",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/contactsSetLocalAliasParams/properties/alias",
+            "maxLength",
+            MAX_ALIAS_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendReactionParams/properties/emoji",
+            "maxLength",
+            MAX_EMOJI_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesAttachmentsGetParams/properties/attachmentId",
+            "maxLength",
+            MAX_ATTACHMENT_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesAttachmentsGetParams/properties/sizeBytes",
+            "maximum",
+            MAX_ATTACHMENT_BYTES as u64,
+        ),
+        (
+            "/$defs/conversationsListParams/properties/limit",
+            "maximum",
+            MAX_PAGE_LIMIT as u64,
+        ),
+        (
+            "/$defs/messagesListParams/properties/limit",
+            "maximum",
+            MAX_PAGE_LIMIT as u64,
+        ),
+        (
+            "/$defs/contactsListParams/properties/limit",
+            "maximum",
+            MAX_PAGE_LIMIT as u64,
+        ),
+    ];
+    assert!(!pairs.is_empty());
+    for (pointer, key, code) in pairs {
+        let declared = schema_bound(pointer, key);
+        assert_eq!(
+            declared, *code,
+            "bound drift at {pointer}.{key}: schema says {declared}, code enforces {code}"
+        );
+    }
 }

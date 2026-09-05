@@ -18,16 +18,20 @@ use crate::store::{
     ConversationSummary, MessageRecord, Page, Store, StoreError, SyncedContact,
 };
 
-const MAX_TEXT_BYTES: usize = 64 * 1024;
+/// Bounds below are the code-side enforcement of the host-facing schema
+/// (schemas/connector-api-v1.schema.json); tests/schema_consistency.rs diffs
+/// each constant against its schema constraint, so the two cannot drift
+/// apart silently.
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
-const MAX_DEVICE_NAME_BYTES: usize = 64;
-const MAX_EMOJI_BYTES: usize = 32;
+pub const MAX_DEVICE_NAME_BYTES: usize = 64;
+pub const MAX_EMOJI_BYTES: usize = 32;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
 /// trivially small.
-const MAX_ALIAS_BYTES: usize = 128;
+pub const MAX_ALIAS_BYTES: usize = 128;
 /// Media PoC bound (contract revision 1.8, implementation-plan §4.7): 5 MiB
 /// raw is the largest size whose standard base64 encoding stays a deliberate
 /// margin under the engine's 8 MiB upstream stdout line limit — a longer
@@ -41,7 +45,11 @@ const MAX_ATTACHMENT_BASE64_CHARS: usize = 4 * MAX_ATTACHMENT_BYTES.div_ceil(3);
 /// the schema's `attachmentId` maxLength (schemas/connector-api-v1.schema.json
 /// is the single source for this length); Signal ids stay far below it, the
 /// bound only rejects absurd values early.
-const MAX_ATTACHMENT_ID_BYTES: usize = 128;
+pub const MAX_ATTACHMENT_ID_BYTES: usize = 128;
+/// Every opaque identifier the host frame carries (accountId, conversationId,
+/// messageId, clientRequestId, operationId, peerKey, peerTitle, query,
+/// groupKey — the schema's opaqueId family and its inline 128 peers).
+pub const MAX_OPAQUE_ID_BYTES: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -1621,10 +1629,10 @@ fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
 }
 
 fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
-    if value.is_empty() || value.len() > 128 {
+    if value.is_empty() || value.len() > MAX_OPAQUE_ID_BYTES {
         return Err(ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
-            format!("{field} must contain between 1 and 128 bytes"),
+            format!("{field} must contain between 1 and {MAX_OPAQUE_ID_BYTES} bytes"),
             false,
         )));
     }
