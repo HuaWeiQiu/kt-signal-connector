@@ -1375,16 +1375,23 @@ impl Store {
         status: &str,
         sent_at: Option<u64>,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
-        let changed = self
-            .lock_conn()?
+        // One transaction for the write and the read-back: two separate
+        // lock/execute rounds let another writer flip the status in between,
+        // so the returned (record, changed) pair could describe two different
+        // writes — and the status event built from it would carry a status
+        // this call never set. The transaction keeps the pair atomic.
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = transaction
             .execute(
                 "UPDATE messages SET status=?2, sent_at=COALESCE(?3, sent_at)
                  WHERE id=?1 AND status<>?2",
                 params![message_id, status, sent_at.map(|v| v as i64)],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let record = self
-            .lock_conn()?
+        let record = transaction
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id
@@ -1393,6 +1400,9 @@ impl Store {
                 message_record_from_row,
             )
             .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(record.map(|record| (record, changed == 1)))
     }
@@ -2678,6 +2688,68 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.direction, "system");
         assert_eq!(reloaded.status, "system");
+    }
+
+    #[test]
+    fn concurrent_status_updates_never_mismatch_record_and_transition() {
+        // Regression (optimization-plan A6): update_message_status used to run
+        // its UPDATE and its read-back SELECT in two separate lock rounds, so
+        // a concurrent writer could flip the status in between and the call
+        // would return the other writer's row together with changed=true — a
+        // status event this call never set. The single transaction keeps the
+        // pair atomic: the read-back must always report the status this call
+        // wrote (a replayed write reports the same status with changed=false).
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let message = MessageRecord {
+            id: "contended".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sent_at: 10,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "pending",
+            client_request_id: None,
+            quote_message_id: None,
+        };
+        store
+            .insert_message(&message, None, Some("body"), false)
+            .unwrap();
+
+        let store = std::sync::Arc::new(store);
+        std::thread::scope(|scope| {
+            for thread_index in 0..4_u32 {
+                let store = std::sync::Arc::clone(&store);
+                scope.spawn(move || {
+                    for round in 0..750_u32 {
+                        let status = if (thread_index + round) % 2 == 0 {
+                            "sent"
+                        } else {
+                            "failed"
+                        };
+                        let (record, _changed) = store
+                            .update_message_status("contended", status, None)
+                            .unwrap()
+                            .expect("contended row exists");
+                        assert_eq!(
+                            record.status, status,
+                            "read-back must report the status this call wrote"
+                        );
+                    }
+                });
+            }
+        });
     }
 
     #[test]

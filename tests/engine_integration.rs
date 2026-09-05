@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kt_signal_connector::engine::{
-    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, SignalCliConfig, SignalCliMode,
-    SocksProxy, event_channel, receive_channel,
+    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, STDIN_WRITE_QUEUE_CAPACITY,
+    SignalCliConfig, SignalCliMode, SocksProxy, event_channel, receive_channel,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -308,4 +308,73 @@ async fn pending_requests_apply_backpressure_at_the_hard_limit() {
     }
     assert!(backpressure >= 1);
     engine.shutdown().await.unwrap();
+}
+
+/// Regression (optimization-plan A7): the actor used to write each request to
+/// the child's stdin inline, so a signal-cli that stopped reading its stdin
+/// parked the whole actor inside `write_all` — the stdout pump, the receive
+/// ingress and the command lane stalled with it. The dedicated writer task
+/// keeps the actor free: with the writer parked on a full pipe, a receive
+/// notification still reaches the queue, and once the bounded write queue
+/// fills, the next request answers Backpressure instead of hanging.
+#[tokio::test]
+async fn stalled_stdin_does_not_block_the_actor() {
+    let (_temp, engine, mut receives) = engine(Duration::from_secs(20)).await;
+
+    // Arm a receive notification that fires in 400 ms without reading stdin.
+    engine
+        .call(
+            "armDelayedReceive",
+            json!({ "delayMs": 400 }),
+            CallClass::ReadOnly,
+        )
+        .await
+        .unwrap();
+    // Wedge the child: it answers this request, then stops reading stdin for
+    // good while staying alive.
+    engine
+        .call("stallStdin", json!({}), CallClass::ReadOnly)
+        .await
+        .unwrap();
+
+    // Oversized requests jam the pipe and then the bounded write queue: the
+    // writer parks mid-frame on the full pipe holding one frame, the queue
+    // holds STDIN_WRITE_QUEUE_CAPACITY more, and the child (sleeping, method
+    // "hang") never answers the rest. Pigeonhole: with capacity + 4 calls at
+    // least two must be refused on the spot once that in-flight budget is
+    // exhausted — the queue is bounded, so admission fails fast instead of
+    // parking the actor.
+    let blob = "x".repeat(200 * 1024);
+    let mut jammed = JoinSet::new();
+    for _ in 0..(STDIN_WRITE_QUEUE_CAPACITY + 4) {
+        let engine = engine.clone();
+        let blob = blob.clone();
+        jammed.spawn(async move {
+            engine
+                .call("hang", json!({ "blob": blob }), CallClass::Mutating)
+                .await
+        });
+    }
+
+    // The writer is parked on a full pipe, yet the actor still pumps stdout:
+    // the armed receive must land while the stdin jam holds.
+    let queued = timeout(Duration::from_secs(2), receives.recv())
+        .await
+        .expect("receive must arrive while stdin is stalled")
+        .expect("receive channel must stay open");
+    assert_eq!(queued.receive().timestamp, Some(42));
+
+    engine.shutdown().await.unwrap();
+    let mut backpressure = 0;
+    while let Some(outcome) = jammed.join_next().await {
+        match outcome.unwrap() {
+            Err(EngineError::Backpressure) => backpressure += 1,
+            Err(EngineError::UnknownOutcome) => {}
+            other => panic!("unexpected jam outcome: {other:?}"),
+        }
+    }
+    assert!(
+        backpressure >= 2,
+        "a full write queue must refuse admission, got {backpressure} refusals"
+    );
 }

@@ -37,9 +37,11 @@ pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 /// Encoded length of [`MAX_ATTACHMENT_BYTES`]: 4 * ceil(n / 3), the exact
 /// padded-base64 length java.util.Base64 emits.
 const MAX_ATTACHMENT_BASE64_CHARS: usize = 4 * MAX_ATTACHMENT_BYTES.div_ceil(3);
-/// An upstream attachment id (receive-time metadata field `id`); Signal ids
-/// stay far below this, the bound only rejects absurd values early.
-const MAX_ATTACHMENT_ID_BYTES: usize = 256;
+/// An upstream attachment id (receive-time metadata field `id`), bounded to
+/// the schema's `attachmentId` maxLength (schemas/connector-api-v1.schema.json
+/// is the single source for this length); Signal ids stay far below it, the
+/// bound only rejects absurd values early.
+const MAX_ATTACHMENT_ID_BYTES: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -996,7 +998,7 @@ impl ConnectorService {
         if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "attachmentId must contain between 1 and 256 bytes",
+                "attachmentId must contain between 1 and 128 bytes",
                 false,
             )));
         }

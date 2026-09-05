@@ -93,8 +93,8 @@ if STDERR_MARKER.exists():
     threading.Thread(target=emit_stderr_while_marked, daemon=True).start()
 
 
-def emit_receive():
-    notification = {
+def receive_notification():
+    return {
         "jsonrpc": "2.0",
         "method": "receive",
         "params": {
@@ -106,7 +106,10 @@ def emit_receive():
             },
         },
     }
-    emit_json(notification)
+
+
+def emit_receive():
+    emit_json(receive_notification())
 
 
 def emit_json_after(value, delay_seconds):
@@ -131,8 +134,26 @@ for line in sys.stdin:
     if method == "oversized":
         print("x" * 512, flush=True)
         continue
+    if method == "stallStdin":
+        # Regression fixture for the stdin writer task (A7): answer this one
+        # request, then stop reading stdin for good while staying alive, like
+        # a wedged signal-cli whose pipe stays full.
+        emit_json({"jsonrpc": "2.0", "id": request_id, "result": {"method": method}})
+        time.sleep(3600)
+        continue
 
-    if method == "startLink":
+    if method == "armDelayedReceive":
+        # Regression fixture for the stdin writer task (A7): emit a receive
+        # notification after a delay without reading anything else from stdin,
+        # so a test can prove the actor keeps pumping stdout while the stdin
+        # writer is parked on a full pipe.
+        threading.Thread(
+            target=emit_json_after,
+            args=(receive_notification(), max(params.get("delayMs", 0), 0) / 1000),
+            daemon=True,
+        ).start()
+        result = {"method": method}
+    elif method == "startLink":
         result = {"deviceLinkUri": ACTIVE_LINK_URI}
     elif method == "finishLink":
         if params.get("deviceLinkUri") != ACTIVE_LINK_URI:

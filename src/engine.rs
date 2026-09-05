@@ -25,6 +25,14 @@ use crate::resource::{
 use crate::{DEFAULT_UPSTREAM_LINE_LIMIT, MAX_PENDING_UPSTREAM_REQUESTS};
 
 const COMMAND_QUEUE_CAPACITY: usize = 128;
+/// Bounded queue of framed requests waiting for the child's stdin (A7): the
+/// actor hands whole encoded requests to a dedicated writer task, so a child
+/// that stops reading its stdin parks only that task, never the actor loop.
+/// Frames are the connector's own validated requests (tens of KiB at most),
+/// so a full queue bounds to well under 2 MiB of in-flight bytes. A full
+/// queue answers Backpressure, the same admission failure as the pending map
+/// cap; the queue can only fill when the pipe itself is already full.
+pub const STDIN_WRITE_QUEUE_CAPACITY: usize = 16;
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 const RECEIVE_QUEUE_CAPACITY: usize = 256;
 const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
@@ -39,7 +47,11 @@ const RECEIVE_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
 const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
-const MAX_RECEIVE_ID_CHARS: usize = 256;
+/// Receive routing ids (account, source, group id). These ids become stored
+/// peer keys, which the schema bounds at 128 (opaqueId/peerKey family in
+/// schemas/connector-api-v1.schema.json); accepting a longer one inbound would
+/// create a conversation the host contract forbids addressing.
+const MAX_RECEIVE_ID_CHARS: usize = 128;
 const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
@@ -780,7 +792,15 @@ async fn run_actor(
         receive_ingress,
     } = channels;
     let process_pid = child.lock().await.id();
-    let mut stdin = Some(stdin);
+    // The single stdin writer lives in its own task (A7): an inline write_all
+    // parked the whole actor whenever the child stopped reading its stdin,
+    // stalling the stdout pump and the command lane with it. The actor now
+    // queues whole frames; the writer keeps writing them in order, and a
+    // full queue or a dead writer is reported through the queue instead of
+    // blocking the loop.
+    let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(STDIN_WRITE_QUEUE_CAPACITY);
+    let (writer_failed_tx, mut writer_failed_rx) = mpsc::channel::<()>(1);
+    let writer = tokio::spawn(run_stdin_writer(stdin, write_rx, writer_failed_tx));
     let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(limits.line_limit));
     let mut pending = HashMap::<String, PendingRequest>::new();
     // Whether dropped receives have been reported as degraded storage; reset
@@ -811,39 +831,53 @@ async fn run_actor(
                             }
                         };
                         encoded.push(b'\n');
-                        let Some(writer) = stdin.as_mut() else {
-                            let _ = response.send(Err(EngineError::Exited));
-                            terminal_state = EngineState::Exited;
-                            break;
-                        };
-                        if writer.write_all(&encoded).await.is_err() || writer.flush().await.is_err() {
-                            let failure = match class {
-                                CallClass::ReadOnly => EngineError::Exited,
-                                CallClass::Mutating => EngineError::UnknownOutcome,
-                            };
-                            let _ = response.send(Err(failure));
-                            terminal_state = EngineState::Exited;
-                            break;
+                        match write_tx.try_send(encoded) {
+                            Ok(()) => {
+                                pending.insert(id, PendingRequest { class, response });
+                            }
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                // The child's stdin pipe and the writer queue
+                                // are both full: same admission failure as the
+                                // pending cap, so the caller hears Backpressure
+                                // instead of parking the actor.
+                                let _ = response.send(Err(EngineError::Backpressure));
+                                continue;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                let failure = match class {
+                                    CallClass::ReadOnly => EngineError::Exited,
+                                    CallClass::Mutating => EngineError::UnknownOutcome,
+                                };
+                                let _ = response.send(Err(failure));
+                                terminal_state = EngineState::Exited;
+                                break;
+                            }
                         }
-                        pending.insert(id, PendingRequest { class, response });
                     }
                     Some(EngineCommand::Cancel { id }) => {
                         pending.remove(&id);
                     }
                     Some(EngineCommand::Shutdown { response }) => {
-                        stdin.take();
+                        writer.abort();
                         stop_child(&child, limits.shutdown_grace).await;
                         let _ = response.send(());
                         terminal_state = EngineState::Stopped;
                         break;
                     }
                     None => {
-                        stdin.take();
+                        writer.abort();
                         stop_child(&child, limits.shutdown_grace).await;
                         terminal_state = EngineState::Stopped;
                         break;
                     }
                 }
+            }
+            // The writer could not deliver a frame (broken pipe: the child is
+            // gone or closed its stdin). Drain pending with the class-correct
+            // failures, exactly as an inline write error used to.
+            _ = writer_failed_rx.recv() => {
+                terminal_state = EngineState::Exited;
+                break;
             }
             line = lines.next() => {
                 match line {
@@ -892,8 +926,12 @@ async fn run_actor(
             "signal-cli engine terminated without a shutdown request"
         );
     }
+    // Aborting the writer drops any half-written frame and closes the child's
+    // stdin pipe immediately — the same close `stdin.take()` used to perform —
+    // so a writer parked on a full pipe cannot delay the child's shutdown.
+    // Aborting an already-finished writer is a no-op.
+    writer.abort();
     if !matches!(terminal_state, EngineState::Stopped) {
-        stdin.take();
         stop_child(&child, limits.shutdown_grace).await;
     }
     let readonly_failure = match terminal_state {
@@ -917,6 +955,27 @@ async fn run_actor(
             CallClass::Mutating => EngineError::UnknownOutcome,
         };
         let _ = request.response.send(Err(failure));
+    }
+}
+
+/// The engine's only stdin writer (A7): frames arrive pre-encoded from the
+/// actor, in dispatch order, and leave one `write_all` + flush at a time —
+/// one writer, one order. A child that stops reading its stdin parks this
+/// task alone; the actor keeps pumping stdout and answering commands. On a
+/// write failure the writer reports to the actor (which drains pending with
+/// the class-correct failures) and exits; when the actor is already gone the
+/// report is dropped and this task simply returns. Returning drops `stdin`,
+/// closing the pipe, the same EOF a taken stdin used to deliver.
+async fn run_stdin_writer(
+    mut stdin: ChildStdin,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    failed: mpsc::Sender<()>,
+) {
+    while let Some(frame) = frames.recv().await {
+        if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
+            let _ = failed.try_send(());
+            break;
+        }
     }
 }
 
