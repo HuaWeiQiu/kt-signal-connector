@@ -441,6 +441,38 @@ feasibility note that wrote `recipient: [peerKey]`), and `name` is the new alias
   the response status is the only authoritative answer. No event is emitted (the local
   history carries no contact row to transition).
 
+### 4.10 presence.setTypingMessage (contract revision 1.11, 2026-09-03)
+
+Send or stop the typing indicator to one conversation. Params: `{accountId, conversationId,
+stop?, operationId?}` — `stop` defaults to `false` (start typing); `operationId` is an
+optional host correlation id (validated, never persisted; same semantics as §4.5–§4.9).
+Targeting is by `conversationId` only: the conversation row must already exist in the
+local history — direct and group conversations are both addressable — and anything else
+(missing row, foreign account) answers `CONVERSATION_NOT_FOUND` before any upstream call.
+
+- Upstream call: the mutating `sendTyping` jsonRpc command. Verified against the pinned
+  0.14.7 distribution bytecode: `SendTypingCommand.getName()` is `sendTyping`; its dests
+  are `recipient` (`nargs="*"`, consumed with `ns.getList("recipient")` — `getList` wraps
+  a scalar in a one-element list, so the array form the connector sends follows the
+  `sendReaction` precedent), `group-id` (mapped to the camelCase `groupId` JSON key by
+  `JsonRpcNamespace`'s dash→camel fallback), and `stop` (a boolean dest read with
+  `ns.getBoolean`). `TypingAction` carries START/STOP; the upstream indicator expires
+  automatically after roughly 15 seconds, so `stop` is an explicit early clear, not a
+  requirement for the indicator to end. The connector always sends the `stop` key
+  explicitly (`{account, stop, recipient: [peerKey]}` or `{account, stop, groupId}`) —
+  with the key absent `getBoolean` answers null and the connector does not depend on how
+  the upstream treats a missing boolean.
+- Outcome semantics (sendReaction precedent): upstream `Ok` answers `{status: "sent"}`;
+  an indeterminate mutating outcome (`EngineError::UnknownOutcome`) answers
+  `{status: "unknown"}`. `unknown` is never retried automatically by the connector; the
+  host may re-send with a fresh requestId.
+- Dispatch: mutating, so the method joins the **send lane** with the per-account mutex
+  and the delete barrier (`sendText`/`remoteDelete`/`sendReaction`/`setLocalAlias`
+  semantics); same-account mutations serialize. Metrics classify it as `send`.
+- Nothing is written locally and no event is emitted: a typing indicator is ephemeral
+  upstream protocol state, not a history row. The inbound direction is out of scope this
+  revision — incoming typing events remain a declared `TODO` in the event contract.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

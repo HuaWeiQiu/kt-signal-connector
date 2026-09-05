@@ -2328,6 +2328,185 @@ async fn contacts_set_local_alias_renames_a_locally_known_peer() {
     assert_clean_exit(&mut connector).await;
 }
 
+#[tokio::test]
+async fn presence_set_typing_message_signals_ephemeral_upstream_state() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Typing" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // A direct conversation to type into (sendText creates the history row).
+    let seeded = request(
+        &mut client,
+        "typing-seed",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "direct",
+            "peerKey": "+15555550101",
+            "text": "typing target",
+            "clientRequestId": "typing-seed-1"
+        }),
+    )
+    .await;
+    let conversation_id = seeded["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Start typing: stop defaults to false and is still sent explicitly (§4.10).
+    let typing = request(
+        &mut client,
+        "typing-start",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "operationId": "typing-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(typing["result"]["status"], "sent");
+
+    // stop=true clears the indicator early.
+    let stopped = request(
+        &mut client,
+        "typing-stop",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    assert_eq!(stopped["result"]["status"], "sent");
+
+    // A group conversation addresses groupId instead of recipient.
+    let group_seeded = request(
+        &mut client,
+        "typing-group-seed",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "text": "group typing target",
+            "clientRequestId": "typing-seed-2"
+        }),
+    )
+    .await;
+    let group_conversation_id = group_seeded["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let group_typing = request(
+        &mut client,
+        "typing-group",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id
+        }),
+    )
+    .await;
+    assert_eq!(group_typing["result"]["status"], "sent");
+
+    // The exact upstream dispatch: account + explicit stop boolean + the
+    // conversation addressing (§4.10). The seed sends carry no `stop` key,
+    // so filtering on it isolates the typing calls.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log sendTyping params");
+    let typing_calls: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("stop").is_some())
+        .collect();
+    assert_eq!(typing_calls.len(), 3, "every typing call must be logged");
+    assert_eq!(typing_calls[0]["account"], "+15555550100");
+    assert_eq!(typing_calls[0]["stop"], json!(false));
+    assert_eq!(typing_calls[0]["recipient"], json!(["+15555550101"]));
+    assert_eq!(typing_calls[1]["stop"], json!(true));
+    assert_eq!(typing_calls[1]["recipient"], json!(["+15555550101"]));
+    assert_eq!(typing_calls[2]["groupId"], json!("ZmFrZS1ncm91cC0x"));
+    assert!(typing_calls[2].get("recipient").is_none());
+
+    // A missing conversation answers CONVERSATION_NOT_FOUND without an
+    // upstream call.
+    let missing = request(
+        &mut client,
+        "typing-missing",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "CONVERSATION_NOT_FOUND");
+
+    // Unknown params are rejected by shape.
+    let invalid = request(
+        &mut client,
+        "typing-invalid",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+
+    // An unknown account is answered without touching the upstream.
+    let absent_account = request(
+        &mut client,
+        "typing-absent-account",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": conversation_id
+        }),
+    )
+    .await;
+    assert_eq!(absent_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();

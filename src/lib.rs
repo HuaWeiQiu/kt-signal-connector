@@ -48,4 +48,5 @@ pub const PHASE2_CAPABILITIES: &[&str] = &[
     "contacts.list",
     "groups.get",
     "contacts.setLocalAlias",
+    "presence.setTypingMessage",
 ];

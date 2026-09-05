@@ -36,7 +36,8 @@ pub fn method_class(method: &str) -> &'static str {
         "messages.sendText"
         | "messages.remoteDelete"
         | "messages.sendReaction"
-        | "contacts.setLocalAlias" => "send",
+        | "contacts.setLocalAlias"
+        | "presence.setTypingMessage" => "send",
         "contacts.sync" | "contacts.list" | "groups.get" => "contacts",
         _ => "unknown",
     }
@@ -198,6 +199,7 @@ mod tests {
             ("messages.remoteDelete", "send"),
             ("messages.sendReaction", "send"),
             ("contacts.setLocalAlias", "send"),
+            ("presence.setTypingMessage", "send"),
             ("contacts.sync", "contacts"),
             ("contacts.list", "contacts"),
             ("groups.get", "contacts"),

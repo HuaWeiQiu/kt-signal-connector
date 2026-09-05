@@ -263,6 +263,19 @@ for line in sys.stdin:
         if params.get("name") == "[fixture-crash-alias]":
             os._exit(25)
         result = {}
+    elif method == "sendTyping":
+        # Same dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests can assert the recipient array / groupId / explicit
+        # stop boolean contract.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # One-shot crash with the mutating call in flight (the magic peer
+        # +15555550999): the indicator may or may not have reached the
+        # server, which is the indeterminate case (engine-exit path).
+        if "+15555550999" in (params.get("recipient") or []):
+            os._exit(27)
+        result = {}
     elif method == "emitReceive":
         result = {"method": method}
     elif method == "emitStderr":

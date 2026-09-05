@@ -55,7 +55,8 @@
             "contacts.sync",
             "contacts.list",
             "groups.get",
-            "contacts.setLocalAlias"
+            "contacts.setLocalAlias",
+            "presence.setTypingMessage"
           ]
         },
         "params": {
@@ -245,6 +246,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/contactsSetLocalAliasParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "presence.setTypingMessage" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/presenceSetTypingMessageParams" }
             }
           }
         }
@@ -479,6 +491,22 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "The new display name, at most 128 UTF-8 bytes."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "presenceSetTypingMessageParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Send or stop the typing indicator to one conversation (contract revision 1.11). The mutating upstream sendTyping command carries {account, stop, recipient: [peerKey]} for direct conversations or {account, stop, groupId} for groups; the connector always sends the stop boolean explicitly (the null handling of an absent key is not part of the pinned upstream contract), and signal-cli expires the indicator by itself after roughly 15 seconds, so stop=true is an early clear, not a requirement. Targeting is by conversationId only; a missing conversation row answers CONVERSATION_NOT_FOUND. The result is {status: 'sent'} when signal-cli confirmed the call, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. Nothing is written locally and no event is emitted: a typing indicator is ephemeral upstream protocol state, and inbound typing events remain a declared TODO.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "stop": {
+          "type": "boolean",
+          "default": false,
+          "description": "true stops an active indicator early; false (default) starts one."
         },
         "operationId": { "$ref": "#/$defs/opaqueId" }
       }

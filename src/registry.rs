@@ -663,6 +663,20 @@ impl ProxyGroupRuntime {
             .set_local_alias(params.account_id, params.peer_key, params.alias)
             .await
     }
+
+    pub async fn set_typing_message(
+        &self,
+        params: crate::service::PresenceSetTypingMessageParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .set_typing_message(
+                params.account_id,
+                params.conversation_id,
+                params.stop.unwrap_or(false),
+            )
+            .await
+    }
 }
 
 impl Drop for ProxyGroupRuntime {

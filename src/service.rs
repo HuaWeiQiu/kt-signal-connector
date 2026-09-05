@@ -483,6 +483,47 @@ impl ConnectorService {
         }))
     }
 
+    /// presence.setTypingMessage (contract revision 1.11, implementation-plan
+    /// §4.10): resolve the conversation locally, then build the upstream
+    /// `sendTyping` dispatch. Targeting is by conversationId only and nothing
+    /// is checked against the message history — a typing indicator references
+    /// no message. The `stop` boolean is always sent explicitly: with the key
+    /// absent the upstream `getBoolean` answers null, and the connector does
+    /// not depend on null handling outside the pinned contract.
+    pub fn prepare_set_typing_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        stop: bool,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let conversation = self
+            .store
+            .conversation_by_id(account_id, conversation_id)?
+            .ok_or(StoreError::ConversationNotFound)?;
+        // signal-cli JSON-RPC sendTyping parameters (verified against the
+        // pinned 0.14.7 distribution: SendTypingCommand dests `recipient`
+        // (nargs=*, consumed with getList), `group-id` and `stop` (a boolean
+        // dest read with getBoolean); JsonRpcNamespace maps dash-separated
+        // dests to camelCase JSON keys). The recipient array follows the
+        // sendReaction addressing precedent (getList wraps a scalar anyway).
+        let mut params = json!({
+            "account": account.signal_account,
+            "stop": stop,
+        });
+        if conversation.kind == "group" {
+            params["groupId"] = json!(conversation.peer_key);
+        } else {
+            params["recipient"] = json!([conversation.peer_key]);
+        }
+        Ok(params)
+    }
+
     /// Cache one full contacts sync atomically: all rows and the sync marker
     /// commit in a single transaction, so a failed batch leaves nothing behind.
     pub fn upsert_synced_contacts(
@@ -1462,6 +1503,15 @@ pub struct ContactsSetLocalAliasParams {
     pub account_id: String,
     pub peer_key: String,
     pub alias: String,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PresenceSetTypingMessageParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub stop: Option<bool>,
     pub operation_id: Option<String>,
 }
 
@@ -3250,5 +3300,72 @@ mod tests {
             .prepare_set_local_alias(&account.id, "+15555550101", &"x".repeat(129))
             .unwrap_err();
         assert_eq!(oversized.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// presence.setTypingMessage prepare (contract revision 1.11, §4.10):
+    /// the upstream params are exactly `account` + the explicit `stop`
+    /// boolean + group/peer addressing; a missing conversation answers
+    /// CONVERSATION_NOT_FOUND without any upstream call.
+    #[test]
+    fn prepare_set_typing_message_builds_upstream_params_from_the_conversation() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "G")
+            .unwrap();
+
+        let start = service
+            .prepare_set_typing_message(&account.id, &direct.id, false)
+            .unwrap();
+        assert_eq!(
+            start,
+            json!({
+                "account": "+15555550100",
+                "stop": false,
+                "recipient": ["+15555550101"]
+            })
+        );
+
+        let stop = service
+            .prepare_set_typing_message(&account.id, &direct.id, true)
+            .unwrap();
+        assert_eq!(
+            stop,
+            json!({
+                "account": "+15555550100",
+                "stop": true,
+                "recipient": ["+15555550101"]
+            })
+        );
+
+        let group_start = service
+            .prepare_set_typing_message(&account.id, &group.id, false)
+            .unwrap();
+        assert_eq!(
+            group_start,
+            json!({
+                "account": "+15555550100",
+                "stop": false,
+                "groupId": "ZmFrZS1ncm91cC0x"
+            })
+        );
+
+        let missing = service
+            .prepare_set_typing_message(&account.id, "no-such-conversation", false)
+            .unwrap_err();
+        assert_eq!(missing.into_api().code, "CONVERSATION_NOT_FOUND");
+
+        let absent_account = service
+            .prepare_set_typing_message("no-such-account", &direct.id, false)
+            .unwrap_err();
+        assert_eq!(absent_account.into_api().code, "ACCOUNT_NOT_FOUND");
     }
 }

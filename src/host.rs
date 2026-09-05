@@ -27,7 +27,8 @@ use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesGetAttachmentParams, MessagesListParams,
-    MessagesRemoteDeleteParams, MessagesSendReactionParams, MessagesSendTextParams, SendTarget,
+    MessagesRemoteDeleteParams, MessagesSendReactionParams, MessagesSendTextParams,
+    PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -192,6 +193,7 @@ impl HostDispatchLimits {
                 | "messages.sendReaction"
                 | "contacts.sync"
                 | "contacts.setLocalAlias"
+                | "presence.setTypingMessage"
                 | "accounts.deleteLocalData"
         ) {
             let account_key = account_id.unwrap_or("").to_string();
@@ -235,7 +237,8 @@ impl HostDispatchLimits {
                 "messages.sendText"
                 | "messages.remoteDelete"
                 | "messages.sendReaction"
-                | "contacts.setLocalAlias" => self.send.clone(),
+                | "contacts.setLocalAlias"
+                | "presence.setTypingMessage" => self.send.clone(),
                 "contacts.sync" => self.read.clone(),
                 _ => self.control.clone(),
             }
@@ -1186,6 +1189,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid contacts.setLocalAlias params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "presence.setTypingMessage" => {
+            match serde_json::from_value::<PresenceSetTypingMessageParams>(request.params) {
+                Ok(params) => match runtime.set_typing_message(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid presence.setTypingMessage params",
                         false,
                     ),
                 ),
