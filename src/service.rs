@@ -446,6 +446,61 @@ impl ConnectorService {
         })
     }
 
+    // --- Shared target resolution for the prepare_* family -----------------
+    // (optimization-plan §5.2 B3): every prepare_* resolves the addressed rows
+    // through this one ladder, in wire order — account, then conversation,
+    // then message — so a bogus id answers its NOT_FOUND code before any
+    // upstream call (implementation-plan §4.4). Per-function validation runs
+    // first and stays in the caller.
+
+    /// The addressed account row, or ACCOUNT_NOT_FOUND.
+    fn resolve_account(&self, account_id: &str) -> Result<AccountRow, ServiceError> {
+        Ok(self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::AccountNotFound)?)
+    }
+
+    /// The addressed conversation row, or CONVERSATION_NOT_FOUND.
+    fn resolve_conversation(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationRow, ServiceError> {
+        Ok(self
+            .store
+            .conversation_by_id(account_id, conversation_id)?
+            .ok_or(StoreError::ConversationNotFound)?)
+    }
+
+    /// The addressed message row, or MESSAGE_NOT_FOUND.
+    fn resolve_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<MessageRecord, ServiceError> {
+        Ok(self
+            .store
+            .message_by_id(account_id, conversation_id, message_id)?
+            .ok_or(StoreError::MessageNotFound)?)
+    }
+
+    /// Account → conversation → message in wire order, for the
+    /// message-addressed trio (`messages.remoteDelete`, `messages.sendReaction`,
+    /// `messages.attachments.get`).
+    fn resolve_target(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(AccountRow, ConversationRow, MessageRecord), ServiceError> {
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        let message = self.resolve_message(account_id, conversation_id, message_id)?;
+        Ok((account, conversation, message))
+    }
+
     /// contacts.setLocalAlias (contract revision 1.10, implementation-plan
     /// §4.9): resolve the rename locally, then build the upstream
     /// `updateContact` dispatch. The peer must already be known to the
@@ -461,10 +516,7 @@ impl ConnectorService {
         validate_opaque_id(account_id, "accountId")?;
         validate_opaque_id(peer_key, "peerKey")?;
         validate_alias(alias)?;
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
+        let account = self.resolve_account(account_id)?;
         let known = self
             .store
             .contact_by_peer(account_id, "contact", peer_key)?
@@ -508,14 +560,8 @@ impl ConnectorService {
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         validate_opaque_id(conversation_id, "conversationId")?;
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
-        let conversation = self
-            .store
-            .conversation_by_id(account_id, conversation_id)?
-            .ok_or(StoreError::ConversationNotFound)?;
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
         // signal-cli JSON-RPC sendTyping parameters (verified against the
         // pinned 0.14.7 distribution: SendTypingCommand dests `recipient`
         // (nargs=*, consumed with getList), `group-id` and `stop` (a boolean
@@ -526,11 +572,7 @@ impl ConnectorService {
             "account": account.signal_account,
             "stop": stop,
         });
-        if conversation.kind == "group" {
-            params["groupId"] = json!(conversation.peer_key);
-        } else {
-            params["recipient"] = json!([conversation.peer_key]);
-        }
+        set_upstream_target(&mut params, &conversation);
         Ok(params)
     }
 
@@ -640,14 +682,8 @@ impl ConnectorService {
         {
             return Ok(PreparedSend::Existing(existing));
         }
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
-        let conversation = self
-            .store
-            .conversation_by_id(account_id, conversation_id)?
-            .ok_or(StoreError::ConversationNotFound)?;
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
         self.dispatch_send(
             &account,
             &conversation,
@@ -700,10 +736,7 @@ impl ConnectorService {
         {
             return Ok(PreparedSend::Existing(existing));
         }
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
+        let account = self.resolve_account(account_id)?;
         let title = peer_title.unwrap_or_else(|| {
             if kind == "group" {
                 "group".to_string()
@@ -773,11 +806,7 @@ impl ConnectorService {
             "account": account.signal_account,
             "message": text,
         });
-        if conversation.kind == "group" {
-            params["groupId"] = json!(conversation.peer_key);
-        } else {
-            params["recipient"] = json!([conversation.peer_key]);
-        }
+        set_upstream_target(&mut params, conversation);
         // signal-cli JSON-RPC send quote parameters (verified against the
         // pinned 0.14.7 distribution): quoteTimestamp is the quoted message's
         // Signal timestamp, quoteAuthor its author's number — both required.
@@ -849,18 +878,8 @@ impl ConnectorService {
         validate_opaque_id(account_id, "accountId")?;
         validate_opaque_id(conversation_id, "conversationId")?;
         validate_opaque_id(message_id, "messageId")?;
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
-        let conversation = self
-            .store
-            .conversation_by_id(account_id, conversation_id)?
-            .ok_or(StoreError::ConversationNotFound)?;
-        let message = self
-            .store
-            .message_by_id(account_id, conversation_id, message_id)?
-            .ok_or(StoreError::MessageNotFound)?;
+        let (account, conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
         if message.direction != "outgoing" || message.status != "sent" {
             return Err(StoreError::MessageNotFound.into());
         }
@@ -874,11 +893,7 @@ impl ConnectorService {
             "account": account.signal_account,
             "targetTimestamp": message.sent_at,
         });
-        if conversation.kind == "group" {
-            params["groupId"] = json!(conversation.peer_key);
-        } else {
-            params["recipient"] = json!([conversation.peer_key]);
-        }
+        set_upstream_target(&mut params, &conversation);
         Ok(PreparedRemoteDelete {
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -914,18 +929,8 @@ impl ConnectorService {
         validate_opaque_id(conversation_id, "conversationId")?;
         validate_opaque_id(message_id, "messageId")?;
         validate_emoji(emoji)?;
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
-        let conversation = self
-            .store
-            .conversation_by_id(account_id, conversation_id)?
-            .ok_or(StoreError::ConversationNotFound)?;
-        let message = self
-            .store
-            .message_by_id(account_id, conversation_id, message_id)?
-            .ok_or(StoreError::MessageNotFound)?;
+        let (account, conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
         // signal-cli JSON-RPC sendReaction parameters (verified against the
         // pinned 0.14.7 distribution: SendReactionCommand dests `emoji`
         // (required, "should be a single unicode grapheme cluster"),
@@ -971,11 +976,7 @@ impl ConnectorService {
             "targetAuthor": target_author,
             "targetTimestamp": message.sent_at,
         });
-        if conversation.kind == "group" {
-            params["groupId"] = json!(conversation.peer_key);
-        } else {
-            params["recipient"] = json!([conversation.peer_key]);
-        }
+        set_upstream_target(&mut params, &conversation);
         Ok(PreparedSendReaction {
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
@@ -1017,16 +1018,8 @@ impl ConnectorService {
                 false,
             )));
         }
-        let account = self
-            .store
-            .account_by_id(account_id)?
-            .ok_or(StoreError::AccountNotFound)?;
-        self.store
-            .conversation_by_id(account_id, conversation_id)?
-            .ok_or(StoreError::ConversationNotFound)?;
-        self.store
-            .message_by_id(account_id, conversation_id, message_id)?
-            .ok_or(StoreError::MessageNotFound)?;
+        let (account, _conversation, _message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
         // signal-cli JSON-RPC getAttachment parameters (verified against the
         // pinned 0.14.7 distribution: GetAttachmentCommand reads only `id` in
         // jsonRpc mode — the CLI-side recipient/group-id flags never reach the
@@ -1523,6 +1516,18 @@ pub struct PresenceSetTypingMessageParams {
     pub conversation_id: String,
     pub stop: Option<bool>,
     pub operation_id: Option<String>,
+}
+
+/// Upstream addressing for one resolved conversation (pinned 0.14.7 JSON-RPC
+/// shape): a group conversation addresses `groupId`, every other kind the
+/// `recipient` array — the same targeting `send`, `sendTyping`,
+/// `remoteDelete`, and `sendReaction` share.
+fn set_upstream_target(params: &mut Value, conversation: &ConversationRow) {
+    if conversation.kind == "group" {
+        params["groupId"] = json!(conversation.peer_key);
+    } else {
+        params["recipient"] = json!([conversation.peer_key]);
+    }
 }
 
 fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
