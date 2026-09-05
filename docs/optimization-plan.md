@@ -313,11 +313,14 @@ Connector（A5–A9，合计 <300 行）：
 - **C2** Pinia store 化 + store 层窗口化：外部调研证实 Signal-Desktop 官方 Timeline 不用虚拟列表库，
   靠 store 窗口化（messageIds+lookup、discardMessages 裁剪、IntersectionObserver 驱动已读/翻页/贴底、
   四锚滚动定位）。我们已有 DynamicScroller + 200 封顶已达标；C2 真正收益 = 状态机脱离单体获得真单测能力。
-- **C3** 融进 C1/C2 的官方设计（不单独立项）：reaction 去重键
-  `(targetAuthorAci,targetTimestamp,fromId,emoji)`；quote 按作者 ACI+sentAt 双键；send 返回
-  timestamp 作乐观 ack 对齐。~~backoff（已停更）换 backon + full jitter~~——查证后不适用：
-  connector 的 Cargo.toml/lock/src 均无 backoff 依赖（外部调研的通用建议，非本仓现状），desktop
-  侧为固定恢复梯 [1s,5s,15s]，无需引入。
+- **C3** 融进 C1/C2 的官方设计（不单独立项）——**四项全部经代码印证后不做（2026-09-06 C2 落地时评估）**：
+  ① reaction 去重键 `(targetAuthorAci,targetTimestamp,fromId,emoji)`：`canReactToMessage` 已排除
+  local-/未决行、reaction 只挂真实 server id，clientRequestId 折叠保证窗口单行——双键无重复面可消；
+  ② quote 按作者 ACI+sentAt 双键：quote 只作用于已结算行，`quoteMessageId` 即稳定 server id——双键
+  无收益；③ send 返回 timestamp 作乐观 ack 对齐：settle 对齐键是 clientRequestId（sentAt 仅展示
+  兜底），收敛已在 dedupeByClientRequestId 完成，timestamp 对齐会扰动 connector 契约且无用户可见
+  收益；④ ~~backoff（已停更）换 backon + full jitter~~：connector 的 Cargo.toml/lock/src 均无
+  backoff 依赖（外部调研通用建议，非本仓现状），desktop 为固定恢复梯 [1s,5s,15s]，无需引入。
 
 ### 5.4 明确不做（四路调研一致结论，防过度工程）
 
@@ -343,7 +346,7 @@ XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去�
 | B-connector | ✅ 完成（2026-09-06） | 23a3d0a（B1 方法→车道收敛 src/methods.rs 单源 + B2 注释，新增 2 守卫测试）；6e567ae（B3 prepare_* 收敛 resolve_target，重复 100% 收敛、净 +5）。门禁：clippy 0 警、test 208 过 0 败。新增方法触点 6→3 |
 | B-desktop（B2/B4） | ✅ 完成（2026-09-06） | 6401f3ac（wire 类型下沉 shared/signalWire 单源，渲染端 signalTypes.ts 删除，UNKNOWN_OUTCOME_PATTERN 收敛）；139d9e29（registerIpc 表驱动 299→247 + reaction/remoteDelete 乐观骨架共享，SignalWorkspace 6706→6686）；3e1dfee5（B2 contacts.sync 归位 read + 镜像说明 + spec 断言）。门禁：typecheck 双段过、vitest 160 文件/1485 用例 0 败 |
 | B5 + 二进制重出 | ✅ 完成（2026-09-06） | aee13ae7（spawn 用例 connect 失败模式确定性修复，见下方根因更新）；ad5fb1e9（verify:signal-runtime-methods 门禁 + prepare:signal-runtime 重出 bundle，双门禁 PASS，详见 §5.0 闭环结果） |
-| C（四刀 + store 化） | 待执行 | |
+| C（四刀 + store 化） | ✅ 完成（2026-09-06） | C1 四刀（每刀 characterization 先行 + 行为纯搬移、逐字比对验证）：61eb55df+581ec7f1（useSignalLinkFlow，-635 行/12 用例）、1a4d8f29+f4cf7ae5（useSignalAttachments，-80 行/6 用例）、de4f0cc7+941e61d3（useSignalMessageActions，-287 行/14 用例）、7dfbd74f+36d2dc40（useSignalOptimisticSend，-480 行/7 用例）；附带 0b68c227 修复 C1b 刻画锁定的附件两真 bug（overflow 逐出 spread 竞态——A3 破图修复实际未生效 + 下载 anchor href 用 state key 真机必错）。C2：ef489276（src/store/signalSessionStore.ts 272 行——持当前视图、四重守卫不动、三级 pinia 实例解析防生产状态分裂）+9abb3079（store 级单测 23 条）。SignalWorkspace.vue 6706→5135；vitest 160 文件/1485→163/1547 全绿。C3 四项借鉴设计经代码印证不做（见 §5.3） |
 
 > **根因更新（2026-09-06，取代下方补记的「负载竞速」归因与 supervisor 宽限候选）**：spawn 类
 > 用例红的真根因 = endpoint 超过 macOS `sun_path` ~104 字节上限 → 首连 EINVAL 同步快败（不可
