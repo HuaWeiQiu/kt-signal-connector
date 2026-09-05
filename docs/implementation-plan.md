@@ -473,6 +473,39 @@ local history — direct and group conversations are both addressable — and an
   upstream protocol state, not a history row. The inbound direction is out of scope this
   revision — incoming typing events remain a declared `TODO` in the event contract.
 
+### 4.11 messages.sendReceipts (contract revision 1.12, 2026-09-05) — reserved, not wired
+
+Registered intent: `messages.sendReceipts` sends **delivery receipts** for previously
+received messages, shape `{accountId, conversationId, timestamps, type, operationId?}`
+with `type` deliberately restricted to `"DELIVERY"`. Read receipts are out of scope for
+this method by contract: READ receipts leak exactly-when-read and the connector never
+sends them. This revision registers the contract only — the method is **not** added to
+the schema method enum, so the connector answers `METHOD_NOT_ALLOWED` today — because
+the pinned signal-cli 0.14.7 distribution exposes no upstream channel to send a
+delivery receipt. Verified against the pinned distribution bytecode:
+
+- The only receipt command is `SendReceiptCommand`, whose jsonRpc name is `sendReceipt`
+  (singular). Its `--type` dest carries exactly two choices (`read`, `viewed`), and its
+  `handleCommand` dispatches only `Manager.sendReadReceipt`/`Manager.sendViewedReceipt`,
+  falling through to `UserErrorException` for anything else. The full jsonRpc command
+  table contains no `sendReceipts` (plural) and no delivery-sending command.
+- The libsignal layer does define `SignalServiceReceiptMessage$Type.DELIVERY`, but no
+  CLI code path reaches it from jsonRpc: `Manager` exposes no `sendDeliveryReceipt`.
+- A host-triggered delivery receipt is redundant protocol state to begin with: the
+  pinned `IncomingMessageHandler.handleMessage` already constructs
+  `SendReceiptAction(recipientId, Type.DELIVERY, timestamp)` for incoming messages, so
+  the engine answers deliveries automatically on receipt.
+
+Consequences for the host:
+
+- Delivery receipts need no connector API: they are guaranteed by the engine's inbound
+  path, not by an explicit host call.
+- The reservation exists so a future upstream that wires `sendDeliveryReceipt` can add
+  the method without reshaping the contract. Registering a method that could only fail
+  upstream (`sendReceipt` with an unsupported type, answering `UPSTREAM_ERROR` on every
+  call) was rejected: a permanently-failing lane is worse than the explicit
+  not-implemented `METHOD_NOT_ALLOWED` answer.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
