@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Multi-group runtime facade (ADR 0001 R6-R9): one connector process, one
-//! supervised signal-cli engine per launcher-defined proxy group.
+//! supervised signal-cli engine per launcher-defined proxy group. Sibling
+//! connector processes on the same host are legal under the ADR 0002
+//! namespace rules — disjoint endpoints and data directories (enforced by
+//! the startup occupancy lock in `crate::datalock`) plus a per-instance
+//! state-dir store; nothing inside this facade assumes it is the only
+//! connector on the machine.
 //!
 //! The facade owns every [`RuntimeSupervisor`] in launcher configuration order
 //! and is the only surface the host protocol talks to. Its responsibilities,
