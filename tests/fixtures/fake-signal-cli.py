@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import zlib
 
 
 expected_java_opts = os.environ.get("KT_FAKE_EXPECT_JAVA_OPTS")
@@ -92,6 +93,102 @@ def next_multi_number():
 def receiving_account():
     numbers = linked_multi_numbers()
     return numbers[-1] if MULTI_ACCOUNT and numbers else LINKED_ACCOUNT
+
+
+# --- Controlled-rate receive injection (optimization-plan §6.4 M3.2) -------
+#
+# The soak driver cannot reach the engines directly (the connector owns the
+# only JSON-RPC channels), so it steers load through a marker file in this
+# engine's data directory: `.fixture-load` holding
+# {"ratePerMinute": R, "accounts": N}. R is messages per minute per account,
+# N the number of simulated receiving accounts (keep N <= 8: receive-driven
+# upserts bypass the link ceiling, and the soak models a legal engine).
+# Every emission appends one line to `.fixture-load-log.jsonl` so the
+# baseline report can count exactly what was injected.
+LOAD_MARKER = SIGNAL_DATA_DIR / ".fixture-load"
+LOAD_LOG = SIGNAL_DATA_DIR / ".fixture-load-log.jsonl"
+LOAD_LOCK = threading.Lock()
+LOAD_STATE = {"spec": None, "stop": None}
+
+
+def read_load_spec():
+    try:
+        spec = json.loads(LOAD_MARKER.read_text())
+        rate = int(spec.get("ratePerMinute", 0))
+        accounts = int(spec.get("accounts", 1))
+    except (OSError, ValueError, AttributeError):
+        return None
+    if 0 < rate <= 6000 and 1 <= accounts <= 8:
+        return {"rate": rate, "accounts": accounts}
+    return None
+
+
+def engine_load_accounts(count):
+    # Per-engine deterministic range (+1557xxxxxxxx, disjoint from the fixed
+    # fixture numbers and the multi-account link range) seeded from the data
+    # directory: two engines sharing one store never flap one account row
+    # between groups.
+    seed = zlib.crc32(str(SIGNAL_DATA_DIR).encode()) % 10_000_000
+    return [f"+1557{seed:07d}{index:02d}" for index in range(count)]
+
+
+def run_load_injector(spec, stop):
+    accounts = engine_load_accounts(spec["accounts"])
+    spacing = 60.0 / (spec["rate"] * len(accounts))
+    seq = 0
+    last_ts = 0
+    while not stop.is_set():
+        seq += 1
+        account = accounts[(seq - 1) % len(accounts)]
+        # Strictly increasing timestamps: the connector dedupes receives on
+        # (account, conversation, direction, sent_at, sender), so a fixed
+        # timestamp would collapse the whole ladder into one message.
+        now_ms = int(time.time() * 1000)
+        last_ts = max(now_ms, last_ts + 1)
+        emit_json(
+            {
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": account,
+                    "envelope": {
+                        "source": "+15555550102",
+                        "timestamp": last_ts,
+                        "dataMessage": {"message": f"soak load {seq}"},
+                    },
+                },
+            }
+        )
+        with LOAD_LOG.open("a") as log:
+            log.write(
+                json.dumps(
+                    {"seq": seq, "account": account, "timestamp": last_ts},
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+        stop.wait(spacing)
+
+
+def watch_load_marker():
+    while True:
+        spec = read_load_spec()
+        with LOAD_LOCK:
+            if spec != LOAD_STATE["spec"]:
+                if LOAD_STATE["stop"] is not None:
+                    LOAD_STATE["stop"].set()
+                stop = None
+                if spec is not None:
+                    stop = threading.Event()
+                    threading.Thread(
+                        target=run_load_injector, args=(spec, stop), daemon=True
+                    ).start()
+                LOAD_STATE["spec"] = spec
+                LOAD_STATE["stop"] = stop
+        time.sleep(0.5)
+
+
+threading.Thread(target=watch_load_marker, daemon=True).start()
 
 
 def emit_json(value):

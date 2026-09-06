@@ -6,7 +6,10 @@
 *.sock
 *.pid
 *.secret
+__pycache__/
 /runtime/
 /data/
 /artifacts/
 /packaging/out/
+
+/packaging/soak/runs/

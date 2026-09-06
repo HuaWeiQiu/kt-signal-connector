@@ -42,16 +42,16 @@ def read_samples(csv_path):
         for row in csv.DictReader(handle):
             try:
                 ts = parse_timestamp(row["ts"]).timestamp()
-                rss_kb = int(row["rss_kb"])
             except (ValueError, KeyError):
                 continue
+            rss_kb = (row.get("rss_kb") or "").strip()
             samples.append(
                 {
                     "ts": ts,
                     "role": row.get("role", ""),
                     "group_id": row.get("group_id", "-"),
                     "pid": row.get("pid", ""),
-                    "rss_mib": rss_kb / 1024.0,
+                    "rss_mib": int(rss_kb) / 1024.0 if rss_kb else None,
                     "state": row.get("state", ""),
                     "pressure": row.get("pressure", ""),
                 }
@@ -61,7 +61,14 @@ def read_samples(csv_path):
 
 
 def series_stats(samples):
-    """(first/last/min/max/mean MiB, drift MiB, slope MiB/h) for one series."""
+    """(first/last/min/max/mean MiB, drift MiB, slope MiB/h) for one series.
+
+    Rows without an RSS sample (rss_mib None) are skipped; callers keep them
+    for pid/state/pressure evidence instead.
+    """
+    samples = [sample for sample in samples if sample["rss_mib"] is not None]
+    if not samples:
+        return {"samples": 0}
     values = [sample["rss_mib"] for sample in samples]
     first = samples[0]["ts"]
     hours = max((samples[-1]["ts"] - first) / 3600.0, 1e-9)
@@ -149,9 +156,10 @@ def aggregate_report(run_dir):
 
     # Aggregate = sum of engine RSS per round (the connector's own share is
     # reported separately), matching the aggregate the runtime reports.
+    # Rounds where an engine has no sample yet sum the engines that do.
     per_round = defaultdict(float)
     for sample in samples:
-        if sample["role"] == "engine":
+        if sample["role"] == "engine" and sample["rss_mib"] is not None:
             per_round[sample["ts"]] += sample["rss_mib"]
     aggregate_rows = [
         {"ts": ts, "rss_mib": total} for ts, total in sorted(per_round.items())
