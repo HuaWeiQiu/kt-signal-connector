@@ -131,7 +131,6 @@ const MESSAGE_CURSOR_PREFIX: &str = "m1:";
 /// rows, so recent history is never pruned no matter which rule selected it:
 /// signal-cli may still replay an envelope, and a resend may still arrive.
 const RETENTION_SAFETY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
-pub const DEFAULT_PAGE_LIMIT: u32 = 100;
 pub const MAX_PAGE_LIMIT: u32 = 200;
 
 #[derive(Debug, Error)]

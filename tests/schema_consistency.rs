@@ -6,7 +6,7 @@
 //!
 //! Code-side sets are extracted mechanically where a stable source exists:
 //!
-//! - methods: `PHASE2_CAPABILITIES` (src/lib.rs:23) plus `"handshake"`, which is
+//! - methods: `PHASE2_CAPABILITIES` (src/lib.rs:35) plus `"handshake"`, which is
 //!   handled before capability dispatch (src/host.rs:307). Every schema method
 //!   must also appear as a dispatch literal in src/host.rs.
 //! - events: every `HostEvent::new("<name>", ...)` literal in src/ (the wire
@@ -150,7 +150,7 @@ fn code_error_codes() -> BTreeSet<String> {
 fn schema_methods_match_code_methods() {
     let schema_methods = schema_methods();
 
-    // Code-side method list: the advertised capability list (src/lib.rs:23-38)
+    // Code-side method list: the advertised capability list (src/lib.rs:32-35)
     // plus "handshake", which is answered before capability dispatch
     // (src/host.rs:307).
     let mut code_methods: BTreeSet<String> = PHASE2_CAPABILITIES

@@ -335,7 +335,7 @@ impl RuntimeSupervisor {
         }
         // Keep listAccounts fast: do not call listContacts here (blocks the single
         // signal-cli queue and starves conversations.list / startLink).
-        // Profile names are filled on finish_link and via refresh_account_profiles.
+        // Profile names are filled on finish_link.
         let accounts = self
             .service
             .lock()
@@ -343,41 +343,6 @@ impl RuntimeSupervisor {
             .sync_accounts_from_numbers(&numbers, &self.group_id)?;
         let _ = engine;
         Ok(accounts)
-    }
-
-    /// Optional profile refresh (not on the hot listAccounts path).
-    pub async fn refresh_account_profiles(&self) -> Result<Vec<AccountSummary>, ServiceError> {
-        let engine = self.running_engine().await?;
-        let accounts = self
-            .service
-            .lock()
-            .await
-            .list_accounts_in_group(&self.group_id)?;
-        let mut enriched = Vec::with_capacity(accounts.len());
-        for account in accounts {
-            let number = match self.service.lock().await.account_signal_number(&account.id) {
-                Ok(n) => n,
-                Err(_) => {
-                    enriched.push(account);
-                    continue;
-                }
-            };
-            let display = self.fetch_self_display_name(&engine, &number).await;
-            if let Some(ref name) = display {
-                match self
-                    .service
-                    .lock()
-                    .await
-                    .set_account_display_name(&account.id, Some(name.as_str()))
-                {
-                    Ok(updated) => enriched.push(updated),
-                    Err(_) => enriched.push(account),
-                }
-            } else {
-                enriched.push(account);
-            }
-        }
-        Ok(enriched)
     }
 
     /// Resolve a human-readable profile label for the local linked account.
