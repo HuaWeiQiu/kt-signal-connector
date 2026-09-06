@@ -817,7 +817,7 @@ increase. RSS pressure still degrades admission and never kills a live JVM autom
   from SQLite.
 - critical receive queue: 256 items and 2 MiB of normalized projected data. It backpressures the
   signal-cli stdout reader at either limit and never routes receives through broadcast delivery.
-- current message page: default 100, maximum 200.
+- current message page: client-supplied `limit` is required in schema (1–200; the store clamps to the same range) and has no server-side default.
 - message text projection: 4 KiB per list/event row; persisted inbound body: 128 KiB maximum.
 - one signal-cli RSS sampler per group engine, every 30 seconds. Pressure requires three consecutive
   samples at or above 512 MiB; recovery requires two consecutive samples at or below 420 MiB.

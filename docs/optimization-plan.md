@@ -359,3 +359,48 @@ XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去�
 > **批次 A 验证补记（2026-09-06 03:41–03:51，历史记录，归因已被上方根因更新取代）**：一轮环境
 > 窗口内 desktop `signalConnectorProxyGroups` 两个 spawn 用例 0/30 确定性红（argv 文件未落盘）；
 > 经 83049f95 / f31fe121 / 0af585d7 / 6bcf2084 四点二分 + 双 worktree 交叉对照判定「批次 A 无回归」。
+
+### 5.6 冗余清扫第二轮（2026-09-06，批次 A/B/C 终验之后）
+
+批次 A/B/C 终验后对双仓再做一轮只读冗余审计（desktop、connector 各一份，全部删项经
+全仓引用核查），随后执行清扫。本节为该轮单一事实源，desktop handoff §6.28 只留指针。
+
+**已删（门禁全绿后提交）**：
+
+- **connector `3469abd`**（3 files，+3/−39，净 −36）：`src/store.rs` 死常量
+  `DEFAULT_PAGE_LIMIT`（全仓唯一命中即定义本身；schema `limit` 为 required、1..=200、
+  无默认路径——`store.rs` 内 clamp(1, MAX_PAGE_LIMIT) 为硬边界而非默认值；据此同步勘误
+  `docs/implementation-plan.md` 「default 100」表述）；`src/supervisor.rs:348-381` 死函数
+  `refresh_account_profiles`（含 doc 注释 36 行，全仓零调用方；338 行注释同步去掉
+  "via refresh_account_profiles" 半句；其私有辅助 `fetch_self_display_name` 在 finish_link
+  路径仍活跃、`AccountSummary` import 另有使用，均未变死代码）；
+  `tests/schema_consistency.rs:9/:153` 两处过期行号引用修正为 `src/lib.rs:32-35` 实际位置。
+  门禁：clippy 0 警、208 测试 0 败、release build 过。
+- **desktop `f8693e8f`**（6 files，+42/−74，净 −32；SignalWorkspace.vue 5135→5122）：
+  五处死代码——`SignalWorkspace.vue` 死 computed `needsStart`（−4）/ 死 CSS `.sg-primary-lg`
+  （−6）/ storeToRefs 死解构 `hasLoadedOlderConversations`+`hasLoadedOlderMessages`（−2，
+  仅 SFC 解构，store state 本体保留、23 条直测不受影响）、
+  `tests/unit/signalConnectorProxyGroups.spec.ts` 死辅助 `stubBinaries`（−7）、
+  `src/global.d.ts` 死声明 `localGPT: boolean`（−1）；IPC channel id 去重——
+  `electron/preload/index.ts` 与 `electron/main/signal/types.ts` 的双份字面量副本收敛，
+  权威定义迁 `shared/signalWire.ts`（21 个 channel 逐项 diff 前后一致，无丢无改名），
+  main 侧 re-export 保住既有 import（含 `signalIpcBoundary.spec.ts`），preload 改引
+  shared（别名使 25 处调用点零改动；preload 走 vite 打包可引仓内 TS，先例 mainConfig）。
+  门禁：typecheck:signal 双段过、vitest 163 文件/1547 用例全绿。
+
+**审计后明确保留（理由在案）**：
+
+- desktop `signalKtRemark*` 半退役模块（26 行，生产读写路径已移除，仅剩 SW hydrate/clear
+  两处生命周期调用）：**功能去留是产品决策**，只登记不删。
+- desktop：32 个仅 export 关键字冗余（风格无收益）、`resetSignalFriendRemarkCache`（测试
+  后门）、~22 个测试固化契约导出、全部 import 逐个验证仍活跃（含
+  signalOutboundOriginStore / parseSignalHostFailure / collapseSignalMessageText）。
+- connector：`metrics.rs:174-195` 手工分类表（唯一逐方法 class 断言点，遍历 METHODS 会变
+  同义反复）；`manifest.rs:487` allow 注解（8 参数确实超限）；Cargo.toml 21 crates 全对账
+  零冗余。
+
+**登记为后续项（本轮不做）**：
+
+- connector `service.rs` 六个 Params 结构体缺 `#[serde(deny_unknown_fields)]`
+  （约 :1398/:1404/:1412/:1421/:1437/:1481）——补齐是线级行为变更（依赖宽松未知字段的
+  调用方将开始报错），需先确认 desktop 不依赖宽松行为，留待下一轮提案一并评审。
