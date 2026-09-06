@@ -521,7 +521,16 @@ connector-per-account 的特例），决策点见 §6.6-D1。
 - D4 真号供给：**fake 先行**——M1–M3.2 用 fake-signal-cli 负载注入建基线，真号阶梯另行安排后补测，
   不阻塞工期。
 
-### 6.7 执行纪律（延续 §5.5）
+### 6.7 执行纪律与状态回填（延续 §5.5）
 
-同仓串行、跨仓并行；不 push；中文 commit；门禁全绿才 commit；每阶段收尾回填本节状态（表在
-执行时补）。
+同仓串行、跨仓并行；不 push；中文 commit；门禁全绿才 commit。
+
+| 阶段 | 状态 | commit 回填 |
+| --- | --- | --- |
+| M1 防互踩 | ✅ 完成（2026-09-06） | `a48aa0f`（data-dir flock/LockFileEx 占用锁——进程任何退出含 SIGKILL 内核自动释放无 stale-lock 砖死、serve 启动期对 default 根+每 proxy-groups 子目录逐一加锁全有或全无；endpoint 长度 fail-fast——sun_path macOS 103/Linux 107 可用字节、canonical+staging 双校验；11 新测试含 SIGKILL 崩溃接管/二进制级冲突三件）、`55b1b82`（ADR 0002 多实例合法化条件+AGENTS/registry 单实例表述修订）。门禁：clippy 0 警、test 219 过 0 败、release build 成功。待跟进：Windows 分支仅 API 级核对（本机 sqlcipher 交叉工具链缺失），首次 Windows 构建/CI 留意 |
+| M2 supervisor 池 | ✅ 完成（2026-09-06） | desktop 五批：`db2f0c19`（M2.1 目录构造注入，缺省=根级布局零迁移）、`f872fa1d`（M2.2 SignalConnectorPool+按 binding.proxyGroup 路由+link 租约 per-connector，binding schema 零变更、租约文件升 v3 向后兼容）、`c46eaf23`（M2.3 store key 命名空间化，default 沿用根级 key 零迁移）、`7875473d`（M2.4 契约升 1.13）、`b6975633`（M2.5 UI 徽标 per-account+事件 connectorId 过滤+e2e 聚合）。门禁：typecheck 双段过、vitest 165 文件/1568 用例全绿（基线 163/1547，主线独立复核一致）。实机：dev client start→ready/accounts=1、store 零迁移完好；boot 后 stopped 经旧代码全量调用点排查确认系两版共有设计行为（workspace「No auto startRuntime」边界原则），非回归。遗留：双 connector 共存 kill 隔离真机验证待真号资源（D4），单元层已覆盖（并行 link 不互阻塞/logout 只停本组/orphan 圈定/事件归属） |
+| M3 长稳与容量 | ✅ 完成（2026-09-06） | `988dbbd`（M3.3 每引擎账号上限 8=MAX_ACCOUNTS_PER_ENGINE，link 两入口+store 提交守卫三层拒绝、组内既有号码重链放行、错误码 ACCOUNT_LIMIT_REACHED 入 schema 枚举双向门禁、fake 多账号模式 KT_FAKE_MULTI_ACCOUNT；二进制级 8 连链集成）、`acb2573`（M3.4 metrics 60s 快照补每引擎 RSS、RSS 策略常量测试钉死、schema 排除项逐条重判 17 对不变零伪配对、rss_report.py 入库并实测 run2 归档吻合）、`b383fda`（M3.1/2/5 soak_driver/judge/launch/README 入库 packaging/soak、fake 受控速率负载注入、不加 GitHub CI——hosted runner 6h 上限）。门禁：test 224 过 0 败、clippy 0 警、release build 成功；120s 冒烟 8 组 running+1440 消息精确吻合+零丢弃、judge 三路径（PASS/FAIL/DEGRADED）实测。**≥24h soak 未跑**（工具就绪，按 README 手动/本地定时，真号阶梯补测待 D4） |
+
+**项目终验（2026-09-06）**：bundle 已从 connector `b383fda` 重出、`verify:signal-runtime` manifest 校验过、
+`verify:signal-runtime-methods` 20/20 PASS；dev client 双仓终态 ready/accounts=1。双仓均未 push
+（等验收后统一处理）。AGPL 硬边界（§6.1���持续有效：对外分发安装包前必须先同步公开源码并打 tag。
