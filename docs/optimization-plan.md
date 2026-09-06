@@ -404,3 +404,122 @@ XState 管消息数据面；SIGNAL_TYPING 删除（活代码等 UI 开关，去�
 - connector `service.rs` 六个 Params 结构体缺 `#[serde(deny_unknown_fields)]`
   （约 :1398/:1404/:1412/:1421/:1437/:1481）——补齐是线级行为变更（依赖宽松未知字段的
   调用方将开始报错），需先确认 desktop 不依赖宽松行为，留待下一轮提案一并评审。
+
+## 6. P2-12/P2-13 立项提案：多 connector 物理隔离 + 多账号长稳与容量门禁（2026-09-06，四路调研已合，待批）
+
+> 单一事实源在本节；desktop handoff §6.29 只留指针。提案依据四路并行只读调研（desktop 多账号
+> 现状 / connector 多实例边界 / 长稳与容量基建 / Signal 官方多账号参照），关键结论已核到
+> file:line，本节只保留决策相关摘要。
+
+### 6.0 现状与差距（调研摘要）
+
+- **隔离现状**：data-dir 与 JVM 已按 proxy group 隔离（ADR 0001 R4：每组独立 data-dir + 独立
+  signal-cli 引擎）；**未隔离的是 connector 进程、SQLCipher store（全组共享一份）、host 连接
+  车道与 desktop 请求调度**——connector 崩溃/重启连坐全部账号，这是 P2-12 要拆掉的共享故障域。
+- **connector 多实例可行性**：三个命名空间（`--endpoint`/`--state-dir`/`--signal-data-dir`）
+  全是 launcher 传入参数（`src/main.rs:37-38,83,85`），**代码层无硬编码单例、无 PID 文件、无
+  全局互斥**，端点重名天然 fail-closed（`src/ipc.rs:123-128/:252`）——多实例「天然支持」。
+  但有三处要补：endpoint 无长度校验（`ipc.rs:94-130`，sun_path 104B EINVAL 教训见 §5.5）、
+  data-dir 无跨进程占用锁（双开同 dir = 双开 signal-cli 打同一数据库）、文档红线冲突
+  （AGENTS.md:24-25 与 ADR 0001:56 的 "one connector process per local profile"）。
+- **desktop 单例假设**：集中在 `electron/main/signal/registerIpc.ts:13-16,58-75` 四个模块级
+  单例 + `hostAdapter.ts:54-90` 单 supervisor；`ConnectorSupervisor` 类本身无全局态、可实例化
+  N 份（endpoint nonce 命名天然不冲突）。renderer 数据面全走 sessionUid（账号注入在 Main），
+  **多 connector 后零改动**；控制面（runtime status/start/stop 无账号参数 + 全局 link 租约 +
+  `scope:'runtime'` 事件全局广播）是契约与 UI 改动最大块。
+- **P2-13 基建缺口**：soak driver 已丢失未入库（run2 归档仅 4 个产物文件，判据只存在于
+  `docs/handover.md:167-184` 文档片段，`/tmp` 已被系统清空）；tier-1 只有 8 引擎空转、零账号、
+  零流量，且有效活跃仅 10.7h（宿主睡眠 13.3h）；**每引擎账号数上限不存在**（全仓 grep 零命中）；
+  RSS 阈值 512/420MiB 每引擎硬编码（`src/resource.rs:13-16`）、JVM `-Xmx384m` 固定
+  （`engine.rs:57`）；队列水位仅 60s 结构化日志（`metrics.rs:143-146`）无告警；容量参数被
+  schema 数值门禁明确排除（`tests/schema_consistency.rs:257-259`）。
+- **官方参照（已查证，非记忆）**：Signal-Desktop **没有官方多账号功能**（社区 55604 官方回复；
+  唯一方式是未文档化的 Chromium `--user-data-dir`，7.80.0 后实际损坏过，issue #7730）。signal-cli
+  官方语义：一个 data-dir 内多账号（`accounts.json` + 每账号独立 `account.db`）或分 data-dir
+  分进程。**结论：我们只应依赖 signal-cli 文档化接口（`--data-dir`/`-a`/multi-account daemon），
+  不借道任何未文档化底层开关。**
+
+### 6.1 硬边界（先于一切阶段，不可越）
+
+- **AGPL 强边界（联动 P2-14）**：本项目一切产物（多实例改造、soak driver、容量报告）仅限组织
+  内部使用与测试。**任何向组织外分发含 AGPL 二进制（signal-cli/libsignal/bundled JRE）安装包
+  的动作之前**，必须先公开含全部本地修改的 connector 源码并按发布打 tag（公开仓
+  `HuaWeiQiu/kt-signal-connector` 当前落后本地未推 commits，分发前必须同步推齐），signal-cli/
+  libsignal 与 OpenJDK 的源码指示与 license 文本随包。闭源 Desktop 聚合的 derivative work
+  判定归法务拍板。
+- 协议外风险在案：signal-cli 是非官方客户端，使用 Signal 官方服务存在 ToS 运营风险。
+- 不改「进程 IPC + 独立二进制」聚合边界；不做 submodule / 源码 vendoring。
+- 多实例必须**每实例独立 state-dir**（store 无实例维度、`Store::open` 无跨进程锁，
+  `src/store.rs:385-417`）——共享 store 的多实例明确排除。
+
+### 6.2 阶段 M1 —— connector 多实例防互踩（小，先行）
+
+1. `src/ipc.rs:94-130` endpoint 路径长度 fail-fast 校验（Unix sun_path ~104B），超长启动期
+   明确报错而非 EINVAL 快败。
+2. data-dir 占用互斥：`<data-dir>` 下 O_EXCL lockfile（或等价），双开同 dir 第二实例
+   fail-closed；覆盖 `--signal-data-dir` 根与 proxy-groups 子目录两级。
+3. 文档正名：ADR 0001 补多实例条款（或新 ADR 0002）——多实例合法化条件 = 三命名空间互不相交
+   + 每 store 独立 state-dir；同步修订 AGENTS.md:24-25 与 `src/registry.rs:3-4` 的单实例表述。
+4. 测试：跨实例冲突用例三件（同 endpoint 拒绝 / 同 data-dir 拒绝 / 超长 endpoint 拒绝）。
+
+门禁：connector 全套（fmt/clippy/test/release）。
+
+### 6.3 阶段 M2 —— desktop supervisor 池与按 session 路由（中大型，边界变更核心）
+
+隔离粒度默认 **connector-per-proxy-group**（组已是 data-dir/JVM 隔离单元；一组一账号即
+connector-per-account 的特例），决策点见 §6.6-D1。
+
+- M2.1 `ConnectorSupervisor` 目录参数化：rootDir/signalDataDir/stateDir 改构造注入
+  （`connectorSupervisor.ts:178-182`），per-connector 落 `userData/signal-connector/<connectorId>/`；
+  孤儿清理（:328-378）按各自 rootDir 圈定，天然不互杀，补多实例验证用例。
+- M2.2 supervisor 池 + 路由：`registerIpc.ts:13-16` 四单例改注册表；**binding 已含 proxyGroup
+  字段**（`sessionRegistry.ts:5-17`），per-group 粒度下 connectorId 直接由 `binding.proxyGroup`
+  派生，binding schema 零变更；sessionHost 数据方法按绑定路由到对应 adapter。
+- M2.3 store key 每实例一把：`storeKey.ts` 命名空间化 `<connectorId>/signal-store-key.enc`；
+  旧单实例布局（根级 `signal-connector/*`）首次启动迁入 default 实例子目录或保留兼容映射——
+  迁移方案实现期细化，必须数据无损验证后才切。
+- M2.4 契约变更（`contracts/signal-host-adapter.md` 同步升版）：runtime status/start/stop
+  参数化或聚合语义；事件带 connector 归属；link 租约 per-connector 串行（决策点 D2）；
+  proxy group 注册表只进所属 connector 的 spawn argv（`proxyGroups.ts:265,288-294`）；「全部
+  登出才停 runtime」（`sessionHost.ts:979-990`）改 per-connector；proxy group 变更的 runtime
+  bounce（:372-396）范围缩到该 connector（收益）。
+- M2.5 UI 与工具：renderer 数据面零改动；通道状态徽标 per-account 化 + 聚合启停
+  （`SignalWorkspace.vue:1275,1663,2667,2687`）；e2e/CDP 脚本参数化（KT_USER_DATA_DIR/端口组合）。
+- 验收：双 connector 实例（两组各一账号）同一 Electron 共存——kill 一个 connector 另一组不受
+  影响（共享故障域拆除）、link 并行不互斥、事件不串台、退出全停、旧单实例数据无损迁移。
+
+门禁：desktop 全套（typecheck:signal + vitest）+ connector 全套 + bundle 重出双门禁。
+
+### 6.4 阶段 M3 —— 多账号长稳与容量门禁（P2-13）
+
+- M3.1 soak driver 入库重建：driver + launch + 判定器进 `packaging/soak/`（判据从 handover
+  文档片段落为可执行代码）；判据钉死「连续活跃 24h」（caffeinate 口径修正 run2 的 10.7h 教训）。
+- M3.2 负载注入：基于 `tests/fixtures/fake-signal-cli.py` 扩展可控速率 receive/send 注入
+  （消息速率阶梯 × 账号阶梯），先 fake 后真号——真实账号供给是独立产品项（D4），不阻塞
+  driver 与基线建立。
+- M3.3 每引擎账号数上限：新增常量 + link/launcher 拒绝路径 + 新错误码 + schema 数值门禁对
+  （`schema_consistency.rs` pairs 模式现成）。初值依据 ADR 0001 成本数据（每引擎 140-280MB
+  idle、+20-80MB/账号）与 M3.2 实测基线，先保守后调。
+- M3.4 水位与基线：queue depth/RSS 进 metrics 快照；rss.csv 聚合脚本入库出基线报告；容量参数
+  逐对评估纳入 schema 数值门禁（撤销 `schema_consistency.rs:257-259` 的排除项）。
+- M3.5 门禁挂载：容量数值断言挂 commit 前（cargo test 扩展）；≥24h 长稳挂手动/定期 workflow
+  （verify 脚本同款模式，产物归档 + 判定脚本给 PASS/FAIL）。
+
+### 6.5 明确不做（本轮）
+
+- 共享 store 的多实例（schema 级变更 + 无跨进程锁，见 §6.1 硬边界）。
+- 借道未文档化底层开关做隔离（官方先例已证非稳定契约）。
+- 真多 Electron profile 并行产品化（`KT_USER_DATA_DIR` 多实例是现成机制，保留为运维逃生门）。
+- L2 功能不受本项目影响，仍按 handoff §7 P2-19 后置。
+
+### 6.6 决策点（待负责人批）
+
+- D1 隔离粒度：connector-per-proxy-group（推荐）vs connector-per-account vs 配置化两档。
+- D2 link 租约：放宽 per-connector（推荐）vs 维持全局串行。
+- D3 每引擎账号上限初值：8（推荐，先保守）vs 其他（M3.2 实测后可调）。
+- D4 真实账号阶梯供给：另行安排不阻塞 M1–M3.2；需要几个真号、谁提供，产品侧给方案。
+
+### 6.7 执行纪律（延续 §5.5）
+
+同仓串行、跨仓并行；不 push；中文 commit；门禁全绿才 commit；每阶段收尾回填本节状态（表在
+执行时补）。
