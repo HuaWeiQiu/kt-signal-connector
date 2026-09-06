@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use kt_signal_connector::auth::{load_bootstrap_payload, load_bootstrap_payload_from_reader};
+use kt_signal_connector::datalock;
 use kt_signal_connector::engine::{SignalCliMode, SocksProxy};
 use kt_signal_connector::groups;
 use kt_signal_connector::host::serve;
@@ -297,6 +298,14 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         socks_proxy,
         &signal_data_dir,
     )?;
+    // ADR 0002 occupancy guard: exclusive cross-process locks over every
+    // planned data directory (the `default` root and each proxy-group
+    // subdirectory), acquired before the bootstrap payload is read and held
+    // for process lifetime. A second connector over any shared data
+    // directory fails fast here without touching secrets or publishing an
+    // endpoint; a crashed holder's locks die with the process (kernel
+    // release), so this can never brick the next start.
+    let _data_dir_locks = datalock::lock_plan_data_dirs(&plan)?;
     let payload = if bootstrap_secret_stdin {
         load_bootstrap_payload_from_reader(std::io::stdin().lock())?
     } else {
