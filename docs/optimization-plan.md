@@ -512,12 +512,14 @@ connector-per-account 的特例），决策点见 §6.6-D1。
 - 真多 Electron profile 并行产品化（`KT_USER_DATA_DIR` 多实例是现成机制，保留为运维逃生门）。
 - L2 功能不受本项目影响，仍按 handoff §7 P2-19 后置。
 
-### 6.6 决策点（待负责人批）
+### 6.6 决策点（2026-09-06 负责人已批，全部采纳推荐项）
 
-- D1 隔离粒度：connector-per-proxy-group（推荐）vs connector-per-account vs 配置化两档。
-- D2 link 租约：放宽 per-connector（推荐）vs 维持全局串行。
-- D3 每引擎账号上限初值：8（推荐，先保守）vs 其他（M3.2 实测后可调）。
-- D4 真实账号阶梯供给：另行安排不阻塞 M1–M3.2；需要几个真号、谁提供，产品侧给方案。
+- D1 隔离粒度：**connector-per-proxy-group**。connectorId ≡ groupId；default 组 connector 沿用
+  根级布局（零迁移），非 default 组 connector 落 `userData/signal-connector/<groupId>/`。
+- D2 link 租约：**放宽 per-connector**（物理隔离后全局互斥失去必要性，UI linkBusy 语义随之改）。
+- D3 每引擎账号上限初值：**8**（M3.2 实测基线后再调）。
+- D4 真号供给：**fake 先行**——M1–M3.2 用 fake-signal-cli 负载注入建基线，真号阶梯另行安排后补测，
+  不阻塞工期。
 
 ### 6.7 执行纪律（延续 §5.5）
 
