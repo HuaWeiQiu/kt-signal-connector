@@ -835,6 +835,10 @@ increase. RSS pressure still degrades admission and never kills a live JVM autom
   samples at or above 512 MiB; recovery requires two consecutive samples at or below 420 MiB.
   Sampling emits only PID/RSS/state and exits immediately with the engine. RSS pressure never kills
   or restarts the JVM automatically. Pressure events identify their group by `groupId` (see 4.4).
+  The 60-second metrics snapshot additionally logs each engine's latest RSS sample (group id and
+  bytes, one line per sampled engine) next to the queue gauges (`receiveQueueDepth`,
+  `hostPendingRequests`) and counters (`receiveDroppedTotal`, `watchdogRestartsTotal`), so a soak
+  run's drop/restart evidence is in the connector log without any external metrics service.
   macOS/Linux sample through a short-lived `ps`; Windows uses the
   native process working-set API and never starts PowerShell for monitoring.
 - conversation cursors are opaque keyset cursors over `(last_message_at nullness,

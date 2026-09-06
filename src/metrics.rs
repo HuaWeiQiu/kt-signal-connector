@@ -165,6 +165,24 @@ pub fn log_snapshot() {
     }
 }
 
+/// Per-engine RSS gauges for the snapshot (optimization-plan §6.4 M3.4): the
+/// latest sample of each proxy group's engine, keyed by the launcher-defined
+/// group id — an opaque id, the same classification the runtime status and
+/// resource-pressure events already carry, never content. A group without a
+/// sample (engine not running yet) logs nothing rather than a misleading 0.
+pub fn log_engine_rss(samples: &[(String, Option<u64>)]) {
+    for (group_id, rss_bytes) in samples {
+        if let Some(rss_bytes) = rss_bytes {
+            tracing::info!(
+                target: "metrics",
+                group_id = %group_id,
+                rss_bytes,
+                "engine rss sample"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,48 +246,54 @@ mod tests {
         assert!(metrics.duration_ms_max.load(Ordering::Relaxed) >= 7);
     }
 
+    /// In-memory capture for snapshot-output assertions.
+    #[derive(Clone, Default)]
+    struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+        type Writer = Buffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_output(log: impl FnOnce()) -> String {
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+    }
+
     /// The snapshot lines are the whole metrics contract: fixed series keys,
     /// classified labels, counts and durations only. Counters are process-wide
     /// and shared with parallel tests, so this asserts structure and the
     /// absence of any content-shaped data, not exact values.
     #[test]
     fn snapshot_output_is_redacted_and_structured() {
-        use std::sync::{Arc, Mutex as StdMutex};
-
-        #[derive(Clone, Default)]
-        struct Buffer(Arc<StdMutex<Vec<u8>>>);
-
-        impl std::io::Write for Buffer {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(data);
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
-            type Writer = Buffer;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buffer = Buffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buffer.clone())
-            .without_time()
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        let output = captured_output(|| {
             record_request("send", "ok", Duration::from_millis(3));
             record_receive_drop();
             record_watchdog_restart();
             set_host_pending(2);
             log_snapshot();
+            log_engine_rss(&[
+                ("default".to_string(), Some(196 * 1024 * 1024)),
+                ("team-a".to_string(), None),
+            ]);
         });
-
-        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
         assert!(output.contains("connector metrics snapshot"));
         // Gauges are process-wide and shared with parallel tests, so assert
         // the series keys, never exact values.
@@ -279,8 +303,28 @@ mod tests {
         assert!(output.contains("receive_queue_depth="));
         assert!(output.contains("host request metrics"));
         assert!(output.contains("method_class=\"send\""));
+        // Per-engine RSS gauges (M3.4): one line per sampled group, keyed by
+        // the opaque group id; a group without a sample stays silent instead
+        // of logging a misleading zero.
+        assert!(output.contains("engine rss sample"));
+        assert!(output.contains("group_id=default"));
+        assert!(output.contains("rss_bytes=205520896"));
+        assert!(!output.contains("group_id=team-a"));
         // Nothing content-shaped ever appears: no numbers, addresses, bodies.
         assert!(!output.contains("+1555"));
         assert!(!output.contains("text"));
+    }
+
+    #[test]
+    fn engine_rss_lines_skip_unsampled_groups() {
+        let output = captured_output(|| {
+            log_engine_rss(&[
+                ("stopped-group".to_string(), None),
+                ("g1".to_string(), Some(1024)),
+            ]);
+        });
+        assert!(output.contains("group_id=g1"));
+        assert!(output.contains("rss_bytes=1024"));
+        assert!(!output.contains("stopped-group"));
     }
 }

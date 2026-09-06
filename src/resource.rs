@@ -228,4 +228,18 @@ mod tests {
         assert!(ResourcePressureTracker::new(100, 100, 1, 1).is_err());
         assert!(ResourcePressureTracker::new(100, 80, 0, 1).is_err());
     }
+
+    /// The default policy constants are a capacity contract documented in
+    /// implementation-plan §7.3 (512 MiB pressure over three samples, 420 MiB
+    /// recovery over two; optimization-plan §6.4 M3.4 keeps them under test so
+    /// the numbers cannot drift away from the documented budget silently).
+    /// They have no schema representation — they are operational thresholds,
+    /// not wire constraints — so this test, not the schema gate, pins them.
+    #[test]
+    fn default_rss_policy_matches_the_documented_budget() {
+        assert_eq!(DEFAULT_RSS_PRESSURE_BYTES, 512 * 1024 * 1024);
+        assert_eq!(DEFAULT_RSS_RECOVERY_BYTES, 420 * 1024 * 1024);
+        assert_eq!(DEFAULT_RSS_PRESSURE_SAMPLES, 3);
+        assert_eq!(DEFAULT_RSS_RECOVERY_SAMPLES, 2);
+    }
 }

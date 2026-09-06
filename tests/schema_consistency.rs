@@ -15,7 +15,9 @@
 //! - numeric bounds: every schema length/numeric constraint the code also
 //!   enforces through a named constant (optimization-plan A8; this is the
 //!   gate that keeps A5-class drift — schema 128 vs code 256 — from
-//!   recurring).
+//!   recurring). Bounds without a natural code-constant or schema
+//!   representation are inventoried with reasons on the bounds test below
+//!   (optimization-plan §6.4 M3.4).
 //!
 //! Known drift is encoded in the explicit allowlists below, each with a reason
 //! and the phase that resolves it. Any drift outside an allowlist fails.
@@ -252,11 +254,43 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 /// that would have caught A5 (schema attachmentId maxLength 128 while the
 /// code enforced 256).
 ///
-/// Pairs cover every code constant that enforces a schema constraint.
-/// Schema-only bounds without a code constant (cursor/before 256, error
-/// message 256, proxyGroupId 128 — launcher ids are validated tighter at 32)
-/// and code-only bounds (inbound text projections, receive queue budgets) are
-/// deliberately not diffed here.
+/// Pairs cover every code constant that enforces a schema constraint. Every
+/// remaining numeric bound was re-evaluated item by item (optimization-plan
+/// §6.4 M3.4) and stays outside the diff for a stated reason — either the
+/// code enforces it by a different mechanism than a named constant, or it
+/// has no schema representation at all:
+///
+/// Schema-only bounds without an enforcing code constant:
+/// - cursor/before `maxLength` 256: cursors fail closed by decode and key
+///   binding (`Store::decode_*_cursor`), never by length; a length constant
+///   would not be the enforcement, so pairing it would be fabricated.
+/// - error message `maxLength` 256: messages are short code-authored
+///   literals; no constant governs them.
+/// - proxyGroupId `maxLength` 128: unknown ids fail closed by launch-plan
+///   lookup (`PROXY_GROUP_NOT_FOUND`); launcher ids additionally obey the
+///   tighter 32-byte grammar at startup (src/groups.rs), which is a
+///   launcher-input rule, not a wire-bound constant.
+/// - `minLength`/`minimum` 1 and pid/rssBytes representation bounds:
+///   inherent shape constraints enforced structurally (required fields,
+///   u64/u32 types); no named constant exists to pair.
+///
+/// Code-only bounds without a schema representation (internal capacity —
+/// gated by behavior tests per optimization-plan §6.4 M3.5, not by pairs):
+/// - receive queue budgets (256 items / 2 MiB) and internal channel
+///   capacities: in-process queues, not wire contracts.
+/// - host admission (128 global / 32 per account / 8 MiB aggregate) and
+///   per-method dispatch lanes: connection-local admission control.
+/// - inbound text projections (4 KiB preview / 128 KiB persisted body),
+///   retention (2000 rows/conversation, 256 delete operations): store-side
+///   bounds.
+/// - RSS pressure policy (512/420 MiB over 3/2 samples, src/resource.rs):
+///   operational thresholds pinned by
+///   `default_rss_policy_matches_the_documented_budget`.
+/// - proxy-group ceiling 8 (src/groups.rs) and the per-engine account
+///   ceiling 8 (M3.3, `MAX_ACCOUNTS_PER_ENGINE`): launcher/store policy with
+///   no natural schema numeric hook; pinned by
+///   `group_count_is_hard_capped_at_eight_including_default` and
+///   `eighth_account_links_but_a_ninth_is_refused_at_the_ceiling`.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[

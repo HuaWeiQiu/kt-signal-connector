@@ -327,7 +327,7 @@ pub async fn serve(
     runtime: Arc<ProxyGroupRuntime>,
 ) -> Result<(), HostError> {
     let secret = Arc::new(secret);
-    spawn_metrics_log();
+    spawn_metrics_log(Arc::downgrade(&runtime));
     loop {
         let stream = tokio::select! {
             accepted = listener.accept() => accepted?,
@@ -789,8 +789,11 @@ fn request_account_id(request: &HostRequest) -> Option<String> {
 }
 
 /// Periodic redacted metrics dump (plan §8): one structured log line per
-/// series. Process-lifetime task; nothing is exported over any socket.
-fn spawn_metrics_log() {
+/// series, plus each engine's latest RSS sample (optimization-plan §6.4 M3.4)
+/// read from the runtime status. Process-lifetime task; nothing is exported
+/// over any socket. The runtime is held through a `Weak` so the task never
+/// keeps the runtime alive past the serve loop.
+fn spawn_metrics_log(runtime: std::sync::Weak<ProxyGroupRuntime>) {
     tokio::spawn(async move {
         let mut ticker = interval(METRICS_LOG_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -799,6 +802,15 @@ fn spawn_metrics_log() {
         loop {
             ticker.tick().await;
             metrics::log_snapshot();
+            if let Some(runtime) = runtime.upgrade() {
+                let status = runtime.status().await;
+                let samples: Vec<_> = status
+                    .proxy_groups
+                    .into_iter()
+                    .map(|group| (group.group_id, group.rss_bytes))
+                    .collect();
+                metrics::log_engine_rss(&samples);
+            }
         }
     });
 }
