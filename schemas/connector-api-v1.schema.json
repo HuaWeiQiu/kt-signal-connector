@@ -649,6 +649,7 @@
             "LINK_NOT_FOUND",
             "LINK_EXPIRED",
             "LINK_CANCELLED",
+            "ACCOUNT_LIMIT_REACHED",
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
             "MESSAGE_NOT_FOUND",

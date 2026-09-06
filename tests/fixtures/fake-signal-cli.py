@@ -62,6 +62,37 @@ SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
+# Multi-account mode (optimization-plan §6.4 M3.3 tests and the soak driver's
+# account ladder): each finishLink hands out a fresh number from its own
+# range (+1556555xxxx, disjoint from the fixed fixture numbers) and persists
+# it, so a group can link up to its account ceiling and engine restarts keep
+# reporting every number handed out so far.
+MULTI_ACCOUNT = os.environ.get("KT_FAKE_MULTI_ACCOUNT") == "1"
+ACCOUNT_NUMBERS_LOG = SIGNAL_DATA_DIR / ".fixture-linked-numbers"
+
+
+def linked_multi_numbers():
+    if not ACCOUNT_NUMBERS_LOG.exists():
+        return []
+    return [line.strip() for line in ACCOUNT_NUMBERS_LOG.read_text().splitlines() if line.strip()]
+
+
+def next_multi_number():
+    with WRITE_LOCK:
+        numbers = linked_multi_numbers()
+        number = f"+1556555{len(numbers) + 1:04d}"
+        with ACCOUNT_NUMBERS_LOG.open("a") as log:
+            log.write(number + "\n")
+    return number
+
+
+# Receiving account for receive notifications: the newest multi-account
+# number when one exists (so post-link receives land on a linked account and
+# the store count matches the link count), otherwise the fixed fixture number.
+def receiving_account():
+    numbers = linked_multi_numbers()
+    return numbers[-1] if MULTI_ACCOUNT and numbers else LINKED_ACCOUNT
+
 
 def emit_json(value):
     with WRITE_LOCK:
@@ -98,7 +129,7 @@ def receive_notification():
         "jsonrpc": "2.0",
         "method": "receive",
         "params": {
-            "account": LINKED_ACCOUNT,
+            "account": receiving_account(),
             "envelope": {
                 "source": "+15555550101",
                 "timestamp": 42,
@@ -172,10 +203,15 @@ for line in sys.stdin:
             os._exit(21)
         ACCOUNT_LINKED = True
         DELETED_MARKER.unlink(missing_ok=True)
-        result = {"number": LINKED_ACCOUNT}
+        # Multi-account mode hands out a fresh number per link; the default
+        # mode keeps the fixed fixture number every existing test expects.
+        result = {"number": next_multi_number() if MULTI_ACCOUNT else LINKED_ACCOUNT}
         emit_receive_after = True
     elif method == "listAccounts":
-        result = [{"number": LINKED_ACCOUNT}] if ACCOUNT_LINKED else []
+        if MULTI_ACCOUNT:
+            result = [{"number": number} for number in linked_multi_numbers()]
+        else:
+            result = [{"number": LINKED_ACCOUNT}] if ACCOUNT_LINKED else []
     elif method == "listContacts":
         result = [
             {

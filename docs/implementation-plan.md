@@ -577,6 +577,15 @@ for the same id reports `LINK_NOT_FOUND`; only a session the connector no longer
 `LINK_NOT_FOUND` on the first attempt. If the owning group's runtime is stopped, the ordinary
 `RUNTIME_NOT_RUNNING` answer precedes dispatch, as for any finish.
 
+Per-engine account ceiling (optimization-plan §6.4 M3.3, decision D3): one proxy group's engine
+serves at most 8 accounts. `link.start` on a full group is refused before the engine mints a QR,
+and `link.finish` is refused before dispatching `finishLink`, so a phone is never asked to approve
+a link the connector would then reject at commit; both answers are `ACCOUNT_LIMIT_REACHED`
+(`retryable=false`) and name the group. The store-level guard re-checks at commit and treats
+re-linking a number already bound to the full group as an update, not an addition. A pre-ceiling
+data directory that already holds more accounts keeps serving them: engine re-sync imports
+reality and never truncates.
+
 Cancellation is linearized before it returns: a cancelled or superseded finish result cannot create
 an account row or emit `account.changed`. The pinned signal-cli JSON-RPC API has no operation that
 cancels an already-dispatched `finishLink`; when `link.cancel` finds one in flight, the connector
@@ -813,6 +822,9 @@ increase. RSS pressure still degrades admission and never kills a live JVM autom
   and lifecycle control.
 - pending signal-cli requests: 128 per group engine (Phase 4: each proxy group's engine keeps its
   own bounded queue; host-side limits stay global on the single authenticated connection).
+- per-engine accounts: at most 8 per proxy group (decision D3, optimization-plan §6.4 M3.3),
+  enforced at both link entries with `ACCOUNT_LIMIT_REACHED`; pre-ceiling data directories keep
+  serving existing accounts and re-sync never truncates.
 - runtime/UI broadcast queue: 1,024 non-critical events with pressure reporting; lag is recoverable
   from SQLite.
 - critical receive queue: 256 items and 2 MiB of normalized projected data. It backpressures the

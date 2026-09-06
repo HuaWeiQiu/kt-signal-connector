@@ -10,6 +10,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{EngineError, NormalizedReceive};
+use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::protocol::ApiError;
@@ -317,12 +318,45 @@ impl ConnectorService {
         number: &str,
         proxy_group: &str,
     ) -> Result<AccountSummary, ServiceError> {
+        let _ = self.require_active_link(link_session_id)?;
+        // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse a
+        // finish that would add a ninth account before the session is
+        // consumed or any row is written. Re-linking a number already bound
+        // to this group is an update, not an addition, and stays allowed.
+        if self.link_would_exceed_ceiling(number, proxy_group)? {
+            return Err(account_limit_error(proxy_group));
+        }
         let _ = self.take_link_session(link_session_id)?;
         // The binding is fixed here, at link.finish success, and immutable for
         // the life of the account (ADR 0001 R3).
         Ok(self
             .store
             .upsert_account_from_signal(number, Some(now_ms()), proxy_group)?)
+    }
+
+    /// Whether this group already holds the per-engine account ceiling, for
+    /// the link entries' early rejection (M3.3). Store failures propagate.
+    pub fn group_at_account_ceiling(&self, proxy_group: &str) -> Result<bool, ServiceError> {
+        Ok(self.store.count_accounts_in_group(proxy_group)? >= MAX_ACCOUNTS_PER_ENGINE as u64)
+    }
+
+    /// Store-level ceiling check for one finishing link (M3.3): true only
+    /// when the group is at the ceiling AND this number would be a new
+    /// account in it (a re-link of a number already bound here is an
+    /// upsert that does not grow the count).
+    fn link_would_exceed_ceiling(
+        &self,
+        number: &str,
+        proxy_group: &str,
+    ) -> Result<bool, ServiceError> {
+        if self
+            .store
+            .account_by_signal(number)?
+            .is_some_and(|row| row.proxy_group == proxy_group)
+        {
+            return Ok(false);
+        }
+        self.group_at_account_ceiling(proxy_group)
     }
 
     pub fn cancel_link(&mut self, link_session_id: &str) -> Result<Value, ServiceError> {
@@ -1541,6 +1575,21 @@ fn validate_device_name(device_name: &str) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// Per-engine account ceiling rejection (optimization-plan §6.4 M3.3): the
+/// message carries the group dimension and the ceiling; it never carries an
+/// account number. Not retryable — freeing capacity needs an explicit
+/// `accounts.deleteLocalData`.
+pub fn account_limit_error(proxy_group: &str) -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "ACCOUNT_LIMIT_REACHED",
+        format!(
+            "proxy group '{proxy_group}' already holds {MAX_ACCOUNTS_PER_ENGINE} accounts, \
+             the per-engine ceiling; delete an account before linking another"
+        ),
+        false,
+    ))
+}
+
 /// contacts.setLocalAlias bound (§4.9): a non-empty, short display name.
 fn validate_alias(alias: &str) -> Result<(), ServiceError> {
     if alias.is_empty() || alias.len() > MAX_ALIAS_BYTES {
@@ -1713,6 +1762,76 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Per-engine account ceiling (optimization-plan §6.4 M3.3, decision D3):
+    /// the eighth account in a group links; the ninth is refused with
+    /// ACCOUNT_LIMIT_REACHED naming the group, and the refusal leaves the
+    /// store untouched.
+    #[test]
+    fn eighth_account_links_but_a_ninth_is_refused_at_the_ceiling() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let link_next = |service: &mut ConnectorService| {
+            let number = format!(
+                "+1556555{:04}",
+                service.list_accounts_in_group(group).unwrap().len() + 1
+            );
+            let started = service
+                .begin_link("KT".into(), "sgnl://link?test".into())
+                .unwrap();
+            let id = started["linkSessionId"].as_str().unwrap().to_string();
+            service.complete_link_session(&id, &number, group)
+        };
+
+        for index in 1..=8 {
+            let account =
+                link_next(&mut service).unwrap_or_else(|e| panic!("link {index} failed: {e}"));
+            assert_eq!(account.proxy_group, group);
+        }
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 8);
+        assert!(service.group_at_account_ceiling(group).unwrap());
+
+        let refused = link_next(&mut service).unwrap_err();
+        let ServiceError::Api(api) = refused else {
+            panic!("expected an api error at the ceiling");
+        };
+        assert_eq!(api.code, "ACCOUNT_LIMIT_REACHED");
+        assert!(!api.retryable);
+        assert!(
+            api.message.contains(group),
+            "message must name the group: {}",
+            api.message
+        );
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 8);
+    }
+
+    /// The ceiling refuses additions, not updates: at a full group, finishing
+    /// a link for a number already bound there completes as an upsert instead
+    /// of an ACCOUNT_LIMIT_REACHED (store-level guard, M3.3).
+    #[test]
+    fn relinking_an_existing_number_at_the_ceiling_still_completes() {
+        let (_temp, mut service) = service();
+        let group = "team-a";
+        for index in 1..=8 {
+            let started = service
+                .begin_link("KT".into(), "sgnl://link?test".into())
+                .unwrap();
+            let id = started["linkSessionId"].as_str().unwrap().to_string();
+            service
+                .complete_link_session(&id, &format!("+1556555{index:04}"), group)
+                .unwrap();
+        }
+
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let id = started["linkSessionId"].as_str().unwrap().to_string();
+        let relinked = service
+            .complete_link_session(&id, "+15565550008", group)
+            .expect("relink of an existing number is an update, not an addition");
+        assert_eq!(relinked.proxy_group, group);
+        assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 8);
     }
 
     #[test]

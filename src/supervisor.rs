@@ -16,8 +16,8 @@ use crate::engine::{
 use crate::protocol::ApiError;
 use crate::service::{
     AttachmentPayload, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
-    PeerTarget, PreparedSend, SendTarget, ServiceError, validate_account_delete_operation_id,
-    validate_attachment_payload,
+    PeerTarget, PreparedSend, SendTarget, ServiceError, account_limit_error,
+    validate_account_delete_operation_id, validate_attachment_payload,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
@@ -387,6 +387,17 @@ impl RuntimeSupervisor {
 
     pub async fn start_link(&self, device_name: String) -> Result<Value, ServiceError> {
         self.service.lock().await.ensure_link_available()?;
+        // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse
+        // before the engine mints a QR, so no one scans a code that can never
+        // finish. A store failure propagates as its own error class.
+        if self
+            .service
+            .lock()
+            .await
+            .group_at_account_ceiling(&self.group_id)?
+        {
+            return Err(account_limit_error(&self.group_id));
+        }
         let engine = self.running_engine().await?;
         let result = engine
             .call("startLink", json!({}), CallClass::ReadOnly)
@@ -445,6 +456,23 @@ impl RuntimeSupervisor {
                 return Err(error);
             }
         };
+
+        // Per-engine account ceiling (M3.3): refuse before dispatching the
+        // mutating finishLink, so the phone is never asked to approve a link
+        // the connector would then have to reject at commit time. Session
+        // errors (LINK_NOT_FOUND/LINK_EXPIRED) keep precedence.
+        if self
+            .service
+            .lock()
+            .await
+            .group_at_account_ceiling(&self.group_id)?
+        {
+            let mut active = self.active_link_finish.lock().await;
+            if active.as_deref() == Some(link_session_id.as_str()) {
+                *active = None;
+            }
+            return Err(account_limit_error(&self.group_id));
+        }
 
         let upstream = engine
             .call_with_timeout(

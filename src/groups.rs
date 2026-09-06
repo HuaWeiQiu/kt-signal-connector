@@ -21,6 +21,16 @@ use crate::engine::SocksProxy;
 /// Hard ceiling on the number of groups including `default` (ADR 0001 R6).
 pub const MAX_PROXY_GROUPS: usize = 8;
 
+/// Hard ceiling on the number of accounts one proxy group's engine may serve
+/// (optimization-plan §6.4 M3.3, decision D3: initial value 8, to be tuned
+/// against the M3.2 fake-load baseline). Enforced at the link entries —
+/// `link.start` refuses before the engine mints a QR and `link.finish`
+/// refuses before dispatching `finishLink` — so linking can never grow a
+/// group past the ceiling. A pre-ceiling data directory that already holds
+/// more accounts keeps serving them; engine re-sync imports reality and is
+/// deliberately not truncated.
+pub const MAX_ACCOUNTS_PER_ENGINE: usize = 8;
+
 /// One launcher-planned group: opaque id, optional SOCKS proxy, and the
 /// per-group signal-cli data directory (R4). The proxy endpoint stays inside
 /// the connector; it never crosses IPC or logs.
