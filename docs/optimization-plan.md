@@ -485,6 +485,11 @@ connector-per-account 的特例），决策点见 §6.6-D1。
   bounce（:372-396）范围缩到该 connector（收益）。
 - M2.5 UI 与工具：renderer 数据面零改动；通道状态徽标 per-account 化 + 聚合启停
   （`SignalWorkspace.vue:1275,1663,2667,2687`）；e2e/CDP 脚本参数化（KT_USER_DATA_DIR/端口组合）。
+- M2.6 connector 崩溃自动重启（2026-09-11 补强，契约 1.14 §5.9）：意外退出（CONNECTOR_EXITED）
+  自动 respawn——指数退避 1s→60s、连续失败封顶 5 次熔断转人工（attempts=0 可整体关闭）、
+  用户 stop/shutdown/dispose 永不重启、成功清零计数；复用 'restarting' 状态 UI 零改动；
+  走既有 start() 完整链路（killOrphan/新 endpoint/新 secret），intent-version 闸门防重启途中
+  stop 的竞态。背景：engine 级已有 scheduleEngineRecovery 自愈，本项补齐 connector 进程级缺口。
 - 验收：双 connector 实例（两组各一账号）同一 Electron 共存——kill 一个 connector 另一组不受
   影响（共享故障域拆除）、link 并行不互斥、事件不串台、退出全停、旧单实例数据无损迁移。
 
@@ -530,6 +535,8 @@ connector-per-account 的特例），决策点见 §6.6-D1。
 | M1 防互踩 | ✅ 完成（2026-09-06） | `a48aa0f`（data-dir flock/LockFileEx 占用锁——进程任何退出含 SIGKILL 内核自动释放无 stale-lock 砖死、serve 启动期对 default 根+每 proxy-groups 子目录逐一加锁全有或全无；endpoint 长度 fail-fast——sun_path macOS 103/Linux 107 可用字节、canonical+staging 双校验；11 新测试含 SIGKILL 崩溃接管/二进制级冲突三件）、`55b1b82`（ADR 0002 多实例合法化条件+AGENTS/registry 单实例表述修订）。门禁：clippy 0 警、test 219 过 0 败、release build 成功。待跟进：Windows 分支仅 API 级核对（本机 sqlcipher 交叉工具链缺失），首次 Windows 构建/CI 留意 |
 | M2 supervisor 池 | ✅ 完成（2026-09-06） | desktop 五批：`db2f0c19`（M2.1 目录构造注入，缺省=根级布局零迁移）、`f872fa1d`（M2.2 SignalConnectorPool+按 binding.proxyGroup 路由+link 租约 per-connector，binding schema 零变更、租约文件升 v3 向后兼容）、`c46eaf23`（M2.3 store key 命名空间化，default 沿用根级 key 零迁移）、`7875473d`（M2.4 契约升 1.13）、`b6975633`（M2.5 UI 徽标 per-account+事件 connectorId 过滤+e2e 聚合）。门禁：typecheck 双段过、vitest 165 文件/1568 用例全绿（基线 163/1547，主线独立复核一致）。实机：dev client start→ready/accounts=1、store 零迁移完好；boot 后 stopped 经旧代码全量调用点排查确认系两版共有设计行为（workspace「No auto startRuntime」边界原则），非回归。遗留：双 connector 共存 kill 隔离真机验证待真号资源（D4），单元层已覆盖（并行 link 不互阻塞/logout 只停本组/orphan 圈定/事件归属） |
 | M3 长稳与容量 | ✅ 完成（2026-09-06） | `988dbbd`（M3.3 每引擎账号上限 8=MAX_ACCOUNTS_PER_ENGINE，link 两入口+store 提交守卫三层拒绝、组内既有号码重链放行、错误码 ACCOUNT_LIMIT_REACHED 入 schema 枚举双向门禁、fake 多账号模式 KT_FAKE_MULTI_ACCOUNT；二进制级 8 连链集成）、`acb2573`（M3.4 metrics 60s 快照补每引擎 RSS、RSS 策略常量测试钉死、schema 排除项逐条重判 17 对不变零伪配对、rss_report.py 入库并实测 run2 归档吻合）、`b383fda`（M3.1/2/5 soak_driver/judge/launch/README 入库 packaging/soak、fake 受控速率负载注入、不加 GitHub CI——hosted runner 6h 上限）。门禁：test 224 过 0 败、clippy 0 警、release build 成功；120s 冒烟 8 组 running+1440 消息精确吻合+零丢弃、judge 三路径（PASS/FAIL/DEGRADED）实测。**≥24h soak 未跑**（工具就绪，按 README 手动/本地定时，真号阶梯补测待 D4） |
+
+| M2.6 崩溃自动重启 | ✅ 完成（2026-09-11） | desktop `ec9e3690`（契约 1.14 §5.9：退避 1s→60s/封顶 5/stop 豁免/成功清零；新 spec signalConnectorCrashRestart 8 例含真实子进程驱动 exit handler 全链路；`connectorRestartPending` 防 refreshInstalledState 在退避窗口把瞬态坍缩成 stopped）。门禁：typecheck 双段过、vitest 166 文件/1576 用例全绿（主线独立复核一致）。**实机验证**：dev client ready 后 `kill -9` connector，~3s 自愈（restarts=1、新 startedAt、accounts=1 无损、无人工介入） |
 
 **项目终验（2026-09-06）**：bundle 已从 connector `b383fda` 重出、`verify:signal-runtime` manifest 校验过、
 `verify:signal-runtime-methods` 20/20 PASS；dev client 双仓终态 ready/accounts=1。双仓均未 push
