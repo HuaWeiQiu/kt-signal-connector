@@ -1577,6 +1577,62 @@ impl Store {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             }
         }
+        // Contract revision 1.14 (§6.5): every synced direct contact and member
+        // group also materializes its conversation skeleton, so the linked
+        // account sees its existing chats right after the sync instead of one
+        // message at a time. The insert is idempotent on the same
+        // stable_hash_id key ensure_conversation uses; existing rows keep
+        // their state (unread/muted/pinned), and a masked/placeholder title
+        // upgrades through the normal path when a real message later lands.
+        {
+            let mut stmt = transaction
+                .prepare(
+                    "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
+                     VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0)
+                     ON CONFLICT(id) DO NOTHING",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for entry in entries {
+                let conversation_kind = match entry.kind {
+                    "contact" => "direct",
+                    other => other,
+                };
+                let id = stable_hash_id(&[account_id, conversation_kind, entry.peer_key]);
+                let inserted = stmt
+                    .execute(params![
+                        id,
+                        account_id,
+                        conversation_kind,
+                        entry.peer_key,
+                        entry.title,
+                    ])
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                if inserted == 0 {
+                    // The row already exists (created by an earlier sync or a
+                    // real message): leave its state alone, but still upgrade
+                    // masked/placeholder titles — the sync cache may carry a
+                    // display name the conversation has not learned yet.
+                    let existing = transaction
+                        .query_row(
+                            "SELECT title FROM conversations WHERE id=?1",
+                            params![id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    if let Some(current) = existing {
+                        if title_should_upgrade(&current, entry.title) {
+                            transaction
+                                .execute(
+                                    "UPDATE conversations SET title=?2 WHERE id=?1",
+                                    params![id, entry.title],
+                                )
+                                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                        }
+                    }
+                }
+            }
+        }
         transaction
             .execute(
                 "INSERT INTO meta(key, value) VALUES(?1, ?2)

@@ -222,7 +222,11 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     let accounts = request(&mut client, "accounts-1", "accounts.list", json!({})).await;
     assert_eq!(accounts["result"].as_array().unwrap().len(), 1);
 
-    // Fixture finishLink emits one receive notification after the JSON-RPC result.
+    // Fixture finishLink emits one receive notification (+15555550101) after
+    // the JSON-RPC result. Contract revision 1.14: the inline contacts.sync
+    // also materializes skeletons for Alice, Bob, and the fixture group, so
+    // the listing has 3 rows — the messaged conversation first (history
+    // ordering), then the two empty skeletons.
     sleep(Duration::from_millis(50)).await;
     let conversations = request(
         &mut client,
@@ -231,15 +235,13 @@ async fn phase2_link_receive_send_and_idempotent_text() {
         json!({ "accountId": account_id, "limit": 50 }),
     )
     .await;
-    assert_eq!(
-        conversations["result"]["items"].as_array().unwrap().len(),
-        1
-    );
-    let conversation_id = conversations["result"]["items"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_eq!(conversations["result"]["items"][0]["type"], "direct");
+    let items = conversations["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    // The messaged conversation first; its title follows the sync cache's
+    // profile-name preference ("Alice Example" over the envelope peer name).
+    assert_eq!(items[0]["title"], "Alice Example");
+    assert_eq!(items[0]["type"], "direct");
+    let conversation_id = items[0]["id"].as_str().unwrap().to_string();
 
     let messages = request(
         &mut client,
@@ -543,7 +545,8 @@ async fn contacts_sync_list_and_send_by_peer() {
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
 
     // finish_link already ran a best-effort sync; an explicit contacts.sync
-    // inside the 60s window returns the cached counts.
+    // inside the 60s window returns the cached counts. The self entry from
+    // listContacts is excluded (contract 1.14): 2 contacts + 1 group.
     let synced = request(
         &mut client,
         "contacts-sync",
@@ -551,7 +554,7 @@ async fn contacts_sync_list_and_send_by_peer() {
         json!({ "accountId": account_id }),
     )
     .await;
-    assert_eq!(synced["result"]["contactCount"], 3);
+    assert_eq!(synced["result"]["contactCount"], 2);
     assert_eq!(synced["result"]["groupCount"], 1);
     assert!(synced["result"]["syncedAt"].as_u64().unwrap() > 0);
 
@@ -563,7 +566,8 @@ async fn contacts_sync_list_and_send_by_peer() {
     )
     .await;
     let items = listed["result"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 4);
+    // The self entry is excluded since contract 1.14.
+    assert_eq!(items.len(), 3);
     let alice = items
         .iter()
         .find(|item| item["peerKey"] == "+15555550101")
@@ -599,7 +603,7 @@ async fn contacts_sync_list_and_send_by_peer() {
         json!({ "accountId": account_id, "limit": 10, "cursor": cursor }),
     )
     .await;
-    assert_eq!(second_page["result"]["items"].as_array().unwrap().len(), 2);
+    assert_eq!(second_page["result"]["items"].as_array().unwrap().len(), 1);
     assert!(second_page["result"].get("nextCursor").is_none());
 
     // contacts.list is read-only: an unknown account is a cache miss, not an

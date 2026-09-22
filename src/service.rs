@@ -735,10 +735,12 @@ impl ConnectorService {
     }
 
     /// Prepare a send addressed by peer (kind + peer_key) instead of an
-    /// existing conversation id. Intentional design: when no conversation for
-    /// the peer exists yet, it is created together with the first outgoing
-    /// message, so the conversation only becomes visible/active once the first
-    /// message is actually sent — no empty conversation skeletons are produced.
+    /// existing conversation id. When no conversation for the peer exists yet,
+    /// it is created here and carries the first outgoing message. Since
+    /// contract revision 1.14 a contacts.sync already materializes skeleton
+    /// conversations for synced peers (§6.5), so this path mostly attaches the
+    /// first message to an existing skeleton; unknown peers still get their
+    /// conversation from this send.
     pub fn prepare_send_text_to_peer(
         &self,
         account_id: &str,

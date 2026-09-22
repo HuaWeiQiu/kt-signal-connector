@@ -1417,6 +1417,13 @@ impl RuntimeSupervisor {
             let Some(peer_key) = peer_key else {
                 continue;
             };
+            // The linked account itself appears in its own contact list
+            // (signal-cli "note to self" entry); it must not become a
+            // conversation skeleton — not even a cache row, matching the
+            // pre-1.14 sync shape.
+            if peer_key == number {
+                continue;
+            }
             let title = compose_contact_display_name(&item)
                 .unwrap_or_else(|| crate::ids::mask_address(peer_key));
             synced.push(("contact".to_string(), peer_key.to_string(), title, None));

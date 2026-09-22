@@ -764,16 +764,30 @@ the JVM queue. Contact rows and the sync marker are deleted with the account.
 `messages.sendText` accepts either `conversationId` or a peer target (`kind` + `peerKey`, optional
 `peerTitle`); exactly one form is required. A peer send resolves the conversation by
 `(account_id, kind, peer_key)` and, when absent, creates it together with the first outgoing
-message. The conversation therefore becomes an active conversation only once the first message is
-actually sent — no empty conversation skeletons are produced. `kind` accepts `contact`/`direct`
-(both a direct chat) or `group`; a missing `peerTitle` falls back to the masked peer address,
-never the raw number.
+message. `kind` accepts `contact`/`direct` (both a direct chat) or `group`; a missing `peerTitle`
+falls back to the masked peer address, never the raw number.
+
+Contract revision 1.14 (2026-09-23) replaces the earlier "no empty conversation skeletons"
+resolution: a successful `contacts.sync` now also ensures one conversation row per synced
+direct contact and per synced member group, in the same transaction as the contact upserts.
+This mirrors the official Desktop post-sync shape — the linked account sees its existing chats
+as empty skeletons (sorted after conversations with history by `last_message_at IS NULL`), the
+title comes from the sync cache and upgrades through the normal `title_should_upgrade` path
+when the first real message lands. Message history is still never backfilled (§6.6); a skeleton
+only becomes an active conversation through a real message. The pre-1.14 behavior —
+conversations created only by the first sent or received message — remains true for entries the
+upstream has not synced (unknown numbers that message the account create their conversation on
+arrival as before).
 
 ### 6.6 History limitation
 
 The connector only promises history it has persisted. `sendSyncRequest` can synchronize contacts and
 groups but is not treated as complete phone/Desktop message-history backfill. Product UI must not
-promise pre-link history until a separately verified upstream capability exists.
+promise pre-link history until a separately verified upstream capability exists. Since contract
+revision 1.14 the synced chats do surface as empty conversation skeletons (§6.5); their message
+lists stay empty until real messages arrive. Official Signal added an optional full-history
+"Link & Sync" archive transfer in 2025; pinned signal-cli 0.14.7 has no such capability, so the
+connector cannot offer it.
 
 ### 6.7 Media limitation
 
