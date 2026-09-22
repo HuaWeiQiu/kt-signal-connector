@@ -4,7 +4,7 @@
 #   1. cargo build --release (connector binary)
 #   2. downloads the pinned signal-cli release (SHA-256 verified) into a
 #      user-level dev dir — never touches production runtime paths
-#   3. locates a JRE >= 21 (required by signal-cli 0.14.x)
+#   3. locates a JRE >= 25 (required by signal-cli 0.14.7, class file 69.0)
 #   4. runs packaging/scripts/smoke-signal-cli.sh against the result
 #   5. writes env.sh with the KT_SIGNAL_* vars the desktop client's
 #      development resolver reads
@@ -19,7 +19,7 @@ SIGNAL_CLI_VERSION="0.14.7"
 # tarball fetched from the release URL below.
 SIGNAL_CLI_SHA256="0e1eefdf4a2109edf7c899c9d1667167c54ac12c3ec824f27db7c1dac4fa7506"
 SIGNAL_CLI_URL="https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}.tar.gz"
-MIN_JAVA_MAJOR=21
+MIN_JAVA_MAJOR=25
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DEV_ROOT="${KT_SIGNAL_DEV_ROOT:-$HOME/.kt-desktop-signal-dev}"
@@ -125,8 +125,8 @@ main() {
   local java_home
   if ! java_home="$(find_java_home)"; then
     die "no JRE >= $MIN_JAVA_MAJOR found. Install one, e.g.:
-  macOS:  brew install openjdk@21
-  Debian: sudo apt install openjdk-21-jre-headless
+  macOS:  brew install openjdk@25
+  Debian: sudo apt install openjdk-25-jre-headless
 then re-run this script (or set JAVA_HOME first)."
   fi
 
