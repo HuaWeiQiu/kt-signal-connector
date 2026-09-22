@@ -49,6 +49,7 @@
             "messages.list",
             "messages.getText",
             "messages.sendText",
+            "messages.attachments.send",
             "messages.remoteDelete",
             "messages.sendReaction",
             "messages.attachments.get",
@@ -158,6 +159,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendTextParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.attachments.send" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendAttachmentParams" }
             }
           }
         },
@@ -456,6 +468,67 @@
           "maximum": 5242880,
           "description": "The attachment size the caller expects, from the message attachment metadata. Enforced deterministically before any upstream read: a different actual size answers INVALID_REQUEST."
         }
+      }
+    },
+    "messagesSendAttachmentParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "clientRequestId", "dataBase64", "sizeBytes"],
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..5242880 bytes, the same 5 MiB PoC bound as messages.attachments.get). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "direct", "group"],
+          "description": "Peer target kind; 'contact' and 'direct' both address a direct chat."
+        },
+        "peerKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Recipient number/uuid for direct chats, group id for groups."
+        },
+        "peerTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional display title used when the peer send creates a new conversation."
+        },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "dataBase64": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 6990508,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "description": "Standard padded base64 of the attachment bytes; decoded size must equal sizeBytes."
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5242880,
+          "description": "Declared raw attachment size; verified against the decoded payload before anything is sent."
+        },
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional display filename for the data URI; path separators and control characters are rejected."
+        },
+        "contentType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$",
+          "description": "Optional RFC 2045 media type 'type/subtype'; defaults to application/octet-stream."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Optional caption; the service authoritatively enforces at most 65536 UTF-8 bytes."
+        },
+        "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "groupsGetParams": {

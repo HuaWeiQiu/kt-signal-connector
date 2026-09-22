@@ -21,7 +21,11 @@ pub mod store;
 pub mod supervisor;
 
 pub const API_VERSION: &str = "1.0";
-pub const DEFAULT_HOST_FRAME_LIMIT: usize = 1024 * 1024;
+/// One ≤16 MiB inbound line per host connection (attachment base64 payloads,
+/// implementation-plan §4.12). Matches the desktop client's connector frame
+/// budget; the desktop is the only local peer on a private, handshake-
+/// authenticated socket.
+pub const DEFAULT_HOST_FRAME_LIMIT: usize = 16 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_LINE_LIMIT: usize = 8 * 1024 * 1024;
 pub const MAX_PENDING_UPSTREAM_REQUESTS: usize = 128;
 /// The reserved, always-present proxy group (ADR 0001 R2). The legacy global

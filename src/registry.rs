@@ -586,6 +586,35 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .send_attachment(
+                account_id,
+                target,
+                client_request_id,
+                data_base64,
+                size_bytes,
+                filename,
+                content_type,
+                text,
+                quote_message_id,
+            )
+            .await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

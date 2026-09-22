@@ -506,6 +506,57 @@ Consequences for the host:
   call) was rejected: a permanently-failing lane is worse than the explicit
   not-implemented `METHOD_NOT_ALLOWED` answer.
 
+### 4.12 messages.attachments.send (contract revision 1.13, 2026-09-22)
+
+API `1.0` evolves in place again (§4.5–§4.7 precedent); the apiVersion handshake binding is
+unchanged. The method is additive and advertised through the handshake `capabilities` array —
+calling it against an older connector answers `METHOD_NOT_ALLOWED`. It follows the
+`messages.sendText` (§4.2) implementation shape end to end: pending row → upstream mutating
+call → `complete_send_success` / `complete_send_unknown` settlement.
+
+- `messages.attachments.send` sends one attachment (optionally with a text caption) to one
+  conversation. Params: `accountId`, `conversationId` **or** `kind`+`peerKey`(+`peerTitle`)
+  addressing (exactly one form, `sendText` semantics), `clientRequestId` (idempotency),
+  `dataBase64`, `sizeBytes` (declared raw budget), optional `filename` (1–128 bytes;
+  caller-supplied display name, rejected outright on path separators or control
+  characters — never sanitized), optional `contentType`
+  (1–128 chars, `type/subtype` shape), optional `text` caption (existing `validate_text`
+  bounds). The base64 payload is **decoded by the connector and re-encoded as an RFC 2397
+  data URI** — upstream jsonRpc `send` accepts `attachments` entries as file paths or data
+  URIs, and `AttachmentHelper` (pinned 0.14.7 distribution, verified in bytecode and source)
+  decodes data URIs itself, uploads via the CDN path, and manages its own temp file lifetime.
+  The connector therefore never persists attachment bytes and never passes caller-controlled
+  file paths upstream (signal-cli itself rejects data-directory paths — same boundary).
+- Why not file paths: the host→connector boundary passes bytes, not paths (§8 discipline);
+  a connector-managed temp file would create a third cleanup owner and a crash window, and
+  upstream already implements the data-URI decode with its own bounded temp handling.
+- Why the limit stays 5 MiB raw (5,242,880 bytes): symmetric with `messages.attachments.get`
+  (§4.7). The inbound host frame limit rises with this revision — `DEFAULT_HOST_FRAME_LIMIT`
+  1 MiB → 16 MiB (`lib.rs`) — because 5 MiB raw encodes to at most 6,990,508 base64 chars
+  (~6.99 MB) plus the JSON envelope; 16 MiB matches the desktop-side
+  `DEFAULT_MAX_CONNECTOR_FRAME_BYTES` so the whole chain narrows at the same gate. The 8 MiB
+  upstream **output** line limit (`DEFAULT_UPSTREAM_LINE_LIMIT`) is not in the send path: the
+  `send` response carries only ids/timestamps, and the data URI travels connector→upstream on
+  an inbound line for which signal-cli sets no length cap (`BufferedReader.readLine`,
+  verified in v0.14.7 source). The frame limit raise is deliberate and reviewed: one host
+  connection may hold one ≤16 MiB line buffer, bounded by the existing per-connection model;
+  the desktop client is the only local peer (private Unix socket / named pipe, peer
+  handshake-authenticated), so the exposure is the same trust domain as before.
+- Result: the sent `MessageRecord` (same projection as `sendText`) on upstream confirmation,
+  or `SEND_OUTCOME_UNKNOWN` when the mutating outcome is indeterminate — identical settlement
+  and no-auto-retry discipline as every other mutating send (§4.2). The pending row's `text`
+  is the caption (may be empty); attachment descriptors ride the upstream params only and are
+  not persisted as local attachment metadata this revision (receive normalization keeps none;
+  the desktop renders its own optimistic attachment bubble from its own send state).
+- Error mapping reuses existing codes only (zero new codes): `ACCOUNT_NOT_FOUND`,
+  `CONVERSATION_NOT_FOUND`, `INVALID_REQUEST` (shape, base64 decode failure, size mismatch,
+  bounds violations), `RUNTIME_NOT_RUNNING`, `UPSTREAM_EXITED`, `UPSTREAM_TIMEOUT`,
+  `UPSTREAM_ERROR` for an explicit upstream rejection (`AttachmentInvalidException` family) —
+  its `retryable=true` is the global mapping, no auto-retry.
+- Dispatch inherits the mutating infrastructure unchanged: the write lane with the per-account
+  mutex (same-account sends serialize), and the per-account request budget. Metrics classify
+  it as `send`.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

@@ -33,8 +33,9 @@ use serde_json::Value;
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
-    MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_DEVICE_NAME_BYTES,
-    MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_TEXT_BYTES,
+    MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES,
+    MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES,
+    MAX_OPAQUE_ID_BYTES, MAX_TEXT_BYTES,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -350,6 +351,31 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesAttachmentsGetParams/properties/sizeBytes",
             "maximum",
             MAX_ATTACHMENT_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/dataBase64",
+            "maxLength",
+            (4 * MAX_ATTACHMENT_BYTES.div_ceil(3)) as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/sizeBytes",
+            "maximum",
+            MAX_ATTACHMENT_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/filename",
+            "maxLength",
+            MAX_ATTACHMENT_FILENAME_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/contentType",
+            "maxLength",
+            MAX_ATTACHMENT_CONTENT_TYPE_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentParams/properties/text",
+            "maxLength",
+            MAX_TEXT_BYTES as u64,
         ),
         (
             "/$defs/conversationsListParams/properties/limit",

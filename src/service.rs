@@ -42,6 +42,12 @@ pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
 /// Encoded length of [`MAX_ATTACHMENT_BYTES`]: 4 * ceil(n / 3), the exact
 /// padded-base64 length java.util.Base64 emits.
 const MAX_ATTACHMENT_BASE64_CHARS: usize = 4 * MAX_ATTACHMENT_BYTES.div_ceil(3);
+/// Attachment send bounds (contract revision 1.13, implementation-plan
+/// §4.12): filename/contentType are caller-supplied display descriptors for
+/// the upstream data URI, bounded like the opaqueId family; the decoded
+/// payload must match the declared `sizeBytes` exactly (§4.7 discipline).
+pub const MAX_ATTACHMENT_FILENAME_BYTES: usize = 128;
+pub const MAX_ATTACHMENT_CONTENT_TYPE_BYTES: usize = 128;
 /// An upstream attachment id (receive-time metadata field `id`), bounded to
 /// the schema's `attachmentId` maxLength (schemas/connector-api-v1.schema.json
 /// is the single source for this length); Signal ids stay far below it, the
@@ -724,6 +730,7 @@ impl ConnectorService {
             text,
             client_request_id,
             quote_message_id,
+            None,
         )
     }
 
@@ -787,6 +794,92 @@ impl ConnectorService {
             text,
             client_request_id,
             quote_message_id,
+            None,
+        )
+    }
+
+    /// Send one attachment (optionally with a caption) — implementation-plan
+    /// §4.12. Validation runs entirely before the pending row exists, so a
+    /// rejected request leaves nothing behind and the same clientRequestId
+    /// stays a fresh request. The base64 payload is size-verified against the
+    /// declared `sizeBytes` and re-encoded as an RFC 2397 data URI: upstream
+    /// decodes it itself (AttachmentHelper, pinned 0.14.7), uploads via CDN,
+    /// and owns any temp file lifetime — bytes never touch connector disk and
+    /// no caller-controlled path reaches upstream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_attachment(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        data_base64: &str,
+        size_bytes: u64,
+        filename: Option<&str>,
+        content_type: Option<&str>,
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_attachment_send_payload(data_base64, size_bytes)?;
+        validate_attachment_descriptor(filename, "filename")?;
+        validate_attachment_content_type(content_type)?;
+        let caption = text.unwrap_or_default();
+        if !caption.is_empty() {
+            validate_text(caption)?;
+        }
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if let Some(quote) = quote_message_id {
+            validate_opaque_id(quote, "quoteMessageId")?;
+        }
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(existing));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = match target {
+            AttachmentSendTarget::Conversation(conversation_id) => {
+                self.resolve_conversation(account_id, conversation_id)?
+            }
+            AttachmentSendTarget::Peer(peer) => {
+                // contacts.list reports 'contact'; conversations use
+                // 'direct'. Both are accepted for the same direct-chat target.
+                let kind = match peer.kind {
+                    "direct" | "contact" => "direct",
+                    "group" => "group",
+                    _ => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "INVALID_REQUEST",
+                            "kind must be 'contact', 'direct', or 'group'",
+                            false,
+                        )));
+                    }
+                };
+                validate_opaque_id(peer.peer_key, "peerKey")?;
+                let peer_title = peer
+                    .peer_title
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(|title| title.chars().take(64).collect::<String>());
+                let title = peer_title.unwrap_or_else(|| {
+                    if kind == "group" {
+                        "group".to_string()
+                    } else {
+                        mask_address(peer.peer_key)
+                    }
+                });
+                self.store
+                    .ensure_conversation(account_id, kind, peer.peer_key, &title)?
+            }
+        };
+        let data_uri = build_attachment_data_uri(data_base64, filename, content_type)?;
+        self.dispatch_send(
+            &account,
+            &conversation,
+            caption,
+            client_request_id,
+            quote_message_id,
+            Some(vec![json!(data_uri)]),
         )
     }
 
@@ -797,6 +890,7 @@ impl ConnectorService {
         text: &str,
         client_request_id: &str,
         quote_message_id: Option<&str>,
+        attachments: Option<Vec<Value>>,
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
@@ -840,6 +934,13 @@ impl ConnectorService {
             "account": account.signal_account,
             "message": text,
         });
+        if let Some(attachments) = attachments {
+            // signal-cli jsonRpc send accepts `attachments` entries as file
+            // paths or RFC 2397 data URIs (SendCommand --attachment, pinned
+            // 0.14.7); the connector passes data URIs only — bytes stay in
+            // memory, no caller-controlled path ever reaches upstream.
+            params["attachments"] = Value::Array(attachments);
+        }
         set_upstream_target(&mut params, conversation);
         // signal-cli JSON-RPC send quote parameters (verified against the
         // pinned 0.14.7 distribution): quoteTimestamp is the quoted message's
@@ -1404,6 +1505,15 @@ pub struct PeerTarget<'a> {
     pub peer_title: Option<&'a str>,
 }
 
+/// Borrowed addressing for an attachment send (implementation-plan §4.12):
+/// same two forms as [`SendTarget`] but borrowed, so validation happens in
+/// the service before any row is written.
+#[derive(Clone, Copy, Debug)]
+pub enum AttachmentSendTarget<'a> {
+    Conversation(&'a str),
+    Peer(PeerTarget<'a>),
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactsSyncOutcome {
@@ -1478,6 +1588,23 @@ pub struct MessagesSendTextParams {
     pub peer_title: Option<String>,
     pub text: String,
     pub client_request_id: String,
+    pub quote_message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendAttachmentParams {
+    pub account_id: String,
+    pub conversation_id: Option<String>,
+    pub kind: Option<String>,
+    pub peer_key: Option<String>,
+    pub peer_title: Option<String>,
+    pub client_request_id: String,
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub text: Option<String>,
     pub quote_message_id: Option<String>,
 }
 
@@ -1725,6 +1852,223 @@ pub fn validate_attachment_payload(
         )));
     }
     Ok(())
+}
+
+/// Validate an attachment send payload (contract revision 1.13,
+/// implementation-plan §4.12): the same base64/size discipline as
+/// [`validate_attachment_payload`] plus the standard-alphabet shape check —
+/// the connector re-encodes the payload into a data URI itself, so a payload
+/// that is not canonical standard base64 would corrupt the data URI.
+fn validate_attachment_send_payload(
+    base64_data: &str,
+    expected_size_bytes: u64,
+) -> Result<(), ServiceError> {
+    validate_attachment_payload(base64_data, expected_size_bytes)?;
+    if base64_data.len() % 4 != 0 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachment payload is not canonical base64",
+            false,
+        )));
+    }
+    let mut decoded = Vec::with_capacity(expected_size_bytes as usize);
+    if base64_decode_to_vec(base64_data, &mut decoded).is_err()
+        || decoded.len() as u64 != expected_size_bytes
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachment payload is not valid base64 or does not match sizeBytes",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// Decode standard base64 (with padding) into `out`. Returns Err on any
+/// non-canonical input; the implementation mirrors the alphabet upstream's
+/// java.util.Base64 accepts.
+fn base64_decode_to_vec(input: &str, out: &mut Vec<u8>) -> Result<(), ()> {
+    const INVALID: u8 = 0xFF;
+    fn value(byte: u8) -> u8 {
+        match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => INVALID,
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err(());
+    }
+    let padding = bytes.iter().rev().take_while(|&&b| b == b'=').count();
+    if padding > 2 {
+        return Err(());
+    }
+    let data_end = bytes.len() - padding;
+    // Every remaining byte before padding must be a data character; '=' only
+    // allowed in the final quad (already ensured by take_while from the end).
+    out.clear();
+    out.reserve(data_end / 4 * 3 + 3);
+    let mut quad = [0u8; 4];
+    let mut quad_len = 0;
+    for &byte in &bytes[..data_end] {
+        let v = value(byte);
+        if v == INVALID {
+            return Err(());
+        }
+        quad[quad_len] = v;
+        quad_len += 1;
+        if quad_len == 4 {
+            out.push((quad[0] << 2) | (quad[1] >> 4));
+            out.push((quad[1] << 4) | (quad[2] >> 2));
+            out.push((quad[2] << 6) | quad[3]);
+            quad_len = 0;
+        }
+    }
+    // Final partial quad: 2 chars -> 1 byte, 3 chars -> 2 bytes; leftover
+    // bits must be zero (canonical form).
+    match quad_len {
+        0 => {}
+        2 => {
+            if quad[1] & 0x0F != 0 {
+                return Err(());
+            }
+            out.push((quad[0] << 2) | (quad[1] >> 4));
+        }
+        3 => {
+            if quad[2] & 0x03 != 0 {
+                return Err(());
+            }
+            out.push((quad[0] << 2) | (quad[1] >> 4));
+            out.push((quad[1] << 4) | (quad[2] >> 2));
+        }
+        _ => return Err(()),
+    }
+    Ok(())
+}
+
+/// Validate the caller-supplied display filename/contentType bound
+/// (1–128 bytes, no control characters). Path separators are rejected for
+/// filename so a descriptor can never masquerade as a path fragment.
+fn validate_attachment_descriptor(value: Option<&str>, field: &str) -> Result<(), ServiceError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_empty() || value.len() > MAX_ATTACHMENT_FILENAME_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            format!("{field} must contain between 1 and 128 bytes"),
+            false,
+        )));
+    }
+    if value.chars().any(char::is_control) || value.contains('/') || value.contains('\\') {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            format!("{field} must not contain path separators or control characters"),
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// Validate an optional RFC 2045 media type (`type/subtype`, both non-empty
+/// token shapes). The pinned upstream parses the data URI header loosely, but
+/// a malformed content type upstream would surface as UPSTREAM_ERROR after a
+/// pending row exists — reject it deterministically here instead.
+fn validate_attachment_content_type(value: Option<&str>) -> Result<(), ServiceError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_empty() || value.len() > MAX_ATTACHMENT_CONTENT_TYPE_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "contentType must contain between 1 and 128 bytes",
+            false,
+        )));
+    }
+    let valid_token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    let (main, sub) = value.split_once('/').ok_or_else(|| {
+        ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "contentType must be 'type/subtype'",
+            false,
+        ))
+    })?;
+    if !valid_token(main) || !valid_token(sub) {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "contentType contains invalid characters",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// Build the RFC 2397 data URI the pinned upstream accepts
+/// (AttachmentHelper: `data:<mime>;filename=<name>;base64,<payload>`). The
+/// payload is re-encoded from the already-validated base64 — decoding first
+/// and re-encoding keeps the URI byte-exact even if the host sent a base64
+/// variant with different padding; the round-trip was verified in
+/// [`validate_attachment_send_payload`].
+fn build_attachment_data_uri(
+    base64_data: &str,
+    filename: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<String, ServiceError> {
+    let mut decoded = Vec::with_capacity(MAX_ATTACHMENT_BYTES);
+    base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
+        ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachment payload is not valid base64",
+            false,
+        ))
+    })?;
+    use std::fmt::Write as _;
+    let mut uri = String::with_capacity(decoded.len() / 3 * 4 + 64);
+    uri.push_str("data:");
+    uri.push_str(content_type.unwrap_or("application/octet-stream"));
+    if let Some(filename) = filename {
+        uri.push_str(";filename=");
+        // encodeURIComponent semantics for the filename parameter.
+        for byte in filename.bytes() {
+            let c = byte as char;
+            if c.is_ascii_alphanumeric() || "-_.!~*'()".contains(c) {
+                uri.push(c);
+            } else {
+                let _ = write!(uri, "%{byte:02X}");
+            }
+        }
+    }
+    uri.push_str(";base64,");
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in decoded.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        uri.push(ALPHABET[(b[0] >> 2) as usize] as char);
+        uri.push(ALPHABET[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            uri.push(ALPHABET[(((b[1] & 0x0F) << 2) | (b[2] >> 6)) as usize] as char);
+        } else {
+            uri.push('=');
+        }
+        if chunk.len() > 2 {
+            uri.push(ALPHABET[(b[2] & 0x3F) as usize] as char);
+        } else {
+            uri.push('=');
+        }
+    }
+    Ok(uri)
 }
 
 #[cfg(test)]
@@ -3287,6 +3631,215 @@ mod tests {
         let oversized = "A".repeat(MAX_ATTACHMENT_BASE64_CHARS + 4);
         let error = validate_attachment_payload(&oversized, 24).unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// Attachment send validation (contract revision 1.13,
+    /// implementation-plan §4.12): canonical-base64 shape, declared-size
+    /// equality, descriptor bounds, and the type/subtype content-type shape
+    /// are all enforced deterministically before any row is written.
+    #[test]
+    fn attachment_send_payload_and_descriptors_are_validated_before_any_row() {
+        let encoded = "Zml4dHVyZSBhdHRhY2htZW50IGJ5dGVz";
+        assert!(validate_attachment_send_payload(encoded, 24).is_ok());
+
+        // Non-canonical inputs: declared-size mismatch, whitespace, missing
+        // padding (wrong length modulo), URL-safe alphabet, non-zero
+        // leftover bits.
+        assert!(validate_attachment_send_payload(encoded, 23).is_err());
+        assert!(validate_attachment_send_payload("Zml4dHVyZSBhdHRhY2htZW50IGJ5dGVz ", 24).is_err());
+        assert!(validate_attachment_send_payload("A", 1).is_err());
+        assert!(validate_attachment_send_payload("YQ", 1).is_err());
+        assert!(validate_attachment_send_payload("_w==", 1).is_err());
+        assert!(validate_attachment_send_payload("YR==", 1).is_err());
+
+        // Filename/contentType descriptor bounds.
+        assert!(validate_attachment_descriptor(Some("report.pdf"), "filename").is_ok());
+        assert!(validate_attachment_descriptor(None, "filename").is_ok());
+        assert!(validate_attachment_descriptor(Some(""), "filename").is_err());
+        assert!(validate_attachment_descriptor(Some("../etc/passwd"), "filename").is_err());
+        assert!(validate_attachment_descriptor(Some("a\\b"), "filename").is_err());
+        assert!(validate_attachment_descriptor(Some("a\nb"), "filename").is_err());
+        assert!(validate_attachment_descriptor(Some(&"界".repeat(43)), "filename").is_err());
+
+        assert!(validate_attachment_content_type(Some("image/png")).is_ok());
+        assert!(validate_attachment_content_type(None).is_ok());
+        assert!(validate_attachment_content_type(Some("image")).is_err());
+        assert!(validate_attachment_content_type(Some("image/png;x=y")).is_err());
+        assert!(validate_attachment_content_type(Some("imag e/png")).is_err());
+    }
+
+    /// The data URI is the only upstream-facing attachment form (§4.12): the
+    /// validated base64 round-trips byte-exact, the filename is
+    /// percent-encoded, and a missing contentType falls back to
+    /// application/octet-stream.
+    #[test]
+    fn attachment_data_uri_round_trips_and_encodes_the_descriptor() {
+        let payload = b"attachment bytes \xe2\x9c\x93";
+        // Standard base64 of the payload, built locally to stay independent.
+        let mut b64 = String::new();
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for chunk in payload.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            b64.push(ALPHABET[(b[0] >> 2) as usize] as char);
+            b64.push(ALPHABET[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                b64.push(ALPHABET[(((b[1] & 0x0F) << 2) | (b[2] >> 6)) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                b64.push(ALPHABET[(b[2] & 0x3F) as usize] as char);
+            }
+        }
+        let pad = (3 - payload.len() % 3) % 3;
+        for _ in 0..pad {
+            b64.push('=');
+        }
+
+        assert!(validate_attachment_send_payload(&b64, payload.len() as u64).is_ok());
+        let uri =
+            build_attachment_data_uri(&b64, Some("notes 下载.txt"), Some("text/plain")).unwrap();
+        assert!(uri.starts_with("data:text/plain;filename=notes%20%E4%B8%8B%E8%BD%BD.txt;base64,"));
+        let payload_part = uri.rsplit(";base64,").next().unwrap();
+        let mut decoded = Vec::new();
+        base64_decode_to_vec(payload_part, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+
+        // Default content type when none given.
+        let uri = build_attachment_data_uri(&b64, None, None).unwrap();
+        assert!(uri.starts_with("data:application/octet-stream;base64,"));
+    }
+
+    /// prepare_send_attachment (§4.12): validation failures leave no pending
+    /// row (the same clientRequestId stays fresh), the prepared upstream
+    /// params carry the data URI under `attachments`, and an unknown
+    /// clientRequestId replay returns the same existing row (idempotency).
+    #[test]
+    fn prepare_send_attachment_builds_data_uri_params_and_is_idempotent() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let _events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(10),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: Some("Peer".into()),
+                    group_id: None,
+                    text: Some("hello".into()),
+                    text_bytes: None,
+                    text_truncated: false,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let conversation_id = service
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0)
+            .id;
+
+        let payload = b"attachment bytes";
+        let b64 = "YXR0YWNobWVudCBieXRlcw=="; // base64 of "attachment bytes"
+        assert_eq!(payload.len(), 16);
+
+        // A rejected request (size mismatch) leaves no row behind: the same
+        // clientRequestId is reusable afterwards.
+        let error = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-attach-1",
+                b64,
+                15,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("see attachment"),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-attach-1")
+                .unwrap()
+                .is_none()
+        );
+
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-attach-1",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("see attachment"),
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch {
+            pending_id, params, ..
+        } = &prepared
+        else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(params["message"], "see attachment");
+        let attachments = params["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 1);
+        let uri = attachments[0].as_str().unwrap();
+        assert_eq!(
+            uri,
+            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        // Addressing rides the shared upstream-target shape.
+        assert!(params.get("recipient").is_some() || params.get("groupId").is_some());
+
+        // The pending row exists once; replaying the same clientRequestId
+        // returns the existing row instead of a second dispatch.
+        let replay = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-attach-1",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("see attachment"),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(replay, PreparedSend::Existing(_)));
+        let _ = pending_id;
+
+        // Unknown account and conversation answer their deterministic errors.
+        let error = service
+            .prepare_send_attachment(
+                "no-such-account",
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-attach-2",
+                b64,
+                16,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
     }
 
     /// groups.get (contract revision 1.9, implementation-plan §4.8): a pure

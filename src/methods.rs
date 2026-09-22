@@ -40,6 +40,7 @@ pub const METHODS: &[MethodRow] = &[
     ("messages.list", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
     ("messages.sendText", Lane::Send, true, "send"),
+    ("messages.attachments.send", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
     ("messages.attachments.get", Lane::Read, false, "read"),
@@ -111,6 +112,7 @@ mod tests {
         ];
         let send_lane = [
             "messages.sendText",
+            "messages.attachments.send",
             "messages.remoteDelete",
             "messages.sendReaction",
             "contacts.setLocalAlias",
@@ -118,6 +120,7 @@ mod tests {
         ];
         let mutating = [
             "messages.sendText",
+            "messages.attachments.send",
             "messages.remoteDelete",
             "messages.sendReaction",
             "contacts.sync",

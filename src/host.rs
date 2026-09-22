@@ -28,8 +28,8 @@ use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesGetAttachmentParams, MessagesListParams,
-    MessagesRemoteDeleteParams, MessagesSendReactionParams, MessagesSendTextParams,
-    PresenceSetTypingMessageParams, SendTarget,
+    MessagesRemoteDeleteParams, MessagesSendAttachmentParams, MessagesSendReactionParams,
+    MessagesSendTextParams, PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -1084,6 +1084,64 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "messages.attachments.send" => {
+            match serde_json::from_value::<MessagesSendAttachmentParams>(request.params) {
+                Ok(params) => {
+                    // Exactly one addressing form, identical to sendText.
+                    let target = match (
+                        params.conversation_id,
+                        params.kind,
+                        params.peer_key,
+                        params.peer_title,
+                    ) {
+                        (Some(conversation_id), None, None, None) => {
+                            Ok(SendTarget::Conversation(conversation_id))
+                        }
+                        (None, Some(kind), Some(peer_key), peer_title) => Ok(SendTarget::Peer {
+                            kind,
+                            peer_key,
+                            peer_title,
+                        }),
+                        _ => Err(ApiError::new(
+                            "INVALID_REQUEST",
+                            "exactly one of conversationId or kind+peerKey must be provided",
+                            false,
+                        )),
+                    };
+                    match target {
+                        Ok(target) => match runtime
+                            .send_attachment(
+                                params.account_id,
+                                target,
+                                params.client_request_id,
+                                params.data_base64,
+                                params.size_bytes,
+                                params.filename,
+                                params.content_type,
+                                params.text,
+                                params.quote_message_id,
+                            )
+                            .await
+                        {
+                            Ok(message) => HostResponse::success(
+                                request_id,
+                                serde_json::to_value(message).unwrap_or(Value::Null),
+                            ),
+                            Err(error) => HostResponse::failure(request_id, error.into_api()),
+                        },
+                        Err(error) => HostResponse::failure(request_id, error),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.attachments.send params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "messages.remoteDelete" => {
             match serde_json::from_value::<MessagesRemoteDeleteParams>(request.params) {
                 Ok(params) => match runtime.remote_delete(params).await {
@@ -1801,6 +1859,78 @@ mod tests {
 
         drop(client);
         assert!(server.await.unwrap().is_ok());
+    }
+
+    /// The host frame limit carries the attachment contract (revision 1.13):
+    /// a request above the pre-1.13 1 MiB limit (a ~5 MiB attachment base64
+    /// payload arrives on this line) is accepted, and a frame beyond the
+    /// 16 MiB codec limit ends the session instead of being parsed.
+    #[tokio::test]
+    async fn host_frame_limit_admits_attachment_sized_frames_and_rejects_beyond_it() {
+        let secret_bytes = [7_u8; 32];
+        let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
+        let runtime = test_runtime();
+        // The duplex buffer holds the largest single write the client makes;
+        // the ~2.2 MiB handshake-free line below fits alongside the challenge.
+        let (server_stream, client_stream) = duplex(4 * 1024 * 1024);
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+
+        let challenge: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
+        let client_nonce = hex::encode([9_u8; 32]);
+        let proof = client_proof(&secret_bytes, server_nonce, &client_nonce);
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": "handshake-1",
+                    "method": "handshake",
+                    "params": { "clientNonce": client_nonce, "proof": proof }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let handshake: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(handshake["result"]["apiVersion"], API_VERSION);
+
+        // A frame far beyond the old 1 MiB limit is parsed and answered (the
+        // method is real, so the answer is a normal response, not a protocol
+        // error): ~2.2 MiB of attachment base64 plus envelope overhead.
+        let payload = "QUJD".repeat(560_000); // 2_240_000 chars
+        let oversized_request = json!({
+            "apiVersion": API_VERSION,
+            "requestId": "attach-frame-1",
+            "method": "messages.attachments.send",
+            "params": {
+                "accountId": "a",
+                "clientRequestId": "cr-1",
+                "dataBase64": payload,
+                "sizeBytes": 5
+            }
+        });
+        let frame = oversized_request.to_string();
+        assert!(frame.len() > 1024 * 1024);
+        client.send(frame).await.unwrap();
+        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["requestId"], "attach-frame-1");
+        assert!(
+            response.get("result").is_some() || response.get("error").is_some(),
+            "a beyond-1MiB frame must be answered, not dropped"
+        );
+
+        // A frame beyond the 16 MiB codec limit breaks the session: either the
+        // send itself fails (the connector dropped the socket mid-frame) or
+        // the reply stream simply ends — in both cases no further valid frame
+        // can be exchanged on this connection.
+        let huge = "A".repeat(DEFAULT_HOST_FRAME_LIMIT + 1024);
+        let _ = client.send(huge).await;
+        let ended = matches!(client.next().await, None | Some(Err(_)));
+        assert!(ended, "a beyond-limit frame must terminate the session");
+        let _ = server.await.expect("server task must not panic");
     }
 
     #[tokio::test]

@@ -15,8 +15,8 @@ use crate::engine::{
 };
 use crate::protocol::ApiError;
 use crate::service::{
-    AttachmentPayload, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
-    PeerTarget, PreparedSend, SendTarget, ServiceError, account_limit_error,
+    AttachmentPayload, AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails,
+    HostSideEvent, PeerTarget, PreparedSend, SendTarget, ServiceError, account_limit_error,
     validate_account_delete_operation_id, validate_attachment_payload,
 };
 use crate::store::{
@@ -1126,6 +1126,56 @@ impl RuntimeSupervisor {
                 }
             },
         }
+    }
+
+    /// Send one attachment (optionally with a caption) — implementation-plan
+    /// §4.12. Identical settlement path to `send_text`: local prepare under
+    /// the service lock, upstream mutating `send` call, pending row settled
+    /// on confirmation / unknown outcome / failure with the same event
+    /// emission and no-auto-retry discipline.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_attachment(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_send_attachment(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                &data_base64,
+                size_bytes,
+                filename.as_deref(),
+                content_type.as_deref(),
+                text.as_deref(),
+                quote_message_id.as_deref(),
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
     }
 
     /// Best-effort "Delete for everyone" for one own sent message
