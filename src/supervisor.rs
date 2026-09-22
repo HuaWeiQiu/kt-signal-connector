@@ -1074,7 +1074,7 @@ impl RuntimeSupervisor {
         prepared: PreparedSend,
     ) -> Result<MessageRecord, ServiceError> {
         match prepared {
-            PreparedSend::Existing(message) => Ok(message),
+            PreparedSend::Existing(message) => Ok(*message),
             PreparedSend::Dispatch {
                 pending_id,
                 account_id,
@@ -1236,6 +1236,43 @@ impl RuntimeSupervisor {
         {
             Ok(_) => Ok("sent"),
             Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// messages.edit (contract revision 1.15): retarget one previously sent
+    /// message's body via the upstream `send` + `editTimestamp` entry point.
+    /// Local prepare (row resolution, text bounds) under the service lock,
+    /// upstream mutating call without it; on confirmed success the local row
+    /// is rewritten and the updated record returned (`Some(record)`); an
+    /// indeterminate outcome maps to `Ok(None)` with the local row unchanged —
+    /// never an automatic retry.
+    pub async fn edit_message(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+        text: String,
+    ) -> Result<Option<MessageRecord>, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_edit(&account_id, &conversation_id, &message_id, &text)?
+        };
+        match engine
+            .call("send", prepared.params, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => {
+                let service = self.service.lock().await;
+                Ok(service.complete_edit_success(
+                    &prepared.account_id,
+                    &prepared.conversation_id,
+                    &prepared.message_id,
+                    &prepared.text,
+                )?)
+            }
+            Err(EngineError::UnknownOutcome) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -1741,6 +1778,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -1833,6 +1873,9 @@ mod tests {
                 text: Some("persist me".into()),
                 text_bytes: Some(10),
                 text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                control: None,
             })
             .await
             .unwrap();

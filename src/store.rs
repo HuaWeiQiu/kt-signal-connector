@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS messages (
   status TEXT NOT NULL,
   client_request_id TEXT,
   quote_message_id TEXT,
+  quote_snapshot TEXT,
+  attachments_json TEXT,
+  edited_at INTEGER,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
@@ -112,6 +115,22 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE INDEX IF NOT EXISTS contacts_account_peer
   ON contacts(account_id, kind, peer_key);
+CREATE TABLE IF NOT EXISTS message_events (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('reaction')),
+  emoji TEXT NOT NULL,
+  target_timestamp INTEGER NOT NULL,
+  actor_id TEXT NOT NULL,
+  removed INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(account_id, conversation_id, kind, target_timestamp, actor_id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id),
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id)
+);
+CREATE INDEX IF NOT EXISTS message_events_conversation
+  ON message_events(account_id, conversation_id, target_timestamp);
 ";
 /// DDL that must run after [`migrate_schema`], not in [`SCHEMA_DDL`], because
 /// it references columns that older stores only gain through a migration.
@@ -308,7 +327,27 @@ pub struct MessageRecord {
     pub client_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_message_id: Option<String>,
+    /// Inbound quote snapshot (contract 1.15): upstream timestamp, author,
+    /// bounded preview. Absent on rows without a quote.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote_snapshot: Option<MessageQuoteSnapshot>,
+    /// Inbound attachment descriptors (contract 1.15): metadata only, never
+    /// bytes. Absent on rows without attachments.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<MessageAttachmentInfo>,
+    /// Local wall-clock time the body was last edited upstream (contract
+    /// 1.15). Absent on rows never edited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<u64>,
 }
+
+/// Inbound quote snapshot stored on the quoted-by message row (same wire
+/// shape the engine normalization produces).
+pub type MessageQuoteSnapshot = crate::engine::NormalizedQuote;
+
+/// One inbound attachment descriptor (metadata only, §4.13; same wire shape
+/// the engine normalization produces).
+pub type MessageAttachmentInfo = crate::engine::NormalizedAttachment;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -317,6 +356,18 @@ pub struct ContactSummary {
     pub kind: &'static str,
     pub peer_key: String,
     pub title: String,
+}
+
+/// One recorded reaction (contract 1.15): the actor's emoji state on a target
+/// message, keyed by the target's upstream timestamp.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionEvent {
+    pub emoji: String,
+    pub target_timestamp: u64,
+    pub actor_id: String,
+    pub removed: bool,
+    pub updated_at: u64,
 }
 
 /// One entry of a contacts sync batch: `kind` is 'contact' or 'group', `extra`
@@ -1126,7 +1177,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2
                    AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1168,7 +1220,8 @@ impl Store {
         self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1186,7 +1239,8 @@ impl Store {
         self.lock_conn()?
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1208,7 +1262,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1254,8 +1309,8 @@ impl Store {
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
-                    quote_message_id
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    quote_message_id, quote_snapshot, attachments_json, edited_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17)",
                 params![
                     message.id,
                     message.account_id,
@@ -1273,6 +1328,14 @@ impl Store {
                     // Retention counts how long this machine has kept a row, so
                     // it reads our clock here and never a peer's claimed time.
                     crate::link::now_ms() as i64,
+                    message
+                        .quote_snapshot
+                        .as_ref()
+                        .map(|quote| serde_json::to_string(quote).expect("quote snapshot json")),
+                    (!message.attachments.is_empty()).then(|| {
+                        serde_json::to_string(&message.attachments).expect("attachments json")
+                    }),
+                    message.edited_at.map(|v| v as i64),
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1405,7 +1468,8 @@ impl Store {
         let record = transaction
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1416,6 +1480,307 @@ impl Store {
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(record.map(|record| (record, changed == 1)))
+    }
+
+    /// Apply an inbound edit (contract 1.15): replace the body of the row the
+    /// target upstream timestamp addresses, only when the editor matches the
+    /// row's sender identity, and stamp `edited_at`. Returns the updated row,
+    /// or None when no matching row exists (missing target / editor mismatch /
+    /// already remote-deleted) — the caller drops the edit in that case.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_inbound_edit(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+        sender_id: &str,
+        legacy_sender_id: &str,
+        new_text: &str,
+        new_text_bytes: u32,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The sender match uses the same identity pair as receive dedupe: the
+        // sender hash for incoming rows differs between store generations.
+        let changed = transaction
+            .execute(
+                "UPDATE messages
+                 SET body=?4, body_bytes=?5, body_truncated=0, edited_at=?6
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND sender_id IN (?7, ?8) AND direction='incoming'
+                   AND status NOT IN ('remote-deleted', 'system')",
+                params![
+                    account_id,
+                    conversation_id,
+                    target_sent_at as i64,
+                    new_text,
+                    new_text_bytes,
+                    crate::link::now_ms() as i64,
+                    sender_id,
+                    legacy_sender_id,
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if changed == 0 {
+            transaction
+                .commit()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            return Ok(None);
+        }
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND sender_id IN (?4, ?5)
+                 ORDER BY id ASC LIMIT 1",
+                params![
+                    account_id,
+                    conversation_id,
+                    target_sent_at as i64,
+                    sender_id,
+                    legacy_sender_id,
+                ],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record)
+    }
+
+    /// Replace an outgoing row's body after a confirmed upstream `send` with
+    /// `editTimestamp` (contract 1.15). The status is untouched — an edited
+    /// message stays `sent` — and `edited_at` marks the row.
+    pub fn apply_outgoing_edit(
+        &self,
+        message_id: &str,
+        account_id: &str,
+        _conversation_id: &str,
+        new_text: &str,
+        new_text_bytes: u32,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .execute(
+                "UPDATE messages
+                 SET body=?3, body_bytes=?4, body_truncated=0, edited_at=?5
+                 WHERE id=?1 AND account_id=?2
+                   AND direction='outgoing'",
+                params![
+                    message_id,
+                    account_id,
+                    new_text,
+                    new_text_bytes,
+                    crate::link::now_ms() as i64,
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
+                 FROM messages WHERE id=?1",
+                params![message_id],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record)
+    }
+
+    /// Our own multi-device edit mirror (contract 1.15): locate the outgoing
+    /// row by its upstream timestamp — the phone's edit echoes
+    /// `targetSentTimestamp`, which equals the row's `sent_at` after
+    /// `complete_outgoing_send` overwrote it — and apply the same body
+    /// replacement as a host-initiated edit.
+    pub fn apply_outgoing_edit_by_signal(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+        new_text: &str,
+        new_text_bytes: u32,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .execute(
+                "UPDATE messages
+                 SET body=?4, body_bytes=?5, body_truncated=0, edited_at=?6
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND direction='outgoing'
+                   AND status NOT IN ('remote-deleted', 'system')",
+                params![
+                    account_id,
+                    conversation_id,
+                    target_sent_at as i64,
+                    new_text,
+                    new_text_bytes,
+                    crate::link::now_ms() as i64,
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND direction='outgoing'
+                 ORDER BY id ASC LIMIT 1",
+                params![account_id, conversation_id, target_sent_at as i64],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record)
+    }
+
+    /// Mark a message remote-deleted (contract 1.15): a peer's or our own
+    /// multi-device remoteDelete pointing at this row's upstream timestamp.
+    /// Idempotent; returns the updated row when the status actually
+    /// transitioned so a replayed delete does not re-emit events.
+    pub fn mark_remote_deleted(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = transaction
+            .execute(
+                "UPDATE messages
+                 SET status='remote-deleted'
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND status NOT IN ('remote-deleted', 'system')",
+                params![account_id, conversation_id, target_sent_at as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, edited_at
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                 ORDER BY id ASC LIMIT 1",
+                params![account_id, conversation_id, target_sent_at as i64],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, changed > 0)))
+    }
+
+    /// Record one inbound reaction (contract 1.15). The protocol shape — one
+    /// emoji state per (conversation, target message, actor) — maps to an
+    /// upsert: a repeated reaction replaces the emoji, `isRemove` marks the
+    /// row removed instead of deleting it (history stays auditable).
+    pub fn upsert_reaction_event(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        emoji: &str,
+        target_sent_at: u64,
+        actor_id: &str,
+        removed: bool,
+    ) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO message_events(
+                    id, account_id, conversation_id, kind, emoji,
+                    target_timestamp, actor_id, removed, updated_at
+                 ) VALUES(?1, ?2, ?3, 'reaction', ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(account_id, conversation_id, kind, target_timestamp, actor_id)
+                 DO UPDATE SET emoji=excluded.emoji,
+                               removed=excluded.removed,
+                               updated_at=excluded.updated_at",
+                params![
+                    crate::ids::stable_hash_id(&[
+                        account_id,
+                        conversation_id,
+                        "reaction",
+                        &target_sent_at.to_string(),
+                        actor_id,
+                    ]),
+                    account_id,
+                    conversation_id,
+                    emoji,
+                    target_sent_at as i64,
+                    actor_id,
+                    i64::from(removed),
+                    crate::link::now_ms() as i64,
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Reaction events for one conversation, newest first, bounded. Served to
+    /// the host alongside the message page so reactions render without a
+    /// second round trip per message.
+    pub fn list_reaction_events(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ReactionEvent>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT emoji, target_timestamp, actor_id, removed, updated_at
+                 FROM message_events
+                 WHERE account_id=?1 AND conversation_id=?2 AND kind='reaction'
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(
+                params![
+                    account_id,
+                    conversation_id,
+                    i64::from(limit.clamp(1, MAX_PAGE_LIMIT))
+                ],
+                |row| {
+                    Ok(ReactionEvent {
+                        emoji: row.get(0)?,
+                        target_timestamp: row.get::<_, i64>(1)? as u64,
+                        actor_id: row.get(2)?,
+                        removed: row.get::<_, i64>(3)? != 0,
+                        updated_at: row.get::<_, i64>(4)? as u64,
+                    })
+                },
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
     /// Mark a pending outgoing row sent. Returns the updated row and whether
@@ -2376,6 +2741,26 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         )
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
     }
+    if current < 8 {
+        // Contract revision 1.15 inbound control plane: quote snapshot and
+        // attachment metadata (descriptors only) are JSON text; the edit
+        // marker is a timestamp. All additive nullable columns — pre-1.15
+        // rows legitimately have none. The message_events table is created
+        // by CREATE TABLE IF NOT EXISTS above, so no data migration is needed.
+        for (column, kind) in [
+            ("quote_snapshot", "TEXT"),
+            ("attachments_json", "TEXT"),
+            ("edited_at", "INTEGER"),
+        ] {
+            if !table_has_column(conn, "messages", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE messages ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2450,6 +2835,7 @@ fn static_status(value: String) -> &'static str {
         "read" => "read",
         "failed" => "failed",
         "system" => "system",
+        "remote-deleted" => "remote-deleted",
         _ => "unknown",
     }
 }
@@ -2464,6 +2850,8 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
                 .map(|value| value.len().min(u32::MAX as usize) as u32)
         });
     let persisted_truncated = row.get::<_, i64>(9)? != 0;
+    let quote_snapshot: Option<String> = row.get(13)?;
+    let attachments_json: Option<String> = row.get(14)?;
     Ok(MessageRecord {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -2479,6 +2867,14 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         status: static_status(row.get::<_, String>(10)?),
         client_request_id: row.get(12)?,
         quote_message_id: row.get(11)?,
+        quote_snapshot: quote_snapshot
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        attachments: attachments_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default(),
+        edited_at: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
     })
 }
 
@@ -2539,6 +2935,9 @@ mod tests {
             status: "sent",
             client_request_id: Some("client-1".into()),
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         assert!(
             store
@@ -2588,6 +2987,9 @@ mod tests {
             status: "pending",
             client_request_id: Some("request-pending".into()),
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(
@@ -2676,6 +3078,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
 
         assert!(matches!(
@@ -2732,6 +3137,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("hello"), true)
@@ -2793,6 +3201,9 @@ mod tests {
             status: "system",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("control notice"), false)
@@ -2838,6 +3249,9 @@ mod tests {
             status: "pending",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("body"), false)
@@ -2907,6 +3321,9 @@ mod tests {
                 status: "delivered",
                 client_request_id: None,
                 quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
             };
             store
                 .insert_message(&message, None, Some(id), false)
@@ -2972,6 +3389,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&changed, None, Some("newer-message-2"), false)
@@ -3011,6 +3431,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&other_message, None, Some("other-message"), false)
@@ -3088,6 +3511,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
 
@@ -3643,6 +4069,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -3703,6 +4132,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -3783,6 +4215,9 @@ mod tests {
                     status: "delivered",
                     client_request_id: None,
                     quote_message_id: None,
+                    quote_snapshot: None,
+                    attachments: Vec::new(),
+                    edited_at: None,
                 };
                 store
                     .insert_message(&message, None, Some("body"), true)
@@ -3920,6 +4355,9 @@ mod tests {
             status: "pending",
             client_request_id: Some("request-pending".into()),
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, Some("request-pending"), Some("body"), false)
@@ -3981,6 +4419,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&recent, None, Some("body"), true)
@@ -4037,6 +4478,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -4096,6 +4540,9 @@ mod tests {
             status: "delivered",
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)

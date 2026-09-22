@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::engine::{EngineError, NormalizedReceive};
+use crate::engine::{ControlReceive, EngineError, NormalizedReceive};
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
@@ -151,16 +151,35 @@ pub enum HostSideEvent {
         message_id: String,
         status: &'static str,
     },
+    /// Ephemeral typing indicator (contract 1.15): never persisted, rate
+    /// limited per account+peer before it reaches the host lane.
+    ConversationTyping {
+        account_id: String,
+        conversation_id: String,
+        action: String,
+    },
 }
+
+/// Ephemeral typing notifications keep the event lane quiet: at most one
+/// notification per account+conversation pair per second, bounded map, oldest
+/// entry evicted (§4.13).
+const TYPING_RATE_LIMIT_MS: u64 = 1_000;
+const TYPING_RATE_MAP_CAPACITY: usize = 256;
 
 pub struct ConnectorService {
     store: Arc<Store>,
     link: Option<ActiveLinkSession>,
+    /// Typing rate limiter: (account_id, conversation_id) → last emission.
+    typing_last_emission: std::collections::HashMap<(String, String), u64>,
 }
 
 impl ConnectorService {
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store, link: None }
+        Self {
+            store,
+            link: None,
+            typing_last_emission: std::collections::HashMap::new(),
+        }
     }
 
     pub fn store_ref(&self) -> &Store {
@@ -720,7 +739,7 @@ impl ConnectorService {
             .store
             .message_by_client_request(account_id, client_request_id)?
         {
-            return Ok(PreparedSend::Existing(existing));
+            return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
@@ -777,7 +796,7 @@ impl ConnectorService {
             .store
             .message_by_client_request(account_id, client_request_id)?
         {
-            return Ok(PreparedSend::Existing(existing));
+            return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         let account = self.resolve_account(account_id)?;
         let title = peer_title.unwrap_or_else(|| {
@@ -836,7 +855,7 @@ impl ConnectorService {
             .store
             .message_by_client_request(account_id, client_request_id)?
         {
-            return Ok(PreparedSend::Existing(existing));
+            return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         let account = self.resolve_account(account_id)?;
         let conversation = match target {
@@ -919,6 +938,9 @@ impl ConnectorService {
             status: "pending",
             client_request_id: Some(client_request_id.to_string()),
             quote_message_id: quote_message_id.map(str::to_string),
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         let inserted =
             self.store
@@ -928,7 +950,7 @@ impl ConnectorService {
                 .store
                 .message_by_client_request(account_id, client_request_id)?
             {
-                return Ok(PreparedSend::Existing(existing));
+                return Ok(PreparedSend::Existing(Box::new(existing)));
             }
         }
 
@@ -995,6 +1017,64 @@ impl ConnectorService {
             }
         };
         Ok((quoted.sent_at, author))
+    }
+
+    /// Pure local validation for `messages.edit` (contract revision 1.15,
+    /// upstream `send` with `editTimestamp`): resolve the target row exactly
+    /// like `prepare_remote_delete` — only an outgoing row in the terminal
+    /// state `sent` carries the upstream protocol identity an edit must
+    /// reference — and build the exact upstream jsonRpc params.
+    pub fn prepare_edit(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<PreparedEdit, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        validate_text(text)?;
+        let (account, conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        if message.direction != "outgoing" || message.status != "sent" {
+            return Err(StoreError::MessageNotFound.into());
+        }
+        // signal-cli `send` with editTimestamp (verified against the jsonRpc
+        // surface: SendCommand dest `edit-timestamp` maps to the camelCase
+        // jsonRpc key) retargets the earlier message; addressing matches send.
+        let mut params = json!({
+            "account": account.signal_account,
+            "message": text,
+            "editTimestamp": message.sent_at,
+        });
+        set_upstream_target(&mut params, &conversation);
+        Ok(PreparedEdit {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            text: text.to_string(),
+            params,
+        })
+    }
+
+    /// Settlement of a confirmed upstream edit (contract 1.15): replace the
+    /// row's body and stamp `edited_at`; status is untouched.
+    pub fn complete_edit_success(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<Option<MessageRecord>, ServiceError> {
+        let text_bytes = text.len().min(u32::MAX as usize) as u32;
+        Ok(self.store.apply_outgoing_edit(
+            message_id,
+            account_id,
+            conversation_id,
+            text,
+            text_bytes,
+        )?)
     }
 
     /// Pure local validation for `messages.remoteDelete` (docs/remote-delete-l2-plan.md §3.2):
@@ -1238,12 +1318,19 @@ impl ConnectorService {
     /// `account`, and with several engines the fallback must never cross
     /// group boundaries.
     pub fn ingest_receive(
-        &self,
+        &mut self,
         receive: NormalizedReceive,
         owner_group: &str,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
         if receive.direction == "skip" {
             return Ok(Vec::new());
+        }
+        // Any control-carrying receive routes to the control plane — not just
+        // direction=="control": a peer's envelope-level editMessage arrives as
+        // direction "incoming" with control Edit and must edit the original
+        // row, never insert a second message.
+        if receive.control.is_some() {
+            return self.ingest_control_receive(receive, owner_group);
         }
         if !matches!(receive.direction, "incoming" | "outgoing" | "system") {
             return Ok(Vec::new());
@@ -1361,6 +1448,9 @@ impl ConnectorService {
             status,
             client_request_id: None,
             quote_message_id: None,
+            quote_snapshot: receive.quote,
+            attachments: receive.attachments,
+            edited_at: None,
         };
         let preview = message
             .text
@@ -1385,6 +1475,183 @@ impl ConnectorService {
         Ok(events)
     }
 
+    /// Persist-and-notify one control-plane receive (contract 1.15): reaction
+    /// upserts, remote-delete marks, edits, and rate-limited typing. Control
+    /// receives never create a conversation, never create a message row, and
+    /// are dropped when they address nothing local.
+    fn ingest_control_receive(
+        &mut self,
+        receive: NormalizedReceive,
+        owner_group: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(control) = receive.control else {
+            return Ok(Vec::new());
+        };
+        // Route to the account the same way messages do.
+        let signal_account = match receive.account.as_deref().filter(|s| !s.is_empty()) {
+            Some(account) => account.to_string(),
+            None => {
+                let accounts = self.store.list_accounts_in_group(owner_group)?;
+                if accounts.len() != 1 {
+                    return Ok(Vec::new());
+                }
+                match self.store.account_by_id(&accounts[0].id)? {
+                    Some(row) => row.signal_account,
+                    None => return Ok(Vec::new()),
+                }
+            }
+        };
+        let account = match self.store.account_by_signal(&signal_account).ok().flatten() {
+            Some(account) => account,
+            None => return Ok(Vec::new()),
+        };
+        // Resolve the conversation: group id, or peer (incoming source /
+        // outgoing destination). Control receives address existing
+        // conversations only — they never create one.
+        let (kind, peer_key) = if let Some(group_id) = receive.group_id.as_deref() {
+            ("group", group_id)
+        } else if let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) {
+            ("direct", peer)
+        } else {
+            return Ok(Vec::new());
+        };
+        let Ok(conversation) = self.store.conversation_by_peer(&account.id, kind, peer_key) else {
+            return Ok(Vec::new());
+        };
+        let Some(conversation) = conversation else {
+            return Ok(Vec::new());
+        };
+        match control {
+            ControlReceive::Reaction {
+                emoji,
+                target_author,
+                target_timestamp,
+                remove,
+            } => {
+                // The actor is the envelope sender; the protocol's
+                // targetAuthor cross-check is advisory (a group member
+                // reacting to another member's message still keys on the
+                // reacting actor).
+                let _ = target_author;
+                let actor_id = match receive.direction {
+                    "outgoing" => account.id.clone(),
+                    _ => stable_hash_id(&[
+                        &account.id,
+                        kind,
+                        receive.source.as_deref().unwrap_or(peer_key),
+                    ]),
+                };
+                self.store.upsert_reaction_event(
+                    &account.id,
+                    &conversation.id,
+                    &emoji,
+                    target_timestamp,
+                    &actor_id,
+                    remove,
+                )?;
+                let mut events = Vec::new();
+                if let Some(summary) = self.store.conversation_summary(&conversation.id)? {
+                    events.push(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok(events)
+            }
+            ControlReceive::RemoteDelete { target_timestamp } => {
+                match self.store.mark_remote_deleted(
+                    &account.id,
+                    &conversation.id,
+                    target_timestamp,
+                )? {
+                    Some((record, true)) => Ok(vec![HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id,
+                        message_id: record.id,
+                        status: record.status,
+                    }]),
+                    _ => Ok(Vec::new()),
+                }
+            }
+            ControlReceive::Edit { target_timestamp } => {
+                let Some(new_text) = receive.text else {
+                    return Ok(Vec::new());
+                };
+                let new_bytes = new_text.len().min(u32::MAX as usize) as u32;
+                match receive.direction {
+                    // Peer edit: keyed on the upstream target timestamp.
+                    "incoming" => {
+                        let sender_id = stable_hash_id(&[
+                            &account.id,
+                            kind,
+                            receive.source.as_deref().unwrap_or(peer_key),
+                        ]);
+                        match self.store.apply_inbound_edit(
+                            &account.id,
+                            &conversation.id,
+                            target_timestamp,
+                            &sender_id,
+                            &legacy_sender_id(kind, peer_key, &account.id),
+                            &new_text,
+                            new_bytes,
+                        )? {
+                            Some(record) => Ok(vec![HostSideEvent::MessageUpserted(record)]),
+                            None => Ok(Vec::new()),
+                        }
+                    }
+                    // Our own multi-device edit of a phone-sent message: the
+                    // sync mirror targets the row by its upstream timestamp
+                    // through the same store path.
+                    _ => {
+                        match self.store.apply_outgoing_edit_by_signal(
+                            &account.id,
+                            &conversation.id,
+                            target_timestamp,
+                            &new_text,
+                            new_bytes,
+                        )? {
+                            Some(record) => Ok(vec![HostSideEvent::MessageUpserted(record)]),
+                            None => Ok(Vec::new()),
+                        }
+                    }
+                }
+            }
+            ControlReceive::Typing { action } => {
+                let key = (account.id.clone(), conversation.id.clone());
+                let now = now_ms();
+                if self.typing_last_emission.len() >= TYPING_RATE_MAP_CAPACITY
+                    && !self.typing_last_emission.contains_key(&key)
+                {
+                    // Bounded map: drop the oldest entry (a linear scan of a
+                    // 256-entry map is cheaper than tracking an order
+                    // structure for a limiter that mostly sees fresh keys).
+                    if let Some(oldest) = self
+                        .typing_last_emission
+                        .iter()
+                        .min_by_key(|(_, at)| **at)
+                        .map(|(key, _)| key.clone())
+                    {
+                        self.typing_last_emission.remove(&oldest);
+                    }
+                }
+                let last = self.typing_last_emission.get(&key).copied();
+                if last.is_some_and(|at| now.saturating_sub(at) < TYPING_RATE_LIMIT_MS) {
+                    return Ok(Vec::new());
+                }
+                self.typing_last_emission.insert(key, now);
+                Ok(vec![HostSideEvent::ConversationTyping {
+                    account_id: account.id,
+                    conversation_id: conversation.id,
+                    action,
+                }])
+            }
+        }
+    }
+}
+
+/// The legacy sender identity a store generation may have written for this
+/// peer (receive dedupe pairs the current and legacy hash).
+fn legacy_sender_id(kind: &str, peer_key: &str, account_id: &str) -> String {
+    stable_hash_id(&[account_id, kind, peer_key])
+}
+
+impl ConnectorService {
     fn require_active_link(
         &mut self,
         link_session_id: &str,
@@ -1422,7 +1689,7 @@ impl ConnectorService {
 
 #[derive(Debug)]
 pub enum PreparedSend {
-    Existing(MessageRecord),
+    Existing(Box<MessageRecord>),
     Dispatch {
         pending_id: String,
         account_id: String,
@@ -1608,6 +1875,25 @@ pub struct MessagesSendAttachmentParams {
     pub content_type: Option<String>,
     pub text: Option<String>,
     pub quote_message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesEditParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub text: String,
+    pub client_request_id: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PreparedEdit {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub text: String,
+    pub params: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2078,6 +2364,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::engine::{NormalizedAttachment, NormalizedQuote};
     use crate::store::StoreKey;
 
     fn service() -> (TempDir, ConnectorService) {
@@ -2253,7 +2540,7 @@ mod tests {
 
     #[test]
     fn inbound_long_text_is_projected_and_fetched_on_demand() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -2273,6 +2560,9 @@ mod tests {
                     text: Some(full_text.clone()),
                     text_bytes: None,
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -2315,7 +2605,7 @@ mod tests {
 
     #[test]
     fn inbound_text_above_receive_ceiling_keeps_only_an_explicit_preview() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
@@ -2334,6 +2624,9 @@ mod tests {
                     text: Some(oversized),
                     text_bytes: None,
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -2367,7 +2660,7 @@ mod tests {
 
     #[test]
     fn outgoing_sync_reconciles_by_signal_timestamp_and_client_request_id() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -2401,6 +2694,9 @@ mod tests {
             text: Some("same text is not identity".into()),
             text_bytes: Some(25),
             text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
         };
         service
             .ingest_receive(sync_receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -2492,7 +2788,7 @@ mod tests {
 
     #[test]
     fn signal_identity_keeps_group_senders_distinct_and_dedupes_replay() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -2509,6 +2805,9 @@ mod tests {
             text: Some(text.into()),
             text_bytes: Some(text.len() as u32),
             text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
         };
 
         let first = receive("peer-a", "first");
@@ -2548,7 +2847,7 @@ mod tests {
 
     #[test]
     fn receive_without_signal_timestamp_has_no_persistence_side_effects() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let receive = NormalizedReceive {
             timestamp: None,
             content_kind: "dataMessage",
@@ -2561,6 +2860,9 @@ mod tests {
             text: Some("unstable identity".into()),
             text_bytes: Some(17),
             text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
         };
 
         assert!(
@@ -2785,7 +3087,7 @@ mod tests {
     /// protocol identity) and quoteAuthor (the peer number).
     #[test]
     fn quote_of_incoming_direct_message_becomes_upstream_quote_params() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -2804,6 +3106,9 @@ mod tests {
                     text: Some("quoted text".into()),
                     text_bytes: Some(11),
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -2898,7 +3203,7 @@ mod tests {
     /// pending row behind — the same clientRequestId must re-validate as new.
     #[test]
     fn unresolvable_quotes_are_rejected_before_any_pending_row_exists() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -2979,6 +3284,9 @@ mod tests {
                     text: Some("group text".into()),
                     text_bytes: Some(10),
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -3085,7 +3393,7 @@ mod tests {
     /// upstream call — the same rule as quote resolution.
     #[test]
     fn remote_delete_rejects_rows_without_a_protocol_identity() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -3129,6 +3437,9 @@ mod tests {
                     text: Some("peer text".into()),
                     text_bytes: Some(9),
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -3181,7 +3492,7 @@ mod tests {
     /// revision 1.7). remove passes through as an explicit boolean.
     #[test]
     fn send_reaction_maps_rows_to_the_direction_derived_target_author() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -3232,6 +3543,9 @@ mod tests {
                     text: Some("peer text".into()),
                     text_bytes: Some(9),
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -3281,7 +3595,7 @@ mod tests {
     /// mis-addressed upstream reaction (quote-resolution precedent).
     #[test]
     fn send_reaction_rejects_rows_without_a_resolvable_target_author() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -3335,6 +3649,9 @@ mod tests {
                     text: Some("group text".into()),
                     text_bytes: Some(10),
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -3721,7 +4038,7 @@ mod tests {
     /// clientRequestId replay returns the same existing row (idempotency).
     #[test]
     fn prepare_send_attachment_builds_data_uri_params_and_is_idempotent() {
-        let (_temp, service) = service();
+        let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -3740,6 +4057,9 @@ mod tests {
                     text: Some("hello".into()),
                     text_bytes: None,
                     text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -4056,5 +4376,534 @@ mod tests {
             .prepare_set_typing_message("no-such-account", &direct.id, false)
             .unwrap_err();
         assert_eq!(absent_account.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// Builds a control-carrying receive addressed to this account/peer.
+    fn control_receive(account: &str, source: &str, control: ControlReceive) -> NormalizedReceive {
+        NormalizedReceive {
+            timestamp: Some(500),
+            content_kind: "control",
+            direction: "control",
+            account_present: true,
+            account: Some(account.into()),
+            source: Some(source.into()),
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: Some(control),
+        }
+    }
+
+    fn linked_account_and_conversation(
+        service: &mut ConnectorService,
+    ) -> (crate::store::AccountSummary, crate::store::ConversationRow) {
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        (account, conversation)
+    }
+
+    fn seed_outgoing_sent(
+        service: &mut ConnectorService,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: u64,
+    ) -> String {
+        let prepared = match service
+            .prepare_send_text(account_id, conversation_id, "original", "req-ctl", None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&prepared, account_id, conversation_id, sent_at)
+            .unwrap();
+        prepared
+    }
+
+    /// A peer reaction upserts a message_events row keyed on the reacting
+    /// actor, answers conversation.changed (never message.upserted), and a
+    /// repeat of the same reaction stays idempotent.
+    #[test]
+    fn inbound_reaction_persists_an_actor_keyed_event_and_notifies_once() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+
+        let receive = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::Reaction {
+                emoji: "👍".into(),
+                target_author: "+15555550100".into(),
+                target_timestamp: 400,
+                remove: false,
+            },
+        );
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, HostSideEvent::ConversationChanged(_))),
+            "reaction answers conversation.changed only: {events:?}"
+        );
+
+        let reactions = service
+            .store_ref()
+            .list_reaction_events(&account.id, &conversation.id, 10)
+            .unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].emoji, "👍");
+        assert_eq!(reactions[0].target_timestamp, 400);
+        assert!(!reactions[0].removed);
+        assert_ne!(reactions[0].actor_id, account.id, "actor is the peer");
+
+        let repeat = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::Reaction {
+                        emoji: "👍".into(),
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                        remove: false,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(!repeat.is_empty(), "the summary still changes for the host");
+        assert_eq!(
+            service
+                .store_ref()
+                .list_reaction_events(&account.id, &conversation.id, 10)
+                .unwrap()
+                .len(),
+            1,
+            "a repeated reaction upserts in place"
+        );
+    }
+
+    /// A reaction removal flips the stored row in place instead of adding a
+    /// second event.
+    #[test]
+    fn inbound_reaction_removal_flips_the_existing_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+        let reaction = |remove: bool| {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Reaction {
+                    emoji: "🎉".into(),
+                    target_author: "+15555550100".into(),
+                    target_timestamp: 400,
+                    remove,
+                },
+            )
+        };
+        service
+            .ingest_receive(reaction(false), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        service
+            .ingest_receive(reaction(true), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let reactions = service
+            .store_ref()
+            .list_reaction_events(&account.id, &conversation.id, 10)
+            .unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert!(reactions[0].removed);
+    }
+
+    /// A reaction addressed to a conversation that does not exist locally is
+    /// dropped without error and without a message_events row.
+    #[test]
+    fn inbound_reaction_without_a_local_conversation_is_dropped() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550999",
+                    ControlReceive::Reaction {
+                        emoji: "👍".into(),
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                        remove: false,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(
+            service
+                .store_ref()
+                .list_reaction_events(&account.id, "no-such-conversation", 10)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    /// A peer remote delete marks the original incoming row
+    /// `remote-deleted` and answers message.statusChanged — never a row
+    /// insert.
+    #[test]
+    fn inbound_remote_delete_marks_the_row_and_answers_status_changed() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let incoming = NormalizedReceive {
+            timestamp: Some(300),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("to be deleted".into()),
+            text_bytes: Some(13),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
+        };
+        service
+            .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::RemoteDelete {
+                        target_timestamp: 300,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], HostSideEvent::MessageStatusChanged { status, .. } if *status == "remote-deleted")
+        );
+
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(messages.len(), 1, "no duplicate row is created");
+        assert_eq!(messages[0].status, "remote-deleted");
+        assert_eq!(messages[0].sent_at, 300);
+    }
+
+    /// A peer's envelope-level edit (direction "incoming" + control Edit)
+    /// updates the original row in place: same id, new body, editedAt set —
+    /// and never inserts a second message row.
+    #[test]
+    fn inbound_peer_edit_updates_the_row_in_place() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let original = NormalizedReceive {
+            timestamp: Some(310),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("before edit".into()),
+            text_bytes: Some(11),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
+        };
+        service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let mut edit = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::Edit {
+                target_timestamp: 310,
+            },
+        );
+        edit.direction = "incoming";
+        edit.content_kind = "editMessage";
+        edit.text = Some("after edit".into());
+        edit.text_bytes = Some(10);
+        let events = service
+            .ingest_receive(edit, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let HostSideEvent::MessageUpserted(record) = &events[0] else {
+            panic!("expected message.upserted, got {:?}", events[0]);
+        };
+        assert_eq!(record.text.as_deref(), Some("after edit"));
+        assert!(record.edited_at.is_some());
+
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(messages.len(), 1, "edit must not insert a second row");
+        assert_eq!(messages[0].id, record.id);
+        assert_eq!(messages[0].text.as_deref(), Some("after edit"));
+        assert!(messages[0].edited_at.is_some());
+    }
+
+    /// Our own multi-device edit echo (direction "outgoing" + control Edit)
+    /// retargets the phone-sent row through its upstream timestamp.
+    #[test]
+    fn sync_outgoing_edit_retargets_the_sent_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 420);
+
+        let mut edit = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::Edit {
+                target_timestamp: 420,
+            },
+        );
+        edit.direction = "outgoing";
+        edit.text = Some("edited on phone".into());
+        edit.text_bytes = Some(15);
+        let events = service
+            .ingest_receive(edit, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let HostSideEvent::MessageUpserted(record) = &events[0] else {
+            panic!("expected message.upserted, got {:?}", events[0]);
+        };
+        assert_eq!(record.text.as_deref(), Some("edited on phone"));
+
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &record.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.sent_at, 420, "protocol identity is untouched");
+        assert!(row.edited_at.is_some());
+    }
+
+    /// Typing START passes through as conversation.typing; an immediate
+    /// second indicator for the same conversation is rate-limited away.
+    #[test]
+    fn typing_start_emits_once_and_an_immediate_repeat_is_rate_limited() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let start = || {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Typing {
+                    action: "START".into(),
+                },
+            )
+        };
+        let first = service
+            .ingest_receive(start(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            &first[0],
+            HostSideEvent::ConversationTyping { action, .. } if action == "START"
+        ));
+        assert!(
+            service
+                .ingest_receive(start(), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "a second indicator inside the window must be swallowed"
+        );
+        // STOP is control-plane state too, but the rate limiter is
+        // conversation-scoped, not action-scoped — it is swallowed as well.
+        assert!(
+            service
+                .ingest_receive(
+                    control_receive(
+                        "+15555550100",
+                        "+15555550101",
+                        ControlReceive::Typing {
+                            action: "STOP".into()
+                        },
+                    ),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let _ = (&account.id, &conversation.id);
+    }
+
+    /// An edit whose receive carries no new body is dropped silently.
+    #[test]
+    fn inbound_edit_without_a_body_is_dropped() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 420);
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::Edit {
+                        target_timestamp: 420,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        let row = service
+            .store_ref()
+            .conversation_summary(&conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.id, conversation.id);
+    }
+
+    /// `messages.edit` preparation: an outgoing sent row resolves to
+    /// upstream editTimestamp params; settlement rewrites the body and
+    /// stamps editedAt.
+    #[test]
+    fn prepare_edit_targets_sent_row_and_settlement_rewrites_it() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let pending = seed_outgoing_sent(&mut service, &account.id, &conversation.id, 430);
+
+        let prepared = service
+            .prepare_edit(&account.id, &conversation.id, &pending, "edited body")
+            .unwrap();
+        assert_eq!(
+            prepared.params["editTimestamp"], 430,
+            "upstream edit targets the sent row's protocol timestamp"
+        );
+        assert_eq!(prepared.params["message"], "edited body");
+
+        let record = service
+            .complete_edit_success(&account.id, &conversation.id, &pending, "edited body")
+            .unwrap()
+            .expect("settlement of a sent row returns the updated record");
+        assert_eq!(record.text.as_deref(), Some("edited body"));
+        assert!(record.edited_at.is_some());
+        assert_eq!(record.status, "sent");
+
+        // An incoming row is not editable by us.
+        let incoming = NormalizedReceive {
+            timestamp: Some(440),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("peer says".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
+        };
+        service
+            .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let incoming_id = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.direction == "incoming")
+            .unwrap()
+            .id;
+        let error = service
+            .prepare_edit(&account.id, &conversation.id, &incoming_id, "nope")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "MESSAGE_NOT_FOUND");
+    }
+
+    /// Inbound quote + attachment metadata ride the message row end to end:
+    /// ingest persists them, list_messages returns them verbatim.
+    #[test]
+    fn inbound_quote_and_attachment_metadata_roundtrip_through_the_store() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let receive = NormalizedReceive {
+            timestamp: Some(360),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("replying with a file".into()),
+            text_bytes: Some(20),
+            text_truncated: false,
+            quote: Some(NormalizedQuote {
+                id: 350,
+                author: "+15555550100".into(),
+                text: "the original".into(),
+            }),
+            attachments: vec![NormalizedAttachment {
+                id: "att-1".into(),
+                content_type: Some("image/png".into()),
+                filename: Some("shot.png".into()),
+                size: Some(2048),
+                width: Some(64),
+                height: Some(32),
+                is_voice_note: false,
+            }],
+            control: None,
+        };
+        service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let quote = row
+            .quote_snapshot
+            .expect("quote snapshot survives the roundtrip");
+        assert_eq!(quote.id, 350);
+        assert_eq!(quote.author, "+15555550100");
+        assert_eq!(quote.text, "the original");
+        assert_eq!(row.attachments.len(), 1);
+        assert_eq!(row.attachments[0].id, "att-1");
+        assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
+        assert_eq!(row.attachments[0].size, Some(2048));
     }
 }

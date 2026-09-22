@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncWriteExt, sink};
@@ -299,7 +299,7 @@ pub struct NormalizedReceive {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<u64>,
     pub content_kind: &'static str,
-    /// incoming | outgoing | system | skip
+    /// incoming | outgoing | system | control | skip
     pub direction: &'static str,
     pub account_present: bool,
     #[serde(skip)]
@@ -318,7 +318,78 @@ pub struct NormalizedReceive {
     pub text_bytes: Option<u32>,
     #[serde(skip)]
     pub text_truncated: bool,
+    /// Quoted message snapshot (upstream timestamp, author, bounded preview).
+    #[serde(skip)]
+    pub quote: Option<NormalizedQuote>,
+    /// Bounded inbound attachment descriptors (metadata only, no bytes).
+    #[serde(skip)]
+    pub attachments: Vec<NormalizedAttachment>,
+    /// Serialized per-conversation control payload (reaction / remote delete /
+    /// typing) for `direction == "control"`; shape mirrors the protocol field.
+    #[serde(skip)]
+    pub control: Option<ControlReceive>,
 }
+
+/// Inbound quote snapshot: the quoted message's upstream identity plus a
+/// bounded preview the host renders without a history lookup.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedQuote {
+    /// Quoted message's Signal timestamp.
+    pub id: u64,
+    /// Quoted author's number (or UUID when the number is absent).
+    pub author: String,
+    /// Bounded quoted-body preview.
+    pub text: String,
+}
+
+/// One inbound attachment descriptor: metadata only, never bytes (§4.13).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedAttachment {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    pub is_voice_note: bool,
+}
+
+/// Control-plane receive payloads that are not messages: reaction add/remove,
+/// remote delete of an earlier message, typing START/STOP, and edit of an
+/// earlier message (new body rides `NormalizedReceive.text`).
+#[derive(Clone, Debug)]
+pub enum ControlReceive {
+    Reaction {
+        emoji: String,
+        target_author: String,
+        target_timestamp: u64,
+        remove: bool,
+    },
+    RemoteDelete {
+        target_timestamp: u64,
+    },
+    Typing {
+        action: String,
+    },
+    Edit {
+        target_timestamp: u64,
+    },
+}
+
+/// Protocol-side bounds for inbound control-plane data (§4.13).
+const MAX_QUOTE_TEXT_CHARS: usize = 128;
+const MAX_INBOUND_ATTACHMENTS: usize = 32;
+const MAX_ATTACHMENT_ID_CHARS: usize = 128;
+const MAX_ATTACHMENT_FILENAME_BYTES: usize = 128;
+const MAX_ATTACHMENT_CONTENT_TYPE_CHARS: usize = 64;
+const MAX_EMOJI_CHARS: usize = 16;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -397,6 +468,21 @@ impl NormalizedReceive {
             + self.peer_name.as_ref().map_or(0, String::len)
             + self.group_id.as_ref().map_or(0, String::len)
             + self.text.as_ref().map_or(0, String::len)
+            // Attachment ids dominate descriptor size; the rest is fixed-width.
+            + self
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    attachment.id.len()
+                        + attachment.content_type.as_ref().map_or(0, String::len)
+                        + attachment.filename.as_ref().map_or(0, String::len)
+                        + std::mem::size_of::<NormalizedAttachment>()
+                })
+                .sum::<usize>()
+            // Quotes carry a bounded preview; control payloads are enum-sized.
+            + self.quote.as_ref().map_or(0, |quote| {
+                quote.author.len() + quote.text.len() + std::mem::size_of::<NormalizedQuote>()
+            })
     }
 }
 
@@ -1135,6 +1221,109 @@ fn data_message_text(message: &serde_json::Map<String, Value>) -> Option<Normali
         .and_then(normalized_text)
 }
 
+/// Bounded inbound quote snapshot (§4.13): upstream timestamp, author, and a
+/// short preview. Malformed or oversized quotes drop the preview rather than
+/// the whole message.
+fn normalized_quote(value: &Value) -> Option<NormalizedQuote> {
+    let object = value.as_object()?;
+    let id = object.get("id").and_then(Value::as_u64)?;
+    let author = ["authorNumber", "authorUuid", "author"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .map(|text| text.chars().take(MAX_QUOTE_TEXT_CHARS).collect::<String>())
+        .unwrap_or_default();
+    Some(NormalizedQuote { id, author, text })
+}
+
+/// Bounded inbound attachment descriptors (§4.13): metadata only, entries past
+/// the cap are dropped, oversized strings are truncated to their bound.
+fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .take(MAX_INBOUND_ATTACHMENTS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_ATTACHMENT_ID_CHARS).collect::<String>())?;
+            let content_type = object
+                .get("contentType")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.chars()
+                        .take(MAX_ATTACHMENT_CONTENT_TYPE_CHARS)
+                        .collect::<String>()
+                });
+            let filename = object
+                .get("filename")
+                .and_then(Value::as_str)
+                .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
+                .filter(|s| !s.is_empty());
+            Some(NormalizedAttachment {
+                id,
+                content_type,
+                filename,
+                size: object.get("size").and_then(Value::as_u64),
+                width: object
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
+                height: object
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.min(u32::MAX as u64) as u32),
+                is_voice_note: object
+                    .get("isVoiceNote")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// Bounded reaction payload: emoji shortened, author bounded, malformed shapes
+/// answer None so the envelope skips instead of inventing protocol state.
+fn normalized_reaction(value: &Value) -> Option<ControlReceive> {
+    let object = value.as_object()?;
+    let emoji = object
+        .get("emoji")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_EMOJI_CHARS).collect::<String>())?;
+    let target_author = ["targetAuthorNumber", "targetAuthorUuid", "targetAuthor"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+    let target_timestamp = object.get("targetSentTimestamp").and_then(Value::as_u64)?;
+    let remove = object
+        .get("isRemove")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(ControlReceive::Reaction {
+        emoji,
+        target_author,
+        target_timestamp,
+        remove,
+    })
+}
+
 fn normalize_receive(params: &Value) -> Result<Option<NormalizedReceive>, EngineError> {
     let normalized = normalize_receive_fields(params)?;
     // Identifier fields route conversations; an oversized one would exhaust the receive
@@ -1150,6 +1339,90 @@ fn normalize_receive(params: &Value) -> Result<Option<NormalizedReceive>, Engine
         return Ok(None);
     }
     Ok(Some(normalized))
+}
+
+/// A receive that routes to a conversation but carries no message row of its
+/// own (reaction / remote delete / typing). The service layer resolves the
+/// conversation the same way it does for messages.
+struct ControlRouting {
+    direction: &'static str,
+    source: Option<String>,
+    group_id: Option<String>,
+    control: ControlReceive,
+}
+
+fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlRouting> {
+    // Peer reaction / remote delete riding a dataMessage without a body.
+    if let Some(data_message) = envelope.get("dataMessage").and_then(Value::as_object) {
+        let group_id = data_message_group_id(data_message);
+        if let Some(reaction) = data_message.get("reaction").and_then(normalized_reaction) {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: reaction,
+            });
+        }
+        if let Some(target) = data_message
+            .get("remoteDelete")
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("timestamp"))
+            .and_then(Value::as_u64)
+        {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: ControlReceive::RemoteDelete {
+                    target_timestamp: target,
+                },
+            });
+        }
+        // A body-less editUpdate rides editMessage at the envelope level; a
+        // dataMessage with only editUpdate content has no local meaning.
+    }
+    // Ephemeral typing indicator.
+    if let Some(typing) = envelope.get("typingMessage").and_then(Value::as_object) {
+        let action = typing
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("START")
+            .to_string();
+        let group_id = typing
+            .get("groupId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: envelope_peer_source(envelope),
+            group_id,
+            control: ControlReceive::Typing { action },
+        });
+    }
+    None
+}
+
+/// Our own multi-device control echo inside `syncMessage.sentMessage`: edit /
+/// remote delete / reaction of an earlier message we sent from the phone.
+fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
+    if let Some(edit) = sent.get("editMessage").and_then(Value::as_object) {
+        if let Some(target) = edit.get("targetSentTimestamp").and_then(Value::as_u64) {
+            return Some(ControlReceive::Edit {
+                target_timestamp: target,
+            });
+        }
+    }
+    if let Some(target) = sent
+        .get("remoteDelete")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("timestamp"))
+        .and_then(Value::as_u64)
+    {
+        return Some(ControlReceive::RemoteDelete {
+            target_timestamp: target,
+        });
+    }
+    sent.get("reaction").and_then(normalized_reaction)
 }
 
 fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineError> {
@@ -1176,21 +1449,48 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 content_kind: &'static str,
                 direction: &'static str,
                 source: Option<String>,
-                peer_name: Option<String>,
                 group_id: Option<String>,
-                text: Option<NormalizedText>| NormalizedReceive {
+                text: Option<NormalizedText>,
+                quote: Option<NormalizedQuote>,
+                attachments: Vec<NormalizedAttachment>,
+                control: Option<ControlReceive>| NormalizedReceive {
         timestamp,
         content_kind,
         direction,
         account_present,
         account: account.clone(),
         source,
-        peer_name,
+        peer_name: peer_name.clone(),
         group_id,
         text: text.as_ref().map(|value| value.value.clone()),
         text_bytes: text.as_ref().map(|value| value.bytes),
         text_truncated: text.is_some_and(|value| value.truncated),
+        quote,
+        attachments,
+        control,
     };
+
+    // Typing and body-less reaction / remote-delete receives carry no message
+    // row; they route as control events and never persist.
+    if let Some(routing) = control_routing(envelope) {
+        let ControlRouting {
+            direction,
+            source,
+            group_id,
+            control,
+        } = routing;
+        return Ok(make(
+            timestamp,
+            "control",
+            direction,
+            source,
+            group_id,
+            None,
+            None,
+            Vec::new(),
+            Some(control),
+        ));
+    }
 
     // Multi-device: phone/other linked device sent a text → show as our outgoing.
     if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
@@ -1198,6 +1498,11 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             // JsonUnwrapped dataMessage fields sit on sentMessage itself.
             let text = data_message_text(sent);
             let group_id = data_message_group_id(sent);
+            let quote = sent.get("quote").and_then(normalized_quote);
+            let attachments = sent
+                .get("attachments")
+                .map(normalized_attachments)
+                .unwrap_or_default();
             let destination = sent
                 .get("destinationNumber")
                 .and_then(Value::as_str)
@@ -1212,6 +1517,23 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 });
+            // Our own multi-device edit / delete / reaction of an earlier
+            // message mirrors as a control receive keyed by its target.
+            if text.is_none() && quote.is_none() && attachments.is_empty() {
+                if let Some(control) = sync_sent_control(sent) {
+                    return Ok(make(
+                        sent.get("timestamp").and_then(Value::as_u64).or(timestamp),
+                        "control",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        None,
+                        None,
+                        Vec::new(),
+                        Some(control),
+                    ));
+                }
+            }
             let sent_ts = sent.get("timestamp").and_then(Value::as_u64).or(timestamp);
             if let Some(text) = text {
                 return Ok(make(
@@ -1219,19 +1541,37 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     "syncMessage",
                     "outgoing",
                     destination,
-                    None,
                     group_id,
                     Some(text),
+                    quote,
+                    attachments,
+                    None,
                 ));
             }
-            // sent without body (sticker/attachment sync) — skip for now
+            // Attachment-only multi-device send: no body but real descriptors.
+            if !attachments.is_empty() {
+                return Ok(make(
+                    sent_ts,
+                    "syncMessage",
+                    "outgoing",
+                    destination,
+                    group_id,
+                    None,
+                    quote,
+                    attachments,
+                    None,
+                ));
+            }
+            // sent without body (sticker/other control sync) — skip for now
             return Ok(make(
                 sent_ts,
                 "syncMessage",
                 "skip",
                 destination,
-                None,
                 group_id,
+                None,
+                None,
+                Vec::new(),
                 None,
             ));
         }
@@ -1241,8 +1581,10 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             "syncMessage",
             "skip",
             peer_source,
-            peer_name,
             None,
+            None,
+            None,
+            Vec::new(),
             None,
         ));
     }
@@ -1250,15 +1592,36 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
     if let Some(data_message) = envelope.get("dataMessage").and_then(Value::as_object) {
         let group_id = data_message_group_id(data_message);
         let text = data_message_text(data_message);
+        let quote = data_message.get("quote").and_then(normalized_quote);
+        let attachments = data_message
+            .get("attachments")
+            .map(normalized_attachments)
+            .unwrap_or_default();
         if let Some(text) = text {
             return Ok(make(
                 timestamp,
                 "dataMessage",
                 "incoming",
                 peer_source,
-                peer_name,
                 group_id,
                 Some(text),
+                quote,
+                attachments,
+                None,
+            ));
+        }
+        // Attachment-only message: real descriptors, no body.
+        if !attachments.is_empty() {
+            return Ok(make(
+                timestamp,
+                "dataMessage",
+                "incoming",
+                peer_source,
+                group_id,
+                None,
+                quote,
+                attachments,
+                None,
             ));
         }
         // Empty body: map a few control shapes to system rows; drop the rest.
@@ -1272,9 +1635,11 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 "dataMessage",
                 "system",
                 peer_source,
-                peer_name,
                 group_id,
                 normalized_text("已更新消息定时消失"),
+                None,
+                Vec::new(),
+                None,
             ));
         }
         return Ok(make(
@@ -1282,18 +1647,58 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             "dataMessage",
             "skip",
             peer_source,
-            peer_name,
             group_id,
+            None,
+            None,
+            Vec::new(),
+            None,
+        ));
+    }
+
+    // Top-level editMessage envelope: a peer edited an earlier message.
+    if let Some(edit) = envelope.get("editMessage").and_then(Value::as_object) {
+        if let Some(target) = edit.get("targetSentTimestamp").and_then(Value::as_u64) {
+            let new_text = edit
+                .get("dataMessage")
+                .and_then(Value::as_object)
+                .and_then(|data| data.get("message"))
+                .and_then(Value::as_str)
+                .and_then(normalized_text);
+            if let Some(new_text) = new_text {
+                return Ok(make(
+                    timestamp,
+                    "editMessage",
+                    "incoming",
+                    peer_source,
+                    data_message_group_id(
+                        edit.get("dataMessage")
+                            .and_then(Value::as_object)
+                            .unwrap_or(&serde_json::Map::new()),
+                    ),
+                    Some(new_text),
+                    None,
+                    Vec::new(),
+                    Some(ControlReceive::Edit {
+                        target_timestamp: target,
+                    }),
+                ));
+            }
+        }
+        return Ok(make(
+            timestamp,
+            "editMessage",
+            "skip",
+            peer_source,
+            None,
+            None,
+            None,
+            Vec::new(),
             None,
         ));
     }
 
     let content_kind = if envelope.contains_key("receiptMessage") {
         "receiptMessage"
-    } else if envelope.contains_key("typingMessage") {
-        "typingMessage"
-    } else if envelope.contains_key("editMessage") {
-        "editMessage"
     } else {
         "other"
     };
@@ -1302,8 +1707,10 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         content_kind,
         "skip",
         peer_source,
-        peer_name,
         None,
+        None,
+        None,
+        Vec::new(),
         None,
     ))
 }
@@ -1527,6 +1934,9 @@ mod tests {
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
             text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
             text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
         };
         let mut admitted = 0;
         while matches!(
@@ -1776,6 +2186,9 @@ mod tests {
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
             text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
             text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
         };
         let mut admitted = 0;
         while matches!(
@@ -1817,6 +2230,9 @@ mod tests {
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
             text_bytes: Some(MAX_INBOUND_TEXT_BYTES as u32),
             text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            control: None,
         };
         while matches!(
             ingress.enqueue(filler.clone()).await,

@@ -27,9 +27,9 @@ use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailur
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessageGetTextParams, MessagesGetAttachmentParams, MessagesListParams,
-    MessagesRemoteDeleteParams, MessagesSendAttachmentParams, MessagesSendReactionParams,
-    MessagesSendTextParams, PresenceSetTypingMessageParams, SendTarget,
+    LinkStartParams, MessageGetTextParams, MessagesEditParams, MessagesGetAttachmentParams,
+    MessagesListParams, MessagesRemoteDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendReactionParams, MessagesSendTextParams, PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -1142,6 +1142,31 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "messages.edit" => {
+            match serde_json::from_value::<MessagesEditParams>(request.params) {
+                Ok(params) => match runtime.edit_message(params).await {
+                    Ok(Some(message)) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(message).unwrap_or(Value::Null),
+                    ),
+                    // Indeterminate upstream outcome: the local row is
+                    // unchanged and the caller must reconcile before retrying.
+                    Ok(None) => HostResponse::failure(
+                        request_id,
+                        ApiError::new(
+                            "SEND_OUTCOME_UNKNOWN",
+                            "edit outcome is indeterminate; the message may or may not have been edited",
+                            false,
+                        ),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid messages.edit params", false),
+                ),
+            }
+        }
         "messages.remoteDelete" => {
             match serde_json::from_value::<MessagesRemoteDeleteParams>(request.params) {
                 Ok(params) => match runtime.remote_delete(params).await {
@@ -1349,6 +1374,20 @@ where
                 &HostEvent::new(
                     "message.statusChanged",
                     json!({ "accountId": account_id, "messageId": message_id, "status": status }),
+                ),
+            )
+            .await
+        }
+        HostSideEvent::ConversationTyping {
+            account_id,
+            conversation_id,
+            action,
+        } => {
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "conversation.typing",
+                    json!({ "accountId": account_id, "conversationId": conversation_id, "action": action }),
                 ),
             )
             .await

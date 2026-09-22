@@ -557,6 +557,68 @@ call → `complete_send_success` / `complete_send_unknown` settlement.
   mutex (same-account sends serialize), and the per-account request budget. Metrics classify
   it as `send`.
 
+### 4.13 Inbound control plane: quote / reaction / remote delete / typing / edit / attachment metadata (contract revision 1.15, 2026-09-23)
+
+API `1.0` evolves in place (§4.5–§4.12 precedent). Receive normalization stops dropping the
+five per-message control surfaces the official clients and signal-cli both carry, and attaches
+bounded inbound attachment metadata to message rows. Everything stays metadata-only: bytes are
+still never downloaded or persisted (§6.7 media boundary unchanged).
+
+Inbound shapes (pinned signal-cli `MessageEnvelope` json surface, cross-checked against the
+official v0.14.8 JSON schemas):
+
+- **quote** (`dataMessage.quote` / `syncMessage.sentMessage.quote`): `{id, author, text}` —
+  the quoted message's upstream timestamp, author number, and bounded text preview. Stored on
+  the message row; the host resolves display through its own history.
+- **reaction** (`dataMessage.reaction` / `syncMessage.sentMessage.reaction`):
+  `{emoji, targetAuthor, targetSentTimestamp, isRemove}` — recorded as a per-conversation
+  event (`message_events` table), not a message row, mirroring the protocol shape. The host
+  receives a `conversation.changed` event and re-reads events with the conversation.
+- **remoteDelete** (`dataMessage.remoteDelete` / `syncMessage.sentMessage.remoteDelete`):
+  `{timestamp}` — the target upstream timestamp authored by the envelope sender. The matching
+  outgoing row (our own multi-device delete) or incoming row (peer delete) in the same
+  conversation is marked remote-deleted locally (no upstream call); the host receives
+  `message.statusChanged` with the new status.
+- **typing** (`typingMessage`): `{action, groupId}` — START/STOP is ephemeral state only,
+  never persisted. Emitted to the host as a new `conversation.typing` host event; a fixed
+  in-memory rate limiter (one notification per account+peer per second, bounded map, oldest
+  entry evicted) keeps a typing storm from flooding the event lane. The host owns display
+  timeout.
+- **edit** (`editMessage` / `syncMessage.sentMessage.editMessage`):
+  `{targetSentTimestamp, dataMessage}` — the new body replaces the target row's body when the
+  row exists in the same conversation and the editor matches the row's sender identity; the
+  row's `edited_at` marks it edited. Missing/mismatched targets are dropped without a local
+  row; the upserted event still notifies the host.
+- **attachment metadata** (`dataMessage.attachments[]` / `syncMessage.sentMessage.attachments[]`):
+  `{id, contentType, filename, size, width, height, isVoiceNote}` — bounded to 32 entries per
+  message, each `id` ≤ 128 chars, `filename` ≤ 128 bytes, `contentType` ≤ 64 chars. Persisted
+  as a JSON column on the message row. Bytes are still never downloaded (`--ignore-attachments`
+  unchanged): `messages.attachments.get` keeps answering `UPSTREAM_ERROR` for these ids until
+  a dedicated bounded download PoC exists (§6.7). `messages.attachments.send` (§4.12) also
+  records its own single descriptor on the sent row at confirm time, so the sender's own
+  bubble shows the attachment across restarts.
+
+Consequences for the host: the `MessageRecord` projection gains optional `quote`, `attachments`,
+`remoteDeleted`, and `editedAt` fields (absent on rows without them), and the host event surface
+gains `conversation.typing` (ephemeral) alongside the existing `message.upserted` /
+`message.statusChanged` / `conversation.changed` events.
+
+### 4.14 messages.edit (contract revision 1.15, 2026-09-23)
+
+`messages.edit` edits one previously sent message upstream: params `accountId`,
+`conversationId`, `messageId`, `text`, `clientRequestId`. It resolves the target exactly like
+`messages.remoteDelete` (outgoing row, terminal `sent` state = upstream protocol identity),
+then dispatches signal-cli `send` with `editTimestamp: <upstream timestamp>` plus the same
+target addressing (`recipient`/`groupId`) — the signal-cli edit entry point (no dedicated
+`sendEditMessage` exists in the jsonRpc surface). Official clients allow a 24 h edit window;
+the connector adds no local window — a late edit answers the upstream rejection
+(`UPSTREAM_ERROR`), keeping the connector's rule set minimal.
+
+Settlement mirrors `messages.sendText`: on confirmed success the row's body is replaced and
+`edited_at` set (status unchanged) and the method answers the updated `MessageRecord`; an
+indeterminate outcome answers `SEND_OUTCOME_UNKNOWN` with the local row unchanged. No
+auto-retry.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -798,6 +860,12 @@ returns an already-downloaded file as full Base64. That is not an acceptable lar
 Media remains disabled until a dedicated PoC proves bounded disk-pressure behavior and streams a
 canonical, already-downloaded file through a short-lived handle without Base64 or arbitrary path
 exposure. Failure to prove the limit leaves the media capability disabled.
+
+Contract revision 1.15 (2026-09-23) narrows this boundary without lifting it: incoming envelopes
+now contribute bounded attachment **metadata only** (§4.13) — descriptors are stored on the
+message row while `--ignore-attachments` keeps byte download, disk pressure, and
+`messages.attachments.get` answering `UPSTREAM_ERROR` exactly as before. A media capability
+change still requires the dedicated bounded-download PoC this section demands.
 
 ## 7. Data and Resource Limits
 

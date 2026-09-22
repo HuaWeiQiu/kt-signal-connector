@@ -515,3 +515,24 @@ for line in sys.stdin:
         emit_json(response)
     if method == "emitReceive" or emit_receive_after:
         emit_receive()
+    if method == "emitEnvelope":
+        # Contract 1.15 test hook: inject arbitrary envelope receives so a
+        # test can exercise reaction / remote-delete / typing / edit /
+        # attachment-metadata normalization end to end through a real engine
+        # process. The envelope is passed through verbatim; `envelopes`
+        # (array form) emits each in order after the response.
+        envelopes = params.get("envelopes")
+        if not isinstance(envelopes, list):
+            envelopes = [params.get("envelope") or {}]
+        account = params.get("account") or receiving_account()
+        result = {"method": method, "emitted": len(envelopes)}
+
+        def emit_envelopes(account=account, envelopes=envelopes):
+            for envelope in envelopes:
+                emit_json({
+                    "jsonrpc": "2.0",
+                    "method": "receive",
+                    "params": {"account": account, "envelope": envelope},
+                })
+
+        threading.Thread(target=emit_envelopes, daemon=True).start()

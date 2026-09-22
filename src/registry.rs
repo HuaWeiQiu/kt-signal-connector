@@ -641,6 +641,21 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn edit_message(
+        &self,
+        params: crate::service::MessagesEditParams,
+    ) -> Result<Option<crate::store::MessageRecord>, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .edit_message(
+                params.account_id,
+                params.conversation_id,
+                params.message_id,
+                params.text,
+            )
+            .await
+    }
+
     pub async fn get_attachment(
         &self,
         params: crate::service::MessagesGetAttachmentParams,

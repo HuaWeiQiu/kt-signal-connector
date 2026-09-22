@@ -50,6 +50,7 @@
             "messages.getText",
             "messages.sendText",
             "messages.attachments.send",
+            "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
             "messages.attachments.get",
@@ -181,6 +182,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messageGetTextParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.edit" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesEditParams" }
             }
           }
         },
@@ -410,6 +422,28 @@
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "messageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesEditParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId", "text"],
+      "description": "Edit one message the linked account itself sent (contract 1.15). Only a local outgoing row in the terminal state 'sent' qualifies: its sentAt is the upstream Signal timestamp the edit targets via editTimestamp; pending/failed/unknown rows carry no protocol identity and answer MESSAGE_NOT_FOUND. Dispatches signal-cli send with editTimestamp; the connector enforces no local edit window — a late edit answers the upstream rejection (UPSTREAM_ERROR). On confirmed success the updated MessageRecord is returned (body replaced, editedAt set, status unchanged); when the outcome of the mutating upstream call cannot be determined the answer is SEND_OUTCOME_UNKNOWN and the local row is unchanged; 'unknown' is never retried automatically by the connector. Targeting is by conversationId only — the target must already exist in the local history. clientRequestId is accepted for host correlation but the connector does not persist it for edits.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "New message body; bounds identical to messages.sendText."
+        },
+        "clientRequestId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Optional host correlation id; validated but not persisted."
+        }
       }
     },
     "messagesRemoteDeleteParams": {
