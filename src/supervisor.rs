@@ -13,10 +13,12 @@ use crate::engine::{
     CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus, QueuedReceive,
     ReceiveIngress, SignalCliConfig, event_channel, receive_channel,
 };
+use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AttachmentPayload, AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails,
-    HostSideEvent, PeerTarget, PreparedSend, SendTarget, ServiceError, account_limit_error,
+    HostSideEvent, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget,
+    PreparedSend, SendTarget, ServiceError, account_limit_error,
     validate_account_delete_operation_id, validate_attachment_payload,
 };
 use crate::store::{
@@ -82,6 +84,11 @@ pub struct RuntimeSupervisor {
     pub(crate) group_id: String,
     engine: Mutex<Option<EngineHandle>>,
     service: Arc<Mutex<ConnectorService>>,
+    /// Media ingest backing (ADR 0002) when the launcher passed
+    /// `--media-ingest`; drives the retention trigger and exists iff the
+    /// service's own backing exists. Never held; `MediaGovernor` is a plain
+    /// data-dir handle.
+    media: Option<MediaIngest>,
     active_link_finish: Mutex<Option<String>>,
     events: broadcast::Sender<EngineEvent>,
     host_events: broadcast::Sender<HostSideEvent>,
@@ -91,27 +98,53 @@ pub struct RuntimeSupervisor {
     watchdog: StdMutex<Option<JoinHandle<()>>>,
     /// One-shot history retention pass; never held across an await.
     retention: StdMutex<Option<JoinHandle<()>>>,
+    /// One-shot media governor pass (ADR 0002: once per process start);
+    /// never held across an await.
+    media_governor_pass: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
 }
 
 impl RuntimeSupervisor {
-    pub fn new(config: SignalCliConfig, store: Arc<Store>, group_id: String) -> Self {
+    pub fn new(
+        config: SignalCliConfig,
+        store: Arc<Store>,
+        group_id: String,
+        media_handles: Option<Arc<MediaHandleTable>>,
+    ) -> Self {
         let (events, _) = event_channel();
         let (host_events, _) = broadcast::channel(1024);
-        let service = Arc::new(Mutex::new(ConnectorService::new(store)));
+        // Media ingest is armed only when the launcher passed both the
+        // `--media-ingest` flag and the shared handle table; anything else
+        // keeps the service on the pre-PoC capability-unavailable shape.
+        let media = if config.media_ingest {
+            media_handles.map(|handles| MediaIngest::new(config.data_dir.clone(), handles))
+        } else {
+            None
+        };
+        if config.media_ingest && media.is_none() {
+            tracing::warn!(
+                "media ingest flag is set without a handle table; media methods stay unavailable"
+            );
+        }
+        let service = Arc::new(Mutex::new(ConnectorService::with_media(
+            store,
+            media.clone(),
+        )));
         let (receive_ingress, receive_rx) = receive_channel();
         let receive_worker = tokio::spawn(receive_persistence_loop(
             receive_rx,
             service.clone(),
             host_events.clone(),
             group_id.clone(),
+            media.as_ref().map(|media| media.governor().clone()),
         ));
         Self {
             config,
             group_id,
             engine: Mutex::new(None),
             service,
+            media,
             active_link_finish: Mutex::new(None),
             events,
             host_events,
@@ -119,6 +152,7 @@ impl RuntimeSupervisor {
             receive_worker,
             watchdog: StdMutex::new(None),
             retention: StdMutex::new(None),
+            media_governor_pass: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
         }
     }
@@ -210,6 +244,25 @@ impl RuntimeSupervisor {
                 ),
             }
         }));
+    }
+
+    /// One media governor pass per process start (ADR 0002 trigger
+    /// discipline; idempotent). Media retention is per engine data directory,
+    /// so — unlike the store-wide history retention — every proxy group's
+    /// supervisor runs its own pass, and the receive pipeline repeats it
+    /// after every [`crate::media::GOVERNOR_INBOUND_MESSAGE_INTERVAL`]
+    /// inbound messages.
+    pub fn spawn_media_governor(self: &Arc<Self>) {
+        let Some(governor) = self.media.as_ref().map(|media| media.governor().clone()) else {
+            return;
+        };
+        let Ok(mut slot) = self.media_governor_pass.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(run_media_governor_pass(governor));
     }
 
     pub fn subscribe_engine(&self) -> broadcast::Receiver<EngineEvent> {
@@ -864,18 +917,32 @@ impl RuntimeSupervisor {
             validate_account_delete_operation_id(operation_id)?;
         }
         let (number, reconcile_first) = match operation_id.as_deref() {
-            Some(operation_id) => match self
-                .service
-                .lock()
-                .await
-                .prepare_account_delete(&account_id, operation_id)?
-            {
-                AccountDeletePlan::Completed => return Ok(json!({})),
-                AccountDeletePlan::Dispatch {
-                    signal_account,
-                    reconcile_first,
-                } => (signal_account, reconcile_first),
-            },
+            Some(operation_id) => {
+                // Bind the plan before matching: the lock guard borrowed by the
+                // prepare call would otherwise live for the whole match, and the
+                // Completed arm re-locks below.
+                let plan = self
+                    .service
+                    .lock()
+                    .await
+                    .prepare_account_delete(&account_id, operation_id)?;
+                match plan {
+                    // Idempotent replay of an already-completed delete: the
+                    // account session is long gone, so any straggler media
+                    // handles from before are released here too.
+                    AccountDeletePlan::Completed => {
+                        self.service
+                            .lock()
+                            .await
+                            .clear_media_handles_for_account(&account_id);
+                        return Ok(json!({}));
+                    }
+                    AccountDeletePlan::Dispatch {
+                        signal_account,
+                        reconcile_first,
+                    } => (signal_account, reconcile_first),
+                }
+            }
             None => match self
                 .service
                 .lock()
@@ -888,10 +955,11 @@ impl RuntimeSupervisor {
         };
         let engine = self.running_engine().await?;
         if reconcile_first && !signal_account_present(&engine, &number).await? {
-            self.service
-                .lock()
-                .await
-                .complete_account_delete(&account_id, operation_id.as_deref())?;
+            {
+                let mut service = self.service.lock().await;
+                service.complete_account_delete(&account_id, operation_id.as_deref())?;
+                service.clear_media_handles_for_account(&account_id);
+            }
             return Ok(json!({}));
         }
         match engine
@@ -923,10 +991,13 @@ impl RuntimeSupervisor {
             }
             Err(error) => return Err(ServiceError::Engine(error)),
         }
-        self.service
-            .lock()
-            .await
-            .complete_account_delete(&account_id, operation_id.as_deref())?;
+        {
+            let mut service = self.service.lock().await;
+            service.complete_account_delete(&account_id, operation_id.as_deref())?;
+            // ADR 0002 gate 3: a chunk-stream handle cannot outlive the
+            // account session it was opened from.
+            service.clear_media_handles_for_account(&account_id);
+        }
         Ok(json!({}))
     }
 
@@ -1319,6 +1390,45 @@ impl RuntimeSupervisor {
         Ok(payload)
     }
 
+    /// Media ingest (ADR 0002, contract revision 1.17): open a chunk stream
+    /// for one already-downloaded attachment. Pure local resolution — the
+    /// engine is not consulted, the upstream whole-file base64
+    /// `getAttachment` read is never used, and a not-downloaded or
+    /// governor-deleted file answers UPSTREAM_ERROR exactly as before.
+    pub async fn open_media(
+        &self,
+        params: crate::service::MessagesAttachmentsOpenParams,
+    ) -> Result<MediaOpenView, ServiceError> {
+        self.service.lock().await.open_media_handle(
+            &params.account_id,
+            &params.conversation_id,
+            &params.message_id,
+            &params.attachment_id,
+        )
+    }
+
+    /// Media ingest: one sequential chunk from a live handle. The handle
+    /// table is process-wide, so this answers identically no matter which
+    /// group's supervisor the registry routed it through.
+    pub async fn read_media_chunk(
+        &self,
+        media_handle: String,
+        offset: u64,
+    ) -> Result<MediaChunkView, ServiceError> {
+        self.service
+            .lock()
+            .await
+            .read_media_chunk(&media_handle, offset)
+    }
+
+    /// Media ingest: explicit early release; idempotent, TTL is the backstop.
+    pub async fn close_media_handle(
+        &self,
+        media_handle: String,
+    ) -> Result<MediaCloseView, ServiceError> {
+        self.service.lock().await.close_media_handle(&media_handle)
+    }
+
     /// Read-only view of the contacts cache; never triggers an upstream call.
     pub async fn list_contacts(
         &self,
@@ -1531,6 +1641,11 @@ impl Drop for RuntimeSupervisor {
         {
             handle.abort();
         }
+        if let Ok(mut slot) = self.media_governor_pass.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -1563,13 +1678,37 @@ fn is_receive_fatal_stderr(line: &str) -> bool {
                 .any(|needle| lower.contains(needle)))
 }
 
+/// Run one media governor pass on a blocking task (ADR 0002): pure
+/// filesystem work — the store lock is never taken, so a deletion sweep can
+/// never delay receives or host requests. Counts only in the log; never
+/// paths or ids.
+fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let stats = tokio::task::spawn_blocking(move || governor.run_pass())
+            .await
+            .unwrap_or_default();
+        if stats.deleted > 0 {
+            tracing::info!(
+                deleted = stats.deleted,
+                bytes_freed = stats.bytes_deleted,
+                "media governor freed attachment storage"
+            );
+        }
+    })
+}
+
 async fn receive_persistence_loop(
     mut receives: mpsc::Receiver<QueuedReceive>,
     service: Arc<Mutex<ConnectorService>>,
     host_events: broadcast::Sender<HostSideEvent>,
     owner_group: String,
+    media_governor: Option<MediaGovernor>,
 ) {
     let mut storage_unavailable = false;
+    // ADR 0002 trigger discipline: after every GOVERNOR_INBOUND_MESSAGE_INTERVAL
+    // persisted inbound messages, one retention pass. A plain counter in this
+    // single task — no shared state, no resident timer thread.
+    let mut inbound_since_governor_pass = 0_u64;
     while let Some(queued) = receives.recv().await {
         crate::metrics::receive_queue_drained();
         let mut retry_delay = RECEIVE_STORE_RETRY_MIN;
@@ -1588,6 +1727,17 @@ async fn receive_persistence_loop(
                         tracing::info!(state = "recovered", "receive persistence recovered");
                         let _ =
                             host_events.send(HostSideEvent::StorageChanged { state: "recovered" });
+                    }
+                    if let Some(governor) = media_governor.as_ref()
+                        && queued.receive().direction == "incoming"
+                    {
+                        inbound_since_governor_pass += 1;
+                        if inbound_since_governor_pass
+                            >= crate::media::GOVERNOR_INBOUND_MESSAGE_INTERVAL
+                        {
+                            inbound_since_governor_pass = 0;
+                            run_media_governor_pass(governor.clone());
+                        }
                     }
                     break;
                 }
@@ -1810,6 +1960,7 @@ mod tests {
             ),
             Arc::new(store),
             DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         ));
 
         supervisor.spawn_history_retention();
@@ -1858,6 +2009,7 @@ mod tests {
             ),
             Arc::new(store),
             DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         );
         let mut host_events = supervisor.subscribe_host();
         supervisor
@@ -1987,6 +2139,7 @@ mod tests {
             config,
             store,
             DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         ));
         supervisor.start().await.unwrap();
         let account = supervisor
@@ -2075,6 +2228,7 @@ mod tests {
             config,
             store,
             DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         ));
         supervisor.start().await.unwrap();
         let account = supervisor
@@ -2164,6 +2318,7 @@ mod tests {
             config,
             store,
             DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         ));
         supervisor.start().await.unwrap();
         let account = supervisor
@@ -2228,6 +2383,7 @@ mod tests {
             config,
             store,
             DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         ));
         supervisor.start().await.unwrap();
         let account = supervisor

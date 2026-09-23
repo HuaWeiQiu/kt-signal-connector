@@ -24,7 +24,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 # ---- Pinned inputs (single source of truth; also emitted as build-info.env) ----
-SIGNAL_CLI_VERSION="0.14.7"
+SIGNAL_CLI_VERSION="0.14.8"
 SIGNAL_CLI_TAG="v${SIGNAL_CLI_VERSION}"
 SIGNAL_CLI_URL="https://github.com/AsamK/signal-cli/archive/refs/tags/${SIGNAL_CLI_TAG}.tar.gz"
 SIGNAL_CLI_SHA256="08b56db45109e351c8f41bd73e05bcb1e29bae9c51783d51b8c3c4996ac83a7b"

@@ -44,6 +44,7 @@ fn watchdog_supervisor_with_throttle(
         config,
         store,
         kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
+        None,
     ));
     supervisor.spawn_watchdog();
     (supervisor, data_dir)

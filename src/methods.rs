@@ -45,6 +45,17 @@ pub const METHODS: &[MethodRow] = &[
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
     ("messages.attachments.get", Lane::Read, false, "read"),
+    // Media ingest (ADR 0002): the chunked streaming triple rides the READ
+    // lane like `messages.attachments.get` — one bounded chunk per call, no
+    // mutation, no upstream traffic.
+    ("messages.attachments.open", Lane::Read, false, "read"),
+    ("messages.attachments.readChunk", Lane::Read, false, "read"),
+    (
+        "messages.attachments.closeHandle",
+        Lane::Read,
+        false,
+        "read",
+    ),
     // `contacts.sync` rides the READ lane: a slow sync must not squeeze the
     // control lane (runtime.status/start keep answering). The desktop
     // client's requestScheduler.ts keeps its own lane limits as a
@@ -107,6 +118,9 @@ mod tests {
             "messages.list",
             "messages.getText",
             "messages.attachments.get",
+            "messages.attachments.open",
+            "messages.attachments.readChunk",
+            "messages.attachments.closeHandle",
             "contacts.sync",
             "contacts.list",
             "groups.get",

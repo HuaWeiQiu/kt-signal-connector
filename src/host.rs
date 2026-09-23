@@ -27,9 +27,11 @@ use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailur
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessageGetTextParams, MessagesEditParams, MessagesGetAttachmentParams,
-    MessagesListParams, MessagesRemoteDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendReactionParams, MessagesSendTextParams, PresenceSetTypingMessageParams, SendTarget,
+    LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesGetAttachmentParams, MessagesListParams, MessagesRemoteDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendReactionParams, MessagesSendTextParams,
+    PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -1218,6 +1220,71 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Media ingest triple (ADR 0002): local chunked streaming behind the
+        // `--media-ingest` launcher opt-in. Without it the service answers
+        // CAPABILITY_UNAVAILABLE before any other check; with it, params
+        // shape errors answer INVALID_REQUEST and every failure maps through
+        // the service's content-free codes.
+        "messages.attachments.open" => {
+            match serde_json::from_value::<MessagesAttachmentsOpenParams>(request.params) {
+                Ok(params) => match runtime.open_media(params).await {
+                    Ok(view) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(view).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.attachments.open params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.attachments.readChunk" => {
+            match serde_json::from_value::<MessagesAttachmentsReadChunkParams>(request.params) {
+                Ok(params) => match runtime
+                    .read_media_chunk(params.media_handle, params.offset)
+                    .await
+                {
+                    Ok(chunk) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(chunk).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.attachments.readChunk params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.attachments.closeHandle" => {
+            match serde_json::from_value::<MessagesAttachmentsCloseHandleParams>(request.params) {
+                Ok(params) => match runtime.close_media_handle(params.media_handle).await {
+                    Ok(view) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(view).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.attachments.closeHandle params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "contacts.sync" => match serde_json::from_value::<ContactsSyncParams>(request.params) {
             Ok(params) => match runtime.sync_contacts(&params.account_id).await {
                 Ok(outcome) => HostResponse::success(
@@ -1483,6 +1550,7 @@ mod tests {
             ),
             Arc::new(store),
             crate::DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
         ))
     }
 

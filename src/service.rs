@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
@@ -13,6 +14,7 @@ use crate::engine::{ControlReceive, EngineError, NormalizedReceive};
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
+use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::store::{
     AccountDeletePlan, AccountRow, AccountSummary, ContactSummary, ConversationRow,
@@ -171,19 +173,121 @@ pub enum HostSideEvent {
 const TYPING_RATE_LIMIT_MS: u64 = 1_000;
 const TYPING_RATE_MAP_CAPACITY: usize = 256;
 
+/// The filesystem-and-handles half of media ingest (ADR 0002), injected into
+/// one service per proxy group when the launcher passes `--media-ingest`.
+/// `None` is the pre-1.17 shape: every media method answers
+/// `CAPABILITY_UNAVAILABLE` before anything else happens. The handle table is
+/// process-wide (a `readChunk` carries no accountId, so the table — not the
+/// routing — is the single-origin authority) and is therefore handed in as a
+/// shared `Arc` across all groups.
+#[derive(Clone)]
+pub struct MediaIngest {
+    governor: MediaGovernor,
+    handles: Arc<MediaHandleTable>,
+}
+
+impl MediaIngest {
+    pub fn new(data_dir: PathBuf, handles: Arc<MediaHandleTable>) -> Self {
+        Self {
+            governor: MediaGovernor::new(data_dir),
+            handles,
+        }
+    }
+
+    /// The retention machine the supervisor drives (process start + every
+    /// [`crate::media::GOVERNOR_INBOUND_MESSAGE_INTERVAL`] inbound messages).
+    pub fn governor(&self) -> &MediaGovernor {
+        &self.governor
+    }
+
+    /// The process-wide chunk-stream table.
+    pub fn handles(&self) -> &MediaHandleTable {
+        &self.handles
+    }
+
+    /// Resolve a sanitized attachment id to its on-disk file and size by
+    /// probing the engine's candidate `attachments/` directories
+    /// (signal-cli `PathConfig` layout — see
+    /// [`MediaGovernor::attachments_dirs`]). `None` means the id names no
+    /// downloaded file: not-downloaded and governor-deleted are
+    /// deliberately indistinguishable (UPSTREAM_ERROR, as before the PoC).
+    fn locate_attachment(&self, sanitized_id: &str) -> Option<(PathBuf, u64)> {
+        for dir in self.governor.attachments_dirs() {
+            let candidate = dir.join(sanitized_id);
+            if let Ok(metadata) = std::fs::metadata(&candidate)
+                && metadata.is_file()
+            {
+                return Some((candidate, metadata.len()));
+            }
+        }
+        None
+    }
+}
+
+/// The capability gate every media method shares (same shape as the
+/// `messages.getText` gate): without the launcher opt-in the answer is
+/// deterministic and precedes every other check.
+fn media_capability_error() -> ServiceError {
+    ServiceError::Api(ApiError::new(
+        "CAPABILITY_UNAVAILABLE",
+        "media ingest is not enabled for this connector",
+        false,
+    ))
+}
+
+/// Map the handle table's content-free failures onto the wire codes. Unknown,
+/// expired, non-sequential, and over-ceiling are all caller mistakes
+/// (INVALID_REQUEST); an I/O failure mid-stream is the upstream file
+/// world (UPSTREAM_ERROR, same answer a missing attachment gives).
+fn map_media_handle_error(error: MediaHandleError) -> ServiceError {
+    let (code, message, retryable) = match error {
+        MediaHandleError::NotFound => (
+            "INVALID_REQUEST",
+            "mediaHandle is unknown, expired, or already closed",
+            false,
+        ),
+        // The wire answer states the rule, never the handle's internal read
+        // position: state helps a probing caller, the rule helps a buggy one.
+        MediaHandleError::NotSequential { .. } => (
+            "INVALID_REQUEST",
+            "offset must match the bytes already read on this handle",
+            false,
+        ),
+        MediaHandleError::Exhausted => (
+            "INVALID_REQUEST",
+            "the account already holds the maximum number of open media handles",
+            false,
+        ),
+        MediaHandleError::Io => ("UPSTREAM_ERROR", "attachment read failed", true),
+    };
+    ServiceError::Api(ApiError::new(code, message, retryable))
+}
+
 pub struct ConnectorService {
     store: Arc<Store>,
     link: Option<ActiveLinkSession>,
     /// Typing rate limiter: (account_id, conversation_id) → last emission.
     typing_last_emission: std::collections::HashMap<(String, String), u64>,
+    /// Media ingest backing (ADR 0002); `None` keeps every media method on
+    /// the pre-PoC `CAPABILITY_UNAVAILABLE` answer.
+    media: Option<MediaIngest>,
 }
 
 impl ConnectorService {
     pub fn new(store: Arc<Store>) -> Self {
+        Self::with_media(store, None)
+    }
+
+    /// Service with the media ingest backing enabled (`--media-ingest`).
+    /// The handle table comes in as a shared `Arc` because it is
+    /// process-wide: `readChunk`/`closeHandle` carry no accountId on the
+    /// wire, so all groups must resolve handles from one table.
+    pub fn with_media(store: Arc<Store>, media: Option<MediaIngest>) -> Self {
         Self {
             store,
             link: None,
             typing_last_emission: std::collections::HashMap::new(),
+            media,
         }
     }
 
@@ -1266,6 +1370,111 @@ impl ConnectorService {
         })
     }
 
+    /// messages.attachments.open (ADR 0002, contract revision 1.17): resolve
+    /// the addressed rows exactly like `prepare_get_attachment`, then locate
+    /// the already-downloaded file in the engine's data directory and mint a
+    /// short-lived chunk-stream handle for it. The addressing resolves before
+    /// any file is touched, the id passes the sanitizeId-parity gate before
+    /// any path join, and a missing file answers UPSTREAM_ERROR —
+    /// not-downloaded and governor-deleted are deliberately
+    /// indistinguishable, exactly as with `messages.attachments.get`.
+    pub fn open_media_handle(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<MediaOpenView, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId must contain between 1 and 128 bytes",
+                false,
+            )));
+        }
+        let sanitized_id = sanitize_attachment_id(attachment_id)?;
+        let (_account, _conversation, _message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
+            return Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "attachment is not available in the signal-cli data directory",
+                true,
+            )));
+        };
+        let media_handle = media
+            .handles
+            .open(
+                account_id,
+                conversation_id,
+                message_id,
+                attachment_id,
+                path,
+                size_bytes,
+            )
+            .map_err(map_media_handle_error)?;
+        Ok(MediaOpenView {
+            media_handle,
+            size_bytes,
+            chunk_bytes: MEDIA_CHUNK_BYTES,
+        })
+    }
+
+    /// messages.attachments.readChunk (ADR 0002): deliver exactly one bounded
+    /// chunk of one live handle at a strictly sequential offset. The handle
+    /// table validates origin, TTL, and offset; this layer base64-encodes the
+    /// raw chunk (≤ 4 * ceil(262_144 / 3) = 349_528 characters, far inside
+    /// the 160 MiB host frame budget) and reports this chunk's byte count
+    /// plus the EOF flag that terminates the caller's loop.
+    pub fn read_media_chunk(
+        &self,
+        media_handle: &str,
+        offset: u64,
+    ) -> Result<MediaChunkView, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(media_handle, "mediaHandle")?;
+        let chunk = media
+            .handles
+            .read_chunk(media_handle, offset)
+            .map_err(map_media_handle_error)?;
+        Ok(MediaChunkView {
+            data_base64: base64_encode(&chunk.data),
+            size_bytes: chunk.data.len() as u64,
+            eof: chunk.eof,
+        })
+    }
+
+    /// messages.attachments.closeHandle (ADR 0002): explicit early release.
+    /// Idempotent — a handle the TTL already reaped still closes cleanly
+    /// (`released: false`) instead of turning the backstop into a race the
+    /// caller must survive.
+    pub fn close_media_handle(&self, media_handle: &str) -> Result<MediaCloseView, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(media_handle, "mediaHandle")?;
+        Ok(MediaCloseView {
+            released: media.handles.close(media_handle),
+        })
+    }
+
+    /// ADR 0002 gate 3: handles cannot outlive their account session. The
+    /// delete-local-data path calls this once the account rows are gone; the
+    /// 300 s TTL backstops every other kind of abandonment.
+    pub fn clear_media_handles_for_account(&self, account_id: &str) {
+        if let Some(media) = self.media.as_ref() {
+            media.handles.clear_account(account_id);
+        }
+    }
+
     pub fn complete_send_success(
         &self,
         pending_id: &str,
@@ -1768,6 +1977,41 @@ pub struct AttachmentPayload {
     pub data: String,
 }
 
+/// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
+/// unguessable 128-bit handle bound to the resolved
+/// (account, conversation, message, attachment) tuple, the file size the
+/// stream will deliver, and the raw chunk size every `readChunk` offsets
+/// advance by. The filesystem path never appears anywhere on the wire.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaOpenView {
+    pub media_handle: String,
+    pub size_bytes: u64,
+    pub chunk_bytes: u64,
+}
+
+/// `messages.attachments.readChunk` result (ADR 0002): exactly one chunk.
+/// `size_bytes` counts this chunk's raw bytes; `dataBase64` inflates them by
+/// the usual per-chunk base64 factor to at most
+/// `4 * ceil(262_144 / 3)` = 349_528 characters — bounded, and far inside
+/// the 160 MiB host frame budget. `eof` terminates the caller's read loop.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaChunkView {
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub eof: bool,
+}
+
+/// `messages.attachments.closeHandle` result: `released` is false when the
+/// handle was already gone (expired or closed earlier) — closing is
+/// idempotent by design.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaCloseView {
+    pub released: bool,
+}
+
 /// The groups.get response (contract revision 1.9): the cached kind='group'
 /// contacts row projected for the host. `member_count` is absent when the
 /// sync batch captured no member list; `synced_at` is the row's last sync
@@ -1954,6 +2198,32 @@ pub struct MessagesGetAttachmentParams {
     pub size_bytes: u64,
 }
 
+/// messages.attachments.open params (ADR 0002): the same addressing triple
+/// as `messages.attachments.get`, plus the attachment id from the message's
+/// received metadata. There is no caller-declared sizeBytes: the file size is
+/// measured locally and reported back, never trusted from the wire.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesAttachmentsOpenParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesAttachmentsReadChunkParams {
+    pub media_handle: String,
+    pub offset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesAttachmentsCloseHandleParams {
+    pub media_handle: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactsSyncParams {
@@ -2135,6 +2405,51 @@ fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// signal-cli `AttachmentStore.sanitizeId` parity (ADR 0002 security gate 3).
+/// Upstream resolves an attachment id as
+/// `new File(attachmentsPath, sanitizeId(id))` where `sanitizeId` replaces
+/// every character outside `[A-Za-z0-9_.-]` with `_`; the connector applies
+/// the identical transform before any path join so it can predict the exact
+/// file the id names. On top of the transform — which alone would silently
+/// launder hostile shapes into harmless-looking names — the shapes that only
+/// make sense as traversal are refused outright: any id containing a path
+/// separator (`/`, `\`) and, after sanitizing, the empty id, `.` and `..`.
+/// Every refusal answers INVALID_REQUEST before the filesystem is touched.
+fn sanitize_attachment_id(attachment_id: &str) -> Result<String, ServiceError> {
+    if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentId must contain between 1 and 128 bytes",
+            false,
+        )));
+    }
+    if attachment_id.contains('/') || attachment_id.contains('\\') {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentId must be a bare attachment file name",
+            false,
+        )));
+    }
+    let sanitized: String = attachment_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "attachmentId does not name an attachment file",
+            false,
+        )));
+    }
+    Ok(sanitized)
+}
+
 /// The upstream base64 must decode to exactly the size the caller declared
 /// (contract revision 1.8): anything else means the host budgeted for a
 /// different payload. Encoding length is checked first so a hostile upstream
@@ -2197,6 +2512,34 @@ fn validate_attachment_send_payload(
         )));
     }
     Ok(())
+}
+
+/// Encode standard padded base64 — the same canonical form
+/// `build_attachment_data_uri` re-encodes to and `base64_decode_to_vec`
+/// accepts. The chunked media delivery (ADR 0002) uses it per 256 KiB chunk:
+/// 349_528 characters worst case, bounded and frame-safe.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let byte1 = chunk.first().copied().unwrap_or_default() as u32;
+        let byte2 = chunk.get(1).copied().unwrap_or_default() as u32;
+        let byte3 = chunk.get(2).copied().unwrap_or_default() as u32;
+        let triple = (byte1 << 16) | (byte2 << 8) | byte3;
+        encoded.push(ALPHABET[(triple >> 18) as usize & 0x3F] as char);
+        encoded.push(ALPHABET[(triple >> 12) as usize & 0x3F] as char);
+        if chunk.len() > 1 {
+            encoded.push(ALPHABET[(triple >> 6) as usize & 0x3F] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(ALPHABET[(triple) as usize & 0x3F] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+    encoded
 }
 
 /// Decode standard base64 (with padding) into `out`. Returns Err on any
@@ -4934,5 +5277,281 @@ mod tests {
         assert_eq!(row.attachments[0].id, "att-1");
         assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
         assert_eq!(row.attachments[0].size, Some(2048));
+    }
+
+    // ---- Media ingest (ADR 0002) -------------------------------------
+
+    /// A service with the media backing armed over an engine-shaped data
+    /// directory (`<data>/attachments/`, the single-account probe layout).
+    fn media_service() -> (TempDir, ConnectorService) {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        let data_dir = temp.path().join("signal-data");
+        std::fs::create_dir_all(data_dir.join("attachments")).unwrap();
+        let handles = Arc::new(MediaHandleTable::new());
+        (
+            temp,
+            ConnectorService::with_media(
+                Arc::new(store),
+                Some(MediaIngest::new(data_dir, handles)),
+            ),
+        )
+    }
+
+    /// Addressing rows for one account, mirroring the
+    /// `prepare_get_attachment` test setup: account → direct conversation →
+    /// one completed outgoing message.
+    fn addressed_message(
+        service: &ConnectorService,
+        number: &str,
+        peer: &str,
+        request_id: &str,
+    ) -> (String, String, String) {
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal(number, None, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", peer, "Peer")
+            .unwrap();
+        let message_id = match service
+            .prepare_send_text(&account.id, &direct.id, "has attachment", request_id, None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&message_id, &account.id, &direct.id, 800)
+            .unwrap();
+        (account.id, direct.id, message_id)
+    }
+
+    /// Without the launcher opt-in (`ConnectorService::new`), all three
+    /// media methods answer the shared capability gate before any other
+    /// check — the pre-PoC contract (ADR 0002 acceptance gate 5).
+    #[test]
+    fn media_methods_are_capability_gated_without_the_opt_in() {
+        let (_temp, service) = service();
+        for error in [
+            service
+                .open_media_handle("a", "c", "m", "att-1")
+                .unwrap_err(),
+            service.read_media_chunk("handle", 0).unwrap_err(),
+            service.close_media_handle("handle").unwrap_err(),
+        ] {
+            let api = error.into_api();
+            assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
+            assert!(!api.retryable);
+        }
+    }
+
+    /// Security gate (ADR 0002 acceptance gate 3): traversal-shaped ids —
+    /// `../x`, absolute paths, backslashes, and the sanitize survivors
+    /// `.` / `..` — answer INVALID_REQUEST before the filesystem is touched.
+    /// The decoy file makes the check real: a naive path join would resolve
+    /// it (and answer a handle or UPSTREAM_ERROR), never INVALID_REQUEST.
+    #[test]
+    fn media_open_rejects_traversal_ids_before_touching_the_filesystem() {
+        let (_temp, service) = media_service();
+        let (account_id, conversation_id, message_id) =
+            addressed_message(&service, "+15555550100", "+15555550101", "req-media-trav");
+        // Exactly where a naive `attachments/` join of "../escape.dat" and
+        // "../../escape.dat" would land.
+        std::fs::write(
+            _temp.path().join("signal-data").join("escape.dat"),
+            b"escaped",
+        )
+        .unwrap();
+
+        for attachment_id in [
+            "../escape.dat",
+            "..",
+            ".",
+            "/etc/passwd",
+            "a\\b.dat",
+            "C:\\temp\\att.dat",
+            "sub/../../escape.dat",
+        ] {
+            let error = service
+                .open_media_handle(&account_id, &conversation_id, &message_id, attachment_id)
+                .unwrap_err()
+                .into_api();
+            assert_eq!(error.code, "INVALID_REQUEST", "{attachment_id}");
+            assert!(!error.retryable, "{attachment_id}");
+        }
+    }
+
+    /// The happy path end to end: a downloaded file resolves, `open` reports
+    /// the local size and the chunk bound, the read loop delivers the exact
+    /// bytes through sequential offsets, and `closeHandle` is idempotent.
+    #[test]
+    fn media_open_streams_a_downloaded_file_through_sequential_chunks() {
+        let (_temp, service) = media_service();
+        let (account_id, conversation_id, message_id) =
+            addressed_message(&service, "+15555550100", "+15555550101", "req-media-open");
+        let body: Vec<u8> = (0..8192_u32).map(|i| (i % 251) as u8).collect();
+        let attachment_dir = _temp.path().join("signal-data").join("attachments");
+        std::fs::write(attachment_dir.join("a1b2c3.dat"), &body).unwrap();
+
+        let view = service
+            .open_media_handle(&account_id, &conversation_id, &message_id, "a1b2c3.dat")
+            .unwrap();
+        assert_eq!(view.size_bytes, body.len() as u64);
+        assert_eq!(view.chunk_bytes, 262_144);
+
+        let mut assembled: Vec<u8> = Vec::with_capacity(body.len());
+        let mut offset = 0_u64;
+        let mut chunks = 0;
+        loop {
+            let chunk = service
+                .read_media_chunk(&view.media_handle, offset)
+                .unwrap();
+            let mut decoded = Vec::with_capacity(chunk.size_bytes as usize);
+            base64_decode_to_vec(&chunk.data_base64, &mut decoded)
+                .expect("chunk base64 must be canonical");
+            assert_eq!(decoded.len() as u64, chunk.size_bytes);
+            assembled.extend_from_slice(&decoded);
+            offset += chunk.size_bytes;
+            chunks += 1;
+            if chunk.eof {
+                break;
+            }
+        }
+        assert_eq!(assembled, body);
+        assert_eq!(chunks, 1, "8 KiB fits one chunk; eof must be immediate");
+
+        assert!(
+            service
+                .close_media_handle(&view.media_handle)
+                .unwrap()
+                .released
+        );
+        // Idempotent close, and a closed handle is unreadable.
+        assert!(
+            !service
+                .close_media_handle(&view.media_handle)
+                .unwrap()
+                .released
+        );
+        let error = service
+            .read_media_chunk(&view.media_handle, offset)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "INVALID_REQUEST");
+    }
+
+    /// A missing file answers UPSTREAM_ERROR, exactly like the pre-PoC
+    /// `messages.attachments.get`: not-downloaded and governor-deleted are
+    /// indistinguishable (ADR 0002).
+    #[test]
+    fn media_open_answers_upstream_error_when_the_file_is_absent() {
+        let (_temp, service) = media_service();
+        let (account_id, conversation_id, message_id) = addressed_message(
+            &service,
+            "+15555550100",
+            "+15555550101",
+            "req-media-missing",
+        );
+        let error = service
+            .open_media_handle(
+                &account_id,
+                &conversation_id,
+                &message_id,
+                "never-downloaded.dat",
+            )
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "UPSTREAM_ERROR");
+        assert!(error.retryable);
+    }
+
+    /// Non-sequential offsets fail closed at the service boundary with the
+    /// shared INVALID_REQUEST answer.
+    #[test]
+    fn media_read_chunk_rejects_non_sequential_offsets() {
+        let (_temp, service) = media_service();
+        let (account_id, conversation_id, message_id) =
+            addressed_message(&service, "+15555550100", "+15555550101", "req-media-seq");
+        let attachment_dir = _temp.path().join("signal-data").join("attachments");
+        std::fs::write(attachment_dir.join("seq.dat"), [0_u8; 4096]).unwrap();
+        let view = service
+            .open_media_handle(&account_id, &conversation_id, &message_id, "seq.dat")
+            .unwrap();
+
+        let error = service
+            .read_media_chunk(&view.media_handle, 1)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "INVALID_REQUEST");
+        // The first read is still at offset 0 after the refusal.
+        service
+            .read_media_chunk(&view.media_handle, 0)
+            .expect("a refused offset must not advance the stream");
+    }
+
+    /// Releasing an account's handles (the deleteLocalData hook) must not
+    /// touch another account's live streams.
+    #[test]
+    fn media_handles_release_per_account_without_cross_account_effects() {
+        let (_temp, service) = media_service();
+        let (account_a, conversation_a, message_a) =
+            addressed_message(&service, "+15555550100", "+15555550191", "req-media-a");
+        let (account_b, conversation_b, message_b) =
+            addressed_message(&service, "+15555550101", "+15555550192", "req-media-b");
+        let attachment_dir = _temp.path().join("signal-data").join("attachments");
+        std::fs::write(attachment_dir.join("a.dat"), [1_u8; 64]).unwrap();
+        std::fs::write(attachment_dir.join("b.dat"), [2_u8; 64]).unwrap();
+        let handle_a = service
+            .open_media_handle(&account_a, &conversation_a, &message_a, "a.dat")
+            .unwrap()
+            .media_handle;
+        let handle_b = service
+            .open_media_handle(&account_b, &conversation_b, &message_b, "b.dat")
+            .unwrap()
+            .media_handle;
+
+        service.clear_media_handles_for_account(&account_a);
+
+        assert_eq!(
+            service
+                .read_media_chunk(&handle_a, 0)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "INVALID_REQUEST"
+        );
+        // The other account's stream is untouched: single-origin by account.
+        let chunk_b = service.read_media_chunk(&handle_b, 0).unwrap();
+        assert_eq!(chunk_b.size_bytes, 64);
+        assert!(chunk_b.eof);
+    }
+
+    /// The encoder emits the exact canonical form the upstream
+    /// java.util.Base64 produces (RFC 4648 vectors), and every encoding
+    /// round-trips through the decoder that guards attachment sends.
+    #[test]
+    fn base64_encode_matches_the_canonical_alphabet_and_round_trips() {
+        for (raw, expected) in [
+            (&b""[..], ""),
+            (b"f".as_slice(), "Zg=="),
+            (b"fo".as_slice(), "Zm8="),
+            (b"foo".as_slice(), "Zm9v"),
+            (b"foob".as_slice(), "Zm9vYg=="),
+            (b"fooba".as_slice(), "Zm9vYmE="),
+            (b"foobar".as_slice(), "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(raw), expected, "{raw:?}");
+        }
+        // A full chunk's encoding is bounded exactly as the contract claims.
+        assert_eq!(base64_encode(&[0_u8; 262_144]).len(), 349_528);
+        // Random round-trip through the independent decoder.
+        let mut value = [0_u8; 1000];
+        use rand::RngCore;
+        rand::rng().fill_bytes(&mut value);
+        let mut decoded = Vec::new();
+        base64_decode_to_vec(&base64_encode(&value), &mut decoded).unwrap();
+        assert_eq!(decoded, value);
     }
 }

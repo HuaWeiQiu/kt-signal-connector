@@ -83,6 +83,13 @@ pub struct SignalCliConfig {
     pub mode: SignalCliMode,
     pub java_home: Option<PathBuf>,
     pub proxy: Option<SocksProxy>,
+    /// Media ingest opt-in (ADR 0002): when false the engine spawns with
+    /// `--ignore-attachments` exactly as before Phase 1.17 and every media
+    /// method answers `CAPABILITY_UNAVAILABLE`; when true the flag is dropped
+    /// so signal-cli downloads inbound attachments into its data directory,
+    /// under the connector's media governor (bounded TTL + quota retention)
+    /// and chunked handle delivery. Launcher input only — never IPC input.
+    pub media_ingest: bool,
     pub line_limit: usize,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -100,6 +107,7 @@ impl SignalCliConfig {
             mode: SignalCliMode::Jvm,
             java_home: None,
             proxy: None,
+            media_ingest: false,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
@@ -177,11 +185,15 @@ fn java_opts(proxy: Option<&SocksProxy>) -> String {
 /// prepends the SOCKS proxy as runtime system properties for the GraalVM
 /// native-image launcher. The launcher consumes `-D` entries anywhere on the
 /// command line before the app parses its own arguments; leading position is
-/// convention, not requirement.
+/// convention, not requirement. `media_ingest` (ADR 0002) only decides
+/// whether `--ignore-attachments` is present: with it the rest of the argv —
+/// including `--ignore-stories` and `--ignore-stickers` — is unchanged, and
+/// without it the argv is byte-identical to the pre-media-POC launcher.
 fn signal_cli_args(
     mode: SignalCliMode,
     proxy: Option<&SocksProxy>,
     data_dir: &Path,
+    media_ingest: bool,
 ) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     if mode == SignalCliMode::Native
@@ -196,7 +208,14 @@ fn signal_cli_args(
     // Explicit: pull server messages as soon as the daemon is up.
     args.push("--receive-mode".into());
     args.push("on-start".into());
-    args.push("--ignore-attachments".into());
+    // ADR 0002: dropping --ignore-attachments is the entire media opt-in —
+    // signal-cli then downloads inbound attachments into its data directory,
+    // where the connector's media governor bounds retention. Stories and
+    // stickers stay ignored in every mode; they are not part of the media
+    // PoC and would add unbounded surface.
+    if !media_ingest {
+        args.push("--ignore-attachments".into());
+    }
     args.push("--ignore-stories".into());
     args.push("--ignore-stickers".into());
     args
@@ -548,6 +567,7 @@ impl EngineHandle {
                 config.mode,
                 config.proxy.as_ref(),
                 &config.data_dir,
+                config.media_ingest,
             ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1844,13 +1864,45 @@ mod tests {
         .collect();
         // JVM mode: proxy travels in JAVA_OPTS, never on the command line.
         assert_eq!(
-            signal_cli_args(SignalCliMode::Jvm, Some(&proxy), Path::new("/data")),
+            signal_cli_args(SignalCliMode::Jvm, Some(&proxy), Path::new("/data"), false),
             expected
         );
         assert_eq!(
-            signal_cli_args(SignalCliMode::Native, None, Path::new("/data")),
+            signal_cli_args(SignalCliMode::Native, None, Path::new("/data"), false),
             expected
         );
+    }
+
+    /// Media opt-in (ADR 0002 gate 5): enabling `--media-ingest` changes the
+    /// spawn argv by exactly one line — `--ignore-attachments` disappears;
+    /// stories and stickers stay ignored and every other byte is unchanged.
+    #[test]
+    fn media_ingest_only_drops_ignore_attachments_from_the_argv() {
+        let baseline = signal_cli_args(SignalCliMode::Jvm, None, Path::new("/data"), false);
+        let media = signal_cli_args(SignalCliMode::Jvm, None, Path::new("/data"), true);
+        let dropped: Vec<_> = baseline
+            .iter()
+            .filter(|arg| !media.contains(arg))
+            .cloned()
+            .collect();
+        let added: Vec<_> = media
+            .iter()
+            .filter(|arg| !baseline.contains(arg))
+            .cloned()
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![std::ffi::OsString::from("--ignore-attachments")]
+        );
+        assert!(added.is_empty());
+        // Stories and stickers are outside the media PoC in both shapes.
+        assert!(baseline.contains(&std::ffi::OsString::from("--ignore-stories")));
+        assert!(baseline.contains(&std::ffi::OsString::from("--ignore-stickers")));
+        assert!(media.contains(&std::ffi::OsString::from("--ignore-stories")));
+        assert!(media.contains(&std::ffi::OsString::from("--ignore-stickers")));
+        // The config default stays opt-out.
+        let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
+        assert!(!config.media_ingest);
     }
 
     #[test]
@@ -1859,7 +1911,12 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 1080,
         };
-        let args = signal_cli_args(SignalCliMode::Native, Some(&proxy), Path::new("/data"));
+        let args = signal_cli_args(
+            SignalCliMode::Native,
+            Some(&proxy),
+            Path::new("/data"),
+            false,
+        );
         assert_eq!(
             args[..2],
             [

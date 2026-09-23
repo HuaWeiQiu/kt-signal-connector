@@ -3,7 +3,7 @@
 # Smoke-check a signal-cli binary before it is accepted into a runtime bundle.
 # Catches the upgrade killers early: wrong version, broken JRE/classpath,
 # missing daemon JSON-RPC socket support. Usage:
-#   packaging/scripts/smoke-signal-cli.sh --bin /abs/path/signal-cli --expect-version 0.14.7
+#   packaging/scripts/smoke-signal-cli.sh --bin /abs/path/signal-cli --expect-version 0.14.8
 set -euo pipefail
 
 BIN=""

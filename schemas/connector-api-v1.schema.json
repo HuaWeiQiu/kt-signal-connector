@@ -54,6 +54,9 @@
             "messages.remoteDelete",
             "messages.sendReaction",
             "messages.attachments.get",
+            "messages.attachments.open",
+            "messages.attachments.readChunk",
+            "messages.attachments.closeHandle",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -226,6 +229,39 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesAttachmentsGetParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.attachments.open" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesAttachmentsOpenParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.attachments.readChunk" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesAttachmentsReadChunkParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.attachments.closeHandle" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesAttachmentsCloseHandleParams" }
             }
           }
         },
@@ -502,6 +538,46 @@
           "maximum": 104857600,
           "description": "The attachment size the caller expects, from the message attachment metadata. Enforced deterministically before any upstream read: a different actual size answers INVALID_REQUEST."
         }
+      }
+    },
+    "messagesAttachmentsOpenParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId", "attachmentId"],
+      "description": "Open a chunked stream for one already-downloaded attachment (ADR 0002, contract revision 1.17). The (accountId, conversationId, messageId) triple resolves against the store exactly as in messages.attachments.get — a bogus conversation or message answers CONVERSATION_NOT_FOUND / MESSAGE_NOT_FOUND before any file is touched. The attachmentId must be a bare file name (the id field of the received message's attachment metadata): any id containing '/' or '\\\\', or any id that resolves to '' / '.' / '..' under the upstream sanitizeId transform ([^A-Za-z0-9_.-] replaced by '_'), answers INVALID_REQUEST before the filesystem is touched, so a hostile id cannot path-traverse. A file signal-cli has not downloaded — or that the media governor already deleted — answers UPSTREAM_ERROR; the two are deliberately indistinguishable. Without the launcher-level --media-ingest opt-in every media method answers CAPABILITY_UNAVAILABLE. The response is {mediaHandle, sizeBytes, chunkBytes}: mediaHandle is an unguessable 128-bit token bound to this resolved tuple (300 s TTL, at most 8 live handles per account, released early by messages.attachments.closeHandle), sizeBytes is the locally measured file size, and chunkBytes is the raw chunk size (262144) every readChunk offset advances by.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "attachmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The upstream attachment id from the received message's attachment metadata; a bare file name, never a path."
+        }
+      }
+    },
+    "messagesAttachmentsReadChunkParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mediaHandle", "offset"],
+      "description": "Read the next chunk of a stream opened with messages.attachments.open (ADR 0002). Offsets are strictly sequential — offset must equal the number of bytes already delivered on this handle — so a handle can never become a random-access scan oracle; any other offset answers INVALID_REQUEST. The response is {dataBase64, sizeBytes, eof}: sizeBytes counts this chunk's raw bytes (at most chunkBytes = 262144; dataBase64 is its padded standard base64, at most 4 * ceil(262144 / 3) = 349528 characters, bounded and far inside the 160 MiB host frame budget) and eof terminates the caller's read loop. A closed, expired, or unknown handle answers INVALID_REQUEST; a file truncated under the stream (media governor pass) terminates with a short chunk and eof; a file that vanished entirely answers UPSTREAM_ERROR.",
+      "properties": {
+        "mediaHandle": { "$ref": "#/$defs/opaqueId" },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Must equal the bytes already read on this handle; 0 for the first read."
+        }
+      }
+    },
+    "messagesAttachmentsCloseHandleParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mediaHandle"],
+      "description": "Release a media stream before its 300 s TTL (ADR 0002). Idempotent: the response is {released}, false when the handle was already gone (expired or closed earlier). Handles are also released when their account's local data is deleted; the TTL backstops every other kind of abandonment.",
+      "properties": {
+        "mediaHandle": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "messagesSendAttachmentParams": {

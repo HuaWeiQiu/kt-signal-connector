@@ -672,6 +672,42 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Media ingest (ADR 0002): `open` routes by account like every other
+    /// account-addressed method, so the file resolves in the owning group's
+    /// data directory.
+    pub async fn open_media(
+        &self,
+        params: crate::service::MessagesAttachmentsOpenParams,
+    ) -> Result<crate::service::MediaOpenView, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.open_media(params).await
+    }
+
+    /// `readChunk` carries no accountId on the wire (ADR 0002): the
+    /// process-wide handle table is the single-origin authority, so any
+    /// supervisor's service resolves it identically. The first group serves.
+    pub async fn read_media_chunk(
+        &self,
+        media_handle: String,
+        offset: u64,
+    ) -> Result<crate::service::MediaChunkView, ServiceError> {
+        self.groups[0]
+            .supervisor
+            .read_media_chunk(media_handle, offset)
+            .await
+    }
+
+    /// `closeHandle` — same process-wide-table reasoning as `readChunk`.
+    pub async fn close_media_handle(
+        &self,
+        media_handle: String,
+    ) -> Result<crate::service::MediaCloseView, ServiceError> {
+        self.groups[0]
+            .supervisor
+            .close_media_handle(media_handle)
+            .await
+    }
+
     pub async fn sync_contacts(
         &self,
         account_id: &str,
@@ -740,7 +776,12 @@ impl Drop for ProxyGroupRuntime {
 
 /// Open the shared per-profile store once and assemble one supervised engine
 /// stack per planned group (ADR 0001 R4/R5). History retention is process-wide
-/// and therefore spawned once; watchdogs are per group.
+/// and therefore spawned once; watchdogs are per group. With `media_ingest`
+/// (ADR 0002) every group's service is armed with the engine's data directory
+/// and one process-wide handle table — process-wide because a
+/// `readChunk`/`closeHandle` carries no accountId, so handle resolution must
+/// not depend on which supervisor the registry routed a request through —
+/// and each group gets its own start-up retention pass.
 pub fn open_group_runtime(
     plan: ProxyGroupPlan,
     signal_cli: PathBuf,
@@ -748,20 +789,25 @@ pub fn open_group_runtime(
     java_home: Option<PathBuf>,
     store_key: Option<StoreKey>,
     signal_cli_mode: SignalCliMode,
+    media_ingest: bool,
 ) -> Result<Arc<ProxyGroupRuntime>, crate::store::StoreError> {
     let store = Arc::new(Store::open(state_dir, store_key)?);
+    let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
     let mut slots = Vec::with_capacity(plan.groups.len());
     for entry in &plan.groups {
         let mut config = SignalCliConfig::new(signal_cli.clone(), entry.data_dir.clone());
         config.java_home = java_home.clone();
         config.proxy = entry.proxy.clone();
         config.mode = signal_cli_mode;
+        config.media_ingest = media_ingest;
         let supervisor = Arc::new(RuntimeSupervisor::new(
             config,
             store.clone(),
             entry.id.clone(),
+            media_ingest.then(|| media_handles.clone()),
         ));
         supervisor.spawn_watchdog();
+        supervisor.spawn_media_governor();
         slots.push(ProxyGroupSlot {
             id: entry.id.clone(),
             supervisor,
@@ -801,6 +847,7 @@ mod tests {
                     ),
                     store.clone(),
                     id.to_string(),
+                    None,
                 )),
             )
         };

@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod link;
 pub mod lkg;
 pub mod manifest;
+pub mod media;
 pub mod methods;
 pub mod metrics;
 pub mod parent;

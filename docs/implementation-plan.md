@@ -6,7 +6,9 @@
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
 - Connector source baseline: `main` @ `6656f70`
-- Target engine baseline: unmodified `signal-cli v0.14.7`
+- Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
+  per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
+  GroupsV2 end-group exposure, no JSON-RPC field removals)
 - Target Java baseline: JRE 25
 - Initial platforms: Windows 10/11 x64, macOS x64, macOS arm64
 - Remote publication: not authorized yet; all work remains local until testing and review are complete
@@ -902,6 +904,11 @@ now contribute bounded attachment **metadata only** (§4.13) — descriptors are
 message row while `--ignore-attachments` keeps byte download, disk pressure, and
 `messages.attachments.get` answering `UPSTREAM_ERROR` exactly as before. A media capability
 change still requires the dedicated bounded-download PoC this section demands.
+
+That PoC is now designed: `docs/adr/0002-media-ingest-poc.md` (2026-09-23) defines the
+opt-in `--media-ingest` spawn flag, a quota+TTL media governor, and chunked handle
+delivery (`messages.attachments.open` / `readChunk` / `closeHandle`, contract revision
+1.17). Until that PoC passes its acceptance gates, this boundary stands.
 
 ## 7. Data and Resource Limits
 

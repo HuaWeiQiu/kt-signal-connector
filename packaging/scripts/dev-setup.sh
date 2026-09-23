@@ -4,7 +4,7 @@
 #   1. cargo build --release (connector binary)
 #   2. downloads the pinned signal-cli release (SHA-256 verified) into a
 #      user-level dev dir — never touches production runtime paths
-#   3. locates a JRE >= 25 (required by signal-cli 0.14.7, class file 69.0)
+#   3. locates a JRE >= 25 (required by signal-cli 0.14.8, class file 69.0)
 #   4. runs packaging/scripts/smoke-signal-cli.sh against the result
 #   5. writes env.sh with the KT_SIGNAL_* vars the desktop client's
 #      development resolver reads
@@ -13,11 +13,11 @@
 # pin. To upgrade, follow docs/signal-cli-upgrade.md.
 set -euo pipefail
 
-SIGNAL_CLI_VERSION="0.14.7"
-# SHA-256 of signal-cli-0.14.7.tar.gz from the official AsamK/signal-cli
+SIGNAL_CLI_VERSION="0.14.8"
+# SHA-256 of signal-cli-0.14.8.tar.gz from the official AsamK/signal-cli
 # release. Upstream publishes no checksum asset; this pin was taken from the
 # tarball fetched from the release URL below.
-SIGNAL_CLI_SHA256="0e1eefdf4a2109edf7c899c9d1667167c54ac12c3ec824f27db7c1dac4fa7506"
+SIGNAL_CLI_SHA256="ccd408e831eff7e41ebaaf309704840bb00d78a7869f35ad700dbae5b5a5bb65"
 SIGNAL_CLI_URL="https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}.tar.gz"
 MIN_JAVA_MAJOR=25
 

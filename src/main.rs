@@ -80,6 +80,13 @@ enum CliCommand {
         /// `default` group keeps this legacy SOCKS proxy and data directory.
         #[arg(long = "proxy-group", value_name = "ID=HOST:PORT")]
         proxy_group: Vec<String>,
+        /// Media ingest opt-in (ADR 0002): the spawned signal-cli keeps
+        /// inbound attachment downloads (no `--ignore-attachments`) under the
+        /// connector's bounded media governor and chunked handle delivery.
+        /// Without the flag the engine spawns byte-identical to the pre-PoC
+        /// launcher and every media method answers CAPABILITY_UNAVAILABLE.
+        #[arg(long, default_value_t = false)]
+        media_ingest: bool,
         #[arg(long)]
         signal_data_dir: PathBuf,
         #[arg(long)]
@@ -205,6 +212,7 @@ struct ServeOptions {
     java_home: Option<PathBuf>,
     socks_proxy: Option<SocksProxy>,
     proxy_group: Vec<String>,
+    media_ingest: bool,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -239,6 +247,7 @@ async fn main() {
             java_home,
             socks_proxy,
             proxy_group,
+            media_ingest,
             signal_data_dir,
             state_dir,
         } => serve_command(ServeOptions {
@@ -251,6 +260,7 @@ async fn main() {
             java_home,
             socks_proxy,
             proxy_group,
+            media_ingest,
             signal_data_dir,
             state_dir,
         })
@@ -277,6 +287,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         java_home,
         socks_proxy,
         proxy_group,
+        media_ingest,
         signal_data_dir,
         state_dir,
     } = options;
@@ -348,6 +359,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         java_home,
         store_key,
         signal_cli_mode,
+        media_ingest,
     )?;
     #[cfg(windows)]
     {
