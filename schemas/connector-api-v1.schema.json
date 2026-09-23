@@ -485,7 +485,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "messageId", "attachmentId", "sizeBytes"],
-      "description": "PoC (contract revision 1.8): fetch one attachment that is already stored in the local signal-cli data directory and return it base64-encoded in the response, the token-for-bytes downgrade the media PoC contract allows when streaming is not implemented. The connector downloads nothing: it never enables attachment fetching upstream, and an attachment signal-cli has not downloaded answers UPSTREAM_ERROR. Because the payload crosses the JSON-RPC host frame, the attachment must be at most 5 MiB (5242880 bytes) — a deliberate margin under the 10 MiB task cap, bounded by the pinned signal-cli stdout line limit (8 MiB, src/engine.rs) that faults a shared engine when a response line exceeds it. The caller must pass the size it expects from the message metadata; a mismatch answers INVALID_REQUEST instead of returning a payload the host did not budget for. The response is {attachmentId, data}; the local messages row is never modified and no event is emitted.",
+      "description": "Fetch one attachment that is already stored in the local signal-cli data directory and return it base64-encoded in the response, the token-for-bytes downgrade the media contract allows when streaming is not implemented. The connector downloads nothing on its own: it never enables attachment fetching upstream, and an attachment signal-cli has not downloaded answers UPSTREAM_ERROR. Because the payload crosses the JSON-RPC host frame, the attachment must be at most 100 MiB (104857600 bytes) — aligned with the official Signal attachment ceiling; the frame budget that carries it is 160 MiB on the host socket (DEFAULT_HOST_FRAME_LIMIT), the pinned signal-cli stdin/stdout line limit (DEFAULT_UPSTREAM_LINE_LIMIT, also 160 MiB), and the in-flight host byte pool (MAX_PENDING_HOST_BYTES, 176 MiB) so one maximum attachment plus regular traffic always fits. The caller must pass the size it expects from the message metadata; a mismatch answers INVALID_REQUEST instead of returning a payload the host did not budget for. The response is {attachmentId, data}; the local messages row is never modified and no event is emitted.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -499,7 +499,7 @@
         "sizeBytes": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 5242880,
+          "maximum": 104857600,
           "description": "The attachment size the caller expects, from the message attachment metadata. Enforced deterministically before any upstream read: a different actual size answers INVALID_REQUEST."
         }
       }
@@ -508,7 +508,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "clientRequestId", "dataBase64", "sizeBytes"],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..5242880 bytes, the same 5 MiB PoC bound as messages.attachments.get). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13, budget raised to the official 100 MiB ceiling in 1.16): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the same bound as messages.attachments.get). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -533,14 +533,14 @@
         "dataBase64": {
           "type": "string",
           "minLength": 4,
-          "maxLength": 6990508,
+          "maxLength": 139810136,
           "pattern": "^[A-Za-z0-9+/]+={0,2}$",
-          "description": "Standard padded base64 of the attachment bytes; decoded size must equal sizeBytes."
+          "description": "Standard padded base64 of the attachment bytes; decoded size must equal sizeBytes. The bound is 4 * ceil(104857600 / 3) — the exact padded-base64 length for the 100 MiB ceiling."
         },
         "sizeBytes": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 5242880,
+          "maximum": 104857600,
           "description": "Declared raw attachment size; verified against the decoded payload before anything is sent."
         },
         "filename": {
@@ -655,6 +655,7 @@
             "proxyGroup.stateChanged",
             "account.changed",
             "conversation.changed",
+            "conversation.typing",
             "message.upserted",
             "message.statusChanged"
           ]
@@ -706,6 +707,30 @@
                   "pid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
                   "rssBytes": { "type": "integer", "minimum": 0 },
                   "resourcePressure": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "conversation.typing" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "action"],
+                "description": "Ephemeral typing indicator (contract 1.15): never persisted, rate limited per account+conversation before it reaches the host lane. The host owns display timeout.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "action": {
+                    "enum": ["START", "STOP"],
+                    "description": "Upstream typingMessage action; START shows the indicator, STOP clears it immediately."
+                  }
                 }
               }
             }

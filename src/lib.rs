@@ -25,8 +25,8 @@ pub const API_VERSION: &str = "1.0";
 /// implementation-plan §4.12). Matches the desktop client's connector frame
 /// budget; the desktop is the only local peer on a private, handshake-
 /// authenticated socket.
-pub const DEFAULT_HOST_FRAME_LIMIT: usize = 16 * 1024 * 1024;
-pub const DEFAULT_UPSTREAM_LINE_LIMIT: usize = 8 * 1024 * 1024;
+pub const DEFAULT_HOST_FRAME_LIMIT: usize = 160 * 1024 * 1024;
+pub const DEFAULT_UPSTREAM_LINE_LIMIT: usize = 160 * 1024 * 1024;
 pub const MAX_PENDING_UPSTREAM_REQUESTS: usize = 128;
 /// The reserved, always-present proxy group (ADR 0001 R2). The legacy global
 /// `--socks-proxy` / `KT_SIGNAL_SOCKS_PROXY` configures this group; the group

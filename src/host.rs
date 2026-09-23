@@ -47,7 +47,7 @@ const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const RECENT_REQUEST_IDS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS: usize = 128;
 const MAX_PENDING_HOST_REQUESTS_PER_ACCOUNT: usize = 32;
-const MAX_PENDING_HOST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_HOST_BYTES: usize = 176 * 1024 * 1024;
 /// Dispatch lane capacities (CONTROL/READ/SEND below). They hand-mirror the
 /// desktop client's `requestScheduler.ts` lane limits (optimization-plan
 /// §5.2 B2): a capacity change must be applied on both sides in the same

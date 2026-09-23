@@ -33,12 +33,12 @@ pub const MAX_EMOJI_BYTES: usize = 32;
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
 /// trivially small.
 pub const MAX_ALIAS_BYTES: usize = 128;
-/// Media PoC bound (contract revision 1.8, implementation-plan §4.7): 5 MiB
-/// raw is the largest size whose standard base64 encoding stays a deliberate
-/// margin under the engine's 8 MiB upstream stdout line limit — a longer
-/// line faults the shared engine (oversized-output semantics). The task
-/// allowed up to 10 MiB, but 10 MiB raw is ~13.7 MiB base64: incompatible.
-pub const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
+/// Attachment size budget (contract revision 1.16, implementation-plan
+/// §4.15): the official clients' 100 MiB ceiling. The engine's upstream line
+/// limit and the host frame budget move with it (both 160 MiB, see lib.rs
+/// DEFAULT_UPSTREAM_LINE_LIMIT / DEFAULT_HOST_FRAME_LIMIT) so one maximum
+/// attachment's base64 always fits a single line/frame.
+pub const MAX_ATTACHMENT_BYTES: usize = 100 * 1024 * 1024;
 /// Encoded length of [`MAX_ATTACHMENT_BYTES`]: 4 * ceil(n / 3), the exact
 /// padded-base64 length java.util.Base64 emits.
 const MAX_ATTACHMENT_BASE64_CHARS: usize = 4 * MAX_ATTACHMENT_BYTES.div_ceil(3);
@@ -139,6 +139,11 @@ impl ServiceError {
 }
 
 #[derive(Clone, Debug)]
+// The reactions projection (contract 1.16) makes `MessageUpserted` the large
+// variant. Events are transient and single-consumer on an in-process lane, so
+// boxing every payload to appease the size lint would trade a real allocation
+// per message event for nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum HostSideEvent {
     StorageChanged {
         state: &'static str,
@@ -941,6 +946,7 @@ impl ConnectorService {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         let inserted =
             self.store
@@ -1068,13 +1074,18 @@ impl ConnectorService {
         text: &str,
     ) -> Result<Option<MessageRecord>, ServiceError> {
         let text_bytes = text.len().min(u32::MAX as usize) as u32;
-        Ok(self.store.apply_outgoing_edit(
+        let mut record = self.store.apply_outgoing_edit(
             message_id,
             account_id,
             conversation_id,
             text,
             text_bytes,
-        )?)
+        )?;
+        if let Some(record) = record.as_mut() {
+            self.store
+                .attach_reactions(account_id, std::slice::from_mut(record))?;
+        }
+        Ok(record)
     }
 
     /// Pure local validation for `messages.remoteDelete` (docs/remote-delete-l2-plan.md §3.2):
@@ -1231,7 +1242,7 @@ impl ConnectorService {
         if size_bytes == 0 || size_bytes as usize > MAX_ATTACHMENT_BYTES {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "sizeBytes must be between 1 and 5242880",
+                "sizeBytes must be between 1 and 104857600",
                 false,
             )));
         }
@@ -1268,7 +1279,7 @@ impl ConnectorService {
         // the outcome is final and must never be auto-retried. The schema has
         // no dedicated code for this; the closest existing one is
         // SEND_OUTCOME_UNKNOWN with retryable=false.
-        let (updated, status_transitioned) = self
+        let mut updated = self
             .store
             .complete_outgoing_send(pending_id, account_id, conversation_id, sent_at)?
             .ok_or_else(|| {
@@ -1278,6 +1289,9 @@ impl ConnectorService {
                     false,
                 ))
             })?;
+        self.store
+            .attach_reactions(account_id, std::slice::from_mut(&mut updated.0))?;
+        let (updated, status_transitioned) = updated;
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             updated.clone(),
         ))];
@@ -1451,6 +1465,7 @@ impl ConnectorService {
             quote_snapshot: receive.quote,
             attachments: receive.attachments,
             edited_at: None,
+            reactions: Vec::new(),
         };
         let preview = message
             .text
@@ -1591,7 +1606,13 @@ impl ConnectorService {
                             &new_text,
                             new_bytes,
                         )? {
-                            Some(record) => Ok(vec![HostSideEvent::MessageUpserted(record)]),
+                            Some(mut record) => {
+                                self.store.attach_reactions(
+                                    &account.id,
+                                    std::slice::from_mut(&mut record),
+                                )?;
+                                Ok(vec![HostSideEvent::MessageUpserted(record)])
+                            }
                             None => Ok(Vec::new()),
                         }
                     }
@@ -1606,7 +1627,13 @@ impl ConnectorService {
                             &new_text,
                             new_bytes,
                         )? {
-                            Some(record) => Ok(vec![HostSideEvent::MessageUpserted(record)]),
+                            Some(mut record) => {
+                                self.store.attach_reactions(
+                                    &account.id,
+                                    std::slice::from_mut(&mut record),
+                                )?;
+                                Ok(vec![HostSideEvent::MessageUpserted(record)])
+                            }
                             None => Ok(Vec::new()),
                         }
                     }
@@ -2126,7 +2153,7 @@ pub fn validate_attachment_payload(
     if base64_data.len() > MAX_ATTACHMENT_BASE64_CHARS {
         return Err(ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
-            "attachment exceeds the 5242880-byte PoC limit",
+            "attachment exceeds the 104857600-byte limit",
             false,
         )));
     }
@@ -2311,7 +2338,7 @@ fn build_attachment_data_uri(
     filename: Option<&str>,
     content_type: Option<&str>,
 ) -> Result<String, ServiceError> {
-    let mut decoded = Vec::with_capacity(MAX_ATTACHMENT_BYTES);
+    let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
         ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
@@ -3928,7 +3955,9 @@ mod tests {
             (2, "YWI="),
             (3, "YWJj"),
             (
-                (MAX_ATTACHMENT_BYTES - 2) as u64, // largest 3-divisible size at the bound
+                // Largest 3-divisible size at the bound, encoded as unpadded
+                // 4-char groups (holds for any MAX modulo 3).
+                (MAX_ATTACHMENT_BYTES - MAX_ATTACHMENT_BYTES % 3) as u64,
                 &"QUJD".repeat(MAX_ATTACHMENT_BYTES / 3),
             ),
         ] {

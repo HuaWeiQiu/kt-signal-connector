@@ -619,6 +619,42 @@ Settlement mirrors `messages.sendText`: on confirmed success the row's body is r
 indeterminate outcome answers `SEND_OUTCOME_UNKNOWN` with the local row unchanged. No
 auto-retry.
 
+### 4.15 Attachment budget to official scale + reaction aggregate projection (contract revision 1.16, 2026-09-23)
+
+Two alignment changes with the official clients' behavior, both host-visible without new
+methods or events.
+
+**Attachment size budget.** `messages.attachments.send` lifts the deliberate PoC ceiling from
+5 MiB to the official 100 MiB (104857600 bytes, the same budget Signal Desktop enforces). The
+four framing constants move together so one attachment never overruns its container:
+
+| Constant | Value | Role |
+| --- | --- | --- |
+| `MAX_ATTACHMENT_BYTES` (service) | 104857600 | declared + validated attachment payload |
+| `DEFAULT_HOST_FRAME_LIMIT` (lib) | 167772160 (160 MiB) | one inbound host frame |
+| `DEFAULT_UPSTREAM_LINE_LIMIT` (lib) | 167772160 (160 MiB) | one signal-cli JSON-RPC line |
+| `MAX_PENDING_HOST_BYTES` (host) | 184549376 (176 MiB) | in-flight frame accumulation pool |
+
+The base64 expansion of a 100 MiB attachment (~134 MiB) plus its JSON wrapper fits the 160 MiB
+frame/line limits; the host pool holds one full frame plus overhead. `build_attachment_data_uri`
+now sizes its buffer from the actual base64 length instead of preallocating the maximum. The
+schema's `sizeBytes` maximums and the `attachments.get`/`attachments.send` descriptions state
+the same budget. Upstream acceptance of very large payloads still depends on the pinned
+signal-cli reader (§6.7 boundary unchanged: bytes are never persisted connector-side).
+
+**Reaction pills in the message projection.** `MessageRecord` gains `reactions`:
+`[{emoji, count, mine}]`, aggregated from `message_events` rows (`removed=0`, grouped by emoji,
+`mine` marks the linked account's own reaction, oldest first). The field is always serialized —
+an empty array, never absent — so a host that merges upserted records into cached state
+replaces the whole list and never keeps a stale pill. Read paths (`messages.list`,
+`messages.get`) and every `message.upserted` event path (send settlement, edits in both
+directions) attach the aggregates; reaction add/remove itself notifies through
+`conversation.changed` only (§4.13 shape), and the host refreshes the open conversation from
+that event.
+
+The schema also gains the `conversation.typing` event entry (§4.13 shipped the event but
+omitted it from the schema enum; data `{accountId, conversationId, action: START|STOP}`).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

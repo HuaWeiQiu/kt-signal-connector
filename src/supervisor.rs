@@ -1781,6 +1781,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&expired, None, Some("body"), true)

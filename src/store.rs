@@ -305,6 +305,18 @@ pub struct ConversationSummary {
     pub pinned: bool,
 }
 
+/// One aggregated reaction pill projected onto a message row (contract
+/// 1.16): the emoji, how many distinct actors reacted, and whether this
+/// account is one of them. Derived from `message_events` at read time —
+/// never persisted on the message row itself.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionSummary {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRecord {
@@ -339,6 +351,10 @@ pub struct MessageRecord {
     /// 1.15). Absent on rows never edited.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<u64>,
+    /// Aggregated active reaction pills (contract 1.16), derived from
+    /// `message_events` at read time. Always serialized so host-side row
+    /// merges stay total (an absent key would never clear stale pills).
+    pub reactions: Vec<MessageReactionSummary>,
 }
 
 /// Inbound quote snapshot stored on the quoted-by message row (same wire
@@ -1173,34 +1189,38 @@ impl Store {
         };
         let before_sent_at = anchor.as_ref().map(|value| value.0);
         let before_id = anchor.as_ref().map(|value| value.1.as_str());
-        let conn = self.lock_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
-                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
-                 FROM messages
-                 WHERE account_id=?1 AND conversation_id=?2
-                   AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
-                 ORDER BY sent_at DESC, id DESC
-                 LIMIT ?5",
-            )
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let rows = stmt
-            .query_map(
-                params![
-                    account_id,
-                    conversation_id,
-                    before_sent_at,
-                    before_id,
-                    fetch as i64
-                ],
-                message_record_from_row,
-            )
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let mut items = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Scoped guard: the page query's connection lock must be released
+        // before the reaction aggregation re-enters the store (a std Mutex
+        // is not reentrant — attach_reactions takes the lock itself).
+        let mut items = {
+            let conn = self.lock_conn()?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                            body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                            quote_snapshot, attachments_json, edited_at
+                     FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2
+                       AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
+                     ORDER BY sent_at DESC, id DESC
+                     LIMIT ?5",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        account_id,
+                        conversation_id,
+                        before_sent_at,
+                        before_id,
+                        fetch as i64
+                    ],
+                    message_record_from_row,
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
             items
@@ -1209,6 +1229,7 @@ impl Store {
         } else {
             None
         };
+        self.attach_reactions(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -1236,7 +1257,8 @@ impl Store {
         conversation_id: &str,
         message_id: &str,
     ) -> Result<Option<MessageRecord>, StoreError> {
-        self.lock_conn()?
+        let mut record = self
+            .lock_conn()?
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
@@ -1246,7 +1268,11 @@ impl Store {
                 message_record_from_row,
             )
             .optional()
-            .map_err(|error| StoreError::Unavailable(Some(error)))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if let Some(record) = record.as_mut() {
+            self.attach_reactions(account_id, std::slice::from_mut(record))?;
+        }
+        Ok(record)
     }
 
     pub fn message_by_signal_identity(
@@ -1781,6 +1807,74 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Active reaction aggregates for one conversation, keyed by the target
+    /// message's upstream timestamp (contract 1.16): per emoji the distinct
+    /// actor count and whether this account reacted. Rows flagged `removed`
+    /// are excluded — a removed reaction stops counting. Ordered by first
+    /// reaction time so pill order is stable across refreshes.
+    pub fn reaction_aggregates_for_conversation(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<std::collections::HashMap<u64, Vec<MessageReactionSummary>>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT target_timestamp, emoji, COUNT(*) AS cnt,
+                        MAX(CASE WHEN actor_id = ?1 THEN 1 ELSE 0 END) AS mine
+                 FROM message_events
+                 WHERE account_id=?2 AND conversation_id=?3
+                   AND kind='reaction' AND removed=0
+                 GROUP BY target_timestamp, emoji
+                 ORDER BY MIN(updated_at) ASC, emoji ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, account_id, conversation_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u64,
+                    MessageReactionSummary {
+                        emoji: row.get(1)?,
+                        count: row.get::<_, i64>(2)?.max(0) as u32,
+                        mine: row.get::<_, i64>(3)? != 0,
+                    },
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut grouped: std::collections::HashMap<u64, Vec<MessageReactionSummary>> =
+            std::collections::HashMap::new();
+        for item in rows {
+            let (target, summary) = item.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            grouped.entry(target).or_default().push(summary);
+        }
+        Ok(grouped)
+    }
+
+    /// Attach reaction aggregates onto message rows by their `sent_at`
+    /// (message_events key the target by the upstream timestamp, which is
+    /// exactly `messages.sent_at`). Read paths and event paths both call
+    /// this so every projected row carries current pills.
+    pub fn attach_reactions(
+        &self,
+        account_id: &str,
+        records: &mut [MessageRecord],
+    ) -> Result<(), StoreError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let conversation_id = records[0].conversation_id.clone();
+        let grouped = self.reaction_aggregates_for_conversation(account_id, &conversation_id)?;
+        if grouped.is_empty() {
+            return Ok(());
+        }
+        for record in records.iter_mut() {
+            if let Some(reactions) = grouped.get(&record.sent_at) {
+                record.reactions = reactions.clone();
+            }
+        }
+        Ok(())
     }
 
     /// Mark a pending outgoing row sent. Returns the updated row and whether
@@ -2875,6 +2969,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default(),
         edited_at: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
+        reactions: Vec::new(),
     })
 }
 
@@ -2938,6 +3033,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         assert!(
             store
@@ -2990,6 +3086,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(
@@ -3081,6 +3178,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
 
         assert!(matches!(
@@ -3140,6 +3238,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("hello"), true)
@@ -3204,6 +3303,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("control notice"), false)
@@ -3252,6 +3352,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("body"), false)
@@ -3324,6 +3425,7 @@ mod tests {
                 quote_snapshot: None,
                 attachments: Vec::new(),
                 edited_at: None,
+                reactions: Vec::new(),
             };
             store
                 .insert_message(&message, None, Some(id), false)
@@ -3392,6 +3494,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&changed, None, Some("newer-message-2"), false)
@@ -3434,6 +3537,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&other_message, None, Some("other-message"), false)
@@ -3514,6 +3618,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store.insert_message(&message, None, None, false).unwrap();
 
@@ -4072,6 +4177,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -4135,6 +4241,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -4218,6 +4325,7 @@ mod tests {
                     quote_snapshot: None,
                     attachments: Vec::new(),
                     edited_at: None,
+                    reactions: Vec::new(),
                 };
                 store
                     .insert_message(&message, None, Some("body"), true)
@@ -4358,6 +4466,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, Some("request-pending"), Some("body"), false)
@@ -4422,6 +4531,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&recent, None, Some("body"), true)
@@ -4481,6 +4591,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -4543,6 +4654,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            reactions: Vec::new(),
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -4930,5 +5042,124 @@ mod tests {
         unsafe { std::env::set_var(STORE_KEY_ENV, valid.to_uppercase()) };
         assert!(matches!(store_key_from_env(), Err(StoreKeyError::Invalid)));
         unsafe { std::env::remove_var(STORE_KEY_ENV) };
+    }
+
+    fn seeded_outgoing_message(
+        store: &Store,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        sent_at: u64,
+    ) {
+        let message = MessageRecord {
+            id: message_id.into(),
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sent_at,
+            received_at: None,
+            text: Some("hello".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            reactions: Vec::new(),
+        };
+        store
+            .insert_message(&message, None, Some("hello"), false)
+            .unwrap();
+    }
+
+    #[test]
+    fn reaction_aggregates_attach_to_message_projections() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let other_conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
+            .unwrap();
+        seeded_outgoing_message(&store, &account.id, &conversation.id, "m-target", 100);
+        seeded_outgoing_message(&store, &account.id, &other_conversation.id, "m-other", 100);
+
+        // A fresh row projects an empty (but present) reaction list.
+        let record = store
+            .message_by_id(&account.id, &conversation.id, "m-target")
+            .unwrap()
+            .unwrap();
+        assert!(record.reactions.is_empty());
+        let page = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        assert!(page.items[0].reactions.is_empty());
+
+        // Two peers plus the linked account react 👍; another peer adds ❤️.
+        // One reaction per actor per target (official semantics): a second
+        // emoji from the same actor replaces the first.
+        store
+            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, "peer-1", false)
+            .unwrap();
+        store
+            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, "peer-2", false)
+            .unwrap();
+        store
+            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, &account.id, false)
+            .unwrap();
+        store
+            .upsert_reaction_event(&account.id, &conversation.id, "❤️", 100, "peer-3", false)
+            .unwrap();
+
+        let record = store
+            .message_by_id(&account.id, &conversation.id, "m-target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.reactions.len(), 2);
+        let thumbs = record
+            .reactions
+            .iter()
+            .find(|summary| summary.emoji == "👍")
+            .unwrap();
+        assert_eq!(thumbs.count, 3);
+        assert!(thumbs.mine);
+        let heart = record
+            .reactions
+            .iter()
+            .find(|summary| summary.emoji == "❤️")
+            .unwrap();
+        assert_eq!(heart.count, 1);
+        assert!(!heart.mine);
+
+        // The same-timestamp row in another conversation stays untouched.
+        let other = store
+            .message_by_id(&account.id, &other_conversation.id, "m-other")
+            .unwrap()
+            .unwrap();
+        assert!(other.reactions.is_empty());
+
+        // The linked account removes its 👍: count drops and `mine` clears.
+        store
+            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, &account.id, true)
+            .unwrap();
+        let record = store
+            .message_by_id(&account.id, &conversation.id, "m-target")
+            .unwrap()
+            .unwrap();
+        let thumbs = record
+            .reactions
+            .iter()
+            .find(|summary| summary.emoji == "👍")
+            .unwrap();
+        assert_eq!(thumbs.count, 2);
+        assert!(!thumbs.mine);
     }
 }
