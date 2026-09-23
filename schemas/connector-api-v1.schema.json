@@ -53,7 +53,6 @@
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
-            "messages.attachments.get",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
@@ -218,17 +217,6 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendReactionParams" }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": { "method": { "const": "messages.attachments.get" } },
-            "required": ["method"]
-          },
-          "then": {
-            "properties": {
-              "params": { "$ref": "#/$defs/messagesAttachmentsGetParams" }
             }
           }
         },
@@ -517,34 +505,11 @@
         "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },
-    "messagesAttachmentsGetParams": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["accountId", "conversationId", "messageId", "attachmentId", "sizeBytes"],
-      "description": "Fetch one attachment that is already stored in the local signal-cli data directory and return it base64-encoded in the response, the token-for-bytes downgrade the media contract allows when streaming is not implemented. The connector downloads nothing on its own: it never enables attachment fetching upstream, and an attachment signal-cli has not downloaded answers UPSTREAM_ERROR. Because the payload crosses the JSON-RPC host frame, the attachment must be at most 100 MiB (104857600 bytes) — aligned with the official Signal attachment ceiling; the frame budget that carries it is 160 MiB on the host socket (DEFAULT_HOST_FRAME_LIMIT), the pinned signal-cli stdin/stdout line limit (DEFAULT_UPSTREAM_LINE_LIMIT, also 160 MiB), and the in-flight host byte pool (MAX_PENDING_HOST_BYTES, 176 MiB) so one maximum attachment plus regular traffic always fits. The caller must pass the size it expects from the message metadata; a mismatch answers INVALID_REQUEST instead of returning a payload the host did not budget for. The response is {attachmentId, data}; the local messages row is never modified and no event is emitted.",
-      "properties": {
-        "accountId": { "$ref": "#/$defs/opaqueId" },
-        "conversationId": { "$ref": "#/$defs/opaqueId" },
-        "messageId": { "$ref": "#/$defs/opaqueId" },
-        "attachmentId": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 128,
-          "description": "The upstream attachment id from the received message's attachment metadata (the pinned signal-cli jsonRpc receive field `id`)."
-        },
-        "sizeBytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 104857600,
-          "description": "The attachment size the caller expects, from the message attachment metadata. Enforced deterministically before any upstream read: a different actual size answers INVALID_REQUEST."
-        }
-      }
-    },
     "messagesAttachmentsOpenParams": {
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "messageId", "attachmentId"],
-      "description": "Open a chunked stream for one already-downloaded attachment (ADR 0002, contract revision 1.17). The (accountId, conversationId, messageId) triple resolves against the store exactly as in messages.attachments.get — a bogus conversation or message answers CONVERSATION_NOT_FOUND / MESSAGE_NOT_FOUND before any file is touched. The attachmentId must be a bare file name (the id field of the received message's attachment metadata): any id containing '/' or '\\\\', or any id that resolves to '' / '.' / '..' under the upstream sanitizeId transform ([^A-Za-z0-9_.-] replaced by '_'), answers INVALID_REQUEST before the filesystem is touched, so a hostile id cannot path-traverse. A file signal-cli has not downloaded — or that the media governor already deleted — answers UPSTREAM_ERROR; the two are deliberately indistinguishable. Without the launcher-level --media-ingest opt-in every media method answers CAPABILITY_UNAVAILABLE. The response is {mediaHandle, sizeBytes, chunkBytes}: mediaHandle is an unguessable 128-bit token bound to this resolved tuple (300 s TTL, at most 8 live handles per account, released early by messages.attachments.closeHandle), sizeBytes is the locally measured file size, and chunkBytes is the raw chunk size (262144) every readChunk offset advances by.",
+      "description": "Open a chunked stream for one already-downloaded attachment (ADR 0002, contract revision 1.17). The (accountId, conversationId, messageId) triple resolves against the store before any file is touched — a bogus conversation or message answers CONVERSATION_NOT_FOUND / MESSAGE_NOT_FOUND. The attachmentId must be a bare file name (the id field of the received message's attachment metadata): any id containing '/' or '\\\\', or any id that resolves to '' / '.' / '..' under the upstream sanitizeId transform ([^A-Za-z0-9_.-] replaced by '_'), answers INVALID_REQUEST before the filesystem is touched, so a hostile id cannot path-traverse. A file signal-cli has not downloaded — or that the media governor already deleted — answers UPSTREAM_ERROR; the two are deliberately indistinguishable. Without the launcher-level --media-ingest opt-in every media method answers CAPABILITY_UNAVAILABLE. The response is {mediaHandle, sizeBytes, chunkBytes}: mediaHandle is an unguessable 128-bit token bound to this resolved tuple (300 s TTL, at most 8 live handles per account, released early by messages.attachments.closeHandle), sizeBytes is the locally measured file size, and chunkBytes is the raw chunk size (262144) every readChunk offset advances by.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -584,7 +549,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "clientRequestId", "dataBase64", "sizeBytes"],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13, budget raised to the official 100 MiB ceiling in 1.16): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the same bound as messages.attachments.get). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13, budget raised to the official 100 MiB ceiling in 1.16): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },

@@ -201,7 +201,6 @@ mod tests {
             ("conversations.list", "read"),
             ("messages.list", "read"),
             ("messages.getText", "read"),
-            ("messages.attachments.get", "read"),
             ("messages.sendText", "send"),
             ("messages.remoteDelete", "send"),
             ("messages.sendReaction", "send"),

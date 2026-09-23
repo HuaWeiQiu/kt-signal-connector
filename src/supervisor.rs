@@ -16,10 +16,9 @@ use crate::engine::{
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AttachmentPayload, AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails,
-    HostSideEvent, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget,
-    PreparedSend, SendTarget, ServiceError, account_limit_error,
-    validate_account_delete_operation_id, validate_attachment_payload,
+    AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget, PreparedSend,
+    SendTarget, ServiceError, account_limit_error, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
@@ -1346,48 +1345,6 @@ impl RuntimeSupervisor {
             Err(EngineError::UnknownOutcome) => Ok(None),
             Err(error) => Err(error.into()),
         }
-    }
-
-    /// Media PoC (contract revision 1.8): read one already-downloaded
-    /// attachment as base64 through the upstream `getAttachment` local read —
-    /// no download, no mutation, no local write, no event. The declared
-    /// `sizeBytes` is re-verified against the returned payload before it
-    /// reaches the host (implementation-plan §4.7); a mismatch answers
-    /// INVALID_REQUEST instead of shipping an unbudgeted payload.
-    pub async fn get_attachment(
-        &self,
-        account_id: String,
-        conversation_id: String,
-        message_id: String,
-        attachment_id: String,
-        size_bytes: u64,
-    ) -> Result<AttachmentPayload, ServiceError> {
-        let engine = self.running_engine().await?;
-        let prepared = {
-            let service = self.service.lock().await;
-            service.prepare_get_attachment(
-                &account_id,
-                &conversation_id,
-                &message_id,
-                &attachment_id,
-                size_bytes,
-            )?
-        };
-        let result = engine
-            .call("getAttachment", prepared.params, CallClass::ReadOnly)
-            .await?;
-        // The upstream jsonRpc response is {"data": "<base64>"}
-        // (JsonAttachmentData); anything else is an upstream protocol error.
-        let data = result
-            .get("data")
-            .and_then(Value::as_str)
-            .ok_or(EngineError::Protocol)?;
-        let payload = AttachmentPayload {
-            attachment_id: prepared.attachment_id,
-            data: data.to_string(),
-        };
-        validate_attachment_payload(&payload.data, size_bytes)?;
-        Ok(payload)
     }
 
     /// Media ingest (ADR 0002, contract revision 1.17): open a chunk stream

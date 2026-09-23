@@ -569,15 +569,3 @@ pub use platform::{LocalListener, LocalStream};
 
 #[cfg(windows)]
 pub use platform::harden_private_directory;
-
-/// Shared helper for packaging docs/tests: describe the platform endpoint shape.
-pub fn endpoint_kind() -> &'static str {
-    #[cfg(unix)]
-    {
-        "unix-socket"
-    }
-    #[cfg(windows)]
-    {
-        "named-pipe"
-    }
-}

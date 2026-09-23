@@ -29,9 +29,8 @@ use crate::service::{
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesGetAttachmentParams, MessagesListParams, MessagesRemoteDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendReactionParams, MessagesSendTextParams,
-    PresenceSetTypingMessageParams, SendTarget,
+    MessagesListParams, MessagesRemoteDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendReactionParams, MessagesSendTextParams, PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
@@ -1196,25 +1195,6 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.sendReaction params",
-                        false,
-                    ),
-                ),
-            }
-        }
-        "messages.attachments.get" => {
-            match serde_json::from_value::<MessagesGetAttachmentParams>(request.params) {
-                Ok(params) => match runtime.get_attachment(params).await {
-                    Ok(payload) => HostResponse::success(
-                        request_id,
-                        serde_json::to_value(payload).unwrap_or(Value::Null),
-                    ),
-                    Err(error) => HostResponse::failure(request_id, error.into_api()),
-                },
-                Err(_) => HostResponse::failure(
-                    request_id,
-                    ApiError::new(
-                        "INVALID_REQUEST",
-                        "invalid messages.attachments.get params",
                         false,
                     ),
                 ),

@@ -656,7 +656,7 @@ impl ConnectorService {
 
     /// Account → conversation → message in wire order, for the
     /// message-addressed trio (`messages.remoteDelete`, `messages.sendReaction`,
-    /// `messages.attachments.get`).
+    /// `messages.attachments.open`).
     fn resolve_target(
         &self,
         account_id: &str,
@@ -1317,67 +1317,13 @@ impl ConnectorService {
         })
     }
 
-    /// Pure local validation for `messages.attachments.get`
-    /// (docs/implementation-plan.md §4.7, upstream `getAttachment`): resolve
-    /// the addressed rows and build the exact upstream jsonRpc params. The
-    /// connector persists no attachment metadata this revision, so the
-    /// attachment id cannot be validated against the message row — the caller
-    /// learns ids out of band (PoC boundary, §4.7). The row lookups keep the
-    /// addressing honest: a bogus conversation or message answers
-    /// CONVERSATION_NOT_FOUND / MESSAGE_NOT_FOUND before any upstream call.
-    pub fn prepare_get_attachment(
-        &self,
-        account_id: &str,
-        conversation_id: &str,
-        message_id: &str,
-        attachment_id: &str,
-        size_bytes: u64,
-    ) -> Result<PreparedGetAttachment, ServiceError> {
-        validate_opaque_id(account_id, "accountId")?;
-        validate_opaque_id(conversation_id, "conversationId")?;
-        validate_opaque_id(message_id, "messageId")?;
-        if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
-            return Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "attachmentId must contain between 1 and 128 bytes",
-                false,
-            )));
-        }
-        if size_bytes == 0 || size_bytes as usize > MAX_ATTACHMENT_BYTES {
-            return Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "sizeBytes must be between 1 and 104857600",
-                false,
-            )));
-        }
-        let (account, _conversation, _message) =
-            self.resolve_target(account_id, conversation_id, message_id)?;
-        // signal-cli JSON-RPC getAttachment parameters (verified against the
-        // pinned 0.14.7 distribution: GetAttachmentCommand reads only `id` in
-        // jsonRpc mode — the CLI-side recipient/group-id flags never reach the
-        // local-command handler — and AttachmentStore.retrieveAttachment is a
-        // pure local file read): `account` is consumed by the upstream
-        // multi-account dispatcher, `id` addresses the already-downloaded file.
-        Ok(PreparedGetAttachment {
-            account_id: account_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-            message_id: message_id.to_string(),
-            attachment_id: attachment_id.to_string(),
-            params: json!({
-                "account": account.signal_account,
-                "id": attachment_id,
-            }),
-        })
-    }
-
     /// messages.attachments.open (ADR 0002, contract revision 1.17): resolve
-    /// the addressed rows exactly like `prepare_get_attachment`, then locate
-    /// the already-downloaded file in the engine's data directory and mint a
-    /// short-lived chunk-stream handle for it. The addressing resolves before
-    /// any file is touched, the id passes the sanitizeId-parity gate before
-    /// any path join, and a missing file answers UPSTREAM_ERROR —
-    /// not-downloaded and governor-deleted are deliberately
-    /// indistinguishable, exactly as with `messages.attachments.get`.
+    /// the addressed rows, then locate the already-downloaded file in the
+    /// engine's data directory and mint a short-lived chunk-stream handle for
+    /// it. The addressing resolves before any file is touched, the id passes
+    /// the sanitizeId-parity gate before any path join, and a missing file
+    /// answers UPSTREAM_ERROR — not-downloaded and governor-deleted are
+    /// deliberately indistinguishable (ADR 0002).
     pub fn open_media_handle(
         &self,
         account_id: &str,
@@ -1955,28 +1901,6 @@ pub struct PreparedSendReaction {
     pub params: Value,
 }
 
-/// Everything the supervisor needs to run one upstream `getAttachment` call,
-/// produced by the pure local `prepare_get_attachment` validation.
-#[derive(Debug)]
-pub struct PreparedGetAttachment {
-    pub account_id: String,
-    pub conversation_id: String,
-    pub message_id: String,
-    pub attachment_id: String,
-    pub params: Value,
-}
-
-/// The attachment payload the host receives (contract revision 1.8): the
-/// upstream base64 passthrough, verified against the declared size. The
-/// upstream jsonRpc response is exactly `{"data": "<base64>"}` (JsonAttachmentData);
-/// `attachmentId` echoes the request so a caller can correlate parallel fetches.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AttachmentPayload {
-    pub attachment_id: String,
-    pub data: String,
-}
-
 /// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
 /// unguessable 128-bit handle bound to the resolved
 /// (account, conversation, message, attachment) tuple, the file size the
@@ -2188,20 +2112,10 @@ pub struct MessagesSendReactionParams {
     pub operation_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MessagesGetAttachmentParams {
-    pub account_id: String,
-    pub conversation_id: String,
-    pub message_id: String,
-    pub attachment_id: String,
-    pub size_bytes: u64,
-}
-
-/// messages.attachments.open params (ADR 0002): the same addressing triple
-/// as `messages.attachments.get`, plus the attachment id from the message's
-/// received metadata. There is no caller-declared sizeBytes: the file size is
-/// measured locally and reported back, never trusted from the wire.
+/// messages.attachments.open params (ADR 0002): the message-addressing triple
+/// plus the attachment id from the message's received metadata. There is no
+/// caller-declared sizeBytes: the file size is measured locally and reported
+/// back, never trusted from the wire.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesAttachmentsOpenParams {
@@ -4203,87 +4117,6 @@ mod tests {
         assert!(service.complete_send_unknown("absent").unwrap().is_empty());
     }
 
-    /// messages.attachments.get prepare (contract revision 1.8): the upstream
-    /// params are exactly `account` + `id`; the addressed conversation and
-    /// message rows must exist (deterministic NOT_FOUND answers before any
-    /// upstream call); the declared size and the attachment id shape are
-    /// bounded before anything is dispatched (implementation-plan §4.7).
-    #[test]
-    fn prepare_get_attachment_builds_upstream_params_and_enforces_bounds() {
-        let (_temp, service) = service();
-        let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
-            .unwrap()
-            .remove(0);
-        let direct = service
-            .store_ref()
-            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
-            .unwrap();
-        let sent_id = match service
-            .prepare_send_text(&account.id, &direct.id, "has attachment", "req-att-1", None)
-            .unwrap()
-        {
-            PreparedSend::Dispatch { pending_id, .. } => pending_id,
-            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
-        };
-        service
-            .complete_send_success(&sent_id, &account.id, &direct.id, 800)
-            .unwrap();
-
-        let prepared = service
-            .prepare_get_attachment(&account.id, &direct.id, &sent_id, "att-1", 24)
-            .unwrap();
-        assert_eq!(prepared.params["account"], json!("+15555550100"));
-        assert_eq!(prepared.params["id"], json!("att-1"));
-        assert_eq!(prepared.attachment_id, "att-1");
-        assert_eq!(prepared.conversation_id, direct.id);
-        assert_eq!(prepared.message_id, sent_id);
-
-        // Missing rows answer deterministically before any upstream call.
-        for (conversation_id, message_id, expected) in [
-            (
-                "no-such-conversation",
-                sent_id.as_str(),
-                "CONVERSATION_NOT_FOUND",
-            ),
-            (direct.id.as_str(), "no-such-message", "MESSAGE_NOT_FOUND"),
-        ] {
-            let error = service
-                .prepare_get_attachment(&account.id, conversation_id, message_id, "att-1", 24)
-                .unwrap_err()
-                .into_api();
-            assert_eq!(error.code, expected);
-        }
-        let error = service
-            .prepare_get_attachment("no-such-account", &direct.id, &sent_id, "att-1", 24)
-            .unwrap_err()
-            .into_api();
-        assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
-
-        // Shape bounds: attachment id, declared size.
-        for (attachment_id, size_bytes) in [
-            ("", 24_u64),
-            (&"a".repeat(257), 24),
-            ("att-1", 0),
-            ("att-1", (MAX_ATTACHMENT_BYTES + 1) as u64),
-        ] {
-            let error = service
-                .prepare_get_attachment(
-                    &account.id,
-                    &direct.id,
-                    &sent_id,
-                    attachment_id,
-                    size_bytes,
-                )
-                .unwrap_err()
-                .into_api();
-            assert_eq!(
-                error.code, "INVALID_REQUEST",
-                "{attachment_id} {size_bytes}"
-            );
-            assert!(!error.retryable);
-        }
-    }
     /// The returned payload must be standard padded base64 decoding to
     /// exactly the declared size (contract revision 1.8): the encoded length
     /// is bounded before any allocation, and the padding arithmetic matches
@@ -5298,9 +5131,8 @@ mod tests {
         )
     }
 
-    /// Addressing rows for one account, mirroring the
-    /// `prepare_get_attachment` test setup: account → direct conversation →
-    /// one completed outgoing message.
+    /// Addressing rows for one account, mirroring the media-open test setup:
+    /// account → direct conversation → one completed outgoing message.
     fn addressed_message(
         service: &ConnectorService,
         number: &str,
@@ -5442,9 +5274,8 @@ mod tests {
         assert_eq!(error.code, "INVALID_REQUEST");
     }
 
-    /// A missing file answers UPSTREAM_ERROR, exactly like the pre-PoC
-    /// `messages.attachments.get`: not-downloaded and governor-deleted are
-    /// indistinguishable (ADR 0002).
+    /// A missing file answers UPSTREAM_ERROR: not-downloaded and
+    /// governor-deleted are indistinguishable (ADR 0002).
     #[test]
     fn media_open_answers_upstream_error_when_the_file_is_absent() {
         let (_temp, service) = media_service();

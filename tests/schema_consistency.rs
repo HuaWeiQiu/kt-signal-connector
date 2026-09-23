@@ -343,14 +343,9 @@ fn schema_numeric_bounds_match_code_constants() {
             MAX_EMOJI_BYTES as u64,
         ),
         (
-            "/$defs/messagesAttachmentsGetParams/properties/attachmentId",
+            "/$defs/messagesAttachmentsOpenParams/properties/attachmentId",
             "maxLength",
             MAX_ATTACHMENT_ID_BYTES as u64,
-        ),
-        (
-            "/$defs/messagesAttachmentsGetParams/properties/sizeBytes",
-            "maximum",
-            MAX_ATTACHMENT_BYTES as u64,
         ),
         (
             "/$defs/messagesSendAttachmentParams/properties/dataBase64",

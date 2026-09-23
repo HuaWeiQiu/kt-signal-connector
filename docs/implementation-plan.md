@@ -340,7 +340,14 @@ end; design rationale and the upstream-verification notes live in `docs/remote-d
   serialize), the delete drain barrier, and the per-account request budget. Metrics classify it
   as `send`.
 
-### 4.7 messages.attachments.get (contract revision 1.8, 2026-09-03)
+### 4.7 messages.attachments.get (contract revision 1.8, 2026-09-03; **retired with 1.20, 2026-09-24**)
+
+> **Retired (contract 1.20).** The chunked media triple (ADR 0002: `messages.attachments.open`
+> / `readChunk` / `closeHandle`) replaced the one-shot base64 reader as the only inbound
+> attachment channel; the method, its params `$def`, its lane-table entry, and the fixture
+> `getAttachment` handler were removed in the same batch. The history below is kept for
+> context; `validate_attachment_payload` and the 100 MiB budget constants survive because the
+> send path and the chunked channel still enforce them.
 
 API `1.0` evolves in place again (§4.5/§4.6 precedent); the apiVersion handshake binding is
 unchanged. The method is additive and advertised through the handshake `capabilities` array —
@@ -657,6 +664,27 @@ that event.
 The schema also gains the `conversation.typing` event entry (§4.13 shipped the event but
 omitted it from the schema enum; data `{accountId, conversationId, action: START|STOP}`).
 
+### 4.16 Retire messages.attachments.get (contract revision 1.20, 2026-09-24)
+
+The desktop contract (kt-desktop `contracts/signal-host-adapter.md` 1.20) removes
+`getAttachmentSessionMessage` / `messages.attachments.get`: the ADR 0002 chunked triple
+(§4.15-era media PoC, contract revision 1.17) has been the default inbound-attachment channel
+since 1.17 and the one-shot base64 path only added a second code path to validate (whole
+payload through one host frame, no chunk budget). Removal is symmetric across both repos:
+
+- host: dispatch branch, `MessagesGetAttachmentParams`, service `prepare_get_attachment`,
+  supervisor `get_attachment` (the only upstream `getAttachment` call), registry router,
+  lane-table entry, metrics label, schema method enum + `messagesAttachmentsGetParams` `$def`
+  + if/then binding, and the fixture's `getAttachment` handler.
+- kept on purpose: `validate_attachment_payload` / `MAX_ATTACHMENT_BASE64_CHARS` (send path),
+  `sanitize_attachment_id` (open path), and all budget constants — the chunked channel and
+  the send path still enforce them.
+
+Failure-shape coverage moves with the replacement: NOT_FOUND-before-upstream addressing and
+sanitize/path-traversal rejection are asserted on `messages.attachments.open`
+(`open_media_handle`, integration + unit tests), and the upstream base64 passthrough test was
+deleted with the method.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -904,6 +932,9 @@ now contribute bounded attachment **metadata only** (§4.13) — descriptors are
 message row while `--ignore-attachments` keeps byte download, disk pressure, and
 `messages.attachments.get` answering `UPSTREAM_ERROR` exactly as before. A media capability
 change still requires the dedicated bounded-download PoC this section demands.
+(2026-09-24, contract 1.20: the one-shot `messages.attachments.get` reader itself was removed
+after the PoC landed — §4.16; the boundary statement now lives entirely in the chunked
+channel's gating.)
 
 That PoC is now designed: `docs/adr/0002-media-ingest-poc.md` (2026-09-23) defines the
 opt-in `--media-ingest` spawn flag, a quota+TTL media governor, and chunked handle

@@ -44,10 +44,11 @@ pub const METHODS: &[MethodRow] = &[
     ("messages.edit", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
-    ("messages.attachments.get", Lane::Read, false, "read"),
     // Media ingest (ADR 0002): the chunked streaming triple rides the READ
-    // lane like `messages.attachments.get` — one bounded chunk per call, no
-    // mutation, no upstream traffic.
+    // lane — one bounded chunk per call, no mutation, no upstream traffic.
+    // The one-shot base64 reader (`messages.attachments.get`, contract 1.10
+    // PoC) was retired with contract 1.20; the chunked triple is the only
+    // inbound-attachment channel.
     ("messages.attachments.open", Lane::Read, false, "read"),
     ("messages.attachments.readChunk", Lane::Read, false, "read"),
     (
@@ -117,7 +118,6 @@ mod tests {
             "conversations.list",
             "messages.list",
             "messages.getText",
-            "messages.attachments.get",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",

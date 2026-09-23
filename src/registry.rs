@@ -656,22 +656,6 @@ impl ProxyGroupRuntime {
             .await
     }
 
-    pub async fn get_attachment(
-        &self,
-        params: crate::service::MessagesGetAttachmentParams,
-    ) -> Result<crate::service::AttachmentPayload, ServiceError> {
-        let slot = self.slot_for_account(&params.account_id).await?;
-        slot.supervisor
-            .get_attachment(
-                params.account_id,
-                params.conversation_id,
-                params.message_id,
-                params.attachment_id,
-                params.size_bytes,
-            )
-            .await
-    }
-
     /// Media ingest (ADR 0002): `open` routes by account like every other
     /// account-addressed method, so the file resolves in the owning group's
     /// data directory.
