@@ -128,6 +128,11 @@ impl ServiceError {
             ServiceError::Engine(EngineError::Upstream) => {
                 ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true)
             }
+            ServiceError::Engine(EngineError::Unauthorized) => ApiError::new(
+                "ACCOUNT_UNLINKED",
+                "device was unlinked by the account holder",
+                false,
+            ),
             ServiceError::Engine(EngineError::Backpressure) => {
                 ApiError::new("INTERNAL_ERROR", "signal-cli request queue is full", true)
             }
@@ -1472,6 +1477,21 @@ impl ConnectorService {
         ))
     }
 
+    /// Contract 1.21: the engine classified an upstream authorization failure
+    /// for `signal_account` — the account holder unlinked this device. Persist
+    /// the dead state and surface it as an `account.changed` event so the
+    /// host can auto-release stale session bindings. Unknown numbers (row
+    /// already deleted) are a no-op.
+    pub fn mark_account_device_unlinked(
+        &self,
+        signal_account: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) = self.store.mark_account_device_unlinked(signal_account)? else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::AccountChanged(account)])
+    }
+
     pub fn complete_send_failed(
         &self,
         pending_id: &str,
@@ -2807,6 +2827,54 @@ mod tests {
         assert!(service.delete_account_local(&account.id).unwrap());
         assert!(!service.delete_account_local(&account.id).unwrap());
         assert!(service.cancel_link(&link_session_id).is_ok());
+    }
+
+    /// Contract 1.21: marking an unlinked device persists `device_unlinked`
+    /// and surfaces an account.changed event; unknown numbers are a no-op.
+    #[test]
+    fn mark_account_device_unlinked_persists_and_emits_account_changed() {
+        let (_temp, service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], group)
+            .unwrap()
+            .remove(0);
+
+        let events = service
+            .mark_account_device_unlinked("+15555550100")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let HostSideEvent::AccountChanged(changed) = &events[0] else {
+            panic!("expected an account.changed event");
+        };
+        assert_eq!(changed.id, account.id);
+        assert_eq!(changed.state, "device_unlinked");
+
+        let listed = service
+            .list_accounts_in_group(group)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == account.id)
+            .unwrap();
+        assert_eq!(listed.state, "device_unlinked");
+
+        // A number with no account row is a silent no-op.
+        assert!(
+            service
+                .mark_account_device_unlinked("+15555559999")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The wire error for a rejected credential is ACCOUNT_UNLINKED
+    /// (retryable=false) — distinct from the generic retryable upstream
+    /// error, so hosts can distinguish "device was unlinked" from noise.
+    #[test]
+    fn unauthorized_engine_errors_map_to_account_unlinked() {
+        let api = ServiceError::Engine(EngineError::Unauthorized).into_api();
+        assert_eq!(api.code, "ACCOUNT_UNLINKED");
+        assert!(!api.retryable);
     }
 
     #[test]

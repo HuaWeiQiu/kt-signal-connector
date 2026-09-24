@@ -58,6 +58,7 @@ DELETED_MARKER = SIGNAL_DATA_DIR / ".fixture-account-deleted"
 STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
 FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
 FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-count"
+AUTH_FAILED_MARKER = SIGNAL_DATA_DIR / ".fixture-auth-failed-user-status"
 SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
@@ -435,6 +436,20 @@ for line in sys.stdin:
         emit_stderr_websocket_error()
         result = {"method": method}
     elif method == "getUserStatus":
+        if AUTH_FAILED_MARKER.exists():
+            # Contract 1.21: the account holder unlinked this device. The
+            # real upstream wraps AuthorizationFailedException in an
+            # UnexpectedErrorException (-32603) with this message shape.
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Failed to send message: Authorization failed! (AuthorizationFailedException)",
+                },
+            }
+            emit_json(response)
+            continue
         if FAIL_USER_STATUS_MARKER.exists():
             response = {
                 "jsonrpc": "2.0",

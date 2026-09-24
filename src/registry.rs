@@ -272,6 +272,11 @@ impl ProxyGroupRuntime {
             EngineEvent::StorageChanged { state } => {
                 let _ = self.events.send(RegistryEvent::StorageChanged { state });
             }
+            EngineEvent::AccountUnauthorized { .. } => {
+                // Contract 1.21: handled by the supervisor's account-unlink
+                // watcher, which owns the service handle; the registry has
+                // nothing to forward for it.
+            }
         }
     }
 

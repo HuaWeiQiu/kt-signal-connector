@@ -180,6 +180,46 @@ async fn watchdog_restarts_engine_after_repeated_ping_failures() {
     supervisor.shutdown().await.unwrap();
 }
 
+/// Contract 1.21: an authorization-failed ping means the account holder
+/// unlinked this device. The credential is dead — restarting cannot fix it —
+/// so the engine pid must stay put while the supervisor's account watcher
+/// marks the account `device_unlinked` in the shared store.
+#[tokio::test]
+async fn unauthorized_ping_marks_account_device_unlinked_without_restart() {
+    let temp = TempDir::new().unwrap();
+    {
+        let seed = test_store(temp.path());
+        seed.upsert_account_from_signal(
+            "+15555550100",
+            Some(1),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap();
+    }
+    let (supervisor, data_dir) = watchdog_supervisor(&temp);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join(".fixture-auth-failed-user-status"), "").unwrap();
+
+    let pid = supervisor.start().await.unwrap().pid.unwrap();
+    // Several watchdog ticks: auth failures never count as ping failures.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        supervisor.status().await.pid,
+        Some(pid),
+        "a dead credential must not churn engine restarts"
+    );
+
+    let store = test_store(temp.path());
+    let account = store
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.state == "device_unlinked")
+        .expect("auth-failed ping must mark the account device_unlinked");
+    assert_eq!(account.unread_count, 0);
+    supervisor.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn watchdog_leaves_a_healthy_engine_alone() {
     let temp = TempDir::new().unwrap();

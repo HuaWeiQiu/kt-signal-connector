@@ -685,6 +685,43 @@ sanitize/path-traversal rejection are asserted on `messages.attachments.open`
 (`open_media_handle`, integration + unit tests), and the upstream base64 passthrough test was
 deleted with the method.
 
+### 4.17 Device-unlink detection and account recovery (contract revision 1.21, 2026-09-24)
+
+The desktop contract (kt-desktop `contracts/signal-host-adapter.md` 1.21) adds a joint
+recovery path for the case where the phone unlinking a linked device leaves stale local
+state on both sides. Previously the engine kept pinging a dead link forever, the supervisor
+kept restarting it (ping failures looked like any other engine failure), and the desktop
+surfaced a permanent `ACCOUNT_BOUND` wall with no way forward from the UI.
+
+Connector behavior, all inside the existing process/watchdog boundary (no new IPC method):
+
+- upstream error classification: engine responses carrying
+  `AuthorizationFailedException` / `Authorization failed` map to
+  `EngineError::Unauthorized` instead of a generic upstream error.
+- attribution: because `send`-family failures arrive without a caller context, the engine
+  attaches the owning account (from the request params' `account` field) to the failure and
+  emits a new internal `AccountUnauthorized { account }` event; requests with no account
+  attribution stay unclassified.
+- durable state: `store.mark_account_device_unlinked` moves the account to a new
+  `device_unlinked` static state (guarded against clobbering an in-flight `unlinking`);
+  the service turns the store result into host-side `account.changed` events so the
+  desktop sees the transition.
+- watchdog: an `Unauthorized` ping result resets the failure counter and does NOT restart
+  the engine — restarting cannot fix a phone-side unlink and only burns the episode
+  budget. The account-unlink watch loop (spawned in `Supervisor::new`, aborted on drop)
+  consumes `AccountUnauthorized` events; the registry router deliberately ignores them
+  (no-op arm) so harnesses without a registry still exercise the real path.
+- wire surface: error enum gains `ACCOUNT_UNLINKED` (`retryable: false`). The upstream
+  classification, the store state, and the wire code are covered by unit tests, the
+  `fake-signal-cli` `.fixture-auth-failed-user-status` marker, and a
+  `supervisor_watchdog` integration test asserting the account flips state without a
+  restart.
+
+Desktop-side obligations (same revision): the `device_unlinked` state enters the wire
+state enum; linking over a dead owner binding auto-cleans (unbind + local-data purge only
+when the collision is a different account id) and proceeds; deleting a session purges its
+connector session via the host adapter.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

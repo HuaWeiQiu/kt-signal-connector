@@ -265,6 +265,8 @@ pub enum EngineError {
     Protocol,
     #[error("signal-cli returned an error")]
     Upstream,
+    #[error("signal-cli rejected the device credentials")]
+    Unauthorized,
 }
 
 impl EngineError {
@@ -280,6 +282,7 @@ impl EngineError {
             EngineError::Exited => "exited",
             EngineError::Protocol => "protocol",
             EngineError::Upstream => "upstream",
+            EngineError::Unauthorized => "unauthorized",
         }
     }
 }
@@ -309,6 +312,14 @@ pub enum EngineEvent {
     /// serializes it as the existing `runtime.storageChanged` event.
     StorageChanged {
         state: &'static str,
+    },
+    /// The Signal server rejected a request because the account holder
+    /// unlinked this device on their phone (contract 1.21). `account` is the
+    /// signal-cli account number from the failed request's params; requests
+    /// without one cannot be attributed and only fail with
+    /// [`EngineError::Unauthorized`].
+    AccountUnauthorized {
+        account: String,
     },
 }
 
@@ -869,6 +880,9 @@ enum EngineCommand {
 
 struct PendingRequest {
     class: CallClass,
+    /// signal-cli account param of the in-flight request, when present — used
+    /// solely to attribute upstream authorization failures (contract 1.21).
+    account: Option<String>,
     response: oneshot::Sender<Result<Value, EngineError>>,
 }
 
@@ -939,7 +953,11 @@ async fn run_actor(
                         encoded.push(b'\n');
                         match write_tx.try_send(encoded) {
                             Ok(()) => {
-                                pending.insert(id, PendingRequest { class, response });
+                                let account = params
+                                    .get("account")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                pending.insert(id, PendingRequest { class, account, response });
                             }
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 // The child's stdin pipe and the writer queue
@@ -1163,12 +1181,39 @@ async fn handle_upstream_line(
         return Err(EngineError::Protocol);
     }
     if has_error {
-        let _ = request.response.send(Err(EngineError::Upstream));
+        if upstream_error_is_unauthorized(object.get("error")) {
+            if let Some(account) = &request.account {
+                let _ = events.send(EngineEvent::AccountUnauthorized {
+                    account: account.clone(),
+                });
+            }
+            let _ = request.response.send(Err(EngineError::Unauthorized));
+        } else {
+            let _ = request.response.send(Err(EngineError::Upstream));
+        }
     } else {
         let result = object.get("result").cloned().unwrap_or(Value::Null);
         let _ = request.response.send(Ok(result));
     }
     Ok(())
+}
+
+/// signal-cli wraps transport failures as UnexpectedErrorException whose
+/// message embeds the upstream cause class. A device unlinked on the phone
+/// (contract 1.21) surfaces as AuthorizationFailedException / "Authorization
+/// failed!" on the next network call, and this is the single observation
+/// point that still sees the raw upstream error body — everything above the
+/// engine boundary stays content-free. A local-only failure (e.g. listAccounts
+/// never touches the network) cannot match, so the classification is safe to
+/// trust as "the server rejected this device's credentials".
+fn upstream_error_is_unauthorized(error: Option<&Value>) -> bool {
+    error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(|message| {
+            message.contains("AuthorizationFailedException")
+                || message.contains("Authorization failed")
+        })
 }
 
 fn envelope_peer_source(envelope: &serde_json::Map<String, Value>) -> Option<String> {
@@ -2338,5 +2383,75 @@ mod tests {
             event_rx.recv().await.unwrap(),
             EngineEvent::StorageChanged { state: "recovered" }
         ));
+    }
+
+    /// contract 1.21: an upstream error carrying the unlink signature is
+    /// classified as Unauthorized and attributed to the request's account.
+    #[tokio::test]
+    async fn unauthorized_error_response_is_classified_and_attributed() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-1".to_string(),
+            PendingRequest {
+                class: CallClass::ReadOnly,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-1",
+            "error": {
+                "code": -32603,
+                "message": "Failed to send message: Authorization failed! (AuthorizationFailedException)"
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Unauthorized));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::AccountUnauthorized { ref account } if account == "+15555550100"
+        ));
+    }
+
+    /// Any other upstream error keeps the generic Upstream classification and
+    /// must not emit an account event.
+    #[tokio::test]
+    async fn generic_upstream_error_stays_unclassified() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-2".to_string(),
+            PendingRequest {
+                class: CallClass::ReadOnly,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-2",
+            "error": { "code": -1, "message": "User input error (UserErrorException)" }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
+        assert!(event_rx.try_recv().is_err());
     }
 }

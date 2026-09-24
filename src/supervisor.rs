@@ -95,6 +95,9 @@ pub struct RuntimeSupervisor {
     receive_worker: JoinHandle<()>,
     /// Receive-liveness watchdog; never held across an await.
     watchdog: StdMutex<Option<JoinHandle<()>>>,
+    /// Engine-event watcher marking device-unlinked accounts (contract 1.21);
+    /// never held across an await.
+    account_unlink_worker: JoinHandle<()>,
     /// One-shot history retention pass; never held across an await.
     retention: StdMutex<Option<JoinHandle<()>>>,
     /// One-shot media governor pass (ADR 0002: once per process start);
@@ -138,6 +141,14 @@ impl RuntimeSupervisor {
             group_id.clone(),
             media.as_ref().map(|media| media.governor().clone()),
         ));
+        // Contract 1.21: authorization failures observed on this group's
+        // engine mark the dead account in the shared store and surface it on
+        // the host lane (account.changed).
+        let account_unlink_worker = tokio::spawn(account_unlink_watch_loop(
+            events.subscribe(),
+            service.clone(),
+            host_events.clone(),
+        ));
         Self {
             config,
             group_id,
@@ -149,6 +160,7 @@ impl RuntimeSupervisor {
             host_events,
             receive_ingress,
             receive_worker,
+            account_unlink_worker,
             watchdog: StdMutex::new(None),
             retention: StdMutex::new(None),
             media_governor_pass: StdMutex::new(None),
@@ -786,6 +798,15 @@ impl RuntimeSupervisor {
                                 );
                                 pending = None;
                             }
+                        }
+                        Err(EngineError::Unauthorized) => {
+                            // Contract 1.21: the ping target's device was
+                            // unlinked by the account holder. The credential
+                            // is dead and no restart can resurrect it; the
+                            // account-unauthorized event has already marked
+                            // the account. Counting this as a ping failure
+                            // would only churn bounded restarts forever.
+                            ping_failures = 0;
                         }
                         Err(_) => {
                             ping_failures += 1;
@@ -1588,6 +1609,7 @@ impl RuntimeSupervisor {
 impl Drop for RuntimeSupervisor {
     fn drop(&mut self) {
         self.receive_worker.abort();
+        self.account_unlink_worker.abort();
         if let Ok(mut slot) = self.watchdog.lock()
             && let Some(handle) = slot.take()
         {
@@ -1652,6 +1674,42 @@ fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
             );
         }
     })
+}
+
+/// Contract 1.21: authorization failures observed on this group's engine mark
+/// the dead account in the shared store and surface it on the host lane
+/// (account.changed). The engine classifies the raw upstream error here —
+/// this loop never sees error content, only the attributed decision.
+async fn account_unlink_watch_loop(
+    mut engine_events: broadcast::Receiver<EngineEvent>,
+    service: Arc<Mutex<ConnectorService>>,
+    host_events: broadcast::Sender<HostSideEvent>,
+) {
+    loop {
+        match engine_events.recv().await {
+            Ok(EngineEvent::AccountUnauthorized { account }) => {
+                let marked = {
+                    let guard = service.lock().await;
+                    guard.mark_account_device_unlinked(&account)
+                };
+                match marked {
+                    Ok(events) => {
+                        for event in events {
+                            let _ = host_events.send(event);
+                        }
+                    }
+                    Err(error) => {
+                        // The state re-syncs on the next failure or list;
+                        // never take the watcher down over a store hiccup.
+                        tracing::warn!(error_class = error.class(), "device-unlinked mark failed");
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 async fn receive_persistence_loop(

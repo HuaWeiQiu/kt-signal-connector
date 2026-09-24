@@ -590,6 +590,31 @@ impl Store {
             .ok_or(StoreError::AccountNotFound)
     }
 
+    /// The Signal server rejected this device's credentials: the account
+    /// holder unlinked this device on their phone (contract 1.21). The local
+    /// credential is permanently dead — no engine restart can revive it — so
+    /// the row carries `device_unlinked` until a fresh link (which re-keys the
+    /// same unique-number row) or an explicit local-data delete removes it.
+    /// A logout already in flight (`unlinking`) is not overwritten.
+    /// `None` when no account row matches the signal-cli number.
+    pub fn mark_account_device_unlinked(
+        &self,
+        signal_account: &str,
+    ) -> Result<Option<AccountSummary>, StoreError> {
+        let Some(existing) = self.account_by_signal(signal_account)? else {
+            return Ok(None);
+        };
+        self.lock_conn()?
+            .execute(
+                "UPDATE accounts SET state='device_unlinked' WHERE id=?1 AND state != 'unlinking'",
+                params![existing.id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        self.account_summary(&existing.id)?
+            .map(Some)
+            .ok_or(StoreError::AccountNotFound)
+    }
+
     pub fn list_accounts(&self) -> Result<Vec<AccountSummary>, StoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn
@@ -2895,6 +2920,7 @@ fn static_state(value: String) -> &'static str {
         "reconnecting" => "reconnecting",
         "disabled" => "disabled",
         "unlinking" => "unlinking",
+        "device_unlinked" => "device_unlinked",
         _ => "error",
     }
 }
