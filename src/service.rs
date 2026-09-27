@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::engine::{ControlReceive, EngineError, NormalizedReceive};
+use crate::engine::{ControlReceive, EngineError, NormalizedReceive, truncate_utf8_bytes};
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
@@ -367,10 +367,6 @@ impl ConnectorService {
         Ok(self
             .store
             .set_account_display_name(account_id, display_name)?)
-    }
-
-    pub fn delete_account_local(&mut self, account_id: &str) -> Result<bool, ServiceError> {
-        Ok(self.store.delete_account_cascade(account_id)?)
     }
 
     pub fn prepare_account_delete(
@@ -2360,17 +2356,6 @@ fn project_message_for_host(mut message: MessageRecord) -> MessageRecord {
     message
 }
 
-fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut end = max_bytes;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
-}
-
 fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
     if value.is_empty() || value.len() > MAX_OPAQUE_ID_BYTES {
         return Err(ServiceError::Api(ApiError::new(
@@ -2431,7 +2416,7 @@ fn sanitize_attachment_id(attachment_id: &str) -> Result<String, ServiceError> {
 /// (contract revision 1.8): anything else means the host budgeted for a
 /// different payload. Encoding length is checked first so a hostile upstream
 /// response cannot inflate memory before the byte budget is confirmed.
-pub fn validate_attachment_payload(
+fn validate_attachment_payload(
     base64_data: &str,
     expected_size_bytes: u64,
 ) -> Result<(), ServiceError> {
@@ -2867,8 +2852,18 @@ mod tests {
             .unwrap();
         let link_session_id = started["linkSessionId"].as_str().unwrap().to_string();
 
-        assert!(service.delete_account_local(&account.id).unwrap());
-        assert!(!service.delete_account_local(&account.id).unwrap());
+        assert!(
+            service
+                .store_ref()
+                .delete_account_cascade(&account.id)
+                .unwrap()
+        );
+        assert!(
+            !service
+                .store_ref()
+                .delete_account_cascade(&account.id)
+                .unwrap()
+        );
         assert!(service.cancel_link(&link_session_id).is_ok());
     }
 
@@ -3141,7 +3136,7 @@ mod tests {
     /// never INTERNAL_ERROR with retryable=true on a mutating operation.
     #[test]
     fn missing_pending_row_at_send_completion_is_final_not_retryable() {
-        let (_temp, mut service) = service();
+        let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
@@ -3160,7 +3155,12 @@ mod tests {
 
         // The deletion race: the account rows disappear while the upstream
         // send is still in flight.
-        assert!(service.delete_account_local(&account.id).unwrap());
+        assert!(
+            service
+                .store_ref()
+                .delete_account_cascade(&account.id)
+                .unwrap()
+        );
 
         let error = service
             .complete_send_success(&pending_id, &account.id, &conversation.id, 100)

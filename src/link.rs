@@ -34,6 +34,9 @@ impl ActiveLinkSession {
         &self.device_link_uri
     }
 
+    /// Test-only drain used by the zeroize-on-drop check; production reads
+    /// the URI through [`ActiveLinkSession::qr_payload`].
+    #[cfg(test)]
     pub fn take_device_link_uri(&mut self) -> String {
         std::mem::take(&mut self.device_link_uri)
     }

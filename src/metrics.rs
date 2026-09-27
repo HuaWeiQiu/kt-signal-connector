@@ -20,11 +20,6 @@ pub const METHOD_CLASSES: [&str; 7] = [
     "control", "accounts", "link", "read", "send", "contacts", "unknown",
 ];
 
-/// Bounded result classification (plan §8 "result classes"): `ok`, `rejected`
-/// (deterministic non-retryable refusal), `failed` (retryable failure), and
-/// `unknown` (a mutating call whose outcome cannot be determined).
-pub const RESULT_CLASSES: [&str; 4] = ["ok", "rejected", "failed", "unknown"];
-
 /// Fixed metrics label for one method (plan §8 "method categories"),
 /// derived from the single method table (`methods::METHODS`). The raw method
 /// string comes from the peer and is never used as a label.

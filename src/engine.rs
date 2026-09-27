@@ -1251,7 +1251,7 @@ struct NormalizedText {
     truncated: bool,
 }
 
-fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }

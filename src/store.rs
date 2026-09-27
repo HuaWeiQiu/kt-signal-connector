@@ -1793,9 +1793,9 @@ impl Store {
         Ok(())
     }
 
-    /// Reaction events for one conversation, newest first, bounded. Served to
-    /// the host alongside the message page so reactions render without a
-    /// second round trip per message.
+    /// Test-only projection of the raw reaction rows; production serves the
+    /// aggregated `attach_reactions` pill list instead.
+    #[cfg(test)]
     pub fn list_reaction_events(
         &self,
         account_id: &str,
@@ -2297,6 +2297,9 @@ impl Store {
         Ok(value.and_then(|value| value.parse::<u64>().ok()))
     }
 
+    /// Test-only wrapper; production writes the marker inside the
+    /// `upsert_synced_contacts` transaction.
+    #[cfg(test)]
     pub fn set_contacts_synced_at(
         &self,
         account_id: &str,
