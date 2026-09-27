@@ -558,10 +558,7 @@ impl ConnectorService {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<ConversationSummary>, ServiceError> {
-        if self.store.account_by_id(account_id)?.is_none() {
-            return Err(ServiceError::Store(StoreError::AccountNotFound));
-        }
-        Ok(self.store.list_conversations(account_id, limit, cursor)?)
+        store_list_conversations(&self.store, account_id, limit, cursor)
     }
 
     /// Read-only view of the contacts cache; never touches the upstream engine.
@@ -572,14 +569,7 @@ impl ConnectorService {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<Page<ContactSummary>, ServiceError> {
-        if self.store.account_by_id(account_id)?.is_none() {
-            return Err(ServiceError::Store(StoreError::AccountNotFound));
-        }
-        let query = query.map(str::trim).filter(|value| !value.is_empty());
-        if let Some(query) = query {
-            validate_opaque_id(query, "query")?;
-        }
-        Ok(self.store.list_contacts(account_id, query, limit, cursor)?)
+        store_list_contacts(&self.store, account_id, query, limit, cursor)
     }
 
     /// Read-only projection of one cached group row (contract revision 1.9,
@@ -593,30 +583,7 @@ impl ConnectorService {
         account_id: &str,
         group_key: &str,
     ) -> Result<GroupDetails, ServiceError> {
-        validate_opaque_id(account_id, "accountId")?;
-        validate_opaque_id(group_key, "groupKey")?;
-        if self.store.account_by_id(account_id)?.is_none() {
-            return Err(ServiceError::Store(StoreError::AccountNotFound));
-        }
-        let Some((title, extra, synced_at)) =
-            self.store.contact_by_peer(account_id, "group", group_key)?
-        else {
-            return Err(ServiceError::Api(ApiError::new(
-                "GROUP_NOT_FOUND",
-                "no cached group row for this accountId and groupKey",
-                false,
-            )));
-        };
-        let member_count = extra
-            .as_deref()
-            .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
-            .and_then(|extra| extra.get("memberCount").and_then(Value::as_u64));
-        Ok(GroupDetails {
-            peer_key: group_key.to_string(),
-            title,
-            member_count,
-            synced_at,
-        })
+        store_get_group(&self.store, account_id, group_key)
     }
 
     // --- Shared target resolution for the prepare_* family -----------------
@@ -777,29 +744,7 @@ impl ConnectorService {
         limit: u32,
         before: Option<&str>,
     ) -> Result<Page<MessageRecord>, ServiceError> {
-        if self.store.account_by_id(account_id)?.is_none() {
-            return Err(ServiceError::Store(StoreError::AccountNotFound));
-        }
-        if self
-            .store
-            .conversation_by_id(account_id, conversation_id)?
-            .is_none()
-        {
-            return Err(ServiceError::Store(StoreError::ConversationNotFound));
-        }
-        // Viewing the thread marks it read (local badge only; no Signal receipt RPC yet).
-        let _ = self
-            .store
-            .clear_conversation_unread(account_id, conversation_id)?;
-        let mut page = self
-            .store
-            .list_messages(account_id, conversation_id, limit, before)?;
-        page.items = page
-            .items
-            .into_iter()
-            .map(project_message_for_host)
-            .collect();
-        Ok(page)
+        store_list_messages(&self.store, account_id, conversation_id, limit, before)
     }
 
     pub fn get_message_text(
@@ -808,32 +753,7 @@ impl ConnectorService {
         conversation_id: &str,
         message_id: &str,
     ) -> Result<MessageText, ServiceError> {
-        validate_opaque_id(account_id, "accountId")?;
-        validate_opaque_id(conversation_id, "conversationId")?;
-        validate_opaque_id(message_id, "messageId")?;
-        let message = self
-            .store
-            .message_by_id(account_id, conversation_id, message_id)?
-            .ok_or(StoreError::MessageNotFound)?;
-        if !message.text_retrievable {
-            return Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "complete message text is unavailable",
-                false,
-            )));
-        }
-        let text = message.text.ok_or_else(|| {
-            ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "message has no text body",
-                false,
-            ))
-        })?;
-        Ok(MessageText {
-            message_id: message.id,
-            text_bytes: message.text_bytes.unwrap_or(text.len() as u32),
-            text,
-        })
+        store_get_message_text(&self.store, account_id, conversation_id, message_id)
     }
 
     pub fn prepare_send_text(
@@ -1845,6 +1765,129 @@ impl ConnectorService {
             }
         }
     }
+}
+
+// Store-backed read paths below: the single implementation behind the
+// matching [`ConnectorService`] methods and the supervisor's `spawn_blocking`
+// lane over the shared `Arc<Store>` (no service lock involved).
+
+pub(crate) fn store_list_conversations(
+    store: &Store,
+    account_id: &str,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<Page<ConversationSummary>, ServiceError> {
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    Ok(store.list_conversations(account_id, limit, cursor)?)
+}
+
+pub(crate) fn store_list_contacts(
+    store: &Store,
+    account_id: &str,
+    query: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<Page<ContactSummary>, ServiceError> {
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(query) = query {
+        validate_opaque_id(query, "query")?;
+    }
+    Ok(store.list_contacts(account_id, query, limit, cursor)?)
+}
+
+pub(crate) fn store_get_group(
+    store: &Store,
+    account_id: &str,
+    group_key: &str,
+) -> Result<GroupDetails, ServiceError> {
+    validate_opaque_id(account_id, "accountId")?;
+    validate_opaque_id(group_key, "groupKey")?;
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    let Some((title, extra, synced_at)) = store.contact_by_peer(account_id, "group", group_key)?
+    else {
+        return Err(ServiceError::Api(ApiError::new(
+            "GROUP_NOT_FOUND",
+            "no cached group row for this accountId and groupKey",
+            false,
+        )));
+    };
+    let member_count = extra
+        .as_deref()
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|extra| extra.get("memberCount").and_then(Value::as_u64));
+    Ok(GroupDetails {
+        peer_key: group_key.to_string(),
+        title,
+        member_count,
+        synced_at,
+    })
+}
+
+pub(crate) fn store_list_messages(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    limit: u32,
+    before: Option<&str>,
+) -> Result<Page<MessageRecord>, ServiceError> {
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if store
+        .conversation_by_id(account_id, conversation_id)?
+        .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    // Viewing the thread marks it read (local badge only; no Signal receipt RPC yet).
+    let _ = store.clear_conversation_unread(account_id, conversation_id)?;
+    let mut page = store.list_messages(account_id, conversation_id, limit, before)?;
+    page.items = page
+        .items
+        .into_iter()
+        .map(project_message_for_host)
+        .collect();
+    Ok(page)
+}
+
+pub(crate) fn store_get_message_text(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    message_id: &str,
+) -> Result<MessageText, ServiceError> {
+    validate_opaque_id(account_id, "accountId")?;
+    validate_opaque_id(conversation_id, "conversationId")?;
+    validate_opaque_id(message_id, "messageId")?;
+    let message = store
+        .message_by_id(account_id, conversation_id, message_id)?
+        .ok_or(StoreError::MessageNotFound)?;
+    if !message.text_retrievable {
+        return Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "complete message text is unavailable",
+            false,
+        )));
+    }
+    let text = message.text.ok_or_else(|| {
+        ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "message has no text body",
+            false,
+        ))
+    })?;
+    Ok(MessageText {
+        message_id: message.id,
+        text_bytes: message.text_bytes.unwrap_or(text.len() as u32),
+        text,
+    })
 }
 
 /// The legacy sender identity a store generation may have written for this

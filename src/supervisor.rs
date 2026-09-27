@@ -18,11 +18,13 @@ use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
     MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget, PreparedSend,
-    SendTarget, ServiceError, account_limit_error, validate_account_delete_operation_id,
+    SendTarget, ServiceError, account_limit_error, store_get_group, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
-    Store, SyncedContact,
+    Store, StoreError, SyncedContact,
 };
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
@@ -83,6 +85,9 @@ pub struct RuntimeSupervisor {
     pub(crate) group_id: String,
     engine: Mutex<Option<EngineHandle>>,
     service: Arc<Mutex<ConnectorService>>,
+    /// Shared store handle for the store-only paths (retention, reads) that
+    /// run on the blocking pool without the service lock.
+    store: Arc<Store>,
     /// Media ingest backing (ADR 0002) when the launcher passed
     /// `--media-ingest`; drives the retention trigger and exists iff the
     /// service's own backing exists. Never held; `MediaGovernor` is a plain
@@ -130,7 +135,7 @@ impl RuntimeSupervisor {
             );
         }
         let service = Arc::new(Mutex::new(ConnectorService::with_media(
-            store,
+            Arc::clone(&store),
             media.clone(),
         )));
         let (receive_ingress, receive_rx) = receive_channel();
@@ -154,6 +159,7 @@ impl RuntimeSupervisor {
             group_id,
             engine: Mutex::new(None),
             service,
+            store,
             media,
             active_link_finish: Mutex::new(None),
             events,
@@ -206,16 +212,19 @@ impl RuntimeSupervisor {
         if slot.is_some() {
             return;
         }
-        let service = Arc::clone(&self.service);
+        let store = Arc::clone(&self.store);
         *slot = Some(tokio::spawn(async move {
             let now = crate::link::now_ms();
             let mut removed = 0_u64;
             loop {
-                let outcome = service
-                    .lock()
-                    .await
-                    .store_ref()
-                    .prune_history(now, RETENTION_BATCH_MESSAGES);
+                // Each batch runs on the blocking pool: rusqlite is
+                // synchronous and must never occupy a tokio worker thread.
+                let outcome = tokio::task::spawn_blocking({
+                    let store = Arc::clone(&store);
+                    move || store.prune_history(now, RETENTION_BATCH_MESSAGES)
+                })
+                .await
+                .unwrap_or(Err(StoreError::Unavailable(None)));
                 match outcome {
                     Ok(outcome) => {
                         removed += outcome.messages_deleted;
@@ -241,11 +250,9 @@ impl RuntimeSupervisor {
             // Phase 3: the one-time plaintext migration backup has its own
             // 7-day retention budget, pruned through this same once-per-start
             // batch pass.
-            match service
-                .lock()
+            match tokio::task::spawn_blocking(move || store.prune_expired_plaintext_backup(now))
                 .await
-                .store_ref()
-                .prune_expired_plaintext_backup(now)
+                .unwrap_or(Err(StoreError::Unavailable(None)))
             {
                 Ok(true) => tracing::info!("expired plaintext store backup removed"),
                 Ok(false) => {}
@@ -1030,10 +1037,12 @@ impl RuntimeSupervisor {
         // Best-effort title enrich only when masks remain — and at most every 60s
         // so poll/UI refresh does not hammer listContacts on the single JVM queue.
         let _ = self.enrich_conversation_titles_throttled(&account_id).await;
-        self.service
-            .lock()
-            .await
-            .list_conversations(&account_id, limit, cursor.as_deref())
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            store_list_conversations(&store, &account_id, limit, cursor.as_deref())
+        })
+        .await
     }
 
     /// Resolve human titles for direct chats still showing mask_address(peer).
@@ -1041,12 +1050,13 @@ impl RuntimeSupervisor {
         &self,
         account_id: &str,
     ) -> Result<(), ServiceError> {
-        let peers = {
-            let service = self.service.lock().await;
-            service
-                .store_ref()
-                .list_direct_peers_needing_title(account_id)?
-        };
+        let peers = tokio::task::spawn_blocking({
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            move || store.list_direct_peers_needing_title(&account_id)
+        })
+        .await
+        .unwrap_or(Err(StoreError::Unavailable(None)))?;
         if peers.is_empty() {
             return Ok(());
         }
@@ -1082,14 +1092,26 @@ impl RuntimeSupervisor {
             .await
             .map_err(ServiceError::Engine)?;
         let items = result.as_array().cloned().unwrap_or_default();
-        let service = self.service.lock().await;
-        for (peer_key, _title) in peers {
-            if let Some(name) = find_contact_display_name(&items, &peer_key) {
-                let _ = service
-                    .store_ref()
-                    .set_conversation_title_for_peer(account_id, "direct", &peer_key, &name);
+        // The row updates are store-only; they run batched on the blocking
+        // pool without the service lock.
+        tokio::task::spawn_blocking({
+            let store = Arc::clone(&self.store);
+            let account_id = account_id.to_string();
+            move || {
+                for (peer_key, _title) in peers {
+                    if let Some(name) = find_contact_display_name(&items, &peer_key) {
+                        let _ = store.set_conversation_title_for_peer(
+                            &account_id,
+                            "direct",
+                            &peer_key,
+                            &name,
+                        );
+                    }
+                }
             }
-        }
+        })
+        .await
+        .map_err(|_| StoreError::Unavailable(None))?;
         Ok(())
     }
 
@@ -1100,12 +1122,18 @@ impl RuntimeSupervisor {
         limit: u32,
         before: Option<String>,
     ) -> Result<Page<MessageRecord>, ServiceError> {
-        self.service.lock().await.list_messages(
-            &account_id,
-            &conversation_id,
-            limit,
-            before.as_deref(),
-        )
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            store_list_messages(
+                &store,
+                &account_id,
+                &conversation_id,
+                limit,
+                before.as_deref(),
+            )
+        })
+        .await
     }
 
     pub async fn get_message_text(
@@ -1114,10 +1142,12 @@ impl RuntimeSupervisor {
         conversation_id: String,
         message_id: String,
     ) -> Result<crate::service::MessageText, ServiceError> {
-        self.service
-            .lock()
-            .await
-            .get_message_text(&account_id, &conversation_id, &message_id)
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            store_get_message_text(&store, &account_id, &conversation_id, &message_id)
+        })
+        .await
     }
 
     pub async fn send_text(
@@ -1415,12 +1445,18 @@ impl RuntimeSupervisor {
         limit: u32,
         cursor: Option<String>,
     ) -> Result<Page<ContactSummary>, ServiceError> {
-        self.service.lock().await.list_contacts(
-            &account_id,
-            query.as_deref(),
-            limit,
-            cursor.as_deref(),
-        )
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            store_list_contacts(
+                &store,
+                &account_id,
+                query.as_deref(),
+                limit,
+                cursor.as_deref(),
+            )
+        })
+        .await
     }
 
     /// contacts.setLocalAlias (contract revision 1.10, implementation-plan
@@ -1481,7 +1517,9 @@ impl RuntimeSupervisor {
         account_id: String,
         group_key: String,
     ) -> Result<GroupDetails, ServiceError> {
-        self.service.lock().await.get_group(&account_id, &group_key)
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || store_get_group(&store, &account_id, &group_key)).await
     }
 
     /// Pull the contacts/groups signal-cli already synced from the primary
@@ -1628,6 +1666,22 @@ impl Drop for RuntimeSupervisor {
     }
 }
 
+/// Run one store-backed call on the blocking pool: rusqlite is synchronous
+/// and must never occupy a tokio worker thread. A blocking task that died
+/// without a result is a storage failure for the caller; the JoinError detail
+/// is never logged.
+async fn blocking_service<T>(
+    call: impl FnOnce() -> Result<T, ServiceError> + Send + 'static,
+) -> Result<T, ServiceError>
+where
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(call).await {
+        Ok(result) => result,
+        Err(_) => Err(ServiceError::Store(StoreError::Unavailable(None))),
+    }
+}
+
 /// Receive one stderr line, skipping lag gaps; None means the stream closed.
 /// Pends forever when there is no subscription, so select! can ignore the branch.
 async fn recv_stderr_line(rx: Option<&mut broadcast::Receiver<String>>) -> Option<String> {
@@ -1728,10 +1782,20 @@ async fn receive_persistence_loop(
         crate::metrics::receive_queue_drained();
         let mut retry_delay = RECEIVE_STORE_RETRY_MIN;
         loop {
-            let result = service
-                .lock()
-                .await
-                .ingest_receive(queued.receive().clone(), &owner_group);
+            // The ingest is a synchronous SQLite batch serialized under the
+            // service lock as before, but it runs on the blocking pool so a
+            // slow store never occupies a tokio worker thread.
+            let result = blocking_service({
+                let receive = queued.receive().clone();
+                let service = Arc::clone(&service);
+                let owner_group = owner_group.clone();
+                move || {
+                    service
+                        .blocking_lock()
+                        .ingest_receive(receive, &owner_group)
+                }
+            })
+            .await;
             match result {
                 Ok(events) => {
                     for event in events {
