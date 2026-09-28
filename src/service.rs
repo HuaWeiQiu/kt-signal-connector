@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::engine::{ControlReceive, EngineError, NormalizedReceive, truncate_utf8_bytes};
+use crate::engine::{
+    ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, truncate_utf8_bytes,
+};
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
@@ -780,6 +782,7 @@ impl ConnectorService {
             client_request_id,
             quote_message_id,
             None,
+            Vec::new(),
         )
     }
 
@@ -846,6 +849,7 @@ impl ConnectorService {
             client_request_id,
             quote_message_id,
             None,
+            Vec::new(),
         )
     }
 
@@ -856,7 +860,9 @@ impl ConnectorService {
     /// declared `sizeBytes` and re-encoded as an RFC 2397 data URI: upstream
     /// decodes it itself (AttachmentHelper, pinned 0.14.7), uploads via CDN,
     /// and owns any temp file lifetime — bytes never touch connector disk and
-    /// no caller-controlled path reaches upstream.
+    /// no caller-controlled path reaches upstream. The pending row carries the
+    /// metadata-only descriptor (same wire shape as inbound, contract 1.15) so
+    /// the host renders the outgoing attachment from its first tick.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_send_attachment(
         &self,
@@ -924,6 +930,19 @@ impl ConnectorService {
             }
         };
         let data_uri = build_attachment_data_uri(data_base64, filename, content_type)?;
+        // The pending row carries the same metadata-only descriptor the
+        // renderer projects (contract 1.15 wire shape), so the desktop bubble
+        // and conversation preview exist from the first pending tick instead
+        // of collapsing into an invisible empty row.
+        let descriptor = NormalizedAttachment {
+            id: stable_hash_id(&[account_id, client_request_id, "attachment", "0"]),
+            content_type: content_type.map(str::to_string),
+            filename: filename.map(str::to_string),
+            size: Some(size_bytes),
+            width: None,
+            height: None,
+            is_voice_note: false,
+        };
         self.dispatch_send(
             &account,
             &conversation,
@@ -931,9 +950,11 @@ impl ConnectorService {
             client_request_id,
             quote_message_id,
             Some(vec![json!(data_uri)]),
+            vec![descriptor],
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_send(
         &self,
         account: &AccountRow,
@@ -942,6 +963,7 @@ impl ConnectorService {
         client_request_id: &str,
         quote_message_id: Option<&str>,
         attachments: Option<Vec<Value>>,
+        attachment_descriptors: Vec<NormalizedAttachment>,
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
@@ -969,13 +991,25 @@ impl ConnectorService {
             client_request_id: Some(client_request_id.to_string()),
             quote_message_id: quote_message_id.map(str::to_string),
             quote_snapshot: None,
-            attachments: Vec::new(),
+            attachments: attachment_descriptors,
             edited_at: None,
             reactions: Vec::new(),
         };
-        let inserted =
-            self.store
-                .insert_message(&pending, Some(client_request_id), Some(text), false)?;
+        // Preview mirrors the visible row: the caption when present, else the
+        // attachment filename — never an empty string for an attachment send.
+        let preview = (!text.is_empty()).then(|| text.to_string()).or_else(|| {
+            pending
+                .attachments
+                .iter()
+                .find_map(|a| a.filename.as_deref().filter(|f| !f.is_empty()))
+                .map(str::to_string)
+        });
+        let inserted = self.store.insert_message(
+            &pending,
+            Some(client_request_id),
+            preview.as_deref(),
+            false,
+        )?;
         if !inserted {
             if let Some(existing) = self
                 .store
@@ -4460,8 +4494,44 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(matches!(replay, PreparedSend::Existing(_)));
+        // The stored row carries the metadata-only descriptor so the desktop
+        // renders the outgoing attachment from its first tick.
+        let PreparedSend::Existing(row) = &replay else {
+            panic!("expected the replayed existing row");
+        };
+        assert_eq!(row.attachments.len(), 1);
+        assert_eq!(row.attachments[0].filename.as_deref(), Some("notes.txt"));
+        assert_eq!(
+            row.attachments[0].content_type.as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(row.attachments[0].size, Some(16));
+        assert!(!row.attachments[0].is_voice_note);
+        assert_eq!(row.text.as_deref(), Some("see attachment"));
         let _ = pending_id;
+
+        // A caption-less attachment previews as the filename — never an
+        // empty preview the conversation list renders as blank.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-attach-3",
+                b64,
+                16,
+                Some("report.pdf"),
+                Some("application/pdf"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
+        let summary = service
+            .store
+            .conversation_summary(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.last_message_preview.as_deref(), Some("report.pdf"));
 
         // Unknown account and conversation answer their deterministic errors.
         let error = service

@@ -343,8 +343,9 @@ pub struct MessageRecord {
     /// bounded preview. Absent on rows without a quote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_snapshot: Option<MessageQuoteSnapshot>,
-    /// Inbound attachment descriptors (contract 1.15): metadata only, never
-    /// bytes. Absent on rows without attachments.
+    /// Attachment descriptors (metadata only, never bytes): inbound via
+    /// engine normalization, outbound via send-attachment descriptors. Absent
+    /// on rows without attachments.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachmentInfo>,
     /// Local wall-clock time the body was last edited upstream (contract
@@ -361,8 +362,8 @@ pub struct MessageRecord {
 /// shape the engine normalization produces).
 pub type MessageQuoteSnapshot = crate::engine::NormalizedQuote;
 
-/// One inbound attachment descriptor (metadata only, §4.13; same wire shape
-/// the engine normalization produces).
+/// One attachment descriptor (metadata only, §4.13; same wire shape the
+/// engine normalization produces — inbound and outbound sends alike).
 pub type MessageAttachmentInfo = crate::engine::NormalizedAttachment;
 
 #[derive(Clone, Debug, Serialize)]

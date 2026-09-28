@@ -554,9 +554,10 @@ call → `complete_send_success` / `complete_send_unknown` settlement.
 - Result: the sent `MessageRecord` (same projection as `sendText`) on upstream confirmation,
   or `SEND_OUTCOME_UNKNOWN` when the mutating outcome is indeterminate — identical settlement
   and no-auto-retry discipline as every other mutating send (§4.2). The pending row's `text`
-  is the caption (may be empty); attachment descriptors ride the upstream params only and are
-  not persisted as local attachment metadata this revision (receive normalization keeps none;
-  the desktop renders its own optimistic attachment bubble from its own send state).
+  is the caption (may be empty). The pending and sent rows carry the metadata-only attachment
+  descriptor (the inbound wire shape, contract 1.15) so the desktop renders the outgoing
+  attachment from its first tick, and the conversation preview falls back to the filename
+  when the caption is empty — never a blank preview for an attachment send.
 - Error mapping reuses existing codes only (zero new codes): `ACCOUNT_NOT_FOUND`,
   `CONVERSATION_NOT_FOUND`, `INVALID_REQUEST` (shape, base64 decode failure, size mismatch,
   bounds violations), `RUNTIME_NOT_RUNNING`, `UPSTREAM_EXITED`, `UPSTREAM_TIMEOUT`,
