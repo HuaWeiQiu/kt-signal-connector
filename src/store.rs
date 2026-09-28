@@ -298,6 +298,12 @@ pub struct ConversationSummary {
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_preview: Option<String>,
+    /// Contract 1.23: attachment category noun for the desktop list preview —
+    /// present only when the newest message is an attachment-only row (no
+    /// caption text). Text/caption and system endings stay `None`; the desktop
+    /// then falls back to `last_message_preview`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<u64>,
     pub unread_count: u32,
@@ -1156,6 +1162,7 @@ impl Store {
                         kind: static_kind(row.get::<_, String>(2)?),
                         title: row.get(3)?,
                         last_message_preview: row.get(4)?,
+                        last_message_kind: None,
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         muted: row.get::<_, i64>(7)? != 0,
@@ -1167,6 +1174,9 @@ impl Store {
         let mut items = rows
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        for item in &mut items {
+            item.last_message_kind = conversation_last_message_kind(&conn, &item.id)?;
+        }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
             items
@@ -1997,7 +2007,8 @@ impl Store {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationSummary>, StoreError> {
-        self.lock_conn()?
+        let conn = self.lock_conn()?;
+        let summary = conn
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, muted, pinned
@@ -2010,6 +2021,7 @@ impl Store {
                         kind: static_kind(row.get::<_, String>(2)?),
                         title: row.get(3)?,
                         last_message_preview: row.get(4)?,
+                        last_message_kind: None,
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         muted: row.get::<_, i64>(7)? != 0,
@@ -2018,7 +2030,14 @@ impl Store {
                 },
             )
             .optional()
-            .map_err(|error| StoreError::Unavailable(Some(error)))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        match summary {
+            Some(mut summary) => {
+                summary.last_message_kind = conversation_last_message_kind(&conn, conversation_id)?;
+                Ok(Some(summary))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Cache one full contacts sync in a single transaction: every entry is
@@ -2964,6 +2983,62 @@ fn static_status(value: String) -> &'static str {
     }
 }
 
+/// Contract 1.23: the desktop list renders the official attachment noun
+/// ("Photo" / "Video" / "Voice message" / "File") from
+/// `ConversationSummary::last_message_kind`. The newest row decides: an
+/// attachment-only ending (attachments present, no caption text) yields its
+/// first attachment's kind; a text/caption ending, a system row, or an empty
+/// conversation stays `None` — the caption wins over the noun, exactly like
+/// the official list preview.
+fn conversation_last_message_kind(
+    conn: &Connection,
+    conversation_id: &str,
+) -> Result<Option<&'static str>, StoreError> {
+    let latest = conn
+        .query_row(
+            "SELECT direction, body, attachments_json FROM messages
+             WHERE conversation_id=?1
+             ORDER BY sent_at DESC, id DESC
+             LIMIT 1",
+            params![conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let Some((direction, body, attachments_json)) = latest else {
+        return Ok(None);
+    };
+    let has_caption = body.is_some_and(|text| !text.trim().is_empty());
+    if direction == "system" || has_caption {
+        return Ok(None);
+    }
+    let attachments: Vec<crate::engine::NormalizedAttachment> = attachments_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+    let Some(first) = attachments.first() else {
+        return Ok(None);
+    };
+    let content_type = first.content_type.as_deref().unwrap_or_default();
+    Ok(Some(
+        if first.is_voice_note || content_type.starts_with("audio/") {
+            "audio"
+        } else if content_type.starts_with("image/") {
+            "image"
+        } else if content_type.starts_with("video/") {
+            "video"
+        } else {
+            "file"
+        },
+    ))
+}
+
 fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let text: Option<String> = row.get(7)?;
     let text_bytes = row
@@ -3085,6 +3160,114 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 10, None)
             .unwrap();
         assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn summary_last_message_kind_follows_official_noun_rules() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let mut clock = 0u64;
+        let mut push =
+            |direction: &'static str,
+             text: Option<&str>,
+             attachments: Vec<crate::engine::NormalizedAttachment>| {
+                clock += 1;
+                let message = MessageRecord {
+                    id: format!("m{clock}"),
+                    account_id: account.id.clone(),
+                    conversation_id: conversation.id.clone(),
+                    direction,
+                    sender_id: "peer".into(),
+                    sent_at: clock * 10,
+                    received_at: None,
+                    text: text.map(Into::into),
+                    text_bytes: None,
+                    text_truncated: false,
+                    text_retrievable: true,
+                    status: if direction == "system" {
+                        "system"
+                    } else {
+                        "sent"
+                    },
+                    client_request_id: None,
+                    quote_message_id: None,
+                    quote_snapshot: None,
+                    attachments,
+                    edited_at: None,
+                    reactions: Vec::new(),
+                };
+                store.insert_message(&message, None, text, false).unwrap();
+            };
+        let attachment =
+            |content_type: &str, is_voice_note: bool| crate::engine::NormalizedAttachment {
+                id: "a1".into(),
+                content_type: Some(content_type.into()),
+                filename: Some("file.bin".into()),
+                size: Some(8),
+                width: None,
+                height: None,
+                is_voice_note,
+            };
+        let kind = || {
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap()
+                .last_message_kind
+        };
+
+        // Empty conversation: no messages, no kind.
+        assert_eq!(kind(), None);
+        // Text ending: None — the preview text is authoritative.
+        push("incoming", Some("hello"), Vec::new());
+        assert_eq!(kind(), None);
+        // Image-only ending: the official photo noun.
+        push("incoming", None, vec![attachment("image/jpeg", false)]);
+        assert_eq!(kind(), Some("image"));
+        // A caption wins over the noun, exactly like the official preview.
+        push(
+            "incoming",
+            Some("看这张图"),
+            vec![attachment("image/jpeg", false)],
+        );
+        assert_eq!(kind(), None);
+        // Voice note: the voice-message noun.
+        push("incoming", None, vec![attachment("audio/aac", true)]);
+        assert_eq!(kind(), Some("audio"));
+        // Plain audio without the voice-note flag stays the audio noun.
+        push("incoming", None, vec![attachment("audio/mpeg", false)]);
+        assert_eq!(kind(), Some("audio"));
+        // Video ending.
+        push("incoming", None, vec![attachment("video/mp4", false)]);
+        assert_eq!(kind(), Some("video"));
+        // Unrecognized content type: the generic file noun.
+        push("incoming", None, vec![attachment("application/pdf", false)]);
+        assert_eq!(kind(), Some("file"));
+        // A system row never yields a noun.
+        push("system", Some("identity changed"), Vec::new());
+        assert_eq!(kind(), None);
+        // A whitespace-only caption counts as caption-less.
+        push(
+            "incoming",
+            Some("   "),
+            vec![attachment("image/png", false)],
+        );
+        assert_eq!(kind(), Some("image"));
+
+        // The list path carries the same derivation as the single read.
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let listed = page
+            .items
+            .iter()
+            .find(|item| item.id == conversation.id)
+            .unwrap();
+        assert_eq!(listed.last_message_kind, Some("image"));
     }
 
     #[test]

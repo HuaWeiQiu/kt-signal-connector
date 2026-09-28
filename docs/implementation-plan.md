@@ -723,6 +723,29 @@ state enum; linking over a dead owner binding auto-cleans (unbind + local-data p
 when the collision is a different account id) and proceeds; deleting a session purges its
 connector session via the host adapter.
 
+### 4.18 Conversation summary last-message kind (contract revision 1.23, 2026-09-28)
+
+The desktop contract (kt-desktop `contracts/signal-host-adapter.md` 1.23) adds an optional
+`lastMessageKind` to conversation summaries so the desktop list renders the official
+attachment-noun preview ("📷 Photo" / "🎥 Video" / "🎤 Voice message" / "📎 File") without
+reverse-engineering it out of the preview string.
+
+- derivation is read-time only, per summary row: the newest message
+  (`ORDER BY sent_at DESC, id DESC LIMIT 1`, covered by the existing
+  `messages_conversation_sent_at` index) decides. An attachment-only ending — the row has
+  attachments and no non-empty body text — yields the first attachment's kind:
+  `image/*` → `image`, `video/*` → `video`, `audio/*` or the voice-note flag → `audio`,
+  anything else → `file`. A text/caption ending, a system row, or an empty conversation
+  yields nothing: the field is omitted and the desktop falls back to `lastMessagePreview`.
+  The caption wins over the noun — exactly the official list-preview behavior
+  (official source: a body text takes precedence over the attachment type noun).
+- wire shape: `lastMessageKind?: 'image' | 'video' | 'audio' | 'file'` on
+  `ConversationSummary`, `skip_serializing_if = "Option::is_none"` like
+  `lastMessagePreview`. Nothing new is persisted; the contract 1.15
+  preview/filename fallback stays authoritative for the text itself.
+- cost: one extra indexed LIMIT-1 query per summary row per page read (local SQLite,
+  desktop-scale page sizes). No write-path change, no cache, no new IPC method.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

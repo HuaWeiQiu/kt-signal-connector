@@ -4510,6 +4510,14 @@ mod tests {
         assert_eq!(row.text.as_deref(), Some("see attachment"));
         let _ = pending_id;
 
+        // The captioned attachment keeps a text ending — no noun (contract 1.22).
+        let summary = service
+            .store
+            .conversation_summary(&conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.last_message_kind, None);
+
         // A caption-less attachment previews as the filename — never an
         // empty preview the conversation list renders as blank.
         let prepared = service
@@ -4532,6 +4540,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.last_message_preview.as_deref(), Some("report.pdf"));
+        // Caption-less attachment ending: the generic file noun (contract 1.22).
+        assert_eq!(summary.last_message_kind, Some("file"));
 
         // Unknown account and conversation answer their deterministic errors.
         let error = service
