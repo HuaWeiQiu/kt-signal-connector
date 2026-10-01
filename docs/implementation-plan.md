@@ -746,6 +746,31 @@ reverse-engineering it out of the preview string.
 - cost: one extra indexed LIMIT-1 query per summary row per page read (local SQLite,
   desktop-scale page sizes). No write-path change, no cache, no new IPC method.
 
+### 4.19 Inbound peer receipts (contract revision 1.24, 2026-10-01)
+
+`envelope.receiptMessage` — the delivery/read confirmation a peer sends back for our
+outgoing rows — stops being skipped and routes through the inbound control plane (§4.13
+precedent). Shape (pinned signal-cli `JsonReceiptMessage`): `{timestamp: [...], when,
+isDelivery, isRead, isViewed}`.
+
+- tier selection: `isViewed` > `isRead` > isDelivery-default. The desktop status ladder is
+  `pending → sent → delivered → read`, so `viewed` maps onto `read` on the wire; there is
+  no fourth tier to surface.
+- confirmed timestamps are bounded (256, de-duplicated, truncation on overflow) and resolve
+  to outgoing rows in the envelope sender's direct conversation by upstream `sent_at`.
+- upgrade is monotonic and per row: `pending|sent → delivered → read`; a lower tier never
+  downgrades a higher one, and incoming/terminal/system rows are never touched. Only real
+  transitions emit `message.statusChanged` (one per moved row) — replays are silent.
+- conversation scoping: receipts carry no `groupId`, so only direct conversations resolve
+  (envelope sender as peer). Group-sent rows stay untouched for now — a declared boundary,
+  not a silent gap.
+- nothing new is persisted: receipt state lives in the message rows' `status` column, so
+  history reads and restarts see the last tier for free. Offline-period receipts (peer
+  confirmed while the connector was down) are lost with the envelope and surface on the
+  next real receipt — the same eventual consistency the official clients accept.
+- no new IPC method, no schema-event addition: the host learns through the existing
+  `message.statusChanged` event and its existing status projection.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

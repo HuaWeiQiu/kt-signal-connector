@@ -1793,6 +1793,22 @@ impl ConnectorService {
                     action,
                 }])
             }
+            ControlReceive::Receipt { kind, timestamps } => {
+                let moved = self.store.upgrade_outgoing_receipts(
+                    &account.id,
+                    &conversation.id,
+                    &timestamps,
+                    kind,
+                )?;
+                Ok(moved
+                    .into_iter()
+                    .map(|record| HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id,
+                        message_id: record.id,
+                        status: record.status,
+                    })
+                    .collect())
+            }
         }
     }
 }
@@ -2730,7 +2746,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::engine::{NormalizedAttachment, NormalizedQuote};
+    use crate::engine::{NormalizedAttachment, NormalizedQuote, ReceiptKind};
     use crate::store::StoreKey;
 
     fn service() -> (TempDir, ConnectorService) {
@@ -5157,6 +5173,99 @@ mod tests {
                 .is_empty()
         );
         let _ = (&account.id, &conversation.id);
+    }
+
+    /// Peer receipts upgrade earlier outgoing rows monotonically
+    /// (sent → delivered → read): a lower tier never downgrades a higher
+    /// one, incoming rows stay put, and only real transitions emit
+    /// message.statusChanged.
+    #[test]
+    fn inbound_receipts_upgrade_outgoing_rows_monotonically() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+        // An incoming row the receipts must never touch.
+        service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(401),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("incoming stays".into()),
+                    text_bytes: Some(14),
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    control: None,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let messages_before = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        let incoming_before = messages_before
+            .iter()
+            .find(|row| row.sent_at == 401)
+            .map(|row| row.status)
+            .unwrap();
+
+        let receipt = |kind| {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Receipt {
+                    kind,
+                    timestamps: vec![400],
+                },
+            )
+        };
+        let delivered = service
+            .ingest_receive(
+                receipt(ReceiptKind::Delivered),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(matches!(
+            &delivered[0],
+            HostSideEvent::MessageStatusChanged { status, .. } if *status == "delivered"
+        ));
+
+        let read = service
+            .ingest_receive(receipt(ReceiptKind::Read), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(matches!(
+            &read[0],
+            HostSideEvent::MessageStatusChanged { status, .. } if *status == "read"
+        ));
+
+        // A late delivery receipt must not downgrade nor re-emit.
+        assert!(
+            service
+                .ingest_receive(
+                    receipt(ReceiptKind::Delivered),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        let outgoing = messages.iter().find(|row| row.sent_at == 400).unwrap();
+        assert_eq!(outgoing.status, "read");
+        let incoming = messages.iter().find(|row| row.sent_at == 401).unwrap();
+        assert_eq!(incoming.status, incoming_before, "incoming rows stay put");
     }
 
     /// An edit whose receive carries no new body is dropped silently.

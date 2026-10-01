@@ -1760,6 +1760,82 @@ impl Store {
         Ok(record.map(|record| (record, changed > 0)))
     }
 
+    /// Upgrade earlier outgoing rows on an inbound peer receipt (delivery /
+    /// read). The status ladder is monotonic — `pending|sent` → `delivered` →
+    /// `read` — and a receipt never downgrades a row (`read` over
+    /// `delivered`), never touches terminal or non-outgoing rows. Returns the
+    /// rows whose status actually moved, so the service emits one
+    /// `message.statusChanged` per real transition.
+    pub fn upgrade_outgoing_receipts(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: &[u64],
+        receipt: crate::engine::ReceiptKind,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        if target_sent_at.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Ranked per row: the target tier only applies when every earlier
+        // tier is already past (or the row is still below it).
+        let target = receipt.as_str();
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut moved = Vec::new();
+        {
+            let mut stmt = transaction
+                .prepare(
+                    "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
+                            received_at, body, body_bytes, body_truncated, status,
+                            quote_message_id, client_request_id, quote_snapshot,
+                            attachments_json, edited_at
+                     FROM messages
+                     WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                       AND direction='outgoing'
+                     ORDER BY id ASC LIMIT 8",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for timestamp in target_sent_at.iter().copied().take(256) {
+                let rows: Vec<MessageRecord> = stmt
+                    .query_map(
+                        params![account_id, conversation_id, timestamp as i64],
+                        message_record_from_row,
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?
+                    .collect::<Result<_, _>>()
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                for record in rows {
+                    let current = record.status;
+                    let next = match (target, current) {
+                        ("delivered", "pending" | "sent") => Some("delivered"),
+                        ("read", "pending" | "sent" | "delivered") => Some("read"),
+                        _ => None,
+                    };
+                    let Some(next) = next else {
+                        continue;
+                    };
+                    transaction
+                        .execute(
+                            "UPDATE messages SET status=?4
+                             WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
+                            params![account_id, conversation_id, timestamp as i64, next],
+                        )
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    moved.push(MessageRecord {
+                        status: next,
+                        ..record
+                    });
+                }
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(moved)
+    }
+
     /// Record one inbound reaction (contract 1.15). The protocol shape — one
     /// emoji state per (conversation, target message, actor) — maps to an
     /// upsert: a repeated reaction replaces the emoji, `isRemove` marks the

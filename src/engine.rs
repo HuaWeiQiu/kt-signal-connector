@@ -391,6 +391,26 @@ pub struct NormalizedAttachment {
     pub is_voice_note: bool,
 }
 
+/// Delivery tier of an inbound receipt (`envelope.receiptMessage`). Order is
+/// the protocol's monotonic upgrade path: a later tier never downgrades an
+/// earlier one (`read` over `delivered` over `sent`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReceiptKind {
+    Delivered,
+    Read,
+    Viewed,
+}
+
+impl ReceiptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReceiptKind::Delivered => "delivered",
+            ReceiptKind::Read => "read",
+            ReceiptKind::Viewed => "read",
+        }
+    }
+}
+
 /// Control-plane receive payloads that are not messages: reaction add/remove,
 /// remote delete of an earlier message, typing START/STOP, and edit of an
 /// earlier message (new body rides `NormalizedReceive.text`).
@@ -411,6 +431,11 @@ pub enum ControlReceive {
     Edit {
         target_timestamp: u64,
     },
+    /// Peer receipt confirming earlier outgoing rows (bounded batch).
+    Receipt {
+        kind: ReceiptKind,
+        timestamps: Vec<u64>,
+    },
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -420,6 +445,10 @@ const MAX_ATTACHMENT_ID_CHARS: usize = 128;
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 128;
 const MAX_ATTACHMENT_CONTENT_TYPE_CHARS: usize = 64;
 const MAX_EMOJI_CHARS: usize = 16;
+/// One receipt confirms at most this many earlier rows; a larger batch is
+/// truncated (Signal Desktop batches receipts per conversation, so real
+/// batches stay far below).
+const MAX_RECEIPT_TIMESTAMPS: usize = 256;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -1464,6 +1493,34 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             control: ControlReceive::Typing { action },
         });
     }
+    // Peer receipt confirming our outgoing rows (delivery / read / viewed).
+    // Viewed maps to `read` on the wire: the desktop's status ladder is
+    // sent → delivered → read; there is no fourth tier to surface.
+    if let Some(receipt) = envelope.get("receiptMessage").and_then(Value::as_object) {
+        let kind = if receipt.get("isViewed").and_then(Value::as_bool) == Some(true) {
+            ReceiptKind::Viewed
+        } else if receipt.get("isRead").and_then(Value::as_bool) == Some(true) {
+            ReceiptKind::Read
+        } else {
+            ReceiptKind::Delivered
+        };
+        let mut timestamps: Vec<u64> = receipt
+            .get("timestamp")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default();
+        timestamps.truncate(MAX_RECEIPT_TIMESTAMPS);
+        timestamps.dedup();
+        if timestamps.is_empty() {
+            return None;
+        }
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: envelope_peer_source(envelope),
+            group_id: None,
+            control: ControlReceive::Receipt { kind, timestamps },
+        });
+    }
     None
 }
 
@@ -2453,5 +2510,70 @@ mod tests {
 
         assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// A peer receiptMessage envelope routes to `ControlReceive::Receipt`:
+    /// tier selection follows the isViewed > isRead > isDelivery flags, the
+    /// confirmed timestamps ride through bounded and de-duplicated, and an
+    /// empty batch is not routed at all.
+    #[test]
+    fn receipt_message_envelope_routes_to_receipt_control() {
+        let envelope_of = |flags: serde_json::Value| -> serde_json::Value {
+            serde_json::from_value(json!({
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "sourceDevice": 1,
+                "receiptMessage": flags,
+            }))
+            .unwrap()
+        };
+        let routing = |flags| {
+            control_routing(envelope_of(flags).as_object().unwrap()).map(|routing| routing.control)
+        };
+
+        let delivered = routing(json!({
+            "timestamp": [1726999000000u64, 1726999000000u64, 1726999001000u64],
+            "when": 1727000000000u64,
+            "isDelivery": true,
+        }))
+        .expect("delivery receipt routes");
+        match delivered {
+            ControlReceive::Receipt { kind, timestamps } => {
+                assert!(matches!(kind, ReceiptKind::Delivered));
+                assert_eq!(timestamps, vec![1726999000000, 1726999001000]);
+            }
+            other => panic!("unexpected control: {other:?}"),
+        }
+
+        let read = routing(json!({
+            "timestamp": [1726999000000u64],
+            "isDelivery": true,
+            "isRead": true,
+        }))
+        .expect("read receipt routes");
+        assert!(matches!(
+            read,
+            ControlReceive::Receipt {
+                kind: ReceiptKind::Read,
+                ..
+            }
+        ));
+
+        let viewed = routing(json!({
+            "timestamp": [1726999000000u64],
+            "isRead": true,
+            "isViewed": true,
+        }))
+        .expect("viewed receipt routes");
+        assert!(matches!(
+            viewed,
+            ControlReceive::Receipt {
+                kind: ReceiptKind::Viewed,
+                ..
+            }
+        ));
+
+        assert!(routing(json!({ "timestamp": [], "isDelivery": true })).is_none());
+        assert!(routing(json!({ "isDelivery": true })).is_none());
     }
 }
