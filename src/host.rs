@@ -1067,6 +1067,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                 params.text,
                                 params.client_request_id,
                                 params.quote_message_id,
+                                params.previews,
                             )
                             .await
                         {

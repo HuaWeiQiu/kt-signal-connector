@@ -18,8 +18,8 @@ use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
     MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget, PreparedSend,
-    SendTarget, ServiceError, account_limit_error, store_get_group, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages,
+    SendTarget, SendTextPreviewParams, ServiceError, account_limit_error, store_get_group,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -1157,6 +1157,7 @@ impl RuntimeSupervisor {
         text: String,
         client_request_id: String,
         quote_message_id: Option<String>,
+        previews: Option<Vec<SendTextPreviewParams>>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -1168,6 +1169,7 @@ impl RuntimeSupervisor {
                     &text,
                     &client_request_id,
                     quote_message_id.as_deref(),
+                    previews,
                 )?,
                 SendTarget::Peer {
                     kind,
@@ -1183,6 +1185,7 @@ impl RuntimeSupervisor {
                     &text,
                     &client_request_id,
                     quote_message_id.as_deref(),
+                    previews,
                 )?,
             }
         };
@@ -2247,6 +2250,7 @@ mod tests {
                 "vanish",
                 "req-rd-crash",
                 None,
+                None,
             )
             .unwrap()
         {
@@ -2335,6 +2339,7 @@ mod tests {
                 &conversation.id,
                 "react to me",
                 "req-sr-crash",
+                None,
                 None,
             )
             .unwrap()

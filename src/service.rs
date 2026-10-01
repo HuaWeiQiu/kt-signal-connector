@@ -761,7 +761,9 @@ impl ConnectorService {
         text: &str,
         client_request_id: &str,
         quote_message_id: Option<&str>,
+        previews: Option<Vec<SendTextPreviewParams>>,
     ) -> Result<PreparedSend, ServiceError> {
+        let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
         validate_opaque_id(client_request_id, "clientRequestId")?;
         if let Some(quote) = quote_message_id {
@@ -781,6 +783,7 @@ impl ConnectorService {
             text,
             client_request_id,
             quote_message_id,
+            preview,
             None,
             Vec::new(),
         )
@@ -800,7 +803,9 @@ impl ConnectorService {
         text: &str,
         client_request_id: &str,
         quote_message_id: Option<&str>,
+        previews: Option<Vec<SendTextPreviewParams>>,
     ) -> Result<PreparedSend, ServiceError> {
+        let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
         validate_opaque_id(client_request_id, "clientRequestId")?;
         if let Some(quote) = quote_message_id {
@@ -848,6 +853,7 @@ impl ConnectorService {
             text,
             client_request_id,
             quote_message_id,
+            preview,
             None,
             Vec::new(),
         )
@@ -949,6 +955,7 @@ impl ConnectorService {
             caption,
             client_request_id,
             quote_message_id,
+            None,
             Some(vec![json!(data_uri)]),
             vec![descriptor],
         )
@@ -962,6 +969,7 @@ impl ConnectorService {
         text: &str,
         client_request_id: &str,
         quote_message_id: Option<&str>,
+        link_preview: Option<UpstreamSendPreview>,
         attachments: Option<Vec<Value>>,
         attachment_descriptors: Vec<NormalizedAttachment>,
     ) -> Result<PreparedSend, ServiceError> {
@@ -1024,6 +1032,21 @@ impl ConnectorService {
             "account": account.signal_account,
             "message": text,
         });
+        if let Some(link_preview) = link_preview {
+            // Outbound link preview (contract §5.10 v1.26), projected 1:1 onto
+            // the signal-cli JSON-RPC send keys (verified against the pinned
+            // distribution: previewUrl/previewTitle/previewDescription plus an
+            // optional previewImage carrying a path or RFC 2397 data URI — the
+            // connector passes data URIs only, mirroring `attachments`).
+            params["previewUrl"] = json!(link_preview.url);
+            params["previewTitle"] = json!(link_preview.title);
+            if let Some(description) = link_preview.description {
+                params["previewDescription"] = json!(description);
+            }
+            if let Some(image) = link_preview.image_data_uri {
+                params["previewImage"] = json!(image);
+            }
+        }
         if let Some(attachments) = attachments {
             // signal-cli jsonRpc send accepts `attachments` entries as file
             // paths or RFC 2397 data URIs (SendCommand --attachment, pinned
@@ -2164,6 +2187,34 @@ pub struct MessagesSendTextParams {
     pub text: String,
     pub client_request_id: String,
     pub quote_message_id: Option<String>,
+    pub previews: Option<Vec<SendTextPreviewParams>>,
+}
+
+/// Outbound link preview (contract §5.10 v1.26). signal-cli's JSON-RPC send
+/// carries exactly one preview per message (`previewUrl`/`previewTitle`/
+/// `previewDescription`/`previewImage`, verified against the pinned
+/// distribution), so only the first entry is used and extras are ignored.
+/// The image travels as an RFC 2397 data URI — the same byte-in-memory
+/// pattern as `messages.attachments.send`; no caller-controlled path ever
+/// reaches upstream.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendTextPreviewParams {
+    pub url: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub image_data_uri: Option<String>,
+}
+
+/// Normalized, validated preview passed down to `dispatch_send` and projected
+/// 1:1 onto the upstream JSON-RPC keys (`previewUrl`/`previewTitle`/
+/// `previewDescription`/`previewImage`).
+#[derive(Debug, Clone)]
+pub struct UpstreamSendPreview {
+    pub url: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub image_data_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2352,6 +2403,84 @@ fn validate_text(text: &str) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+/// Bounds for the outbound link preview (contract §5.10 v1.26). The URL cap
+/// follows the de-facto upstream limit; title/description caps mirror the
+/// official desktop renderer's truncation headroom; the image cap bounds the
+/// data URI to ~1 MiB of binary (4/3 base64 inflation included).
+const MAX_PREVIEW_URL_BYTES: usize = 2048;
+const MAX_PREVIEW_TITLE_BYTES: usize = 1024;
+const MAX_PREVIEW_DESCRIPTION_BYTES: usize = 4096;
+const MAX_PREVIEW_IMAGE_DATA_URI_CHARS: usize = 1_572_864;
+
+/// At most one preview per send upstream (signal-cli builds `List.of(one)`);
+/// extras are ignored, `None`/empty list means no preview.
+fn previews_to_upstream(
+    previews: Option<Vec<SendTextPreviewParams>>,
+    text: &str,
+) -> Result<Option<UpstreamSendPreview>, ServiceError> {
+    previews
+        .and_then(|list| list.into_iter().next())
+        .map(|preview| normalize_send_preview(preview, text))
+        .transpose()
+}
+
+/// Validate and normalize the caller-supplied link preview into the exact
+/// shape the upstream JSON-RPC `send` expects. Enforced here — not at the
+/// engine — because signal-cli validates "the same url must also appear in
+/// the message body" only via its CLI help text, and a late upstream failure
+/// would surface as an unknown-outcome-shaped error instead of a
+/// deterministic INVALID_REQUEST.
+fn normalize_send_preview(
+    preview: SendTextPreviewParams,
+    text: &str,
+) -> Result<UpstreamSendPreview, ServiceError> {
+    let invalid = |why: &str| {
+        Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            why,
+            false,
+        )))
+    };
+    let url = preview.url.trim();
+    if url.is_empty() || url.len() > MAX_PREVIEW_URL_BYTES {
+        return invalid("preview url must contain between 1 and 2048 bytes");
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return invalid("preview url must be an absolute http(s) url");
+    }
+    // signal-cli: "the same url must also appear in the message body".
+    if !text.contains(url) {
+        return invalid("preview url must appear in the message text");
+    }
+    let title = preview.title.trim();
+    if title.is_empty() || title.len() > MAX_PREVIEW_TITLE_BYTES {
+        return invalid("preview title must contain between 1 and 1024 bytes");
+    }
+    let description = preview
+        .description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    if let Some(description) = &description {
+        if description.len() > MAX_PREVIEW_DESCRIPTION_BYTES {
+            return invalid("preview description must contain at most 4096 bytes");
+        }
+    }
+    if let Some(image) = &preview.image_data_uri {
+        if !image.starts_with("data:image/") {
+            return invalid("preview image must be a data:image/ rfc2397 data uri");
+        }
+        if image.len() > MAX_PREVIEW_IMAGE_DATA_URI_CHARS {
+            return invalid("preview image data uri exceeds 1.5M chars");
+        }
+    }
+    Ok(UpstreamSendPreview {
+        url: url.to_string(),
+        title: title.to_string(),
+        description,
+        image_data_uri: preview.image_data_uri,
+    })
 }
 
 /// The reaction must be exactly one unicode grapheme cluster of at most 32
@@ -3103,6 +3232,125 @@ mod tests {
     }
 
     #[test]
+    fn send_text_projects_first_preview_onto_upstream_params() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let dispatch = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "look at https://example.com/a now",
+                "req-preview-ok",
+                None,
+                Some(vec![
+                    SendTextPreviewParams {
+                        url: "https://example.com/a".into(),
+                        title: "Example".into(),
+                        description: Some("A page".into()),
+                        image_data_uri: Some("data:image/jpeg;base64,QUJD".into()),
+                    },
+                    // extras are ignored upstream (List.of(one) on the pinned
+                    // signal-cli) — the connector only forwards the first.
+                    SendTextPreviewParams {
+                        url: "https://example.com/b".into(),
+                        title: "Second".into(),
+                        description: None,
+                        image_data_uri: None,
+                    },
+                ]),
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        assert_eq!(dispatch["previewUrl"], json!("https://example.com/a"));
+        assert_eq!(dispatch["previewTitle"], json!("Example"));
+        assert_eq!(dispatch["previewDescription"], json!("A page"));
+        assert_eq!(
+            dispatch["previewImage"],
+            json!("data:image/jpeg;base64,QUJD")
+        );
+    }
+
+    #[test]
+    fn send_text_preview_rejects_deterministic_shape_violations() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let preview = |url: &str, title: &str| SendTextPreviewParams {
+            url: url.into(),
+            title: title.into(),
+            description: None,
+            image_data_uri: None,
+        };
+        // signal-cli requires the preview url to appear in the message body —
+        // enforced here so the failure is a deterministic INVALID_REQUEST
+        // instead of a late upstream send error.
+        let url_absent = service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "no link in here",
+                "req-preview-absent",
+                None,
+                Some(vec![preview("https://example.com/a", "Example")]),
+            )
+            .unwrap_err();
+        assert!(matches!(url_absent, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
+        // A preview image is a data:image/ URI only — never a caller path.
+        let path_image = service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "see https://example.com/a",
+                "req-preview-path",
+                None,
+                Some(vec![SendTextPreviewParams {
+                    url: "https://example.com/a".into(),
+                    title: "Example".into(),
+                    description: None,
+                    image_data_uri: Some("/etc/passwd".into()),
+                }]),
+            )
+            .unwrap_err();
+        assert!(matches!(path_image, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
+        // Title is mandatory upstream.
+        let empty_title = service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "see https://example.com/a",
+                "req-preview-title",
+                None,
+                Some(vec![preview("https://example.com/a", "   ")]),
+            )
+            .unwrap_err();
+        assert!(matches!(empty_title, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
+        // A rejected preview leaves no pending row behind.
+        assert!(
+            service
+                .store_ref()
+                .message_by_client_request(&account.id, "req-preview-absent")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn outgoing_sync_reconciles_by_signal_timestamp_and_client_request_id() {
         let (_temp, mut service) = service();
         let account = service
@@ -3119,6 +3367,7 @@ mod tests {
                 &conversation.id,
                 "same text is not identity",
                 "client-request-exact",
+                None,
                 None,
             )
             .unwrap()
@@ -3201,7 +3450,14 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let pending_id = match service
-            .prepare_send_text(&account.id, &conversation.id, "in flight", "req-race", None)
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "in flight",
+                "req-race",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -3350,6 +3606,7 @@ mod tests {
                 "hello peer",
                 "peer-req-1",
                 None,
+                None,
             )
             .unwrap()
         {
@@ -3380,6 +3637,7 @@ mod tests {
                 },
                 "hello again",
                 "peer-req-2",
+                None,
                 None,
             )
             .unwrap()
@@ -3412,13 +3670,14 @@ mod tests {
                     "hello peer",
                     "peer-req-1",
                     None,
+                    None
                 )
                 .unwrap(),
             PreparedSend::Existing(_)
         ));
         assert!(matches!(
             service
-                .prepare_send_text(&account.id, &first, "hello peer", "peer-req-1", None)
+                .prepare_send_text(&account.id, &first, "hello peer", "peer-req-1", None, None)
                 .unwrap(),
             PreparedSend::Existing(_)
         ));
@@ -3443,7 +3702,7 @@ mod tests {
                 "text",
                 "req-bad-kind",
                 None,
-            ),
+             None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
         assert!(matches!(
@@ -3457,7 +3716,7 @@ mod tests {
                 "text",
                 "req-empty-peer",
                 None,
-            ),
+             None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
         assert!(matches!(
@@ -3471,6 +3730,7 @@ mod tests {
                 "text",
                 "req-absent",
                 None,
+                None
             ),
             Err(ServiceError::Store(StoreError::AccountNotFound))
         ));
@@ -3485,6 +3745,7 @@ mod tests {
                 },
                 "group hello",
                 "req-group",
+                None,
                 None,
             )
             .unwrap()
@@ -3514,6 +3775,7 @@ mod tests {
                 },
                 "masked hello",
                 "req-masked",
+                None,
                 None,
             )
             .unwrap()
@@ -3581,6 +3843,7 @@ mod tests {
                 "reply with quote",
                 "req-quote-1",
                 Some(&quoted.id),
+                None,
             )
             .unwrap()
         {
@@ -3622,6 +3885,7 @@ mod tests {
                 "original",
                 "req-original",
                 None,
+                None,
             )
             .unwrap()
         {
@@ -3639,6 +3903,7 @@ mod tests {
                 "quote own",
                 "req-quote-own",
                 Some(&pending_id),
+                None,
             )
             .unwrap()
         {
@@ -3674,6 +3939,7 @@ mod tests {
                 "reply",
                 "req-quote-missing",
                 Some("no-such-message"),
+                None,
             )
             .unwrap_err()
             .into_api();
@@ -3689,6 +3955,7 @@ mod tests {
                     &conversation.id,
                     "reply",
                     "req-quote-missing",
+                    None,
                     None
                 )
                 .unwrap(),
@@ -3704,6 +3971,7 @@ mod tests {
                 "in flight",
                 "req-pending",
                 None,
+                None,
             )
             .unwrap()
         {
@@ -3717,7 +3985,7 @@ mod tests {
                 "quote pending",
                 "req-quote-pending",
                 Some(&pending_id),
-            ),
+             None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
 
@@ -3759,7 +4027,7 @@ mod tests {
                 "quote group",
                 "req-quote-group",
                 Some(&group_message.id),
-            ),
+             None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
 
@@ -3771,6 +4039,7 @@ mod tests {
                 "cross quote",
                 "req-quote-cross",
                 Some(&group_message.id),
+                None
             ),
             Err(ServiceError::Store(StoreError::MessageNotFound))
         ));
@@ -3795,7 +4064,7 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let direct_id = match service
-            .prepare_send_text(&account.id, &direct.id, "delete me", "req-rd-1", None)
+            .prepare_send_text(&account.id, &direct.id, "delete me", "req-rd-1", None, None)
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -3824,7 +4093,14 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let group_message_id = match service
-            .prepare_send_text(&account.id, &group.id, "group delete", "req-rd-2", None)
+            .prepare_send_text(
+                &account.id,
+                &group.id,
+                "group delete",
+                "req-rd-2",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -3857,7 +4133,14 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let pending_id = match service
-            .prepare_send_text(&account.id, &conversation.id, "in flight", "req-rd-p", None)
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "in flight",
+                "req-rd-p",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -3959,7 +4242,14 @@ mod tests {
 
         // Outgoing `sent` row: targetAuthor is the linked account itself.
         let sent_id = match service
-            .prepare_send_text(&account.id, &direct.id, "react to me", "req-sr-1", None)
+            .prepare_send_text(
+                &account.id,
+                &direct.id,
+                "react to me",
+                "req-sr-1",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -4026,7 +4316,14 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let group_message_id = match service
-            .prepare_send_text(&account.id, &group.id, "group react", "req-sr-2", None)
+            .prepare_send_text(
+                &account.id,
+                &group.id,
+                "group react",
+                "req-sr-2",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -4061,7 +4358,14 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let pending_id = match service
-            .prepare_send_text(&account.id, &conversation.id, "in flight", "req-sr-p", None)
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "in flight",
+                "req-sr-p",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -4225,6 +4529,7 @@ mod tests {
                 "status flow",
                 "req-status",
                 None,
+                None,
             )
             .unwrap()
         {
@@ -4248,7 +4553,14 @@ mod tests {
 
         // Terminal failure paths emit exactly once as well.
         let failed_id = match service
-            .prepare_send_text(&account.id, &conversation.id, "will fail", "req-fail", None)
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "will fail",
+                "req-fail",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -4267,6 +4579,7 @@ mod tests {
                 &conversation.id,
                 "will vanish",
                 "req-unknown",
+                None,
                 None,
             )
             .unwrap()
@@ -4845,7 +5158,14 @@ mod tests {
         sent_at: u64,
     ) -> String {
         let prepared = match service
-            .prepare_send_text(account_id, conversation_id, "original", "req-ctl", None)
+            .prepare_send_text(
+                account_id,
+                conversation_id,
+                "original",
+                "req-ctl",
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -5467,7 +5787,14 @@ mod tests {
             .ensure_conversation(&account.id, "direct", peer, "Peer")
             .unwrap();
         let message_id = match service
-            .prepare_send_text(&account.id, &direct.id, "has attachment", request_id, None)
+            .prepare_send_text(
+                &account.id,
+                &direct.id,
+                "has attachment",
+                request_id,
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,

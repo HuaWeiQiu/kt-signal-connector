@@ -803,6 +803,26 @@ No new IPC method or event: the host learns through the existing `message.upsert
 history reads. The desktop renders previews as link cards, mentions as highlighted ranges, the
 four styles, and a view-once badge; its boundaries are declared in the desktop contract 1.25.
 
+### 4.21 Outbound link previews on messages.sendText (contract revision 1.26, 2026-10-01)
+
+`messages.sendText` gains an optional `previews` array; only the first entry is used because the
+pinned signal-cli builds `List.of(one)` preview per send (verified by decompiling `SendCommand` /
+`ManagerImpl` from the distribution jar). The entry shape is `{url, title, description?,
+imageDataUri?}`, and every constraint is enforced deterministically before the pending row exists:
+
+- `url`: trimmed, non-empty, ≤ 2048 bytes, absolute http(s), and **must appear in the message
+  text** — signal-cli's own requirement ("the same url must also appear in the message body")
+  surfaced here as a local `INVALID_REQUEST` instead of a late upstream send error.
+- `title`: non-empty, ≤ 1024 bytes. `description`: optional, ≤ 4096 bytes.
+- `imageDataUri`: optional, `data:image/*` RFC 2397 data URI only, ≤ 1.5M chars (~1.1 MiB
+  binary). Bytes stay in memory and pass straight to upstream — the same pattern as
+  `messages.attachments.send` (upstream `AttachmentHelper.uploadAttachment` is data-URI aware,
+  verified from bytecode). **No caller-controlled file path ever reaches upstream.**
+
+Validation passes project 1:1 onto the upstream JSON-RPC keys `previewUrl` / `previewTitle` /
+`previewDescription` / `previewImage` (`JsonRpcNamespace` maps dash-separated option names to
+camelCase — verified from bytecode). The connector never composes or synthesizes preview content.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
