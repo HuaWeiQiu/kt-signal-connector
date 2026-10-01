@@ -993,6 +993,7 @@ impl ConnectorService {
             quote_snapshot: None,
             attachments: attachment_descriptors,
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         // Preview mirrors the visible row: the caption when present, else the
@@ -1589,6 +1590,7 @@ impl ConnectorService {
             quote_message_id: None,
             quote_snapshot: receive.quote,
             attachments: receive.attachments,
+            rich: receive.rich,
             edited_at: None,
             reactions: Vec::new(),
         };
@@ -3002,6 +3004,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -3066,6 +3069,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -3136,6 +3140,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         service
@@ -3252,6 +3257,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
 
@@ -3307,6 +3313,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
 
@@ -3553,6 +3560,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -3731,6 +3739,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -3884,6 +3893,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -3990,6 +4000,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -4096,6 +4107,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -4425,6 +4437,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -4806,6 +4819,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: Some(control),
         }
     }
@@ -4999,6 +5013,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         service
@@ -5052,6 +5067,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         service
@@ -5201,6 +5217,7 @@ mod tests {
                     text_truncated: false,
                     quote: None,
                     attachments: Vec::new(),
+                    rich: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5336,6 +5353,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         service
@@ -5387,6 +5405,7 @@ mod tests {
                 height: Some(32),
                 is_voice_note: false,
             }],
+            rich: None,
             control: None,
         };
         service

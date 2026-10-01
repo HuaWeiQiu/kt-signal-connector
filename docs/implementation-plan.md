@@ -771,6 +771,38 @@ isDelivery, isRead, isViewed}`.
 - no new IPC method, no schema-event addition: the host learns through the existing
   `message.statusChanged` event and its existing status projection.
 
+### 4.20 Inbound rich bodies: previews / mentions / textStyles / viewOnce (contract revision 1.25, 2026-10-01)
+
+The four rich-body fields a peer's `dataMessage` (and the multi-device `syncMessage.sentMessage`
+mirror) carries stop being dropped and flow to the host on the message row. Shapes are the pinned
+signal-cli 0.14.8 JSON models, verified by decompiling `JsonPreview` / `JsonMention` /
+`JsonTextStyle` from the distribution jar:
+
+- `previews: [{url, title?, description?, image?}]` — bounded to 4 cards; url capped at 2048
+  chars, title/description at 512 UTF-8 bytes. `image` reuses the §4.13 metadata-only attachment
+  descriptor (id/contentType/filename/size/width/height); the connector never fetches image bytes.
+- `mentions: [{number|uuid, name?, start, length}]` — bounded to 64 ranges; author resolves
+  number-first, name capped at 128 bytes. Ranges index into the received body text.
+- `textStyles: [{style, start, length}]` — bounded to 64 ranges; only `BOLD` `ITALIC`
+  `STRIKETHROUGH` `MONOSPACE` `SPOILER` pass validation, `NONE` and unknown values drop
+  individually.
+- `viewOnce: true` — persisted only when true; plain messages carry nothing.
+
+Bounds follow §4.13: entries past a cap drop, oversized strings truncate, malformed entries drop
+individually — a hostile payload can never fail the message itself. An all-default result
+collapses to absent, so rows without rich data are byte-identical to pre-1.25 rows.
+
+Persistence: one additive nullable `messages.rich_json` TEXT column (schema 8 → 9) holding the
+packed `NormalizedRich` JSON, read back flattened onto the wire MessageRecord as
+`previews` / `mentions` / `textStyles` / `viewOnce` (absent keys stay absent on the wire). Rich
+fields never change after receive — an edit replaces the body but keeps the original ranges
+(the official client re-renders edited bodies the same way until a new body arrives with fresh
+ranges). Outgoing rows our client sends stay plain text; the desktop does not compose rich bodies.
+
+No new IPC method or event: the host learns through the existing `message.upserted` payload and
+history reads. The desktop renders previews as link cards, mentions as highlighted ranges, the
+four styles, and a view-once badge; its boundaries are declared in the desktop contract 1.25.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

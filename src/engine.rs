@@ -354,6 +354,10 @@ pub struct NormalizedReceive {
     /// Bounded inbound attachment descriptors (metadata only, no bytes).
     #[serde(skip)]
     pub attachments: Vec<NormalizedAttachment>,
+    /// Bounded rich-body payload (contract 1.25): link previews, @mentions,
+    /// text-style ranges and the view-once marker. Absent on plain rows.
+    #[serde(skip)]
+    pub rich: Option<NormalizedRich>,
     /// Serialized per-conversation control payload (reaction / remote delete /
     /// typing) for `direction == "control"`; shape mirrors the protocol field.
     #[serde(skip)]
@@ -374,7 +378,7 @@ pub struct NormalizedQuote {
 }
 
 /// One inbound attachment descriptor: metadata only, never bytes (§4.13).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedAttachment {
     pub id: String,
@@ -389,6 +393,70 @@ pub struct NormalizedAttachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     pub is_voice_note: bool,
+}
+
+/// One inbound link-preview card (contract 1.25): bounded metadata only — the
+/// image rides the same metadata-only attachment descriptor; bytes are never
+/// fetched by the connector.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedPreview {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<NormalizedAttachment>,
+}
+
+/// One inbound @mention range (contract 1.25): the author resolves to the
+/// mentioned peer; the styled range [start, start+length) is already part of
+/// the received body text.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedMention {
+    /// Mentioned peer's number, or UUID when the number is absent.
+    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub start: u32,
+    pub length: u32,
+}
+
+/// One inbound text-style range (contract 1.25). Only the styles the protocol
+/// renders pass validation; `NONE` and unknown values drop individually.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedTextStyle {
+    pub style: String,
+    pub start: u32,
+    pub length: u32,
+}
+
+/// Bounded rich-body payload (contract 1.25): link previews, @mentions and
+/// text-style ranges off one dataMessage, plus the view-once marker. An
+/// all-default shape collapses to `None` so plain messages carry nothing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedRich {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<NormalizedPreview>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<NormalizedMention>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_styles: Vec<NormalizedTextStyle>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view_once: bool,
+}
+
+impl NormalizedRich {
+    fn is_empty(&self) -> bool {
+        self.previews.is_empty()
+            && self.mentions.is_empty()
+            && self.text_styles.is_empty()
+            && !self.view_once
+    }
 }
 
 /// Delivery tier of an inbound receipt (`envelope.receiptMessage`). Order is
@@ -449,6 +517,15 @@ const MAX_EMOJI_CHARS: usize = 16;
 /// truncated (Signal Desktop batches receipts per conversation, so real
 /// batches stay far below).
 const MAX_RECEIPT_TIMESTAMPS: usize = 256;
+/// Rich-body bounds (contract 1.25, §4.13 parity): caps on card/range counts
+/// and string sizes. Entries past a cap drop, oversized strings truncate — a
+/// hostile payload can never fail the message itself.
+const MAX_PREVIEWS: usize = 4;
+const MAX_MENTIONS: usize = 64;
+const MAX_TEXT_STYLES: usize = 64;
+const MAX_PREVIEW_URL_CHARS: usize = 2048;
+const MAX_PREVIEW_FIELD_BYTES: usize = 512;
+const MAX_MENTION_NAME_BYTES: usize = 128;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -541,6 +618,30 @@ impl NormalizedReceive {
             // Quotes carry a bounded preview; control payloads are enum-sized.
             + self.quote.as_ref().map_or(0, |quote| {
                 quote.author.len() + quote.text.len() + std::mem::size_of::<NormalizedQuote>()
+            })
+            // Rich bodies carry capped urls/titles/names; ranges are fixed-width.
+            + self.rich.as_ref().map_or(0, |rich| {
+                std::mem::size_of::<NormalizedRich>()
+                    + rich
+                        .previews
+                        .iter()
+                        .map(|preview| {
+                            preview.url.len()
+                                + preview.title.as_ref().map_or(0, String::len)
+                                + preview.description.as_ref().map_or(0, String::len)
+                                + std::mem::size_of::<NormalizedPreview>()
+                        })
+                        .sum::<usize>()
+                    + rich
+                        .mentions
+                        .iter()
+                        .map(|mention| {
+                            mention.author.len()
+                                + mention.name.as_ref().map_or(0, String::len)
+                                + std::mem::size_of::<NormalizedMention>()
+                        })
+                        .sum::<usize>()
+                    + rich.text_styles.len() * std::mem::size_of::<NormalizedTextStyle>()
             })
     }
 }
@@ -1344,49 +1445,157 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
     entries
         .iter()
         .take(MAX_INBOUND_ATTACHMENTS)
-        .filter_map(|entry| {
-            let object = entry.as_object()?;
-            let id = object
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.chars().take(MAX_ATTACHMENT_ID_CHARS).collect::<String>())?;
-            let content_type = object
-                .get("contentType")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.chars()
-                        .take(MAX_ATTACHMENT_CONTENT_TYPE_CHARS)
-                        .collect::<String>()
-                });
-            let filename = object
-                .get("filename")
-                .and_then(Value::as_str)
-                .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
-                .filter(|s| !s.is_empty());
-            Some(NormalizedAttachment {
-                id,
-                content_type,
-                filename,
-                size: object.get("size").and_then(Value::as_u64),
-                width: object
-                    .get("width")
-                    .and_then(Value::as_u64)
-                    .map(|value| value.min(u32::MAX as u64) as u32),
-                height: object
-                    .get("height")
-                    .and_then(Value::as_u64)
-                    .map(|value| value.min(u32::MAX as u64) as u32),
-                is_voice_note: object
-                    .get("isVoiceNote")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-        })
+        .filter_map(|entry| entry.as_object().and_then(normalized_attachment))
         .collect()
+}
+
+/// One bounded attachment descriptor off an attachment-shaped object (§4.13,
+/// reused by message attachments and link-preview images alike).
+fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_ATTACHMENT_ID_CHARS).collect::<String>())?;
+    let content_type = object
+        .get("contentType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(MAX_ATTACHMENT_CONTENT_TYPE_CHARS)
+                .collect::<String>()
+        });
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
+        .filter(|s| !s.is_empty());
+    Some(NormalizedAttachment {
+        id,
+        content_type,
+        filename,
+        size: object.get("size").and_then(Value::as_u64),
+        width: object
+            .get("width")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(u32::MAX as u64) as u32),
+        height: object
+            .get("height")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(u32::MAX as u64) as u32),
+        is_voice_note: object
+            .get("isVoiceNote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Bounded rich-body payload (contract 1.25) off a dataMessage-shaped object:
+/// link previews, @mentions, text-style ranges and the view-once marker.
+/// Malformed or oversized entries drop individually; an all-default result is
+/// None so plain messages carry nothing.
+fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<NormalizedRich> {
+    let mut rich = NormalizedRich::default();
+    if let Some(previews) = message.get("previews").and_then(Value::as_array) {
+        rich.previews = previews
+            .iter()
+            .take(MAX_PREVIEWS)
+            .filter_map(|entry| {
+                let object = entry.as_object()?;
+                let url = object
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(MAX_PREVIEW_URL_CHARS).collect::<String>())?;
+                Some(NormalizedPreview {
+                    url,
+                    title: object
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(|s| truncate_utf8_bytes(s, MAX_PREVIEW_FIELD_BYTES))
+                        .filter(|s| !s.is_empty()),
+                    description: object
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(|s| truncate_utf8_bytes(s, MAX_PREVIEW_FIELD_BYTES))
+                        .filter(|s| !s.is_empty()),
+                    image: object
+                        .get("image")
+                        .and_then(Value::as_object)
+                        .and_then(normalized_attachment),
+                })
+            })
+            .collect();
+    }
+    if let Some(mentions) = message.get("mentions").and_then(Value::as_array) {
+        rich.mentions = mentions
+            .iter()
+            .take(MAX_MENTIONS)
+            .filter_map(|entry| {
+                let object = entry.as_object()?;
+                let author = ["number", "uuid"]
+                    .iter()
+                    .find_map(|key| object.get(*key).and_then(Value::as_str))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+                Some(NormalizedMention {
+                    author,
+                    name: object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(|s| truncate_utf8_bytes(s, MAX_MENTION_NAME_BYTES))
+                        .filter(|s| !s.is_empty()),
+                    start: bounded_range_u32(object, "start")?,
+                    length: bounded_range_u32(object, "length")?,
+                })
+            })
+            .collect();
+    }
+    if let Some(styles) = message.get("textStyles").and_then(Value::as_array) {
+        rich.text_styles = styles
+            .iter()
+            .take(MAX_TEXT_STYLES)
+            .filter_map(|entry| {
+                let object = entry.as_object()?;
+                let style = match object.get("style").and_then(Value::as_str) {
+                    Some("BOLD") => "BOLD",
+                    Some("ITALIC") => "ITALIC",
+                    Some("STRIKETHROUGH") => "STRIKETHROUGH",
+                    Some("MONOSPACE") => "MONOSPACE",
+                    Some("SPOILER") => "SPOILER",
+                    _ => return None,
+                };
+                Some(NormalizedTextStyle {
+                    style: style.to_string(),
+                    start: bounded_range_u32(object, "start")?,
+                    length: bounded_range_u32(object, "length")?,
+                })
+            })
+            .collect();
+    }
+    rich.view_once = message
+        .get("viewOnce")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if rich.is_empty() {
+        return None;
+    }
+    Some(rich)
+}
+
+/// One protocol range coordinate: missing, non-numeric or out-of-u32 values
+/// drop the entry rather than clamp into a wrong rendered range.
+fn bounded_range_u32(object: &serde_json::Map<String, Value>, key: &str) -> Option<u32> {
+    object
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= u32::MAX as u64)
+        .map(|value| value as u32)
 }
 
 /// Bounded reaction payload: emoji shortened, author bounded, malformed shapes
@@ -1575,6 +1784,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 text: Option<NormalizedText>,
                 quote: Option<NormalizedQuote>,
                 attachments: Vec<NormalizedAttachment>,
+                rich: Option<NormalizedRich>,
                 control: Option<ControlReceive>| NormalizedReceive {
         timestamp,
         content_kind,
@@ -1589,6 +1799,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         text_truncated: text.is_some_and(|value| value.truncated),
         quote,
         attachments,
+        rich,
         control,
     };
 
@@ -1610,6 +1821,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             None,
             None,
             Vec::new(),
+            None,
             Some(control),
         ));
     }
@@ -1625,6 +1837,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 .get("attachments")
                 .map(normalized_attachments)
                 .unwrap_or_default();
+            let rich = normalized_rich(sent);
             let destination = sent
                 .get("destinationNumber")
                 .and_then(Value::as_str)
@@ -1641,7 +1854,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 });
             // Our own multi-device edit / delete / reaction of an earlier
             // message mirrors as a control receive keyed by its target.
-            if text.is_none() && quote.is_none() && attachments.is_empty() {
+            if text.is_none() && quote.is_none() && attachments.is_empty() && rich.is_none() {
                 if let Some(control) = sync_sent_control(sent) {
                     return Ok(make(
                         sent.get("timestamp").and_then(Value::as_u64).or(timestamp),
@@ -1652,6 +1865,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                         None,
                         None,
                         Vec::new(),
+                        None,
                         Some(control),
                     ));
                 }
@@ -1667,6 +1881,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     Some(text),
                     quote,
                     attachments,
+                    rich,
                     None,
                 ));
             }
@@ -1681,6 +1896,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     None,
                     quote,
                     attachments,
+                    rich,
                     None,
                 ));
             }
@@ -1694,6 +1910,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 None,
                 None,
                 Vec::new(),
+                rich,
                 None,
             ));
         }
@@ -1708,6 +1925,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             None,
             Vec::new(),
             None,
+            None,
         ));
     }
 
@@ -1719,6 +1937,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             .get("attachments")
             .map(normalized_attachments)
             .unwrap_or_default();
+        let rich = normalized_rich(data_message);
         if let Some(text) = text {
             return Ok(make(
                 timestamp,
@@ -1729,6 +1948,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 Some(text),
                 quote,
                 attachments,
+                rich,
                 None,
             ));
         }
@@ -1743,6 +1963,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 None,
                 quote,
                 attachments,
+                rich,
                 None,
             ));
         }
@@ -1762,6 +1983,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 None,
                 Vec::new(),
                 None,
+                None,
             ));
         }
         return Ok(make(
@@ -1773,6 +1995,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             None,
             None,
             Vec::new(),
+            None,
             None,
         ));
     }
@@ -1800,6 +2023,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     Some(new_text),
                     None,
                     Vec::new(),
+                    None,
                     Some(ControlReceive::Edit {
                         target_timestamp: target,
                     }),
@@ -1815,6 +2039,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             None,
             None,
             Vec::new(),
+            None,
             None,
         ));
     }
@@ -1833,6 +2058,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         None,
         None,
         Vec::new(),
+        None,
         None,
     ))
 }
@@ -2095,6 +2321,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         let mut admitted = 0;
@@ -2347,6 +2574,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         let mut admitted = 0;
@@ -2391,6 +2619,7 @@ mod tests {
             text_truncated: false,
             quote: None,
             attachments: Vec::new(),
+            rich: None,
             control: None,
         };
         while matches!(
@@ -2575,5 +2804,167 @@ mod tests {
 
         assert!(routing(json!({ "timestamp": [], "isDelivery": true })).is_none());
         assert!(routing(json!({ "isDelivery": true })).is_none());
+    }
+
+    /// Rich-body fields (contract 1.25) ride a dataMessage through
+    /// normalization bounded: cards/ranges capped, strings truncated, invalid
+    /// styles dropped — and a plain message carries no rich payload at all.
+    #[test]
+    fn data_message_rich_fields_normalize_bounded() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let rich = normalize(json!({
+            "message": "hello @peer check this link",
+            "viewOnce": true,
+            "previews": [{
+                "url": "https://example.com/article",
+                "title": "An article",
+                "description": "Readable summary",
+                "image": { "id": "att-1", "contentType": "image/jpeg",
+                           "filename": "card.jpg", "size": 2048,
+                           "width": 64, "height": 32 },
+            }],
+            "mentions": [{ "number": "+15555550101", "name": "Peer",
+                           "start": 6, "length": 4 }],
+            "textStyles": [
+                { "style": "BOLD", "start": 0, "length": 5 },
+                { "style": "SPOILER", "start": 6, "length": 4 },
+            ],
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(rich.previews.len(), 1);
+        assert_eq!(rich.previews[0].url, "https://example.com/article");
+        assert_eq!(rich.previews[0].title.as_deref(), Some("An article"));
+        assert_eq!(
+            rich.previews[0]
+                .image
+                .as_ref()
+                .map(|image| image.id.as_str()),
+            Some("att-1")
+        );
+        assert_eq!(rich.mentions.len(), 1);
+        assert_eq!(rich.mentions[0].author, "+15555550101");
+        assert_eq!(rich.mentions[0].name.as_deref(), Some("Peer"));
+        assert_eq!(rich.mentions[0].start, 6);
+        assert_eq!(rich.mentions[0].length, 4);
+        assert_eq!(
+            rich.text_styles
+                .iter()
+                .map(|style| style.style.as_str())
+                .collect::<Vec<_>>(),
+            ["BOLD", "SPOILER"]
+        );
+        assert!(rich.view_once);
+
+        // A plain message carries nothing.
+        let plain = normalize(json!({ "message": "hello" }));
+        assert!(plain.rich.is_none());
+    }
+
+    /// Rich bounds (§4.20): entries past a cap drop, oversized strings
+    /// truncate, malformed entries and unknown styles drop individually.
+    #[test]
+    fn rich_fields_enforce_bounds() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let previews = (0..8)
+            .map(|index| json!({ "url": format!("https://example.com/{index}"), "title": "t" }))
+            .collect::<Vec<_>>();
+        let mentions = (0..70)
+            .map(
+                |index| json!({ "number": format!("+1555555010{index}"), "start": 0, "length": 1 }),
+            )
+            .collect::<Vec<_>>();
+        let long_url = "https://example.com/".repeat(300);
+        let rich = normalize(json!({
+            "message": "rich",
+            "previews": previews,
+            "mentions": mentions,
+            "textStyles": [
+                { "style": "NONE", "start": 0, "length": 1 },
+                { "style": "MAGIC", "start": 0, "length": 1 },
+                { "style": "MONOSPACE", "start": 0, "length": 1 },
+                { "style": "BOLD", "start": 0 },
+                { "style": "BOLD" },
+            ],
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(rich.previews.len(), MAX_PREVIEWS);
+        assert_eq!(rich.mentions.len(), MAX_MENTIONS);
+        assert_eq!(
+            rich.text_styles.len(),
+            1,
+            "only the valid MONOSPACE range survives"
+        );
+        assert_eq!(rich.text_styles[0].style, "MONOSPACE");
+
+        let truncated = normalize(json!({
+            "message": "long",
+            "previews": [{ "url": long_url, "title": "x".repeat(2000) }],
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(
+            truncated.previews[0].url.chars().count(),
+            MAX_PREVIEW_URL_CHARS
+        );
+        assert!(
+            truncated.previews[0].title.as_ref().unwrap().len() <= MAX_PREVIEW_FIELD_BYTES,
+            "title truncates to its byte bound"
+        );
+
+        // All-default shapes collapse to None, malformed entries never fail
+        // the message.
+        let none = normalize(json!({
+            "message": "plain",
+            "previews": [{ "title": "no url" }],
+            "mentions": [{ "name": "no author", "start": 0, "length": 1 }],
+            "textStyles": [{ "style": "MAGIC", "start": 0, "length": 1 }],
+            "viewOnce": false,
+        }));
+        assert!(none.rich.is_none());
+    }
+
+    /// The multi-device sentMessage mirror carries the same rich payload as a
+    /// direct dataMessage (contract 1.25), so our own phone-originated rich
+    /// sends render identically after a restart.
+    #[test]
+    fn sync_sent_message_mirror_carries_rich_fields() {
+        let normalized = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1727000000000u64,
+                        "destinationNumber": "+15555550101",
+                        "message": "from my phone",
+                        "previews": [{ "url": "https://example.com" }],
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(normalized.direction, "outgoing");
+        let rich = normalized.rich.expect("rich payload");
+        assert_eq!(rich.previews[0].url, "https://example.com");
     }
 }

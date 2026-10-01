@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS messages (
   quote_message_id TEXT,
   quote_snapshot TEXT,
   attachments_json TEXT,
+  rich_json TEXT,
   edited_at INTEGER,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
@@ -354,6 +355,11 @@ pub struct MessageRecord {
     /// on rows without attachments.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachmentInfo>,
+    /// Bounded rich-body payload (contract 1.25): link previews, @mentions,
+    /// text-style ranges and the view-once marker, flattened onto the wire
+    /// row so absent keys stay absent. None on plain and pre-1.25 rows.
+    #[serde(flatten)]
+    pub rich: Option<crate::engine::NormalizedRich>,
     /// Local wall-clock time the body was last edited upstream (contract
     /// 1.15). Absent on rows never edited.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1234,7 +1240,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, edited_at
+                            quote_snapshot, attachments_json, rich_json, edited_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1278,7 +1284,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1298,7 +1304,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1325,7 +1331,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1371,8 +1377,8 @@ impl Store {
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
-                    quote_message_id, quote_snapshot, attachments_json, edited_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17)",
+                    quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17)",
                 params![
                     message.id,
                     message.account_id,
@@ -1398,6 +1404,10 @@ impl Store {
                         serde_json::to_string(&message.attachments).expect("attachments json")
                     }),
                     message.edited_at.map(|v| v as i64),
+                    message
+                        .rich
+                        .as_ref()
+                        .map(|rich| serde_json::to_string(rich).expect("rich json")),
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1531,7 +1541,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1595,7 +1605,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -1651,7 +1661,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1702,7 +1712,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -1745,7 +1755,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -1790,7 +1800,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, edited_at
+                            attachments_json, rich_json, edited_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -2979,6 +2989,16 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             }
         }
     }
+    if current < 9 {
+        // Contract revision 1.25 inbound rich bodies: one additive nullable
+        // JSON column packs previews/mentions/textStyles/viewOnce (§4.20).
+        // Pre-1.25 rows legitimately have none; bounds live in the engine, so
+        // the column only ever holds what §4.20 bounded.
+        if !table_has_column(conn, "messages", "rich_json")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN rich_json TEXT", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3127,6 +3147,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let persisted_truncated = row.get::<_, i64>(9)? != 0;
     let quote_snapshot: Option<String> = row.get(13)?;
     let attachments_json: Option<String> = row.get(14)?;
+    let rich_json: Option<String> = row.get(15)?;
     Ok(MessageRecord {
         id: row.get(0)?,
         account_id: row.get(1)?,
@@ -3149,7 +3170,10 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or_default(),
-        edited_at: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
+        rich: rich_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok()),
+        edited_at: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
         reactions: Vec::new(),
     })
 }
@@ -3214,6 +3238,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         assert!(
@@ -3236,6 +3261,135 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 10, None)
             .unwrap();
         assert_eq!(page.items.len(), 1);
+    }
+
+    /// Contract 1.25: a rich-body payload persists in the rich_json column,
+    /// round-trips through reads, and flattens onto the wire row as top-level
+    /// previews/mentions/textStyles/viewOnce; a plain row stays key-absent.
+    #[test]
+    fn rich_payload_round_trips_and_flattens_on_the_wire() {
+        use crate::engine::{NormalizedMention, NormalizedPreview, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sent_at: 10,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+        };
+
+        let mut rich = base("rich-1");
+        rich.rich = Some(NormalizedRich {
+            previews: vec![NormalizedPreview {
+                url: "https://example.com/a".into(),
+                title: Some("Title".into()),
+                description: None,
+                image: None,
+            }],
+            mentions: vec![NormalizedMention {
+                author: "+15555550101".into(),
+                name: Some("Peer".into()),
+                start: 0,
+                length: 4,
+            }],
+            text_styles: vec![crate::engine::NormalizedTextStyle {
+                style: "BOLD".into(),
+                start: 0,
+                length: 4,
+            }],
+            view_once: true,
+        });
+        assert!(
+            store
+                .insert_message(&rich, None, Some("body"), true)
+                .unwrap()
+        );
+        let read = store
+            .message_by_id(&account.id, &conversation.id, "rich-1")
+            .unwrap();
+        let read = read.unwrap();
+        let stored = read.rich.as_ref().expect("rich round-trips");
+        assert_eq!(stored.previews[0].url, "https://example.com/a");
+        assert_eq!(stored.mentions[0].author, "+15555550101");
+        assert_eq!(stored.text_styles[0].style, "BOLD");
+        assert!(stored.view_once);
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(wire["previews"][0]["url"], "https://example.com/a");
+        assert_eq!(wire["mentions"][0]["author"], "+15555550101");
+        assert_eq!(wire["textStyles"][0]["style"], "BOLD");
+        assert_eq!(wire["viewOnce"], true);
+
+        assert!(
+            store
+                .insert_message(&base("plain-1"), None, Some("body"), true)
+                .unwrap()
+        );
+        let plain = store
+            .message_by_id(&account.id, &conversation.id, "plain-1")
+            .unwrap()
+            .unwrap();
+        assert!(plain.rich.is_none());
+        let plain_wire = serde_json::to_value(&plain).unwrap();
+        assert!(plain_wire.get("previews").is_none());
+        assert!(plain_wire.get("viewOnce").is_none());
+    }
+
+    /// Contract 1.25 schema step: a v8 database migrates in place — the
+    /// additive rich_json column appears and the version stamp moves to 9.
+    #[test]
+    fn schema_v9_upgrade_adds_rich_json() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '8');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "rich_json").unwrap());
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -3276,6 +3430,7 @@ mod tests {
                     quote_snapshot: None,
                     attachments,
                     edited_at: None,
+                    rich: None,
                     reactions: Vec::new(),
                 };
                 store.insert_message(&message, None, text, false).unwrap();
@@ -3375,6 +3530,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -3467,6 +3623,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
 
@@ -3527,6 +3684,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -3592,6 +3750,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -3641,6 +3800,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -3714,6 +3874,7 @@ mod tests {
                 quote_snapshot: None,
                 attachments: Vec::new(),
                 edited_at: None,
+                rich: None,
                 reactions: Vec::new(),
             };
             store
@@ -3783,6 +3944,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -3826,6 +3988,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -3907,6 +4070,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store.insert_message(&message, None, None, false).unwrap();
@@ -4466,6 +4630,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -4530,6 +4695,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -4614,6 +4780,7 @@ mod tests {
                     quote_snapshot: None,
                     attachments: Vec::new(),
                     edited_at: None,
+                    rich: None,
                     reactions: Vec::new(),
                 };
                 store
@@ -4755,6 +4922,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -4820,6 +4988,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -4880,6 +5049,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -4943,6 +5113,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store
@@ -5358,6 +5529,7 @@ mod tests {
             quote_snapshot: None,
             attachments: Vec::new(),
             edited_at: None,
+            rich: None,
             reactions: Vec::new(),
         };
         store

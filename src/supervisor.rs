@@ -2009,6 +2009,7 @@ mod tests {
             quote_message_id: None,
             quote_snapshot: None,
             attachments: Vec::new(),
+            rich: None,
             edited_at: None,
             reactions: Vec::new(),
         };
@@ -2107,6 +2108,7 @@ mod tests {
                 text_truncated: false,
                 quote: None,
                 attachments: Vec::new(),
+                rich: None,
                 control: None,
             })
             .await
