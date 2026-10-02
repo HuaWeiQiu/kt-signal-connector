@@ -378,3 +378,70 @@ async fn stalled_stdin_does_not_block_the_actor() {
         "a full write queue must refuse admission, got {backpressure} refusals"
     );
 }
+
+/// Real-sidecar smoke for the experimental kt-engine mode (implementation
+/// plan §5): drives the actual `kt-signal-engine` binary through this
+/// crate's engine actor — spawn validation, stdio JSON-RPC round-trips, and
+/// graceful shutdown. Gated so the hermetic test suite stays hermetic: run
+/// it with the engine binary and its fake service selected, e.g.
+///
+/// ```text
+/// KT_SMOKE_ENGINE_BIN=/path/to/kt-signal-engine KT_ENGINE_FAKE_SERVICE=1 \
+///   cargo test --test engine_integration kt_engine_sidecar -- --nocapture
+/// ```
+///
+/// Without `KT_SMOKE_ENGINE_BIN` (and the fake-service flag, which the child
+/// inherits from this environment) the test returns immediately. Fake mode
+/// keeps every round-trip offline; the real-service paths are exercised by
+/// the engine repository's own contract suite.
+#[tokio::test]
+async fn kt_engine_sidecar_round_trips_over_the_engine_actor() {
+    let Ok(bin) = std::env::var("KT_SMOKE_ENGINE_BIN") else {
+        return;
+    };
+    if std::env::var("KT_ENGINE_FAKE_SERVICE").is_err() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let mut config = SignalCliConfig::new(PathBuf::from(bin), temp.path().join("signal-data"));
+    config.mode = SignalCliMode::KtEngine;
+    config.shutdown_grace = Duration::from_secs(2);
+    let (events, _) = event_channel();
+    let (receive_ingress, _receives) = receive_channel();
+    let engine = EngineHandle::start(config, events, receive_ingress)
+        .await
+        .expect("kt-signal-engine spawns");
+
+    let accounts = engine
+        .call("listAccounts", json!({}), CallClass::ReadOnly)
+        .await
+        .expect("listAccounts round-trips");
+    assert_eq!(accounts, json!([]));
+
+    let status = engine
+        .call(
+            "getUserStatus",
+            json!({ "account": "+15559990000" }),
+            CallClass::ReadOnly,
+        )
+        .await
+        .expect("getUserStatus round-trips");
+    assert_eq!(status, json!({ "isRegistered": true }));
+
+    let sent = engine
+        .call(
+            "send",
+            json!({
+                "account": "+15559990000",
+                "recipient": "+15551112222",
+                "message": "smoke"
+            }),
+            CallClass::Mutating,
+        )
+        .await
+        .expect("send round-trips");
+    assert!(sent.get("results").is_some(), "send mirrors the shape");
+
+    engine.shutdown().await.expect("graceful shutdown");
+    assert_eq!(engine.status().state, EngineState::Stopped);
+}

@@ -1039,6 +1039,27 @@ Rules:
   appears on the child command line; the JVM mode keeps it in the environment. Every other
   supervision guarantee (absolute-path non-symlink executable check, stdio JSON-RPC, receive-mode,
   kill-on-drop, watchdog, RSS sampling) is identical across modes.
+- Experimental `kt-engine` mode (2026-10-03): launches KT's own AGPL-3.0 sidecar
+  `kt-signal-engine` (separate repository; the libsignal-based replacement for the signal-cli JVM)
+  in place of signal-cli, selected explicitly with `serve --signal-cli-engine kt-engine` or
+  `KT_SIGNAL_CLI_ENGINE=kt-engine` (explicit selection, never probed: packaging controls what it
+  ships). In this mode `--signal-cli` points at the engine executable. The stdio JSON-RPC surface,
+  the argv tail (`--data-dir <dir> jsonRpc --receive-mode on-start [--ignore-attachments]
+  --ignore-stories --ignore-stickers`), and every supervision guarantee are identical to the
+  signal-cli modes, so the watchdog, unlink detection (§4.17: the engine reproduces the
+  AuthorizationFailed classification surface), and shutdown semantics apply unchanged. Two
+  deliberate divergences, both fail-closed at startup before any data-directory lock is taken:
+  a configured SOCKS proxy (default group or any `--proxy-group` entry) aborts the launch — the
+  engine cannot honor the privacy control yet, and silently dropping it would route traffic
+  direct; `--media-ingest` aborts the launch — the engine never downloads attachments, so the
+  media governor would promise a capability the child cannot deliver. The engine's argv parser is
+  fail-closed on unknown arguments, so the JVM/native `-DsocksProxy*` entries are never emitted in
+  this mode, `JAVA_HOME` is ignored with a warning, and the child environment is inherited except
+  for the store-key override, exactly like the other modes. The engine writes its own
+  `engine-state.json` / `engine-send-log.jsonl` / `accounts/lk-<hex>` layout under the group data
+  directory, disjoint from signal-cli's files and the connector's `.kt-signal-connector.lock`.
+  Scope: local smoke and development only — runtime-manifest packaging, licensing metadata, and
+  Desktop integration for the engine bundle are future work.
 
 During the local Phase 1 PoC, the trusted launcher supplies absolute executable and data-directory
 paths as process arguments; neither is accepted over host IPC. Phase 3 replaces this bootstrap with

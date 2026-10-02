@@ -56,8 +56,10 @@ const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
 
-/// How the configured signal-cli executable is launched.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// How the configured engine executable is launched. Selected explicitly by
+/// the trusted launcher (`serve --signal-cli-engine` / `KT_SIGNAL_CLI_ENGINE`,
+/// or the legacy `--signal-cli-native` flag); never probed from the file.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub enum SignalCliMode {
     /// The upstream launcher script: a JVM is started and the heap budget and
     /// SOCKS proxy reach it through the `JAVA_OPTS` environment variable.
@@ -74,6 +76,15 @@ pub enum SignalCliMode {
     /// puts proxy host:port on the child command line; the JVM mode keeps it
     /// in the environment.
     Native,
+    /// KT's own `kt-signal-engine` sidecar (separate AGPL-3.0 repository):
+    /// spawned directly with the same argv tail, but the `-D` SOCKS prepend
+    /// is never emitted because the engine's argv parser is fail-closed on
+    /// unknown arguments. A configured SOCKS proxy or media ingest aborts the
+    /// launch at startup validation (implementation plan §5): the engine
+    /// cannot honor either capability yet, and dropping a privacy control or
+    /// promising downloads that never happen is not an acceptable default.
+    /// `JAVA_HOME` is ignored with a warning, like native mode.
+    KtEngine,
 }
 
 #[derive(Clone, Debug)]
@@ -181,7 +192,7 @@ fn java_opts(proxy: Option<&SocksProxy>) -> String {
     }
 }
 
-/// signal-cli CLI arguments, identical in both modes except that native mode
+/// signal-cli CLI arguments, identical in every mode except that native mode
 /// prepends the SOCKS proxy as runtime system properties for the GraalVM
 /// native-image launcher. The launcher consumes `-D` entries anywhere on the
 /// command line before the app parses its own arguments; leading position is
@@ -189,6 +200,9 @@ fn java_opts(proxy: Option<&SocksProxy>) -> String {
 /// whether `--ignore-attachments` is present: with it the rest of the argv —
 /// including `--ignore-stories` and `--ignore-stickers` — is unchanged, and
 /// without it the argv is byte-identical to the pre-media-POC launcher.
+/// `KtEngine` never receives the `-D` prepend (its argv parser is fail-closed
+/// on unknown arguments); the launcher-level validation rejects a configured
+/// proxy in that mode before any engine is built.
 fn signal_cli_args(
     mode: SignalCliMode,
     proxy: Option<&SocksProxy>,
@@ -698,8 +712,8 @@ impl EngineHandle {
             return Err(EngineError::StartFailed);
         }
         prepare_data_dir(&config.data_dir).map_err(|_| EngineError::StartFailed)?;
-        if config.mode == SignalCliMode::Native && config.java_home.is_some() {
-            tracing::warn!("native signal-cli mode ignores the configured JAVA_HOME");
+        if !matches!(config.mode, SignalCliMode::Jvm) && config.java_home.is_some() {
+            tracing::warn!("the selected engine mode ignores the configured JAVA_HOME");
         }
 
         let mut command = Command::new(&config.executable);
@@ -2253,6 +2267,45 @@ mod tests {
             ]
         );
         assert_eq!(args[2], "--data-dir");
+    }
+
+    /// kt-engine mode (implementation plan §5): the engine's argv parser is
+    /// fail-closed on unknown arguments, so the `-D` SOCKS prepend of native
+    /// mode is never emitted — even if a proxy somehow reaches this function,
+    /// the tail stays byte-identical to the signal-cli launcher shape. The
+    /// launcher-level validation is what rejects the combination outright.
+    #[test]
+    fn kt_engine_mode_never_prepends_socks_properties_to_args() {
+        let proxy = SocksProxy {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        };
+        let expected: Vec<std::ffi::OsString> = [
+            "--data-dir",
+            "/data",
+            "jsonRpc",
+            "--receive-mode",
+            "on-start",
+            "--ignore-attachments",
+            "--ignore-stories",
+            "--ignore-stickers",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(
+            signal_cli_args(
+                SignalCliMode::KtEngine,
+                Some(&proxy),
+                Path::new("/data"),
+                false
+            ),
+            expected
+        );
+        assert_eq!(
+            signal_cli_args(SignalCliMode::KtEngine, None, Path::new("/data"), false),
+            expected
+        );
     }
 
     #[test]

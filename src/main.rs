@@ -67,6 +67,20 @@ enum CliCommand {
             value_parser = clap::builder::BoolishValueParser::new(),
         )]
         signal_cli_native: bool,
+        /// Engine kind to launch (env: KT_SIGNAL_CLI_ENGINE): `jvm` (the
+        /// signal-cli launcher script, default), `native` (GraalVM single
+        /// binary; equivalent to --signal-cli-native), or `kt-engine` (KT's
+        /// own sidecar; `--signal-cli` then points at the engine executable).
+        /// Explicit selection only — packaging controls what it ships.
+        /// Conflicts with --signal-cli-native; a configured SOCKS proxy or
+        /// --media-ingest aborts the launch in kt-engine mode (plan §5).
+        #[arg(
+            long,
+            env = "KT_SIGNAL_CLI_ENGINE",
+            value_enum,
+            conflicts_with = "signal_cli_native"
+        )]
+        signal_cli_engine: Option<SignalCliMode>,
         #[arg(long)]
         java_home: Option<PathBuf>,
         /// SOCKS proxy for the signal-cli child as host:port (env:
@@ -209,6 +223,7 @@ struct ServeOptions {
     parent_pid: Option<u32>,
     signal_cli: PathBuf,
     signal_cli_native: bool,
+    signal_cli_engine: Option<SignalCliMode>,
     java_home: Option<PathBuf>,
     socks_proxy: Option<SocksProxy>,
     proxy_group: Vec<String>,
@@ -244,6 +259,7 @@ async fn main() {
             parent_pid,
             signal_cli,
             signal_cli_native,
+            signal_cli_engine,
             java_home,
             socks_proxy,
             proxy_group,
@@ -257,6 +273,7 @@ async fn main() {
             parent_pid,
             signal_cli,
             signal_cli_native,
+            signal_cli_engine,
             java_home,
             socks_proxy,
             proxy_group,
@@ -276,6 +293,38 @@ async fn main() {
     }
 }
 
+/// kt-engine capability gate (implementation plan §5): the engine sidecar
+/// cannot honor a SOCKS proxy (its argv parser is fail-closed on `-D`
+/// entries, and silently dropping the privacy control would route traffic
+/// direct) and never downloads attachments (`--media-ingest` would arm the
+/// media governor for downloads that can never arrive). Both abort the
+/// launch with an explicit message; the other modes are unaffected.
+fn ensure_engine_mode_supported(
+    mode: SignalCliMode,
+    plan: &groups::ProxyGroupPlan,
+    media_ingest: bool,
+) -> Result<(), String> {
+    if mode != SignalCliMode::KtEngine {
+        return Ok(());
+    }
+    if media_ingest {
+        return Err(
+            "kt-engine mode does not support --media-ingest: the engine \
+                    never downloads inbound attachments"
+                .into(),
+        );
+    }
+    if plan.groups.iter().any(|group| group.proxy.is_some()) {
+        return Err(
+            "kt-engine mode does not support a SOCKS proxy: the engine cannot \
+             honor the proxy, and launching without it would bypass the \
+             configured privacy control"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let ServeOptions {
         endpoint,
@@ -284,6 +333,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         parent_pid,
         signal_cli,
         signal_cli_native,
+        signal_cli_engine,
         java_home,
         socks_proxy,
         proxy_group,
@@ -302,6 +352,13 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     // launch without leaking any endpoint into diagnostics (ADR 0001 R10).
     // Flag entries come first in launcher order, then environment entries;
     // duplicates across the two sources are rejected rather than merged.
+    // The engine kind resolves before anything touches the filesystem so the
+    // kt-engine capability validation (below) can abort the launch first.
+    let signal_cli_mode = match signal_cli_engine {
+        Some(mode) => mode,
+        None if signal_cli_native => SignalCliMode::Native,
+        None => SignalCliMode::Jvm,
+    };
     let env_spec = std::env::var("KT_SIGNAL_PROXY_GROUPS").ok();
     let plan = groups::build_group_plan(
         &proxy_group,
@@ -309,6 +366,10 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         socks_proxy,
         &signal_data_dir,
     )?;
+    // kt-engine capability gate (plan §5): fail the launch before any
+    // data-directory lock or secret read rather than spawning an engine that
+    // cannot honor the configured proxy or deliver media downloads.
+    ensure_engine_mode_supported(signal_cli_mode, &plan, media_ingest)?;
     // ADR 0002 occupancy guard: exclusive cross-process locks over every
     // planned data directory (the `default` root and each proxy-group
     // subdirectory), acquired before the bootstrap payload is read and held
@@ -347,11 +408,6 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         harden_private_directory(&state_dir)?;
     }
     let listener = LocalListener::bind(&endpoint)?;
-    let signal_cli_mode = if signal_cli_native {
-        SignalCliMode::Native
-    } else {
-        SignalCliMode::Jvm
-    };
     let runtime = open_group_runtime(
         plan,
         signal_cli,
@@ -601,4 +657,83 @@ fn load_optional_trust(
         .ok_or("--trusted-public-key-file is required unless --allow-unsigned")?;
     let key = load_verifying_key(&key_path).map_err(|error| error.to_string())?;
     Ok(Some((key_id, key)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn plan_with_proxies(proxies: Vec<Option<SocksProxy>>) -> groups::ProxyGroupPlan {
+        groups::ProxyGroupPlan {
+            groups: proxies
+                .into_iter()
+                .enumerate()
+                .map(|(index, proxy)| groups::ProxyGroupPlanEntry {
+                    id: format!("group-{index}"),
+                    proxy,
+                    data_dir: PathBuf::from(format!("/data/group-{index}")),
+                })
+                .collect(),
+        }
+    }
+
+    fn proxy() -> SocksProxy {
+        SocksProxy {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        }
+    }
+
+    #[test]
+    fn kt_engine_mode_rejects_a_configured_proxy_on_any_group() {
+        assert!(
+            ensure_engine_mode_supported(
+                SignalCliMode::KtEngine,
+                &plan_with_proxies(vec![None, Some(proxy())]),
+                false,
+            )
+            .is_err()
+        );
+        // The default group alone is equally covered.
+        assert!(
+            ensure_engine_mode_supported(
+                SignalCliMode::KtEngine,
+                &plan_with_proxies(vec![Some(proxy())]),
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kt_engine_mode_rejects_media_ingest() {
+        let error = ensure_engine_mode_supported(
+            SignalCliMode::KtEngine,
+            &plan_with_proxies(vec![None]),
+            true,
+        )
+        .expect_err("media ingest must abort the launch");
+        assert!(error.contains("media-ingest"));
+    }
+
+    #[test]
+    fn kt_engine_mode_accepts_a_plain_plan() {
+        ensure_engine_mode_supported(
+            SignalCliMode::KtEngine,
+            &plan_with_proxies(vec![None, None]),
+            false,
+        )
+        .expect("plain plan is supported");
+    }
+
+    #[test]
+    fn signal_cli_modes_keep_proxy_and_media_capabilities() {
+        let proxy_plan = plan_with_proxies(vec![Some(proxy())]);
+        for mode in [SignalCliMode::Jvm, SignalCliMode::Native] {
+            ensure_engine_mode_supported(mode, &proxy_plan, true)
+                .expect("signal-cli modes are unrestricted");
+        }
+    }
 }
