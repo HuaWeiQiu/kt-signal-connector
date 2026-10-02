@@ -236,8 +236,45 @@ def receive_notification():
     }
 
 
+# Contract 1.27 test hook: `.fixture-extra-receives.json` holds a JSON array
+# of raw envelopes. finishLink's receive burst delivers every not-yet-emitted
+# entry in order after the default one, and `flush_extra_receives()` re-checks
+# the marker on later upstream calls a test controls — sendTyping (via
+# presence.setTypingMessage, which changes no conversation state) and
+# listContacts — so envelopes appended after link time (e.g. a group reaction
+# remove) reach the connector at a chosen point. contacts.sync itself is no
+# trigger inside its 60s debounce window: it answers from the cache without
+# calling listContacts, so sendTyping is the reliable post-link flush.
+EXTRA_RECEIVES_MARKER = SIGNAL_DATA_DIR / ".fixture-extra-receives.json"
+EXTRA_RECEIVES_EMITTED = [0]
+
+
+def pending_extra_receive_notifications():
+    if not EXTRA_RECEIVES_MARKER.exists():
+        return []
+    envelopes = json.loads(EXTRA_RECEIVES_MARKER.read_text())
+    if not isinstance(envelopes, list):
+        return []
+    pending = envelopes[EXTRA_RECEIVES_EMITTED[0]:]
+    EXTRA_RECEIVES_EMITTED[0] = len(envelopes)
+    return [
+        {
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {"account": receiving_account(), "envelope": envelope},
+        }
+        for envelope in pending
+    ]
+
+
+def flush_extra_receives():
+    for notification in pending_extra_receive_notifications():
+        emit_json(notification)
+
+
 def emit_receive():
     emit_json(receive_notification())
+    flush_extra_receives()
 
 
 def emit_json_after(value, delay_seconds):
@@ -310,6 +347,10 @@ for line in sys.stdin:
         else:
             result = [{"number": LINKED_ACCOUNT}] if ACCOUNT_LINKED else []
     elif method == "listContacts":
+        # Contract 1.27 hook: deliver extra receives appended to the marker
+        # after link time before answering. Only reached outside the
+        # contacts-sync debounce window.
+        flush_extra_receives()
         result = [
             {
                 "number": LINKED_ACCOUNT,
@@ -418,6 +459,10 @@ for line in sys.stdin:
             os._exit(25)
         result = {}
     elif method == "sendTyping":
+        # Contract 1.27 hook: deliver extra receives appended to the marker
+        # after link time before answering. Typing indicators change no
+        # conversation state, so this is the clean post-link flush trigger.
+        flush_extra_receives()
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the recipient array / groupId / explicit
         # stop boolean contract.

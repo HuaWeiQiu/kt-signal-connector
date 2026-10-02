@@ -1437,6 +1437,296 @@ async fn send_reaction_maps_row_direction_and_answers_upstream_outcome() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.27 end to end: envelopes carrying `sourceName` — staged in the
+/// fixture's `.fixture-extra-receives.json` marker and delivered through the
+/// real engine's receive stream — flow into the message rows (`senderName`),
+/// the conversation summaries (`lastMessageDirection` /
+/// `lastMessageAuthorName` / `lastMessageReactions`), and the per-actor
+/// reaction detail on the pills (`actors` with self/name/reactedAt); a later
+/// remove empties the pill and drops the summary emoji prefix, and an
+/// outgoing ending flips the direction without an author name.
+#[tokio::test]
+async fn conversation_summary_and_reactions_carry_author_metadata() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [29_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Stage the first batch before linking: one named group message and one
+    // named group reaction onto it, both carrying the sender's display name
+    // exactly like a real signal-cli receive envelope. finishLink's receive
+    // burst delivers them right after the default unnamed direct receive.
+    // Timestamps stay below 99 — the fixture's fixed send timestamp — so the
+    // outgoing message sent at the end becomes the conversation's newest row.
+    let extra_receives = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-extra-receives.json");
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        &extra_receives,
+        json!([
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 50,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "group hello"
+                }
+            },
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 51,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "reaction": {
+                        "emoji": "👍",
+                        "targetAuthor": "+15555550101",
+                        "targetSentTimestamp": 50,
+                        "isRemove": false
+                    }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Summary-Meta" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+
+    // Drain the finish burst: the link answer, the group message upsert, and
+    // the add-state summary change (reaction emoji on the new last message).
+    let mut account_id: Option<String> = None;
+    let mut group_conversation_id: Option<String> = None;
+    let mut group_message_id: Option<String> = None;
+    timeout(Duration::from_secs(5), async {
+        while account_id.is_none() || group_conversation_id.is_none() || group_message_id.is_none()
+        {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                account_id = Some(frame["result"]["id"].as_str().unwrap().to_string());
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["sentAt"] == 50
+            {
+                group_message_id = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("conversation.changed")
+                && frame["data"]["type"] == "group"
+                && frame["data"]["lastMessageReactions"] == json!(["👍"])
+            {
+                group_conversation_id = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            }
+        }
+    })
+    .await
+    .expect("the finish burst must deliver the named group message and reaction");
+    let account_id = account_id.unwrap();
+    let group_conversation_id = group_conversation_id.unwrap();
+    let group_message_id = group_message_id.unwrap();
+
+    // Persisted add-state projection: direction incoming, captured author
+    // name, reaction emoji on the group row; the unnamed direct row from the
+    // default receive carries a direction but no author name.
+    let conversations = request(
+        &mut client,
+        "conv-summary",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let items = conversations["result"]["items"].as_array().unwrap();
+    let group_row = items
+        .iter()
+        .find(|item| item["id"] == group_conversation_id.as_str())
+        .unwrap();
+    assert_eq!(group_row["lastMessageDirection"], "incoming");
+    assert_eq!(group_row["lastMessageAuthorName"], "林菲菲");
+    assert_eq!(group_row["lastMessageReactions"], json!(["👍"]));
+    let direct_row = items
+        .iter()
+        .find(|item| item["type"] == "direct" && item.get("lastMessageDirection").is_some())
+        .unwrap();
+    assert_eq!(direct_row["lastMessageDirection"], "incoming");
+    assert!(direct_row.get("lastMessageAuthorName").is_none());
+
+    // The message row carries the author name and the per-actor pill detail
+    // the official ReactionViewer renders.
+    let messages = request(
+        &mut client,
+        "messages-meta",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "limit": 10
+        }),
+    )
+    .await;
+    let row = messages["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == group_message_id.as_str())
+        .unwrap();
+    assert_eq!(row["senderName"], "林菲菲");
+    assert_eq!(row["reactions"][0]["emoji"], "👍");
+    assert_eq!(row["reactions"][0]["count"], 1);
+    assert_eq!(row["reactions"][0]["mine"], false);
+    let actors = row["reactions"][0]["actors"].as_array().unwrap();
+    assert_eq!(actors.len(), 1);
+    assert_eq!(actors[0]["self"], false);
+    assert_eq!(actors[0]["name"], "林菲菲");
+    assert!(actors[0]["reactedAt"].is_u64());
+
+    // Append the reaction remove and deliver it through a later upstream
+    // call: the fixture flushes pending extra receives before answering
+    // sendTyping, and a typing indicator changes no conversation state.
+    let mut envelopes: Vec<Value> =
+        serde_json::from_str(&fs::read_to_string(&extra_receives).unwrap()).unwrap();
+    envelopes.push(json!({
+        "source": "+15555550101",
+        "sourceName": "林菲菲",
+        "timestamp": 52,
+        "dataMessage": {
+            "groupId": "ZmFrZS1ncm91cC0x",
+            "reaction": {
+                "emoji": "👍",
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 50,
+                "isRemove": true
+            }
+        }
+    }));
+    fs::write(&extra_receives, serde_json::to_string(&envelopes).unwrap()).unwrap();
+
+    send_request_frame(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id
+        }),
+    )
+    .await;
+    let mut remove_seen = false;
+    timeout(Duration::from_secs(5), async {
+        while !remove_seen {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("conversation.changed")
+                && frame["data"]["id"] == group_conversation_id.as_str()
+                && frame["data"].get("lastMessageReactions").is_none()
+            {
+                remove_seen = true;
+            }
+        }
+    })
+    .await
+    .expect("the reaction remove must clear the summary emoji prefix");
+
+    // Removal semantics: the pill list is always serialized and empties
+    // entirely, and the summary row keeps direction and author but loses the
+    // reaction prefix.
+    let messages = request(
+        &mut client,
+        "messages-meta-removed",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "limit": 10
+        }),
+    )
+    .await;
+    let row = messages["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == group_message_id.as_str())
+        .unwrap();
+    assert!(row["reactions"].as_array().unwrap().is_empty());
+    let conversations = request(
+        &mut client,
+        "conv-summary-removed",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_row = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == group_conversation_id.as_str())
+        .unwrap();
+    assert_eq!(group_row["lastMessageDirection"], "incoming");
+    assert_eq!(group_row["lastMessageAuthorName"], "林菲菲");
+    assert!(group_row.get("lastMessageReactions").is_none());
+
+    // An outgoing ending flips the direction and drops the author name: the
+    // client renders its own self label.
+    let sent = request(
+        &mut client,
+        "send-group-summary",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "text": "summary outgoing",
+            "clientRequestId": "summary-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversations = request(
+        &mut client,
+        "conv-summary-outgoing",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_row = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == group_conversation_id.as_str())
+        .unwrap();
+    assert_eq!(group_row["lastMessageDirection"], "outgoing");
+    assert!(group_row.get("lastMessageAuthorName").is_none());
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn socks_proxy_env_is_forwarded_to_the_jvm() {
     let temp = TempDir::new().unwrap();

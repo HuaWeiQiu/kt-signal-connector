@@ -2001,6 +2001,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: expired_at,
             received_at: Some(expired_at),
             text: Some("body".into()),

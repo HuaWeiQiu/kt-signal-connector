@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments_json TEXT,
   rich_json TEXT,
   edited_at INTEGER,
+  sender_name TEXT,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
@@ -126,6 +127,7 @@ CREATE TABLE IF NOT EXISTS message_events (
   actor_id TEXT NOT NULL,
   removed INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL,
+  actor_name TEXT,
   UNIQUE(account_id, conversation_id, kind, target_timestamp, actor_id),
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
@@ -152,6 +154,17 @@ const MESSAGE_CURSOR_PREFIX: &str = "m1:";
 /// signal-cli may still replay an envelope, and a resend may still arrive.
 const RETENTION_SAFETY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_PAGE_LIMIT: u32 = 200;
+/// Contract 1.27 read bounds for the per-actor reaction detail: at most this
+/// many active reaction rows are fetched per conversation read (newest
+/// reaction first, deterministic truncation), and one emoji pill lists at
+/// most this many actors. Real conversations stay far below both; the caps
+/// keep a pathological store from inflating a read response.
+const MAX_REACTION_DETAIL_ROWS: usize = 1024;
+const MAX_REACTION_ACTORS: usize = 64;
+/// Contract 1.27: at most this many distinct reaction emoji are attached to a
+/// conversation summary's last-message field (official previews render a
+/// short emoji prefix, not the full pill set).
+const MAX_SUMMARY_REACTIONS: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -305,6 +318,24 @@ pub struct ConversationSummary {
     /// then falls back to `last_message_preview`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_kind: Option<&'static str>,
+    /// Contract 1.27: the newest row's direction — `outgoing` or `incoming`.
+    /// Absent when the conversation has no rows or ends on a system row, the
+    /// same endings the official list preview shows without send state or
+    /// author prefix. `outgoing` marks the linked account as the author (the
+    /// client renders its own localized self label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_direction: Option<&'static str>,
+    /// Contract 1.27: newest incoming author's display name, captured from the
+    /// envelope `sourceName` at receive and stored on the message row. Absent
+    /// for outgoing (self), system endings, and rows received before 1.27 or
+    /// without a captured name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_author_name: Option<String>,
+    /// Contract 1.27: distinct active reaction emoji on the newest row, oldest
+    /// reaction first (the same order the message pills use). Absent when the
+    /// last message carries no active reactions.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub last_message_reactions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<u64>,
     pub unread_count: u32,
@@ -313,15 +344,39 @@ pub struct ConversationSummary {
 }
 
 /// One aggregated reaction pill projected onto a message row (contract
-/// 1.16): the emoji, how many distinct actors reacted, and whether this
-/// account is one of them. Derived from `message_events` at read time —
-/// never persisted on the message row itself.
+/// 1.16, per-author detail added in 1.27): the emoji, how many distinct
+/// actors reacted, whether this account is one of them, and who they are.
+/// Derived from `message_events` at read time — never persisted on the
+/// message row itself.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageReactionSummary {
     pub emoji: String,
     pub count: u32,
     pub mine: bool,
+    /// Contract 1.27 per-actor detail: every active actor of this emoji,
+    /// newest reaction first (the official ReactionViewer order). Always
+    /// serialized — empty means no active actor — so host-side pill merges
+    /// stay total and a removal clears the actor it removed. `count` and
+    /// `actors.len()` agree: one `message_events` row per actor per target.
+    pub actors: Vec<MessageReactionActor>,
+}
+
+/// One reacting actor (contract 1.27): the linked account itself
+/// (`self: true`, the client renders its own localized label) or a peer with
+/// the display name captured from the reaction envelope's `sourceName`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageReactionActor {
+    #[serde(rename = "self")]
+    pub is_self: bool,
+    /// Peer display name at reaction time; absent for self and when the
+    /// envelope carried no name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Local wall-clock ms the reaction was last recorded (receive time for
+    /// inbound, echo time for own multi-device reactions).
+    pub reacted_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -332,6 +387,12 @@ pub struct MessageRecord {
     pub conversation_id: String,
     pub direction: &'static str,
     pub sender_id: String,
+    /// Contract 1.27: incoming author display name captured from the envelope
+    /// `sourceName` at receive (bounded by the engine to 64 chars). Absent on
+    /// outgoing (sender is self), system rows, and pre-1.27 rows. Backs the
+    /// conversation-summary author field and per-actor reaction names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
     pub sent_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received_at: Option<u64>,
@@ -1169,6 +1230,9 @@ impl Store {
                         title: row.get(3)?,
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
+                        last_message_direction: None,
+                        last_message_author_name: None,
+                        last_message_reactions: Vec::new(),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         muted: row.get::<_, i64>(7)? != 0,
@@ -1181,7 +1245,11 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         for item in &mut items {
-            item.last_message_kind = conversation_last_message_kind(&conn, &item.id)?;
+            let meta = conversation_last_message_meta(&conn, &item.id)?;
+            item.last_message_kind = meta.kind;
+            item.last_message_direction = meta.direction;
+            item.last_message_author_name = meta.author_name;
+            item.last_message_reactions = meta.reactions;
         }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
@@ -1240,7 +1308,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1284,7 +1352,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1304,7 +1372,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1331,7 +1399,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1377,8 +1445,8 @@ impl Store {
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
-                    quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17)",
+                    quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19)",
                 params![
                     message.id,
                     message.account_id,
@@ -1408,6 +1476,7 @@ impl Store {
                         .rich
                         .as_ref()
                         .map(|rich| serde_json::to_string(rich).expect("rich json")),
+                    message.sender_name,
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1541,7 +1610,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1605,7 +1674,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -1661,7 +1730,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1712,7 +1781,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -1755,7 +1824,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -1800,7 +1869,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at
+                            attachments_json, rich_json, edited_at, sender_name
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -1846,10 +1915,13 @@ impl Store {
         Ok(moved)
     }
 
-    /// Record one inbound reaction (contract 1.15). The protocol shape — one
-    /// emoji state per (conversation, target message, actor) — maps to an
-    /// upsert: a repeated reaction replaces the emoji, `isRemove` marks the
-    /// row removed instead of deleting it (history stays auditable).
+    /// Record one inbound reaction (contract 1.15; actor name captured since
+    /// 1.27). The protocol shape — one emoji state per (conversation, target
+    /// message, actor) — maps to an upsert: a repeated reaction replaces the
+    /// emoji, `isRemove` marks the row removed instead of deleting it
+    /// (history stays auditable), and a later envelope refreshes the captured
+    /// display name.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_reaction_event(
         &self,
         account_id: &str,
@@ -1858,17 +1930,19 @@ impl Store {
         target_sent_at: u64,
         actor_id: &str,
         removed: bool,
+        actor_name: Option<&str>,
     ) -> Result<(), StoreError> {
         self.lock_conn()?
             .execute(
                 "INSERT INTO message_events(
                     id, account_id, conversation_id, kind, emoji,
-                    target_timestamp, actor_id, removed, updated_at
-                 ) VALUES(?1, ?2, ?3, 'reaction', ?4, ?5, ?6, ?7, ?8)
+                    target_timestamp, actor_id, removed, updated_at, actor_name
+                 ) VALUES(?1, ?2, ?3, 'reaction', ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(account_id, conversation_id, kind, target_timestamp, actor_id)
                  DO UPDATE SET emoji=excluded.emoji,
                                removed=excluded.removed,
-                               updated_at=excluded.updated_at",
+                               updated_at=excluded.updated_at,
+                               actor_name=excluded.actor_name",
                 params![
                     crate::ids::stable_hash_id(&[
                         account_id,
@@ -1884,6 +1958,7 @@ impl Store {
                     actor_id,
                     i64::from(removed),
                     crate::link::now_ms() as i64,
+                    actor_name,
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1931,11 +2006,16 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
-    /// Active reaction aggregates for one conversation, keyed by the target
-    /// message's upstream timestamp (contract 1.16): per emoji the distinct
-    /// actor count and whether this account reacted. Rows flagged `removed`
-    /// are excluded — a removed reaction stops counting. Ordered by first
-    /// reaction time so pill order is stable across refreshes.
+    /// Active reaction pills for one conversation, keyed by the target
+    /// message's upstream timestamp (contract 1.16, per-author detail in
+    /// 1.27): per emoji the distinct active actor count, whether this account
+    /// reacted, and every actor newest-first (the official ReactionViewer
+    /// order). Rows flagged `removed` are excluded — removal is the actor's
+    /// disappearance from `actors` and from `count`. One read, bounded by
+    /// `MAX_REACTION_DETAIL_ROWS` newest rows and `MAX_REACTION_ACTORS` per
+    /// emoji; `count` and `actors.len()` always agree because an actor owns
+    /// exactly one event row per target. Ordered by first reaction time so
+    /// pill order is stable across refreshes.
     pub fn reaction_aggregates_for_conversation(
         &self,
         account_id: &str,
@@ -1944,32 +2024,89 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT target_timestamp, emoji, COUNT(*) AS cnt,
-                        MAX(CASE WHEN actor_id = ?1 THEN 1 ELSE 0 END) AS mine
+                "SELECT target_timestamp, emoji, actor_id, actor_name, updated_at
                  FROM message_events
-                 WHERE account_id=?2 AND conversation_id=?3
+                 WHERE account_id=?1 AND conversation_id=?2
                    AND kind='reaction' AND removed=0
-                 GROUP BY target_timestamp, emoji
-                 ORDER BY MIN(updated_at) ASC, emoji ASC",
+                 ORDER BY updated_at DESC, id DESC
+                 LIMIT ?3",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let rows = stmt
-            .query_map(params![account_id, account_id, conversation_id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)? as u64,
-                    MessageReactionSummary {
-                        emoji: row.get(1)?,
-                        count: row.get::<_, i64>(2)?.max(0) as u32,
-                        mine: row.get::<_, i64>(3)? != 0,
-                    },
-                ))
-            })
+            .query_map(
+                params![account_id, conversation_id, MAX_REACTION_DETAIL_ROWS as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)? as u64,
+                    ))
+                },
+            )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Assemble pills newest-first per emoji, then re-order the pills by
+        // their oldest member (first reaction wins, then emoji) so the order
+        // matches the pre-1.27 aggregate exactly.
+        struct Pill {
+            actors: Vec<MessageReactionActor>,
+            first_reacted_at: u64,
+            mine: bool,
+        }
+        let mut order: Vec<(u64, String)> = Vec::new();
+        let mut pills: std::collections::HashMap<(u64, String), Pill> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (target, emoji, actor_id, actor_name, updated_at) =
+                row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let key = (target, emoji.clone());
+            let pill = pills.entry(key.clone()).or_insert_with(|| {
+                order.push(key);
+                Pill {
+                    actors: Vec::new(),
+                    first_reacted_at: updated_at,
+                    mine: false,
+                }
+            });
+            if pill.actors.len() < MAX_REACTION_ACTORS {
+                pill.actors.push(MessageReactionActor {
+                    is_self: actor_id == account_id,
+                    name: actor_name.filter(|name| !name.trim().is_empty()),
+                    reacted_at: updated_at,
+                });
+                if actor_id == account_id {
+                    pill.mine = true;
+                }
+            }
+        }
+        order.sort_by(|(left_target, left_emoji), (right_target, right_emoji)| {
+            let left = pills
+                .get(&(*left_target, left_emoji.clone()))
+                .map(|pill| pill.first_reacted_at)
+                .unwrap_or(u64::MAX);
+            let right = pills
+                .get(&(*right_target, right_emoji.clone()))
+                .map(|pill| pill.first_reacted_at)
+                .unwrap_or(u64::MAX);
+            left.cmp(&right).then(left_emoji.cmp(right_emoji))
+        });
         let mut grouped: std::collections::HashMap<u64, Vec<MessageReactionSummary>> =
             std::collections::HashMap::new();
-        for item in rows {
-            let (target, summary) = item.map_err(|error| StoreError::Unavailable(Some(error)))?;
-            grouped.entry(target).or_default().push(summary);
+        for (target, emoji) in order {
+            let pill = pills
+                .remove(&(target, emoji.clone()))
+                .expect("pill tracked");
+            let count = pill.actors.len().min(u32::MAX as usize) as u32;
+            grouped
+                .entry(target)
+                .or_default()
+                .push(MessageReactionSummary {
+                    emoji,
+                    count,
+                    mine: pill.mine,
+                    actors: pill.actors,
+                });
         }
         Ok(grouped)
     }
@@ -2108,6 +2245,9 @@ impl Store {
                         title: row.get(3)?,
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
+                        last_message_direction: None,
+                        last_message_author_name: None,
+                        last_message_reactions: Vec::new(),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         muted: row.get::<_, i64>(7)? != 0,
@@ -2119,7 +2259,11 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         match summary {
             Some(mut summary) => {
-                summary.last_message_kind = conversation_last_message_kind(&conn, conversation_id)?;
+                let meta = conversation_last_message_meta(&conn, conversation_id)?;
+                summary.last_message_kind = meta.kind;
+                summary.last_message_direction = meta.direction;
+                summary.last_message_author_name = meta.author_name;
+                summary.last_message_reactions = meta.reactions;
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -2999,6 +3143,22 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 10 {
+        // Contract revision 1.27: per-row author display names captured from
+        // the receive envelope's `sourceName` — on messages (backs the
+        // conversation-summary author field) and on reaction events (backs the
+        // per-actor reaction detail). Both additive nullable: pre-1.27 rows
+        // legitimately have none and are never backfilled, because the name a
+        // past envelope carried was never stored and must not be invented.
+        if !table_has_column(conn, "messages", "sender_name")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN sender_name TEXT", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        if !table_has_column(conn, "message_events", "actor_name")? {
+            conn.execute("ALTER TABLE message_events ADD COLUMN actor_name TEXT", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3016,6 +3176,7 @@ fn table_has_column(
     let sql = match table {
         "accounts" => "PRAGMA table_info(accounts)",
         "messages" => "PRAGMA table_info(messages)",
+        "message_events" => "PRAGMA table_info(message_events)",
         _ => return Err(StoreError::Unavailable(None)),
     };
     let mut stmt = conn
@@ -3079,20 +3240,34 @@ fn static_status(value: String) -> &'static str {
     }
 }
 
-/// Contract 1.23: the desktop list renders the official attachment noun
-/// ("Photo" / "Video" / "Voice message" / "File") from
-/// `ConversationSummary::last_message_kind`. The newest row decides: an
-/// attachment-only ending (attachments present, no caption text) yields its
-/// first attachment's kind; a text/caption ending, a system row, or an empty
-/// conversation stays `None` — the caption wins over the noun, exactly like
-/// the official list preview.
-fn conversation_last_message_kind(
+/// Contract 1.23 (attachment noun) generalized by contract 1.27: one indexed
+/// read of the newest row decides every last-message projection on a
+/// conversation summary. The desktop list renders the official preview line —
+/// attachment noun ("Photo" / "Video" / "Voice message" / "File"), send-state
+/// icon (outgoing only), group author prefix, reaction emoji prefix — so the
+/// read returns `kind`, `direction`, the captured author name, and the
+/// distinct active reaction emoji of that row.
+///
+/// Rules unchanged from 1.23 for `kind`: an attachment-only ending (no
+/// caption text) yields its first attachment's kind; a text/caption ending, a
+/// system row, or an empty conversation stays `None` — the caption wins over
+/// the noun, exactly like the official list preview. `direction` follows the
+/// same newest row but stays `None` for system rows and empty conversations;
+/// the author name is surfaced only for incoming rows that carry one.
+struct ConversationLastMessageMeta {
+    kind: Option<&'static str>,
+    direction: Option<&'static str>,
+    author_name: Option<String>,
+    reactions: Vec<String>,
+}
+
+fn conversation_last_message_meta(
     conn: &Connection,
     conversation_id: &str,
-) -> Result<Option<&'static str>, StoreError> {
+) -> Result<ConversationLastMessageMeta, StoreError> {
     let latest = conn
         .query_row(
-            "SELECT direction, body, attachments_json FROM messages
+            "SELECT direction, body, attachments_json, sender_name, sent_at FROM messages
              WHERE conversation_id=?1
              ORDER BY sent_at DESC, id DESC
              LIMIT 1",
@@ -3102,37 +3277,82 @@ fn conversation_last_message_kind(
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    let Some((direction, body, attachments_json)) = latest else {
-        return Ok(None);
+    let Some((direction, body, attachments_json, sender_name, sent_at)) = latest else {
+        return Ok(ConversationLastMessageMeta {
+            kind: None,
+            direction: None,
+            author_name: None,
+            reactions: Vec::new(),
+        });
     };
     let has_caption = body.is_some_and(|text| !text.trim().is_empty());
-    if direction == "system" || has_caption {
-        return Ok(None);
-    }
-    let attachments: Vec<crate::engine::NormalizedAttachment> = attachments_json
-        .as_deref()
-        .and_then(|json| serde_json::from_str(json).ok())
-        .unwrap_or_default();
-    let Some(first) = attachments.first() else {
-        return Ok(None);
+    let kind = if direction == "system" || has_caption {
+        None
+    } else {
+        let attachments: Vec<crate::engine::NormalizedAttachment> = attachments_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        attachments.first().map(|first| {
+            let content_type = first.content_type.as_deref().unwrap_or_default();
+            if first.is_voice_note || content_type.starts_with("audio/") {
+                "audio"
+            } else if content_type.starts_with("image/") {
+                "image"
+            } else if content_type.starts_with("video/") {
+                "video"
+            } else {
+                "file"
+            }
+        })
     };
-    let content_type = first.content_type.as_deref().unwrap_or_default();
-    Ok(Some(
-        if first.is_voice_note || content_type.starts_with("audio/") {
-            "audio"
-        } else if content_type.starts_with("image/") {
-            "image"
-        } else if content_type.starts_with("video/") {
-            "video"
-        } else {
-            "file"
-        },
-    ))
+    let wire_direction = match direction.as_str() {
+        "system" => None,
+        other => Some(static_direction(other.to_string())),
+    };
+    let author_name = match wire_direction {
+        Some("incoming") => sender_name.filter(|name| !name.trim().is_empty()),
+        _ => None,
+    };
+    // Active reactions on exactly the newest row, keyed by its upstream
+    // timestamp; pill order (oldest reaction first, then emoji) matches the
+    // message projection so the summary prefix and the open conversation
+    // agree.
+    let mut reactions = Vec::new();
+    if direction != "system" {
+        let mut stmt = conn
+            .prepare(
+                "SELECT emoji FROM message_events
+                 WHERE conversation_id=?1 AND kind='reaction' AND removed=0
+                   AND target_timestamp=?2
+                 GROUP BY emoji
+                 ORDER BY MIN(updated_at) ASC, emoji ASC
+                 LIMIT ?3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(
+                params![conversation_id, sent_at, MAX_SUMMARY_REACTIONS as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        for emoji in rows {
+            reactions.push(emoji.map_err(|error| StoreError::Unavailable(Some(error)))?);
+        }
+    }
+    Ok(ConversationLastMessageMeta {
+        kind,
+        direction: wire_direction,
+        author_name,
+        reactions,
+    })
 }
 
 fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
@@ -3174,6 +3394,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok()),
         edited_at: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
+        sender_name: row.get(17)?,
         reactions: Vec::new(),
     })
 }
@@ -3225,6 +3446,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "outgoing",
             sender_id: "self".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: None,
             text: Some("hello".into()),
@@ -3283,6 +3505,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: None,
             text: Some("body".into()),
@@ -3392,6 +3615,76 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Contract 1.27 schema step: a v9 database migrates in place — both
+    /// additive author-name columns appear (messages.sender_name,
+    /// message_events.actor_name) and the version stamp moves to 10.
+    #[test]
+    fn schema_v10_upgrade_adds_author_name_columns() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '9');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               rich_json TEXT,
+               edited_at INTEGER
+             );
+             CREATE TABLE message_events (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               emoji TEXT NOT NULL,
+               target_timestamp INTEGER NOT NULL,
+               actor_id TEXT NOT NULL,
+               removed INTEGER NOT NULL DEFAULT 0,
+               updated_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "sender_name").unwrap());
+        assert!(table_has_column(&store.conn(), "message_events", "actor_name").unwrap());
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
     #[test]
     fn summary_last_message_kind_follows_official_noun_rules() {
         let temp = TempDir::new().unwrap();
@@ -3414,6 +3707,7 @@ mod tests {
                     conversation_id: conversation.id.clone(),
                     direction,
                     sender_id: "peer".into(),
+                    sender_name: None,
                     sent_at: clock * 10,
                     received_at: None,
                     text: text.map(Into::into),
@@ -3501,6 +3795,176 @@ mod tests {
         assert_eq!(listed.last_message_kind, Some("image"));
     }
 
+    /// Contract 1.27: the summary's last-message fields — direction, incoming
+    /// author name (captured from the envelope `sourceName`), and the newest
+    /// row's active reaction emoji. Outgoing rows mark self via direction;
+    /// system endings and empty conversations expose nothing; reactions key
+    /// on the newest row's upstream timestamp and follow removal.
+    #[test]
+    fn summary_carries_last_message_direction_author_and_reactions() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "fake-group-1", "Group")
+            .unwrap();
+        let push = |id: &str,
+                    direction: &'static str,
+                    sender_name: Option<&str>,
+                    sent_at: u64,
+                    text: Option<&str>| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction,
+                sender_id: if direction == "outgoing" {
+                    account.id.clone()
+                } else {
+                    "peer-hash".into()
+                },
+                sender_name: sender_name.map(Into::into),
+                sent_at,
+                received_at: None,
+                text: text.map(Into::into),
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: true,
+                status: if direction == "system" {
+                    "system"
+                } else if direction == "outgoing" {
+                    "sent"
+                } else {
+                    "delivered"
+                },
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+            };
+            store.insert_message(&message, None, text, false).unwrap();
+        };
+        let summary = || {
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap()
+        };
+
+        // Empty conversation: no direction, no author, no reactions.
+        let current = summary();
+        assert_eq!(current.last_message_direction, None);
+        assert_eq!(current.last_message_author_name, None);
+        assert!(current.last_message_reactions.is_empty());
+
+        // Incoming ending: direction incoming, captured author name.
+        push("m1", "incoming", Some("林菲菲"), 100, Some("你好"));
+        let current = summary();
+        assert_eq!(current.last_message_direction, Some("incoming"));
+        assert_eq!(current.last_message_author_name.as_deref(), Some("林菲菲"));
+        assert!(current.last_message_reactions.is_empty());
+
+        // Outgoing ending: the author is the account itself — no name is
+        // surfaced, the client renders its own self label.
+        push("m2", "outgoing", None, 200, Some("好的"));
+        let current = summary();
+        assert_eq!(current.last_message_direction, Some("outgoing"));
+        assert_eq!(current.last_message_author_name, None);
+
+        // Reactions key on the newest row only: they target m2's timestamp.
+        store
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "👍",
+                200,
+                "peer-hash-1",
+                false,
+                Some("林菲菲"),
+            )
+            .unwrap();
+        store
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "❤️",
+                200,
+                "peer-hash-2",
+                false,
+                None,
+            )
+            .unwrap();
+        let current = summary();
+        assert_eq!(
+            current.last_message_reactions,
+            vec!["👍".to_string(), "❤️".to_string()]
+        );
+        // A reaction on the older row must not leak into the summary.
+        store
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "😂",
+                100,
+                "peer-hash-1",
+                false,
+                None,
+            )
+            .unwrap();
+        let current = summary();
+        assert_eq!(
+            current.last_message_reactions,
+            vec!["👍".to_string(), "❤️".to_string()]
+        );
+
+        // Removal drops the emoji from the summary.
+        store
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "👍",
+                200,
+                "peer-hash-1",
+                true,
+                None,
+            )
+            .unwrap();
+        let current = summary();
+        assert_eq!(current.last_message_reactions, vec!["❤️".to_string()]);
+
+        // A system ending exposes neither direction nor author nor reactions.
+        push("m3", "system", None, 300, Some("identity changed"));
+        let current = summary();
+        assert_eq!(current.last_message_direction, None);
+        assert_eq!(current.last_message_author_name, None);
+        assert!(current.last_message_reactions.is_empty());
+
+        // The list path carries the same projection.
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let listed = page
+            .items
+            .iter()
+            .find(|item| item.id == conversation.id)
+            .unwrap();
+        assert_eq!(listed.last_message_direction, None);
+        assert!(listed.last_message_reactions.is_empty());
+        // (back to an incoming ending for the list-path assertion)
+        push("m4", "incoming", Some("阿强"), 400, Some("收到"));
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let listed = page
+            .items
+            .iter()
+            .find(|item| item.id == conversation.id)
+            .unwrap();
+        assert_eq!(listed.last_message_direction, Some("incoming"));
+        assert_eq!(listed.last_message_author_name.as_deref(), Some("阿强"));
+    }
+
     #[test]
     fn send_completion_removes_only_unclaimed_sync_duplicate() {
         let temp = TempDir::new().unwrap();
@@ -3517,6 +3981,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "outgoing",
             sender_id: account.id.clone(),
+            sender_name: None,
             sent_at: 1,
             received_at: None,
             text: Some("same".into()),
@@ -3610,6 +4075,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: Some(10),
             text: Some("hello".into()),
@@ -3671,6 +4137,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: Some(10),
             text: Some("hello".into()),
@@ -3737,6 +4204,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "system",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: Some(10),
             text: Some("control notice".into()),
@@ -3788,6 +4256,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "outgoing",
             sender_id: account.id.clone(),
+            sender_name: None,
             sent_at: 10,
             received_at: None,
             text: Some("body".into()),
@@ -3862,6 +4331,7 @@ mod tests {
                 conversation_id: conversation.id.clone(),
                 direction: "incoming",
                 sender_id: "peer".into(),
+                sender_name: None,
                 sent_at,
                 received_at: Some(sent_at),
                 text: Some(id.into()),
@@ -3931,6 +4401,7 @@ mod tests {
             conversation_id: cursor_conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: 30,
             received_at: Some(30),
             text: Some("changed after cursor".into()),
@@ -3975,6 +4446,7 @@ mod tests {
             conversation_id: other_conversation.id.clone(),
             direction: "incoming",
             sender_id: "other-peer".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: Some(10),
             text: Some("other".into()),
@@ -4057,6 +4529,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "+15555550101".into(),
+            sender_name: None,
             sent_at: 10,
             received_at: Some(11),
             text: Some("delete me".into()),
@@ -4617,6 +5090,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: now - 10 * day,
             received_at: Some(now - 10 * day),
             text: Some("kept body".into()),
@@ -4681,6 +5155,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             // Sender clock claims the epoch; we received it yesterday.
             sent_at: 5_000,
             received_at: Some(now - day),
@@ -4768,6 +5243,7 @@ mod tests {
                     conversation_id: conversation.id.clone(),
                     direction: "incoming",
                     sender_id: "peer".into(),
+                    sender_name: None,
                     sent_at: now - age,
                     received_at: Some(now - age),
                     text: Some("body".into()),
@@ -4909,6 +5385,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "outgoing",
             sender_id: account.id.clone(),
+            sender_name: None,
             sent_at: now - 400 * day,
             received_at: None,
             text: Some("body".into()),
@@ -4975,6 +5452,7 @@ mod tests {
             conversation_id: kept.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: now - day,
             received_at: Some(now - day),
             text: Some("body".into()),
@@ -5036,6 +5514,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: now - 20 * day,
             received_at: Some(now - 20 * day),
             text: Some("kept body".into()),
@@ -5100,6 +5579,7 @@ mod tests {
             conversation_id: conversation.id.clone(),
             direction: "incoming",
             sender_id: "peer".into(),
+            sender_name: None,
             sent_at: now - 300 * day,
             received_at: Some(now - 300 * day),
             text: Some("body".into()),
@@ -5517,6 +5997,7 @@ mod tests {
             conversation_id: conversation_id.to_string(),
             direction: "outgoing",
             sender_id: "self".into(),
+            sender_name: None,
             sent_at,
             received_at: None,
             text: Some("hello".into()),
@@ -5566,18 +6047,55 @@ mod tests {
 
         // Two peers plus the linked account react 👍; another peer adds ❤️.
         // One reaction per actor per target (official semantics): a second
-        // emoji from the same actor replaces the first.
+        // emoji from the same actor replaces the first. Reaction timestamps
+        // are the connector's receive clock, so the ordering steps sleep
+        // briefly to keep the newest-first actor order deterministic.
         store
-            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, "peer-1", false)
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "👍",
+                100,
+                "peer-1",
+                false,
+                Some("林菲菲"),
+            )
             .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
         store
-            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, "peer-2", false)
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "👍",
+                100,
+                "peer-2",
+                false,
+                None,
+            )
             .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
         store
-            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, &account.id, false)
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "👍",
+                100,
+                &account.id,
+                false,
+                None,
+            )
             .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
         store
-            .upsert_reaction_event(&account.id, &conversation.id, "❤️", 100, "peer-3", false)
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "❤️",
+                100,
+                "peer-3",
+                false,
+                None,
+            )
             .unwrap();
 
         let record = store
@@ -5592,6 +6110,19 @@ mod tests {
             .unwrap();
         assert_eq!(thumbs.count, 3);
         assert!(thumbs.mine);
+        // Per-actor detail (contract 1.27): newest first, self flagged, peer
+        // names carried when the envelope captured one. count and actors stay
+        // in lockstep.
+        assert_eq!(thumbs.actors.len(), 3);
+        assert!(thumbs.actors[0].is_self);
+        assert!(thumbs.actors[0].name.is_none());
+        assert!(!thumbs.actors[1].is_self);
+        assert_eq!(thumbs.actors[1].name, None);
+        assert!(!thumbs.actors[2].is_self);
+        assert_eq!(thumbs.actors[2].name.as_deref(), Some("林菲菲"));
+        assert!(thumbs.actors[0].reacted_at >= thumbs.actors[1].reacted_at);
+        assert!(thumbs.actors[1].reacted_at >= thumbs.actors[2].reacted_at);
+        assert_eq!(thumbs.count as usize, thumbs.actors.len());
         let heart = record
             .reactions
             .iter()
@@ -5599,6 +6130,8 @@ mod tests {
             .unwrap();
         assert_eq!(heart.count, 1);
         assert!(!heart.mine);
+        assert_eq!(heart.actors.len(), 1);
+        assert!(!heart.actors[0].is_self);
 
         // The same-timestamp row in another conversation stays untouched.
         let other = store
@@ -5607,9 +6140,18 @@ mod tests {
             .unwrap();
         assert!(other.reactions.is_empty());
 
-        // The linked account removes its 👍: count drops and `mine` clears.
+        // The linked account removes its 👍: count drops, `mine` clears, and
+        // the actor disappears from the per-actor detail (removal semantics).
         store
-            .upsert_reaction_event(&account.id, &conversation.id, "👍", 100, &account.id, true)
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "👍",
+                100,
+                &account.id,
+                true,
+                None,
+            )
             .unwrap();
         let record = store
             .message_by_id(&account.id, &conversation.id, "m-target")
@@ -5622,5 +6164,7 @@ mod tests {
             .unwrap();
         assert_eq!(thumbs.count, 2);
         assert!(!thumbs.mine);
+        assert_eq!(thumbs.actors.len(), 2);
+        assert!(thumbs.actors.iter().all(|actor| !actor.is_self));
     }
 }

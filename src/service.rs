@@ -989,6 +989,7 @@ impl ConnectorService {
             conversation_id: conversation_id.to_string(),
             direction: "outgoing",
             sender_id: account_id.to_string(),
+            sender_name: None,
             sent_at: now_ms(),
             received_at: None,
             text: Some(text.to_string()),
@@ -1602,6 +1603,14 @@ impl ConnectorService {
             conversation_id: conversation.id.clone(),
             direction,
             sender_id,
+            // Contract 1.27: the incoming author's display name, captured from
+            // the envelope `sourceName` (already bounded by the engine).
+            // Outgoing rows are the account itself; system rows have no author.
+            sender_name: if direction == "incoming" {
+                receive.peer_name.clone()
+            } else {
+                None
+            },
             sent_at,
             received_at: Some(now_ms()),
             text: stored_text,
@@ -1696,7 +1705,9 @@ impl ConnectorService {
                 // The actor is the envelope sender; the protocol's
                 // targetAuthor cross-check is advisory (a group member
                 // reacting to another member's message still keys on the
-                // reacting actor).
+                // reacting actor). The display name rides the same envelope
+                // (contract 1.27); own multi-device echoes are the account
+                // itself and carry no name.
                 let _ = target_author;
                 let actor_id = match receive.direction {
                     "outgoing" => account.id.clone(),
@@ -1706,6 +1717,11 @@ impl ConnectorService {
                         receive.source.as_deref().unwrap_or(peer_key),
                     ]),
                 };
+                let actor_name = if receive.direction == "outgoing" {
+                    None
+                } else {
+                    receive.peer_name.as_deref()
+                };
                 self.store.upsert_reaction_event(
                     &account.id,
                     &conversation.id,
@@ -1713,6 +1729,7 @@ impl ConnectorService {
                     target_timestamp,
                     &actor_id,
                     remove,
+                    actor_name,
                 )?;
                 let mut events = Vec::new();
                 if let Some(summary) = self.store.conversation_summary(&conversation.id)? {
@@ -3552,6 +3569,91 @@ mod tests {
         );
     }
 
+    /// Contract 1.27: an incoming message captures the envelope `sourceName`
+    /// on the row (`senderName` on the wire record) and the conversation
+    /// summary carries the last-message direction plus that author name —
+    /// the metadata the desktop list needs for the official author-prefix
+    /// preview. Outgoing rows stay name-less (the author is self).
+    #[test]
+    fn incoming_receive_captures_sender_name_into_summary_projection() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let receive = NormalizedReceive {
+            timestamp: Some(200),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: Some("林菲菲".into()),
+            group_id: Some("group-one".into()),
+            text: Some("你好".into()),
+            text_bytes: Some(6),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            control: None,
+        };
+        assert!(
+            !service
+                .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+
+        let conversation = service
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        let summary = service
+            .store
+            .conversation_summary(&conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.last_message_direction, Some("incoming"));
+        assert_eq!(summary.last_message_author_name.as_deref(), Some("林菲菲"));
+        assert!(summary.last_message_reactions.is_empty());
+
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(row.sender_name.as_deref(), Some("林菲菲"));
+        let wire = serde_json::to_value(&row).unwrap();
+        assert_eq!(wire["senderName"], "林菲菲");
+
+        // The connector's own outgoing rows are the account itself: no name
+        // is captured and the summary flips to outgoing with no author.
+        let reply = NormalizedReceive {
+            direction: "outgoing",
+            timestamp: Some(300),
+            content_kind: "syncMessage",
+            source: Some("group-one".into()),
+            text: Some("好的".into()),
+            text_bytes: Some(6),
+            ..receive
+        };
+        assert!(
+            !service
+                .ingest_receive(reply, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let summary = service
+            .store
+            .conversation_summary(&conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.last_message_direction, Some("outgoing"));
+        assert_eq!(summary.last_message_author_name, None);
+    }
+
     #[test]
     fn receive_without_signal_timestamp_has_no_persistence_side_effects() {
         let (_temp, mut service) = service();
@@ -5137,6 +5239,19 @@ mod tests {
         }
     }
 
+    /// Same as [`control_receive`] with the envelope display name a real
+    /// signal-cli receive carries (contract 1.27 actor-name capture).
+    fn control_receive_named(
+        account: &str,
+        source: &str,
+        peer_name: &str,
+        control: ControlReceive,
+    ) -> NormalizedReceive {
+        let mut receive = control_receive(account, source, control);
+        receive.peer_name = Some(peer_name.into());
+        receive
+    }
+
     fn linked_account_and_conversation(
         service: &mut ConnectorService,
     ) -> (crate::store::AccountSummary, crate::store::ConversationRow) {
@@ -5179,16 +5294,19 @@ mod tests {
 
     /// A peer reaction upserts a message_events row keyed on the reacting
     /// actor, answers conversation.changed (never message.upserted), and a
-    /// repeat of the same reaction stays idempotent.
+    /// repeat of the same reaction stays idempotent. The envelope display
+    /// name rides along (contract 1.27) and surfaces on the pill's per-actor
+    /// detail.
     #[test]
     fn inbound_reaction_persists_an_actor_keyed_event_and_notifies_once() {
         let (_temp, mut service) = service();
         let (account, conversation) = linked_account_and_conversation(&mut service);
-        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+        let message_id = seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
 
-        let receive = control_receive(
+        let receive = control_receive_named(
             "+15555550100",
             "+15555550101",
+            "林菲菲",
             ControlReceive::Reaction {
                 emoji: "👍".into(),
                 target_author: "+15555550100".into(),
@@ -5215,6 +5333,20 @@ mod tests {
         assert_eq!(reactions[0].target_timestamp, 400);
         assert!(!reactions[0].removed);
         assert_ne!(reactions[0].actor_id, account.id, "actor is the peer");
+
+        // The pill projection carries the actor with the captured name.
+        let record = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &message_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.reactions.len(), 1);
+        assert_eq!(record.reactions[0].actors.len(), 1);
+        assert!(!record.reactions[0].actors[0].is_self);
+        assert_eq!(
+            record.reactions[0].actors[0].name.as_deref(),
+            Some("林菲菲")
+        );
 
         let repeat = service
             .ingest_receive(

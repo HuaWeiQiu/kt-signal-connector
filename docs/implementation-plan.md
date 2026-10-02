@@ -823,6 +823,69 @@ Validation passes project 1:1 onto the upstream JSON-RPC keys `previewUrl` / `pr
 `previewDescription` / `previewImage` (`JsonRpcNamespace` maps dash-separated option names to
 camelCase — verified from bytecode). The connector never composes or synthesizes preview content.
 
+### 4.22 Conversation-summary author/reaction metadata + per-actor reaction detail (contract revision 1.27, 2026-10-02)
+
+Two read-side capability additions that close the desktop list/interactions gaps the v8.31 parity
+audit filed against the wire ("wire 缺作者/反应元数据"): the conversation list cannot render the
+official group-author prefix, reaction emoji prefix, or send-state direction on the last message,
+and the ReactionViewer ("who reacted") has no per-author data — the 1.16 pill projection is
+aggregated only. No new IPC method or event; both surfaces evolve in place.
+
+**Author-name capture (shared foundation).** The receive envelope's `sourceName` — the peer's
+profile/contact label as the linked account sees it, already bounded to 64 chars by the engine —
+is now persisted at receive time on two additive nullable columns (schema 9 → 10):
+`messages.sender_name` for incoming message rows and `message_events.actor_name` for inbound
+reaction events. Outgoing rows and own multi-device echoes store nothing (the author is the
+account itself). Pre-1.27 rows are never backfilled: the name a past envelope carried was never
+stored and must not be invented. `MessageRecord` projects the column as `senderName`
+(skip-when-absent), so the desktop can already name group senders on the canvas.
+
+**Conversation summary fields.** `ConversationSummary` gains three optional fields derived at
+read time from the newest row (`ORDER BY sent_at DESC, id DESC LIMIT 1`, the existing
+`messages_conversation_sent_at` index; one extra indexed LIMIT-1 reaction query per row, bounded
+to 8 distinct emoji):
+
+- `lastMessageDirection?: 'outgoing' | 'incoming'` — absent when the conversation has no rows or
+  ends on a system row, the same endings the official preview shows without send state or author.
+  `outgoing` marks the linked account as the author: the client renders its own localized self
+  label ("You"), the connector never ships locale-dependent strings.
+- `lastMessageAuthorName?: string` — the newest incoming author's captured display name; absent
+  for outgoing (self), system endings, and rows without a captured name.
+- `lastMessageReactions?: string[]` — distinct active reaction emoji on the newest row, oldest
+  reaction first (the same order the message pills use); absent when none. A reaction on an older
+  row never leaks into the summary, and removal drops the emoji.
+
+All three use `skip_serializing_if`, so rows without the data are byte-identical to pre-1.27
+summaries and a host that merges summaries replaces the fields wholesale.
+
+**Per-actor reaction detail.** The storage was already per-actor (`message_events` keys
+`(conversation, target_timestamp, actor_id)` with `emoji`/`removed`/`updated_at`, one row per
+actor per target); only the wire aggregated it. `MessageReactionSummary` gains `actors` (always
+serialized, like `reactions` itself, so host-side pill merges stay total and a removal clears the
+actor it removed):
+
+```text
+reactions: [{
+  emoji: string,          // unchanged (1.16)
+  count: number,          // unchanged (1.16); == actors.length
+  mine: boolean,          // unchanged (1.16)
+  actors: [{              // new in 1.27, newest reaction first (official ReactionViewer order)
+    self: boolean,        // true = the linked account's own reaction
+    name?: string,        // peer display name captured from the reaction envelope's sourceName
+    reactedAt: number     // local wall-clock ms the reaction was last recorded
+  }]
+}]
+```
+
+Removal semantics: a removed reaction (`isRemove` upsert) is excluded from `count` and `actors`
+entirely — removal is the actor's disappearance, exactly like the aggregated count it already
+followed; re-reacting flips the row back with a fresh `reactedAt`. Reads are bounded
+deterministically: at most 1024 newest active reaction rows per conversation read and 64 actors
+per emoji, so a pathological store cannot inflate a response. `actorId` (the connector-internal
+sender hash) deliberately stays off the wire — it is not resolvable by the host and carries no
+rendering value beyond `self` + `name`.
+
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
