@@ -1048,14 +1048,16 @@ Rules:
   --ignore-stories --ignore-stickers`), and every supervision guarantee are identical to the
   signal-cli modes, so the watchdog, unlink detection (§4.17: the engine reproduces the
   AuthorizationFailed classification surface), and shutdown semantics apply unchanged. Two
-  deliberate divergences, both fail-closed at startup before any data-directory lock is taken:
-  a configured SOCKS proxy (default group or any `--proxy-group` entry) aborts the launch — the
-  engine cannot honor the privacy control yet, and silently dropping it would route traffic
-  direct; `--media-ingest` aborts the launch — the engine never downloads attachments, so the
-  media governor would promise a capability the child cannot deliver. The engine's argv parser is
-  fail-closed on unknown arguments, so the JVM/native `-DsocksProxy*` entries are never emitted in
-  this mode, `JAVA_HOME` is ignored with a warning, and the child environment is inherited except
-  for the store-key override, exactly like the other modes. The engine writes its own
+  transport divergences, both deliberate: the JVM/native `-DsocksProxy*` entries are never
+  emitted in this mode because the engine's argv parser is fail-closed on unknown arguments —
+  proxy parity instead holds at the environment level, with the engine consuming the same
+  `KT_SIGNAL_SOCKS_PROXY=host:port` variable this launcher injects and mapping it onto reqwest's
+  `ALL_PROXY`, which the libsignal-service HTTP and WebSocket transport (a single reqwest client)
+  honors natively, so the per-group desktop proxy probe keeps working unchanged; and
+  `--media-ingest` aborts the launch fail-closed before any data-directory lock is taken — the
+  engine never downloads attachments, so the media governor would promise a capability the child
+  cannot deliver. `JAVA_HOME` is ignored with a warning, and the child environment is inherited
+  except for the store-key override, exactly like the other modes. The engine writes its own
   `engine-state.json` / `engine-send-log.jsonl` / `accounts/lk-<hex>` layout under the group data
   directory, disjoint from signal-cli's files and the connector's `.kt-signal-connector.lock`.
   Scope: local smoke and development only — runtime-manifest packaging, licensing metadata, and

@@ -72,8 +72,9 @@ enum CliCommand {
         /// binary; equivalent to --signal-cli-native), or `kt-engine` (KT's
         /// own sidecar; `--signal-cli` then points at the engine executable).
         /// Explicit selection only — packaging controls what it ships.
-        /// Conflicts with --signal-cli-native; a configured SOCKS proxy or
-        /// --media-ingest aborts the launch in kt-engine mode (plan §5).
+        /// Conflicts with --signal-cli-native; --media-ingest aborts the
+        /// launch in kt-engine mode (plan §5). SOCKS proxy parity holds: the
+        /// engine consumes the same KT_SIGNAL_SOCKS_PROXY environment.
         #[arg(
             long,
             env = "KT_SIGNAL_CLI_ENGINE",
@@ -293,17 +294,14 @@ async fn main() {
     }
 }
 
-/// kt-engine capability gate (implementation plan §5): the engine sidecar
-/// cannot honor a SOCKS proxy (its argv parser is fail-closed on `-D`
-/// entries, and silently dropping the privacy control would route traffic
-/// direct) and never downloads attachments (`--media-ingest` would arm the
-/// media governor for downloads that can never arrive). Both abort the
-/// launch with an explicit message; the other modes are unaffected.
-fn ensure_engine_mode_supported(
-    mode: SignalCliMode,
-    plan: &groups::ProxyGroupPlan,
-    media_ingest: bool,
-) -> Result<(), String> {
+/// kt-engine capability gate (implementation plan §5): the engine never
+/// downloads attachments, so `--media-ingest` would arm the media governor
+/// for downloads that can never arrive — that aborts the launch. A SOCKS
+/// proxy is NOT rejected: the engine consumes the same
+/// `KT_SIGNAL_SOCKS_PROXY` environment variable the connector injects for
+/// the JVM (mapped onto reqwest's `ALL_PROXY`), so proxy parity holds in
+/// every mode. The other modes are unaffected.
+fn ensure_engine_mode_supported(mode: SignalCliMode, media_ingest: bool) -> Result<(), String> {
     if mode != SignalCliMode::KtEngine {
         return Ok(());
     }
@@ -311,14 +309,6 @@ fn ensure_engine_mode_supported(
         return Err(
             "kt-engine mode does not support --media-ingest: the engine \
                     never downloads inbound attachments"
-                .into(),
-        );
-    }
-    if plan.groups.iter().any(|group| group.proxy.is_some()) {
-        return Err(
-            "kt-engine mode does not support a SOCKS proxy: the engine cannot \
-             honor the proxy, and launching without it would bypass the \
-             configured privacy control"
                 .into(),
         );
     }
@@ -369,7 +359,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     // kt-engine capability gate (plan §5): fail the launch before any
     // data-directory lock or secret read rather than spawning an engine that
     // cannot honor the configured proxy or deliver media downloads.
-    ensure_engine_mode_supported(signal_cli_mode, &plan, media_ingest)?;
+    ensure_engine_mode_supported(signal_cli_mode, media_ingest)?;
     // ADR 0002 occupancy guard: exclusive cross-process locks over every
     // planned data directory (the `default` root and each proxy-group
     // subdirectory), acquired before the bootstrap payload is read and held
@@ -661,79 +651,28 @@ fn load_optional_trust(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-
-    fn plan_with_proxies(proxies: Vec<Option<SocksProxy>>) -> groups::ProxyGroupPlan {
-        groups::ProxyGroupPlan {
-            groups: proxies
-                .into_iter()
-                .enumerate()
-                .map(|(index, proxy)| groups::ProxyGroupPlanEntry {
-                    id: format!("group-{index}"),
-                    proxy,
-                    data_dir: PathBuf::from(format!("/data/group-{index}")),
-                })
-                .collect(),
-        }
-    }
-
-    fn proxy() -> SocksProxy {
-        SocksProxy {
-            host: "127.0.0.1".into(),
-            port: 1080,
-        }
-    }
-
-    #[test]
-    fn kt_engine_mode_rejects_a_configured_proxy_on_any_group() {
-        assert!(
-            ensure_engine_mode_supported(
-                SignalCliMode::KtEngine,
-                &plan_with_proxies(vec![None, Some(proxy())]),
-                false,
-            )
-            .is_err()
-        );
-        // The default group alone is equally covered.
-        assert!(
-            ensure_engine_mode_supported(
-                SignalCliMode::KtEngine,
-                &plan_with_proxies(vec![Some(proxy())]),
-                false,
-            )
-            .is_err()
-        );
-    }
 
     #[test]
     fn kt_engine_mode_rejects_media_ingest() {
-        let error = ensure_engine_mode_supported(
-            SignalCliMode::KtEngine,
-            &plan_with_proxies(vec![None]),
-            true,
-        )
-        .expect_err("media ingest must abort the launch");
+        let error = ensure_engine_mode_supported(SignalCliMode::KtEngine, true)
+            .expect_err("media ingest must abort the launch");
         assert!(error.contains("media-ingest"));
     }
 
+    /// Proxy parity (plan §5): kt-engine consumes the same
+    /// KT_SIGNAL_SOCKS_PROXY environment the connector injects, so a
+    /// proxy-configured plan launches in every mode.
     #[test]
-    fn kt_engine_mode_accepts_a_plain_plan() {
-        ensure_engine_mode_supported(
-            SignalCliMode::KtEngine,
-            &plan_with_proxies(vec![None, None]),
-            false,
-        )
-        .expect("plain plan is supported");
+    fn kt_engine_mode_launches_with_media_ingest_off() {
+        ensure_engine_mode_supported(SignalCliMode::KtEngine, false)
+            .expect("plain kt-engine launch is supported");
     }
 
     #[test]
-    fn signal_cli_modes_keep_proxy_and_media_capabilities() {
-        let proxy_plan = plan_with_proxies(vec![Some(proxy())]);
+    fn signal_cli_modes_remain_unrestricted() {
         for mode in [SignalCliMode::Jvm, SignalCliMode::Native] {
-            ensure_engine_mode_supported(mode, &proxy_plan, true)
-                .expect("signal-cli modes are unrestricted");
+            ensure_engine_mode_supported(mode, true).expect("signal-cli modes are unrestricted");
         }
     }
 }

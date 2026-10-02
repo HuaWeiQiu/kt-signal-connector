@@ -79,11 +79,14 @@ pub enum SignalCliMode {
     /// KT's own `kt-signal-engine` sidecar (separate AGPL-3.0 repository):
     /// spawned directly with the same argv tail, but the `-D` SOCKS prepend
     /// is never emitted because the engine's argv parser is fail-closed on
-    /// unknown arguments. A configured SOCKS proxy or media ingest aborts the
-    /// launch at startup validation (implementation plan §5): the engine
-    /// cannot honor either capability yet, and dropping a privacy control or
-    /// promising downloads that never happen is not an acceptable default.
-    /// `JAVA_HOME` is ignored with a warning, like native mode.
+    /// unknown arguments. Proxy parity holds at the environment level: the
+    /// engine consumes the same `KT_SIGNAL_SOCKS_PROXY` variable this
+    /// process injects (it maps it onto reqwest's `ALL_PROXY`, which covers
+    /// the libsignal-service HTTP and WebSocket transport). Media ingest
+    /// aborts the launch at startup validation (implementation plan §5): the
+    /// engine cannot honor that capability yet, and promising downloads that
+    /// never happen is not an acceptable default. `JAVA_HOME` is ignored
+    /// with a warning, like native mode.
     KtEngine,
 }
 
