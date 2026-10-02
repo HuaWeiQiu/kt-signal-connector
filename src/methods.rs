@@ -39,6 +39,9 @@ pub const METHODS: &[MethodRow] = &[
     ("conversations.list", Lane::Read, false, "read"),
     ("messages.list", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
+    // Account-wide store search (contract 1.30): a bounded read over the
+    // local database only — no upstream traffic, no mutation.
+    ("messages.search", Lane::Read, false, "read"),
     ("messages.sendText", Lane::Send, true, "send"),
     ("messages.attachments.send", Lane::Send, true, "send"),
     ("messages.edit", Lane::Send, true, "send"),
@@ -118,6 +121,7 @@ mod tests {
             "conversations.list",
             "messages.list",
             "messages.getText",
+            "messages.search",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",

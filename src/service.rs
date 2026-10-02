@@ -745,6 +745,16 @@ impl ConnectorService {
         store_list_messages(&self.store, account_id, conversation_id, limit, before)
     }
 
+    pub fn search_messages(
+        &self,
+        account_id: &str,
+        query: &str,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<Page<MessageRecord>, ServiceError> {
+        store_search_messages(&self.store, account_id, query, limit, cursor)
+    }
+
     pub fn get_message_text(
         &self,
         account_id: &str,
@@ -1961,6 +1971,43 @@ pub(crate) fn store_list_messages(
     Ok(page)
 }
 
+pub(crate) fn store_search_messages(
+    store: &Store,
+    account_id: &str,
+    query: &str,
+    limit: u32,
+    cursor: Option<&str>,
+) -> Result<Page<MessageRecord>, ServiceError> {
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    // An empty (or whitespace-only) query would match every stored body;
+    // the client treats that as "no query", so answer with an empty page.
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Page {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+    }
+    // Search terms are user input echoed into a LIKE pattern: bound them so
+    // a paste cannot inflate the query (contract 1.30).
+    if query.chars().count() > 128 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "query must be at most 128 characters",
+            false,
+        )));
+    }
+    let mut page = store.search_messages(account_id, query, limit, cursor)?;
+    page.items = page
+        .items
+        .into_iter()
+        .map(project_message_for_host)
+        .collect();
+    Ok(page)
+}
+
 pub(crate) fn store_get_message_text(
     store: &Store,
     account_id: &str,
@@ -2190,6 +2237,15 @@ pub struct MessagesListParams {
     pub account_id: String,
     pub conversation_id: String,
     pub before: Option<String>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesSearchParams {
+    pub account_id: String,
+    pub query: String,
+    pub cursor: Option<String>,
     pub limit: u32,
 }
 

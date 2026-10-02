@@ -20,7 +20,7 @@ use crate::service::{
     MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget, PreparedSend,
     SendTarget, SendTextPreviewParams, ServiceError, account_limit_error, store_get_group,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    validate_account_delete_operation_id,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
@@ -1132,6 +1132,21 @@ impl RuntimeSupervisor {
                 limit,
                 before.as_deref(),
             )
+        })
+        .await
+    }
+
+    pub async fn search_messages(
+        &self,
+        account_id: String,
+        query: String,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Page<MessageRecord>, ServiceError> {
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            store_search_messages(&store, &account_id, &query, limit, cursor.as_deref())
         })
         .await
     }

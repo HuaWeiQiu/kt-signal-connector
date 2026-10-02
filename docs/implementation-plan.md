@@ -967,6 +967,33 @@ without touching either counter. The desktop renders the badge from `unreadMenti
 never diffs message lists to maintain it, so receipt upgrades, edits, and reactions cannot
 drift it.
 
+### 4.25 messages.search: account-wide local full-text search (contract revision 1.30, 2026-10-02)
+
+The official client searches messages as-you-type (`Signal-Desktop` `MessageSearch`), but it does
+so entirely over its **local** database — upstream Signal offers no server-side search endpoint,
+and the pinned `signal-cli` jsonRpc surface has none either (§4.23). The connector's store is the
+only searchable corpus, so `messages.search` is a bounded read over it: `params` are `accountId`,
+`query` (required), `cursor?`, `limit` (1..=200, same clamps as `messages.list`). The result is
+`Page<MessageRecord>` — identical row shape to `messages.list`, with reaction aggregates attached
+— so the client renders a hit exactly like a thread row.
+
+Semantics, all explicit: the query is trimmed; an empty or whitespace-only query answers an empty
+page (the client treats it as "no query" rather than an error); a query over 128 characters is
+rejected `INVALID_REQUEST` (the wire schema caps the raw string at 4096 so an oversized paste gets
+the semantic error, not a schema violation). Matching is a `LIKE '%term%'` over stored bodies with
+`ESCAPE '\'` — `%`, `_`, and `\` in the query are literal. Ordering is `sent_at DESC, id DESC`
+across **every conversation in the account**; pagination rides a dedicated `s1:accountId:sentAt:id`
+cursor carrying its own sort key (a page still resolves after retention removes a row it pointed
+at) and bound to the account alone, since results span conversations. Rows whose body was never
+stored (attachment-only or unretrievable) simply never match — `LIKE` over `NULL` is false.
+
+Recorded boundaries: SQLite `LIKE` folds case only for **ASCII** — non-ASCII terms (CJK among
+them) match byte-exactly, so a CJK query is case-sensitive by construction (which is also what
+the official desktop ships on SQLite, minus its FTS5 index). There is no FTS5 index, no
+tokenization, and no relevance ranking this revision: substring over `body` only. Search never
+touches upstream, never mutates state, and rides the READ lane (`read` metrics class, not
+account-scoped-mutating). `PHASE2_CAPABILITIES` grows by one entry, advertised at handshake.
+
 
 ## 5. signal-cli Boundary
 

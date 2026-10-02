@@ -562,6 +562,19 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn search_messages(
+        &self,
+        account_id: String,
+        query: String,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Page<MessageRecord>, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .search_messages(account_id, query, limit, cursor)
+            .await
+    }
+
     pub async fn get_message_text(
         &self,
         account_id: String,
