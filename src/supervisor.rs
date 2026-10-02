@@ -2002,6 +2002,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: expired_at,
             received_at: Some(expired_at),
             text: Some("body".into()),

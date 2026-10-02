@@ -926,6 +926,47 @@ mute/archive/forward/search can therefore only be connector-local state or a loc
 approximation (never cross-device synced), which is a separate decision, not part of this
 revision.
 
+### 4.24 Unread @mentions: row marker + conversation badge (contract revision 1.29, 2026-10-02)
+
+The official list renders an @-mention badge next to a conversation's unread counter when the
+unread messages @mention the account (Signal-Desktop `unreadMentionCount`), and highlights the
+mentioned range as "@you" on the bubble. Neither was representable on the wire: the desktop
+cannot decide self-ness itself because the account address it sees (`maskedAddress`) is masked,
+and mention ranges carry the *mentioned peer's* identity, not the reader's. Two additive
+read/write surfaces close the gap; the store schema moves 10 → 11.
+
+**Row marker.** `MessageRecord` gains `mentionsSelf?: boolean` (skip-when-false, so plain rows
+are byte-identical to pre-1.29 rows): at receive, the ingest compares every normalized mention
+author (§4.20 `mentions[].author`, resolved number-first by the engine) against the linked
+account's own number and persists the verdict on the row in the same insert that stores the
+rich body. The comparison is **number-based by necessity**: the pinned upstream jsonRpc surface
+exposes the account only as `listAccounts: [{number}]` (`JsonAccount(number)` in the pinned
+source) — the account UUID is not queryable — so a mention author carrying only a UUID cannot
+be attributed to self. That is this revision's recorded boundary; it under-counts only when
+upstream fails to resolve a self-mention to the number, not a false positive. The verdict is
+receive-time and never recomputed or backfilled: pre-1.29 rows carry no flag, edits never move
+it (the counter counts receipt-time mentions, like the official receipt-time increment), and
+the client renders "@you" from `mentionsSelf` + the existing §4.20 ranges without needing the
+real address.
+
+**Conversation badge.** `conversations` gains `unread_mentions` (schema 11), a write-side
+counter moving in lockstep with `unread_count`: the same receive transaction bumps both (an
+incoming row that mentions self and contributes unread bumps both or neither — a crash can
+never split the pair), and the same open-chat clear (`conversations.markRead`) zeroes both.
+`ConversationSummary` gains `unreadMentions?: number` (skip-when-zero, pre-1.29 hosts read
+byte-identical summaries). There is deliberately no account-level mention aggregate — the
+official badge is per-conversation too — and no summary read cost: the counter is maintained
+at write time, mirroring how `unread_count` already works.
+
+Boundaries, all explicit: only incoming rows can mention self (outgoing/system rows never set
+the flag and never touch the counter); a remote-deleted row stays unread, so both counters
+keep counting it — the same boundary `unread_count` already has (the official client
+decrements on delete; this connector's delete path does not adjust unread, and the @ badge
+follows its sibling rather than inventing its own rule); retention pruning removes rows
+without touching either counter. The desktop renders the badge from `unreadMentions` alone and
+never diffs message lists to maintain it, so receipt upgrades, edits, and reactions cannot
+drift it.
+
 
 ## 5. signal-cli Boundary
 

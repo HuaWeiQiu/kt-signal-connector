@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   last_message_preview TEXT,
   last_message_at INTEGER,
   unread_count INTEGER NOT NULL DEFAULT 0,
+  unread_mentions INTEGER NOT NULL DEFAULT 0,
   muted INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   UNIQUE(account_id, kind, peer_key),
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS messages (
   rich_json TEXT,
   edited_at INTEGER,
   sender_name TEXT,
+  mentions_self INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
@@ -348,8 +350,22 @@ pub struct ConversationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_at: Option<u64>,
     pub unread_count: u32,
+    /// Contract 1.29: how many unread incoming rows @mention the linked
+    /// account. Moves in lockstep with `unread_count` — incremented by the
+    /// same receive transaction when the row mentions self, zeroed by the
+    /// same open-chat clear — so the @ badge and the unread badge can never
+    /// disagree. No account-level aggregate exists (the official list badge
+    /// is per-conversation too). Absent when zero.
+    #[serde(skip_serializing_if = "u32_is_zero")]
+    pub unread_mentions: u32,
     pub muted: bool,
     pub pinned: bool,
+}
+
+/// Serde gate for optional-count fields (contract 1.29): zero collapses to an
+/// absent key so pre-1.29 hosts read byte-identical summaries.
+fn u32_is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// One aggregated reaction pill projected onto a message row (contract
@@ -402,6 +418,13 @@ pub struct MessageRecord {
     /// conversation-summary author field and per-actor reaction names.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
+    /// Contract 1.29: the incoming row @mentions the linked account — one of
+    /// the normalized mention authors resolved to the account's own identity.
+    /// Captured at receive and persisted on the row; the desktop cannot make
+    /// this call itself (its account address is masked on the wire). Absent
+    /// (false) on outgoing/system rows, non-mention rows, and pre-1.29 rows.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mentions_self: bool,
     pub sent_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received_at: Option<u64>,
@@ -1203,7 +1226,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, muted, pinned
+                        unread_count, unread_mentions, muted, pinned
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -1245,8 +1268,9 @@ impl Store {
                         last_message_reactions: Vec::new(),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
-                        muted: row.get::<_, i64>(7)? != 0,
-                        pinned: row.get::<_, i64>(8)? != 0,
+                        unread_mentions: row.get::<_, i64>(7)? as u32,
+                        muted: row.get::<_, i64>(8)? != 0,
+                        pinned: row.get::<_, i64>(9)? != 0,
                     })
                 },
             )
@@ -1319,7 +1343,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1363,7 +1387,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1383,7 +1407,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1410,7 +1434,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1456,8 +1480,9 @@ impl Store {
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
-                    quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19)",
+                    quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name,
+                    mentions_self
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19, ?20)",
                 params![
                     message.id,
                     message.account_id,
@@ -1488,6 +1513,7 @@ impl Store {
                         .as_ref()
                         .map(|rich| serde_json::to_string(rich).expect("rich json")),
                     message.sender_name,
+                    i64::from(message.mentions_self),
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1497,18 +1523,23 @@ impl Store {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             return Ok(false);
         }
+        // The @ badge rides the same transaction as the unread badge (contract
+        // 1.29): an incoming row that mentions self bumps both counters or
+        // neither, so a crash between them can never split the pair.
         let conversation_updated = transaction
             .execute(
                 "UPDATE conversations
                  SET last_message_preview=?2,
                      last_message_at=?3,
-                     unread_count = unread_count + ?4
+                     unread_count = unread_count + ?4,
+                     unread_mentions = unread_mentions + ?5
                  WHERE id=?1",
                 params![
                     message.conversation_id,
                     preview,
                     message.sent_at as i64,
-                    if increment_unread { 1 } else { 0 }
+                    if increment_unread { 1 } else { 0 },
+                    i64::from(increment_unread && message.mentions_self)
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1564,7 +1595,11 @@ impl Store {
         }
         let conversation_updated = transaction
             .execute(
-                "UPDATE conversations SET unread_count=0 WHERE id=?1 AND account_id=?2",
+                // Contract 1.29: the @ badge clears with the unread badge —
+                // opening the chat is reading it, exactly like the official
+                // conversation open.
+                "UPDATE conversations SET unread_count=0, unread_mentions=0
+                 WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1621,7 +1656,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1685,7 +1720,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -1741,7 +1776,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1792,7 +1827,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -1835,7 +1870,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -1880,7 +1915,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -2245,7 +2280,7 @@ impl Store {
         let summary = conn
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, muted, pinned
+                        unread_count, unread_mentions, muted, pinned
                  FROM conversations WHERE id=?1",
                 params![conversation_id],
                 |row| {
@@ -2262,8 +2297,9 @@ impl Store {
                         last_message_reactions: Vec::new(),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
-                        muted: row.get::<_, i64>(7)? != 0,
-                        pinned: row.get::<_, i64>(8)? != 0,
+                        unread_mentions: row.get::<_, i64>(7)? as u32,
+                        muted: row.get::<_, i64>(8)? != 0,
+                        pinned: row.get::<_, i64>(9)? != 0,
                     })
                 },
             )
@@ -3172,6 +3208,30 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 11 {
+        // Contract revision 1.29: unread @mentions. `messages.mentions_self`
+        // is captured at receive from the normalized mention authors and the
+        // account's own identity — never backfilled, because which past
+        // envelopes addressed this account is only known from the envelopes
+        // themselves. `conversations.unread_mentions` is a write-side counter
+        // moving in lockstep with `unread_count`; history rows that predate
+        // the column contributed to neither, so the counter starts at zero
+        // and there is nothing to reconstruct.
+        if !table_has_column(conn, "messages", "mentions_self")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN mentions_self INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        if !table_has_column(conn, "conversations", "unread_mentions")? {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN unread_mentions INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3188,6 +3248,7 @@ fn table_has_column(
 ) -> Result<bool, StoreError> {
     let sql = match table {
         "accounts" => "PRAGMA table_info(accounts)",
+        "conversations" => "PRAGMA table_info(conversations)",
         "messages" => "PRAGMA table_info(messages)",
         "message_events" => "PRAGMA table_info(message_events)",
         _ => return Err(StoreError::Unavailable(None)),
@@ -3428,6 +3489,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
             .and_then(|json| serde_json::from_str(json).ok()),
         edited_at: row.get::<_, Option<i64>>(16)?.map(|value| value as u64),
         sender_name: row.get(17)?,
+        mentions_self: row.get::<_, i64>(18)? != 0,
         reactions: Vec::new(),
     })
 }
@@ -3480,6 +3542,7 @@ mod tests {
             direction: "outgoing",
             sender_id: "self".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: None,
             text: Some("hello".into()),
@@ -3539,6 +3602,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: None,
             text: Some("body".into()),
@@ -3741,6 +3805,7 @@ mod tests {
                     direction,
                     sender_id: "peer".into(),
                     sender_name: None,
+                    mentions_self: false,
                     sent_at: clock * 10,
                     received_at: None,
                     text: text.map(Into::into),
@@ -3861,6 +3926,7 @@ mod tests {
                     "peer-hash".into()
                 },
                 sender_name: sender_name.map(Into::into),
+                mentions_self: false,
                 sent_at,
                 received_at: None,
                 text: text.map(Into::into),
@@ -4039,6 +4105,7 @@ mod tests {
                 direction: "outgoing",
                 sender_id: account.id.clone(),
                 sender_name: None,
+                mentions_self: false,
                 sent_at,
                 received_at: None,
                 text: Some("hi".into()),
@@ -4108,6 +4175,211 @@ mod tests {
         assert_eq!(listed.last_message_status, None);
     }
 
+    /// Contract 1.29: the @ badge counts only incoming rows whose normalized
+    /// mention authors resolve to the linked account's own number; opening
+    /// the chat clears it together with the unread badge, and a remote
+    /// delete leaves both counters untouched (the row stays unread).
+    #[test]
+    fn unread_mentions_counts_only_self_addressed_incoming() {
+        use crate::engine::{NormalizedMention, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "grp-1", "Group")
+            .unwrap();
+        let push = |id: &str, authors: &[&str], increment_unread: bool| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer".into(),
+                sender_name: None,
+                mentions_self: authors.contains(&"+15555550100"),
+                sent_at: id.len() as u64 * 10,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: (!authors.is_empty()).then(|| NormalizedRich {
+                    mentions: authors
+                        .iter()
+                        .map(|author| NormalizedMention {
+                            author: (*author).into(),
+                            name: None,
+                            start: 0,
+                            length: 4,
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                reactions: Vec::new(),
+            };
+            store
+                .insert_message(&message, None, None, increment_unread)
+                .unwrap();
+        };
+        let summary = || {
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap()
+        };
+
+        // A mention of a peer never moves the badge, and the summary key
+        // stays absent at zero.
+        push("m1", &["+15555550101"], true);
+        let current = summary();
+        assert_eq!(current.unread_count, 1);
+        assert_eq!(current.unread_mentions, 0);
+
+        // A mention resolving to the linked account's number counts.
+        push("m2", &["+15555550100"], true);
+        let current = summary();
+        assert_eq!(current.unread_count, 2);
+        assert_eq!(current.unread_mentions, 1);
+
+        // The row carries the flag on reads, so the desktop can highlight
+        // the bubble without knowing the account number (it is masked on
+        // the wire).
+        let row = store
+            .message_by_id(&account.id, &conversation.id, "m2")
+            .unwrap()
+            .unwrap();
+        assert!(row.mentions_self);
+        let plain = store
+            .message_by_id(&account.id, &conversation.id, "m1")
+            .unwrap()
+            .unwrap();
+        assert!(!plain.mentions_self);
+
+        // A mention author carrying only a UUID cannot be attributed to
+        // self: the pinned upstream jsonRpc surface exposes the account by
+        // number only (`listAccounts` returns `{number}`), the recorded
+        // boundary of this revision.
+        push("m3", &["3f2504e0-4f89-11d3-9a0c-0305e82c3301"], true);
+        assert_eq!(summary().unread_mentions, 1);
+
+        // Opening the chat clears both badges together.
+        store
+            .clear_conversation_unread(&account.id, &conversation.id)
+            .unwrap();
+        let current = summary();
+        assert_eq!(current.unread_count, 0);
+        assert_eq!(current.unread_mentions, 0);
+
+        // A remote-deleted row stays unread: neither counter moves, the
+        // same boundary `unread_count` already has.
+        push("m4", &["+15555550100"], true);
+        store
+            .mark_remote_deleted(&account.id, &conversation.id, 40)
+            .unwrap();
+        let current = summary();
+        assert_eq!(current.unread_count, 1);
+        assert_eq!(current.unread_mentions, 1);
+    }
+
+    /// Contract 1.29 byte-compat: `unreadMentions` is absent at zero so a
+    /// pre-1.29 host reads byte-identical summaries, and present exactly
+    /// when the count is positive; `mentionsSelf` on a row is absent when
+    /// false.
+    #[test]
+    fn unread_mentions_wire_keys_collapse_to_absent_at_zero() {
+        use crate::engine::{NormalizedMention, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let plain = MessageRecord {
+            id: "m1".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 10,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+        };
+        store.insert_message(&plain, None, None, true).unwrap();
+
+        let row_json = serde_json::to_value(
+            store
+                .message_by_id(&account.id, &conversation.id, "m1")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(row_json.get("mentionsSelf").is_none());
+        let summary_json = serde_json::to_value(
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(summary_json.get("unreadMentions").is_none());
+
+        let mentioned = MessageRecord {
+            id: "m2".into(),
+            sent_at: 20,
+            mentions_self: true,
+            rich: Some(NormalizedRich {
+                mentions: vec![NormalizedMention {
+                    author: "+15555550100".into(),
+                    name: None,
+                    start: 0,
+                    length: 4,
+                }],
+                ..Default::default()
+            }),
+            ..plain.clone()
+        };
+        store.insert_message(&mentioned, None, None, true).unwrap();
+        let summary_json = serde_json::to_value(
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary_json["unreadMentions"], 1);
+        let row_json = serde_json::to_value(
+            store
+                .message_by_id(&account.id, &conversation.id, "m2")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(row_json["mentionsSelf"], true);
+    }
+
     #[test]
     fn send_completion_removes_only_unclaimed_sync_duplicate() {
         let temp = TempDir::new().unwrap();
@@ -4125,6 +4397,7 @@ mod tests {
             direction: "outgoing",
             sender_id: account.id.clone(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 1,
             received_at: None,
             text: Some("same".into()),
@@ -4219,6 +4492,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: Some(10),
             text: Some("hello".into()),
@@ -4281,6 +4555,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: Some(10),
             text: Some("hello".into()),
@@ -4348,6 +4623,7 @@ mod tests {
             direction: "system",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: Some(10),
             text: Some("control notice".into()),
@@ -4400,6 +4676,7 @@ mod tests {
             direction: "outgoing",
             sender_id: account.id.clone(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: None,
             text: Some("body".into()),
@@ -4475,6 +4752,7 @@ mod tests {
                 direction: "incoming",
                 sender_id: "peer".into(),
                 sender_name: None,
+                mentions_self: false,
                 sent_at,
                 received_at: Some(sent_at),
                 text: Some(id.into()),
@@ -4545,6 +4823,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 30,
             received_at: Some(30),
             text: Some("changed after cursor".into()),
@@ -4590,6 +4869,7 @@ mod tests {
             direction: "incoming",
             sender_id: "other-peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: Some(10),
             text: Some("other".into()),
@@ -4673,6 +4953,7 @@ mod tests {
             direction: "incoming",
             sender_id: "+15555550101".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: 10,
             received_at: Some(11),
             text: Some("delete me".into()),
@@ -5234,6 +5515,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: now - 10 * day,
             received_at: Some(now - 10 * day),
             text: Some("kept body".into()),
@@ -5299,6 +5581,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             // Sender clock claims the epoch; we received it yesterday.
             sent_at: 5_000,
             received_at: Some(now - day),
@@ -5387,6 +5670,7 @@ mod tests {
                     direction: "incoming",
                     sender_id: "peer".into(),
                     sender_name: None,
+                    mentions_self: false,
                     sent_at: now - age,
                     received_at: Some(now - age),
                     text: Some("body".into()),
@@ -5529,6 +5813,7 @@ mod tests {
             direction: "outgoing",
             sender_id: account.id.clone(),
             sender_name: None,
+            mentions_self: false,
             sent_at: now - 400 * day,
             received_at: None,
             text: Some("body".into()),
@@ -5596,6 +5881,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: now - day,
             received_at: Some(now - day),
             text: Some("body".into()),
@@ -5658,6 +5944,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: now - 20 * day,
             received_at: Some(now - 20 * day),
             text: Some("kept body".into()),
@@ -5723,6 +6010,7 @@ mod tests {
             direction: "incoming",
             sender_id: "peer".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at: now - 300 * day,
             received_at: Some(now - 300 * day),
             text: Some("body".into()),
@@ -6141,6 +6429,7 @@ mod tests {
             direction: "outgoing",
             sender_id: "self".into(),
             sender_name: None,
+            mentions_self: false,
             sent_at,
             received_at: None,
             text: Some("hello".into()),

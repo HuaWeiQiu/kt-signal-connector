@@ -990,6 +990,7 @@ impl ConnectorService {
             direction: "outgoing",
             sender_id: account_id.to_string(),
             sender_name: None,
+            mentions_self: false,
             sent_at: now_ms(),
             received_at: None,
             text: Some(text.to_string()),
@@ -1597,6 +1598,20 @@ impl ConnectorService {
             "system" => "system",
             _ => "delivered",
         };
+        // Contract 1.29: a row @mentions the linked account when one of its
+        // normalized mention authors resolves to the account's own number.
+        // The match is number-based because the pinned upstream jsonRpc
+        // surface exposes the account only by number (`listAccounts` returns
+        // `{number}`; the account UUID is not queryable), so a mention author
+        // carrying only a UUID cannot be attributed to self — recorded as the
+        // revision's known boundary. Mention authors prefer the resolved
+        // number (`number` first, `uuid` fallback), so the common group case
+        // matches. Computed before the record consumes the rich payload.
+        let mentions_self = direction == "incoming"
+            && receive
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.mentions.iter().any(|m| m.author == signal_account));
         let message = MessageRecord {
             id: message_id,
             account_id: account.id.clone(),
@@ -1611,6 +1626,7 @@ impl ConnectorService {
             } else {
                 None
             },
+            mentions_self,
             sent_at,
             received_at: Some(now_ms()),
             text: stored_text,
