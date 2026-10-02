@@ -885,6 +885,47 @@ per emoji, so a pathological store cannot inflate a response. `actorId` (the con
 sender hash) deliberately stays off the wire — it is not resolvable by the host and carries no
 rendering value beyond `self` + `name`.
 
+### 4.23 Conversation-summary last-message send state (contract revision 1.28, 2026-10-02)
+
+The last of the three list-preview gaps the v8.31 parity audit filed against the wire
+(audit-B `b-row-status`, P1): the official list renders the send-state icon on the last message
+— only when that message is outgoing (`sending` 4s spinner / `sent` check / `delivered`
+double-check / `read`·`viewed` solid double-check / `error` red exclamation) — and the summary
+carried no field to drive it. Pure read-side addition, the 1.27 pattern: no new IPC method, no
+event, no store-schema change (the `status` column has been persisted at receive/send time since
+the 1.15 era; nothing is backfilled because nothing needs to be).
+
+`ConversationSummary` gains one optional field derived in the same single newest-row read as the
+1.23/1.27 projections (`conversation_last_message_meta`, the existing
+`messages_conversation_sent_at` index, zero extra queries):
+
+- `lastMessageStatus?: 'pending' | 'sent' | 'delivered' | 'read' | 'failed'` — present only when
+  the newest row is `outgoing`, and then exactly that row's `status` value: the same vocabulary
+  `MessageRecord.status` projects, so the list icon and the bubble icon can never disagree. The
+  desktop maps the tiers onto its existing official projection (`pending` → sending spinner,
+  `sent` → check, `delivered`/`read` → double-checks, `failed` → red exclamation); the connector
+  ships no icon or locale-dependent string.
+
+Boundaries, all explicit: incoming and system endings and empty conversations expose nothing
+(the official icon exists only on outgoing endings); an outgoing row that ended
+`remote-deleted` or `unknown` exposes no status either — the official icon set has no
+representation for a deleted last message, so the row degrades to the same no-icon rendering an
+incoming ending gets while `lastMessageDirection` still marks it self-authored. There is no
+`paused` tier (the connector has no pausable send pipeline) and no `error` tier — send failures
+already land as `failed` rows via the existing failure path, which the summary reflects for
+free. Receipt upgrades (§4.19) move the summary field for free on the next read: it is a
+projection of the row, never a cached copy.
+
+The field uses `skip_serializing_if`, so endings without a send state are byte-identical to
+pre-1.28 summaries. Feasibility note recorded for the desktop parity backlog (verified against
+the pinned signal-cli command registry, all 61 JSON-RPC methods enumerated from source): mute,
+archive, forward, and full-text search have no upstream JSON-RPC support — conversation-level
+mute does not exist upstream at all, `listContacts[].isArchived` is a read-only legacy-contact
+projection with no write API, and there is no `forward` or `search` method; any desktop-side
+mute/archive/forward/search can therefore only be connector-local state or a local
+approximation (never cross-device synced), which is a separate decision, not part of this
+revision.
+
 
 ## 5. signal-cli Boundary
 

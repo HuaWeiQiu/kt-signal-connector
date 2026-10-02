@@ -325,6 +325,15 @@ pub struct ConversationSummary {
     /// client renders its own localized self label).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message_direction: Option<&'static str>,
+    /// Contract 1.28: the newest outgoing row's send state — the exact
+    /// vocabulary the message rows carry (`pending` / `sent` / `delivered` /
+    /// `read` / `failed`), so the list icon and the bubble icon agree.
+    /// Present only on outgoing endings with a genuine send tier: incoming
+    /// and system endings, empty conversations, and outgoing rows that ended
+    /// `remote-deleted`/`unknown` expose no send state (the official icon set
+    /// has no representation for those).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_message_status: Option<&'static str>,
     /// Contract 1.27: newest incoming author's display name, captured from the
     /// envelope `sourceName` at receive and stored on the message row. Absent
     /// for outgoing (self), system endings, and rows received before 1.27 or
@@ -1231,6 +1240,7 @@ impl Store {
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
+                        last_message_status: None,
                         last_message_author_name: None,
                         last_message_reactions: Vec::new(),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
@@ -1248,6 +1258,7 @@ impl Store {
             let meta = conversation_last_message_meta(&conn, &item.id)?;
             item.last_message_kind = meta.kind;
             item.last_message_direction = meta.direction;
+            item.last_message_status = meta.status;
             item.last_message_author_name = meta.author_name;
             item.last_message_reactions = meta.reactions;
         }
@@ -2246,6 +2257,7 @@ impl Store {
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
                         last_message_direction: None,
+                        last_message_status: None,
                         last_message_author_name: None,
                         last_message_reactions: Vec::new(),
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
@@ -2262,6 +2274,7 @@ impl Store {
                 let meta = conversation_last_message_meta(&conn, conversation_id)?;
                 summary.last_message_kind = meta.kind;
                 summary.last_message_direction = meta.direction;
+                summary.last_message_status = meta.status;
                 summary.last_message_author_name = meta.author_name;
                 summary.last_message_reactions = meta.reactions;
                 Ok(Some(summary))
@@ -3240,13 +3253,13 @@ fn static_status(value: String) -> &'static str {
     }
 }
 
-/// Contract 1.23 (attachment noun) generalized by contract 1.27: one indexed
-/// read of the newest row decides every last-message projection on a
+/// Contract 1.23 (attachment noun) generalized by contracts 1.27/1.28: one
+/// indexed read of the newest row decides every last-message projection on a
 /// conversation summary. The desktop list renders the official preview line —
 /// attachment noun ("Photo" / "Video" / "Voice message" / "File"), send-state
 /// icon (outgoing only), group author prefix, reaction emoji prefix — so the
-/// read returns `kind`, `direction`, the captured author name, and the
-/// distinct active reaction emoji of that row.
+/// read returns `kind`, `direction`, the outgoing send state, the captured
+/// author name, and the distinct active reaction emoji of that row.
 ///
 /// Rules unchanged from 1.23 for `kind`: an attachment-only ending (no
 /// caption text) yields its first attachment's kind; a text/caption ending, a
@@ -3254,9 +3267,12 @@ fn static_status(value: String) -> &'static str {
 /// the noun, exactly like the official list preview. `direction` follows the
 /// same newest row but stays `None` for system rows and empty conversations;
 /// the author name is surfaced only for incoming rows that carry one.
+/// `status` is the send-state tier of an outgoing ending, in the message-row
+/// vocabulary; every other ending exposes none.
 struct ConversationLastMessageMeta {
     kind: Option<&'static str>,
     direction: Option<&'static str>,
+    status: Option<&'static str>,
     author_name: Option<String>,
     reactions: Vec<String>,
 }
@@ -3267,7 +3283,7 @@ fn conversation_last_message_meta(
 ) -> Result<ConversationLastMessageMeta, StoreError> {
     let latest = conn
         .query_row(
-            "SELECT direction, body, attachments_json, sender_name, sent_at FROM messages
+            "SELECT direction, body, attachments_json, sender_name, status, sent_at FROM messages
              WHERE conversation_id=?1
              ORDER BY sent_at DESC, id DESC
              LIMIT 1",
@@ -3278,16 +3294,18 @@ fn conversation_last_message_meta(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-    let Some((direction, body, attachments_json, sender_name, sent_at)) = latest else {
+    let Some((direction, body, attachments_json, sender_name, status, sent_at)) = latest else {
         return Ok(ConversationLastMessageMeta {
             kind: None,
             direction: None,
+            status: None,
             author_name: None,
             reactions: Vec::new(),
         });
@@ -3321,6 +3339,20 @@ fn conversation_last_message_meta(
         Some("incoming") => sender_name.filter(|name| !name.trim().is_empty()),
         _ => None,
     };
+    // Contract 1.28: the official list shows the send-state icon only when
+    // the conversation ends on an outgoing message. The value is that row's
+    // own status — the same projection `MessageRecord.status` carries, so the
+    // list icon and the bubble icon can never disagree — restricted to the
+    // genuine send tiers: a `remote-deleted`/`unknown` outgoing ending has no
+    // official icon and exposes no state.
+    let wire_status = if direction == "outgoing" {
+        match static_status(status) {
+            tier @ ("pending" | "sent" | "delivered" | "read" | "failed") => Some(tier),
+            _ => None,
+        }
+    } else {
+        None
+    };
     // Active reactions on exactly the newest row, keyed by its upstream
     // timestamp; pill order (oldest reaction first, then emoji) matches the
     // message projection so the summary prefix and the open conversation
@@ -3350,6 +3382,7 @@ fn conversation_last_message_meta(
     Ok(ConversationLastMessageMeta {
         kind,
         direction: wire_direction,
+        status: wire_status,
         author_name,
         reactions,
     })
@@ -3799,7 +3832,9 @@ mod tests {
     /// author name (captured from the envelope `sourceName`), and the newest
     /// row's active reaction emoji. Outgoing rows mark self via direction;
     /// system endings and empty conversations expose nothing; reactions key
-    /// on the newest row's upstream timestamp and follow removal.
+    /// on the newest row's upstream timestamp and follow removal. Contract
+    /// 1.28 adds the outgoing send state: present only on outgoing endings,
+    /// always `None` for incoming/system endings and empty conversations.
     #[test]
     fn summary_carries_last_message_direction_author_and_reactions() {
         let temp = TempDir::new().unwrap();
@@ -3856,25 +3891,39 @@ mod tests {
                 .unwrap()
         };
 
-        // Empty conversation: no direction, no author, no reactions.
+        // Empty conversation: no direction, no author, no reactions, no
+        // send state.
         let current = summary();
         assert_eq!(current.last_message_direction, None);
+        assert_eq!(current.last_message_status, None);
         assert_eq!(current.last_message_author_name, None);
         assert!(current.last_message_reactions.is_empty());
 
-        // Incoming ending: direction incoming, captured author name.
+        // Incoming ending: direction incoming, captured author name, and no
+        // send state — the official icon exists only on outgoing endings.
         push("m1", "incoming", Some("林菲菲"), 100, Some("你好"));
         let current = summary();
         assert_eq!(current.last_message_direction, Some("incoming"));
+        assert_eq!(current.last_message_status, None);
         assert_eq!(current.last_message_author_name.as_deref(), Some("林菲菲"));
         assert!(current.last_message_reactions.is_empty());
 
         // Outgoing ending: the author is the account itself — no name is
-        // surfaced, the client renders its own self label.
+        // surfaced, the client renders its own self label. The send state is
+        // the row's own status.
         push("m2", "outgoing", None, 200, Some("好的"));
         let current = summary();
         assert_eq!(current.last_message_direction, Some("outgoing"));
+        assert_eq!(current.last_message_status, Some("sent"));
         assert_eq!(current.last_message_author_name, None);
+
+        // A peer receipt moves the row's status and the summary follows.
+        store
+            .update_message_status("m2", "delivered", None)
+            .unwrap();
+        assert_eq!(summary().last_message_status, Some("delivered"));
+        store.update_message_status("m2", "read", None).unwrap();
+        assert_eq!(summary().last_message_status, Some("read"));
 
         // Reactions key on the newest row only: they target m2's timestamp.
         store
@@ -3937,10 +3986,12 @@ mod tests {
         let current = summary();
         assert_eq!(current.last_message_reactions, vec!["❤️".to_string()]);
 
-        // A system ending exposes neither direction nor author nor reactions.
+        // A system ending exposes neither direction nor author nor reactions
+        // nor send state.
         push("m3", "system", None, 300, Some("identity changed"));
         let current = summary();
         assert_eq!(current.last_message_direction, None);
+        assert_eq!(current.last_message_status, None);
         assert_eq!(current.last_message_author_name, None);
         assert!(current.last_message_reactions.is_empty());
 
@@ -3963,6 +4014,98 @@ mod tests {
             .unwrap();
         assert_eq!(listed.last_message_direction, Some("incoming"));
         assert_eq!(listed.last_message_author_name.as_deref(), Some("阿强"));
+    }
+
+    /// Contract 1.28: the summary send state covers the whole outgoing ladder
+    /// (pending → sent → delivered → read, plus failed) in the exact message
+    /// row vocabulary, and stays absent on outgoing endings that carry no
+    /// official icon (remote-deleted) — while the direction keeps marking the
+    /// ending as self-authored.
+    #[test]
+    fn summary_last_message_status_covers_the_outgoing_ladder_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550111", "Peer")
+            .unwrap();
+        let push = |id: &str, status: &'static str, sent_at: u64| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "outgoing",
+                sender_id: account.id.clone(),
+                sender_name: None,
+                sent_at,
+                received_at: None,
+                text: Some("hi".into()),
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: true,
+                status,
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+            };
+            store.insert_message(&message, None, None, false).unwrap();
+        };
+        let summary_status = || {
+            store
+                .conversation_summary(&conversation.id)
+                .unwrap()
+                .unwrap()
+                .last_message_status
+        };
+
+        // A queued outgoing row carries its pending state into the summary.
+        push("m1", "pending", 100);
+        assert_eq!(summary_status(), Some("pending"));
+
+        // The failed tier surfaces like every other tier.
+        push("m2", "pending", 200);
+        store.update_message_status("m2", "failed", None).unwrap();
+        assert_eq!(summary_status(), Some("failed"));
+
+        // A newer outgoing row replaces the ending, then receipts walk the
+        // ladder through the summary.
+        push("m3", "sent", 300);
+        assert_eq!(summary_status(), Some("sent"));
+        store
+            .update_message_status("m3", "delivered", None)
+            .unwrap();
+        assert_eq!(summary_status(), Some("delivered"));
+        store.update_message_status("m3", "read", None).unwrap();
+        assert_eq!(summary_status(), Some("read"));
+
+        // A remote-deleted outgoing ending keeps the self-authored direction
+        // but exposes no send state — the official icon set has no
+        // representation for it.
+        store
+            .mark_remote_deleted(&account.id, &conversation.id, 300)
+            .unwrap();
+        let current = store
+            .conversation_summary(&conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.last_message_direction, Some("outgoing"));
+        assert_eq!(current.last_message_status, None);
+
+        // The list path carries the same projection.
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let listed = page
+            .items
+            .iter()
+            .find(|item| item.id == conversation.id)
+            .unwrap();
+        assert_eq!(listed.last_message_direction, Some("outgoing"));
+        assert_eq!(listed.last_message_status, None);
     }
 
     #[test]

@@ -1570,12 +1570,14 @@ async fn conversation_summary_and_reactions_carry_author_metadata() {
     assert_eq!(group_row["lastMessageDirection"], "incoming");
     assert_eq!(group_row["lastMessageAuthorName"], "林菲菲");
     assert_eq!(group_row["lastMessageReactions"], json!(["👍"]));
+    assert!(group_row.get("lastMessageStatus").is_none());
     let direct_row = items
         .iter()
         .find(|item| item["type"] == "direct" && item.get("lastMessageDirection").is_some())
         .unwrap();
     assert_eq!(direct_row["lastMessageDirection"], "incoming");
     assert!(direct_row.get("lastMessageAuthorName").is_none());
+    assert!(direct_row.get("lastMessageStatus").is_none());
 
     // The message row carries the author name and the per-actor pill detail
     // the official ReactionViewer renders.
@@ -1721,6 +1723,9 @@ async fn conversation_summary_and_reactions_carry_author_metadata() {
         .unwrap();
     assert_eq!(group_row["lastMessageDirection"], "outgoing");
     assert!(group_row.get("lastMessageAuthorName").is_none());
+    // Contract 1.28: the completed send carries its row status into the
+    // summary — the same vocabulary the message rows use.
+    assert_eq!(group_row["lastMessageStatus"], "sent");
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
