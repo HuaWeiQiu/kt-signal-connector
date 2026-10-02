@@ -82,10 +82,12 @@ pub enum SignalCliMode {
     /// unknown arguments. Proxy parity holds at the environment level: the
     /// engine consumes the same `KT_SIGNAL_SOCKS_PROXY` variable this
     /// process injects (it maps it onto reqwest's `ALL_PROXY`, which covers
-    /// the libsignal-service HTTP and WebSocket transport). Media ingest
-    /// aborts the launch at startup validation (implementation plan §5): the
-    /// engine cannot honor that capability yet, and promising downloads that
-    /// never happen is not an acceptable default. `JAVA_HOME` is ignored
+    /// the libsignal-service HTTP and WebSocket transport). Media ingest is
+    /// NOT rejected in this mode: it is downgraded (implementation plan §5) —
+    /// the engine cannot download attachments yet, so a launcher that arms
+    /// ingest gets the pre-1.17 shape instead (`--ignore-attachments` on the
+    /// argv, no media governor) rather than a failed launch, and every media
+    /// method answers CAPABILITY_UNAVAILABLE. `JAVA_HOME` is ignored
     /// with a warning, like native mode.
     KtEngine,
 }

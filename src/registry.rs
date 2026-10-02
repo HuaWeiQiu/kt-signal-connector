@@ -781,6 +781,22 @@ impl Drop for ProxyGroupRuntime {
     }
 }
 
+/// kt-engine capability downgrade (implementation plan §5): the engine never
+/// downloads attachments, so a launcher that arms media ingest in this mode is
+/// downgraded to the pre-1.17 shape — `--ignore-attachments` stays on the
+/// argv, the media governor is not armed, and every media method answers
+/// CAPABILITY_UNAVAILABLE — instead of refusing the whole channel (the dev
+/// desktop arms media ingest unconditionally).
+fn effective_media_ingest(mode: SignalCliMode, media_ingest: bool) -> bool {
+    if mode == SignalCliMode::KtEngine && media_ingest {
+        tracing::warn!(
+            "kt-engine mode has no attachment ingest; media methods answer CAPABILITY_UNAVAILABLE"
+        );
+        return false;
+    }
+    media_ingest
+}
+
 /// Open the shared per-profile store once and assemble one supervised engine
 /// stack per planned group (ADR 0001 R4/R5). History retention is process-wide
 /// and therefore spawned once; watchdogs are per group. With `media_ingest`
@@ -798,6 +814,7 @@ pub fn open_group_runtime(
     signal_cli_mode: SignalCliMode,
     media_ingest: bool,
 ) -> Result<Arc<ProxyGroupRuntime>, crate::store::StoreError> {
+    let media_ingest = effective_media_ingest(signal_cli_mode, media_ingest);
     let store = Arc::new(Store::open(state_dir, store_key)?);
     let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
     let mut slots = Vec::with_capacity(plan.groups.len());
@@ -898,5 +915,18 @@ mod tests {
             Some("team-b")
         );
         assert_eq!(runtime.resolve_link_session("never-started").await, None);
+    }
+
+    /// kt-engine media downgrade (plan §5): arming ingest in kt-engine mode
+    /// collapses to the pre-1.17 shape; every other mode keeps the launcher's
+    /// choice untouched.
+    #[test]
+    fn kt_engine_downgrades_media_ingest_other_modes_keep_it() {
+        assert!(!effective_media_ingest(SignalCliMode::KtEngine, true));
+        assert!(!effective_media_ingest(SignalCliMode::KtEngine, false));
+        for mode in [SignalCliMode::Jvm, SignalCliMode::Native] {
+            assert!(effective_media_ingest(mode, true));
+            assert!(!effective_media_ingest(mode, false));
+        }
     }
 }

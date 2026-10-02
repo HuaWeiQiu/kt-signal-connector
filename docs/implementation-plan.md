@@ -1054,9 +1054,12 @@ Rules:
   `KT_SIGNAL_SOCKS_PROXY=host:port` variable this launcher injects and mapping it onto reqwest's
   `ALL_PROXY`, which the libsignal-service HTTP and WebSocket transport (a single reqwest client)
   honors natively, so the per-group desktop proxy probe keeps working unchanged; and
-  `--media-ingest` aborts the launch fail-closed before any data-directory lock is taken — the
-  engine never downloads attachments, so the media governor would promise a capability the child
-  cannot deliver. `JAVA_HOME` is ignored with a warning, and the child environment is inherited
+  `--media-ingest` is downgraded instead of refused (2026-10-03): the engine never downloads
+  attachments, so arming ingest in this mode silently keeps the pre-1.17 shape —
+  `--ignore-attachments` stays on the argv, the media governor is not armed, and every media
+  method answers CAPABILITY_UNAVAILABLE — with a launch-time warning, so the dev desktop
+  (which arms ingest unconditionally) still boots instead of failing closed. `JAVA_HOME` is
+  ignored with a warning, and the child environment is inherited
   except for the store-key override, exactly like the other modes. The engine writes its own
   `engine-state.json` / `engine-send-log.jsonl` / `accounts/lk-<hex>` layout under the group data
   directory, disjoint from signal-cli's files and the connector's `.kt-signal-connector.lock`.

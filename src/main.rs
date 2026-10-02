@@ -72,9 +72,9 @@ enum CliCommand {
         /// binary; equivalent to --signal-cli-native), or `kt-engine` (KT's
         /// own sidecar; `--signal-cli` then points at the engine executable).
         /// Explicit selection only — packaging controls what it ships.
-        /// Conflicts with --signal-cli-native; --media-ingest aborts the
-        /// launch in kt-engine mode (plan §5). SOCKS proxy parity holds: the
-        /// engine consumes the same KT_SIGNAL_SOCKS_PROXY environment.
+        /// Conflicts with --signal-cli-native. SOCKS proxy parity holds via
+        /// the KT_SIGNAL_SOCKS_PROXY environment; --media-ingest is
+        /// downgraded to CAPABILITY_UNAVAILABLE in kt-engine mode (plan §5).
         #[arg(
             long,
             env = "KT_SIGNAL_CLI_ENGINE",
@@ -294,27 +294,6 @@ async fn main() {
     }
 }
 
-/// kt-engine capability gate (implementation plan §5): the engine never
-/// downloads attachments, so `--media-ingest` would arm the media governor
-/// for downloads that can never arrive — that aborts the launch. A SOCKS
-/// proxy is NOT rejected: the engine consumes the same
-/// `KT_SIGNAL_SOCKS_PROXY` environment variable the connector injects for
-/// the JVM (mapped onto reqwest's `ALL_PROXY`), so proxy parity holds in
-/// every mode. The other modes are unaffected.
-fn ensure_engine_mode_supported(mode: SignalCliMode, media_ingest: bool) -> Result<(), String> {
-    if mode != SignalCliMode::KtEngine {
-        return Ok(());
-    }
-    if media_ingest {
-        return Err(
-            "kt-engine mode does not support --media-ingest: the engine \
-                    never downloads inbound attachments"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
 async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let ServeOptions {
         endpoint,
@@ -342,8 +321,9 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     // launch without leaking any endpoint into diagnostics (ADR 0001 R10).
     // Flag entries come first in launcher order, then environment entries;
     // duplicates across the two sources are rejected rather than merged.
-    // The engine kind resolves before anything touches the filesystem so the
-    // kt-engine capability validation (below) can abort the launch first.
+    // The engine kind resolves from the explicit flag (or the legacy native
+    // flag) before launch configuration is built; capability shaping for
+    // kt-engine (the media-ingest downgrade) happens in `open_group_runtime`.
     let signal_cli_mode = match signal_cli_engine {
         Some(mode) => mode,
         None if signal_cli_native => SignalCliMode::Native,
@@ -356,10 +336,6 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         socks_proxy,
         &signal_data_dir,
     )?;
-    // kt-engine capability gate (plan §5): fail the launch before any
-    // data-directory lock or secret read rather than spawning an engine that
-    // cannot honor the configured proxy or deliver media downloads.
-    ensure_engine_mode_supported(signal_cli_mode, media_ingest)?;
     // ADR 0002 occupancy guard: exclusive cross-process locks over every
     // planned data directory (the `default` root and each proxy-group
     // subdirectory), acquired before the bootstrap payload is read and held
@@ -647,32 +623,4 @@ fn load_optional_trust(
         .ok_or("--trusted-public-key-file is required unless --allow-unsigned")?;
     let key = load_verifying_key(&key_path).map_err(|error| error.to_string())?;
     Ok(Some((key_id, key)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn kt_engine_mode_rejects_media_ingest() {
-        let error = ensure_engine_mode_supported(SignalCliMode::KtEngine, true)
-            .expect_err("media ingest must abort the launch");
-        assert!(error.contains("media-ingest"));
-    }
-
-    /// Proxy parity (plan §5): kt-engine consumes the same
-    /// KT_SIGNAL_SOCKS_PROXY environment the connector injects, so a
-    /// proxy-configured plan launches in every mode.
-    #[test]
-    fn kt_engine_mode_launches_with_media_ingest_off() {
-        ensure_engine_mode_supported(SignalCliMode::KtEngine, false)
-            .expect("plain kt-engine launch is supported");
-    }
-
-    #[test]
-    fn signal_cli_modes_remain_unrestricted() {
-        for mode in [SignalCliMode::Jvm, SignalCliMode::Native] {
-            ensure_engine_mode_supported(mode, true).expect("signal-cli modes are unrestricted");
-        }
-    }
 }
