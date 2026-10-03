@@ -1069,6 +1069,50 @@ the full history without a new method. The table cascades with its message row (
 DELETE CASCADE, `foreign_keys=ON` already enforced) and retention passes remove it with the row
 — the store never grows edit orphans.
 
+### 4.28 Message pin/unpin + group admin delete (contract revision 1.33, 2026-10-04)
+
+Three additive mutating methods plus three inbound projections, all carrying official protocol
+fields the engine's stack already speaks — `DataMessage.pinMessage = 27`, `unpinMessage = 28`,
+`adminDelete = 29` (Signal-Desktop v8.31.0-alpha.1 `protos/SignalService.proto`, verified;
+behavior aligned with official `SendMessage.preload.ts` / `processDataMessage.preload.ts`).
+Official semantics: one pinned message per conversation, `pinDurationSeconds != null` means a
+timed pin, absent/null means forever; `unpinMessage` carries only the target identity;
+`adminDelete` is group-only (a group admin removing someone else's message; direct chats have no
+admin concept).
+
+- `messages.sendPinMessage`: params `accountId`, `conversationId`, `messageId` (required; the
+  reaction addressing model §4.6 verbatim), optional `pinDurationSeconds` (u32; absent = forever,
+  out-of-range fails closed with `INVALID_REQUEST`), optional `operationId` (shape-validated,
+  never persisted). Engine call: `sendPinMessage` with `targetAuthor` per row direction (own
+  number for outgoing rows, peer for incoming direct rows, unresolvable group-incoming rows keep
+  the §4.6 `INVALID_REQUEST` answer) — the engine resolves it to the 16-byte
+  `targetAuthorAciBinary` the wire requires. Groups map to the engine `groupId` form.
+- `messages.sendUnpinMessage`: same addressing, no duration. Engine call: `sendUnpinMessage`.
+- `messages.sendAdminDelete`: same addressing, group conversations only (`INVALID_REQUEST`
+  otherwise). Engine call: `sendAdminDelete`. Target eligibility against admin state is not
+  pre-checked — the server is the authority and rejects non-admin attempts; the connector
+  surfaces the upstream rejection (official behavior: send and show the failure).
+- Result follows the reaction precedent exactly: `{"status": "sent"}` / `{"status": "unknown"}`,
+  no automatic retries, same write-lane mutex and delete-drain barrier. Error mapping reuses
+  existing codes only. Handshake `capabilities` gains `pin-messages` and `admin-delete`
+  (contract-gated discovery, §4.5 precedent).
+- Inbound projections: `receive` envelopes now carry optional `pinMessage`
+  (`{targetAuthor, targetSentTimestamp, pinDurationSeconds?}` — absent `pinDurationSeconds` =
+  forever), `unpinMessage` (`{targetAuthor, targetSentTimestamp}`), and `adminDelete`
+  (`{targetAuthor, targetSentTimestamp}`) keys on `dataMessage`, with the reaction targetAuthor
+  resolution (E.164 on contacts hit, ACI string otherwise). The connector persists the derived
+  per-conversation pinned state (at most one entry; a newer pin replaces the older one; expiry
+  from `pinDurationSeconds` is connector-clock computed) and surfaces it on the conversation
+  summary as optional `pinnedMessage: {messageId, targetAuthor, targetSentTimestamp,
+  pinnedAt, expiresAt?}` so a reloaded window renders the pin bar without replaying events;
+  `unpinMessage` and `adminDelete` clear/update that state and persist as row-level markers
+  (`adminDeleted` flag renders the official "deleted by admin" tombstone; the row body stays
+  for the audit window, retention prunes normally). Store schema 13 (additive columns + one
+  table), no data migration.
+- Known boundaries: pins are conversation-scoped (the official model) — the backup-archive
+  `ChatItem.PinDetails` surface is engine-side import metadata (§6.6) and does not feed this
+  state; phone clients older than the official pin rollout ignore the unknown field (proto
+  forward-compatibility), so peers without support simply never show the pin.
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -1351,8 +1395,15 @@ export); libsignal v0.99.0 (already in the engine's dependency tree) ships the `
 and backup-key primitives. The S1 kill-gate spike PASSED on 2026-10-03 (ADR 0005 §取证记录):
 the phone honors a third-party `backup5` QR capability and the provisioning envelope carries
 `ephemeralBackupKey`, `GET /v1/devices/transfer_archive` plus the CDN attachment download
-succeeded byte-level (6,576-byte archive), and no presage patch is needed. Until S2/S3 land,
-the connector keeps serving skeletons only (§6.5).
+succeeded byte-level (6,576-byte archive), and no presage patch is needed. S2 landed in the
+engine on 2026-10-04 (kt-signal-engine 0eedc8c, ADR 0005 §5): the link flow bypasses presage's
+`Manager::link_secondary_device` (which drops `ephemeral_backup_key`) and calls
+`provisioning::link_device` directly with `capabilities=backup5` on the QR URL, persists the
+registration through the official store format, then best-effort long-polls the transfer
+archive, decrypts it (official `libsignal-message-backup` v0.99.0 primitives) and streams a
+frame-by-frame NDJSON export to the account store directory (`history-import.ndjson`). Until
+the connector consumes that file (S3, contract pending), the connector keeps serving skeletons
+only (§6.5); the NDJSON presence is the import-result signal the S3 consumer will use.
 
 ### 6.7 Media limitation
 
