@@ -2071,6 +2071,9 @@ mod tests {
             rich: None,
             edited_at: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)

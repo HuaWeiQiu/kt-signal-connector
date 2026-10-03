@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -119,6 +119,18 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE INDEX IF NOT EXISTS contacts_account_peer
   ON contacts(account_id, kind, peer_key);
+CREATE TABLE IF NOT EXISTS message_edits (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  body_bytes INTEGER NOT NULL,
+  edited_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id),
+  FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS message_edits_message
+  ON message_edits(account_id, message_id, seq);
 CREATE TABLE IF NOT EXISTS message_events (
   id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -159,6 +171,12 @@ const SEARCH_MESSAGE_CURSOR_PREFIX: &str = "s1:";
 /// signal-cli may still replay an envelope, and a resend may still arrive.
 const RETENTION_SAFETY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_PAGE_LIMIT: u32 = 200;
+/// Contract 1.32 edit-history bounds: at most this many prior-body snapshots
+/// are kept per message (oldest pruned) and one snapshot body is at most this
+/// many bytes (UTF-8-safe truncation, the same budget as the host text
+/// preview). Real edit chains stay far below both.
+const MAX_EDIT_HISTORY_ENTRIES: usize = 20;
+const MAX_EDIT_BODY_BYTES: usize = 4 * 1024;
 /// Contract 1.27 read bounds for the per-actor reaction detail: at most this
 /// many active reaction rows are fetched per conversation read (newest
 /// reaction first, deterministic truncation), and one emoji pill lists at
@@ -464,6 +482,32 @@ pub struct MessageRecord {
     /// `message_events` at read time. Always serialized so host-side row
     /// merges stay total (an absent key would never clear stale pills).
     pub reactions: Vec<MessageReactionSummary>,
+    /// Prior-body snapshots (contract 1.32), ascending by replacement time —
+    /// the desktop renders newest-first like the official edit history
+    /// unshift. Empty (absent on the wire) on rows never edited; attached at
+    /// read time by `attach_edits`, never stored on the row itself.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<MessageEditEntry>,
+    /// Connector wall-clock ms the first delivery receipt stamped the row
+    /// (contract 1.32). Absent on undelivered and pre-1.32 rows; never
+    /// re-stamped by a later receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at: Option<u64>,
+    /// Connector wall-clock ms the first read/viewed receipt stamped the row
+    /// (contract 1.32). Same first-stamp-wins discipline as `delivered_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<u64>,
+}
+
+/// One prior body of an edited message (contract 1.32): the text the edit
+/// replaced, its byte count, and the replacement time. Bounded at insert
+/// (≤ 4096 bytes per entry, ≤ 20 entries per message, oldest pruned).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageEditEntry {
+    pub body: String,
+    pub body_bytes: u32,
+    pub edited_at: u64,
 }
 
 /// Inbound quote snapshot stored on the quoted-by message row (same wire
@@ -1346,7 +1390,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1378,6 +1422,7 @@ impl Store {
             None
         };
         self.attach_reactions(account_id, &mut items)?;
+        self.attach_edits(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -1424,7 +1469,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -1451,6 +1496,7 @@ impl Store {
             None
         };
         self.attach_reactions(account_id, &mut items)?;
+        self.attach_edits(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
     }
 
@@ -1463,7 +1509,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1483,7 +1529,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1492,6 +1538,7 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         if let Some(record) = record.as_mut() {
             self.attach_reactions(account_id, std::slice::from_mut(record))?;
+            self.attach_edits(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
     }
@@ -1510,7 +1557,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1732,7 +1779,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1770,7 +1817,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1805,6 +1852,32 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         // The sender match uses the same identity pair as receive dedupe: the
         // sender hash for incoming rows differs between store generations.
+        // The prior body is read before the overwrite so the contract-1.32
+        // snapshot can record what this edit replaced.
+        let prior: Option<(String, String, i64)> = transaction
+            .query_row(
+                "SELECT id, body, body_bytes FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND sender_id IN (?4, ?5) AND direction='incoming'
+                   AND status NOT IN ('remote-deleted', 'system')
+                 ORDER BY id ASC LIMIT 1",
+                params![
+                    account_id,
+                    conversation_id,
+                    target_sent_at as i64,
+                    sender_id,
+                    legacy_sender_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let changed = transaction
             .execute(
                 "UPDATE messages
@@ -1830,11 +1903,14 @@ impl Store {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             return Ok(None);
         }
+        if let Some((message_id, prior_body, _)) = prior {
+            Self::snapshot_prior_body(&transaction, account_id, &message_id, &prior_body)?;
+        }
         let record = transaction
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -1871,6 +1947,22 @@ impl Store {
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Contract-1.32 snapshot: the body this host-initiated edit replaces.
+        let prior: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT body, body_bytes FROM messages
+                 WHERE id=?1 AND account_id=?2 AND direction='outgoing'",
+                params![message_id, account_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .map(|(body, _)| (message_id.to_string(), body));
         transaction
             .execute(
                 "UPDATE messages
@@ -1886,11 +1978,14 @@ impl Store {
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if let Some((snapshot_id, prior_body)) = prior {
+            Self::snapshot_prior_body(&transaction, account_id, &snapshot_id, &prior_body)?;
+        }
         let record = transaction
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1920,6 +2015,25 @@ impl Store {
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Contract-1.32 snapshot: the body this multi-device mirror edit
+        // replaces, read under the same predicate the UPDATE below guards.
+        let prior: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT id, body FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND direction='outgoing'
+                   AND status NOT IN ('remote-deleted', 'system')
+                 ORDER BY id ASC LIMIT 1",
+                params![account_id, conversation_id, target_sent_at as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         transaction
             .execute(
                 "UPDATE messages
@@ -1937,11 +2051,14 @@ impl Store {
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if let Some((snapshot_id, prior_body)) = prior {
+            Self::snapshot_prior_body(&transaction, account_id, &snapshot_id, &prior_body)?;
+        }
         let record = transaction
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -1984,7 +2101,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -2002,8 +2119,11 @@ impl Store {
     /// Upgrade earlier outgoing rows on an inbound peer receipt (delivery /
     /// read). The status ladder is monotonic — `pending|sent` → `delivered` →
     /// `read` — and a receipt never downgrades a row (`read` over
-    /// `delivered`), never touches terminal or non-outgoing rows. Returns the
-    /// rows whose status actually moved, so the service emits one
+    /// `delivered`), never touches terminal or non-outgoing rows. `when` is
+    /// the receipt's arrival instant (envelope timestamp, contract 1.32) and
+    /// stamps `delivered_at` / `read_at` on the rows the receipt actually
+    /// moves — first stamp wins, a replayed or later receipt never re-stamps.
+    /// Returns the rows whose status actually moved, so the service emits one
     /// `message.statusChanged` per real transition.
     pub fn upgrade_outgoing_receipts(
         &self,
@@ -2011,6 +2131,7 @@ impl Store {
         conversation_id: &str,
         target_sent_at: &[u64],
         receipt: crate::engine::ReceiptKind,
+        when: u64,
     ) -> Result<Vec<MessageRecord>, StoreError> {
         if target_sent_at.is_empty() {
             return Ok(Vec::new());
@@ -2029,7 +2150,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -2057,13 +2178,35 @@ impl Store {
                     };
                     transaction
                         .execute(
-                            "UPDATE messages SET status=?4
+                            "UPDATE messages SET status=?4,
+                               delivered_at=CASE WHEN ?4='delivered'
+                                 THEN COALESCE(delivered_at, ?5) ELSE delivered_at END,
+                               read_at=CASE WHEN ?4='read'
+                                 THEN COALESCE(read_at, ?5) ELSE read_at END
                              WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
-                            params![account_id, conversation_id, timestamp as i64, next],
+                            params![
+                                account_id,
+                                conversation_id,
+                                timestamp as i64,
+                                next,
+                                when as i64
+                            ],
                         )
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    let delivered_at = if next == "delivered" {
+                        Some(when)
+                    } else {
+                        record.delivered_at
+                    };
+                    let read_at = if next == "read" {
+                        Some(when)
+                    } else {
+                        record.read_at
+                    };
                     moved.push(MessageRecord {
                         status: next,
+                        delivered_at,
+                        read_at,
                         ..record
                     });
                 }
@@ -2293,6 +2436,119 @@ impl Store {
                 record.reactions = reactions.clone();
             }
         }
+        Ok(())
+    }
+
+    /// Attach prior-body edit history (contract 1.32) to the records that
+    /// carry `edited_at`: one batched read over `message_edits`, ascending by
+    /// replacement time (the desktop renders newest-first like the official
+    /// unshift). Rows never edited are untouched — the wire key stays absent,
+    /// mirroring the `attach_reactions` read-side discipline. The table is
+    /// capped per message at insert, so the read is bounded by page size.
+    pub fn attach_edits(
+        &self,
+        account_id: &str,
+        records: &mut [MessageRecord],
+    ) -> Result<(), StoreError> {
+        let ids: Vec<&str> = records
+            .iter()
+            .filter(|record| record.edited_at.is_some())
+            .map(|record| record.id.as_str())
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let mut grouped: std::collections::HashMap<String, Vec<MessageEditEntry>> =
+            std::collections::HashMap::new();
+        {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT message_id, body, body_bytes, edited_at
+                 FROM message_edits
+                 WHERE account_id=?1 AND message_id IN ({placeholders})
+                 ORDER BY seq ASC"
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&account_id];
+            for id in &ids {
+                bind.push(id);
+            }
+            let rows = stmt
+                .query_map(bind.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?.max(0).min(u32::MAX as i64) as u32,
+                        row.get::<_, i64>(3)?.max(0) as u64,
+                    ))
+                })
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for row in rows {
+                let (message_id, body, body_bytes, edited_at) =
+                    row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+                grouped
+                    .entry(message_id)
+                    .or_default()
+                    .push(MessageEditEntry {
+                        body,
+                        body_bytes,
+                        edited_at,
+                    });
+            }
+        }
+        for record in records.iter_mut() {
+            if let Some(edits) = grouped.get(&record.id) {
+                record.edits = edits.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Snapshot the prior body of one message row (contract 1.32) inside the
+    /// caller's transaction, then prune past the per-message cap. The
+    /// snapshot rides the same transaction as the overwriting UPDATE, so a
+    /// rolled-back edit never loses the prior body. An empty prior body
+    /// snapshots nothing — there is no text worth showing in a history list.
+    fn snapshot_prior_body(
+        transaction: &rusqlite::Transaction<'_>,
+        account_id: &str,
+        message_id: &str,
+        prior_body: &str,
+    ) -> Result<(), StoreError> {
+        if prior_body.is_empty() {
+            return Ok(());
+        }
+        let body = crate::engine::truncate_utf8_bytes(prior_body, MAX_EDIT_BODY_BYTES);
+        let body_bytes = body.len().min(u32::MAX as usize) as i64;
+        transaction
+            .execute(
+                "INSERT INTO message_edits (account_id, message_id, body, body_bytes, edited_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    account_id,
+                    message_id,
+                    body,
+                    body_bytes,
+                    crate::link::now_ms() as i64
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .execute(
+                "DELETE FROM message_edits
+                 WHERE message_id=?1
+                   AND seq NOT IN (
+                     SELECT seq FROM message_edits WHERE message_id=?1
+                     ORDER BY seq DESC LIMIT ?2
+                   )",
+                params![message_id, MAX_EDIT_HISTORY_ENTRIES as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(())
     }
 
@@ -3381,6 +3637,23 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 12 {
+        // Contract revision 1.32: peer-receipt timestamps and prior-body edit
+        // history. `delivered_at` / `read_at` are additive nullable columns —
+        // receipts only ever arrive live, so history rows are never backfilled
+        // and pre-1.32 rows legitimately carry none. The `message_edits` table
+        // is created by CREATE TABLE IF NOT EXISTS above, so no data migration
+        // is needed; its rows cascade with their message row.
+        for (column, kind) in [("delivered_at", "INTEGER"), ("read_at", "INTEGER")] {
+            if !table_has_column(conn, "messages", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE messages ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3641,6 +3914,9 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         sender_name: row.get(17)?,
         mentions_self: row.get::<_, i64>(18)? != 0,
         reactions: Vec::new(),
+        edits: Vec::new(),
+        delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
+        read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
     })
 }
 
@@ -3708,6 +3984,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         assert!(
             store
@@ -3767,6 +4046,9 @@ mod tests {
             rich: None,
             edited_at: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
 
         let mut rich = base("rich-1");
@@ -3933,6 +4215,76 @@ mod tests {
     }
 
     #[test]
+    fn schema_v12_upgrade_adds_receipt_timestamp_columns() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '11');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               rich_json TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "delivered_at").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "read_at").unwrap());
+        let edits_table: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message_edits'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            edits_table, 1,
+            "the edit-history table exists after migration"
+        );
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn summary_last_message_kind_follows_official_noun_rules() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
@@ -3974,6 +4326,9 @@ mod tests {
                     edited_at: None,
                     rich: None,
                     reactions: Vec::new(),
+                    edits: Vec::new(),
+                    delivered_at: None,
+                    read_at: None,
                 };
                 store.insert_message(&message, None, text, false).unwrap();
             };
@@ -4097,6 +4452,9 @@ mod tests {
                 edited_at: None,
                 rich: None,
                 reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
             };
             store.insert_message(&message, None, text, false).unwrap();
         };
@@ -4153,6 +4511,10 @@ mod tests {
                 Some("林菲菲"),
             )
             .unwrap();
+        // Reaction timestamps are the receive clock; a same-millisecond tie
+        // orders by the random event id, so step the clock like
+        // reaction_aggregates_attach_to_message_projections does.
+        std::thread::sleep(std::time::Duration::from_millis(3));
         store
             .upsert_reaction_event(
                 &account.id,
@@ -4270,6 +4632,9 @@ mod tests {
                 edited_at: None,
                 rich: None,
                 reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -4374,6 +4739,9 @@ mod tests {
                     ..Default::default()
                 }),
                 reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
             };
             store
                 .insert_message(&message, None, None, increment_unread)
@@ -4476,6 +4844,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store.insert_message(&plain, None, None, true).unwrap();
 
@@ -4563,6 +4934,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(
@@ -4658,6 +5032,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
 
         assert!(matches!(
@@ -4721,6 +5098,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("hello"), true)
@@ -4789,6 +5169,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("control notice"), false)
@@ -4841,6 +5224,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("body"), false)
@@ -4917,6 +5303,9 @@ mod tests {
                 edited_at: None,
                 rich: None,
                 reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
             };
             store
                 .insert_message(&message, None, Some(id), false)
@@ -4989,6 +5378,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&changed, None, Some("newer-message-2"), false)
@@ -5035,6 +5427,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&other_message, None, Some("other-message"), false)
@@ -5122,6 +5517,9 @@ mod tests {
                 rich: None,
                 edited_at: None,
                 reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
             };
             if id == "attachment-only" {
                 message.text = None;
@@ -5212,6 +5610,9 @@ mod tests {
                 rich: None,
                 edited_at: None,
                 reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         }
@@ -5304,6 +5705,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
 
@@ -5866,6 +6270,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -5933,6 +6340,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -6020,6 +6430,9 @@ mod tests {
                     edited_at: None,
                     rich: None,
                     reactions: Vec::new(),
+                    edits: Vec::new(),
+                    delivered_at: None,
+                    read_at: None,
                 };
                 store
                     .insert_message(&message, None, Some("body"), true)
@@ -6164,6 +6577,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, Some("request-pending"), Some("body"), false)
@@ -6232,6 +6648,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&recent, None, Some("body"), true)
@@ -6295,6 +6714,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -6361,6 +6783,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -6779,10 +7204,108 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store
             .insert_message(&message, None, Some("hello"), false)
             .unwrap();
+    }
+
+    /// Contract 1.32 edit history: every peer edit snapshots the body it
+    /// replaced, the per-message history stays capped at twenty ascending
+    /// snapshots, and a row nobody edited carries none.
+    #[test]
+    fn edit_history_caps_at_twenty_entries_and_rides_edited_rows_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let message = MessageRecord {
+            id: "m-edited".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 1000,
+            received_at: Some(1000),
+            text: Some("v0".into()),
+            text_bytes: Some(2),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+        };
+        store
+            .insert_message(&message, None, Some("v0"), true)
+            .unwrap();
+
+        // A fresh row projects an empty (but present) edit history.
+        let fresh = store
+            .message_by_id(&account.id, &conversation.id, "m-edited")
+            .unwrap()
+            .unwrap();
+        assert!(fresh.edits.is_empty());
+
+        for round in 1..=22 {
+            let body = format!("v{round}");
+            let updated = store
+                .apply_inbound_edit(
+                    &account.id,
+                    &conversation.id,
+                    1000,
+                    "peer",
+                    "legacy-peer",
+                    &body,
+                    body.len() as u32,
+                )
+                .unwrap()
+                .expect("each edit rewrites the seeded incoming row");
+            assert_eq!(updated.text.as_deref(), Some(body.as_str()));
+        }
+
+        let row = store
+            .message_by_id(&account.id, &conversation.id, "m-edited")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.text.as_deref(), Some("v22"));
+        assert!(row.edited_at.is_some());
+        assert_eq!(
+            row.edits.len(),
+            20,
+            "history keeps the newest twenty snapshots"
+        );
+        assert_eq!(
+            row.edits[0].body, "v2",
+            "pruning drops the oldest snapshots first"
+        );
+        assert_eq!(
+            row.edits.last().unwrap().body,
+            "v21",
+            "the current body lives on the row, not in its own history"
+        );
+        assert!(
+            row.edits
+                .windows(2)
+                .all(|pair| pair[0].edited_at <= pair[1].edited_at),
+            "history is ascending, oldest first"
+        );
     }
 
     #[test]
@@ -6974,6 +7497,9 @@ mod tests {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
         // FK 合法的幽灵行：账户存在、会话存在，但 account 归属另一账户。

@@ -1467,15 +1467,23 @@ where
             account_id,
             message_id,
             status,
+            delivered_at,
+            read_at,
         } => {
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "message.statusChanged",
-                    json!({ "accountId": account_id, "messageId": message_id, "status": status }),
-                ),
-            )
-            .await
+            // Contract 1.32: receipt stamps ride only when the transition
+            // wrote them — absent keys keep the host merge total.
+            let mut payload = json!({
+                "accountId": account_id,
+                "messageId": message_id,
+                "status": status,
+            });
+            if let Some(at) = delivered_at {
+                payload["deliveredAt"] = json!(at);
+            }
+            if let Some(at) = read_at {
+                payload["readAt"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("message.statusChanged", payload)).await
         }
         HostSideEvent::ConversationTyping {
             account_id,

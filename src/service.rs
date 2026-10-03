@@ -164,6 +164,11 @@ pub enum HostSideEvent {
         account_id: String,
         message_id: String,
         status: &'static str,
+        /// Contract 1.32: receipt stamps carried on the transition that wrote
+        /// them (absent on transitions that did not stamp, so the host merge
+        /// never clears an existing stamp with a no-op).
+        delivered_at: Option<u64>,
+        read_at: Option<u64>,
     },
     /// Ephemeral typing indicator (contract 1.15): never persisted, rate
     /// limited per account+peer before it reaches the host lane.
@@ -1028,6 +1033,9 @@ impl ConnectorService {
             edited_at: None,
             rich: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -1313,6 +1321,8 @@ impl ConnectorService {
         if let Some(record) = record.as_mut() {
             self.store
                 .attach_reactions(account_id, std::slice::from_mut(record))?;
+            self.store
+                .attach_edits(account_id, std::slice::from_mut(record))?;
         }
         Ok(record)
     }
@@ -1826,6 +1836,9 @@ impl ConnectorService {
             rich: receive.rich,
             edited_at: None,
             reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
         };
         let preview = message
             .text
@@ -1954,6 +1967,8 @@ impl ConnectorService {
                         account_id: record.account_id,
                         message_id: record.id,
                         status: record.status,
+                        delivered_at: None,
+                        read_at: None,
                     }]),
                     _ => Ok(Vec::new()),
                 }
@@ -1985,6 +2000,8 @@ impl ConnectorService {
                                     &account.id,
                                     std::slice::from_mut(&mut record),
                                 )?;
+                                self.store
+                                    .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
                                 Ok(vec![HostSideEvent::MessageUpserted(record)])
                             }
                             None => Ok(Vec::new()),
@@ -2006,6 +2023,8 @@ impl ConnectorService {
                                     &account.id,
                                     std::slice::from_mut(&mut record),
                                 )?;
+                                self.store
+                                    .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
                                 Ok(vec![HostSideEvent::MessageUpserted(record)])
                             }
                             None => Ok(Vec::new()),
@@ -2042,12 +2061,22 @@ impl ConnectorService {
                     action,
                 }])
             }
-            ControlReceive::Receipt { kind, timestamps } => {
+            ControlReceive::Receipt {
+                kind,
+                timestamps,
+                when,
+            } => {
+                // Contract 1.32: the receipt's arrival instant (envelope
+                // timestamp; connector clock as fallback) stamps the rows the
+                // receipt moves, and each status event carries the stamp it
+                // just wrote.
+                let when = when.unwrap_or_else(crate::link::now_ms);
                 let moved = self.store.upgrade_outgoing_receipts(
                     &account.id,
                     &conversation.id,
                     &timestamps,
                     kind,
+                    when,
                 )?;
                 Ok(moved
                     .into_iter()
@@ -2055,6 +2084,8 @@ impl ConnectorService {
                         account_id: record.account_id,
                         message_id: record.id,
                         status: record.status,
+                        delivered_at: record.delivered_at,
+                        read_at: record.read_at,
                     })
                     .collect())
             }
@@ -2799,6 +2830,8 @@ fn status_changed_event(record: &MessageRecord) -> HostSideEvent {
         account_id: record.account_id.clone(),
         message_id: record.id.clone(),
         status: record.status,
+        delivered_at: record.delivered_at,
+        read_at: record.read_at,
     }
 }
 
@@ -5140,6 +5173,7 @@ mod tests {
                         account_id,
                         message_id,
                         status,
+                        ..
                     } => Some((account_id.clone(), message_id.clone(), *status)),
                     _ => None,
                 })
@@ -6214,6 +6248,7 @@ mod tests {
                 ControlReceive::Receipt {
                     kind,
                     timestamps: vec![400],
+                    when: Some(1234),
                 },
             )
         };
@@ -6257,6 +6292,173 @@ mod tests {
         assert_eq!(outgoing.status, "read");
         let incoming = messages.iter().find(|row| row.sent_at == 401).unwrap();
         assert_eq!(incoming.status, incoming_before, "incoming rows stay put");
+    }
+
+    /// Receipt envelopes carrying a `when` stamp the delivered/read timeline
+    /// (contract 1.32): the first stamp wins, a replayed receipt neither
+    /// re-stamps nor re-emits, and reloaded rows keep both stamps for the
+    /// host projection.
+    #[test]
+    fn receipts_stamp_the_delivered_read_timeline_once() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+
+        let receipt = |kind, when: u64| {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Receipt {
+                    kind,
+                    timestamps: vec![400],
+                    when: Some(when),
+                },
+            )
+        };
+
+        let delivered = service
+            .ingest_receive(
+                receipt(ReceiptKind::Delivered, 1234),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(matches!(
+            &delivered[0],
+            HostSideEvent::MessageStatusChanged { status, delivered_at, read_at, .. }
+                if *status == "delivered"
+                    && *delivered_at == Some(1234)
+                    && read_at.is_none()
+        ));
+
+        let read = service
+            .ingest_receive(
+                receipt(ReceiptKind::Read, 5678),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(matches!(
+            &read[0],
+            HostSideEvent::MessageStatusChanged { status, delivered_at, read_at, .. }
+                if *status == "read"
+                    && *delivered_at == Some(1234)
+                    && *read_at == Some(5678)
+        ));
+
+        // A replayed read neither re-stamps nor re-emits.
+        assert!(
+            service
+                .ingest_receive(
+                    receipt(ReceiptKind::Read, 9999),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        let outgoing = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 400)
+            .unwrap();
+        assert_eq!(outgoing.status, "read");
+        assert_eq!(outgoing.delivered_at, Some(1234));
+        assert_eq!(outgoing.read_at, Some(5678));
+    }
+
+    /// Peer edits snapshot the body they replace (contract 1.32): each
+    /// upserted record rides the ascending prior-body history and reloaded
+    /// rows keep it (the desktop renders newest-first on its own).
+    #[test]
+    fn edits_snapshot_the_replaced_body_into_the_row_projection() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let original = NormalizedReceive {
+            timestamp: Some(310),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            peer_name: None,
+            group_id: None,
+            text: Some("v0".into()),
+            text_bytes: Some(2),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            control: None,
+        };
+        service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let edit = |body: &str| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Edit {
+                    target_timestamp: 310,
+                },
+            );
+            receive.direction = "incoming";
+            receive.content_kind = "editMessage";
+            receive.text = Some(body.into());
+            receive.text_bytes = Some(body.len() as u32);
+            receive
+        };
+
+        let first = service
+            .ingest_receive(edit("v1"), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        let HostSideEvent::MessageUpserted(record) = &first[0] else {
+            panic!("expected message.upserted, got {:?}", first[0]);
+        };
+        assert_eq!(record.text.as_deref(), Some("v1"));
+        let bodies: Vec<&str> = record
+            .edits
+            .iter()
+            .map(|entry| entry.body.as_str())
+            .collect();
+        assert_eq!(bodies, ["v0"], "the replaced body rides the upserted row");
+
+        let second = service
+            .ingest_receive(edit("v2"), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        let HostSideEvent::MessageUpserted(record) = &second[0] else {
+            panic!("expected message.upserted, got {:?}", second[0]);
+        };
+        let bodies: Vec<&str> = record
+            .edits
+            .iter()
+            .map(|entry| entry.body.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            ["v0", "v1"],
+            "history grows ascending, oldest first"
+        );
+
+        let reloaded = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 310)
+            .unwrap();
+        assert_eq!(reloaded.text.as_deref(), Some("v2"));
+        let bodies: Vec<&str> = reloaded
+            .edits
+            .iter()
+            .map(|entry| entry.body.as_str())
+            .collect();
+        assert_eq!(bodies, ["v0", "v1"]);
     }
 
     /// An edit whose receive carries no new body is dropped silently.

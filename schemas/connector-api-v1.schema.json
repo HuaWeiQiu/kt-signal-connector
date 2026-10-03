@@ -839,8 +839,16 @@
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "messageId": { "$ref": "#/$defs/opaqueId" },
                   "status": {
-                    "enum": ["sent", "unknown", "failed"],
-                    "description": "Terminal state one outgoing message transitioned to; emitted only on a real transition (pending -> sent/unknown/failed), never replayed."
+                    "enum": ["sent", "unknown", "failed", "delivered", "read"],
+                    "description": "State one outgoing message transitioned to; emitted only on a real transition (pending -> sent/unknown/failed, receipts -> delivered/read), never replayed."
+                  },
+                  "deliveredAt": {
+                    "type": "integer",
+                    "description": "Contract 1.32: connector wall-clock ms the delivery receipt that triggered this event stamped the row. Absent on transitions that did not stamp it."
+                  },
+                  "readAt": {
+                    "type": "integer",
+                    "description": "Contract 1.32: connector wall-clock ms the read/viewed receipt that triggered this event stamped the row. Absent on transitions that did not stamp it."
                   }
                 }
               }

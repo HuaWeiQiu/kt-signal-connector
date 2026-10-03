@@ -518,10 +518,14 @@ pub enum ControlReceive {
     Edit {
         target_timestamp: u64,
     },
-    /// Peer receipt confirming earlier outgoing rows (bounded batch).
+    /// Peer receipt confirming earlier outgoing rows (bounded batch). `when`
+    /// is the receipt envelope's own timestamp (contract 1.32) — when the
+    /// peer sent the receipt — falling back to connector wall-clock at the
+    /// service layer when the envelope carries none.
     Receipt {
         kind: ReceiptKind,
         timestamps: Vec<u64>,
+        when: Option<u64>,
     },
 }
 
@@ -1746,7 +1750,13 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             direction: "incoming",
             source: envelope_peer_source(envelope),
             group_id: None,
-            control: ControlReceive::Receipt { kind, timestamps },
+            control: ControlReceive::Receipt {
+                kind,
+                timestamps,
+                // Contract 1.32: the receipt's own envelope timestamp backs the
+                // desktop's delivered/read timeline.
+                when: envelope.get("timestamp").and_then(Value::as_u64),
+            },
         });
     }
     None
@@ -2825,9 +2835,16 @@ mod tests {
         }))
         .expect("delivery receipt routes");
         match delivered {
-            ControlReceive::Receipt { kind, timestamps } => {
+            ControlReceive::Receipt {
+                kind,
+                timestamps,
+                when,
+            } => {
                 assert!(matches!(kind, ReceiptKind::Delivered));
                 assert_eq!(timestamps, vec![1726999000000, 1726999001000]);
+                // Contract 1.32: the envelope's own timestamp backs the
+                // delivered/read timeline.
+                assert_eq!(when, Some(1727000000000));
             }
             other => panic!("unexpected control: {other:?}"),
         }

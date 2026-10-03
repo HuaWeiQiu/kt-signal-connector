@@ -1036,6 +1036,39 @@ There is no automatic retry anywhere in the path — the connector retries nothi
 an explicit `messages.retryText` may re-dispatch a failed send, and only a definite failure may
 be so re-dispatched.
 
+### 4.27 Peer-receipt timestamps + prior-body edit history (contract revision 1.32, 2026-10-03)
+
+Two host-visible data additions, both read-only consequences of events the engine already
+delivers — the connector previously projected them away.
+
+**(a) Delivery/read receipt timestamps.** The desktop's message-info page (official
+MessageDetail) shows *when* a peer receipt arrived; the wire `message.statusChanged` event
+carried only the new `status`, so the desktop could show the ladder but never a timeline.
+`ControlReceive::Receipt` now carries `when` — the receipt envelope's own `timestamp` (when the
+peer sent the receipt), falling back to connector wall-clock when absent. The monotonic
+`upgrade_outgoing_receipts` write stamps `delivered_at` / `read_at` (additive nullable columns,
+store schema 12) on the rows the receipt actually moves: first stamp wins (`COALESCE` — a
+replayed or later receipt never re-stamps), and no history row is backfilled (receipts only
+ever arrive live). The `message.statusChanged` event gains optional `deliveredAt` / `readAt`
+(copy of the just-written stamps), and the `MessageRecord` row projection carries the same
+optional fields so a reloaded window renders the timeline without re-deriving it. Boundary:
+the local "view thread marks it read" badge write is store-local only and stamps nothing —
+no peer receipt, no timestamp.
+
+**(b) Prior-body edit history.** The official client keeps every prior body of an edited
+message (EditHistoryMessagesModal, newest first). The connector edits overwrote the body in
+place, so prior text was unrecoverable. Every accepted edit — inbound peer edit, host-initiated
+`messages.edit`, multi-device mirror edit — now snapshots the PRIOR body into a `message_edits`
+table (schema 12) inside the same transaction as the overwrite: `{messageId, body, bodyBytes,
+editedAt}` where `editedAt` is the replacement time. Bounds: one entry ≤ 4096 bytes
+(UTF-8-safe truncation, same budget as the host text preview), at most 20 entries per message
+(oldest pruned), `editedAt` ascending = chronological order; the desktop renders newest-first
+like the official unshift. The `MessageRecord` row projection gains optional `edits`
+(absent on rows never edited), so list reads, search hits and every `message.upserted` carry
+the full history without a new method. The table cascades with its message row (foreign key ON
+DELETE CASCADE, `foreign_keys=ON` already enforced) and retention passes remove it with the row
+— the store never grows edit orphans.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
