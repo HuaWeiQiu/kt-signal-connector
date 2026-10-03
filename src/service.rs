@@ -1036,6 +1036,7 @@ impl ConnectorService {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -1490,6 +1491,201 @@ impl ConnectorService {
             .conversation_summary(account_id, conversation_id)?)
     }
 
+    /// The §4.6 reaction addressing model, reused verbatim by the pin family
+    /// (contract 1.33): the upstream `targetAuthor` follows the row
+    /// direction — the linked account's own number for addressable outgoing
+    /// rows, the conversation peer for incoming direct rows. A group incoming
+    /// row persists only a local sender hash and a system row has no author
+    /// at all, so neither resolves and the request fails with the
+    /// deterministic INVALID_REQUEST instead of mis-addressing upstream.
+    fn resolve_pin_target(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<(AccountRow, ConversationRow, MessageRecord, String), ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        let (account, conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let target_author = match message.direction {
+            // We authored it: the author is the linked account itself. Only
+            // an addressable send carries the upstream timestamp the pin
+            // family matches on; pending/failed/unknown rows would
+            // mis-target.
+            "outgoing" if outgoing_status_is_addressable(message.status) => {
+                account.signal_account.clone()
+            }
+            // An outgoing row without an addressable state carries no
+            // upstream protocol identity (its sent_at is a local clock value)
+            // and is indistinguishable from a missing row (remoteDelete
+            // precedent).
+            "outgoing" => return Err(StoreError::MessageNotFound.into()),
+            // In a direct chat the only other possible author is the peer.
+            // Incoming rows store the envelope timestamp, which is the
+            // protocol identity the pin family references.
+            "incoming" if conversation.kind == "direct" => conversation.peer_key.clone(),
+            // Group messages do not persist the member address, and system
+            // rows have no author at all.
+            _ => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "pin target author is not resolvable",
+                    false,
+                )));
+            }
+        };
+        Ok((account, conversation, message, target_author))
+    }
+
+    /// messages.sendPinMessage (contract 1.33): resolve the target with the
+    /// reaction addressing model and build the exact upstream jsonRpc
+    /// params. Groups map to the engine `groupId` form, direct chats to the
+    /// `recipient` array; `pinDurationSeconds` is passed through when the
+    /// caller supplied one (absent = the official forever pin — the key is
+    /// not sent).
+    pub fn prepare_send_pin_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        pin_duration_seconds: Option<u32>,
+    ) -> Result<PreparedPin, ServiceError> {
+        let (account, conversation, message, target_author) =
+            self.resolve_pin_target(account_id, conversation_id, message_id)?;
+        let mut params = json!({
+            "account": account.signal_account,
+            "targetAuthor": target_author,
+            "targetTimestamp": message.sent_at,
+        });
+        set_upstream_target(&mut params, &conversation);
+        if let Some(seconds) = pin_duration_seconds {
+            params["pinDurationSeconds"] = json!(seconds);
+        }
+        Ok(PreparedPin {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            params,
+            target_author,
+            target_sent_at: message.sent_at,
+            pin_duration_seconds,
+        })
+    }
+
+    /// messages.sendUnpinMessage (contract 1.33): same addressing as the
+    /// pin, no duration.
+    pub fn prepare_send_unpin_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<PreparedPin, ServiceError> {
+        let (account, conversation, message, target_author) =
+            self.resolve_pin_target(account_id, conversation_id, message_id)?;
+        let mut params = json!({
+            "account": account.signal_account,
+            "targetAuthor": target_author,
+            "targetTimestamp": message.sent_at,
+        });
+        set_upstream_target(&mut params, &conversation);
+        Ok(PreparedPin {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            params,
+            target_author,
+            target_sent_at: message.sent_at,
+            pin_duration_seconds: None,
+        })
+    }
+
+    /// messages.sendAdminDelete (contract 1.33): group conversations only —
+    /// direct chats have no admin concept and answer INVALID_REQUEST before
+    /// any upstream call. Admin eligibility against group state is not
+    /// pre-checked: the server is the authority and rejects non-admin
+    /// attempts, which surface as the upstream rejection (official behavior:
+    /// send and show the failure).
+    pub fn prepare_send_admin_delete(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<PreparedPin, ServiceError> {
+        let (account, conversation, message, target_author) =
+            self.resolve_pin_target(account_id, conversation_id, message_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "admin delete applies to group conversations only",
+                false,
+            )));
+        }
+        let mut params = json!({
+            "account": account.signal_account,
+            "targetAuthor": target_author,
+            "targetTimestamp": message.sent_at,
+        });
+        set_upstream_target(&mut params, &conversation);
+        Ok(PreparedPin {
+            account_id: account_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            message_id: message_id.to_string(),
+            params,
+            target_author,
+            target_sent_at: message.sent_at,
+            pin_duration_seconds: None,
+        })
+    }
+
+    /// sendPinMessage 上行确认后的本地落库（reaction 先例的 complete 段）：
+    /// 本机置顶以发送方口径写入每会话 pinned 状态（新 pin 替换旧 pin，
+    /// 过期时间用 connector 时钟计算），并返回会话摘要供调用方推
+    /// conversation.changed——重载窗口由此免重放即可渲染置顶条。
+    pub fn complete_send_pin_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_author: &str,
+        target_sent_at: u64,
+        pin_duration_seconds: Option<u32>,
+    ) -> Result<Option<ConversationSummary>, ServiceError> {
+        self.store.upsert_conversation_pin(
+            account_id,
+            conversation_id,
+            target_author,
+            target_sent_at,
+            pin_duration_seconds,
+        )?;
+        Ok(self
+            .store
+            .conversation_summary(account_id, conversation_id)?)
+    }
+
+    /// sendUnpinMessage 上行确认后的本地落库：仅当本地 pinned 状态仍指向
+    /// 被解 pin 的 (author, timestamp) 时清除；不匹配的 unpin 不动更新的
+    /// pin。清除发生时返回会话摘要供调用方推 conversation.changed。
+    pub fn complete_send_unpin_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_author: &str,
+        target_sent_at: u64,
+    ) -> Result<Option<ConversationSummary>, ServiceError> {
+        if !self.store.clear_conversation_pin(
+            account_id,
+            conversation_id,
+            target_author,
+            target_sent_at,
+        )? {
+            return Ok(None);
+        }
+        Ok(self
+            .store
+            .conversation_summary(account_id, conversation_id)?)
+    }
+
     /// messages.attachments.open (ADR 0002, contract revision 1.17): resolve
     /// the addressed rows, then locate the already-downloaded file in the
     /// engine's data directory and mint a short-lived chunk-stream handle for
@@ -1839,6 +2035,7 @@ impl ConnectorService {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         let preview = message
             .text
@@ -2089,6 +2286,95 @@ impl ConnectorService {
                     })
                     .collect())
             }
+            ControlReceive::PinMessage {
+                target_author,
+                target_timestamp,
+                duration_seconds,
+            } => {
+                // Contract 1.33: the derived per-conversation pinned state —
+                // a newer pin replaces the older one, the expiry is connector
+                // clock computed, and the host refreshes the pin bar through
+                // the summary that rides conversation.changed (the reaction
+                // notification precedent).
+                self.store.upsert_conversation_pin(
+                    &account.id,
+                    &conversation.id,
+                    &target_author,
+                    target_timestamp,
+                    duration_seconds,
+                )?;
+                let mut events = Vec::new();
+                if let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok(events)
+            }
+            ControlReceive::UnpinMessage {
+                target_author,
+                target_timestamp,
+            } => {
+                // Only the pinned (author, timestamp) the unpin names clears;
+                // a stale or mismatched unpin leaves a newer pin alone and
+                // stays silent (replays never re-notify).
+                if !self.store.clear_conversation_pin(
+                    &account.id,
+                    &conversation.id,
+                    &target_author,
+                    target_timestamp,
+                )? {
+                    return Ok(Vec::new());
+                }
+                let mut events = Vec::new();
+                if let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok(events)
+            }
+            ControlReceive::AdminDelete {
+                target_author,
+                target_timestamp,
+            } => {
+                // Contract 1.33: the official "deleted by admin" tombstone is
+                // a row-level marker — the status ladder is untouched and the
+                // body stays for the audit window (retention prunes the row
+                // normally). The host re-renders the row through the
+                // upserted record; if the removed message is also the pinned
+                // one, the pin state clears and the summary refreshes.
+                let mut events = Vec::new();
+                if let Some((mut record, true)) = self.store.mark_admin_deleted(
+                    &account.id,
+                    &conversation.id,
+                    target_timestamp,
+                )? {
+                    self.store
+                        .attach_reactions(&account.id, std::slice::from_mut(&mut record))?;
+                    self.store
+                        .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
+                    events.push(HostSideEvent::MessageUpserted(project_message_for_host(
+                        record,
+                    )));
+                }
+                if self.store.clear_conversation_pin(
+                    &account.id,
+                    &conversation.id,
+                    &target_author,
+                    target_timestamp,
+                )? {
+                    if let Some(summary) = self
+                        .store
+                        .conversation_summary(&account.id, &conversation.id)?
+                    {
+                        events.push(HostSideEvent::ConversationChanged(summary));
+                    }
+                }
+                Ok(events)
+            }
         }
     }
 }
@@ -2330,6 +2616,22 @@ pub struct PreparedSendReaction {
     pub emoji: String,
     pub remove: bool,
     pub target_sent_at: u64,
+}
+
+/// Everything the supervisor needs to run one upstream pin-family call
+/// (`sendPinMessage` / `sendUnpinMessage` / `sendAdminDelete`, contract
+/// 1.33), produced by the pure local prepare validations. The target
+/// identity rides along for the complete step (own pins and own unpins
+/// converge the locally derived pinned state).
+#[derive(Debug)]
+pub struct PreparedPin {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub params: Value,
+    pub target_author: String,
+    pub target_sent_at: u64,
+    pub pin_duration_seconds: Option<u32>,
 }
 
 /// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
@@ -2589,6 +2891,43 @@ pub struct MessagesSendReactionParams {
     pub emoji: String,
     #[serde(default)]
     pub remove: bool,
+    pub operation_id: Option<String>,
+}
+
+/// messages.sendPinMessage params (contract 1.33): the §4.6 reaction
+/// addressing triple verbatim plus the optional timed-pin duration. The u32
+/// bound is the fail-closed range check — a negative, fractional, or
+/// oversized value fails params deserialization with INVALID_REQUEST, and an
+/// absent/null value is the official forever pin.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendPinMessageParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub pin_duration_seconds: Option<u32>,
+    pub operation_id: Option<String>,
+}
+
+/// messages.sendUnpinMessage params (contract 1.33): same addressing, no
+/// duration — the official unpinMessage carries only the target identity.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendUnpinMessageParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub operation_id: Option<String>,
+}
+
+/// messages.sendAdminDelete params (contract 1.33): same addressing, group
+/// conversations only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendAdminDeleteParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
     pub operation_id: Option<String>,
 }
 
@@ -5122,6 +5461,595 @@ mod tests {
             .unwrap()
             .reactions;
         assert!(reactions.is_empty());
+    }
+
+    /// One pin-family prepare callable under a uniform signature, so the
+    /// guard loop drives all three methods over the same failing row.
+    type PinPrepare<'a> =
+        Box<dyn Fn(&ConnectorService, &str) -> Result<PreparedPin, ServiceError> + 'a>;
+
+    /// Contract 1.33 pin family addressing: the §4.6 reaction model reused
+    /// verbatim — an addressable outgoing row targets the linked account
+    /// itself, a direct-chat incoming row targets the peer, groups map to
+    /// `groupId` addressing, and `pinDurationSeconds` rides the upstream
+    /// params only when the caller supplied one (absent = the official
+    /// forever pin, the key is not sent).
+    #[test]
+    fn pin_family_maps_rows_with_the_reaction_addressing_model() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let sent_id = match service
+            .prepare_send_text(&account.id, &direct.id, "pin me", "req-pin-1", None, None)
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&sent_id, &account.id, &direct.id, 777)
+            .unwrap();
+
+        // Pin with a duration: every upstream key carries the reaction
+        // addressing plus the passthrough `pinDurationSeconds`.
+        let prepared = service
+            .prepare_send_pin_message(&account.id, &direct.id, &sent_id, Some(3600))
+            .unwrap();
+        assert_eq!(prepared.params["account"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(777));
+        assert_eq!(prepared.params["pinDurationSeconds"], json!(3600));
+        assert_eq!(prepared.params["recipient"], json!(["+15555550101"]));
+        assert!(prepared.params.get("groupId").is_none());
+        assert_eq!(prepared.target_author, "+15555550100");
+        assert_eq!(prepared.target_sent_at, 777);
+        assert_eq!(prepared.pin_duration_seconds, Some(3600));
+
+        // Pin without a duration: the key stays absent (forever pin).
+        let prepared = service
+            .prepare_send_pin_message(&account.id, &direct.id, &sent_id, None)
+            .unwrap();
+        assert!(prepared.params.get("pinDurationSeconds").is_none());
+        assert_eq!(prepared.pin_duration_seconds, None);
+
+        // Unpin: the same addressing, no duration field at all.
+        let prepared = service
+            .prepare_send_unpin_message(&account.id, &direct.id, &sent_id)
+            .unwrap();
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(777));
+        assert!(prepared.params.get("pinDurationSeconds").is_none());
+        assert_eq!(prepared.pin_duration_seconds, None);
+
+        // Incoming direct row: the target author is the peer and the
+        // envelope timestamp is the protocol identity.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(50),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("peer pin target".into()),
+                    text_bytes: Some(15),
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: None,
+                    control: None,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let incoming = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        let prepared = service
+            .prepare_send_pin_message(&account.id, &direct.id, &incoming.id, None)
+            .unwrap();
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550101"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(50));
+
+        // Group conversation: groupId addressing for the pin and the admin
+        // delete, no recipient array.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
+            .unwrap();
+        let group_message_id = match service
+            .prepare_send_text(
+                &account.id,
+                &group.id,
+                "group pin target",
+                "req-pin-group",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&group_message_id, &account.id, &group.id, 888)
+            .unwrap();
+        let prepared = service
+            .prepare_send_pin_message(&account.id, &group.id, &group_message_id, None)
+            .unwrap();
+        assert_eq!(prepared.params["groupId"], json!("Z3JvdXAtaWQ="));
+        assert!(prepared.params.get("recipient").is_none());
+        let prepared = service
+            .prepare_send_admin_delete(&account.id, &group.id, &group_message_id)
+            .unwrap();
+        assert_eq!(prepared.params["groupId"], json!("Z3JvdXAtaWQ="));
+        assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
+        assert_eq!(prepared.params["targetTimestamp"], json!(888));
+        assert!(prepared.params.get("recipient").is_none());
+        assert!(prepared.params.get("pinDurationSeconds").is_none());
+    }
+
+    /// The pin family eligibility guard is the reaction guard: rows without a
+    /// resolvable protocol identity answer MESSAGE_NOT_FOUND, a group
+    /// incoming row's author is not resolvable (INVALID_REQUEST), and a
+    /// direct chat has no admin concept — sendAdminDelete fails closed
+    /// INVALID_REQUEST before any upstream call.
+    #[test]
+    fn pin_family_rejects_unaddressable_and_out_of_scope_targets() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "in flight",
+                "req-pin-pending",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        for status in ["pending", "failed", "unknown"] {
+            service
+                .store_ref()
+                .update_message_status(&pending_id, status, None)
+                .unwrap();
+            let prepares: Vec<PinPrepare> = vec![
+                Box::new(|service, id| {
+                    service.prepare_send_pin_message(&account.id, &conversation.id, id, None)
+                }),
+                Box::new(|service, id| {
+                    service.prepare_send_unpin_message(&account.id, &conversation.id, id)
+                }),
+                Box::new(|service, id| {
+                    service.prepare_send_admin_delete(&account.id, &conversation.id, id)
+                }),
+            ];
+            for prepare in prepares {
+                let error = prepare(&service, &pending_id).unwrap_err();
+                assert_eq!(
+                    error.into_api().code,
+                    "MESSAGE_NOT_FOUND",
+                    "a {status} row must not be pin-family addressable"
+                );
+            }
+        }
+
+        // A group incoming message's author address is not persisted, so no
+        // pin-family method can be addressed upstream.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-one", "group")
+            .unwrap();
+        let group_events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(900),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550105".into()),
+                    peer_name: None,
+                    group_id: Some("group-one".into()),
+                    text: Some("group text".into()),
+                    text_bytes: Some(10),
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: None,
+                    control: None,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let group_message = group_events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        let prepares: Vec<PinPrepare> = vec![
+            Box::new(|service, id| {
+                service.prepare_send_pin_message(&account.id, &group.id, id, None)
+            }),
+            Box::new(|service, id| service.prepare_send_unpin_message(&account.id, &group.id, id)),
+            Box::new(|service, id| service.prepare_send_admin_delete(&account.id, &group.id, id)),
+        ];
+        for prepare in prepares {
+            assert_eq!(
+                prepare(&service, &group_message.id)
+                    .unwrap_err()
+                    .into_api()
+                    .code,
+                "INVALID_REQUEST"
+            );
+        }
+
+        // A direct chat has no admin: sendAdminDelete answers INVALID_REQUEST
+        // even on a perfectly addressable row.
+        let sent_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "direct row",
+                "req-pin-direct",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&sent_id, &account.id, &conversation.id, 410)
+            .unwrap();
+        assert_eq!(
+            service
+                .prepare_send_admin_delete(&account.id, &conversation.id, &sent_id)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "INVALID_REQUEST"
+        );
+
+        // Missing rows, conversations, and accounts answer their own
+        // deterministic codes.
+        assert_eq!(
+            service
+                .prepare_send_pin_message(&account.id, &conversation.id, "absent-message", None)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "MESSAGE_NOT_FOUND"
+        );
+        assert_eq!(
+            service
+                .prepare_send_unpin_message(&account.id, "absent-conversation", "anything")
+                .unwrap_err()
+                .into_api()
+                .code,
+            "CONVERSATION_NOT_FOUND"
+        );
+        assert_eq!(
+            service
+                .prepare_send_admin_delete("absent-account", "absent-conversation", "anything")
+                .unwrap_err()
+                .into_api()
+                .code,
+            "ACCOUNT_NOT_FOUND"
+        );
+    }
+
+    /// 上行确认后的 complete 落库：pin 写入每会话 pinned 状态（新 pin 替换
+    /// 旧 pin，timed pin 带 connector 时钟 expiry，forever pin 无
+    /// expiresAt），摘要以 camelCase `pinnedMessage` 投影；不匹配的 unpin
+    /// 不动新 pin（返回 None），匹配的 unpin 清除并返回刷新摘要。
+    #[test]
+    fn complete_pin_unpin_write_replace_and_clear_the_pinned_state() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let own_row = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "pin target one",
+                "req-pin-c1",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&own_row, &account.id, &conversation.id, 888)
+            .unwrap();
+
+        // Timed pin on the own row: the summary projects the pin bar with an
+        // expiry computed from the duration.
+        let summary = service
+            .complete_send_pin_message(
+                &account.id,
+                &conversation.id,
+                "+15555550100",
+                888,
+                Some(3600),
+            )
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(&summary).unwrap();
+        let pinned = &wire["pinnedMessage"];
+        assert_eq!(pinned["messageId"], json!(own_row));
+        assert_eq!(pinned["targetAuthor"], json!("+15555550100"));
+        assert_eq!(pinned["targetSentTimestamp"], json!(888));
+        assert!(pinned["pinnedAt"].is_u64());
+        assert!(
+            pinned["expiresAt"].is_u64(),
+            "a timed pin carries expiresAt"
+        );
+        assert_eq!(
+            summary
+                .pinned_message
+                .as_ref()
+                .unwrap()
+                .target_sent_timestamp,
+            888
+        );
+
+        // A newer pin replaces the older one: pin the peer row (forever) and
+        // the summary follows.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(50),
+                    content_kind: "dataMessage",
+                    direction: "incoming",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: Some("+15555550101".into()),
+                    peer_name: None,
+                    group_id: None,
+                    text: Some("peer pin target".into()),
+                    text_bytes: Some(15),
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: None,
+                    control: None,
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let incoming_id = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message.id.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let summary = service
+            .complete_send_pin_message(&account.id, &conversation.id, "+15555550101", 50, None)
+            .unwrap()
+            .unwrap();
+        let pinned = summary.pinned_message.as_ref().unwrap();
+        assert_eq!(pinned.message_id, incoming_id);
+        assert_eq!(pinned.expires_at, None, "a forever pin carries no expiry");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire["pinnedMessage"].get("expiresAt").is_none());
+
+        // A stale unpin naming the replaced (author, timestamp) stays
+        // silent: complete answers None and the newer pin survives.
+        assert!(
+            service
+                .complete_send_unpin_message(&account.id, &conversation.id, "+15555550100", 888)
+                .unwrap()
+                .is_none()
+        );
+        let pinned = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap()
+            .pinned_message
+            .unwrap();
+        assert_eq!(pinned.target_sent_timestamp, 50);
+
+        // The matching unpin clears the state and returns the refreshed
+        // summary (pinnedMessage absent again).
+        let summary = service
+            .complete_send_unpin_message(&account.id, &conversation.id, "+15555550101", 50)
+            .unwrap()
+            .unwrap();
+        assert!(summary.pinned_message.is_none());
+    }
+
+    /// 收件面（contract 1.33）：peer 的 pinMessage 更新每会话 pinned 状态并
+    /// 推 conversation.changed（摘要带 pinnedMessage）；不匹配的 unpinMessage
+    /// 静默；匹配的清除；adminDelete 落行级 adminDeleted 墓碑（status 不动、
+    /// body 保留）——若被删行正是 pinned 行则一并清 pin。
+    #[test]
+    fn inbound_pin_family_updates_pinned_state_and_admin_delete_marks_rows() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let message_id = seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+
+        // Peer pins our message with a timed duration: conversation.changed
+        // carries the pinned summary.
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::PinMessage {
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                        duration_seconds: Some(300),
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("an inbound pin answers conversation.changed");
+        let pinned = changed.pinned_message.as_ref().unwrap();
+        assert_eq!(pinned.message_id, message_id);
+        assert_eq!(pinned.target_author, "+15555550100");
+        assert_eq!(pinned.target_sent_timestamp, 400);
+        assert!(pinned.expires_at.is_some(), "the timed pin carries expiry");
+
+        // An unpin naming another message stays silent (no event) and leaves
+        // the pin alone.
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::UnpinMessage {
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 999,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "a mismatched unpin must be silent");
+        assert!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .is_some()
+        );
+
+        // The matching unpin clears the state and notifies once.
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::UnpinMessage {
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("a matching unpin answers conversation.changed");
+        assert!(changed.pinned_message.is_none());
+
+        // Re-pin (forever), then a group admin deletes the pinned row: the
+        // row flips its additive tombstone (status ladder untouched, body
+        // kept) and the pinned state clears with it.
+        service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::PinMessage {
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                        duration_seconds: None,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::AdminDelete {
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record),
+                _ => None,
+            })
+            .expect("an admin delete answers message.upserted");
+        assert_eq!(upserted.id, message_id);
+        assert!(upserted.admin_deleted, "the tombstone flips");
+        assert_eq!(upserted.status, "sent", "the status ladder is untouched");
+        assert_eq!(upserted.text.as_deref(), Some("original"));
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("clearing the pinned row refreshes the conversation");
+        assert!(changed.pinned_message.is_none());
+
+        // A replayed adminDelete flips nothing: no events, state unchanged.
+        let events = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::AdminDelete {
+                        target_author: "+15555550100".into(),
+                        target_timestamp: 400,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "a replayed admin delete must be silent");
     }
 
     /// The emoji guard enforces the pinned signal-cli contract locally:

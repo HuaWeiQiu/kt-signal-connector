@@ -679,6 +679,41 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn send_pin_message(
+        &self,
+        params: crate::service::MessagesSendPinMessageParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_pin_message(
+                params.account_id,
+                params.conversation_id,
+                params.message_id,
+                params.pin_duration_seconds,
+            )
+            .await
+    }
+
+    pub async fn send_unpin_message(
+        &self,
+        params: crate::service::MessagesSendUnpinMessageParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_unpin_message(params.account_id, params.conversation_id, params.message_id)
+            .await
+    }
+
+    pub async fn send_admin_delete(
+        &self,
+        params: crate::service::MessagesSendAdminDeleteParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_admin_delete(params.account_id, params.conversation_id, params.message_id)
+            .await
+    }
+
     pub async fn edit_message(
         &self,
         params: crate::service::MessagesEditParams,

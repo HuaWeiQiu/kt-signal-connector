@@ -2597,6 +2597,406 @@ async fn presence_set_typing_message_signals_ephemeral_upstream_state() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.33 end to end: inbound pin-family envelopes staged in the
+/// fixture's `.fixture-extra-receives.json` marker drive the per-conversation
+/// pinned state (conversation summaries carry `pinnedMessage`, a matching
+/// unpin clears it) and the group adminDelete tombstone (`adminDeleted` on the
+/// upserted row, the pinned row's removal clears the pin). The three upstream
+/// methods carry the exact reaction addressing — targetAuthor follows the row
+/// direction, groups address `groupId`, `pinDurationSeconds` passes through
+/// only when supplied — and the guard rails answer deterministically (direct
+/// adminDelete INVALID_REQUEST, out-of-range duration INVALID_REQUEST, an
+/// unknown message MESSAGE_NOT_FOUND) without touching the upstream.
+#[tokio::test]
+async fn pin_family_round_trips_pinned_state_and_admin_delete_tombstone() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [29_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Stage the inbound face before linking: a named group message, then a
+    // peer's timed pin of it — both delivered by the finishLink receive burst.
+    let extra_receives = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-extra-receives.json");
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        &extra_receives,
+        json!([
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 50,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "group pin target"
+                }
+            },
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 51,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "pinMessage": {
+                        "targetAuthor": "+15555550101",
+                        "targetSentTimestamp": 50,
+                        "pinDurationSeconds": 3600
+                    }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Pin-Family" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+
+    // Drain the finish burst: the link answer, the group message upsert, and
+    // the pin-driven conversation change whose summary carries pinnedMessage.
+    let mut account_id: Option<String> = None;
+    let mut group_message_id: Option<String> = None;
+    let mut pinned_change: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while account_id.is_none() || group_message_id.is_none() || pinned_change.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                account_id = Some(frame["result"]["id"].as_str().unwrap().to_string());
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["sentAt"] == 50
+            {
+                group_message_id = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("conversation.changed")
+                && frame["data"].get("pinnedMessage").is_some()
+            {
+                pinned_change = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("the finish burst must deliver the group message and its pin");
+    let account_id = account_id.unwrap();
+    let group_message_id = group_message_id.unwrap();
+    let pinned = pinned_change.unwrap()["data"]["pinnedMessage"].clone();
+    assert_eq!(pinned["messageId"], json!(group_message_id));
+    assert_eq!(pinned["targetAuthor"], json!("+15555550101"));
+    assert_eq!(pinned["targetSentTimestamp"], json!(50));
+    assert!(pinned["pinnedAt"].is_u64());
+    assert!(pinned["expiresAt"].is_u64(), "a timed pin carries expiry");
+
+    // The persisted summary projects the same pin bar (a reloaded window
+    // renders it without replaying events).
+    let conversations = request(
+        &mut client,
+        "conv-pinned",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_row = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "group")
+        .unwrap();
+    assert_eq!(group_row["pinnedMessage"]["targetSentTimestamp"], json!(50));
+
+    // Append the group adminDelete of the pinned row and deliver it through a
+    // later upstream call (sendTyping flushes staged receives, changes no
+    // conversation state).
+    let mut envelopes: Vec<Value> =
+        serde_json::from_str(&fs::read_to_string(&extra_receives).unwrap()).unwrap();
+    envelopes.push(json!({
+        "source": "+15555550101",
+        "sourceName": "林菲菲",
+        "timestamp": 53,
+        "dataMessage": {
+            "groupId": "ZmFrZS1ncm91cC0x",
+            "adminDelete": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 50
+            }
+        }
+    }));
+    fs::write(&extra_receives, json!(envelopes).to_string()).unwrap();
+    // Deliver it through a later upstream call: sendTyping flushes staged
+    // receives before answering, and a typing indicator changes no
+    // conversation state. The flush and the answer can interleave in either
+    // order on the socket, so the frame is sent without waiting and the drain
+    // below collects the typing answer together with the projections.
+    send_request_frame(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_row["id"],
+            "stop": true
+        }),
+    )
+    .await;
+
+    // The tombstone lands as a row-level adminDeleted marker (status ladder
+    // untouched, body kept) and the pinned row's removal clears the pin.
+    let mut typed: Option<Value> = None;
+    let mut upserted: Option<Value> = None;
+    let mut unpinned_change: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while typed.is_none() || upserted.is_none() || unpinned_change.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("typing-flush") {
+                typed = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["sentAt"] == 50
+            {
+                upserted = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("conversation.changed")
+                && frame["data"].get("pinnedMessage").is_none()
+                && frame["data"]["type"] == "group"
+            {
+                unpinned_change = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("the adminDelete must upsert the tombstone and clear the pin");
+    assert_eq!(typed.unwrap()["result"]["status"], "sent");
+    let tombstone = upserted.unwrap()["data"].clone();
+    assert_eq!(tombstone["adminDeleted"], json!(true));
+    assert_eq!(tombstone["status"], json!("delivered"));
+    assert_eq!(tombstone["text"], json!("group pin target"));
+    assert_eq!(
+        unpinned_change.unwrap()["data"]["id"],
+        group_row["id"].clone()
+    );
+    let conversations = request(
+        &mut client,
+        "conv-unpinned",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_row = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "group")
+        .unwrap();
+    assert!(group_row.get("pinnedMessage").is_none());
+
+    // Upstream face: send an own group row and pin/unpin/adminDelete it. The
+    // send lane mirrors the reaction addressing — targetAuthor is the linked
+    // account, groups address groupId, and the duration passes through only
+    // when supplied.
+    let sent = request(
+        &mut client,
+        "send-group-pin",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "text": "pin me upstream",
+            "clientRequestId": "pin-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let group_conversation_id = sent["result"]["conversationId"].clone();
+    let pinned_upstream = request(
+        &mut client,
+        "pin-upstream",
+        "messages.sendPinMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "messageId": sent["result"]["id"],
+            "pinDurationSeconds": 86400
+        }),
+    )
+    .await;
+    assert_eq!(pinned_upstream["result"]["status"], "sent");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log sendPinMessage params");
+    let pin_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("pinDurationSeconds").is_some())
+        .expect("the sendPinMessage must reach the upstream");
+    assert_eq!(pin_call["account"], "+15555550100");
+    assert_eq!(pin_call["targetAuthor"], "+15555550100");
+    assert_eq!(pin_call["targetTimestamp"], json!(99));
+    assert_eq!(pin_call["pinDurationSeconds"], json!(86400));
+    assert_eq!(pin_call["groupId"], json!("ZmFrZS1ncm91cC0x"));
+    assert!(pin_call.get("recipient").is_none());
+
+    // Unpin: the same addressing, no duration key on the wire.
+    let unpinned_upstream = request(
+        &mut client,
+        "unpin-upstream",
+        "messages.sendUnpinMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "messageId": sent["result"]["id"]
+        }),
+    )
+    .await;
+    assert_eq!(unpinned_upstream["result"]["status"], "sent");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap();
+    let unpin_call: Value = send_log
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the sendUnpinMessage must reach the upstream");
+    assert_eq!(unpin_call["targetAuthor"], "+15555550100");
+    assert_eq!(unpin_call["targetTimestamp"], json!(99));
+    assert!(unpin_call.get("pinDurationSeconds").is_none());
+
+    // Admin delete: group-only, groupId addressing on the wire.
+    let admin_deleted = request(
+        &mut client,
+        "admin-delete-upstream",
+        "messages.sendAdminDelete",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "messageId": sent["result"]["id"]
+        }),
+    )
+    .await;
+    assert_eq!(admin_deleted["result"]["status"], "sent");
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap();
+    let delete_call: Value = send_log
+        .lines()
+        .rev()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|params: &Value| params.get("targetTimestamp").is_some())
+        .expect("the sendAdminDelete must reach the upstream");
+    assert_eq!(delete_call["targetAuthor"], "+15555550100");
+    assert_eq!(delete_call["targetTimestamp"], json!(99));
+    assert_eq!(delete_call["groupId"], json!("ZmFrZS1ncm91cC0x"));
+
+    // Guard rails, none of which touch the upstream: a direct chat has no
+    // admin concept, the duration range is enforced fail-closed, and an
+    // unknown message answers MESSAGE_NOT_FOUND.
+    let direct_sent = request(
+        &mut client,
+        "send-direct-pin",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "direct admin delete target",
+            "clientRequestId": "pin-send-direct"
+        }),
+    )
+    .await;
+    assert_eq!(direct_sent["result"]["status"], "sent");
+    let direct_conversation = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "direct")
+        .unwrap();
+    let direct_delete = request(
+        &mut client,
+        "admin-delete-direct",
+        "messages.sendAdminDelete",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation["id"],
+            "messageId": direct_sent["result"]["id"]
+        }),
+    )
+    .await;
+    assert_eq!(direct_delete["error"]["code"], "INVALID_REQUEST");
+    for bad in [-1_i64, 4_294_967_296_i64] {
+        let out_of_range = request(
+            &mut client,
+            "pin-range",
+            "messages.sendPinMessage",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation_id,
+                "messageId": sent["result"]["id"],
+                "pinDurationSeconds": bad
+            }),
+        )
+        .await;
+        assert_eq!(
+            out_of_range["error"]["code"], "INVALID_REQUEST",
+            "pinDurationSeconds {bad} must fail closed"
+        );
+    }
+    let unknown = request(
+        &mut client,
+        "pin-unknown",
+        "messages.sendPinMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "messageId": "no-such-message"
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "MESSAGE_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();

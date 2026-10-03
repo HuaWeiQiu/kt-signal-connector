@@ -1489,6 +1489,127 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// Best-effort pin for one message with a resolvable protocol identity
+    /// (contract revision 1.33): the reaction shape end to end — local
+    /// prepare under the service lock, upstream `sendPinMessage` call without
+    /// it. On confirmation the derived per-conversation pinned state is
+    /// written (a newer pin replaces the older one; the expiry is connector
+    /// clock computed) and the conversation refresh rides the host lane, so a
+    /// reloaded window renders the pin bar without replaying events. An
+    /// indeterminate mutating outcome answers `{"status":"unknown"}` and is
+    /// never retried automatically.
+    pub async fn send_pin_message(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+        pin_duration_seconds: Option<u32>,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_send_pin_message(
+                &account_id,
+                &conversation_id,
+                &message_id,
+                pin_duration_seconds,
+            )?
+        };
+        match engine
+            .call("sendPinMessage", prepared.params, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => {
+                let summary = {
+                    let service = self.service.lock().await;
+                    service.complete_send_pin_message(
+                        &prepared.account_id,
+                        &prepared.conversation_id,
+                        &prepared.target_author,
+                        prepared.target_sent_at,
+                        prepared.pin_duration_seconds,
+                    )?
+                };
+                if let Some(summary) = summary {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok("sent")
+            }
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Best-effort unpin (contract revision 1.33): the pin shape without the
+    /// duration. On confirmation the local pinned state clears only when it
+    /// still points at the (author, timestamp) this unpin names, and the
+    /// conversation refresh rides the host lane.
+    pub async fn send_unpin_message(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_send_unpin_message(&account_id, &conversation_id, &message_id)?
+        };
+        match engine
+            .call("sendUnpinMessage", prepared.params, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => {
+                let summary = {
+                    let service = self.service.lock().await;
+                    service.complete_send_unpin_message(
+                        &prepared.account_id,
+                        &prepared.conversation_id,
+                        &prepared.target_author,
+                        prepared.target_sent_at,
+                    )?
+                };
+                if let Some(summary) = summary {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok("sent")
+            }
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Best-effort group admin delete (contract revision 1.33): the pin
+    /// addressing, group conversations only, with no admin-eligibility
+    /// pre-check — the server is the authority and its rejection surfaces as
+    /// the upstream error. The local row is left unchanged on success (the
+    /// remoteDelete boundary, §4.5): the authoritative tombstone converges
+    /// through the row-marker projection when the echo arrives.
+    pub async fn send_admin_delete(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_send_admin_delete(&account_id, &conversation_id, &message_id)?
+        };
+        match engine
+            .call("sendAdminDelete", prepared.params, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// messages.edit (contract revision 1.15): retarget one previously sent
     /// message's body via the upstream `send` + `editTimestamp` entry point.
     /// Local prepare (row resolution, text bounds) under the service lock,
@@ -2159,6 +2280,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -2618,6 +2740,216 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(2), host_lane.recv())
             .await
             .expect("conversation.changed within timeout")
+            .unwrap();
+        assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// The fixture's `sendPinMessage` handler exits with the mutating call in
+    /// flight (target timestamp 424), so the upstream result is lost mid-call.
+    /// sendPinMessage must answer the explicit `unknown` — never a retryable
+    /// error, never an automatic retry — and write no pinned state locally
+    /// (the reaction precedent, contract revision 1.33).
+    #[tokio::test]
+    async fn send_pin_message_with_a_lost_upstream_result_answers_unknown() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match supervisor
+            .service
+            .lock()
+            .await
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "pin me",
+                "req-pin-crash",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            crate::service::PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            crate::service::PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        supervisor
+            .service
+            .lock()
+            .await
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 424)
+            .unwrap();
+
+        assert_eq!(
+            supervisor
+                .send_pin_message(
+                    account.id.clone(),
+                    conversation.id.clone(),
+                    pending_id.clone(),
+                    Some(3600)
+                )
+                .await
+                .unwrap(),
+            "unknown",
+            "a lost mutating result must answer unknown, never retry"
+        );
+
+        // No pinned state was written: the local conversation stays pin-free.
+        assert!(
+            supervisor
+                .service
+                .lock()
+                .await
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .is_none()
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// 上行确认路径（fixture 正常应答，targetTimestamp≠424/352）：确认后
+    /// pinned 状态落库（timed pin 带 expiry）并向 host lane 推
+    /// conversation.changed；随后的 unpin 清除状态并再推一次——重载窗口
+    /// 由此免重放即可渲染/摘除置顶条（contract revision 1.33）。
+    #[tokio::test]
+    async fn send_pin_message_confirmed_persists_pin_and_unpin_clears() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match supervisor
+            .service
+            .lock()
+            .await
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "pin confirmed",
+                "req-pin-ok",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            crate::service::PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            crate::service::PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        supervisor
+            .service
+            .lock()
+            .await
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 426)
+            .unwrap();
+        let mut host_lane = supervisor.subscribe_host();
+
+        assert_eq!(
+            supervisor
+                .send_pin_message(
+                    account.id.clone(),
+                    conversation.id.clone(),
+                    pending_id.clone(),
+                    Some(3600)
+                )
+                .await
+                .unwrap(),
+            "sent"
+        );
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        let pinned = summary.pinned_message.expect("the confirmed pin persists");
+        assert_eq!(pinned.message_id, pending_id);
+        assert_eq!(pinned.target_author, "+15555550100");
+        assert_eq!(pinned.target_sent_timestamp, 426);
+        assert!(pinned.expires_at.is_some(), "a timed pin carries expiry");
+        let event = tokio::time::timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
+
+        assert_eq!(
+            supervisor
+                .send_unpin_message(account.id.clone(), conversation.id.clone(), pending_id)
+                .await
+                .unwrap(),
+            "sent"
+        );
+        assert!(
+            supervisor
+                .service
+                .lock()
+                .await
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .is_none()
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("unpin conversation.changed within timeout")
             .unwrap();
         assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
         supervisor.shutdown().await.unwrap();

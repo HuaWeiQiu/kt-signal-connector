@@ -50,6 +50,11 @@ pub const METHODS: &[MethodRow] = &[
     ("messages.edit", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
+    // Pin family (contract 1.33): mutating, send-lane upstream traffic — the
+    // reaction class verbatim, same-account mutex and delete barrier included.
+    ("messages.sendPinMessage", Lane::Send, true, "send"),
+    ("messages.sendUnpinMessage", Lane::Send, true, "send"),
+    ("messages.sendAdminDelete", Lane::Send, true, "send"),
     // Media ingest (ADR 0002): the chunked streaming triple rides the READ
     // lane — one bounded chunk per call, no mutation, no upstream traffic.
     // The one-shot base64 reader (`messages.attachments.get`, contract 1.10
@@ -139,6 +144,9 @@ mod tests {
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
+            "messages.sendPinMessage",
+            "messages.sendUnpinMessage",
+            "messages.sendAdminDelete",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
         ];
@@ -149,6 +157,9 @@ mod tests {
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
+            "messages.sendPinMessage",
+            "messages.sendUnpinMessage",
+            "messages.sendAdminDelete",
             "contacts.sync",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",

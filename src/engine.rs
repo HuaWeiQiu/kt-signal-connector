@@ -527,6 +527,24 @@ pub enum ControlReceive {
         timestamps: Vec<u64>,
         when: Option<u64>,
     },
+    /// Pin of an earlier message (contract 1.33): the target identity plus
+    /// the optional timed-pin duration — absent means the official forever
+    /// pin.
+    PinMessage {
+        target_author: String,
+        target_timestamp: u64,
+        duration_seconds: Option<u32>,
+    },
+    /// Unpin of the earlier message it names (contract 1.33).
+    UnpinMessage {
+        target_author: String,
+        target_timestamp: u64,
+    },
+    /// Group admin removed the earlier message it names (contract 1.33).
+    AdminDelete {
+        target_author: String,
+        target_timestamp: u64,
+    },
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -1650,6 +1668,62 @@ fn normalized_reaction(value: &Value) -> Option<ControlReceive> {
     })
 }
 
+/// The pin-family target identity (contract 1.33), bounded like the reaction
+/// target: the author as the upstream resolved it (E.164 on a contacts hit,
+/// ACI string otherwise) and the pinned message's upstream timestamp.
+fn normalized_pin_target(value: &Value) -> Option<(String, u64)> {
+    let object = value.as_object()?;
+    let target_author = ["targetAuthorNumber", "targetAuthorUuid", "targetAuthor"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+    let target_timestamp = object.get("targetSentTimestamp").and_then(Value::as_u64)?;
+    Some((target_author, target_timestamp))
+}
+
+/// `dataMessage.pinMessage`: `{targetAuthor, targetSentTimestamp,
+/// pinDurationSeconds?}` — absent/null duration is the official forever pin,
+/// an out-of-u32 duration drops the field rather than inventing a wrong
+/// expiry.
+fn normalized_pin_message(value: &Value) -> Option<ControlReceive> {
+    let object = value.as_object()?;
+    let (target_author, target_timestamp) = normalized_pin_target(value)?;
+    let duration_seconds = object
+        .get("pinDurationSeconds")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= u32::MAX as u64)
+        .map(|value| value as u32);
+    Some(ControlReceive::PinMessage {
+        target_author,
+        target_timestamp,
+        duration_seconds,
+    })
+}
+
+/// `dataMessage.unpinMessage`: `{targetAuthor, targetSentTimestamp}` —
+/// target identity only.
+fn normalized_unpin_message(value: &Value) -> Option<ControlReceive> {
+    normalized_pin_target(value).map(|(target_author, target_timestamp)| {
+        ControlReceive::UnpinMessage {
+            target_author,
+            target_timestamp,
+        }
+    })
+}
+
+/// `dataMessage.adminDelete`: `{targetAuthor, targetSentTimestamp}` —
+/// target identity only.
+fn normalized_admin_delete(value: &Value) -> Option<ControlReceive> {
+    normalized_pin_target(value).map(|(target_author, target_timestamp)| {
+        ControlReceive::AdminDelete {
+            target_author,
+            target_timestamp,
+        }
+    })
+}
+
 fn normalize_receive(params: &Value) -> Result<Option<NormalizedReceive>, EngineError> {
     let normalized = normalize_receive_fields(params)?;
     // Identifier fields route conversations; an oversized one would exhaust the receive
@@ -1702,6 +1776,41 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 control: ControlReceive::RemoteDelete {
                     target_timestamp: target,
                 },
+            });
+        }
+        // Pin family (contract 1.33): per-conversation pin state and the
+        // admin-delete tombstone, projected by the service layer.
+        if let Some(pin) = data_message
+            .get("pinMessage")
+            .and_then(normalized_pin_message)
+        {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: pin,
+            });
+        }
+        if let Some(unpin) = data_message
+            .get("unpinMessage")
+            .and_then(normalized_unpin_message)
+        {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: unpin,
+            });
+        }
+        if let Some(admin_delete) = data_message
+            .get("adminDelete")
+            .and_then(normalized_admin_delete)
+        {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: admin_delete,
             });
         }
         // A body-less editUpdate rides editMessage at the envelope level; a
@@ -2879,6 +2988,80 @@ mod tests {
 
         assert!(routing(json!({ "timestamp": [], "isDelivery": true })).is_none());
         assert!(routing(json!({ "isDelivery": true })).is_none());
+    }
+
+    /// The pin family (contract 1.33) routes off `dataMessage` with the
+    /// reaction targetAuthor resolution: pin carries the optional duration
+    /// (absent = forever), unpin and adminDelete carry the target identity
+    /// only, and a malformed payload is not routed at all.
+    #[test]
+    fn pin_family_envelopes_route_to_pin_controls() {
+        let routing = |data: serde_json::Value| {
+            let envelope: serde_json::Value = serde_json::from_value(json!({
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "sourceDevice": 1,
+                "dataMessage": data,
+            }))
+            .unwrap();
+            control_routing(envelope.as_object().unwrap()).map(|routing| routing.control)
+        };
+
+        let pin = routing(json!({
+            "pinMessage": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+                "pinDurationSeconds": 604800u64,
+            },
+        }))
+        .expect("timed pin routes");
+        assert!(matches!(
+            pin,
+            ControlReceive::PinMessage {
+                ref target_author,
+                target_timestamp,
+                duration_seconds: Some(604800),
+            } if target_author == "+15555550101" && target_timestamp == 1726999000000
+        ));
+
+        let forever = routing(json!({
+            "pinMessage": {
+                "targetAuthor": "9d7762bb-1fb5-4cfd-9b15-aef4f8ef9c14",
+                "targetSentTimestamp": 1726999000000u64,
+            },
+        }))
+        .expect("forever pin routes");
+        assert!(matches!(
+            forever,
+            ControlReceive::PinMessage {
+                duration_seconds: None,
+                ..
+            }
+        ));
+
+        let unpin = routing(json!({
+            "unpinMessage": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+            },
+        }))
+        .expect("unpin routes");
+        assert!(matches!(unpin, ControlReceive::UnpinMessage { .. }));
+
+        let admin_delete = routing(json!({
+            "adminDelete": {
+                "targetAuthor": "+15555550101",
+                "targetSentTimestamp": 1726999000000u64,
+            },
+        }))
+        .expect("adminDelete routes");
+        assert!(matches!(admin_delete, ControlReceive::AdminDelete { .. }));
+
+        // Malformed shapes drop instead of inventing protocol state.
+        assert!(routing(json!({ "pinMessage": { "targetSentTimestamp": 1 } })).is_none());
+        assert!(routing(json!({ "pinMessage": { "targetAuthor": "+15555550101" } })).is_none());
+        assert!(routing(json!({ "unpinMessage": { "targetAuthor": "+15555550101" } })).is_none());
+        assert!(routing(json!({ "adminDelete": { "targetSentTimestamp": 1 } })).is_none());
     }
 
     /// Rich-body fields (contract 1.25) ride a dataMessage through

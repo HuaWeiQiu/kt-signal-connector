@@ -55,6 +55,9 @@
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
+            "messages.sendPinMessage",
+            "messages.sendUnpinMessage",
+            "messages.sendAdminDelete",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
@@ -241,6 +244,39 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendReactionParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendPinMessage" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendPinMessageParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendUnpinMessage" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendUnpinMessageParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendAdminDelete" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendAdminDeleteParams" }
             }
           }
         },
@@ -549,6 +585,48 @@
           "default": false,
           "description": "True removes a previously sent reaction; the emoji must still identify the reaction to remove."
         },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesSendPinMessageParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "description": "Pin one message that already exists in the local history (contract revision 1.33; one pinned message per conversation, the official model). Addressing follows the messages.sendReaction model: a local outgoing row qualifies in the terminal state 'sent' (its sentAt is the upstream Signal timestamp); an incoming direct row carries the envelope timestamp; the target author follows the row direction (the linked account's own number for outgoing rows, the conversation peer for incoming direct rows). Rows without a resolvable protocol identity (missing, pending/failed/unknown outgoing, system, group incoming — only a local sender hash is persisted) fail closed: MESSAGE_NOT_FOUND or a deterministic INVALID_REQUEST. Groups address the engine groupId form, direct chats the recipient array. pinDurationSeconds is the optional timed-pin duration: absent or null is the official forever pin, and a value outside 0..4294967295 fails closed with INVALID_REQUEST. The result is {status: 'sent'} when the upstream confirmed the pin, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "pinDurationSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Optional timed-pin duration in seconds; absent or null means the pin never expires."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesSendUnpinMessageParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "description": "Unpin one message that already exists in the local history (contract revision 1.33). Same addressing as messages.sendPinMessage, with no duration: the official unpinMessage carries only the target identity. The result is {status: 'sent'} when the upstream confirmed the unpin, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesSendAdminDeleteParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "description": "Remove one message from a group conversation as a group admin (contract revision 1.33; the official deleted-by-admin tombstone). Direct chats have no admin concept and answer INVALID_REQUEST before any upstream call. Same addressing as messages.sendPinMessage; admin eligibility is not pre-checked — the server is the authority and rejects non-admin attempts, which surface as the upstream error. A group incoming row persists only a local sender hash, so its author is not resolvable and the request fails with a deterministic INVALID_REQUEST. The result is {status: 'sent'} when the upstream confirmed the removal, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
         "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },

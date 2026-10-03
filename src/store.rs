@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -148,6 +148,17 @@ CREATE TABLE IF NOT EXISTS message_events (
 );
 CREATE INDEX IF NOT EXISTS message_events_conversation
   ON message_events(account_id, conversation_id, target_timestamp);
+CREATE TABLE IF NOT EXISTS conversation_pins (
+  account_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  target_author TEXT NOT NULL,
+  target_sent_at INTEGER NOT NULL,
+  pinned_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  PRIMARY KEY(account_id, conversation_id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
 ";
 /// DDL that must run after [`migrate_schema`], not in [`SCHEMA_DDL`], because
 /// it references columns that older stores only gain through a migration.
@@ -381,6 +392,28 @@ pub struct ConversationSummary {
     pub unread_mentions: u32,
     pub muted: bool,
     pub pinned: bool,
+    /// Contract 1.33: the conversation's current pinned message, projected
+    /// from `conversation_pins` so a reloaded window renders the pin bar
+    /// without replaying events. Absent when nothing is pinned, the pin
+    /// expired (connector-clock computed), or the pinned row is no longer in
+    /// the local history (retention) — an unrenderable pin is not surfaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_message: Option<ConversationPinnedMessage>,
+}
+
+/// One conversation's pinned state (contract 1.33): the local row the pin
+/// resolves to, the protocol identity it was pinned under, and the pin
+/// timing. `expires_at` is absent on a forever pin; a timed pin carries the
+/// connector-clock expiry computed from `pinDurationSeconds` at pin time.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPinnedMessage {
+    pub message_id: String,
+    pub target_author: String,
+    pub target_sent_timestamp: u64,
+    pub pinned_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 
 /// Serde gate for optional-count fields (contract 1.29): zero collapses to an
@@ -497,6 +530,12 @@ pub struct MessageRecord {
     /// (contract 1.32). Same first-stamp-wins discipline as `delivered_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<u64>,
+    /// Group admin-delete tombstone (contract 1.33): an inbound adminDelete
+    /// envelope marked this row "deleted by admin". The body stays for the
+    /// audit window and retention prunes the row normally. Absent (false) on
+    /// rows no admin removed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub admin_deleted: bool,
 }
 
 /// One prior body of an edited message (contract 1.32): the text the edit
@@ -1318,6 +1357,7 @@ impl Store {
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
+                        pinned_message: None,
                     })
                 },
             )
@@ -1332,6 +1372,7 @@ impl Store {
             item.last_message_status = meta.status;
             item.last_message_author_name = meta.author_name;
             item.last_message_reactions = meta.reactions;
+            item.pinned_message = pinned_message_for_conversation(&conn, account_id, &item.id)?;
         }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
@@ -1390,7 +1431,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1469,7 +1510,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -1509,7 +1550,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1529,7 +1570,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1557,7 +1598,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1779,7 +1820,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1817,7 +1858,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1910,7 +1951,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -1985,7 +2026,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2058,7 +2099,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -2101,7 +2142,123 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                 ORDER BY id ASC LIMIT 1",
+                params![account_id, conversation_id, target_sent_at as i64],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, changed > 0)))
+    }
+
+    /// Record the conversation's pinned state (contract 1.33). The official
+    /// model keeps at most one pinned message per conversation, so the
+    /// (account, conversation) primary key turns a newer pin into a
+    /// replacement of the older one. `pinned_at` is the connector clock at
+    /// pin time; `expires_at` is that clock plus `pinDurationSeconds`
+    /// (absent duration = forever pin, no expiry). A missing target row is
+    /// not an error: the state is still derived (the summary projection only
+    /// surfaces pins whose row is locally renderable).
+    pub fn upsert_conversation_pin(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_author: &str,
+        target_sent_at: u64,
+        duration_seconds: Option<u32>,
+    ) -> Result<(), StoreError> {
+        let pinned_at = crate::link::now_ms();
+        let expires_at =
+            duration_seconds.map(|seconds| pinned_at.saturating_add(u64::from(seconds) * 1_000));
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO conversation_pins(
+                    account_id, conversation_id, target_author, target_sent_at,
+                    pinned_at, expires_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(account_id, conversation_id) DO UPDATE SET
+                   target_author=excluded.target_author,
+                   target_sent_at=excluded.target_sent_at,
+                   pinned_at=excluded.pinned_at,
+                   expires_at=excluded.expires_at",
+                params![
+                    account_id,
+                    conversation_id,
+                    target_author,
+                    target_sent_at as i64,
+                    pinned_at as i64,
+                    expires_at.map(|value| value as i64),
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Clear the conversation's pinned state, but only when it still points
+    /// at the (author, timestamp) the unpin / admin-delete names — the
+    /// official unpinMessage carries a target identity, and a stale or
+    /// mismatched unpin leaves a newer pin alone. Returns whether a row was
+    /// removed so replays stay silent.
+    pub fn clear_conversation_pin(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_author: &str,
+        target_sent_at: u64,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .lock_conn()?
+            .execute(
+                "DELETE FROM conversation_pins
+             WHERE account_id=?1 AND conversation_id=?2
+               AND target_author=?3 AND target_sent_at=?4",
+                params![
+                    account_id,
+                    conversation_id,
+                    target_author,
+                    target_sent_at as i64
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// Mark a message admin-deleted (contract 1.33): a group admin removed
+    /// this row. The status ladder is untouched — the tombstone is the
+    /// additive `admin_deleted` flag and the body stays for the audit window;
+    /// retention prunes the row like any other. Idempotent; returns the
+    /// updated row when the flag actually flipped so a replayed adminDelete
+    /// does not re-emit events.
+    pub fn mark_admin_deleted(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = transaction
+            .execute(
+                "UPDATE messages
+                 SET admin_deleted=1
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND admin_deleted=0 AND status!='system'",
+                params![account_id, conversation_id, target_sent_at as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -2150,7 +2307,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -2671,6 +2828,7 @@ impl Store {
                         unread_mentions: row.get::<_, i64>(7)? as u32,
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
+                        pinned_message: None,
                     })
                 },
             )
@@ -2685,6 +2843,8 @@ impl Store {
                 summary.last_message_status = meta.status;
                 summary.last_message_author_name = meta.author_name;
                 summary.last_message_reactions = meta.reactions;
+                summary.pinned_message =
+                    pinned_message_for_conversation(&conn, account_id, conversation_id)?;
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -3654,6 +3814,21 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             }
         }
     }
+    if current < 13 {
+        // Contract revision 1.33: message pin/unpin + group admin delete. The
+        // `admin_deleted` marker is an additive flag — the tombstone is a
+        // property of rows that receive an adminDelete envelope, so history
+        // rows are never backfilled. The `conversation_pins` table is created
+        // by CREATE TABLE IF NOT EXISTS above, so no data migration is needed;
+        // its rows cascade with their conversation (account deletes clean up).
+        if !table_has_column(conn, "messages", "admin_deleted")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN admin_deleted INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3758,6 +3933,60 @@ struct ConversationLastMessageMeta {
     status: Option<&'static str>,
     author_name: Option<String>,
     reactions: Vec<String>,
+}
+
+/// Project one conversation's pinned state onto the summary wire shape
+/// (contract 1.33). Expired pins stop rendering (connector-clock comparison
+/// — a timed pin past its `expires_at` is no longer pinned); a pin whose
+/// target row is no longer in the local history (retention pruned it, or it
+/// never landed here) is not surfaced either, because the desktop can only
+/// render a pin bar for a message it holds. Read-time resolution keeps the
+/// stored state free of dangling row ids.
+fn pinned_message_for_conversation(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+) -> Result<Option<ConversationPinnedMessage>, StoreError> {
+    let stored = conn
+        .query_row(
+            "SELECT target_author, target_sent_at, pinned_at, expires_at
+             FROM conversation_pins
+             WHERE account_id=?1 AND conversation_id=?2",
+            params![account_id, conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, Option<i64>>(3)?.map(|value| value as u64),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let Some((target_author, target_sent_at, pinned_at, expires_at)) = stored else {
+        return Ok(None);
+    };
+    if expires_at.is_some_and(|expires_at| expires_at <= crate::link::now_ms()) {
+        return Ok(None);
+    }
+    let message_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM messages
+             WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+             ORDER BY id ASC LIMIT 1",
+            params![account_id, conversation_id, target_sent_at as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(message_id.map(|message_id| ConversationPinnedMessage {
+        message_id,
+        target_author,
+        target_sent_timestamp: target_sent_at,
+        pinned_at,
+        expires_at,
+    }))
 }
 
 fn conversation_last_message_meta(
@@ -3917,6 +4146,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         edits: Vec::new(),
         delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
         read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
+        admin_deleted: row.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -3987,6 +4217,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         assert!(
             store
@@ -4049,6 +4280,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
 
         let mut rich = base("rich-1");
@@ -4284,6 +4516,330 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Contract 1.33 schema step: a v12 database migrates in place — the
+    /// additive `admin_deleted` tombstone column and the `conversation_pins`
+    /// table appear and the version stamp moves to 13.
+    #[test]
+    fn schema_v13_upgrade_adds_admin_deleted_and_conversation_pins() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '12');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               rich_json TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "admin_deleted").unwrap());
+        let pins_table: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conversation_pins'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            pins_table, 1,
+            "the per-conversation pin table exists after migration"
+        );
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Conversation pin state (contract 1.33): a newer pin replaces the older
+    /// one, a mismatched clear leaves the pin alone, a matching clear removes
+    /// it, the summary projects the camelCase `pinnedMessage` with `expiresAt`
+    /// only on a live timed pin — an expired timed pin (`duration 0` = already
+    /// past) and a pin whose target row is gone stop rendering.
+    #[test]
+    fn conversation_pin_upsert_replaces_and_clears_with_expiry_projection() {
+        use serde_json::json;
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str, sent_at: u64| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+        };
+        assert!(
+            store
+                .insert_message(&base("m1", 10), None, Some("body"), true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_message(&base("m2", 20), None, Some("body"), true)
+                .unwrap()
+        );
+
+        // Forever pin on the first row: projected with the resolved message
+        // id and no expiresAt (the wire key stays absent).
+        store
+            .upsert_conversation_pin(&account.id, &conversation.id, "+15555550101", 10, None)
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        let pinned = summary.pinned_message.as_ref().unwrap();
+        assert_eq!(pinned.message_id, "m1");
+        assert_eq!(pinned.target_author, "+15555550101");
+        assert_eq!(pinned.target_sent_timestamp, 10);
+        assert!(pinned.pinned_at > 0);
+        assert_eq!(pinned.expires_at, None);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["pinnedMessage"]["messageId"], json!("m1"));
+        assert_eq!(wire["pinnedMessage"]["targetSentTimestamp"], json!(10));
+        assert!(wire["pinnedMessage"].get("expiresAt").is_none());
+
+        // A newer pin replaces the older one in place (one row per
+        // conversation, new pin wins).
+        store
+            .upsert_conversation_pin(
+                &account.id,
+                &conversation.id,
+                "+15555550101",
+                20,
+                Some(3600),
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        let pinned = summary.pinned_message.as_ref().unwrap();
+        assert_eq!(pinned.message_id, "m2");
+        assert!(pinned.expires_at.is_some(), "a timed pin carries expiry");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert!(wire["pinnedMessage"]["expiresAt"].is_u64());
+
+        // A clear naming the replaced (author, timestamp) is a no-op.
+        assert!(
+            !store
+                .clear_conversation_pin(&account.id, &conversation.id, "+15555550101", 10)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .as_ref()
+                .unwrap()
+                .target_sent_timestamp,
+            20
+        );
+
+        // The matching clear removes the state.
+        assert!(
+            store
+                .clear_conversation_pin(&account.id, &conversation.id, "+15555550101", 20)
+                .unwrap()
+        );
+        assert!(
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .is_none()
+        );
+
+        // An already-expired timed pin (duration 0) and a pin whose target
+        // row is no longer in the history stop rendering.
+        store
+            .upsert_conversation_pin(&account.id, &conversation.id, "+15555550101", 10, Some(0))
+            .unwrap();
+        assert!(
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .is_none(),
+            "an expired pin must not render"
+        );
+        store
+            .upsert_conversation_pin(&account.id, &conversation.id, "+15555550101", 999, None)
+            .unwrap();
+        assert!(
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .pinned_message
+                .is_none(),
+            "a pin without a local row must not render"
+        );
+    }
+
+    /// The admin-delete tombstone (contract 1.33): the flag flips exactly
+    /// once per row (idempotent replays answer `false` and re-emit nothing),
+    /// the status ladder and body are untouched, and system rows are exempt —
+    /// a state change notice is not an admin-removable message.
+    #[test]
+    fn mark_admin_deleted_flips_once_and_skips_system_rows() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
+            .unwrap();
+        let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction,
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: if direction == "system" {
+                "system"
+            } else {
+                "delivered"
+            },
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+        };
+        assert!(
+            store
+                .insert_message(&base("m1", 30, "incoming"), None, Some("body"), true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_message(
+                    &base("m2", 31, "system"),
+                    None,
+                    Some("left the group"),
+                    true
+                )
+                .unwrap()
+        );
+
+        let (record, changed) = store
+            .mark_admin_deleted(&account.id, &conversation.id, 30)
+            .unwrap()
+            .unwrap();
+        assert!(changed, "the first flip must report changed");
+        assert!(record.admin_deleted);
+        assert_eq!(record.status, "delivered", "the status ladder is untouched");
+        assert_eq!(record.text.as_deref(), Some("body"));
+
+        let (record, changed) = store
+            .mark_admin_deleted(&account.id, &conversation.id, 30)
+            .unwrap()
+            .unwrap();
+        assert!(!changed, "a replayed admin delete must not re-emit");
+        assert!(record.admin_deleted);
+
+        // A system row resolves but never flips.
+        let (record, changed) = store
+            .mark_admin_deleted(&account.id, &conversation.id, 31)
+            .unwrap()
+            .unwrap();
+        assert!(!changed, "system rows are exempt");
+        assert!(!record.admin_deleted);
+
+        // An absent timestamp answers None.
+        assert!(
+            store
+                .mark_admin_deleted(&account.id, &conversation.id, 999)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn summary_last_message_kind_follows_official_noun_rules() {
         let temp = TempDir::new().unwrap();
@@ -4329,6 +4885,7 @@ mod tests {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    admin_deleted: false,
                 };
                 store.insert_message(&message, None, text, false).unwrap();
             };
@@ -4455,6 +5012,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                admin_deleted: false,
             };
             store.insert_message(&message, None, text, false).unwrap();
         };
@@ -4635,6 +5193,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                admin_deleted: false,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -4742,6 +5301,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                admin_deleted: false,
             };
             store
                 .insert_message(&message, None, None, increment_unread)
@@ -4847,6 +5407,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store.insert_message(&plain, None, None, true).unwrap();
 
@@ -4937,6 +5498,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(
@@ -5035,6 +5597,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
 
         assert!(matches!(
@@ -5101,6 +5664,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("hello"), true)
@@ -5172,6 +5736,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("control notice"), false)
@@ -5227,6 +5792,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("body"), false)
@@ -5306,6 +5872,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                admin_deleted: false,
             };
             store
                 .insert_message(&message, None, Some(id), false)
@@ -5381,6 +5948,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&changed, None, Some("newer-message-2"), false)
@@ -5430,6 +5998,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&other_message, None, Some("other-message"), false)
@@ -5520,6 +6089,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                admin_deleted: false,
             };
             if id == "attachment-only" {
                 message.text = None;
@@ -5613,6 +6183,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                admin_deleted: false,
             };
             store.insert_message(&message, None, None, false).unwrap();
         }
@@ -5708,6 +6279,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store.insert_message(&message, None, None, false).unwrap();
 
@@ -6273,6 +6845,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -6343,6 +6916,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -6433,6 +7007,7 @@ mod tests {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    admin_deleted: false,
                 };
                 store
                     .insert_message(&message, None, Some("body"), true)
@@ -6580,6 +7155,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, Some("request-pending"), Some("body"), false)
@@ -6651,6 +7227,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&recent, None, Some("body"), true)
@@ -6717,6 +7294,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -6786,6 +7364,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -7207,6 +7786,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("hello"), false)
@@ -7251,6 +7831,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store
             .insert_message(&message, None, Some("v0"), true)
@@ -7500,6 +8081,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            admin_deleted: false,
         };
         store.insert_message(&message, None, None, false).unwrap();
         // FK 合法的幽灵行：账户存在、会话存在，但 account 归属另一账户。

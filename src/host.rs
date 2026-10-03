@@ -30,7 +30,8 @@ use crate::service::{
     LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
     MessagesListParams, MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAttachmentParams, MessagesSendReactionParams, MessagesSendTextParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
+    MessagesSendReactionParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
     PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
@@ -1247,6 +1248,57 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.sendReaction params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Pin family (contract 1.33): the reaction dispatch shape — params
+        // shape errors answer INVALID_REQUEST, the outcome mirrors the
+        // upstream mutating result ({status: sent|unknown}).
+        "messages.sendPinMessage" => {
+            match serde_json::from_value::<MessagesSendPinMessageParams>(request.params) {
+                Ok(params) => match runtime.send_pin_message(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendPinMessage params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.sendUnpinMessage" => {
+            match serde_json::from_value::<MessagesSendUnpinMessageParams>(request.params) {
+                Ok(params) => match runtime.send_unpin_message(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendUnpinMessage params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.sendAdminDelete" => {
+            match serde_json::from_value::<MessagesSendAdminDeleteParams>(request.params) {
+                Ok(params) => match runtime.send_admin_delete(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendAdminDelete params",
                         false,
                     ),
                 ),
