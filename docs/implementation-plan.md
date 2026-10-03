@@ -1113,6 +1113,52 @@ admin concept).
   `ChatItem.PinDetails` surface is engine-side import metadata (§6.6) and does not feed this
   state; phone clients older than the official pin rollout ignore the unknown field (proto
   forward-compatibility), so peers without support simply never show the pin.
+
+### 4.29 Outbound read/viewed receipts + send rich-face + group receive parity (contract revision 1.34, 2026-10-04)
+
+The outbound receipt face, the send-side mention face, and the group-receive parity note. All
+upstream JSON-RPC extensions below are provided by `kt-signal-engine` (the ADR-0005 replacement
+line, behavior pinned to official Signal-Desktop `sendReceipts.preload.ts` /
+`SendMessage.preload.ts`); against stock `signal-cli 0.14.8` the new methods fail upstream and
+surface through the existing error mapping — a declared swap boundary, not a silent gap.
+
+- `messages.markRead` / `messages.markViewed`: send-lane, account-scoped mutating (reaction
+  precedent §4.6 write-lane mutex). Params: `accountId`, `conversationId`, optional `messageIds`
+  (bounded 512, incoming rows only — outgoing and system rows are skipped; absent = every
+  incoming row of the conversation, ascending `sent_at`, bounded 512). The connector does not
+  persist our own read state (the desktop owns its unread state), so absent mode may re-receipt
+  rows the desktop already marked — duplicates are protocol-idempotent for the peer. Rows whose
+  author cannot be resolved from local data (group rows carrying only the sender hash, §4.28)
+  are skipped from the fan-out, not an error. The connector groups the selected rows by author
+  and calls the engine `sendReadReceipt` / `sendViewedReceipt` once per author (single-author
+  recipient + that author's timestamps; the engine chunks 100 per envelope, official CHUNK_SIZE).
+  Result follows the reaction precedent: `{"status": "sent"}` / `{"status": "unknown"}` — a
+  receipt send failure never fails the request, and unknown outcomes are never retried
+  (AGENTS.md). Zero eligible rows is a trivial `{"status": "sent"}` no-op. Handshake
+  `capabilities` gains `send-receipts`.
+- Auto delivery receipts: for every incoming envelope the connector best-effort calls the engine
+  `sendDeliveryReceipt` (author, [sent_at]) after the row lands — official receiving-client
+  behavior, no user setting, no retry, fully silent (failures change nothing).
+- `messages.sendText` gains optional `mentions: [{number, start, length}]` (bounded 64, the §4.20
+  receive caps mirrored; `number` resolves contacts-first, ACI passthrough; offsets are UTF-16
+  code units, the official BodyRange semantics — the caller indexes its own body). Engine side
+  converts to `BodyRange.MentionAci`. Bounds violations drop the entry; a fully malformed array
+  fails closed `INVALID_REQUEST`.
+- Upstream rich-face parity notes (no connector change): `quoteTimestamp`/`quoteAuthor`
+  (contract 1.13) and `previewUrl`/`previewTitle`/`previewDescription` (§4.21) now take real
+  effect on the engine wire face — quote `text` is enriched engine-side from the engine's own
+  store (official/`signal-cli` behavior; when the quoted body is unknown the quote rides without
+  text, the official degrade path), and `previewImage` (same data-URI shape as `attachments`)
+  uploads with the attachment batch and lands as the official `Preview.image` (engine
+  2026-10-04; before that face imageless previews rode protocol-valid).
+- Group receive parity: the engine now projects the signal-cli-shaped `groupInfo {groupId}` on
+  inbound group `dataMessage` / `sentMessage` (master-key base64, the exact shape
+  `data_message_group_id` already consumes), so group receives land through the unchanged
+  connector pipeline — the earlier "engine skips groups" note is void. Group conversation
+  skeletons remain progressive-fill (first group message); direct-chat skeletons are covered by
+  the engine's contacts sync on link/restart (its receive pipeline runs one
+  `request_contacts` round per account, warn-only, 60s one-shot — no connector change).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
