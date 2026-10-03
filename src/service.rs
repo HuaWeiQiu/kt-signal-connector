@@ -6369,6 +6369,61 @@ mod tests {
         assert_eq!(outgoing.read_at, Some(5678));
     }
 
+    /// A receipt envelope without its own timestamp (contract 1.32) falls
+    /// back to the connector clock: the row is stamped with a positive now
+    /// and the event carries exactly the stamp it just wrote.
+    #[test]
+    fn receipt_without_envelope_timestamp_falls_back_to_connector_clock() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+
+        let before = crate::link::now_ms();
+        let delivered = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::Receipt {
+                        kind: ReceiptKind::Delivered,
+                        timestamps: vec![400],
+                        when: None,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let after = crate::link::now_ms();
+
+        assert_eq!(delivered.len(), 1);
+        let fallback = match &delivered[0] {
+            HostSideEvent::MessageStatusChanged {
+                status,
+                delivered_at,
+                read_at,
+                ..
+            } if *status == "delivered" && read_at.is_none() => {
+                delivered_at.expect("fallback stamp must be present")
+            }
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(
+            fallback >= before && fallback <= after,
+            "fallback stamp {fallback} outside [{before}, {after}]"
+        );
+
+        let outgoing = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 400)
+            .unwrap();
+        assert_eq!(outgoing.status, "delivered");
+        assert_eq!(outgoing.delivered_at, Some(fallback));
+        assert_eq!(outgoing.read_at, None);
+    }
+
     /// Peer edits snapshot the body they replace (contract 1.32): each
     /// upserted record rides the ascending prior-body history and reloaded
     /// rows keep it (the desktop renders newest-first on its own).
