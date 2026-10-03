@@ -1343,8 +1343,13 @@ phone must be online and cooperate at link time, and an installation that ever r
 re-import (isLinkAndSyncEnabled gates on registration). Upstream tracking: AsamK/signal-cli
 issue/PR #2134 (open, 2026-09-29, "qr history daemon") proposes `importHistory` on
 `startLink`/`finishLink` plus paged `export-history` with attachment metadata only — not merged,
-not released. Re-evaluate the pinned signal-cli bump (or a kt-signal-engine backup5 project) when
-that lands or when product prioritizes full history; until then this boundary stands.
+not released, and has no maintainer engagement. Product decision (2026-10-03): full link-time
+history is a hard requirement, so this is no longer a standing boundary but an active project:
+kt-signal-engine ADR 0005 (2026-10-03) commits to a self-built backup5 receiver (capability
+advertisement, ephemeralBackupKey capture, archive download/decrypt, receive-compatible frame
+export) with a real-device S1 spike as the kill gate; libsignal v0.99.0 (already in the engine's
+dependency tree) ships the `message-backup` and backup-key primitives. Until S2/S3 land, the
+connector keeps serving skeletons only (§6.5).
 
 ### 6.7 Media limitation
 
