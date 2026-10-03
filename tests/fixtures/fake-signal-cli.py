@@ -469,6 +469,20 @@ for line in sys.stdin:
         if method == "sendPinMessage" and params.get("targetTimestamp") == 424:
             os._exit(23)
         result = {}
+    elif method in ("sendDeliveryReceipt", "sendReadReceipt", "sendViewedReceipt"):
+        # Contract 1.34 receipt face: same dispatch-recording discipline as
+        # `send`: the exact upstream params, so tests can assert the
+        # {account, recipient (single author), timestamps} contract.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # One-shot crash with the mutating call in flight: the receipt may or
+        # may not have reached the server, which is the indeterminate case
+        # (engine-exit path). Sentinel 425 keeps the sentinel space disjoint
+        # from remoteDelete 421 / reaction 423 / pin 424.
+        if 425 in (params.get("timestamps") or []):
+            os._exit(23)
+        result = {}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the single-string recipient contract.

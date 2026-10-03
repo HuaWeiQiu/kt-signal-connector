@@ -29,13 +29,14 @@ use crate::service::{
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
     MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
     MessagesSendReactionParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
     PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
-use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, PHASE2_CAPABILITIES};
+use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -501,7 +502,7 @@ where
             json!({
                 "sessionId": random_identifier(),
                 "apiVersion": API_VERSION,
-                "capabilities": PHASE2_CAPABILITIES,
+                "capabilities": advertised_capabilities(),
             }),
         ),
     )
@@ -1092,6 +1093,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                 params.client_request_id,
                                 params.quote_message_id,
                                 params.previews,
+                                params.mentions,
                             )
                             .await
                         {
@@ -1299,6 +1301,38 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.sendAdminDelete params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Outbound receipt face (contract revision 1.34): the pin dispatch
+        // shape — params shape errors answer INVALID_REQUEST, and the answer
+        // is {status: sent|unknown}; a receipt send failure never fails the
+        // request (the supervisor aggregates per-author calls into unknown).
+        "messages.markRead" => {
+            match serde_json::from_value::<MessagesMarkReadParams>(request.params) {
+                Ok(params) => match runtime.send_mark_read(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid messages.markRead params", false),
+                ),
+            }
+        }
+        "messages.markViewed" => {
+            match serde_json::from_value::<MessagesMarkViewedParams>(request.params) {
+                Ok(params) => match runtime.send_mark_viewed(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.markViewed params",
                         false,
                     ),
                 ),

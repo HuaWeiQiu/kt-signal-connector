@@ -55,6 +55,12 @@ pub const METHODS: &[MethodRow] = &[
     ("messages.sendPinMessage", Lane::Send, true, "send"),
     ("messages.sendUnpinMessage", Lane::Send, true, "send"),
     ("messages.sendAdminDelete", Lane::Send, true, "send"),
+    // Outbound receipt face (contract 1.34): mutating, send-lane upstream
+    // traffic — the reaction class again; the receipt send failure never
+    // fails the request, but the write-lane mutex and delete drain barrier
+    // still serialize it against sends on the same account.
+    ("messages.markRead", Lane::Send, true, "send"),
+    ("messages.markViewed", Lane::Send, true, "send"),
     // Media ingest (ADR 0002): the chunked streaming triple rides the READ
     // lane — one bounded chunk per call, no mutation, no upstream traffic.
     // The one-shot base64 reader (`messages.attachments.get`, contract 1.10
@@ -116,6 +122,14 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
     names
 };
 
+/// Feature capability tags that ride the handshake `capabilities` array
+/// beyond the method-name list (contract revision 1.34): `send-receipts`
+/// marks the outbound receipt face — `messages.markRead` /
+/// `messages.markViewed` plus the auto delivery receipt — as present. They
+/// never join [`METHOD_NAMES`]: the schema request-frame method enum and the
+/// dispatch table describe real methods only.
+pub const FEATURE_CAPABILITIES: &[&str] = &["send-receipts"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +161,8 @@ mod tests {
             "messages.sendPinMessage",
             "messages.sendUnpinMessage",
             "messages.sendAdminDelete",
+            "messages.markRead",
+            "messages.markViewed",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
         ];
@@ -160,6 +176,8 @@ mod tests {
             "messages.sendPinMessage",
             "messages.sendUnpinMessage",
             "messages.sendAdminDelete",
+            "messages.markRead",
+            "messages.markViewed",
             "contacts.sync",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
@@ -188,7 +206,18 @@ mod tests {
     /// the classification rows cannot drift apart.
     #[test]
     fn capabilities_and_metrics_labels_derive_from_the_table() {
+        // The advertised method list is exactly the table; the handshake
+        // payload appends the feature tags after it (contract revision 1.34:
+        // `send-receipts`).
         assert_eq!(crate::PHASE2_CAPABILITIES, METHOD_NAMES.as_slice());
+        assert_eq!(
+            crate::advertised_capabilities()[..METHOD_NAMES.len()],
+            METHOD_NAMES[..]
+        );
+        assert_eq!(
+            &crate::advertised_capabilities()[METHOD_NAMES.len()..],
+            FEATURE_CAPABILITIES
+        );
         let names: Vec<_> = METHODS.iter().map(|row| row.0).collect();
         let mut unique = names.clone();
         unique.sort_unstable();

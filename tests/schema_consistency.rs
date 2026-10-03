@@ -33,9 +33,9 @@ use serde_json::Value;
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
-    MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES,
-    MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES,
-    MAX_OPAQUE_ID_BYTES, MAX_TEXT_BYTES,
+    MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
+    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_SEND_MENTIONS, MAX_TEXT_BYTES,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -386,6 +386,21 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/contactsListParams/properties/limit",
             "maximum",
             MAX_PAGE_LIMIT as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/mentions",
+            "maxItems",
+            MAX_SEND_MENTIONS as u64,
+        ),
+        (
+            "/$defs/messagesMarkReadParams/properties/messageIds",
+            "maxItems",
+            MARK_RECEIPT_MESSAGE_IDS_LIMIT as u64,
+        ),
+        (
+            "/$defs/messagesMarkViewedParams/properties/messageIds",
+            "maxItems",
+            MARK_RECEIPT_MESSAGE_IDS_LIMIT as u64,
         ),
     ];
     assert!(!pairs.is_empty());

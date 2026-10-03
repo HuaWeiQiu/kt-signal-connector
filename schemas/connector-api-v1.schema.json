@@ -58,6 +58,8 @@
             "messages.sendPinMessage",
             "messages.sendUnpinMessage",
             "messages.sendAdminDelete",
+            "messages.markRead",
+            "messages.markViewed",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
@@ -282,6 +284,28 @@
         },
         {
           "if": {
+            "properties": { "method": { "const": "messages.markRead" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesMarkReadParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.markViewed" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesMarkViewedParams" }
+            }
+          }
+        },
+        {
+          "if": {
             "properties": { "method": { "const": "messages.attachments.open" } },
             "required": ["method"]
           },
@@ -455,7 +479,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "text", "clientRequestId"],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional).",
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). mentions (contract revision 1.34) is the optional outbound @mention list: at most 64 entries (extras are dropped, the §4.20 receive cap mirrored); number resolves contacts-first with ACI/UUID passthrough — an entry whose number resolves to nothing local is dropped (the official behavior for unresolvable mention addresses), and an empty number fails closed INVALID_REQUEST; start/length are UTF-16 code-unit offsets the caller indexes against its own body (the official BodyRange semantics).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -483,7 +507,36 @@
           "description": "Non-empty text; the service authoritatively enforces at most 65536 UTF-8 bytes."
         },
         "clientRequestId": { "$ref": "#/$defs/opaqueId" },
-        "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
+        "quoteMessageId": { "$ref": "#/$defs/opaqueId" },
+        "mentions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["number", "start", "length"],
+            "properties": {
+              "number": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "The mentioned address: a phone number (resolved against the local contacts cache, digit-suffix rule) or a UUID-shaped ACI (passthrough)."
+              },
+              "start": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295,
+                "description": "UTF-16 code-unit offset into the caller's body."
+              },
+              "length": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295,
+                "description": "UTF-16 code-unit length of the mentioned range."
+              }
+            }
+          }
+        }
       }
     },
     "messagesRetryTextParams": {
@@ -628,6 +681,38 @@
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "messageId": { "$ref": "#/$defs/opaqueId" },
         "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesMarkReadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Send the upstream read receipt for messages the peers authored (contract revision 1.34; official sendReceipts per-author fan-out, one engine sendReadReceipt per author with that author's timestamps, the engine chunking 100 per envelope). messageIds is optional: absent means every incoming row of the conversation in ascending sentAt order, both forms bounded at 512 (an explicit list beyond 512 is truncated, not rejected). Only incoming rows qualify — outgoing and system rows are skipped; rows whose author cannot be resolved from local data (group rows carry only a local sender hash) are skipped from the fan-out, not an error. The connector does not persist our own read state (the desktop owns its unread state), so the absent form may re-receipt rows the desktop already marked — duplicates are protocol-idempotent for the peer. The result is {status: 'sent'} when every per-author upstream call confirmed, or {status: 'unknown'} when any failed (including an indeterminate outcome); a receipt failure never fails the request and 'unknown' is never retried automatically. Zero eligible rows is a trivial {status: 'sent'} no-op.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageIds": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/opaqueId" },
+          "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
+        }
+      }
+    },
+    "messagesMarkViewedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Send the upstream viewed receipt (contract revision 1.34): identical addressing, selection bounds, per-author fan-out, and {status: sent|unknown} aggregation as messages.markRead, with the engine sendViewedReceipt upstream face.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageIds": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/opaqueId" },
+          "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
+        }
       }
     },
     "messagesAttachmentsOpenParams": {

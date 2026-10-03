@@ -61,6 +61,15 @@ pub const MAX_ATTACHMENT_ID_BYTES: usize = 128;
 /// messageId, clientRequestId, operationId, peerKey, peerTitle, query,
 /// groupKey — the schema's opaqueId family and its inline 128 peers).
 pub const MAX_OPAQUE_ID_BYTES: usize = 128;
+/// The receipt selection cap (contract revision 1.34, §4.29): both the
+/// absent-`messageIds` scan and an explicit list are bounded at 512 incoming
+/// rows — the schema declares the same bound as the early shape guard, this
+/// constant is the authoritative code-side enforcement.
+pub const MARK_RECEIPT_MESSAGE_IDS_LIMIT: usize = 512;
+/// The outbound @mention cap (contract revision 1.34): the §4.20 receive
+/// projection cap mirrored — entries beyond 64 are dropped, mirroring the
+/// official bounded BodyRange list.
+pub const MAX_SEND_MENTIONS: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -782,6 +791,7 @@ impl ConnectorService {
         store_get_message_text(&self.store, account_id, conversation_id, message_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_send_text(
         &self,
         account_id: &str,
@@ -790,6 +800,7 @@ impl ConnectorService {
         client_request_id: &str,
         quote_message_id: Option<&str>,
         previews: Option<Vec<SendTextPreviewParams>>,
+        mentions: Option<Vec<SendTextMentionParams>>,
     ) -> Result<PreparedSend, ServiceError> {
         let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
@@ -804,6 +815,7 @@ impl ConnectorService {
             return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         let account = self.resolve_account(account_id)?;
+        let mentions = self.mentions_to_upstream(&account, mentions)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
         self.dispatch_send(
             &account,
@@ -812,6 +824,7 @@ impl ConnectorService {
             client_request_id,
             quote_message_id,
             preview,
+            mentions,
             None,
             Vec::new(),
         )
@@ -824,6 +837,7 @@ impl ConnectorService {
     /// conversations for synced peers (§6.5), so this path mostly attaches the
     /// first message to an existing skeleton; unknown peers still get their
     /// conversation from this send.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_send_text_to_peer(
         &self,
         account_id: &str,
@@ -832,6 +846,7 @@ impl ConnectorService {
         client_request_id: &str,
         quote_message_id: Option<&str>,
         previews: Option<Vec<SendTextPreviewParams>>,
+        mentions: Option<Vec<SendTextMentionParams>>,
     ) -> Result<PreparedSend, ServiceError> {
         let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
@@ -865,6 +880,7 @@ impl ConnectorService {
             return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         let account = self.resolve_account(account_id)?;
+        let mentions = self.mentions_to_upstream(&account, mentions)?;
         let title = peer_title.unwrap_or_else(|| {
             if kind == "group" {
                 "group".to_string()
@@ -882,9 +898,71 @@ impl ConnectorService {
             client_request_id,
             quote_message_id,
             preview,
+            mentions,
             None,
             Vec::new(),
         )
+    }
+
+    /// Validate and normalize the caller-supplied mentions (contract revision
+    /// 1.34) into the exact shape the upstream `send` expects. Enforced here —
+    /// not at the engine — because the engine answers a malformed or
+    /// unresolvable mention entry with a late upstream internal error, which
+    /// would surface as an unknown-outcome-shaped send failure instead of
+    /// deterministic local behavior.
+    ///
+    /// Rules (spec §4.29): more than 64 entries are dropped (the §4.20
+    /// receive cap mirrored); an empty/whitespace number fails the whole
+    /// request closed INVALID_REQUEST; a UUID-shaped number passes through
+    /// (the engine resolves ACIs directly); anything else must digit-suffix
+    /// match the linked account's own number or the cached contacts — the
+    /// engine `resolve_author_aci` rule — and is dropped when nothing matches
+    /// (the official behavior for unresolvable mention addresses). Entries
+    /// that survive keep their `number` verbatim: the engine re-resolves
+    /// against its own store, which stays the single resolution authority.
+    fn mentions_to_upstream(
+        &self,
+        account: &AccountRow,
+        mentions: Option<Vec<SendTextMentionParams>>,
+    ) -> Result<Option<Vec<UpstreamSendMention>>, ServiceError> {
+        let Some(mentions) = mentions else {
+            return Ok(None);
+        };
+        let mut upstream = Vec::with_capacity(mentions.len().min(MAX_SEND_MENTIONS));
+        let mut contacts: Option<Vec<String>> = None;
+        for entry in mentions.into_iter().take(MAX_SEND_MENTIONS) {
+            if entry.number.trim().is_empty() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "mention number must not be empty",
+                    false,
+                )));
+            }
+            let keep = is_uuid_shaped(&entry.number) || {
+                let digits = address_digits(&entry.number);
+                !digits.is_empty()
+                    && (address_digits(&account.signal_account) == digits
+                        || contacts
+                            .get_or_insert_with(|| {
+                                self.store
+                                    .contact_peer_keys(&account.id)
+                                    .unwrap_or_default()
+                            })
+                            .iter()
+                            .any(|peer_key| {
+                                let candidate = address_digits(peer_key);
+                                !candidate.is_empty() && candidate.ends_with(&digits)
+                            }))
+            };
+            if keep {
+                upstream.push(UpstreamSendMention {
+                    number: entry.number,
+                    start: entry.start,
+                    length: entry.length,
+                });
+            }
+        }
+        Ok((!upstream.is_empty()).then_some(upstream))
     }
 
     /// Send one attachment (optionally with a caption) — implementation-plan
@@ -984,6 +1062,7 @@ impl ConnectorService {
             client_request_id,
             quote_message_id,
             None,
+            None,
             Some(vec![json!(data_uri)]),
             vec![descriptor],
         )
@@ -998,6 +1077,7 @@ impl ConnectorService {
         client_request_id: &str,
         quote_message_id: Option<&str>,
         link_preview: Option<UpstreamSendPreview>,
+        mentions: Option<Vec<UpstreamSendMention>>,
         attachments: Option<Vec<Value>>,
         attachment_descriptors: Vec<NormalizedAttachment>,
     ) -> Result<PreparedSend, ServiceError> {
@@ -1066,6 +1146,7 @@ impl ConnectorService {
             &account.signal_account,
             text,
             link_preview.as_ref(),
+            mentions.as_deref(),
             attachments,
             quote,
             conversation,
@@ -1089,6 +1170,11 @@ impl ConnectorService {
     /// optional previewImage carrying a path or RFC 2397 data URI — the
     /// connector passes data URIs only, mirroring `attachments`).
     ///
+    /// Outbound @mentions (contract revision 1.34) project onto the engine
+    /// `send` `mentions` entry keys verbatim — `number`/`start`/`length`;
+    /// validation and address resolution happened in `mentions_to_upstream`,
+    /// so every entry that gets here is upstream-safe.
+    ///
     /// signal-cli jsonRpc send accepts `attachments` entries as file paths or
     /// RFC 2397 data URIs (SendCommand --attachment, pinned 0.14.7); the
     /// connector passes data URIs only — bytes stay in memory, no
@@ -1101,6 +1187,7 @@ impl ConnectorService {
         signal_account: &str,
         text: &str,
         preview: Option<&UpstreamSendPreview>,
+        mentions: Option<&[UpstreamSendMention]>,
         attachments: Option<Vec<Value>>,
         quote: Option<(u64, String)>,
         conversation: &ConversationRow,
@@ -1118,6 +1205,23 @@ impl ConnectorService {
             if let Some(image) = &link_preview.image_data_uri {
                 params["previewImage"] = json!(image);
             }
+        }
+        if let Some(mentions) = mentions {
+            // The engine `send` mention entry keys, verbatim (number/start/
+            // length); offsets are UTF-16 code units passed through — the
+            // caller indexes its own body.
+            params["mentions"] = json!(
+                mentions
+                    .iter()
+                    .map(|mention| {
+                        json!({
+                            "number": mention.number,
+                            "start": mention.start,
+                            "length": mention.length,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
         }
         if let Some(attachments) = attachments {
             params["attachments"] = Value::Array(attachments);
@@ -1207,9 +1311,13 @@ impl ConnectorService {
             .as_deref()
             .map(|quote_id| self.resolve_quote(&account, &conversation, quote_id))
             .transpose()?;
+        // Mentions are not persisted on the row, so a retry rebuilds the send
+        // without them (documented deviation: a retried mention send goes out
+        // un-highlighted; the text arrives unchanged).
         let params = Self::upstream_text_send_params(
             &account.signal_account,
             &text,
+            None,
             None,
             None,
             quote,
@@ -1684,6 +1792,104 @@ impl ConnectorService {
         Ok(self
             .store
             .conversation_summary(account_id, conversation_id)?)
+    }
+
+    /// messages.markRead (contract revision 1.34, §4.29): select the
+    /// receipt-eligible incoming rows of one conversation and group their
+    /// upstream timestamps by author — one engine `sendReadReceipt` per
+    /// author, the official per-author fan-out (the engine chunks 100 per
+    /// envelope). No local row changes — the desktop owns its read state —
+    /// so there is no complete step; an empty group list is the trivial
+    /// no-op the supervisor answers `{"status":"sent"}` for.
+    pub fn prepare_mark_read(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<PreparedReceipts, ServiceError> {
+        self.prepare_receipt(account_id, conversation_id, message_ids)
+    }
+
+    /// messages.markViewed: identical addressing, selection, and grouping,
+    /// upstream `sendViewedReceipt`.
+    pub fn prepare_mark_viewed(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<PreparedReceipts, ServiceError> {
+        self.prepare_receipt(account_id, conversation_id, message_ids)
+    }
+
+    /// Shared mark-read/mark-viewed body. Validation runs in the 1.33
+    /// `resolve_pin_target` order — ids, account, conversation, then the
+    /// bounded selection — so a bogus address answers its deterministic
+    /// NOT_FOUND before any store scan. Author resolution follows the
+    /// reaction addressing model read-side: a direct conversation's incoming
+    /// rows are all the peer's; group rows persist only a local sender hash
+    /// (§4.28), so their author is unknown and they are skipped from the
+    /// fan-out — skipped, not an error (spec: rows whose author cannot be
+    /// resolved are skipped).
+    fn prepare_receipt(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<PreparedReceipts, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        let rows = match message_ids {
+            Some(ids) => {
+                for id in ids.iter().take(MARK_RECEIPT_MESSAGE_IDS_LIMIT) {
+                    validate_opaque_id(id, "messageId")?;
+                }
+                // Explicit lists beyond the cap are truncated, not rejected:
+                // a receipt marks what it can, and the bound keeps one
+                // request's fan-out bounded (the schema guards the same 512
+                // earlier).
+                let bounded: Vec<String> = ids
+                    .into_iter()
+                    .take(MARK_RECEIPT_MESSAGE_IDS_LIMIT)
+                    .collect();
+                self.store
+                    .incoming_rows_by_ids(account_id, conversation_id, &bounded)?
+            }
+            None => self.store.incoming_rows_for_receipts(
+                account_id,
+                conversation_id,
+                MARK_RECEIPT_MESSAGE_IDS_LIMIT as u32,
+            )?,
+        };
+        let groups = if conversation.kind == "direct" {
+            // Rows arrive in receipt order (`sent_at ASC, id ASC`) from both
+            // store paths, so per-author timestamps stay ascending; same-
+            // timestamp rows collapse (duplicates are protocol-idempotent,
+            // but one entry per upstream timestamp is what the official
+            // desktop sends).
+            let mut timestamps = rows
+                .into_iter()
+                .map(|row| row.sent_at)
+                .collect::<Vec<u64>>();
+            timestamps.dedup();
+            if timestamps.is_empty() {
+                Vec::new()
+            } else {
+                vec![ReceiptGroup {
+                    recipient: conversation.peer_key.clone(),
+                    timestamps,
+                }]
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(PreparedReceipts {
+            account_id: account.id,
+            conversation_id: conversation.id,
+            account_signal: account.signal_account,
+            groups,
+        })
     }
 
     /// messages.attachments.open (ADR 0002, contract revision 1.17): resolve
@@ -2634,6 +2840,29 @@ pub struct PreparedPin {
     pub pin_duration_seconds: Option<u32>,
 }
 
+/// One per-author receipt group (contract revision 1.34): the recipient the
+/// engine addresses — the message author, never the whole group (official
+/// receipts are always per-author direct sends) — plus that author's upstream
+/// timestamps in receipt order.
+#[derive(Debug)]
+pub struct ReceiptGroup {
+    pub recipient: String,
+    pub timestamps: Vec<u64>,
+}
+
+/// The `messages.markRead` / `messages.markViewed` prepare result: the
+/// resolved account plus the per-author fan-out. An empty group list is the
+/// trivial no-op the supervisor answers `{"status":"sent"}` for; the
+/// supervisor calls the engine once per group and never fails the request on
+/// a receipt-call failure.
+#[derive(Debug)]
+pub struct PreparedReceipts {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub account_signal: String,
+    pub groups: Vec<ReceiptGroup>,
+}
+
 /// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
 /// unguessable 128-bit handle bound to the resolved
 /// (account, conversation, message, attachment) tuple, the file size the
@@ -2796,6 +3025,21 @@ pub struct MessagesSendTextParams {
     pub client_request_id: String,
     pub quote_message_id: Option<String>,
     pub previews: Option<Vec<SendTextPreviewParams>>,
+    pub mentions: Option<Vec<SendTextMentionParams>>,
+}
+
+/// One outbound @mention entry (contract revision 1.34, §4.29): the shape
+/// mirrors the §4.20 receive projection — `number` resolves contacts-first
+/// (ACI/UUID passthrough), and `start`/`length` are UTF-16 code-unit offsets
+/// the caller indexes against its own body (the official BodyRange
+/// semantics). A malformed entry fails params deserialization with
+/// INVALID_REQUEST before anything else runs.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendTextMentionParams {
+    pub number: String,
+    pub start: u32,
+    pub length: u32,
 }
 
 /// Retry one definitively-failed outgoing text (contract 1.31): addressed by
@@ -2835,6 +3079,19 @@ pub struct UpstreamSendPreview {
     pub title: String,
     pub description: Option<String>,
     pub image_data_uri: Option<String>,
+}
+
+/// A validated mention passed down to `dispatch_send` and projected 1:1 onto
+/// the upstream `mentions` entry keys (`number`/`start`/`length`). Only
+/// entries the connector could plausibly resolve — a UUID-shaped ACI, the
+/// linked account's own number, or a digit-suffix match of the cached
+/// contacts — survive this far; everything else was dropped at validation
+/// (the official behavior for unresolvable mention addresses).
+#[derive(Debug, Clone)]
+pub struct UpstreamSendMention {
+    pub number: String,
+    pub start: u32,
+    pub length: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2929,6 +3186,30 @@ pub struct MessagesSendAdminDeleteParams {
     pub conversation_id: String,
     pub message_id: String,
     pub operation_id: Option<String>,
+}
+
+/// messages.markRead / messages.markViewed params (contract revision 1.34):
+/// the conversation plus an optional bounded `messageIds` list — absent means
+/// every incoming row of the conversation (ascending `sentAt`, bounded 512);
+/// explicit ids beyond 512 are truncated, not rejected. No operationId: the
+/// request never mutates local state and its outcome never triggers a retry,
+/// so there is nothing to correlate.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesMarkReadParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Option<Vec<String>>,
+}
+
+/// messages.markViewed params: identical shape to
+/// [`MessagesMarkReadParams`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesMarkViewedParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Option<Vec<String>>,
 }
 
 /// messages.attachments.open params (ADR 0002): the message-addressing triple
@@ -3081,6 +3362,38 @@ fn previews_to_upstream(
         .and_then(|list| list.into_iter().next())
         .map(|preview| normalize_send_preview(preview, text))
         .transpose()
+}
+
+/// The ACI/UUID wire shape (contract revision 1.34): 36 chars, hyphens at the
+/// canonical positions, hex elsewhere. Only this shape passes the mention
+/// gate without a contacts lookup — the engine's ServiceId parse accepts
+/// exactly it for bare-UUID entries.
+fn is_uuid_shaped(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        match index {
+            8 | 13 | 18 | 23 => {
+                if *byte != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The ASCII digits of an address — the engine `resolve_author_aci` matching
+/// key (numbers compare as digit-suffix, ignoring formatting).
+fn address_digits(value: &str) -> String {
+    value.chars().filter(char::is_ascii_digit).collect()
 }
 
 /// Validate and normalize the caller-supplied link preview into the exact
@@ -3924,6 +4237,7 @@ mod tests {
                         image_data_uri: None,
                     },
                 ]),
+                None,
             )
             .unwrap()
         {
@@ -3967,6 +4281,7 @@ mod tests {
                 "req-preview-absent",
                 None,
                 Some(vec![preview("https://example.com/a", "Example")]),
+                None,
             )
             .unwrap_err();
         assert!(matches!(url_absent, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -3984,6 +4299,7 @@ mod tests {
                     description: None,
                     image_data_uri: Some("/etc/passwd".into()),
                 }]),
+                None,
             )
             .unwrap_err();
         assert!(matches!(path_image, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -3996,6 +4312,7 @@ mod tests {
                 "req-preview-title",
                 None,
                 Some(vec![preview("https://example.com/a", "   ")]),
+                None,
             )
             .unwrap_err();
         assert!(matches!(empty_title, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -4028,6 +4345,7 @@ mod tests {
                 &conversation.id,
                 "to retry",
                 "retry-req-1",
+                None,
                 None,
                 None,
             )
@@ -4092,6 +4410,7 @@ mod tests {
                 "retry-req-2",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -4154,6 +4473,7 @@ mod tests {
                 &conversation.id,
                 "same text is not identity",
                 "client-request-exact",
+                None,
                 None,
                 None,
             )
@@ -4242,6 +4562,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-race",
+                None,
                 None,
                 None,
             )
@@ -4479,6 +4800,7 @@ mod tests {
                 "peer-req-1",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -4509,6 +4831,7 @@ mod tests {
                 },
                 "hello again",
                 "peer-req-2",
+                None,
                 None,
                 None,
             )
@@ -4542,6 +4865,7 @@ mod tests {
                     "hello peer",
                     "peer-req-1",
                     None,
+                    None,
                     None
                 )
                 .unwrap(),
@@ -4549,7 +4873,15 @@ mod tests {
         ));
         assert!(matches!(
             service
-                .prepare_send_text(&account.id, &first, "hello peer", "peer-req-1", None, None)
+                .prepare_send_text(
+                    &account.id,
+                    &first,
+                    "hello peer",
+                    "peer-req-1",
+                    None,
+                    None,
+                    None
+                )
                 .unwrap(),
             PreparedSend::Existing(_)
         ));
@@ -4574,7 +4906,7 @@ mod tests {
                 "text",
                 "req-bad-kind",
                 None,
-             None),
+             None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
         assert!(matches!(
@@ -4588,7 +4920,7 @@ mod tests {
                 "text",
                 "req-empty-peer",
                 None,
-             None),
+             None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
         assert!(matches!(
@@ -4601,6 +4933,7 @@ mod tests {
                 },
                 "text",
                 "req-absent",
+                None,
                 None,
                 None
             ),
@@ -4617,6 +4950,7 @@ mod tests {
                 },
                 "group hello",
                 "req-group",
+                None,
                 None,
                 None,
             )
@@ -4647,6 +4981,7 @@ mod tests {
                 },
                 "masked hello",
                 "req-masked",
+                None,
                 None,
                 None,
             )
@@ -4716,6 +5051,7 @@ mod tests {
                 "req-quote-1",
                 Some(&quoted.id),
                 None,
+                None,
             )
             .unwrap()
         {
@@ -4758,6 +5094,7 @@ mod tests {
                 "req-original",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -4775,6 +5112,7 @@ mod tests {
                 "quote own",
                 "req-quote-own",
                 Some(&pending_id),
+                None,
                 None,
             )
             .unwrap()
@@ -4812,6 +5150,7 @@ mod tests {
                 "req-quote-missing",
                 Some("no-such-message"),
                 None,
+                None,
             )
             .unwrap_err()
             .into_api();
@@ -4827,6 +5166,7 @@ mod tests {
                     &conversation.id,
                     "reply",
                     "req-quote-missing",
+                    None,
                     None,
                     None
                 )
@@ -4844,6 +5184,7 @@ mod tests {
                 "req-pending",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -4857,7 +5198,7 @@ mod tests {
                 "quote pending",
                 "req-quote-pending",
                 Some(&pending_id),
-             None),
+             None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
 
@@ -4899,7 +5240,7 @@ mod tests {
                 "quote group",
                 "req-quote-group",
                 Some(&group_message.id),
-             None),
+             None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
 
@@ -4911,6 +5252,7 @@ mod tests {
                 "cross quote",
                 "req-quote-cross",
                 Some(&group_message.id),
+                None,
                 None
             ),
             Err(ServiceError::Store(StoreError::MessageNotFound))
@@ -4936,7 +5278,15 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let direct_id = match service
-            .prepare_send_text(&account.id, &direct.id, "delete me", "req-rd-1", None, None)
+            .prepare_send_text(
+                &account.id,
+                &direct.id,
+                "delete me",
+                "req-rd-1",
+                None,
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -4970,6 +5320,7 @@ mod tests {
                 &group.id,
                 "group delete",
                 "req-rd-2",
+                None,
                 None,
                 None,
             )
@@ -5010,6 +5361,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-rd-p",
+                None,
                 None,
                 None,
             )
@@ -5121,6 +5473,7 @@ mod tests {
                 "req-sr-1",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -5195,6 +5548,7 @@ mod tests {
                 "req-sr-2",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -5235,6 +5589,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-sr-p",
+                None,
                 None,
                 None,
             )
@@ -5363,6 +5718,7 @@ mod tests {
                 "req-sr-advance",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -5405,6 +5761,7 @@ mod tests {
                 &conversation.id,
                 "reaction target",
                 "req-sr-complete",
+                None,
                 None,
                 None,
             )
@@ -5486,7 +5843,15 @@ mod tests {
             .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
             .unwrap();
         let sent_id = match service
-            .prepare_send_text(&account.id, &direct.id, "pin me", "req-pin-1", None, None)
+            .prepare_send_text(
+                &account.id,
+                &direct.id,
+                "pin me",
+                "req-pin-1",
+                None,
+                None,
+                None,
+            )
             .unwrap()
         {
             PreparedSend::Dispatch { pending_id, .. } => pending_id,
@@ -5578,6 +5943,7 @@ mod tests {
                 "req-pin-group",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -5624,6 +5990,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-pin-pending",
+                None,
                 None,
                 None,
             )
@@ -5720,6 +6087,7 @@ mod tests {
                 "req-pin-direct",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -5787,6 +6155,7 @@ mod tests {
                 &conversation.id,
                 "pin target one",
                 "req-pin-c1",
+                None,
                 None,
                 None,
             )
@@ -6116,6 +6485,7 @@ mod tests {
                 "req-status",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -6146,6 +6516,7 @@ mod tests {
                 "req-fail",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -6165,6 +6536,7 @@ mod tests {
                 &conversation.id,
                 "will vanish",
                 "req-unknown",
+                None,
                 None,
                 None,
             )
@@ -6764,6 +7136,7 @@ mod tests {
                 "req-ctl",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -6774,6 +7147,217 @@ mod tests {
             .complete_send_success(&prepared, account_id, conversation_id, sent_at)
             .unwrap();
         prepared
+    }
+
+    /// Contract 1.34: `prepare_receipt` (markRead/markViewed shared body) —
+    /// a direct conversation fans one group out to its peer with ascending
+    /// deduplicated timestamps, explicit ids are filtered to incoming rows in
+    /// receipt order, group conversations answer zero groups (local sender
+    /// hashes cannot be resolved to an author), a 600-id list is truncated to
+    /// the 512 cap instead of rejected, and an empty conversation is the
+    /// trivial no-op.
+    #[test]
+    fn prepare_receipt_groups_direct_timestamps_and_skips_groups() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let seed = |id: &str, sent_at: u64, direction: &'static str, conv: &str| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conv.to_string(),
+                direction,
+                sender_id: if direction == "incoming" {
+                    "peer-hash".into()
+                } else {
+                    account.id.clone()
+                },
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: if direction == "incoming" {
+                    "delivered"
+                } else {
+                    "sent"
+                },
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                admin_deleted: false,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        seed("m3", 30, "incoming", &conversation.id);
+        seed("out-1", 40, "outgoing", &conversation.id);
+        seed("m1", 10, "incoming", &conversation.id);
+        seed("m2", 20, "incoming", &conversation.id);
+
+        let absent = service
+            .prepare_mark_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(absent.account_id, account.id);
+        assert_eq!(absent.conversation_id, conversation.id);
+        assert_eq!(absent.account_signal, "+15555550100");
+        assert_eq!(absent.groups.len(), 1);
+        assert_eq!(absent.groups[0].recipient, "+15555550101");
+        assert_eq!(absent.groups[0].timestamps, [10, 20, 30]);
+
+        let explicit = service
+            .prepare_mark_viewed(
+                &account.id,
+                &conversation.id,
+                Some(vec![
+                    "m3".into(),
+                    "out-1".into(),
+                    "m3".into(),
+                    "missing".into(),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(explicit.groups.len(), 1);
+        assert_eq!(explicit.groups[0].timestamps, [30]);
+
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Group")
+            .unwrap();
+        seed("g1", 50, "incoming", &group.id);
+        let group_receipts = service
+            .prepare_mark_read(&account.id, &group.id, None)
+            .unwrap();
+        assert!(
+            group_receipts.groups.is_empty(),
+            "group rows carry no resolvable author"
+        );
+
+        let truncated = service
+            .prepare_mark_read(
+                &account.id,
+                &conversation.id,
+                Some((0..600).map(|index| format!("junk-{index}")).collect()),
+            )
+            .unwrap();
+        assert!(truncated.groups.is_empty(), "truncation drops unknown ids");
+
+        let empty_conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Quiet")
+            .unwrap();
+        let empty = service
+            .prepare_mark_viewed(&account.id, &empty_conversation.id, None)
+            .unwrap();
+        assert!(empty.groups.is_empty());
+    }
+
+    /// Contract 1.34 outbound mentions: more than 64 entries are capped, an
+    /// empty number fails the whole request INVALID_REQUEST, a UUID-shaped
+    /// number passes through without a lookup, the linked account's own
+    /// number and digit-suffix contact matches survive, an unresolvable
+    /// number drops its entry, and an all-dropped list leaves the upstream
+    /// params without a `mentions` key at all.
+    #[test]
+    fn send_text_mentions_are_capped_resolved_and_dropped_locally() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        service
+            .store_ref()
+            .upsert_synced_contacts(
+                &account.id,
+                &[SyncedContact {
+                    kind: "contact",
+                    peer_key: "+15555550101",
+                    title: "Peer",
+                    extra: None,
+                }],
+                1,
+            )
+            .unwrap();
+        let uuid = |index: usize| format!("00000000-0000-4000-8000-{index:012x}");
+        let mention = |number: &str, start: u32, length: u32| SendTextMentionParams {
+            number: number.to_string(),
+            start,
+            length,
+        };
+        let dispatch = |prepared: PreparedSend| match prepared {
+            PreparedSend::Dispatch { params, .. } => params,
+            PreparedSend::Existing(_) => panic!("a fresh client request must dispatch"),
+        };
+        let send = |service: &mut ConnectorService,
+                    client_request_id: &str,
+                    mentions: Vec<SendTextMentionParams>| {
+            service.prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "hi @all",
+                client_request_id,
+                None,
+                None,
+                Some(mentions),
+            )
+        };
+
+        let capped = dispatch(
+            send(
+                &mut service,
+                "req-cap",
+                (0..70).map(|index| mention(&uuid(index), 0, 2)).collect(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(capped["mentions"].as_array().unwrap().len(), 64);
+
+        let error = match send(&mut service, "req-empty", vec![mention("  ", 0, 2)]).unwrap_err() {
+            ServiceError::Api(api) => api,
+            other => panic!("an empty mention number must fail closed, got {other:?}"),
+        };
+        assert_eq!(error.code, "INVALID_REQUEST");
+
+        let resolved = dispatch(
+            send(
+                &mut service,
+                "req-mixed",
+                vec![
+                    mention("+19990000001", 0, 2),
+                    mention(&uuid(1), 3, 4),
+                    mention("+15555550101", 7, 8),
+                    mention("+15555550100", 9, 10),
+                ],
+            )
+            .unwrap(),
+        );
+        let entries = resolved["mentions"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["number"], uuid(1));
+        assert_eq!(entries[0]["start"], 3);
+        assert_eq!(entries[0]["length"], 4);
+        assert_eq!(entries[1]["number"], "+15555550101");
+        assert_eq!(entries[2]["number"], "+15555550100");
+
+        let all_dropped = dispatch(
+            send(
+                &mut service,
+                "req-dropped",
+                vec![mention("+19990000001", 0, 2), mention("+19990000002", 3, 4)],
+            )
+            .unwrap(),
+        );
+        assert!(all_dropped.get("mentions").is_none());
     }
 
     /// A peer reaction upserts a message_events row keyed on the reacting
@@ -7631,6 +8215,7 @@ mod tests {
                 &direct.id,
                 "has attachment",
                 request_id,
+                None,
                 None,
                 None,
             )

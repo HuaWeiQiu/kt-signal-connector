@@ -10,17 +10,18 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::engine::{
-    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus, QueuedReceive,
-    ReceiveIngress, SignalCliConfig, event_channel, receive_channel,
+    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
+    NormalizedReceive, QueuedReceive, ReceiveIngress, SignalCliConfig, event_channel,
+    receive_channel,
 };
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
     MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget, PreparedSend,
-    SendTarget, SendTextPreviewParams, ServiceError, account_limit_error, store_get_group,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError, account_limit_error,
+    store_get_group, store_get_message_text, store_list_contacts, store_list_conversations,
+    store_list_messages, store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
@@ -40,6 +41,20 @@ const RETENTION_BATCH_MESSAGES: u32 = 2_000;
 /// Breathing room between retention batches so receives and host requests get
 /// the store lock while a large history is being pruned.
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(50);
+/// Capacity of the auto delivery-receipt queue (contract revision 1.34):
+/// bounded, lossy by design — a full queue drops the job, never the receive.
+const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
+
+/// One queued auto delivery receipt (contract revision 1.34, §4.29): after an
+/// incoming dataMessage row lands, the connector best-effort tells the engine
+/// to send the official delivery receipt to its author. Fully silent: failures
+/// change nothing, and there is no retry.
+#[derive(Clone, Debug)]
+struct DeliveryReceiptJob {
+    account: String,
+    recipient: String,
+    timestamp: u64,
+}
 
 /// What raised a restart request. Drives whether ping recovery may clear a
 /// pending restart: the REST ping says nothing about the receive WebSocket,
@@ -111,6 +126,13 @@ pub struct RuntimeSupervisor {
     /// One-shot contacts/groups re-sync pass (once per process start);
     /// never held across an await.
     contacts_resync: StdMutex<Option<JoinHandle<()>>>,
+    /// Receiver of the bounded auto delivery-receipt queue; `Some` until
+    /// `spawn_delivery_receipt_worker` takes it. The queue itself is created
+    /// in `new` (the persistence loop holds the sender), but the worker can
+    /// only be spawned once the supervisor sits behind its `Arc`.
+    delivery_receipt_rx: StdMutex<Option<mpsc::Receiver<DeliveryReceiptJob>>>,
+    /// The delivery-receipt worker; never held across an await.
+    delivery_receipt_worker: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
 }
@@ -142,12 +164,19 @@ impl RuntimeSupervisor {
             media.clone(),
         )));
         let (receive_ingress, receive_rx) = receive_channel();
+        // Auto delivery receipts (contract revision 1.34): the persistence
+        // loop queues one job per landed incoming dataMessage; the worker
+        // spawned later by the registry drains it. Bounded and lossy — a full
+        // queue drops the receipt job, never the receive.
+        let (delivery_receipt_tx, delivery_receipt_rx) =
+            mpsc::channel::<DeliveryReceiptJob>(DELIVERY_RECEIPT_QUEUE_CAP);
         let receive_worker = tokio::spawn(receive_persistence_loop(
             receive_rx,
             service.clone(),
             host_events.clone(),
             group_id.clone(),
             media.as_ref().map(|media| media.governor().clone()),
+            delivery_receipt_tx,
         ));
         // Contract 1.21: authorization failures observed on this group's
         // engine mark the dead account in the shared store and surface it on
@@ -174,6 +203,8 @@ impl RuntimeSupervisor {
             retention: StdMutex::new(None),
             media_governor_pass: StdMutex::new(None),
             contacts_resync: StdMutex::new(None),
+            delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
+            delivery_receipt_worker: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
         }
     }
@@ -285,6 +316,47 @@ impl RuntimeSupervisor {
             return;
         }
         *slot = Some(run_media_governor_pass(governor));
+    }
+
+    /// Take the queued auto delivery-receipt receiver and spawn its one
+    /// worker (contract revision 1.34, idempotent). Spawned by the registry —
+    /// not in `new`, which runs before the supervisor sits behind its
+    /// `Arc<Self>` — and the worker re-resolves `running_engine()` per job
+    /// because a pre-cloned engine handle would go stale across watchdog
+    /// restarts. Fully silent: every failure (runtime down, engine error,
+    /// unknown outcome) is dropped; nothing is retried.
+    pub fn spawn_delivery_receipt_worker(self: &Arc<Self>) {
+        let Some(receiver) = self
+            .delivery_receipt_rx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        else {
+            return;
+        };
+        let supervisor = Arc::clone(self);
+        let worker = tokio::spawn(async move {
+            let mut receiver = receiver;
+            while let Some(job) = receiver.recv().await {
+                let Ok(engine) = supervisor.running_engine().await else {
+                    continue;
+                };
+                let _ = engine
+                    .call(
+                        "sendDeliveryReceipt",
+                        json!({
+                            "account": job.account,
+                            "recipient": job.recipient,
+                            "timestamps": [job.timestamp],
+                        }),
+                        CallClass::Mutating,
+                    )
+                    .await;
+            }
+        });
+        if let Ok(mut slot) = self.delivery_receipt_worker.lock() {
+            *slot = Some(worker);
+        }
     }
 
     /// One best-effort contacts/groups re-sync per linked account of this
@@ -1236,6 +1308,7 @@ impl RuntimeSupervisor {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_text(
         &self,
         account_id: String,
@@ -1244,6 +1317,7 @@ impl RuntimeSupervisor {
         client_request_id: String,
         quote_message_id: Option<String>,
         previews: Option<Vec<SendTextPreviewParams>>,
+        mentions: Option<Vec<SendTextMentionParams>>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -1256,6 +1330,7 @@ impl RuntimeSupervisor {
                     &client_request_id,
                     quote_message_id.as_deref(),
                     previews,
+                    mentions,
                 )?,
                 SendTarget::Peer {
                     kind,
@@ -1272,6 +1347,7 @@ impl RuntimeSupervisor {
                     &client_request_id,
                     quote_message_id.as_deref(),
                     previews,
+                    mentions,
                 )?,
             }
         };
@@ -1610,6 +1686,84 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// Outbound read receipt (contract revision 1.34, §4.29): the pin-family
+    /// shape with a fan-out instead of a single call — one engine
+    /// `sendReadReceipt` per author group, results aggregated. A receipt-call
+    /// failure never fails the request: any failure (including an unknown
+    /// outcome) only degrades the answer to `{"status":"unknown"}`, and
+    /// nothing is ever retried automatically.
+    pub async fn send_read_receipt(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<&'static str, ServiceError> {
+        self.send_receipt(account_id, conversation_id, message_ids, "sendReadReceipt")
+            .await
+    }
+
+    /// Outbound viewed receipt (contract revision 1.34): identical fan-out,
+    /// upstream `sendViewedReceipt`.
+    pub async fn send_viewed_receipt(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<&'static str, ServiceError> {
+        self.send_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            "sendViewedReceipt",
+        )
+        .await
+    }
+
+    /// Shared mark-read/mark-viewed body: prepare (selection + author
+    /// grouping) under the service lock, one mutating engine call per author
+    /// group without it. Zero groups is the trivial `sent` no-op; the
+    /// per-author params are exactly the engine contract
+    /// `{account, recipient, timestamps}` — recipient is the single author,
+    /// timestamps ascend (the engine chunks 100 per envelope).
+    async fn send_receipt(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_ids: Option<Vec<String>>,
+        method: &'static str,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            match method {
+                "sendReadReceipt" => {
+                    service.prepare_mark_read(&account_id, &conversation_id, message_ids)?
+                }
+                _ => service.prepare_mark_viewed(&account_id, &conversation_id, message_ids)?,
+            }
+        };
+        if prepared.groups.is_empty() {
+            return Ok("sent");
+        }
+        let mut all_confirmed = true;
+        for group in &prepared.groups {
+            let params = json!({
+                "account": prepared.account_signal,
+                "recipient": group.recipient,
+                "timestamps": group.timestamps,
+            });
+            match engine.call(method, params, CallClass::Mutating).await {
+                Ok(_) => {}
+                // Any failure — definite upstream error, transport trouble,
+                // or an unknown outcome — degrades to `unknown` and is never
+                // propagated: a receipt is best-effort, and an unknown
+                // outcome must not be retried (AGENTS.md).
+                Err(_) => all_confirmed = false,
+            }
+        }
+        Ok(if all_confirmed { "sent" } else { "unknown" })
+    }
+
     /// messages.edit (contract revision 1.15): retarget one previously sent
     /// message's body via the upstream `send` + `editTimestamp` entry point.
     /// Local prepare (row resolution, text bounds) under the service lock,
@@ -1926,6 +2080,11 @@ impl Drop for RuntimeSupervisor {
         {
             handle.abort();
         }
+        if let Ok(mut slot) = self.delivery_receipt_worker.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -2035,6 +2194,7 @@ async fn receive_persistence_loop(
     host_events: broadcast::Sender<HostSideEvent>,
     owner_group: String,
     media_governor: Option<MediaGovernor>,
+    delivery_receipts: mpsc::Sender<DeliveryReceiptJob>,
 ) {
     let mut storage_unavailable = false;
     // ADR 0002 trigger discipline: after every GOVERNOR_INBOUND_MESSAGE_INTERVAL
@@ -2061,8 +2221,8 @@ async fn receive_persistence_loop(
             .await;
             match result {
                 Ok(events) => {
-                    for event in events {
-                        let _ = host_events.send(event);
+                    for event in &events {
+                        let _ = host_events.send(event.clone());
                     }
                     if storage_unavailable {
                         storage_unavailable = false;
@@ -2080,6 +2240,18 @@ async fn receive_persistence_loop(
                             inbound_since_governor_pass = 0;
                             run_media_governor_pass(governor.clone());
                         }
+                    }
+                    // Auto delivery receipt (contract revision 1.34): only a
+                    // real landing proves eligibility — the MessageUpserted
+                    // event in `events` means the row was inserted now (not a
+                    // dedupe replay), and only incoming dataMessage envelopes
+                    // carry an author the receipt can address. Bounded and
+                    // lossy: a full queue drops the job silently.
+                    if let Some(job) = delivery_receipt_job(queued.receive(), &events)
+                        && let Err(_) = delivery_receipts.try_send(job)
+                    {
+                        // Queue full: drop the receipt, never block the
+                        // receive pipeline.
                     }
                     break;
                 }
@@ -2103,6 +2275,34 @@ async fn receive_persistence_loop(
             }
         }
     }
+}
+
+/// Eligibility for one auto delivery receipt (contract revision 1.34): the
+/// envelope must be an incoming dataMessage carrying account, author, and
+/// timestamp, and the ingest pass must have produced a `MessageUpserted`
+/// event for an incoming row — proof the row landed now, not that the
+/// envelope deduped against an already-stored message.
+fn delivery_receipt_job(
+    receive: &NormalizedReceive,
+    events: &[HostSideEvent],
+) -> Option<DeliveryReceiptJob> {
+    if receive.direction != "incoming" || receive.content_kind != "dataMessage" {
+        return None;
+    }
+    let landed = events.iter().any(|event| {
+        matches!(
+            event,
+            HostSideEvent::MessageUpserted(record) if record.direction == "incoming"
+        )
+    });
+    if !landed {
+        return None;
+    }
+    Some(DeliveryReceiptJob {
+        account: receive.account.clone()?,
+        recipient: receive.source.clone()?,
+        timestamp: receive.timestamp?,
+    })
 }
 
 async fn signal_account_present(
@@ -2517,6 +2717,7 @@ mod tests {
                 "req-rd-crash",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -2607,6 +2808,7 @@ mod tests {
                 "req-sr-crash",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -2695,6 +2897,7 @@ mod tests {
                 &conversation.id,
                 "react confirmed",
                 "req-sr-ok",
+                None,
                 None,
                 None,
             )
@@ -2793,6 +2996,7 @@ mod tests {
                 "req-pin-crash",
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -2881,6 +3085,7 @@ mod tests {
                 &conversation.id,
                 "pin confirmed",
                 "req-pin-ok",
+                None,
                 None,
                 None,
             )

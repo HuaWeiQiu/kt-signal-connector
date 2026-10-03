@@ -40,8 +40,8 @@ use crate::engine::{
 use crate::groups::{MAX_PROXY_GROUPS, ProxyGroupPlan};
 use crate::protocol::ApiError;
 use crate::service::{
-    ContactsSyncOutcome, HostSideEvent, MessageText, SendTarget, SendTextPreviewParams,
-    ServiceError,
+    ContactsSyncOutcome, HostSideEvent, MessageText, SendTarget, SendTextMentionParams,
+    SendTextPreviewParams, ServiceError,
 };
 use crate::store::{
     AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
@@ -587,6 +587,7 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_text(
         &self,
         account_id: String,
@@ -595,6 +596,7 @@ impl ProxyGroupRuntime {
         client_request_id: String,
         quote_message_id: Option<String>,
         previews: Option<Vec<SendTextPreviewParams>>,
+        mentions: Option<Vec<SendTextMentionParams>>,
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
@@ -605,6 +607,7 @@ impl ProxyGroupRuntime {
                 client_request_id,
                 quote_message_id,
                 previews,
+                mentions,
             )
             .await
     }
@@ -711,6 +714,37 @@ impl ProxyGroupRuntime {
         let slot = self.slot_for_account(&params.account_id).await?;
         slot.supervisor
             .send_admin_delete(params.account_id, params.conversation_id, params.message_id)
+            .await
+    }
+
+    /// Outbound read receipt routing (contract revision 1.34): the owning
+    /// group's supervisor fans out per author over its own engine.
+    pub async fn send_mark_read(
+        &self,
+        params: crate::service::MessagesMarkReadParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_read_receipt(
+                params.account_id,
+                params.conversation_id,
+                params.message_ids,
+            )
+            .await
+    }
+
+    /// Outbound viewed receipt routing (contract revision 1.34).
+    pub async fn send_mark_viewed(
+        &self,
+        params: crate::service::MessagesMarkViewedParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_viewed_receipt(
+                params.account_id,
+                params.conversation_id,
+                params.message_ids,
+            )
             .await
     }
 
@@ -882,6 +916,7 @@ pub fn open_group_runtime(
         ));
         supervisor.spawn_watchdog();
         supervisor.spawn_media_governor();
+        supervisor.spawn_delivery_receipt_worker();
         slots.push(ProxyGroupSlot {
             id: entry.id.clone(),
             supervisor,

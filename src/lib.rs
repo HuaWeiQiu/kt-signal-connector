@@ -39,3 +39,10 @@ pub const DEFAULT_PROXY_GROUP_ID: &str = "default";
 /// (`methods::METHOD_NAMES`) and never hand-written (optimization-plan §5.2
 /// B1).
 pub const PHASE2_CAPABILITIES: &[&str] = &methods::METHOD_NAMES;
+
+/// The handshake `capabilities` payload: every dispatchable method name in
+/// table order followed by the feature capability tags (contract revision
+/// 1.34: `send-receipts`).
+pub fn advertised_capabilities() -> Vec<&'static str> {
+    [&methods::METHOD_NAMES[..], methods::FEATURE_CAPABILITIES].concat()
+}

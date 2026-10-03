@@ -2997,6 +2997,494 @@ async fn pin_family_round_trips_pinned_state_and_admin_delete_tombstone() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// The receipt send-log lines (contract 1.34 delivery/read/viewed all record
+/// `{account, recipient, timestamps}`), in file order.
+fn receipt_log_lines(contents: &str) -> Vec<Value> {
+    contents
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("timestamps").is_some())
+        .collect()
+}
+
+/// Contract revision 1.34 end to end: the auto delivery receipt fires once per
+/// genuinely-ingested incoming dataMessage (the finishLink burst covers the
+/// default fixture receive, a staged direct message, and a staged group
+/// message — every receipt addresses the author as a single string, never the
+/// group id); `messages.markRead` without messageIds fans the whole direct
+/// conversation out as one ascending per-author read receipt;
+/// `messages.markViewed` with explicit ids narrows to those rows; and a group
+/// markRead is the silent `sent` no-op (local group rows carry no resolvable
+/// author, so zero upstream calls).
+#[tokio::test]
+async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [31_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Stage a group message and a second direct message behind the default
+    // link receive: three incoming dataMessages, three auto delivery receipts.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 50,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "group text"
+                }
+            },
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 60,
+                "dataMessage": { "message": "second direct text" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Receipts" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+
+    // Drain the finish burst: the link answer plus the three message upserts
+    // (42 direct, 50 group, 60 direct).
+    let mut account_id: Option<String> = None;
+    let mut upserted: Vec<Value> = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        while account_id.is_none() || upserted.len() < 3 {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                account_id = Some(frame["result"]["id"].as_str().unwrap().to_string());
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+            {
+                upserted.push(frame["data"].clone());
+            }
+        }
+    })
+    .await
+    .expect("the finish burst must deliver three incoming messages");
+    let account_id = account_id.unwrap();
+
+    // Auto delivery receipts: one per ingested message in ingest order, the
+    // author as a single-string recipient, never a group id.
+    let send_log_path = signal_data.join(".fixture-send-log.jsonl");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(contents) = fs::read_to_string(&send_log_path) {
+                if receipt_log_lines(&contents).len() >= 3 {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("three auto delivery receipts must reach the engine");
+    let delivery_receipts = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
+    assert_eq!(delivery_receipts.len(), 3);
+    let timestamps: Vec<Vec<u64>> = delivery_receipts
+        .iter()
+        .map(|entry| {
+            entry["timestamps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(timestamps, [vec![42], vec![50], vec![60]]);
+    for entry in &delivery_receipts {
+        assert_eq!(entry["account"], "+15555550100");
+        assert_eq!(entry["recipient"], "+15555550101");
+        assert!(entry.get("groupId").is_none());
+    }
+
+    // The messaged direct conversation carries both direct rows (history
+    // ordering puts it first, ahead of the contacts-sync skeletons).
+    let conversations = request(
+        &mut client,
+        "conv-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let items = conversations["result"]["items"].as_array().unwrap();
+    let direct = items.iter().find(|item| item["type"] == "direct").unwrap();
+    let direct_id = direct["id"].as_str().unwrap().to_string();
+    let group = items.iter().find(|item| item["type"] == "group").unwrap();
+    let group_id = group["id"].as_str().unwrap().to_string();
+    let messages = request(
+        &mut client,
+        "messages-1",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let rows = messages["result"]["items"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let id_42 = rows.iter().find(|row| row["sentAt"] == 42).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let id_60 = rows.iter().find(|row| row["sentAt"] == 60).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Absent messageIds: the whole conversation as one ascending read
+    // receipt — distinguishable from every delivery receipt by its [42, 60]
+    // shape, and its log line precedes the markRead answer.
+    let marked = request(
+        &mut client,
+        "mark-read",
+        "messages.markRead",
+        json!({ "accountId": account_id, "conversationId": direct_id }),
+    )
+    .await;
+    assert_eq!(marked["result"]["status"], "sent");
+    let after_read = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
+    assert_eq!(after_read.len(), 4);
+    assert_eq!(after_read[3]["timestamps"], json!([42, 60]));
+    assert_eq!(after_read[3]["recipient"], "+15555550101");
+
+    // Explicit messageIds: exactly the addressed rows, receipt order, same
+    // single-author fan-out.
+    let viewed = request(
+        &mut client,
+        "mark-viewed",
+        "messages.markViewed",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_id,
+            "messageIds": [id_42, id_60]
+        }),
+    )
+    .await;
+    assert_eq!(viewed["result"]["status"], "sent");
+    let after_viewed = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
+    assert_eq!(after_viewed.len(), 5);
+    assert_eq!(after_viewed[4]["timestamps"], json!([42, 60]));
+
+    // A group markRead resolves no author locally: the trivial `sent` no-op
+    // with zero new upstream calls — no receipt ever carries the group id.
+    let group_marked = request(
+        &mut client,
+        "mark-read-group",
+        "messages.markRead",
+        json!({ "accountId": account_id, "conversationId": group_id }),
+    )
+    .await;
+    assert_eq!(group_marked["result"]["status"], "sent");
+    let after_group = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
+    assert_eq!(after_group.len(), 5);
+    assert!(
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .all(|params| params.get("groupId").is_none()),
+        "no receipt call may address the group id"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.34 failure face: the auto delivery receipt is real
+/// upstream traffic — a receipt whose timestamps carry the fixture's 425
+/// sentinel crashes the engine right after link, an explicit restart recovers
+/// on the same store, and the same sentinel inside `messages.markRead`
+/// degrades the answer to `{status: "unknown"}` — a result, never an error,
+/// with no retry.
+#[tokio::test]
+async fn receipt_upstream_failures_degrade_to_unknown_not_errors() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [32_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // The staged direct message's auto delivery receipt carries 425: the
+    // engine dies while the receipt pipeline is demonstrably in flight.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "sourceName": "林菲菲",
+                "timestamp": 425,
+                "dataMessage": { "message": "receipt crash target" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Receipt-Crash" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    wait_for_process_exit(engine_pid).await;
+
+    // The receipt crash is recoverable: an explicit start brings a fresh
+    // engine up on the same data directory (the store kept both rows).
+    let restarted = request(&mut client, "restart-1", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid);
+
+    let conversations = request(
+        &mut client,
+        "conv-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let direct = conversations["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "direct")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The default selection includes the 425 row, so the read receipt kills
+    // the engine mid-call — and the request still answers, degraded to
+    // `unknown`, with no error object and no retry.
+    let marked = request(
+        &mut client,
+        "mark-read",
+        "messages.markRead",
+        json!({ "accountId": account_id, "conversationId": direct }),
+    )
+    .await;
+    assert_eq!(marked["result"]["status"], "unknown");
+    assert!(
+        marked.get("error").is_none(),
+        "a receipt failure must not fail the request: {marked:?}"
+    );
+    wait_for_process_exit(recovered_pid).await;
+    let again = request(&mut client, "restart-2", "runtime.start", json!({})).await;
+    assert_eq!(again["result"]["state"], "running");
+    let final_pid = again["result"]["pid"].as_u64().unwrap() as u32;
+
+    drop(client);
+    wait_for_process_exit(final_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.34 announcement and outbound mentions: the handshake
+/// capabilities carry the new methods plus the `send-receipts` feature tag,
+/// and `messages.sendText` mentions reach the engine resolved — a UUID-shaped
+/// number and the cached contact pass verbatim, the unresolvable number is
+/// dropped locally — while an empty mention number fails the request closed.
+#[tokio::test]
+async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [33_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+
+    // Handshake with an inline capability assertion (the shared helper only
+    // checks the api version).
+    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
+    let client_nonce = hex::encode([9_u8; 32]);
+    let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
+    mac.update(b"kt-signal-connector-v1\0");
+    mac.update(server_nonce.as_bytes());
+    mac.update(b"\0");
+    mac.update(client_nonce.as_bytes());
+    mac.update(b"\0");
+    mac.update(API_VERSION.as_bytes());
+    client
+        .send(
+            json!({
+                "apiVersion": API_VERSION,
+                "requestId": "handshake-1",
+                "method": "handshake",
+                "params": {
+                    "clientNonce": client_nonce,
+                    "proof": hex::encode(mac.finalize().into_bytes())
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let handshake: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.markRead", "messages.markViewed", "send-receipts"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Mentions" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Refresh the contacts cache outside the link debounce so the digit
+    // suffix resolution has +15555550101 to match against.
+    request(
+        &mut client,
+        "sync-1",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let mention_send = request(
+        &mut client,
+        "send-mentions",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "ping @alice",
+            "clientRequestId": "mentions-1",
+            "mentions": [
+                {
+                    "number": "018c3f2a-1b2c-7cde-9f01-234567890abc",
+                    "start": 5,
+                    "length": 6
+                },
+                { "number": "+15555550101", "start": 5, "length": 6 },
+                { "number": "+19990000001", "start": 0, "length": 3 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(mention_send["result"]["status"], "sent");
+    let mentions: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("mentions").is_some())
+        .collect();
+    assert_eq!(mentions.len(), 1);
+    let entries = mentions[0]["mentions"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "the unresolvable number must be dropped");
+    assert_eq!(entries[0]["number"], "018c3f2a-1b2c-7cde-9f01-234567890abc");
+    assert_eq!(entries[0]["start"], 5);
+    assert_eq!(entries[0]["length"], 6);
+    assert_eq!(entries[1]["number"], "+15555550101");
+
+    let invalid = request(
+        &mut client,
+        "send-empty-mention",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "bad mention",
+            "clientRequestId": "mentions-2",
+            "mentions": [{ "number": "  ", "start": 0, "length": 1 }]
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();

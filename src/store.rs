@@ -2375,6 +2375,102 @@ impl Store {
         Ok(moved)
     }
 
+    /// The incoming rows of one conversation in receipt order (`sent_at ASC,
+    /// id ASC`), bounded — the absent-`messageIds` mode of
+    /// `messages.markRead` / `messages.markViewed` (contract 1.34). Only
+    /// incoming rows qualify: an outbound receipt references messages the
+    /// peers authored, never our own sends or system rows.
+    pub fn incoming_rows_for_receipts(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
+                 ORDER BY sent_at ASC, id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(
+                params![account_id, conversation_id, i64::from(limit)],
+                message_record_from_row,
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// The explicit-`messageIds` mode: only rows that exist in this
+    /// conversation and are incoming — outgoing and system rows are skipped,
+    /// duplicates collapse, and the result comes back in receipt order
+    /// (`sent_at ASC, id ASC`) regardless of caller order. One lock, one
+    /// prepared statement, one round of per-id lookups bounded by the caller.
+    pub fn incoming_rows_by_ids(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                 FROM messages
+                 WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = Vec::with_capacity(ids.len());
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        for id in ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(record) = stmt
+                .query_row(
+                    params![id, account_id, conversation_id],
+                    message_record_from_row,
+                )
+                .optional()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+            {
+                rows.push(record);
+            }
+        }
+        rows.sort_by(|left, right| {
+            (left.sent_at, left.id.as_str()).cmp(&(right.sent_at, right.id.as_str()))
+        });
+        Ok(rows)
+    }
+
+    /// The account's cached contact addresses (kind='contact' peer keys) for
+    /// the mention-number resolution (contract 1.34). The caller matches
+    /// digit suffixes in Rust — the same resolution rule the engine applies —
+    /// so a mention number that resolves to nothing local is dropped before
+    /// any upstream call (the official behavior for unresolvable addresses).
+    pub fn contact_peer_keys(&self, account_id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT peer_key FROM contacts WHERE account_id=?1 AND kind='contact'")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| row.get::<_, String>(0))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
     /// Record one inbound reaction (contract 1.15; actor name captured since
     /// 1.27). The protocol shape — one emoji state per (conversation, target
     /// message, actor) — maps to an upsert: a repeated reaction replaces the
@@ -4337,6 +4433,126 @@ mod tests {
         let plain_wire = serde_json::to_value(&plain).unwrap();
         assert!(plain_wire.get("previews").is_none());
         assert!(plain_wire.get("viewOnce").is_none());
+    }
+
+    /// Contract 1.34: the receipt selection queries — absent-`messageIds`
+    /// mode orders incoming rows by `sent_at ASC, id ASC` under the caller's
+    /// limit and skips outgoing rows; explicit-`messageIds` mode additionally
+    /// drops unknown ids and collapses duplicates; `contact_peer_keys` only
+    /// surfaces kind='contact' rows for mention-number resolution.
+    #[test]
+    fn receipt_selection_queries_order_filter_and_bound() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction,
+            sender_id: if direction == "incoming" {
+                "peer".into()
+            } else {
+                "self".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: if direction == "incoming" {
+                "delivered"
+            } else {
+                "sent"
+            },
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+        };
+        for (id, sent_at, direction) in [
+            ("m3", 30, "incoming"),
+            ("out-1", 40, "outgoing"),
+            ("m1", 10, "incoming"),
+            ("m2", 20, "incoming"),
+        ] {
+            assert!(
+                store
+                    .insert_message(&base(id, sent_at, direction), None, Some("body"), true)
+                    .unwrap()
+            );
+        }
+
+        let bounded = store
+            .incoming_rows_for_receipts(&account.id, &conversation.id, 2)
+            .unwrap();
+        assert_eq!(
+            bounded
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+
+        let picked = store
+            .incoming_rows_by_ids(
+                &account.id,
+                &conversation.id,
+                &[
+                    "m3".into(),
+                    "m1".into(),
+                    "out-1".into(),
+                    "m3".into(),
+                    "missing".into(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            picked.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["m1", "m3"]
+        );
+        assert_eq!(picked[0].sent_at, 10);
+        assert_eq!(picked[1].sent_at, 30);
+
+        store
+            .upsert_synced_contacts(
+                &account.id,
+                &[
+                    SyncedContact {
+                        kind: "contact",
+                        peer_key: "+15555550101",
+                        title: "Peer",
+                        extra: None,
+                    },
+                    SyncedContact {
+                        kind: "group",
+                        peer_key: "ZmFrZS1ncm91cC0x",
+                        title: "Group",
+                        extra: None,
+                    },
+                ],
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            store.contact_peer_keys(&account.id).unwrap(),
+            ["+15555550101"]
+        );
     }
 
     /// Contract 1.25 schema step: a v8 database migrates in place — the
