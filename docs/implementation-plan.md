@@ -1333,6 +1333,19 @@ lists stay empty until real messages arrive. Official Signal added an optional f
 "Link & Sync" archive transfer in 2025; pinned signal-cli 0.14.7 has no such capability, so the
 connector cannot offer it.
 
+Verified against official sources (2026-10-03, Signal-Desktop v8.31.0-alpha.1): the mechanism is
+the `backup5` link capability (`ts/textsecure/Provisioner.preload.ts` — advertised in the link QR
+URL only when the desktop has never registered) plus a `ProvisionEnvelope.ephemeralBackupKey`
+carried by the phone at scan time; the newly linked desktop then downloads a full backup archive
+from the Signal backup service and imports it before entering the app
+(`ts/services/backups/index.preload.ts`). Two product constraints apply officially as well: the
+phone must be online and cooperate at link time, and an installation that ever registered cannot
+re-import (isLinkAndSyncEnabled gates on registration). Upstream tracking: AsamK/signal-cli
+issue/PR #2134 (open, 2026-09-29, "qr history daemon") proposes `importHistory` on
+`startLink`/`finishLink` plus paged `export-history` with attachment metadata only — not merged,
+not released. Re-evaluate the pinned signal-cli bump (or a kt-signal-engine backup5 project) when
+that lands or when product prioritizes full history; until then this boundary stands.
+
 ### 6.7 Media limitation
 
 Phase 1 runs signal-cli with attachments, stories, and stickers ignored. Current signal-cli downloads
