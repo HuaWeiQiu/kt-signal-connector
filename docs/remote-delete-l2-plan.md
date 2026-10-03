@@ -94,7 +94,7 @@
 
 - 形状与 `messageGetTextParams` 同构（`schemas/connector-api-v1.schema.json:321-330`），
   `operationId` 可选项借鉴 `accountDeleteLocalDataParams`（`schemas/connector-api-v1.schema.json:224-232`）。
-- params 描述文字须写明：仅 `status:"sent"` 的本人 outgoing 消息可删；上游语义为
+- params 描述文字须写明：仅地址可达（`status` ∈ `sent`/`delivered`/`read`）的本人 outgoing 消息可删；上游语义为
   Delete for everyone（24h 窗口、best effort、引用不删除）。
 - 寻址只接受 `conversationId`（不像 `messages.sendText` 那样支持 kind+peerKey 直达）：
   删除的目标必须已存在于本地历史，凭空寻址没有意义，也让 messageId→协议身份的解析路径唯一。
@@ -186,12 +186,13 @@ host.rs dispatch 新 arm（"messages.remoteDelete"，紧邻 messages.sendText ar
 | 上游 remoteDelete 参数 | 本地来源 | 依据 |
 |---|---|---|
 | `account` | `accounts.signal_account`（`AccountRow`，`src/store.rs:336-340`；`account_by_id`，`src/store.rs:587-602`） | 与 send 相同的账号寻址（`src/service.rs:619`） |
-| `targetTimestamp` | `messages.sent_at`，**仅当 `status=='sent'`** | 本人已发消息的 `sent_at` 在发送完成时被上游时间戳覆盖：`complete_outgoing_send`（`src/store.rs:1456-1461`）写入 send 响应的 `result.timestamp`（`src/supervisor.rs:1092-1095`）。pending/failed/unknown 行的 `sent_at` 是本地 `now_ms()`（`src/service.rs:596`），不是 Signal 协议身份——**先例**：引用解析只信 `status=="sent"` 的 outgoing 行（`resolve_quote`，`src/service.rs:659-666, 677`） |
+| `targetTimestamp` | `messages.sent_at`，**仅当地址可达：`status` ∈ `sent`/`delivered`/`read`** | 本人已发消息的 `sent_at` 在发送完成时被上游时间戳覆盖：`complete_outgoing_send`（`src/store.rs:1456-1461`）写入 send 响应的 `result.timestamp`（`src/supervisor.rs:1092-1095`）。回执只推进 `status`，`update_message_status` 以 COALESCE 保留 `sent_at`，故 delivered/read 行同样是协议身份（`outgoing_status_is_addressable`，`src/service.rs`）。pending/failed/unknown 行的 `sent_at` 是本地 `now_ms()`（`src/service.rs:596`），不是 Signal 协议身份——**先例**：引用解析同口径（`resolve_quote`） |
 | `recipient`（direct） | `conversations.peer_key`（kind=='direct'），组装为 `recipient:[peer_key]` | 与 send 完全同型（`src/service.rs:625`） |
 | `groupId`（group） | `conversations.peer_key`（kind=='group'） | 与 send 完全同型（`src/service.rs:622-623`）；`ConversationRow` 见 `src/store.rs:342-348`、`conversation_by_id` `src/store.rs:927-948` |
 
-**资格守卫**（prepare 阶段确定性执行，不打上游）：`direction=='outgoing' && status=='sent'`，
-否则返回 `MESSAGE_NOT_FOUND`。incoming 行虽然 `sent_at` 也是信封时间戳，但"删别人的消息"属于
+**资格守卫**（prepare 阶段确定性执行，不打上游）：`direction=='outgoing' && outgoing_status_is_addressable(status)`
+（`sent`/`delivered`/`read`——三者 `sent_at` 均为上游协议时间戳），否则返回 `MESSAGE_NOT_FOUND`。
+incoming 行虽然 `sent_at` 也是信封时间戳，但"删别人的消息"属于
 admin delete（非目标 §1.2.1），上游亦会拒绝。
 
 note-to-self：本仓库未见专门的 note-to-self 会话形态；若 peer_key 等于本机号的 direct 会话

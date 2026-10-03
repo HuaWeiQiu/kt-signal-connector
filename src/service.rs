@@ -270,6 +270,19 @@ fn map_media_handle_error(error: MediaHandleError) -> ServiceError {
     ServiceError::Api(ApiError::new(code, message, retryable))
 }
 
+/// Whether an outgoing row's `sent_at` is the upstream Signal protocol
+/// timestamp (real protocol identity) rather than a local clock value.
+/// `complete_outgoing_send` overwrites `sent_at` with the send response's
+/// upstream timestamp when the row settles at `sent`; later delivery/read
+/// receipts only advance `status` — `update_message_status` preserves
+/// `sent_at` (COALESCE) — so `sent`/`delivered`/`read` rows are all
+/// addressable upstream. `pending`/`failed`/`unknown` rows hold a local
+/// `now_ms()` value and are indistinguishable from a missing row
+/// (remote-delete plan §3.2 precedent).
+fn outgoing_status_is_addressable(status: &str) -> bool {
+    matches!(status, "sent" | "delivered" | "read")
+}
+
 pub struct ConnectorService {
     store: Arc<Store>,
     link: Option<ActiveLinkSession>,
@@ -1218,10 +1231,12 @@ impl ConnectorService {
             .message_by_id(&account.id, &conversation.id, quote_message_id)?
             .ok_or(StoreError::MessageNotFound)?;
         let author = match quoted.direction {
-            // We authored it: the author is the linked account itself. Only a
-            // completed send carries the upstream timestamp Signal quotes
+            // We authored it: the author is the linked account itself. Only an
+            // addressable send carries the upstream timestamp Signal quotes
             // match on; pending/failed/unknown rows would misquote.
-            "outgoing" if quoted.status == "sent" => account.signal_account.clone(),
+            "outgoing" if outgoing_status_is_addressable(quoted.status) => {
+                account.signal_account.clone()
+            }
             // In a direct chat the only other possible author is the peer.
             // Incoming rows store the envelope timestamp, which is the
             // protocol identity a quote references.
@@ -1257,7 +1272,7 @@ impl ConnectorService {
         validate_text(text)?;
         let (account, conversation, message) =
             self.resolve_target(account_id, conversation_id, message_id)?;
-        if message.direction != "outgoing" || message.status != "sent" {
+        if message.direction != "outgoing" || !outgoing_status_is_addressable(message.status) {
             return Err(StoreError::MessageNotFound.into());
         }
         // signal-cli `send` with editTimestamp (verified against the jsonRpc
@@ -1304,9 +1319,10 @@ impl ConnectorService {
 
     /// Pure local validation for `messages.remoteDelete` (docs/remote-delete-l2-plan.md §3.2):
     /// resolve the target row and build the exact upstream jsonRpc params. Only an
-    /// outgoing row in the terminal state `sent` carries a real Signal protocol identity
+    /// addressable outgoing row carries a real Signal protocol identity
     /// — its `sent_at` was overwritten with the send response's upstream timestamp by
-    /// `complete_outgoing_send`, the same precedent as quote resolution
+    /// `complete_outgoing_send` and is preserved across delivery/read receipts
+    /// (`outgoing_status_is_addressable`), the same precedent as quote resolution
     /// (`resolve_quote`). Pending/failed/unknown rows hold a local clock value there,
     /// so they are indistinguishable from a missing row and answer `MESSAGE_NOT_FOUND`.
     /// Nothing is written locally and no event is emitted: the connector does not
@@ -1322,7 +1338,7 @@ impl ConnectorService {
         validate_opaque_id(message_id, "messageId")?;
         let (account, conversation, message) =
             self.resolve_target(account_id, conversation_id, message_id)?;
-        if message.direction != "outgoing" || message.status != "sent" {
+        if message.direction != "outgoing" || !outgoing_status_is_addressable(message.status) {
             return Err(StoreError::MessageNotFound.into());
         }
         // signal-cli JSON-RPC remoteDelete parameters (verified against the pinned
@@ -1349,12 +1365,13 @@ impl ConnectorService {
     /// resolve the target row and build the exact upstream jsonRpc params.
     /// A reaction targets a message that already exists in the local history,
     /// so both directions are addressable — an own outgoing row qualifies in
-    /// the terminal state `sent` (its `sent_at` is the upstream Signal
-    /// timestamp, same precedent as `resolve_quote`/`prepare_remote_delete`),
+    /// an addressable state (`sent`/`delivered`/`read`; its `sent_at` is the
+    /// upstream Signal timestamp preserved across receipts, same precedent as
+    /// `resolve_quote`/`prepare_remote_delete`),
     /// an incoming row carries the envelope timestamp. The target author
     /// follows the direction: the linked account's own number for outgoing
-    /// rows, the conversation peer for incoming rows. Outgoing rows without a
-    /// terminal `sent` state carry no protocol identity and answer
+    /// rows, the conversation peer for incoming rows. Outgoing rows without an
+    /// addressable state carry no protocol identity and answer
     /// `MESSAGE_NOT_FOUND`; group incoming rows persist only a local sender
     /// hash, not the member's number, so their author is not resolvable
     /// (deterministic `INVALID_REQUEST`). Nothing is written locally and no
@@ -1385,11 +1402,13 @@ impl ConnectorService {
         // `recipient`/`groupId` address the receiving side — the same
         // addressing shape as `send`/`remoteDelete`.
         let target_author = match message.direction {
-            // We authored it: the author is the linked account itself. Only a
-            // completed send carries the upstream timestamp Signal reactions
+            // We authored it: the author is the linked account itself. Only an
+            // addressable send carries the upstream timestamp Signal reactions
             // match on; pending/failed/unknown rows would mis-target.
-            "outgoing" if message.status == "sent" => account.signal_account.clone(),
-            // An outgoing row without the terminal `sent` state carries no
+            "outgoing" if outgoing_status_is_addressable(message.status) => {
+                account.signal_account.clone()
+            }
+            // An outgoing row without an addressable state carries no
             // upstream protocol identity (its sent_at is a local clock value)
             // and is indistinguishable from a missing row (remoteDelete
             // precedent).
@@ -4907,6 +4926,52 @@ mod tests {
                 .code,
             "ACCOUNT_NOT_FOUND"
         );
+    }
+
+    /// Receipt-advanced outgoing rows stay addressable: delivery/read
+    /// receipts only advance `status` while `update_message_status` preserves
+    /// the upstream `sent_at`, so a delivered or read row reacts with the
+    /// same protocol identity it had at `sent` (official behavior — reacting
+    /// to an already-delivered message is the common case).
+    #[test]
+    fn send_reaction_accepts_receipt_advanced_outgoing_rows() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let message_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "delivered then read",
+                "req-sr-advance",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&message_id, &account.id, &conversation.id, 777)
+            .unwrap();
+        for status in ["sent", "delivered", "read"] {
+            service
+                .store_ref()
+                .update_message_status(&message_id, status, None)
+                .unwrap();
+            let prepared = service
+                .prepare_send_reaction(&account.id, &conversation.id, &message_id, "👍", false)
+                .unwrap();
+            assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
+            assert_eq!(prepared.params["targetTimestamp"], json!(777));
+        }
     }
 
     /// The emoji guard enforces the pinned signal-cli contract locally:

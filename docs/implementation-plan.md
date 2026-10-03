@@ -262,9 +262,9 @@ through the handshake `capabilities` array — calling it against an older conne
   optional `operationId` that the connector validates by shape but never persists — there is no
   operation ledger and no store migration. Addressing is by `conversationId` only: the target must
   already exist in the local history.
-- Eligibility: only a local outgoing row in the terminal state `sent` qualifies; its `sentAt` was
+- Eligibility: only a local addressable outgoing row (`sent`/`delivered`/`read`) qualifies; its `sentAt` was
   overwritten with the send response's upstream Signal timestamp and becomes the delete's protocol
-  identity. Pending/failed/unknown rows carry only a local clock value, and incoming rows are not
+  identity (delivery/read receipts preserve it). Pending/failed/unknown rows carry only a local clock value, and incoming rows are not
   the account's own messages — all of them answer `MESSAGE_NOT_FOUND`, exactly like quote
   resolution. The conversation's kind selects the upstream addressing: `recipient: [peerKey]` for
   direct chats, `groupId: peerKey` for groups (signal-cli jsonRpc `remoteDelete` params
@@ -308,8 +308,9 @@ end; design rationale and the upstream-verification notes live in `docs/remote-d
   0.14.7 distribution). Grapheme clustering keeps multi-codepoint emoji (ZWJ sequences,
   skin-tone modifiers, flags) valid while rejecting multi-emoji strings; the service enforces the
   rule deterministically.
-- Eligibility and target identity: an own outgoing row qualifies in the terminal state `sent`
-  (its `sentAt` was overwritten with the send response's upstream Signal timestamp); an incoming
+- Eligibility and target identity: an own outgoing row qualifies in an addressable state
+  (`sent`/`delivered`/`read`; its `sentAt` was overwritten with the send response's upstream Signal
+  timestamp and preserved across receipts); an incoming
   row carries the envelope timestamp, so it is addressable too. The upstream `targetAuthor`
   follows the row direction — the linked account's own number for outgoing rows, the conversation
   peer for incoming direct rows (the quote-resolution precedent). Pending/failed/unknown rows
@@ -617,7 +618,7 @@ gains `conversation.typing` (ephemeral) alongside the existing `message.upserted
 
 `messages.edit` edits one previously sent message upstream: params `accountId`,
 `conversationId`, `messageId`, `text`, `clientRequestId`. It resolves the target exactly like
-`messages.remoteDelete` (outgoing row, terminal `sent` state = upstream protocol identity),
+`messages.remoteDelete` (addressable outgoing row `sent`/`delivered`/`read` = upstream protocol identity),
 then dispatches signal-cli `send` with `editTimestamp: <upstream timestamp>` plus the same
 target addressing (`recipient`/`groupId`) — the signal-cli edit entry point (no dedicated
 `sendEditMessage` exists in the jsonRpc surface). Official clients allow a 24 h edit window;
