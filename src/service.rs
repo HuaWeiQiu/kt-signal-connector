@@ -1563,7 +1563,10 @@ impl ConnectorService {
         if status_transitioned {
             events.push(status_changed_event(&updated));
         }
-        if let Some(conversation) = self.store.conversation_summary(conversation_id)? {
+        if let Some(conversation) = self
+            .store
+            .conversation_summary(account_id, conversation_id)?
+        {
             events.push(HostSideEvent::ConversationChanged(conversation));
         }
         if let Some(account) = self.store.account_summary(account_id)? {
@@ -1785,7 +1788,10 @@ impl ConnectorService {
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             message,
         ))];
-        if let Some(conversation) = self.store.conversation_summary(&conversation.id)? {
+        if let Some(conversation) = self
+            .store
+            .conversation_summary(&account.id, &conversation.id)?
+        {
             events.push(HostSideEvent::ConversationChanged(conversation));
         }
         if let Some(account) = self.store.account_summary(&account.id)? {
@@ -1877,7 +1883,10 @@ impl ConnectorService {
                     actor_name,
                 )?;
                 let mut events = Vec::new();
-                if let Some(summary) = self.store.conversation_summary(&conversation.id)? {
+                if let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
                     events.push(HostSideEvent::ConversationChanged(summary));
                 }
                 Ok(events)
@@ -3943,7 +3952,7 @@ mod tests {
             .remove(0);
         let summary = service
             .store
-            .conversation_summary(&conversation.id)
+            .conversation_summary(&account.id, &conversation.id)
             .unwrap()
             .unwrap();
         assert_eq!(summary.last_message_direction, Some("incoming"));
@@ -3978,7 +3987,7 @@ mod tests {
         );
         let summary = service
             .store
-            .conversation_summary(&conversation.id)
+            .conversation_summary(&account.id, &conversation.id)
             .unwrap()
             .unwrap();
         assert_eq!(summary.last_message_direction, Some("outgoing"));
@@ -5288,7 +5297,7 @@ mod tests {
         // The captioned attachment keeps a text ending — no noun (contract 1.22).
         let summary = service
             .store
-            .conversation_summary(&conversation_id)
+            .conversation_summary(&account.id, &conversation_id)
             .unwrap()
             .unwrap();
         assert_eq!(summary.last_message_kind, None);
@@ -5311,7 +5320,7 @@ mod tests {
         assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
         let summary = service
             .store
-            .conversation_summary(&conversation_id)
+            .conversation_summary(&account.id, &conversation_id)
             .unwrap()
             .unwrap();
         assert_eq!(summary.last_message_preview.as_deref(), Some("report.pdf"));
@@ -6089,7 +6098,7 @@ mod tests {
         assert!(events.is_empty());
         let row = service
             .store_ref()
-            .conversation_summary(&conversation.id)
+            .conversation_summary(&account.id, &conversation.id)
             .unwrap()
             .unwrap();
         assert_eq!(row.id, conversation.id);

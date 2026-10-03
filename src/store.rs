@@ -1282,7 +1282,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         for item in &mut items {
-            let meta = conversation_last_message_meta(&conn, &item.id)?;
+            let meta = conversation_last_message_meta(&conn, account_id, &item.id)?;
             item.last_message_kind = meta.kind;
             item.last_message_direction = meta.direction;
             item.last_message_status = meta.status;
@@ -2388,6 +2388,7 @@ impl Store {
 
     pub fn conversation_summary(
         &self,
+        account_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationSummary>, StoreError> {
         let conn = self.lock_conn()?;
@@ -2395,8 +2396,8 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
                         unread_count, unread_mentions, muted, pinned
-                 FROM conversations WHERE id=?1",
-                params![conversation_id],
+                 FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
                 |row| {
                     Ok(ConversationSummary {
                         id: row.get(0)?,
@@ -2421,7 +2422,8 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         match summary {
             Some(mut summary) => {
-                let meta = conversation_last_message_meta(&conn, conversation_id)?;
+                let meta =
+                    conversation_last_message_meta(&conn, &summary.account_id, conversation_id)?;
                 summary.last_message_kind = meta.kind;
                 summary.last_message_direction = meta.direction;
                 summary.last_message_status = meta.status;
@@ -3487,15 +3489,16 @@ struct ConversationLastMessageMeta {
 
 fn conversation_last_message_meta(
     conn: &Connection,
+    account_id: &str,
     conversation_id: &str,
 ) -> Result<ConversationLastMessageMeta, StoreError> {
     let latest = conn
         .query_row(
             "SELECT direction, body, attachments_json, sender_name, status, sent_at FROM messages
-             WHERE conversation_id=?1
+             WHERE account_id=?1 AND conversation_id=?2
              ORDER BY sent_at DESC, id DESC
              LIMIT 1",
-            params![conversation_id],
+            params![account_id, conversation_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -3986,7 +3989,7 @@ mod tests {
             };
         let kind = || {
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap()
                 .last_message_kind
@@ -4099,7 +4102,7 @@ mod tests {
         };
         let summary = || {
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap()
         };
@@ -4272,7 +4275,7 @@ mod tests {
         };
         let summary_status = || {
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap()
                 .last_message_status
@@ -4305,7 +4308,7 @@ mod tests {
             .mark_remote_deleted(&account.id, &conversation.id, 300)
             .unwrap();
         let current = store
-            .conversation_summary(&conversation.id)
+            .conversation_summary(&conversation.account_id, &conversation.id)
             .unwrap()
             .unwrap();
         assert_eq!(current.last_message_direction, Some("outgoing"));
@@ -4378,7 +4381,7 @@ mod tests {
         };
         let summary = || {
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap()
         };
@@ -4486,7 +4489,7 @@ mod tests {
         assert!(row_json.get("mentionsSelf").is_none());
         let summary_json = serde_json::to_value(
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap(),
         )
@@ -4511,7 +4514,7 @@ mod tests {
         store.insert_message(&mentioned, None, None, true).unwrap();
         let summary_json = serde_json::to_value(
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap(),
         )
@@ -4669,7 +4672,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap()
                 .unread_count,
@@ -4737,7 +4740,7 @@ mod tests {
         ));
         assert_eq!(
             store
-                .conversation_summary(&conversation.id)
+                .conversation_summary(&conversation.account_id, &conversation.id)
                 .unwrap()
                 .unwrap()
                 .unread_count,
@@ -6930,5 +6933,80 @@ mod tests {
         assert!(!thumbs.mine);
         assert_eq!(thumbs.actors.len(), 2);
         assert!(thumbs.actors.iter().all(|actor| !actor.is_self));
+    }
+
+    /// 摘要与列表 meta 必须按账户过滤：FK 允许出现「account_id 与会话归属
+    /// 不一致」的孤儿消息行（历史缺陷可留下的残行），只按 conversation_id
+    /// 过滤的旧 meta 查询会让更晚 sent_at 的幽灵 pending 行顶掉真末条——
+    /// 对应线上「会话列表 pending、消息窗口 delivered」互相矛盾的成因类别。
+    #[test]
+    fn summary_and_list_meta_ignore_rows_from_other_accounts() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let other = store
+            .upsert_account_from_signal("+15555550101", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550199", "peer")
+            .unwrap();
+        let message = MessageRecord {
+            id: "m-own".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 100,
+            received_at: None,
+            text: Some("delivered row".into()),
+            text_bytes: None,
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+        };
+        store.insert_message(&message, None, None, false).unwrap();
+        // FK 合法的幽灵行：账户存在、会话存在，但 account 归属另一账户。
+        store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO messages(id, account_id, conversation_id, direction, sender_id,
+                                      sent_at, status)
+                 VALUES('m-ghost', ?1, ?2, 'outgoing', 'self', 200, 'pending')",
+                params![other.id, conversation.id],
+            )
+            .unwrap();
+
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.last_message_status, Some("delivered"));
+        assert_eq!(summary.last_message_direction, Some("outgoing"));
+        // 错账户查询：conversations 行本身按账户过滤，直接不可见。
+        assert!(
+            store
+                .conversation_summary(&other.id, &conversation.id)
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = store
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(listed.last_message_status, Some("delivered"));
     }
 }
