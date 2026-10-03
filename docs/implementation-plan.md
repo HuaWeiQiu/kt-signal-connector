@@ -1159,6 +1159,63 @@ surface through the existing error mapping — a declared swap boundary, not a s
   the engine's contacts sync on link/restart (its receive pipeline runs one
   `request_contacts` round per account, warn-only, 60s one-shot — no connector change).
 
+### 4.30 Outbound voice notes on messages.attachments.send (contract revision 1.35, 2026-10-04)
+
+`messages.attachments.send` (§4.12) gains an optional `voiceNote: boolean` (default false). When
+true the connector's `build_attachment_data_uri` appends the `;voice=true` data-URI parameter and
+the engine maps it to the official `AttachmentPointer.flags = VOICE_MESSAGE` — the exact wire
+shape the official desktop recorder emits (`audioRecorder.preload.ts`: attachment with
+`flags=VOICE_MESSAGE`, contentType `audio/mpeg`, no separate message body; receiving clients'
+`isVoiceMessage` judges by the flag first). Validation: `voiceNote` requires `contentType` to be
+`audio/*` (the official recorder only produces audio; anything else is `INVALID_REQUEST` before
+the pending row exists). The sent row's attachment descriptor records `isVoiceNote: true`, so
+the sender's own bubble renders the voice UI across restarts.
+
+Receive side is already contract-complete: the inbound attachment descriptor has carried
+`isVoiceNote` since contract 1.15 and the engine projects it from the pointer flags — zero
+receive-plane change. Waveform rendering is a desktop concern (the official client derives it
+from the decoded audio; no protocol surface). No new method, no schema change, no capability
+entry — `attachments.send` callers discover the face from the updated schema description.
+
+### 4.31 Stickers: messages.sendSticker + receive projection (contract revision 1.35, 2026-10-04)
+
+Official send face (`sendStickerMessage`): `DataMessage.sticker {packId, packKey, stickerId,
+emoji, data: AttachmentPointer}` with `body` undefined, no regular attachments, mutually
+exclusive with text/attachments/previews/mentions, quote allowed to co-ride. The pinned
+signal-cli JSON-RPC has no sticker method (sticker faces are CLI-command-only), so this is an
+engine-extension method mirrored 1:1 by the connector.
+
+**`messages.sendSticker`** (new host method, Send lane, mutating, §4.12 settlement discipline:
+pending row → upstream → `complete_send_success` / `complete_send_unknown`, no auto-retry,
+advertised through handshake `capabilities` as `send-sticker`): params `accountId`,
+`conversationId` **or** `kind`+`peerKey` addressing (exactly one form), `clientRequestId`,
+`packId` (hex, even-length, 1–64 chars — official pack ids serialize hex), `packKey` (standard
+base64, 1–128 chars — official `Bytes.fromBase64` convention), `stickerId` (u32), `emoji?`
+(≤ 32 chars), `image` `{dataBase64, sizeBytes, contentType, width?, height?}` — the same budget
+and validation family as §4.12 (≤ 100 MiB declared+validated, path-separator/control-char
+rejection n/a here since no filename) with one sticker-specific rule: `contentType` must be
+`image/*` (the official client sniffs image MIME and falls back to `image/webp`; it refuses
+`video/*` and `text/*`). The connector composes the engine `send` call with the `sticker`
+object (packId/packKey passthrough after shape validation, image re-encoded data URI,
+width/height passthrough — official `AttachmentPointer` display metadata) and an empty body.
+The sent row's descriptor records the sticker image attachment plus a `sticker` metadata field
+(packId/packKey/stickerId/emoji) so the sender's bubble renders as a sticker across restarts.
+
+**Receive projection**: the engine projects inbound `DataMessage.sticker` as
+`sticker {packId(hex), packKey(base64), stickerId, emoji?, data}` (official serialization
+conventions). The connector normalizes it onto the row: the sticker metadata persists as an
+additive JSON column (`messages.sticker_json`, schema 13 → 14) and `MessageRecord` gains an
+optional `sticker` field (`skip_serializing_if` absent — pre-1.35 rows stay byte-identical).
+The `data` pointer rides the existing metadata-only attachment descriptor list (contract 1.15
+shape, bounded 32) so byte fetch goes through the existing media channel — the connector never
+downloads sticker bytes (§6.7 boundary unchanged). Reactions/replies/remote-delete on sticker
+rows behave exactly like attachment rows (the sticker is body-less metadata, not a special row
+kind). A sticker on a message that also carries `pinMessage`/`unpinMessage`/`adminDelete`
+control surfaces keeps working — the control plane is orthogonal (§4.28).
+
+Bounds failures are deterministic `INVALID_REQUEST` before the pending row exists; unknown
+mutating outcomes answer `SEND_OUTCOME_UNKNOWN` and are never retried.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
