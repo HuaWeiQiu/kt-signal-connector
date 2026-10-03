@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS messages (
   quote_snapshot TEXT,
   attachments_json TEXT,
   rich_json TEXT,
+  sticker_json TEXT,
   edited_at INTEGER,
   sender_name TEXT,
   mentions_self INTEGER NOT NULL DEFAULT 0,
@@ -536,6 +537,11 @@ pub struct MessageRecord {
     /// rows no admin removed.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub admin_deleted: bool,
+    /// Inbound sticker metadata (contract revision 1.35, §4.31): the pack
+    /// identity beside the message. The sticker's byte pointer rides
+    /// `attachments`, so absent keys stay absent on plain and pre-1.35 rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sticker: Option<crate::engine::NormalizedSticker>,
 }
 
 /// One prior body of an edited message (contract 1.32): the text the edit
@@ -1431,7 +1437,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1510,7 +1516,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -1550,7 +1556,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1570,7 +1576,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1598,7 +1604,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1645,8 +1651,8 @@ impl Store {
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
                     quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name,
-                    mentions_self
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19, ?20)",
+                    mentions_self, sticker_json
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19, ?20, ?21)",
                 params![
                     message.id,
                     message.account_id,
@@ -1678,6 +1684,10 @@ impl Store {
                         .map(|rich| serde_json::to_string(rich).expect("rich json")),
                     message.sender_name,
                     i64::from(message.mentions_self),
+                    message
+                        .sticker
+                        .as_ref()
+                        .map(|sticker| serde_json::to_string(sticker).expect("sticker json")),
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1820,7 +1830,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1858,7 +1868,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1951,7 +1961,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -2026,7 +2036,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2099,7 +2109,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -2142,7 +2152,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -2258,7 +2268,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -2307,7 +2317,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -2391,7 +2401,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                  ORDER BY sent_at ASC, id ASC
@@ -2425,7 +2435,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -3925,6 +3935,18 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 14 {
+        // Contract revision 1.35: inbound sticker metadata (§4.31). One
+        // additive nullable JSON column beside `rich_json` — pre-1.35 rows
+        // legitimately carry none and are never backfilled, because the
+        // sticker identity a past envelope carried was never stored. The
+        // sticker's byte pointer keeps riding `attachments_json`, so no
+        // attachment data moves with this column.
+        if !table_has_column(conn, "messages", "sticker_json")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN sticker_json TEXT", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -4243,6 +4265,9 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
         read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
         admin_deleted: row.get::<_, i64>(21)? != 0,
+        sticker: row
+            .get::<_, Option<String>>(22)?
+            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -4313,6 +4338,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         assert!(
@@ -4376,6 +4402,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
 
@@ -4483,6 +4510,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         for (id, sent_at, direction) in [
@@ -4806,6 +4834,170 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Contract revision 1.35 receive projection: opening a v13 store adds the
+    /// additive `sticker_json` column (schema 13 → 14) and stamps the new
+    /// version; history rows stay null and are never backfilled.
+    #[test]
+    fn schema_v14_upgrade_adds_sticker_json_column() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '13');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "sticker_json").unwrap());
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Sticker persistence (contract revision 1.35, §4.31): the pack identity
+    /// round-trips through `sticker_json` beside the metadata-only descriptor,
+    /// and `MessageRecord` keeps absent sticker keys off the wire so pre-1.35
+    /// rows stay byte-identical.
+    #[test]
+    fn sticker_row_round_trips_and_plain_rows_stay_key_absent() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let base = |id: &str, sent_at: u64| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            text_retrievable: false,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+            sticker: None,
+        };
+
+        let mut sticker_row = base("sticker-row", 60);
+        sticker_row.attachments = vec![crate::engine::NormalizedAttachment {
+            id: "att-sticker".into(),
+            content_type: Some("image/webp".into()),
+            filename: None,
+            size: Some(8192),
+            width: Some(512),
+            height: Some(512),
+            is_voice_note: false,
+        }];
+        sticker_row.sticker = Some(crate::engine::NormalizedSticker {
+            pack_id: "abcdef01".into(),
+            pack_key: "AAAAAAAAAAAAAAAAAAAAAA==".into(),
+            sticker_id: 7,
+            emoji: Some("🎉".into()),
+        });
+        store
+            .insert_message(&sticker_row, Some("req-sticker-store"), None, false)
+            .unwrap();
+        let row = store
+            .message_by_client_request(&account.id, "req-sticker-store")
+            .unwrap()
+            .expect("the sticker row exists");
+        let sticker = row
+            .sticker
+            .clone()
+            .expect("the pack identity survives the store");
+        assert_eq!(sticker.pack_id, "abcdef01");
+        assert_eq!(sticker.pack_key, "AAAAAAAAAAAAAAAAAAAAAA==");
+        assert_eq!(sticker.sticker_id, 7);
+        assert_eq!(sticker.emoji.as_deref(), Some("🎉"));
+        assert_eq!(row.attachments.len(), 1);
+        assert_eq!(row.attachments[0].id, "att-sticker");
+        assert_eq!(row.attachments[0].width, Some(512));
+        let wire = serde_json::to_value(&row).unwrap();
+        assert_eq!(wire["sticker"]["packId"], "abcdef01");
+        assert_eq!(wire["sticker"]["stickerId"], 7);
+        assert_eq!(wire["attachments"][0]["contentType"], "image/webp");
+        assert!(wire["attachments"][0].get("filename").is_none());
+
+        // A plain row keeps the key absent — pre-1.35 rows stay byte-identical
+        // on the wire.
+        store
+            .insert_message(&base("plain-row", 61), None, None, false)
+            .unwrap();
+        let rows = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        let plain_row = rows
+            .iter()
+            .find(|row| row.id == "plain-row")
+            .expect("the plain row exists");
+        let wire = serde_json::to_value(plain_row).unwrap();
+        assert!(wire.get("sticker").is_none(), "{wire}");
+    }
+
     /// Conversation pin state (contract 1.33): a newer pin replaces the older
     /// one, a mismatched clear leaves the pin alone, a matching clear removes
     /// it, the summary projects the camelCase `pinnedMessage` with `expiresAt`
@@ -4847,6 +5039,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         assert!(
@@ -5005,6 +5198,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         assert!(
@@ -5101,6 +5295,7 @@ mod tests {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    sticker: None,
                     admin_deleted: false,
                 };
                 store.insert_message(&message, None, text, false).unwrap();
@@ -5228,6 +5423,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             store.insert_message(&message, None, text, false).unwrap();
@@ -5409,6 +5605,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             store.insert_message(&message, None, None, false).unwrap();
@@ -5517,6 +5714,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             store
@@ -5623,6 +5821,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store.insert_message(&plain, None, None, true).unwrap();
@@ -5714,6 +5913,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -5813,6 +6013,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
 
@@ -5880,6 +6081,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -5952,6 +6154,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -6008,6 +6211,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -6088,6 +6292,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             store
@@ -6164,6 +6369,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -6214,6 +6420,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -6305,6 +6512,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             if id == "attachment-only" {
@@ -6399,6 +6607,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             store.insert_message(&message, None, None, false).unwrap();
@@ -6495,6 +6704,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store.insert_message(&message, None, None, false).unwrap();
@@ -7061,6 +7271,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -7132,6 +7343,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -7223,6 +7435,7 @@ mod tests {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    sticker: None,
                     admin_deleted: false,
                 };
                 store
@@ -7371,6 +7584,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -7443,6 +7657,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -7510,6 +7725,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -7580,6 +7796,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -8002,6 +8219,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -8047,6 +8265,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store
@@ -8297,6 +8516,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            sticker: None,
             admin_deleted: false,
         };
         store.insert_message(&message, None, None, false).unwrap();

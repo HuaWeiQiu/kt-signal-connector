@@ -377,6 +377,10 @@ pub struct NormalizedReceive {
     /// text-style ranges and the view-once marker. Absent on plain rows.
     #[serde(skip)]
     pub rich: Option<NormalizedRich>,
+    /// Sticker metadata (contract revision 1.35). Absent on non-sticker rows;
+    /// the sticker's byte pointer rides `attachments`.
+    #[serde(skip)]
+    pub sticker: Option<NormalizedSticker>,
     /// Serialized per-conversation control payload (reaction / remote delete /
     /// typing) for `direction == "control"`; shape mirrors the protocol field.
     #[serde(skip)]
@@ -478,6 +482,26 @@ impl NormalizedRich {
     }
 }
 
+/// Inbound sticker metadata (contract revision 1.35): the official
+/// `DataMessage.sticker` identity — pack id as hex, pack key as standard
+/// base64 (the serialization conventions the engine projects), the pack-local
+/// sticker id and the optional emoji label. The sticker's byte pointer is not
+/// part of this shape: `data` rides the row's metadata-only attachment
+/// descriptor list, so fetches go through the existing media channel and the
+/// connector never downloads sticker bytes (§6.7).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedSticker {
+    /// Sticker pack id, hex as the official client serializes it.
+    pub pack_id: String,
+    /// Sticker pack key, standard base64 as `Bytes.fromBase64` produces.
+    pub pack_key: String,
+    /// Pack-local sticker id.
+    pub sticker_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+}
+
 /// Delivery tier of an inbound receipt (`envelope.receiptMessage`). Order is
 /// the protocol's monotonic upgrade path: a later tier never downgrades an
 /// earlier one (`read` over `delivered` over `sent`).
@@ -567,6 +591,12 @@ const MAX_TEXT_STYLES: usize = 64;
 const MAX_PREVIEW_URL_CHARS: usize = 2048;
 const MAX_PREVIEW_FIELD_BYTES: usize = 512;
 const MAX_MENTION_NAME_BYTES: usize = 128;
+/// Sticker bounds (contract revision 1.35): the same face bounds the send
+/// method enforces — pack id 64 hex chars, pack key 128 base64 chars, emoji
+/// label 32 chars.
+const MAX_STICKER_PACK_ID_CHARS: usize = 64;
+const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
+const MAX_STICKER_EMOJI_CHARS: usize = 32;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -1534,6 +1564,56 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
     })
 }
 
+/// One inbound sticker (contract revision 1.35): bounded pack identity beside
+/// the message plus the `data` pointer as a regular metadata-only attachment
+/// descriptor. A sticker missing any identity field or a usable data pointer
+/// answers None so the envelope keeps its plain routing instead of carrying
+/// half a sticker.
+fn normalized_sticker(
+    sticker: &serde_json::Map<String, Value>,
+) -> Option<(NormalizedSticker, NormalizedAttachment)> {
+    let pack_id = sticker
+        .get("packId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(MAX_STICKER_PACK_ID_CHARS)
+                .collect::<String>()
+        })?;
+    let pack_key = sticker
+        .get("packKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(MAX_STICKER_PACK_KEY_CHARS)
+                .collect::<String>()
+        })?;
+    let sticker_id = bounded_range_u32(sticker, "stickerId")?;
+    let emoji = sticker
+        .get("emoji")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_STICKER_EMOJI_CHARS).collect::<String>());
+    let data = sticker
+        .get("data")
+        .and_then(Value::as_object)
+        .and_then(normalized_attachment)?;
+    Some((
+        NormalizedSticker {
+            pack_id,
+            pack_key,
+            sticker_id,
+            emoji,
+        },
+        data,
+    ))
+}
+
 /// Bounded rich-body payload (contract 1.25) off a dataMessage-shaped object:
 /// link previews, @mentions, text-style ranges and the view-once marker.
 /// Malformed or oversized entries drop individually; an all-default result is
@@ -1938,6 +2018,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         quote,
         attachments,
         rich,
+        sticker: None,
         control,
     };
 
@@ -2071,38 +2152,63 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         let group_id = data_message_group_id(data_message);
         let text = data_message_text(data_message);
         let quote = data_message.get("quote").and_then(normalized_quote);
-        let attachments = data_message
+        let mut attachments = data_message
             .get("attachments")
             .map(normalized_attachments)
             .unwrap_or_default();
+        // Sticker (contract revision 1.35): the metadata normalizes beside the
+        // message, and the `data` pointer joins the attachment descriptor list
+        // as a regular metadata-only descriptor — byte fetches stay on the
+        // existing media channel. A sticker with no usable data pointer has
+        // nothing renderable and keeps the plain skip routing.
+        let sticker = data_message
+            .get("sticker")
+            .and_then(Value::as_object)
+            .and_then(normalized_sticker);
+        if let Some((_, sticker_image)) = sticker.as_ref() {
+            attachments.push(sticker_image.clone());
+        }
         let rich = normalized_rich(data_message);
+        let with_sticker =
+            |mut receive: NormalizedReceive,
+             sticker: Option<(NormalizedSticker, NormalizedAttachment)>| {
+                receive.sticker = sticker.map(|(meta, _)| meta);
+                receive
+            };
         if let Some(text) = text {
-            return Ok(make(
-                timestamp,
-                "dataMessage",
-                "incoming",
-                peer_source,
-                group_id,
-                Some(text),
-                quote,
-                attachments,
-                rich,
-                None,
+            return Ok(with_sticker(
+                make(
+                    timestamp,
+                    "dataMessage",
+                    "incoming",
+                    peer_source,
+                    group_id,
+                    Some(text),
+                    quote,
+                    attachments,
+                    rich,
+                    None,
+                ),
+                sticker,
             ));
         }
-        // Attachment-only message: real descriptors, no body.
+        // Attachment-only message: real descriptors, no body — a sticker row
+        // lands here through its data descriptor.
         if !attachments.is_empty() {
-            return Ok(make(
-                timestamp,
-                "dataMessage",
-                "incoming",
-                peer_source,
-                group_id,
-                None,
-                quote,
-                attachments,
-                rich,
-                None,
+            return Ok(with_sticker(
+                make(
+                    timestamp,
+                    "dataMessage",
+                    "incoming",
+                    peer_source,
+                    group_id,
+                    None,
+                    quote,
+                    attachments,
+                    rich,
+                    None,
+                ),
+                sticker,
             ));
         }
         // Empty body: map a few control shapes to system rows; drop the rest.
@@ -2499,6 +2605,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         let mut admitted = 0;
@@ -2615,6 +2722,91 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(skip_sticker.direction, "skip");
+    }
+
+    /// Sticker receive projection (contract revision 1.35): a sticker with a
+    /// usable `data` pointer lands as an incoming row carrying the pack
+    /// identity beside a metadata-only descriptor (the byte pointer rides the
+    /// attachment list); a sticker without one keeps the plain skip routing,
+    /// and absent sticker keys stay absent on the wire.
+    #[test]
+    fn receive_normalization_projects_sticker_metadata_and_data_descriptor() {
+        let with_data = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 54,
+                "dataMessage": {
+                    "sticker": {
+                        "packId": "abcdef01",
+                        "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                        "stickerId": 7,
+                        "emoji": "🎉",
+                        "data": {
+                            "id": "att-1",
+                            "contentType": "image/webp",
+                            "size": 8192,
+                            "width": 512,
+                            "height": 512
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(with_data.direction, "incoming");
+        let sticker = with_data.sticker.as_ref().expect("sticker metadata");
+        assert_eq!(sticker.pack_id, "abcdef01");
+        assert_eq!(sticker.pack_key, "AAAAAAAAAAAAAAAAAAAAAA==");
+        assert_eq!(sticker.sticker_id, 7);
+        assert_eq!(sticker.emoji.as_deref(), Some("🎉"));
+        assert_eq!(with_data.attachments.len(), 1);
+        let descriptor = &with_data.attachments[0];
+        assert_eq!(descriptor.id, "att-1");
+        assert_eq!(descriptor.content_type.as_deref(), Some("image/webp"));
+        assert_eq!(descriptor.size, Some(8192));
+        assert_eq!(descriptor.width, Some(512));
+        assert_eq!(descriptor.height, Some(512));
+        assert!(!descriptor.is_voice_note);
+
+        // The pack identity does not ride the engine-side normalization wire
+        // shape (the service layer projects it onto MessageRecord, asserted in
+        // the store round-trip test); it is reachable programmatically here.
+        let plain = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 55,
+                "dataMessage": { "message": "plain" }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(plain.sticker.is_none());
+        assert!(plain.attachments.is_empty());
+
+        // No usable data pointer → nothing renderable: the plain skip
+        // routing, no half-carried sticker state.
+        let without_data = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 56,
+                "dataMessage": {
+                    "sticker": {
+                        "packId": "abcdef01",
+                        "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                        "stickerId": 7
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(without_data.direction, "skip");
+        assert!(without_data.sticker.is_none());
+        assert!(without_data.attachments.is_empty());
     }
 
     #[test]
@@ -2752,6 +2944,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         let mut admitted = 0;
@@ -2797,6 +2990,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         while matches!(

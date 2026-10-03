@@ -32,6 +32,12 @@ const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
 const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 pub const MAX_DEVICE_NAME_BYTES: usize = 64;
 pub const MAX_EMOJI_BYTES: usize = 32;
+/// messages.sendSticker bounds (contract revision 1.35, §4.31): the official
+/// pack identity shapes — hex pack id, standard base64 pack key, and the
+/// emoji label, each mirrored by the engine's receive projection bounds.
+pub const MAX_STICKER_PACK_ID_CHARS: usize = 64;
+pub const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
+pub const MAX_STICKER_EMOJI_CHARS: usize = 32;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
@@ -987,10 +993,22 @@ impl ConnectorService {
         content_type: Option<&str>,
         text: Option<&str>,
         quote_message_id: Option<&str>,
+        voice_note: bool,
     ) -> Result<PreparedSend, ServiceError> {
         validate_attachment_send_payload(data_base64, size_bytes)?;
         validate_attachment_descriptor(filename, "filename")?;
         validate_attachment_content_type(content_type)?;
+        // §4.30: the voice flag requires an audio attachment — the official
+        // recorder only produces audio, and a non-audio voice flag would
+        // render as an unplayable bubble. Deterministic rejection before the
+        // pending row exists.
+        if voice_note && !content_type.is_some_and(|value| value.starts_with("audio/")) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "voiceNote requires an audio/* contentType",
+                false,
+            )));
+        }
         let caption = text.unwrap_or_default();
         if !caption.is_empty() {
             validate_text(caption)?;
@@ -1006,13 +1024,50 @@ impl ConnectorService {
             return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         let account = self.resolve_account(account_id)?;
-        let conversation = match target {
+        let conversation = self.resolve_send_conversation(account_id, target)?;
+        let data_uri = build_attachment_data_uri(data_base64, filename, content_type, voice_note)?;
+        // The pending row carries the same metadata-only descriptor the
+        // renderer projects (contract 1.15 wire shape), so the desktop bubble
+        // and conversation preview exist from the first pending tick instead
+        // of collapsing into an invisible empty row. The voice flag rides the
+        // descriptor (§4.30), so the sender's own bubble renders the voice UI
+        // across restarts.
+        let descriptor = NormalizedAttachment {
+            id: stable_hash_id(&[account_id, client_request_id, "attachment", "0"]),
+            content_type: content_type.map(str::to_string),
+            filename: filename.map(str::to_string),
+            size: Some(size_bytes),
+            width: None,
+            height: None,
+            is_voice_note: voice_note,
+        };
+        self.dispatch_send(
+            &account,
+            &conversation,
+            caption,
+            client_request_id,
+            quote_message_id,
+            None,
+            None,
+            Some(vec![json!(data_uri)]),
+            vec![descriptor],
+        )
+    }
+
+    /// Shared §4.12 addressing resolution for body-carrying and sticker
+    /// sends alike: a conversation id resolves the stored row; kind+peerKey
+    /// progressive-fills a skeleton the same way (contacts.list reports
+    /// 'contact', conversations use 'direct' — both accepted).
+    fn resolve_send_conversation(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+    ) -> Result<ConversationRow, ServiceError> {
+        match target {
             AttachmentSendTarget::Conversation(conversation_id) => {
-                self.resolve_conversation(account_id, conversation_id)?
+                self.resolve_conversation(account_id, conversation_id)
             }
             AttachmentSendTarget::Peer(peer) => {
-                // contacts.list reports 'contact'; conversations use
-                // 'direct'. Both are accepted for the same direct-chat target.
                 let kind = match peer.kind {
                     "direct" | "contact" => "direct",
                     "group" => "group",
@@ -1037,35 +1092,159 @@ impl ConnectorService {
                         mask_address(peer.peer_key)
                     }
                 });
-                self.store
-                    .ensure_conversation(account_id, kind, peer.peer_key, &title)?
+                Ok(self
+                    .store
+                    .ensure_conversation(account_id, kind, peer.peer_key, &title)?)
             }
-        };
-        let data_uri = build_attachment_data_uri(data_base64, filename, content_type)?;
-        // The pending row carries the same metadata-only descriptor the
-        // renderer projects (contract 1.15 wire shape), so the desktop bubble
-        // and conversation preview exist from the first pending tick instead
-        // of collapsing into an invisible empty row.
+        }
+    }
+
+    /// messages.sendSticker (contract revision 1.35, §4.31): §4.12 settlement
+    /// discipline with a body-less upstream `send` carrying the `sticker`
+    /// object — pending row (sticker metadata + image descriptor) before the
+    /// upstream call, then the shared `dispatch_prepared` completion. Bounds
+    /// failures reject before the pending row exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_send_sticker(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        pack_id: &str,
+        pack_key: &str,
+        sticker_id: u32,
+        emoji: Option<&str>,
+        image: &MessagesSendStickerImage,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_sticker_pack_id(pack_id)?;
+        validate_sticker_pack_key(pack_key)?;
+        validate_attachment_send_payload(&image.data_base64, image.size_bytes)?;
+        validate_attachment_content_type(Some(&image.content_type))?;
+        // The official client sniffs image MIME (falling back to image/webp)
+        // and refuses video/text; the connector refuses them deterministically
+        // so a rejected sticker never leaves a pending row behind.
+        if !image.content_type.starts_with("image/") {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "sticker image contentType must be image/*",
+                false,
+            )));
+        }
+        if let Some(emoji) = emoji {
+            let count = emoji.chars().count();
+            if count == 0 || count > MAX_STICKER_EMOJI_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "emoji must contain between 1 and 32 characters",
+                    false,
+                )));
+            }
+        }
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(Box::new(existing)));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_send_conversation(account_id, target)?;
+        let data_uri =
+            build_attachment_data_uri(&image.data_base64, None, Some(&image.content_type), false)?;
+        // The sent row's descriptor records the sticker image (metadata only)
+        // and the row itself records the pack identity, so the sender's bubble
+        // renders as a sticker across restarts (§4.31).
         let descriptor = NormalizedAttachment {
-            id: stable_hash_id(&[account_id, client_request_id, "attachment", "0"]),
-            content_type: content_type.map(str::to_string),
-            filename: filename.map(str::to_string),
-            size: Some(size_bytes),
-            width: None,
-            height: None,
+            id: stable_hash_id(&[account_id, client_request_id, "sticker", "0"]),
+            content_type: Some(image.content_type.clone()),
+            filename: None,
+            size: Some(image.size_bytes),
+            width: image.width,
+            height: image.height,
             is_voice_note: false,
         };
-        self.dispatch_send(
-            &account,
-            &conversation,
-            caption,
+        let sticker = crate::engine::NormalizedSticker {
+            pack_id: pack_id.to_string(),
+            pack_key: pack_key.to_string(),
+            sticker_id,
+            emoji: emoji.map(str::to_string),
+        };
+        let pending_id = stable_hash_id(&[
+            account_id,
+            conversation.id.as_str(),
+            "outgoing",
             client_request_id,
-            quote_message_id,
-            None,
-            None,
-            Some(vec![json!(data_uri)]),
-            vec![descriptor],
-        )
+        ]);
+        let pending = MessageRecord {
+            id: pending_id.clone(),
+            account_id: account_id.to_string(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account_id.to_string(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: now_ms(),
+            received_at: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            text_retrievable: false,
+            status: "pending",
+            client_request_id: Some(client_request_id.to_string()),
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: vec![descriptor],
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+            sticker: Some(sticker),
+        };
+        let inserted = self
+            .store
+            .insert_message(&pending, Some(client_request_id), None, false)?;
+        if !inserted {
+            if let Some(existing) = self
+                .store
+                .message_by_client_request(account_id, client_request_id)?
+            {
+                return Ok(PreparedSend::Existing(Box::new(existing)));
+            }
+        }
+        // Upstream shape (official `sendStickerMessage`): the sticker object
+        // with the image re-encoded as a data URI, plus the shared upstream
+        // target — and deliberately no `message` or `attachments` key, the
+        // mutual exclusivity the official face enforces.
+        let mut sticker_object = json!({
+            "packId": pack_id,
+            "packKey": pack_key,
+            "stickerId": sticker_id,
+            "image": data_uri,
+        });
+        if let Some(emoji) = emoji {
+            sticker_object["emoji"] = json!(emoji);
+        }
+        if let Some(width) = image.width {
+            sticker_object["width"] = json!(width);
+        }
+        if let Some(height) = image.height {
+            sticker_object["height"] = json!(height);
+        }
+        let mut params = json!({
+            "account": account.signal_account,
+            "sticker": sticker_object,
+        });
+        set_upstream_target(&mut params, &conversation);
+        Ok(PreparedSend::Dispatch {
+            pending_id,
+            account_id: account_id.to_string(),
+            conversation_id: conversation.id.clone(),
+            params,
+            pending_sent_at: pending.sent_at,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1117,6 +1296,7 @@ impl ConnectorService {
             delivered_at: None,
             read_at: None,
             admin_deleted: false,
+            sticker: None,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -2242,6 +2422,7 @@ impl ConnectorService {
             delivered_at: None,
             read_at: None,
             admin_deleted: false,
+            sticker: receive.sticker,
         };
         let preview = message
             .text
@@ -3109,6 +3290,46 @@ pub struct MessagesSendAttachmentParams {
     pub content_type: Option<String>,
     pub text: Option<String>,
     pub quote_message_id: Option<String>,
+    /// §4.30 voice note marker: true maps the attachment to the official
+    /// VOICE_MESSAGE flag via the `;voice=true` data-URI parameter. Requires
+    /// `audio/*` contentType, validated before the pending row exists.
+    #[serde(default)]
+    pub voice_note: bool,
+}
+
+/// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
+/// §4.12 attachment budget family minus filename — a sticker has no display
+/// name — with the sticker-specific `image/*` content-type rule enforced in
+/// the prepare step.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendStickerImage {
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub content_type: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// `messages.sendSticker` params (contract revision 1.35, §4.31): §4.12-style
+/// addressing (`conversationId` or `kind`+`peerKey`, exactly one form) plus
+/// the official `DataMessage.sticker` identity — hex pack id, standard base64
+/// pack key, pack-local sticker id, optional emoji label — and the body-less
+/// image payload. The upstream call carries no `message` key.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendStickerParams {
+    pub account_id: String,
+    pub conversation_id: Option<String>,
+    pub kind: Option<String>,
+    pub peer_key: Option<String>,
+    pub peer_title: Option<String>,
+    pub client_request_id: String,
+    pub pack_id: String,
+    pub pack_key: String,
+    pub sticker_id: u32,
+    pub emoji: Option<String>,
+    pub image: MessagesSendStickerImage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3785,16 +4006,59 @@ fn validate_attachment_content_type(value: Option<&str>) -> Result<(), ServiceEr
     Ok(())
 }
 
+/// messages.sendSticker pack identity bounds (contract revision 1.35, §4.31).
+/// The official pack id serializes hex (even-length — each byte is two hex
+/// chars) and the pack key standard base64 (`Bytes.fromBase64`); both pass
+/// through verbatim after shape validation, mirroring the official face.
+fn validate_sticker_pack_id(pack_id: &str) -> Result<(), ServiceError> {
+    let count = pack_id.chars().count();
+    if count == 0
+        || count > MAX_STICKER_PACK_ID_CHARS
+        || count % 2 != 0
+        || !pack_id.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "packId must be an even-length hex string of 1-64 characters",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sticker_pack_key(pack_key: &str) -> Result<(), ServiceError> {
+    let count = pack_key.chars().count();
+    if count == 0 || count > MAX_STICKER_PACK_KEY_CHARS {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "packKey must contain between 1 and 128 characters",
+            false,
+        )));
+    }
+    let mut decoded = Vec::new();
+    if base64_decode_to_vec(pack_key, &mut decoded).is_err() {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "packKey must be standard base64",
+            false,
+        )));
+    }
+    Ok(())
+}
+
 /// Build the RFC 2397 data URI the pinned upstream accepts
 /// (AttachmentHelper: `data:<mime>;filename=<name>;base64,<payload>`). The
 /// payload is re-encoded from the already-validated base64 — decoding first
 /// and re-encoding keeps the URI byte-exact even if the host sent a base64
 /// variant with different padding; the round-trip was verified in
-/// [`validate_attachment_send_payload`].
+/// [`validate_attachment_send_payload`]. `voice` appends the `;voice=true`
+/// parameter (§4.30), which the engine maps to the official VOICE_MESSAGE
+/// attachment flag — the wire shape the official desktop recorder emits.
 fn build_attachment_data_uri(
     base64_data: &str,
     filename: Option<&str>,
     content_type: Option<&str>,
+    voice: bool,
 ) -> Result<String, ServiceError> {
     let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
@@ -3808,6 +4072,9 @@ fn build_attachment_data_uri(
     let mut uri = String::with_capacity(decoded.len() / 3 * 4 + 64);
     uri.push_str("data:");
     uri.push_str(content_type.unwrap_or("application/octet-stream"));
+    if voice {
+        uri.push_str(";voice=true");
+    }
     if let Some(filename) = filename {
         uri.push_str(";filename=");
         // encodeURIComponent semantics for the filename parameter.
@@ -4106,6 +4373,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -4171,6 +4439,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -4497,6 +4766,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         service
@@ -4622,6 +4892,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
 
@@ -4687,6 +4958,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         assert!(
@@ -4763,6 +5035,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
 
@@ -5030,6 +5303,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5221,6 +5495,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5401,6 +5676,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5516,6 +5792,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5639,6 +5916,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5911,6 +6189,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6048,6 +6327,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6218,6 +6498,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6669,7 +6950,8 @@ mod tests {
 
         assert!(validate_attachment_send_payload(&b64, payload.len() as u64).is_ok());
         let uri =
-            build_attachment_data_uri(&b64, Some("notes 下载.txt"), Some("text/plain")).unwrap();
+            build_attachment_data_uri(&b64, Some("notes 下载.txt"), Some("text/plain"), false)
+                .unwrap();
         assert!(uri.starts_with("data:text/plain;filename=notes%20%E4%B8%8B%E8%BD%BD.txt;base64,"));
         let payload_part = uri.rsplit(";base64,").next().unwrap();
         let mut decoded = Vec::new();
@@ -6677,8 +6959,14 @@ mod tests {
         assert_eq!(decoded, payload);
 
         // Default content type when none given.
-        let uri = build_attachment_data_uri(&b64, None, None).unwrap();
+        let uri = build_attachment_data_uri(&b64, None, None, false).unwrap();
         assert!(uri.starts_with("data:application/octet-stream;base64,"));
+
+        // §4.30: the voice flag inserts the `;voice=true` parameter after the
+        // mime type, before the filename and base64 payload markers.
+        let uri =
+            build_attachment_data_uri(&b64, Some("voice.ogg"), Some("audio/ogg"), true).unwrap();
+        assert!(uri.starts_with("data:audio/ogg;voice=true;filename=voice.ogg;base64,"));
     }
 
     /// prepare_send_attachment (§4.12): validation failures leave no pending
@@ -6709,6 +6997,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6738,6 +7027,7 @@ mod tests {
                 Some("text/plain"),
                 Some("see attachment"),
                 None,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -6760,6 +7050,7 @@ mod tests {
                 Some("text/plain"),
                 Some("see attachment"),
                 None,
+                false,
             )
             .unwrap();
         let PreparedSend::Dispatch {
@@ -6792,6 +7083,7 @@ mod tests {
                 Some("text/plain"),
                 Some("see attachment"),
                 None,
+                false,
             )
             .unwrap();
         // The stored row carries the metadata-only descriptor so the desktop
@@ -6831,6 +7123,7 @@ mod tests {
                 Some("application/pdf"),
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
@@ -6855,9 +7148,339 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+
+        // §4.30: a voice-note send rides an audio attachment — the data URI
+        // gains the ;voice=true parameter and the descriptor records the flag
+        // so the sender's own bubble renders the voice UI across restarts.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-voice-1",
+                b64,
+                16,
+                None,
+                Some("audio/ogg"),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        let uri = params["attachments"][0].as_str().unwrap();
+        assert_eq!(
+            uri,
+            "data:audio/ogg;voice=true;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-voice-1")
+            .unwrap()
+            .expect("the pending voice row exists");
+        assert!(row.attachments[0].is_voice_note);
+        assert_eq!(
+            row.attachments[0].content_type.as_deref(),
+            Some("audio/ogg")
+        );
+
+        // A voice flag on a non-audio attachment rejects deterministically
+        // before the pending row exists: the same clientRequestId stays fresh.
+        let error = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation_id),
+                "req-voice-2",
+                b64,
+                16,
+                None,
+                Some("image/png"),
+                None,
+                None,
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-voice-2")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// prepare_send_sticker (contract revision 1.35, §4.31): bounds failures
+    /// reject before the pending row exists, the happy path dispatches a
+    /// body-less upstream send whose only payload keys are account, the
+    /// sticker object and the shared upstream target, and the pending row
+    /// carries the pack identity plus the metadata-only image descriptor.
+    #[test]
+    fn prepare_send_sticker_validates_bounds_and_builds_sticker_params() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let image_b64 = "iVBORw0KGgo="; // canonical base64 of the 8 PNG magic bytes
+        let pack_key = "AAAAAAAAAAAAAAAAAAAAAA=="; // standard base64 of 16 zero bytes
+
+        // Every bounds failure answers INVALID_REQUEST and leaves no pending
+        // row: the same clientRequestId stays a fresh request.
+        let rejects = &[
+            (
+                "odd hex length",
+                "abc",
+                pack_key,
+                Some("🎉"),
+                "image/webp",
+                "packId must be an even-length hex string of 1-64 characters",
+            ),
+            (
+                "non-hex pack id",
+                "abcdefgh",
+                pack_key,
+                None,
+                "image/webp",
+                "packId must be an even-length hex string of 1-64 characters",
+            ),
+            (
+                "oversized pack id",
+                "ab".repeat(33).leak(),
+                pack_key,
+                None,
+                "image/webp",
+                "packId must be an even-length hex string of 1-64 characters",
+            ),
+            (
+                "non-base64 pack key",
+                "abcdef01",
+                "not base64!!",
+                None,
+                "image/webp",
+                "packKey must be standard base64",
+            ),
+            (
+                "oversized pack key",
+                "abcdef01",
+                "QQ".repeat(65).leak(),
+                None,
+                "image/webp",
+                "packKey must contain between 1 and 128 characters",
+            ),
+            (
+                "oversized emoji",
+                "abcdef01",
+                pack_key,
+                Some(&"😀".repeat(33)),
+                "image/webp",
+                "emoji must contain between 1 and 32 characters",
+            ),
+            (
+                "video content type",
+                "abcdef01",
+                pack_key,
+                None,
+                "video/mp4",
+                "sticker image contentType must be image/*",
+            ),
+        ];
+        for (index, (name, pack_id, pack_key, emoji, content_type, message)) in
+            rejects.iter().enumerate()
+        {
+            let error = service
+                .prepare_send_sticker(
+                    &account.id,
+                    &AttachmentSendTarget::Conversation(&conversation.id),
+                    "req-sticker-invalid",
+                    pack_id,
+                    pack_key,
+                    7,
+                    *emoji,
+                    &MessagesSendStickerImage {
+                        data_base64: image_b64.to_string(),
+                        size_bytes: 8,
+                        content_type: (*content_type).to_string(),
+                        width: Some(512),
+                        height: None,
+                    },
+                )
+                .unwrap_err();
+            let api = error.into_api();
+            assert_eq!(api.code, "INVALID_REQUEST", "{name}");
+            assert_eq!(api.message, *message, "{name}");
+            assert!(
+                service
+                    .store
+                    .message_by_client_request(&account.id, "req-sticker-invalid")
+                    .unwrap()
+                    .is_none(),
+                "{name} must not leave a pending row"
+            );
+            let _ = index;
+        }
+
+        // A payload that fails the §4.12 family (size mismatch) rejects the
+        // same way.
+        let error = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-sticker-invalid",
+                "abcdef01",
+                pack_key,
+                7,
+                None,
+                &MessagesSendStickerImage {
+                    data_base64: image_b64.to_string(),
+                    size_bytes: 9,
+                    content_type: "image/webp".to_string(),
+                    width: None,
+                    height: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-sticker-invalid")
+                .unwrap()
+                .is_none()
+        );
+
+        // Happy path: exactly-one addressing, emoji/width keys present only
+        // when supplied, and no `message` / `attachments` key upstream.
+        let prepared = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-sticker-1",
+                "abcdef01",
+                pack_key,
+                7,
+                Some("🎉"),
+                &MessagesSendStickerImage {
+                    data_base64: image_b64.to_string(),
+                    size_bytes: 8,
+                    content_type: "image/webp".to_string(),
+                    width: Some(512),
+                    height: Some(512),
+                },
+            )
+            .unwrap();
+        let PreparedSend::Dispatch {
+            pending_id,
+            account_id,
+            conversation_id,
+            params,
+            pending_sent_at,
+        } = &prepared
+        else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(conversation_id, &conversation.id);
+        assert_eq!(params["account"], "+15555550100");
+        assert!(params.get("message").is_none());
+        assert!(params.get("attachments").is_none());
+        assert_eq!(
+            params["recipient"],
+            json!(["+15555550101"]),
+            "direct chats address the recipient array"
+        );
+        let sticker = &params["sticker"];
+        assert_eq!(sticker["packId"], "abcdef01");
+        assert_eq!(sticker["packKey"], pack_key);
+        assert_eq!(sticker["stickerId"], 7);
+        assert_eq!(sticker["emoji"], "🎉");
+        assert_eq!(sticker["width"], 512);
+        assert_eq!(sticker["height"], 512);
+        assert_eq!(
+            sticker["image"], "data:image/webp;base64,iVBORw0KGgo=",
+            "the image re-encodes as a data URI without a filename"
+        );
+        assert!(*pending_sent_at > 0);
+        let _ = pending_id;
+
+        // The pending row records the pack identity beside a metadata-only
+        // image descriptor — no body text.
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-sticker-1")
+            .unwrap()
+            .expect("the pending sticker row exists");
+        assert_eq!(row.status, "pending");
+        assert!(row.text.is_none());
+        assert_eq!(row.attachments.len(), 1);
+        let descriptor = &row.attachments[0];
+        assert_eq!(descriptor.content_type.as_deref(), Some("image/webp"));
+        assert_eq!(descriptor.filename, None);
+        assert_eq!(descriptor.size, Some(8));
+        assert_eq!(descriptor.width, Some(512));
+        assert_eq!(descriptor.height, Some(512));
+        assert!(!descriptor.is_voice_note);
+        let sticker_meta = row.sticker.expect("the row carries the pack identity");
+        assert_eq!(sticker_meta.pack_id, "abcdef01");
+        assert_eq!(sticker_meta.pack_key, pack_key);
+        assert_eq!(sticker_meta.sticker_id, 7);
+        assert_eq!(sticker_meta.emoji.as_deref(), Some("🎉"));
+
+        // Replaying the same clientRequestId returns the existing row.
+        let replay = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-sticker-1",
+                "abcdef01",
+                pack_key,
+                7,
+                Some("🎉"),
+                &MessagesSendStickerImage {
+                    data_base64: image_b64.to_string(),
+                    size_bytes: 8,
+                    content_type: "image/webp".to_string(),
+                    width: Some(512),
+                    height: Some(512),
+                },
+            )
+            .unwrap();
+        assert!(matches!(replay, PreparedSend::Existing(_)));
+
+        // Peer addressing progressive-fills a group skeleton and addresses
+        // groupId upstream; emoji/width/height keys stay absent when unsupplied.
+        let prepared = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Peer(PeerTarget {
+                    kind: "group",
+                    peer_key: "ZmFrZS1ncm91cC0x",
+                    peer_title: None,
+                }),
+                "req-sticker-2",
+                "ABCDEF01",
+                pack_key,
+                0,
+                None,
+                &MessagesSendStickerImage {
+                    data_base64: image_b64.to_string(),
+                    size_bytes: 8,
+                    content_type: "image/png".to_string(),
+                    width: None,
+                    height: None,
+                },
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert!(params.get("recipient").is_none());
+        assert_eq!(params["groupId"], "ZmFrZS1ncm91cC0x");
+        assert!(params["sticker"].get("emoji").is_none());
+        assert!(params["sticker"].get("width").is_none());
+        assert!(params["sticker"].get("height").is_none());
     }
 
     /// groups.get (contract revision 1.9, implementation-plan §4.8): a pure
@@ -7091,6 +7714,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: Some(control),
         }
     }
@@ -7194,6 +7818,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                sticker: None,
                 admin_deleted: false,
             };
             assert!(
@@ -7534,6 +8159,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         service
@@ -7588,6 +8214,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         service
@@ -7738,6 +8365,7 @@ mod tests {
                     quote: None,
                     attachments: Vec::new(),
                     rich: None,
+                    sticker: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -7958,6 +8586,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         service
@@ -8097,6 +8726,7 @@ mod tests {
             quote: None,
             attachments: Vec::new(),
             rich: None,
+            sticker: None,
             control: None,
         };
         service
@@ -8149,6 +8779,7 @@ mod tests {
                 is_voice_note: false,
             }],
             rich: None,
+            sticker: None,
             control: None,
         };
         service

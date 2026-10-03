@@ -35,7 +35,8 @@ use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
     MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
-    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_SEND_MENTIONS, MAX_TEXT_BYTES,
+    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_SEND_MENTIONS,
+    MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -371,6 +372,31 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesSendAttachmentParams/properties/text",
             "maxLength",
             MAX_TEXT_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendStickerParams/properties/packId",
+            "maxLength",
+            MAX_STICKER_PACK_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStickerParams/properties/packKey",
+            "maxLength",
+            MAX_STICKER_PACK_KEY_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStickerParams/properties/emoji",
+            "maxLength",
+            MAX_STICKER_EMOJI_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStickerParams/properties/image/properties/dataBase64",
+            "maxLength",
+            (4 * MAX_ATTACHMENT_BYTES.div_ceil(3)) as u64,
+        ),
+        (
+            "/$defs/messagesSendStickerParams/properties/image/properties/sizeBytes",
+            "maximum",
+            MAX_ATTACHMENT_BYTES as u64,
         ),
         (
             "/$defs/conversationsListParams/properties/limit",

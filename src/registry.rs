@@ -639,6 +639,7 @@ impl ProxyGroupRuntime {
         content_type: Option<String>,
         text: Option<String>,
         quote_message_id: Option<String>,
+        voice_note: bool,
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
@@ -652,8 +653,17 @@ impl ProxyGroupRuntime {
                 content_type,
                 text,
                 quote_message_id,
+                voice_note,
             )
             .await
+    }
+
+    pub async fn send_sticker(
+        &self,
+        params: crate::service::MessagesSendStickerParams,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_sticker(params).await
     }
 
     pub async fn remote_delete(

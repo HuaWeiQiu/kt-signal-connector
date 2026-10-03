@@ -18,10 +18,11 @@ use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, PeerTarget, PreparedSend,
-    SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError, account_limit_error,
-    store_get_group, store_get_message_text, store_list_contacts, store_list_conversations,
-    store_list_messages, store_search_messages, validate_account_delete_operation_id,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MessagesSendStickerParams,
+    PeerTarget, PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    ServiceError, account_limit_error, store_get_group, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
@@ -1450,6 +1451,7 @@ impl RuntimeSupervisor {
         content_type: Option<String>,
         text: Option<String>,
         quote_message_id: Option<String>,
+        voice_note: bool,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -1478,6 +1480,67 @@ impl RuntimeSupervisor {
                 content_type.as_deref(),
                 text.as_deref(),
                 quote_message_id.as_deref(),
+                voice_note,
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
+    /// messages.sendSticker (contract revision 1.35, §4.31): the §4.12
+    /// attachment shape end to end — local prepare under the service lock
+    /// (addressing resolved like `messages.attachments.send`, exactly one
+    /// form), upstream `send` with the `sticker` object via the shared
+    /// `dispatch_prepared` settlement (success completes the pending row with
+    /// the upstream timestamp; an unknown mutating outcome answers
+    /// SEND_OUTCOME_UNKNOWN and is never retried).
+    pub async fn send_sticker(
+        &self,
+        params: MessagesSendStickerParams,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let MessagesSendStickerParams {
+                account_id,
+                conversation_id,
+                kind,
+                peer_key,
+                peer_title,
+                client_request_id,
+                pack_id,
+                pack_key,
+                sticker_id,
+                emoji,
+                image,
+            } = params;
+            let target = match (&conversation_id, &kind, &peer_key, &peer_title) {
+                (Some(conversation_id), None, None, None) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                (None, Some(kind), Some(peer_key), peer_title) => {
+                    AttachmentSendTarget::Peer(PeerTarget {
+                        kind,
+                        peer_key,
+                        peer_title: peer_title.as_deref(),
+                    })
+                }
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "exactly one of conversationId or kind+peerKey must be provided",
+                        false,
+                    )));
+                }
+            };
+            service.prepare_send_sticker(
+                &account_id,
+                &target,
+                &client_request_id,
+                &pack_id,
+                &pack_key,
+                sticker_id,
+                emoji.as_deref(),
+                &image,
             )?
         };
         self.dispatch_prepared(&engine, prepared).await
@@ -2481,6 +2544,7 @@ mod tests {
             delivered_at: None,
             read_at: None,
             admin_deleted: false,
+            sticker: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -2578,6 +2642,7 @@ mod tests {
                 quote: None,
                 attachments: Vec::new(),
                 rich: None,
+                sticker: None,
                 control: None,
             })
             .await

@@ -32,8 +32,8 @@ use crate::service::{
     MessagesListParams, MessagesMarkReadParams, MessagesMarkViewedParams,
     MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
     MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
-    MessagesSendReactionParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    PresenceSetTypingMessageParams, SendTarget,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, PresenceSetTypingMessageParams, SendTarget,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1176,6 +1176,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                 params.content_type,
                                 params.text,
                                 params.quote_message_id,
+                                params.voice_note,
                             )
                             .await
                         {
@@ -1193,6 +1194,25 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.attachments.send params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.sendSticker" => {
+            match serde_json::from_value::<MessagesSendStickerParams>(request.params) {
+                Ok(params) => match runtime.send_sticker(params).await {
+                    Ok(message) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(message).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendSticker params",
                         false,
                     ),
                 ),

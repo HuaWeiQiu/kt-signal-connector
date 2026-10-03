@@ -52,6 +52,7 @@
             "messages.sendText",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.sendSticker",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
@@ -202,6 +203,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendAttachmentParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendSticker" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendStickerParams" }
             }
           }
         },
@@ -759,7 +771,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "clientRequestId", "dataBase64", "sizeBytes"],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13, budget raised to the official 100 MiB ceiling in 1.16): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13, budget raised to the official 100 MiB ceiling in 1.16): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. voiceNote (contract revision 1.35) marks the attachment as a voice note: the data URI gains the ;voice=true parameter the engine maps to the official VOICE_MESSAGE flag, and the sent row's descriptor carries isVoiceNote — voiceNote requires contentType audio/* and is rejected INVALID_REQUEST before the pending row exists. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -813,7 +825,112 @@
           "maxLength": 65536,
           "description": "Optional caption; the service authoritatively enforces at most 65536 UTF-8 bytes."
         },
-        "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
+        "quoteMessageId": { "$ref": "#/$defs/opaqueId" },
+        "voiceNote": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send the attachment as a voice note (contract revision 1.35): the data URI gains ;voice=true (engine maps it to the official VOICE_MESSAGE flag — the exact wire shape the official desktop recorder emits) and the sent descriptor records isVoiceNote. Requires contentType audio/*; anything else is INVALID_REQUEST before the pending row exists."
+        }
+      }
+    },
+    "messagesSendStickerParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountId",
+        "clientRequestId",
+        "packId",
+        "packKey",
+        "stickerId",
+        "image"
+      ],
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one sticker (contract revision 1.35, mirroring the official sendStickerMessage face): packId is the official hex pack id (even length, 1-64 characters), packKey the standard-base64 pack key (1-128 characters), stickerId the pack-local id, emoji an optional ≤32-character label. image follows the messages.attachments.send budget family (dataBase64 standard padded base64, decoded size must equal sizeBytes, 1..104857600 bytes) with one sticker-specific rule: contentType must be image/* (the official client sniffs image MIME and refuses video/text). The upstream send carries only the sticker object — no message body, no regular attachments. Settlement follows messages.sendText: the response is the sent MessageRecord whose descriptor records the sticker image plus the pack identity, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "direct", "group"],
+          "description": "Peer target kind; 'contact' and 'direct' both address a direct chat."
+        },
+        "peerKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Recipient number/uuid for direct chats, group id for groups."
+        },
+        "peerTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional display title used when the peer send creates a new conversation."
+        },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" },
+        "packId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^([0-9A-Fa-f]{2})+$",
+          "description": "Sticker pack id as the official client serializes it: hex, even length (each byte two hex chars), 1-64 characters; passed through verbatim after shape validation."
+        },
+        "packKey": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "description": "Sticker pack key in standard base64 (Bytes.fromBase64 convention), 1-128 characters; passed through verbatim after shape validation."
+        },
+        "stickerId": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Pack-local sticker id."
+        },
+        "emoji": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Optional emoji label for the sticker, at most 32 characters."
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dataBase64", "sizeBytes", "contentType"],
+          "properties": {
+            "dataBase64": {
+              "type": "string",
+              "minLength": 4,
+              "maxLength": 139810136,
+              "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+              "description": "Standard padded base64 of the sticker image bytes; decoded size must equal sizeBytes. The bound is 4 * ceil(104857600 / 3) — the exact padded-base64 length for the 100 MiB ceiling."
+            },
+            "sizeBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 104857600,
+              "description": "Declared raw image size; verified against the decoded payload before anything is sent."
+            },
+            "contentType": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$",
+              "description": "RFC 2045 media type 'type/subtype'; must be image/* (the official client sniffs image MIME and refuses video/text)."
+            },
+            "width": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "Optional display width, passed through as official AttachmentPointer display metadata."
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "Optional display height, passed through as official AttachmentPointer display metadata."
+            }
+          }
+        }
       }
     },
     "groupsGetParams": {

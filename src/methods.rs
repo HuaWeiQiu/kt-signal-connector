@@ -47,6 +47,10 @@ pub const METHODS: &[MethodRow] = &[
     // send-lane, upstream traffic — the same class as the original send.
     ("messages.retryText", Lane::Send, true, "send"),
     ("messages.attachments.send", Lane::Send, true, "send"),
+    // Sticker send (contract 1.35): mutating, send-lane upstream traffic —
+    // the §4.12 attachment class verbatim, same-account mutex and delete
+    // barrier included; advertised through `send-sticker`.
+    ("messages.sendSticker", Lane::Send, true, "send"),
     ("messages.edit", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
@@ -125,10 +129,12 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// Feature capability tags that ride the handshake `capabilities` array
 /// beyond the method-name list (contract revision 1.34): `send-receipts`
 /// marks the outbound receipt face — `messages.markRead` /
-/// `messages.markViewed` plus the auto delivery receipt — as present. They
-/// never join [`METHOD_NAMES`]: the schema request-frame method enum and the
-/// dispatch table describe real methods only.
-pub const FEATURE_CAPABILITIES: &[&str] = &["send-receipts"];
+/// `messages.markViewed` plus the auto delivery receipt — as present, and
+/// `send-sticker` (contract revision 1.35) marks `messages.sendSticker` plus
+/// the sticker receive projection as present. They never join
+/// [`METHOD_NAMES`]: the schema request-frame method enum and the dispatch
+/// table describe real methods only.
+pub const FEATURE_CAPABILITIES: &[&str] = &["send-receipts", "send-sticker"];
 
 #[cfg(test)]
 mod tests {
@@ -155,6 +161,7 @@ mod tests {
             "messages.sendText",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.sendSticker",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
@@ -170,6 +177,7 @@ mod tests {
             "messages.sendText",
             "messages.retryText",
             "messages.attachments.send",
+            "messages.sendSticker",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",

@@ -3338,7 +3338,8 @@ async fn receipt_upstream_failures_degrade_to_unknown_not_errors() {
 }
 
 /// Contract revision 1.34 announcement and outbound mentions: the handshake
-/// capabilities carry the new methods plus the `send-receipts` feature tag,
+/// capabilities carry the new methods plus the `send-receipts` feature tag
+/// (and the 1.35 `messages.sendSticker` method plus the `send-sticker` tag),
 /// and `messages.sendText` mentions reach the engine resolved — a UUID-shaped
 /// number and the cached contact pass verbatim, the unresolvable number is
 /// dropped locally — while an empty mention number fails the request closed.
@@ -3385,7 +3386,13 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         .unwrap();
     let handshake: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
     let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
-    for advertised in ["messages.markRead", "messages.markViewed", "send-receipts"] {
+    for advertised in [
+        "messages.markRead",
+        "messages.markViewed",
+        "send-receipts",
+        "messages.sendSticker",
+        "send-sticker",
+    ] {
         assert!(
             capabilities
                 .iter()
@@ -3482,6 +3489,326 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.35 stickers end to end: the upstream `send` carries
+/// only the sticker object (no `message`, no `attachments` key), the pending
+/// row settles with the upstream timestamp, an engine crash with the mutating
+/// send in flight answers SEND_OUTCOME_UNKNOWN and leaves the row unknown
+/// with no automatic retry, bounds failures reject before any row exists, and
+/// an inbound sticker envelope projects onto a row with its pack identity
+/// beside the metadata-only descriptor (a data-less sticker keeps the skip
+/// routing).
+#[tokio::test]
+async fn sticker_send_and_receive_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [31_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Stickers" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let sticker_calls = || {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("sticker").is_some())
+            .collect::<Vec<_>>()
+    };
+
+    // Happy path: peer addressing progressive-fills the direct chat, the
+    // upstream call carries the sticker object only, and the row settles with
+    // the upstream timestamp.
+    let sent = request(
+        &mut client,
+        "sticker-1",
+        "messages.sendSticker",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "clientRequestId": "sticker-req-1",
+            "packId": "abcdef01",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "stickerId": 7,
+            "emoji": "🎉",
+            "image": {
+                "dataBase64": "iVBORw0KGgo=",
+                "sizeBytes": 8,
+                "contentType": "image/png",
+                "width": 512,
+                "height": 512
+            }
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    assert_eq!(sent["result"]["sentAt"], json!(99));
+    let sticker_row_id = sent["result"]["id"].clone();
+    let conversation_id = sent["result"]["conversationId"].clone();
+
+    let calls = sticker_calls();
+    assert_eq!(calls.len(), 1, "exactly one upstream send: {calls:?}");
+    let call = &calls[0];
+    assert_eq!(call["account"], "+15555550100");
+    assert!(
+        call.get("message").is_none(),
+        "a sticker send carries no message body: {call}"
+    );
+    assert!(
+        call.get("attachments").is_none(),
+        "a sticker send carries no regular attachments: {call}"
+    );
+    assert_eq!(call["recipient"], json!(["+15555550101"]));
+    assert_eq!(call["sticker"]["packId"], "abcdef01");
+    assert_eq!(call["sticker"]["packKey"], "AAAAAAAAAAAAAAAAAAAAAA==");
+    assert_eq!(call["sticker"]["stickerId"], 7);
+    assert_eq!(call["sticker"]["emoji"], "🎉");
+    assert_eq!(
+        call["sticker"]["image"],
+        "data:image/png;base64,iVBORw0KGgo="
+    );
+    assert_eq!(call["sticker"]["width"], 512);
+    assert_eq!(call["sticker"]["height"], 512);
+
+    // The sent row renders the sticker identity beside the metadata-only
+    // descriptor, read back from the persisted store (what a restart loads).
+    let listed = request(
+        &mut client,
+        "list-sticker",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == sticker_row_id)
+        .expect("the sent sticker row is listed");
+    assert_eq!(row["sticker"]["packId"], "abcdef01");
+    assert_eq!(row["sticker"]["packKey"], "AAAAAAAAAAAAAAAAAAAAAA==");
+    assert_eq!(row["sticker"]["stickerId"], 7);
+    assert_eq!(row["sticker"]["emoji"], "🎉");
+    assert_eq!(row["attachments"][0]["contentType"], "image/png");
+    assert_eq!(row["attachments"][0]["size"], 8);
+    assert_eq!(row["attachments"][0]["width"], 512);
+    assert!(
+        row.get("text").map(Value::is_null).unwrap_or(true),
+        "a sticker row has no body text: {row}"
+    );
+
+    // Bounds failure: a video sticker rejects INVALID_REQUEST before any row
+    // exists — the same clientRequestId stays a fresh request.
+    let invalid = request(
+        &mut client,
+        "sticker-invalid",
+        "messages.sendSticker",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "sticker-req-invalid",
+            "packId": "abcdef01",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "stickerId": 8,
+            "image": {
+                "dataBase64": "iVBORw0KGgo=",
+                "sizeBytes": 8,
+                "contentType": "video/mp4"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(invalid["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(sticker_calls().len(), 1, "no upstream call for the reject");
+
+    // Indeterminate outcome: the all-f pack id kills the engine with the
+    // mutating send in flight, the request still answers SEND_OUTCOME_UNKNOWN,
+    // the row settles to `unknown`, and nothing is retried.
+    let unknown = request(
+        &mut client,
+        "sticker-unknown",
+        "messages.sendSticker",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "sticker-req-unknown",
+            "packId": "ffffffff",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "stickerId": 9,
+            "image": {
+                "dataBase64": "iVBORw0KGgo=",
+                "sizeBytes": 8,
+                "contentType": "image/png"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+
+    // The crash is recoverable: an explicit start brings a fresh engine up on
+    // the same data directory, and the unknown row survives the reload.
+    let restarted = request(&mut client, "restart-sticker", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid);
+
+    let unknown_calls = sticker_calls();
+    assert_eq!(
+        unknown_calls
+            .iter()
+            .filter(|call| call["sticker"]["packId"] == "ffffffff")
+            .count(),
+        1,
+        "an unknown outcome is never retried: {unknown_calls:?}"
+    );
+    let listed = request(
+        &mut client,
+        "list-unknown",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let unknown_row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["clientRequestId"] == "sticker-req-unknown")
+        .expect("the unknown sticker row survives the engine restart");
+    assert_eq!(unknown_row["status"], "unknown");
+
+    // Inbound projection: a sticker with a usable `data` pointer lands as an
+    // incoming row; a data-less sticker keeps the skip routing (no row).
+    let extra_receives = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-extra-receives.json");
+    fs::write(
+        &extra_receives,
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceName": "Ada",
+                "timestamp": 777,
+                "dataMessage": {
+                    "sticker": {
+                        "packId": "00ff00ff",
+                        "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                        "stickerId": 3,
+                        "emoji": "🚀",
+                        "data": {
+                            "id": "att-in-1",
+                            "contentType": "image/webp",
+                            "size": 4096,
+                            "width": 256,
+                            "height": 256
+                        }
+                    }
+                }
+            },
+            {
+                "source": "+15555550102",
+                "sourceName": "Ada",
+                "timestamp": 778,
+                "dataMessage": {
+                    "sticker": { "packId": "00ff00ff", "stickerId": 4 }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    // The fixture flushes pending extra receives before answering sendTyping,
+    // so the flush response can outrun the receive processing: wait for the
+    // conversation.changed event that the stored sticker row emits, and take
+    // the progressive-filled conversation id straight from it.
+    send_request_frame(
+        &mut client,
+        "sticker-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id
+        }),
+    )
+    .await;
+    let incoming_conversation = timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("conversation.changed") {
+                return frame["data"]["id"].as_str().unwrap().to_string();
+            }
+        }
+    })
+    .await
+    .expect("the inbound sticker row must refresh its conversation");
+    let listed = request(
+        &mut client,
+        "list-incoming-sticker",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": incoming_conversation,
+            "limit": 50
+        }),
+    )
+    .await;
+    let items = listed["result"]["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the data-less sticker envelope stays skipped: {items:?}"
+    );
+    let incoming = &items[0];
+    assert_eq!(incoming["direction"], "incoming");
+    assert_eq!(incoming["sticker"]["packId"], "00ff00ff");
+    assert_eq!(incoming["sticker"]["stickerId"], 3);
+    assert_eq!(incoming["sticker"]["emoji"], "🚀");
+    assert_eq!(incoming["attachments"][0]["id"], "att-in-1");
+    assert_eq!(incoming["attachments"][0]["contentType"], "image/webp");
+    assert_eq!(incoming["attachments"][0]["width"], 256);
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
     assert_clean_exit(&mut connector).await;
 }
 

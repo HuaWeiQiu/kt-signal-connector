@@ -402,6 +402,12 @@ for line in sys.stdin:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         result = {"timestamp": 99, "results": []}
+        # Contract 1.35 test hook: a sticker send whose pack id is all-f
+        # crashes with the mutating call in flight — the send may or may not
+        # have reached the server, which is the indeterminate case
+        # (engine-exit path).
+        if (params.get("sticker") or {}).get("packId") == "ffffffff":
+            os._exit(23)
     elif method == "remoteDelete":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert targetTimestamp/recipient/groupId.
