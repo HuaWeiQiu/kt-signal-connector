@@ -108,6 +108,9 @@ pub struct RuntimeSupervisor {
     /// One-shot media governor pass (ADR 0002: once per process start);
     /// never held across an await.
     media_governor_pass: StdMutex<Option<JoinHandle<()>>>,
+    /// One-shot contacts/groups re-sync pass (once per process start);
+    /// never held across an await.
+    contacts_resync: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
 }
@@ -170,6 +173,7 @@ impl RuntimeSupervisor {
             watchdog: StdMutex::new(None),
             retention: StdMutex::new(None),
             media_governor_pass: StdMutex::new(None),
+            contacts_resync: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
         }
     }
@@ -283,6 +287,66 @@ impl RuntimeSupervisor {
         *slot = Some(run_media_governor_pass(governor));
     }
 
+    /// One best-effort contacts/groups re-sync per linked account of this
+    /// group once an engine has landed (boot start or watchdog recovery).
+    ///
+    /// The sync is what materializes the contract-1.14 conversation
+    /// skeletons, so an account linked before that revision — or whose
+    /// inline link-time sync failed — would otherwise surface conversations
+    /// only message by message. It runs in the background (the host
+    /// handshake path never waits on the JVM) and the 60-second cache inside
+    /// the sync folds repeat starts into read-only no-ops. One pass per
+    /// process start, same discipline as history retention.
+    fn spawn_contacts_resync(&self) {
+        let Ok(engine_slot) = self.engine.try_lock() else {
+            return;
+        };
+        let Some(engine) = engine_slot
+            .as_ref()
+            .filter(|engine| !engine.is_terminal())
+            .cloned()
+        else {
+            return;
+        };
+        drop(engine_slot);
+        self.spawn_contacts_resync_with(engine);
+    }
+
+    fn spawn_contacts_resync_with(&self, engine: EngineHandle) {
+        let Ok(mut slot) = self.contacts_resync.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let service = Arc::clone(&self.service);
+        let group_id = self.group_id.clone();
+        *slot = Some(tokio::spawn(async move {
+            // Let the fresh JVM settle and any link-time inline sync land
+            // first; the 60-second cache then folds the overlap into a no-op.
+            sleep(Duration::from_secs(2)).await;
+            let accounts = match service.lock().await.list_accounts_in_group(&group_id) {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    tracing::warn!(
+                        error_class = error.class(),
+                        "startup contacts resync account listing failed"
+                    );
+                    return;
+                }
+            };
+            for account in accounts {
+                if let Err(error) = sync_contacts_with(&service, &engine, &account.id).await {
+                    tracing::warn!(
+                        error_class = error.class(),
+                        account_id = %account.id,
+                        "startup contacts resync failed"
+                    );
+                }
+            }
+        }));
+    }
+
     pub fn subscribe_engine(&self) -> broadcast::Receiver<EngineEvent> {
         self.events.subscribe()
     }
@@ -320,6 +384,10 @@ impl RuntimeSupervisor {
         .await?;
         let status = engine.status();
         *slot = Some(engine);
+        drop(slot);
+        if status.state == EngineState::Running {
+            self.spawn_contacts_resync();
+        }
         Ok(status)
     }
 
@@ -675,7 +743,10 @@ impl RuntimeSupervisor {
             self.receive_ingress.clone(),
         )
         .await?;
+        let fresh = engine.clone();
         *slot = Some(engine);
+        drop(slot);
+        self.spawn_contacts_resync_with(fresh);
         Ok(())
     }
 
@@ -1601,104 +1672,113 @@ impl RuntimeSupervisor {
                 }
             }
         }
-        let number = self
-            .service
-            .lock()
-            .await
-            .account_signal_number(account_id)?;
         let engine = self.running_engine().await?;
-        // Contacts registered on the account only (no allRecipients walk).
-        let contacts_result = engine
-            .call(
-                "listContacts",
-                json!({ "account": number }),
-                CallClass::ReadOnly,
-            )
-            .await
-            .map_err(ServiceError::Engine)?;
-        let groups_result = engine
-            .call(
-                "listGroups",
-                json!({ "account": number }),
-                CallClass::ReadOnly,
-            )
-            .await
-            .map_err(ServiceError::Engine)?;
-
-        let mut synced: Vec<(String, String, String, Option<String>)> = Vec::new();
-        let mut contact_count = 0_u64;
-        let mut group_count = 0_u64;
-        for item in contacts_result.as_array().cloned().unwrap_or_default() {
-            let peer_key = ["number", "uuid", "numberUuid"]
-                .iter()
-                .find_map(|field| item.get(field).and_then(Value::as_str))
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let Some(peer_key) = peer_key else {
-                continue;
-            };
-            // The linked account itself appears in its own contact list
-            // (signal-cli "note to self" entry); it must not become a
-            // conversation skeleton — not even a cache row, matching the
-            // pre-1.14 sync shape.
-            if peer_key == number {
-                continue;
-            }
-            let title = compose_contact_display_name(&item)
-                .unwrap_or_else(|| crate::ids::mask_address(peer_key));
-            synced.push(("contact".to_string(), peer_key.to_string(), title, None));
-            contact_count += 1;
-        }
-        for item in groups_result.as_array().cloned().unwrap_or_default() {
-            // Only groups the linked account is still a member of.
-            if item.get("isMember").and_then(Value::as_bool) != Some(true) {
-                continue;
-            }
-            let Some(peer_key) = item
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let title = item
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(|value| value.chars().take(64).collect::<String>())
-                .unwrap_or_else(|| "group".to_string());
-            let extra = item
-                .get("members")
-                .and_then(Value::as_array)
-                .map(|members| json!({ "memberCount": members.len() }).to_string());
-            synced.push(("group".to_string(), peer_key.to_string(), title, extra));
-            group_count += 1;
-        }
-
-        let entries: Vec<SyncedContact<'_>> = synced
-            .iter()
-            .map(|(kind, peer_key, title, extra)| SyncedContact {
-                kind: kind.as_str(),
-                peer_key: peer_key.as_str(),
-                title: title.as_str(),
-                extra: extra.as_deref(),
-            })
-            .collect();
-        // One transaction for the whole batch plus the sync marker: the store
-        // lock is held once instead of per contact, and a partial sync is
-        // never visible (a failed entry rolls back the rows and the marker).
-        self.service
-            .lock()
-            .await
-            .upsert_synced_contacts(account_id, &entries, now_ms)?;
-        Ok(ContactsSyncOutcome {
-            contact_count,
-            group_count,
-            synced_at: now_ms,
-        })
+        sync_contacts_with(&self.service, &engine, account_id).await
     }
+}
+
+/// Shared body of [`RuntimeSupervisor::sync_contacts`] plus the startup
+/// re-sync: the read-only engine listing and the single all-or-nothing upsert
+/// transaction. Free-standing so the spawned startup pass can run against the
+/// engine handle it captured at spawn time.
+async fn sync_contacts_with(
+    service: &Arc<Mutex<ConnectorService>>,
+    engine: &EngineHandle,
+    account_id: &str,
+) -> Result<ContactsSyncOutcome, ServiceError> {
+    let number = service.lock().await.account_signal_number(account_id)?;
+    // Contacts registered on the account only (no allRecipients walk).
+    let contacts_result = engine
+        .call(
+            "listContacts",
+            json!({ "account": number }),
+            CallClass::ReadOnly,
+        )
+        .await
+        .map_err(ServiceError::Engine)?;
+    let groups_result = engine
+        .call(
+            "listGroups",
+            json!({ "account": number }),
+            CallClass::ReadOnly,
+        )
+        .await
+        .map_err(ServiceError::Engine)?;
+
+    let mut synced: Vec<(String, String, String, Option<String>)> = Vec::new();
+    let mut contact_count = 0_u64;
+    let mut group_count = 0_u64;
+    for item in contacts_result.as_array().cloned().unwrap_or_default() {
+        let peer_key = ["number", "uuid", "numberUuid"]
+            .iter()
+            .find_map(|field| item.get(field).and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(peer_key) = peer_key else {
+            continue;
+        };
+        // The linked account itself appears in its own contact list
+        // (signal-cli "note to self" entry); it must not become a
+        // conversation skeleton — not even a cache row, matching the
+        // pre-1.14 sync shape.
+        if peer_key == number {
+            continue;
+        }
+        let title = compose_contact_display_name(&item)
+            .unwrap_or_else(|| crate::ids::mask_address(peer_key));
+        synced.push(("contact".to_string(), peer_key.to_string(), title, None));
+        contact_count += 1;
+    }
+    for item in groups_result.as_array().cloned().unwrap_or_default() {
+        // Only groups the linked account is still a member of.
+        if item.get("isMember").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(peer_key) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let title = item
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(64).collect::<String>())
+            .unwrap_or_else(|| "group".to_string());
+        let extra = item
+            .get("members")
+            .and_then(Value::as_array)
+            .map(|members| json!({ "memberCount": members.len() }).to_string());
+        synced.push(("group".to_string(), peer_key.to_string(), title, extra));
+        group_count += 1;
+    }
+
+    let entries: Vec<SyncedContact<'_>> = synced
+        .iter()
+        .map(|(kind, peer_key, title, extra)| SyncedContact {
+            kind: kind.as_str(),
+            peer_key: peer_key.as_str(),
+            title: title.as_str(),
+            extra: extra.as_deref(),
+        })
+        .collect();
+    // One transaction for the whole batch plus the sync marker: the store
+    // lock is held once instead of per contact, and a partial sync is
+    // never visible (a failed entry rolls back the rows and the marker).
+    let now_ms = crate::link::now_ms();
+    service
+        .lock()
+        .await
+        .upsert_synced_contacts(account_id, &entries, now_ms)?;
+    Ok(ContactsSyncOutcome {
+        contact_count,
+        group_count,
+        synced_at: now_ms,
+    })
 }
 
 impl Drop for RuntimeSupervisor {
@@ -1716,6 +1796,11 @@ impl Drop for RuntimeSupervisor {
             handle.abort();
         }
         if let Ok(mut slot) = self.media_governor_pass.lock()
+            && let Some(handle) = slot.take()
+        {
+            handle.abort();
+        }
+        if let Ok(mut slot) = self.contacts_resync.lock()
             && let Some(handle) = slot.take()
         {
             handle.abort();

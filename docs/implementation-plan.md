@@ -1295,7 +1295,13 @@ After link, signal-cli has already synchronized contacts and groups from the pri
 group engine queue and upserts them into a per-account `contacts` cache table keyed by
 `(account_id, kind, peer_key)`. A successful sync less than 60 seconds old returns the cached
 counts without touching the engine. `link.finish` runs one best-effort sync inline; its failure is
-logged and never fails the link flow. `contacts.list` serves the cache only (optional substring
+logged and never fails the link flow. Every group supervisor engine start (boot `runtime.start` or
+a watchdog recovery restart) also runs one best-effort background re-sync pass for the group's
+linked accounts after a settle delay: an account linked before the skeleton revision — or whose
+inline link-time sync failed — still materializes its contact/group conversation skeletons on the
+next engine start instead of surfacing conversations only message by message. The pass is
+one-shot per process start (history-retention discipline), warn-only, and the 60-second cache
+folds repeat starts into read-only no-ops. `contacts.list` serves the cache only (optional substring
 filter, cursor pagination) and never calls upstream, so the Desktop new-chat picker cannot starve
 the JVM queue. Contact rows and the sync marker are deleted with the account.
 
