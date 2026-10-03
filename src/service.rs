@@ -1443,7 +1443,41 @@ impl ConnectorService {
             conversation_id: conversation_id.to_string(),
             message_id: message_id.to_string(),
             params,
+            emoji: emoji.to_string(),
+            remove,
+            target_sent_at: message.sent_at,
         })
+    }
+
+    /// sendReaction 上行确认后的本地落库（对齐 edit 的 prepare/complete 两段
+    /// 式）：本机回应以 account.id 为 actor、无显示名——与收件侧多设备 echo
+    /// 同口径（contract 1.27），pill 由聚合投影自然带出 mine=true。返回的会话
+    /// 摘要供调用方推 conversation.changed，app 即时刷新，不等轮询。
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_send_reaction(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        emoji: &str,
+        remove: bool,
+        target_sent_at: u64,
+    ) -> Result<Option<ConversationSummary>, ServiceError> {
+        let account = self
+            .store
+            .account_by_id(account_id)?
+            .ok_or(StoreError::MessageNotFound)?;
+        self.store.upsert_reaction_event(
+            account_id,
+            conversation_id,
+            emoji,
+            target_sent_at,
+            &account.id,
+            remove,
+            None,
+        )?;
+        Ok(self
+            .store
+            .conversation_summary(account_id, conversation_id)?)
     }
 
     /// messages.attachments.open (ADR 0002, contract revision 1.17): resolve
@@ -2260,6 +2294,11 @@ pub struct PreparedSendReaction {
     pub conversation_id: String,
     pub message_id: String,
     pub params: Value,
+    /// Upstream-confirmed reaction delta, carried for the complete step
+    /// (own reactions persist with the account itself as the actor).
+    pub emoji: String,
+    pub remove: bool,
+    pub target_sent_at: u64,
 }
 
 /// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
@@ -4972,6 +5011,84 @@ mod tests {
             assert_eq!(prepared.params["targetAuthor"], json!("+15555550100"));
             assert_eq!(prepared.params["targetTimestamp"], json!(777));
         }
+    }
+
+    /// 上行确认后的 complete 落库：own 回应以 account 为 actor 持久化，pill
+    /// 带 mine=true、actor 标 self；remove=true 撤回后 pill 消失。app 的乐观
+    /// 窗口结束后读侧仍一致（supervisor 侧另推 conversation.changed）。
+    #[test]
+    fn complete_send_reaction_persists_own_pill_and_removal() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let message_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "reaction target",
+                "req-sr-complete",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service
+            .complete_send_success(&message_id, &account.id, &conversation.id, 888)
+            .unwrap();
+        let prepared = service
+            .prepare_send_reaction(&account.id, &conversation.id, &message_id, "👍", false)
+            .unwrap();
+        assert!(
+            service
+                .complete_send_reaction(
+                    &prepared.account_id,
+                    &prepared.conversation_id,
+                    &prepared.emoji,
+                    prepared.remove,
+                    prepared.target_sent_at,
+                )
+                .unwrap()
+                .is_some()
+        );
+        let reactions = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &message_id)
+            .unwrap()
+            .unwrap()
+            .reactions;
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].emoji, "👍");
+        assert!(reactions[0].mine);
+        assert!(reactions[0].actors.iter().all(|actor| actor.is_self));
+
+        let prepared = service
+            .prepare_send_reaction(&account.id, &conversation.id, &message_id, "👍", true)
+            .unwrap();
+        service
+            .complete_send_reaction(
+                &prepared.account_id,
+                &prepared.conversation_id,
+                &prepared.emoji,
+                prepared.remove,
+                prepared.target_sent_at,
+            )
+            .unwrap();
+        let reactions = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &message_id)
+            .unwrap()
+            .unwrap()
+            .reactions;
+        assert!(reactions.is_empty());
     }
 
     /// The emoji guard enforces the pinned signal-cli contract locally:

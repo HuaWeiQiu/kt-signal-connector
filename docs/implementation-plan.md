@@ -333,9 +333,13 @@ end; design rationale and the upstream-verification notes live in `docs/remote-d
   `UPSTREAM_ERROR` for an explicit upstream rejection (unknown target, unregistered recipient,
   reaction not found) — its `retryable=true` is the global mapping, and hosts must not auto-retry
   reactions on it.
-- Known behavior boundaries: the local `messages` row is intentionally left unchanged on a
-  successful reaction; incoming reaction envelopes from peers are not yet converged into a
-  rendered-reaction state locally; nothing is emitted to `message.statusChanged` by this method.
+- Known behavior boundaries: the local `messages` row itself stays unchanged on a successful
+  reaction, but the own reaction is now recorded in `message_events` under the contract 1.27
+  actor model (the linked account as actor, no display name) once signal-cli confirms, and a
+  `conversation.changed` event is pushed so host-side pills survive the optimistic window
+  without a poll; `remove=true` records the removal the same way. Incoming reaction envelopes
+  from peers converge through the same store path on receive; nothing is emitted to
+  `message.statusChanged` by this method.
 - Dispatch inherits the mutating infrastructure unchanged: the write lane with the per-account
   mutex (same-account `sendText`/`remoteDelete`/`sendReaction`/`contacts.sync`/`deleteLocalData`
   serialize), the delete drain barrier, and the per-account request budget. Metrics classify it

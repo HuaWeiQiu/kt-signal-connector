@@ -1392,7 +1392,27 @@ impl RuntimeSupervisor {
             .call("sendReaction", prepared.params, CallClass::Mutating)
             .await
         {
-            Ok(_) => Ok("sent"),
+            Ok(_) => {
+                // Confirmed upstream: persist the own reaction and push the
+                // conversation refresh so pills survive the app's optimistic
+                // window (the same event the receive path uses for reactions).
+                let summary = {
+                    let service = self.service.lock().await;
+                    service.complete_send_reaction(
+                        &prepared.account_id,
+                        &prepared.conversation_id,
+                        &prepared.emoji,
+                        prepared.remove,
+                        prepared.target_sent_at,
+                    )?
+                };
+                if let Some(summary) = summary {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok("sent")
+            }
             Err(EngineError::UnknownOutcome) => Ok("unknown"),
             Err(error) => Err(error.into()),
         }
@@ -2417,6 +2437,101 @@ mod tests {
             .unwrap();
         assert_eq!(row.status, "sent");
         assert_eq!(row.sent_at, 423);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// 上行确认路径（fixture 正常应答，targetTimestamp≠423/351）：确认后
+    /// complete 落库 own 反应（contract 1.27 actor 口径：account 本体、无名），
+    /// 并向 host lane 推 conversation.changed——app 的乐观药丸由此获得权威
+    /// 状态兜底，不再随窗口过期消失。
+    #[tokio::test]
+    async fn send_reaction_confirmed_persists_own_pill_and_pushes_conversation_changed() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match supervisor
+            .service
+            .lock()
+            .await
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "react confirmed",
+                "req-sr-ok",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            crate::service::PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            crate::service::PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        supervisor
+            .service
+            .lock()
+            .await
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 424)
+            .unwrap();
+        let mut host_lane = supervisor.subscribe_host();
+
+        assert_eq!(
+            supervisor
+                .send_reaction(
+                    account.id.clone(),
+                    conversation.id.clone(),
+                    pending_id.clone(),
+                    "👍".to_string(),
+                    false
+                )
+                .await
+                .unwrap(),
+            "sent"
+        );
+
+        let row = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.reactions.len(), 1);
+        assert_eq!(row.reactions[0].emoji, "👍");
+        assert!(row.reactions[0].mine);
+        assert!(row.reactions[0].actors.iter().all(|actor| actor.is_self));
+        let event = tokio::time::timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
         supervisor.shutdown().await.unwrap();
     }
 
