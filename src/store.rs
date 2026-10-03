@@ -1745,6 +1745,44 @@ impl Store {
         Ok(record.map(|record| (record, changed == 1)))
     }
 
+    /// Rearm exactly one failed outgoing row for a send retry (contract 1.31):
+    /// the transition `failed -> pending` is the single guarded write — a row
+    /// in any other state (or already rearmed by a concurrent retry) is left
+    /// untouched and reported as `changed=false`, so a double-click retry or a
+    /// status push that settled the row between guard and rearm can never arm
+    /// two dispatches of the same message. Same transaction shape as
+    /// `update_message_status`: one lock round for write + read-back.
+    pub fn rearm_failed_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = transaction
+            .execute(
+                "UPDATE messages SET status='pending' WHERE id=?1 AND status='failed'",
+                params![message_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self
+                 FROM messages WHERE id=?1",
+                params![message_id],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, changed == 1)))
+    }
+
     /// Apply an inbound edit (contract 1.15): replace the body of the row the
     /// target upstream timestamp addresses, only when the editor matches the
     /// row's sender identity, and stamp `edited_at`. Returns the updated row,

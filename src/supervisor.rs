@@ -1207,6 +1207,25 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
+    /// Retry one definitively-failed outgoing text in place (contract 1.31,
+    /// implementation-plan §4.26). Same settlement path as `send_text` — the
+    /// pending row rearmed by `prepare_retry_text` keeps its original id, so
+    /// success / unknown / failure all complete the SAME row the desktop
+    /// bubble renders and no superseded duplicate row can appear.
+    pub async fn retry_text(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        client_request_id: String,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_retry_text(&account_id, &conversation_id, &client_request_id)?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
     async fn dispatch_prepared(
         &self,
         engine: &EngineHandle,

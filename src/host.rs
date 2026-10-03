@@ -29,7 +29,7 @@ use crate::service::{
     ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesRemoteDeleteParams, MessagesSearchParams,
+    MessagesListParams, MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
     MessagesSendAttachmentParams, MessagesSendReactionParams, MessagesSendTextParams,
     PresenceSetTypingMessageParams, SendTarget,
 };
@@ -1106,6 +1106,34 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 Err(_) => HostResponse::failure(
                     request_id,
                     ApiError::new("INVALID_REQUEST", "invalid messages.sendText params", false),
+                ),
+            }
+        }
+        "messages.retryText" => {
+            match serde_json::from_value::<MessagesRetryTextParams>(request.params) {
+                Ok(params) => {
+                    match runtime
+                        .retry_text(
+                            params.account_id,
+                            params.conversation_id,
+                            params.client_request_id,
+                        )
+                        .await
+                    {
+                        Ok(message) => HostResponse::success(
+                            request_id,
+                            serde_json::to_value(message).unwrap_or(Value::Null),
+                        ),
+                        Err(error) => HostResponse::failure(request_id, error.into_api()),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.retryText params",
+                        false,
+                    ),
                 ),
             }
         }

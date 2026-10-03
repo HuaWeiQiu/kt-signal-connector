@@ -43,6 +43,9 @@ pub const METHODS: &[MethodRow] = &[
     // local database only — no upstream traffic, no mutation.
     ("messages.search", Lane::Read, false, "read"),
     ("messages.sendText", Lane::Send, true, "send"),
+    // Same-row retry of a definitively failed send (contract 1.31): mutating,
+    // send-lane, upstream traffic — the same class as the original send.
+    ("messages.retryText", Lane::Send, true, "send"),
     ("messages.attachments.send", Lane::Send, true, "send"),
     ("messages.edit", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
@@ -131,6 +134,7 @@ mod tests {
         ];
         let send_lane = [
             "messages.sendText",
+            "messages.retryText",
             "messages.attachments.send",
             "messages.edit",
             "messages.remoteDelete",
@@ -140,6 +144,7 @@ mod tests {
         ];
         let mutating = [
             "messages.sendText",
+            "messages.retryText",
             "messages.attachments.send",
             "messages.edit",
             "messages.remoteDelete",

@@ -609,6 +609,21 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Same-row retry of a definitively failed send (contract 1.31): routed
+    /// through the account's own proxy-group slot exactly like the original
+    /// send — the retry must reach the same engine the first attempt used.
+    pub async fn retry_text(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        client_request_id: String,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .retry_text(account_id, conversation_id, client_request_id)
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn send_attachment(
         &self,

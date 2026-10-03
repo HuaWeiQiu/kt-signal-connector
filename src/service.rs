@@ -1040,46 +1040,165 @@ impl ConnectorService {
             }
         }
 
-        let mut params = json!({
-            "account": account.signal_account,
-            "message": text,
-        });
-        if let Some(link_preview) = link_preview {
-            // Outbound link preview (contract §5.10 v1.26), projected 1:1 onto
-            // the signal-cli JSON-RPC send keys (verified against the pinned
-            // distribution: previewUrl/previewTitle/previewDescription plus an
-            // optional previewImage carrying a path or RFC 2397 data URI — the
-            // connector passes data URIs only, mirroring `attachments`).
-            params["previewUrl"] = json!(link_preview.url);
-            params["previewTitle"] = json!(link_preview.title);
-            if let Some(description) = link_preview.description {
-                params["previewDescription"] = json!(description);
-            }
-            if let Some(image) = link_preview.image_data_uri {
-                params["previewImage"] = json!(image);
-            }
-        }
-        if let Some(attachments) = attachments {
-            // signal-cli jsonRpc send accepts `attachments` entries as file
-            // paths or RFC 2397 data URIs (SendCommand --attachment, pinned
-            // 0.14.7); the connector passes data URIs only — bytes stay in
-            // memory, no caller-controlled path ever reaches upstream.
-            params["attachments"] = Value::Array(attachments);
-        }
-        set_upstream_target(&mut params, conversation);
-        // signal-cli JSON-RPC send quote parameters (verified against the
-        // pinned 0.14.7 distribution): quoteTimestamp is the quoted message's
-        // Signal timestamp, quoteAuthor its author's number — both required.
-        if let Some((quote_timestamp, quote_author)) = quote {
-            params["quoteTimestamp"] = json!(quote_timestamp);
-            params["quoteAuthor"] = json!(quote_author);
-        }
+        let params = Self::upstream_text_send_params(
+            &account.signal_account,
+            text,
+            link_preview.as_ref(),
+            attachments,
+            quote,
+            conversation,
+        );
         Ok(PreparedSend::Dispatch {
             pending_id,
             account_id: account_id.to_string(),
             conversation_id: conversation_id.to_string(),
             params,
             pending_sent_at: pending.sent_at,
+        })
+    }
+
+    /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
+    /// and same-row retry (`prepare_retry_text`) — one owner for the wire key
+    /// names so the two paths cannot drift.
+    ///
+    /// Outbound link preview (contract §5.10 v1.26), projected 1:1 onto the
+    /// signal-cli JSON-RPC send keys (verified against the pinned
+    /// distribution: previewUrl/previewTitle/previewDescription plus an
+    /// optional previewImage carrying a path or RFC 2397 data URI — the
+    /// connector passes data URIs only, mirroring `attachments`).
+    ///
+    /// signal-cli jsonRpc send accepts `attachments` entries as file paths or
+    /// RFC 2397 data URIs (SendCommand --attachment, pinned 0.14.7); the
+    /// connector passes data URIs only — bytes stay in memory, no
+    /// caller-controlled path ever reaches upstream.
+    ///
+    /// signal-cli JSON-RPC send quote parameters (verified against the pinned
+    /// 0.14.7 distribution): quoteTimestamp is the quoted message's Signal
+    /// timestamp, quoteAuthor its author's number — both required.
+    fn upstream_text_send_params(
+        signal_account: &str,
+        text: &str,
+        preview: Option<&UpstreamSendPreview>,
+        attachments: Option<Vec<Value>>,
+        quote: Option<(u64, String)>,
+        conversation: &ConversationRow,
+    ) -> Value {
+        let mut params = json!({
+            "account": signal_account,
+            "message": text,
+        });
+        if let Some(link_preview) = preview {
+            params["previewUrl"] = json!(link_preview.url);
+            params["previewTitle"] = json!(link_preview.title);
+            if let Some(description) = &link_preview.description {
+                params["previewDescription"] = json!(description);
+            }
+            if let Some(image) = &link_preview.image_data_uri {
+                params["previewImage"] = json!(image);
+            }
+        }
+        if let Some(attachments) = attachments {
+            params["attachments"] = Value::Array(attachments);
+        }
+        set_upstream_target(&mut params, conversation);
+        if let Some((quote_timestamp, quote_author)) = quote {
+            params["quoteTimestamp"] = json!(quote_timestamp);
+            params["quoteAuthor"] = json!(quote_author);
+        }
+        params
+    }
+
+    /// Retry one definitively-failed outgoing text in place (contract 1.31,
+    /// §4.26): the row addressed by its original clientRequestId is rearmed
+    /// `failed -> pending` under a store-level guard and re-dispatched with
+    /// upstream params rebuilt from the persisted record — a retry never
+    /// mints a new clientRequestId, so the history keeps exactly one row per
+    /// logical message and settlement (any terminal outcome) completes the
+    /// SAME row the desktop bubble already renders.
+    pub fn prepare_retry_text(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        client_request_id: &str,
+    ) -> Result<PreparedSend, ServiceError> {
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        let row = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+            .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
+        if row.conversation_id != conversation.id {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "clientRequestId does not belong to this conversation",
+                false,
+            )));
+        }
+        if row.direction != "outgoing" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "only outgoing messages can be retried",
+                false,
+            )));
+        }
+        let text = row.text.clone().unwrap_or_default();
+        if text.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "retry supports text messages only",
+                false,
+            )));
+        }
+        if row.status == "pending" {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_IN_FLIGHT",
+                "retry already in flight",
+                false,
+            )));
+        }
+        if row.status != "failed" {
+            // 'unknown' is never retryable: its wire outcome was never
+            // settled, so a blind resend could double-deliver.
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_NOT_ALLOWED",
+                "only a definitively failed send can be retried",
+                false,
+            )));
+        }
+        // Store-level rearm is the authority: `WHERE status='failed'` makes
+        // the transition atomic, so a status push that settled the row
+        // between the guard above and this write cannot be overwritten.
+        let (rearmed, changed) = self
+            .store
+            .rearm_failed_message(&row.id)?
+            .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
+        if !changed {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_IN_FLIGHT",
+                "retry already in flight",
+                false,
+            )));
+        }
+        let quote = row
+            .quote_message_id
+            .as_deref()
+            .map(|quote_id| self.resolve_quote(&account, &conversation, quote_id))
+            .transpose()?;
+        let params = Self::upstream_text_send_params(
+            &account.signal_account,
+            &text,
+            None,
+            None,
+            quote,
+            &conversation,
+        );
+        Ok(PreparedSend::Dispatch {
+            pending_id: row.id,
+            account_id: account.id,
+            conversation_id: conversation.id,
+            params,
+            pending_sent_at: rearmed.sent_at,
         })
     }
 
@@ -2279,6 +2398,18 @@ pub struct MessagesSendTextParams {
     pub previews: Option<Vec<SendTextPreviewParams>>,
 }
 
+/// Retry one definitively-failed outgoing text (contract 1.31): addressed by
+/// the ORIGINAL send's clientRequestId so both an in-session optimistic row
+/// and a reloaded store row hit the same persisted record. No optional forms:
+/// a retry has exactly one target.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesRetryTextParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub client_request_id: String,
+}
+
 /// Outbound link preview (contract §5.10 v1.26). signal-cli's JSON-RPC send
 /// carries exactly one preview per message (`previewUrl`/`previewTitle`/
 /// `previewDescription`/`previewImage`, verified against the pinned
@@ -3437,6 +3568,134 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn retry_text_rearms_the_same_failed_row_and_guards_states() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        // First send: prepare inserts the pending row, then it fails for real.
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "to retry",
+                "retry-req-1",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service.complete_send_failed(&pending_id).unwrap();
+
+        // Retry re-dispatches the SAME row — no second row is inserted.
+        let params = match service
+            .prepare_retry_text(&account.id, &conversation.id, "retry-req-1")
+            .unwrap()
+        {
+            PreparedSend::Dispatch {
+                pending_id: retry_pending_id,
+                params,
+                ..
+            } => {
+                assert_eq!(retry_pending_id, pending_id);
+                params
+            }
+            PreparedSend::Existing(_) => panic!("retry must re-dispatch the same row"),
+        };
+        assert_eq!(params["message"], "to retry");
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "retry-req-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.id, pending_id);
+        assert_eq!(row.status, "pending");
+
+        // Settlement completes the SAME row; the history stays one row.
+        let (sent, _) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 777)
+            .unwrap();
+        assert_eq!(sent.status, "sent");
+        let rows = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, pending_id);
+
+        // A settled row answers RETRY_NOT_ALLOWED.
+        let sent_retry = service
+            .prepare_retry_text(&account.id, &conversation.id, "retry-req-1")
+            .unwrap_err();
+        assert!(
+            matches!(sent_retry, ServiceError::Api(ref error) if error.code == "RETRY_NOT_ALLOWED")
+        );
+
+        // An unknown-outcome row is never retryable (no automatic or blind
+        // resend of an unsettled wire outcome).
+        let unknown_pending = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "unknown outcome",
+                "retry-req-2",
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        service.complete_send_unknown(&unknown_pending).unwrap();
+        let unknown_retry = service
+            .prepare_retry_text(&account.id, &conversation.id, "retry-req-2")
+            .unwrap_err();
+        assert!(
+            matches!(unknown_retry, ServiceError::Api(ref error) if error.code == "RETRY_NOT_ALLOWED")
+        );
+
+        // A row already in flight answers RETRY_IN_FLIGHT (double click).
+        service.complete_send_failed(&unknown_pending).unwrap();
+        service
+            .prepare_retry_text(&account.id, &conversation.id, "retry-req-2")
+            .unwrap();
+        let inflight = service
+            .prepare_retry_text(&account.id, &conversation.id, "retry-req-2")
+            .unwrap_err();
+        assert!(
+            matches!(inflight, ServiceError::Api(ref error) if error.code == "RETRY_IN_FLIGHT")
+        );
+
+        // Unknown clientRequestId -> MESSAGE_NOT_FOUND; a row addressed from
+        // another conversation answers INVALID_REQUEST.
+        let missing = service
+            .prepare_retry_text(&account.id, &conversation.id, "retry-req-absent")
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::MessageNotFound)
+        ));
+        let other = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Peer2")
+            .unwrap();
+        let cross = service
+            .prepare_retry_text(&account.id, &other.id, "retry-req-1")
+            .unwrap_err();
+        assert!(matches!(cross, ServiceError::Api(ref error) if error.code == "INVALID_REQUEST"));
     }
 
     #[test]

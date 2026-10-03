@@ -994,6 +994,42 @@ tokenization, and no relevance ranking this revision: substring over `body` only
 touches upstream, never mutates state, and rides the READ lane (`read` metrics class, not
 account-scoped-mutating). `PHASE2_CAPABILITIES` grows by one entry, advertised at handshake.
 
+### 4.26 messages.retryText: same-row resend of a failed send (contract revision 1.31, 2026-10-03)
+
+The official client offers "resend" on a message that definitively failed to send, and the resent
+message **replaces** the failed one — the history never grows a second row for the same logical
+message. The connector's `clientRequestId` idempotency made the naive desktop-side retry wrong: a
+retry that minted a new id inserted a second pending row while the old `failed` row stayed in the
+store, so every refresh rendered both (a failed bubble plus its resent twin). `messages.retryText`
+makes the retry a first-class connector operation instead: `params` are `accountId`,
+`conversationId`, `clientRequestId` (the idempotency key of the ORIGINAL send — persisted rows
+always carry it, so both an in-session optimistic row and a reloaded store row address the same
+target). The service resolves the row via `message_by_client_request`, guards it, rearms it
+in place, and re-dispatches the upstream send rebuilt from the persisted record; the pending id
+never changes, so settlement (success / `SEND_OUTCOME_UNKNOWN` / definite failure) completes the
+SAME row and the history keeps exactly one row per logical message.
+
+Guards, all explicit: the row must be an outgoing **text** row with a stored `clientRequestId` in
+the terminal state `failed` — a missing row answers `MESSAGE_NOT_FOUND`, `pending` answers
+`RETRY_IN_FLIGHT` (double-click or a concurrent rearm; the store-level
+`WHERE status='failed'` rearm makes the transition atomic), `unknown` answers `RETRY_NOT_ALLOWED`
+(its wire outcome was never settled, so a blind resend could double-deliver — the standing rule
+"an unknown send outcome must not be retried automatically" extends to user-initiated retries),
+incoming/system rows and rows without a clientRequestId answer `INVALID_REQUEST`, and an empty
+body answers `INVALID_REQUEST` (attachment retry needs the attachments path and is out of scope
+this revision). Rebuilt upstream params carry the persisted body and quote (`quoteTimestamp` /
+`quoteAuthor` re-resolved at retry time); staged link previews are not persisted with the row and
+therefore do not ride a retry — the wire message goes out plain-text when its original preview
+staging is gone, matching the composer-less nature of a retry.
+
+Recorded boundaries: the rearm is one store transaction (`failed -> pending` only), so a status
+push that already settled the row between guard and rearm cannot be overwritten; the send lane
+(`Lane::Send`, mutating, metrics class `send`) serializes the retry with ordinary sends of the
+same account; the row stays `pending` while the upstream call is in flight, and a definite
+upstream error flips it straight back to `failed` (the desktop's retry affordance reappears).
+There is no automatic retry anywhere in the path — the connector retries nothing by itself; only
+an explicit `messages.retryText` may re-dispatch a failed send, and only a definite failure may
+be so re-dispatched.
 
 ## 5. signal-cli Boundary
 

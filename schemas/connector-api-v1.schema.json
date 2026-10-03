@@ -50,6 +50,7 @@
             "messages.search",
             "messages.getText",
             "messages.sendText",
+            "messages.retryText",
             "messages.attachments.send",
             "messages.edit",
             "messages.remoteDelete",
@@ -174,6 +175,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendTextParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.retryText" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesRetryTextParams" }
             }
           }
         },
@@ -436,6 +448,17 @@
         },
         "clientRequestId": { "$ref": "#/$defs/opaqueId" },
         "quoteMessageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesRetryTextParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "clientRequestId"],
+      "description": "Contract 1.31: retry one definitively-failed outgoing text by its clientRequestId (the same idempotency key the original send used). The connector rearms the SAME pending row (status 'failed' -> 'pending') and re-dispatches the upstream send rebuilt from the persisted record — a retry never mints a new clientRequestId, so the local history keeps exactly one row per logical message (official resend behavior; the superseded-row duplication of a naive new-id retry cannot occur). Guards: the row must be an outgoing text with a stored clientRequestId in the terminal state 'failed' — 'pending' answers RETRY_IN_FLIGHT, 'unknown' answers RETRY_NOT_ALLOWED (its wire outcome was never settled, so a blind resend could double-deliver; the host must never auto-resend an unknown outcome), incoming/system rows and rows without a clientRequestId answer INVALID_REQUEST, a missing row or conversation answers MESSAGE_NOT_FOUND / CONVERSATION_NOT_FOUND. Settlement follows messages.sendText: the response is the SAME MessageRecord (same row id) now 'sent', an indeterminate outcome answers SEND_OUTCOME_UNKNOWN leaving the row 'unknown', a definite upstream error answers UPSTREAM_ERROR with the row back in 'failed'.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "clientRequestId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "contactsSyncParams": {
@@ -860,6 +883,8 @@
             "ACCOUNT_DELETE_OUTCOME_UNKNOWN",
             "LINK_OUTCOME_UNKNOWN",
             "SEND_OUTCOME_UNKNOWN",
+            "RETRY_NOT_ALLOWED",
+            "RETRY_IN_FLIGHT",
             "INTERNAL_ERROR"
           ]
         },
