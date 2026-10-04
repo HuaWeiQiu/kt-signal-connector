@@ -48,6 +48,7 @@ use crate::store::{
     StoreKey,
 };
 use crate::supervisor::RuntimeSupervisor;
+use std::time::Duration;
 
 /// One group slot: opaque id plus its full supervision stack.
 pub struct ProxyGroupSlot {
@@ -729,6 +730,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_conversation_pinned(params).await
     }
 
+    /// conversations.setExpireTimer (contract 1.42, §4.41): the timer lives
+    /// with the account's engine, so the write routes through the account's
+    /// owning supervisor like every other mutating face.
+    pub async fn set_conversation_expire_timer(
+        &self,
+        params: crate::service::ConversationsSetExpireTimerParams,
+    ) -> Result<crate::service::ConversationsSetExpireTimerResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_conversation_expire_timer(params).await
+    }
+
     /// Sticker pack sync (contract 1.37, §4.34): account state — the records
     /// live in the account's storage session, so both faces route through the
     /// account's owning engine, unlike the anonymous §4.32 browse face.
@@ -1003,6 +1015,7 @@ fn effective_media_ingest(mode: SignalCliMode, media_ingest: bool) -> bool {
 /// `readChunk`/`closeHandle` carries no accountId, so handle resolution must
 /// not depend on which supervisor the registry routed a request through —
 /// and each group gets its own start-up retention pass.
+#[allow(clippy::too_many_arguments)]
 pub fn open_group_runtime(
     plan: ProxyGroupPlan,
     signal_cli: PathBuf,
@@ -1011,6 +1024,7 @@ pub fn open_group_runtime(
     store_key: Option<StoreKey>,
     signal_cli_mode: SignalCliMode,
     media_ingest: bool,
+    expire_sweep_interval: Duration,
 ) -> Result<Arc<ProxyGroupRuntime>, crate::store::StoreError> {
     let media_ingest = effective_media_ingest(signal_cli_mode, media_ingest);
     let store = Arc::new(Store::open(state_dir, store_key)?);
@@ -1022,6 +1036,7 @@ pub fn open_group_runtime(
         config.proxy = entry.proxy.clone();
         config.mode = signal_cli_mode;
         config.media_ingest = media_ingest;
+        config.expire_sweep_interval = expire_sweep_interval;
         let supervisor = Arc::new(RuntimeSupervisor::new(
             config,
             store.clone(),
@@ -1031,6 +1046,7 @@ pub fn open_group_runtime(
         supervisor.spawn_watchdog();
         supervisor.spawn_media_governor();
         supervisor.spawn_delivery_receipt_worker();
+        supervisor.spawn_expire_sweeper();
         slots.push(ProxyGroupSlot {
             id: entry.id.clone(),
             supervisor,

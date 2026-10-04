@@ -3783,6 +3783,9 @@ async fn sticker_send_and_receive_round_trip() {
         }),
     )
     .await;
+    if listed["result"]["items"].is_null() {
+        panic!("list response: {listed}");
+    }
     let row = listed["result"]["items"]
         .as_array()
         .unwrap()
@@ -4302,6 +4305,203 @@ async fn sticker_pack_browse_and_pin_sync_round_trip() {
     .await;
     assert_eq!(storage_down["error"]["code"], "STORAGE_UNAVAILABLE");
     assert_eq!(storage_down["error"]["retryable"], true);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// conversations.setExpireTimer end to end (contract 1.42, §4.41): the
+/// mutating call lands on the signal-cli face's `updateContact` with the
+/// int-seconds `expiration`, the success mirrors the timer into the
+/// conversation and rides `conversation.changed`, the result carries the
+/// resolved value; a group conversation answers INVALID_REQUEST before any
+/// upstream call and an unknown conversation answers CONVERSATION_NOT_FOUND.
+#[tokio::test]
+async fn conversations_set_expire_timer_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ExpireTimer" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Materialize a direct conversation with a text send, then set its
+    // timer: the mirror lands and the summary carries it.
+    let sent = request(
+        &mut client,
+        "timer-setup-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "timer setup",
+            "clientRequestId": "timer-setup-1"
+        }),
+    )
+    .await;
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let set_timer = request(
+        &mut client,
+        "set-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "expireSeconds": 86400
+        }),
+    )
+    .await;
+    assert_eq!(set_timer["result"]["expireTimerSeconds"], 86400);
+
+    // The refreshed summary arrived on conversation.changed with the timer.
+    let mut saw_timer_change = false;
+    for _ in 0..8 {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == conversation_id
+            && frame["data"]["expireTimerSeconds"] == 86400
+        {
+            saw_timer_change = true;
+            break;
+        }
+    }
+    assert!(
+        saw_timer_change,
+        "conversation.changed must carry the mirrored timer"
+    );
+
+    // conversations.list agrees with the mirror.
+    let listed = request(
+        &mut client,
+        "list-timers",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == conversation_id)
+        .expect("the conversation is listed")
+        .clone();
+    assert_eq!(row["expireTimerSeconds"], 86400);
+
+    // The exact upstream contract landed on the wire: int-seconds
+    // `expiration` with the single-string resolved recipient.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let timer_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("expiration").is_some())
+        .expect("the timer call must reach updateContact");
+    assert_eq!(timer_call["account"], "+15555550100");
+    assert_eq!(timer_call["recipient"], "+15555550102");
+    assert_eq!(timer_call["expiration"], 86400);
+
+    // A group conversation answers INVALID_REQUEST before any upstream call:
+    // the fixture links with one known group conversation in place.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let group_timer = request(
+        &mut client,
+        "group-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "expireSeconds": 60
+        }),
+    )
+    .await;
+    assert_eq!(group_timer["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(group_timer["error"]["retryable"], false);
+
+    // Unknown conversation answers CONVERSATION_NOT_FOUND locally.
+    let unknown = request(
+        &mut client,
+        "unknown-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "expireSeconds": 60
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+
+    // Out-of-face value and missing field fail closed locally.
+    let oversized = request(
+        &mut client,
+        "oversized-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "expireSeconds": 2147483648_u64
+        }),
+    )
+    .await;
+    assert_eq!(oversized["error"]["code"], "INVALID_REQUEST");
+    let missing = request(
+        &mut client,
+        "missing-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "INVALID_REQUEST");
 
     drop(client);
     wait_for_process_exit(engine_pid).await;

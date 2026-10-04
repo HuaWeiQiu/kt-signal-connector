@@ -113,6 +113,11 @@ pub struct SignalCliConfig {
     pub resource_sample_interval: Duration,
     pub watchdog_interval: Duration,
     pub watchdog_min_restart_interval: Duration,
+    /// Disappearing-message sweep cadence (contract 1.42, §4.41): how often
+    /// each group's supervisor looks for rows whose timer ran out. The
+    /// launcher may tighten it (integration tests); production keeps the
+    /// default — a disappearing message legitimately outlives this by design.
+    pub expire_sweep_interval: Duration,
 }
 
 impl SignalCliConfig {
@@ -131,6 +136,7 @@ impl SignalCliConfig {
             resource_sample_interval: Duration::from_secs(30),
             watchdog_interval: Duration::from_secs(30),
             watchdog_min_restart_interval: Duration::from_secs(300),
+            expire_sweep_interval: Duration::from_secs(30),
         }
     }
 }
@@ -399,6 +405,15 @@ pub struct NormalizedReceive {
     /// typing) for `direction == "control"`; shape mirrors the protocol field.
     #[serde(skip)]
     pub control: Option<ControlReceive>,
+    /// Disappearing-message timer as the envelope stated it (contract 1.42,
+    /// §4.41): `Some(0)` = stated off, `None` = no stated value. Both engine
+    /// faces share this parse; only the engine face states a start stamp.
+    #[serde(skip)]
+    pub expire_seconds: Option<u64>,
+    /// Engine-reported countdown start (>0 stamps only). signal-cli faces
+    /// never carry it — the deadline then falls back to receive time.
+    #[serde(skip)]
+    pub expire_start_at: Option<u64>,
 }
 
 /// Inbound quote snapshot: the quoted message's upstream identity plus a
@@ -503,6 +518,13 @@ pub struct NormalizedRich {
     /// back off the row to gate media opens and replays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view_once_opened_at: Option<u64>,
+    /// Disappearing-message timer-change marker (contract 1.42, §4.41): the
+    /// message announced a timer change for its conversation (`true` only
+    /// when the envelope flagged `isExpirationUpdate`). Timer-notice rows
+    /// carry it as their only rich content; a body message that happened to
+    /// carry the flag keeps it beside the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_expiration_update: bool,
 }
 
 impl NormalizedRich {
@@ -513,6 +535,7 @@ impl NormalizedRich {
             && !self.view_once
             && !self.view_once_invalid
             && self.view_once_opened_at.is_none()
+            && !self.is_expiration_update
     }
 }
 
@@ -1836,6 +1859,10 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
         .get("viewOnceInvalid")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    rich.is_expiration_update = message
+        .get("isExpirationUpdate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if rich.is_empty() {
         return None;
     }
@@ -2085,6 +2112,52 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
     None
 }
 
+/// The disappearing-message keys one dataMessage face carries (contract
+/// 1.42, §4.41). Both engine faces share the shape: `expiresInSeconds` is the
+/// stated timer — every signal-cli `JsonDataMessage` carries it (0 = the
+/// sender's timer is off), the engine face omits the key when it has nothing
+/// to say — and `expirationStartTimestamp` (>0) is the engine-only countdown
+/// start the signal-cli face never exposes.
+fn envelope_expire_keys(message: &serde_json::Map<String, Value>) -> (Option<u64>, Option<u64>) {
+    let seconds = message.get("expiresInSeconds").and_then(Value::as_u64);
+    let start_at = message
+        .get("expirationStartTimestamp")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
+    (seconds, start_at)
+}
+
+/// Decorate a normalized receive with the face's expire keys.
+fn with_expire(
+    mut receive: NormalizedReceive,
+    seconds: Option<u64>,
+    start_at: Option<u64>,
+) -> NormalizedReceive {
+    receive.expire_seconds = seconds;
+    receive.expire_start_at = start_at;
+    receive
+}
+
+/// The timer-notice system row's text material (contract 1.42, §4.41): the
+/// announced value rides the text so the desktop renders the change without
+/// parsing protocol state; `0` and the absent-key close form both read as
+/// off. Localized copy is the desktop's job — this is the raw material.
+fn timer_change_text(seconds: Option<u64>) -> Option<NormalizedText> {
+    let text = match seconds {
+        Some(value) if value > 0 => format!("已更新消息定时消失：{value} 秒"),
+        _ => "已更新消息定时消失：已关闭".to_string(),
+    };
+    normalized_text(&text)
+}
+
+/// The rich marker a timer-notice row carries (its only rich content).
+fn timer_change_rich() -> NormalizedRich {
+    NormalizedRich {
+        is_expiration_update: true,
+        ..Default::default()
+    }
+}
+
 /// Our own multi-device control echo inside `syncMessage.sentMessage`: edit /
 /// remote delete / reaction of an earlier message we sent from the phone.
 fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
@@ -2161,6 +2234,8 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         rich,
         sticker: None,
         control,
+        expire_seconds: None,
+        expire_start_at: None,
     };
 
     // Typing and body-less reaction / remote-delete receives carry no message
@@ -2240,6 +2315,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 .map(normalized_attachments)
                 .unwrap_or_default();
             let rich = normalized_rich(sent);
+            let (expire_seconds, expire_start_at) = envelope_expire_keys(sent);
             let destination = sent
                 .get("destinationNumber")
                 .and_then(Value::as_str)
@@ -2273,33 +2349,66 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 }
             }
             let sent_ts = sent.get("timestamp").and_then(Value::as_u64).or(timestamp);
+            // Our own device set the conversation's disappearing timer (the
+            // phone-side toggle): the mirror is the same timer-notice system
+            // row a peer's change lands as (§4.41), addressed by destination.
+            if text.is_none()
+                && quote.is_none()
+                && attachments.is_empty()
+                && rich.as_ref().is_some_and(|rich| rich.is_expiration_update)
+            {
+                return Ok(with_expire(
+                    make(
+                        sent_ts,
+                        "syncMessage",
+                        "system",
+                        destination,
+                        group_id,
+                        timer_change_text(expire_seconds),
+                        None,
+                        Vec::new(),
+                        Some(timer_change_rich()),
+                        None,
+                    ),
+                    expire_seconds,
+                    expire_start_at,
+                ));
+            }
             if let Some(text) = text {
-                return Ok(make(
-                    sent_ts,
-                    "syncMessage",
-                    "outgoing",
-                    destination,
-                    group_id,
-                    Some(text),
-                    quote,
-                    attachments,
-                    rich,
-                    None,
+                return Ok(with_expire(
+                    make(
+                        sent_ts,
+                        "syncMessage",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        Some(text),
+                        quote,
+                        attachments,
+                        rich,
+                        None,
+                    ),
+                    expire_seconds,
+                    expire_start_at,
                 ));
             }
             // Attachment-only multi-device send: no body but real descriptors.
             if !attachments.is_empty() {
-                return Ok(make(
-                    sent_ts,
-                    "syncMessage",
-                    "outgoing",
-                    destination,
-                    group_id,
-                    None,
-                    quote,
-                    attachments,
-                    rich,
-                    None,
+                return Ok(with_expire(
+                    make(
+                        sent_ts,
+                        "syncMessage",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        None,
+                        quote,
+                        attachments,
+                        rich,
+                        None,
+                    ),
+                    expire_seconds,
+                    expire_start_at,
                 ));
             }
             // sent without body (sticker/other control sync) — skip for now
@@ -2352,6 +2461,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             attachments.push(sticker_image.clone());
         }
         let rich = normalized_rich(data_message);
+        let (expire_seconds, expire_start_at) = envelope_expire_keys(data_message);
         let with_sticker =
             |mut receive: NormalizedReceive,
              sticker: Option<(NormalizedSticker, NormalizedAttachment)>| {
@@ -2359,58 +2469,69 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 receive
             };
         if let Some(text) = text {
-            return Ok(with_sticker(
-                make(
-                    timestamp,
-                    "dataMessage",
-                    "incoming",
-                    peer_source,
-                    group_id,
-                    Some(text),
-                    quote,
-                    attachments,
-                    rich,
-                    None,
+            return Ok(with_expire(
+                with_sticker(
+                    make(
+                        timestamp,
+                        "dataMessage",
+                        "incoming",
+                        peer_source,
+                        group_id,
+                        Some(text),
+                        quote,
+                        attachments,
+                        rich,
+                        None,
+                    ),
+                    sticker,
                 ),
-                sticker,
+                expire_seconds,
+                expire_start_at,
             ));
         }
         // Attachment-only message: real descriptors, no body — a sticker row
         // lands here through its data descriptor.
         if !attachments.is_empty() {
-            return Ok(with_sticker(
-                make(
-                    timestamp,
-                    "dataMessage",
-                    "incoming",
-                    peer_source,
-                    group_id,
-                    None,
-                    quote,
-                    attachments,
-                    rich,
-                    None,
+            return Ok(with_expire(
+                with_sticker(
+                    make(
+                        timestamp,
+                        "dataMessage",
+                        "incoming",
+                        peer_source,
+                        group_id,
+                        None,
+                        quote,
+                        attachments,
+                        rich,
+                        None,
+                    ),
+                    sticker,
                 ),
-                sticker,
+                expire_seconds,
+                expire_start_at,
             ));
         }
         // Empty body: map a few control shapes to system rows; drop the rest.
-        if data_message
-            .get("isExpirationUpdate")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            return Ok(make(
-                timestamp,
-                "dataMessage",
-                "system",
-                peer_source,
-                group_id,
-                normalized_text("已更新消息定时消失"),
-                None,
-                Vec::new(),
-                None,
-                None,
+        // A timer change is one of them (contract 1.42, §4.41): the
+        // announced value rides the text material and the receive's
+        // expire_seconds so the service layer mirrors the conversation state.
+        if rich.as_ref().is_some_and(|rich| rich.is_expiration_update) {
+            return Ok(with_expire(
+                make(
+                    timestamp,
+                    "dataMessage",
+                    "system",
+                    peer_source,
+                    group_id,
+                    timer_change_text(expire_seconds),
+                    None,
+                    Vec::new(),
+                    Some(timer_change_rich()),
+                    None,
+                ),
+                expire_seconds,
+                expire_start_at,
             ));
         }
         return Ok(make(
@@ -2791,7 +2912,10 @@ mod tests {
             rich: None,
             sticker: None,
             control: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
+
         let mut admitted = 0;
         while matches!(
             timeout(Duration::from_millis(10), ingress.enqueue(receive())).await,
@@ -2894,7 +3018,13 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(system.direction, "system");
-        assert_eq!(system.text.as_deref(), Some("已更新消息定时消失"));
+        // Close form: the flag without a stated value reads as off (§4.41).
+        assert_eq!(system.text.as_deref(), Some("已更新消息定时消失：已关闭"));
+        assert_eq!(system.expire_seconds, None);
+        assert_eq!(
+            system.rich.as_ref().map(|rich| rich.is_expiration_update),
+            Some(true)
+        );
 
         let skip_sticker = normalize_receive(&json!({
             "envelope": {
@@ -3131,7 +3261,10 @@ mod tests {
             rich: None,
             sticker: None,
             control: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
+
         let mut admitted = 0;
         while matches!(
             ingress.enqueue(receive()).await,
@@ -3178,7 +3311,10 @@ mod tests {
             rich: None,
             sticker: None,
             control: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
+
         while matches!(
             ingress.enqueue(filler.clone()).await,
             Ok(EnqueueOutcome::Enqueued)
@@ -3923,5 +4059,133 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(bare.source_uuid.is_none());
+    }
+
+    /// Contract 1.42 (§4.41): a dataMessage states its conversation's
+    /// disappearing timer with `expiresInSeconds` (absent = no value,
+    /// 0 = stated off) and may carry the engine-reported countdown start
+    /// `expirationStartTimestamp`; both ride the normalized receive
+    /// unchanged, and a stated start stamp of 0 is treated as absent.
+    #[test]
+    fn data_message_expire_metadata_normalizes() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let live = normalize(json!({
+            "message": "vanishing soon",
+            "expiresInSeconds": 86400u64,
+            "expirationStartTimestamp": 1726999900000u64,
+        }));
+        assert_eq!(live.expire_seconds, Some(86400));
+        assert_eq!(live.expire_start_at, Some(1726999900000));
+        assert!(!live.rich.is_some_and(|rich| rich.is_expiration_update));
+        assert_eq!(live.direction, "incoming");
+
+        let stated_off = normalize(json!({
+            "message": "plain",
+            "expiresInSeconds": 0u64,
+        }));
+        assert_eq!(stated_off.expire_seconds, Some(0));
+        assert_eq!(stated_off.expire_start_at, None);
+
+        let silent = normalize(json!({ "message": "plain" }));
+        assert_eq!(silent.expire_seconds, None);
+        assert_eq!(silent.expire_start_at, None);
+
+        let zero_start = normalize(json!({
+            "message": "plain",
+            "expiresInSeconds": 60u64,
+            "expirationStartTimestamp": 0u64,
+        }));
+        assert_eq!(zero_start.expire_seconds, Some(60));
+        assert_eq!(zero_start.expire_start_at, None);
+    }
+
+    /// Contract 1.42 (§4.41): a peer's timer change lands as a bodyless
+    /// dataMessage flagged `isExpirationUpdate` — projected as a system row
+    /// whose text material carries the announced value (0 and the absent
+    /// close form both read as off), with the rich marker as the row's only
+    /// rich content. A body message never carries the marker.
+    #[test]
+    fn peer_timer_change_projects_system_row() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let open = normalize(json!({
+            "isExpirationUpdate": true,
+            "expiresInSeconds": 86400u64,
+        }));
+        assert_eq!(open.direction, "system");
+        assert_eq!(open.text.as_deref(), Some("已更新消息定时消失：86400 秒"));
+        assert!(open.rich.is_some_and(|rich| rich.is_expiration_update));
+        assert_eq!(open.expire_seconds, Some(86400));
+
+        let close = normalize(json!({
+            "isExpirationUpdate": true,
+            "expiresInSeconds": 0u64,
+        }));
+        assert_eq!(close.direction, "system");
+        assert_eq!(close.text.as_deref(), Some("已更新消息定时消失：已关闭"));
+        assert_eq!(close.expire_seconds, Some(0));
+
+        let body = normalize(json!({
+            "message": "hello",
+            "isExpirationUpdate": false,
+        }));
+        assert_eq!(body.direction, "incoming");
+        assert!(!body.rich.is_some_and(|rich| rich.is_expiration_update));
+    }
+
+    /// Contract 1.42 (§4.41): our own phone-side timer toggle mirrors through
+    /// `syncMessage.sentMessage` (`isExpirationUpdate`, no body) as the same
+    /// system row a peer's change lands as, addressed by the sent
+    /// destination — so every linked device's history agrees.
+    #[test]
+    fn sync_sent_timer_change_projects_system_row() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "account": "+15555550100",
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": { "sentMessage": data },
+                },
+            }))
+            .unwrap()
+        };
+        let open = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "destinationNumber": "+15555550101",
+            "isExpirationUpdate": true,
+            "expiresInSeconds": 604800u64,
+        }));
+        assert_eq!(open.direction, "system");
+        assert_eq!(open.content_kind, "syncMessage");
+        assert_eq!(open.text.as_deref(), Some("已更新消息定时消失：604800 秒"));
+        assert!(open.rich.is_some_and(|rich| rich.is_expiration_update));
+        assert_eq!(open.expire_seconds, Some(604800));
+
+        // A real sent body keeps flowing as outgoing with the timer keys.
+        let sent = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "destinationNumber": "+15555550101",
+            "message": "from my phone",
+            "expiresInSeconds": 3600u64,
+        }));
+        assert_eq!(sent.direction, "outgoing");
+        assert_eq!(sent.expire_seconds, Some(3600));
     }
 }

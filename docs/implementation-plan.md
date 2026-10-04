@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.40 (2026-10-05)
+- Contract revision: 1.42 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1665,6 +1665,80 @@ string with no way for a host to tell which identity family it is reading.
 - Desktop consumption: an @-chip resolves against the §4.39 roster by `authorAci` when present,
   falling back to `author` (which the roster's `id`/`uuid` pair joins in both engine modes);
   the "@you" highlight keeps reading `mentionsSelf` and needs neither field.
+
+### 4.41 Disappearing messages: receive metadata, timer mirror, local sweeper, conversations.setExpireTimer, history import (contract revision 1.42, 2026-10-05)
+
+The premise this revision implements: Signal's disappearing messages are a protocol feature the
+connector must stop swallowing. Upstream, the timer lives in the conversation state and every
+message row carries the countdown it was sent with; locally, pre-1.42 receives dropped all of it,
+so a linked device silently kept forever what the sender meant to expire. The upstream engine
+(E-batch, separate repository) projects the envelope keys and validates the timer set; KT Desktop
+(D-batch) renders and triggers; this connector owns the middle: capture, mirror, local expiry of
+stored history, the host-facing control method, and the archive import.
+
+- Receive metadata (both engine faces, one parse): a `dataMessage` (direct `dataMessage` or the
+  multi-device `syncMessage.sentMessage` mirror) states its conversation's timer with
+  `expiresInSeconds` — absent = the envelope states nothing, `0` = the sender's timer is off —
+  and, on the engine face only, the countdown start `expirationStartTimestamp` (>0 stamps only;
+  a `0` is treated as absent). Both ride the normalized receive verbatim (`expire_seconds`,
+  `expire_start_at`); neither is recomputed, defaulted, or clamped: the values are protocol
+  state, not connector policy.
+- Row persistence (schema 16, additive): `messages.expire_seconds` / `messages.expire_start_at`
+  keep the stated keys verbatim; `messages.expire_at` is the connector's sweep deadline, written
+  at insert as `start + seconds·1000` (saturating, capped at the `i64` face) where `start` is the
+  engine-stated start, else the row's receive time, else the store's own insert stamp — never a
+  peer-claimed wall clock. Rows without a live timer (`0`, absent, timer notices) keep all three
+  columns NULL, so a conversation without disappearing messages costs zero sweep work. A partial
+  index on `expire_at` bounds the sweeper's due-set scan.
+- Timer-change mirroring: a bodyless receive flagged `isExpirationUpdate` is a timer update, not
+  a message. It lands as a `system` row (status `system`, rich marker `isExpirationUpdate: true`
+  as its only rich content) whose text material speaks the announced value —
+  `已更新消息定时消失：{N} 秒` for N>0, `已更新消息定时消失：已关闭` for the `0` and absent close
+  forms; the desktop localizes presentation from this material. Before the row inserts, the
+  conversation's mirror column `conversations.expire_timer_seconds` (NULL unknown / `0` off /
+  N seconds) updates, so the `conversation.changed` summary the row's landing already carries
+  the new state. A peer change and our own phone-side toggle (which mirrors through
+  `sentMessage` addressed by destination) land as the same row shape, so every device's history
+  agrees. A timer notice row never sweeps (its record carries no expire columns) — the state is
+  in the conversation row; the notice is only the visible event.
+- Local sweeper: one bounded pass per group supervisor deletes at most 256 due rows
+  (`expire_at <= now`, oldest deadline first) in a single transaction and repairs exactly the
+  touched summaries — the same last-message/unread clamp a retention prune applies — plus the
+  account aggregates, so a sweep never leaves a summary promising a row the timer ate. A full
+  batch drains again immediately (the cap bounds rows, not conversations); otherwise the
+  supervisor sleeps the sweep interval (default 30 s, `serve --expire-sweep-interval-ms` /
+  `KT_SIGNAL_EXPIRE_SWEEP_INTERVAL_MS`, startup settle 5 s). The pass is single-flight per
+  process, and failures leave the rest for the next tick. Every touched conversation emits
+  `message.expired` once per batch: `{accountId, conversationId, messageIds}` (non-empty,
+  bounded by the batch; groups arrive per conversation with no global ordering guarantee). The
+  sweep deletes store rows only — attachment bytes follow the media governor's existing
+  retention discipline, identical to a prune — and never touches upstream state.
+- `conversations.setExpireTimer` (host method, capability `disappearing-messages`): params
+  `{accountId, conversationId, expireSeconds}` with `expireSeconds ≤ 2147483647` (the common
+  `i32` denominator of both upstream faces); result `{expireTimerSeconds}`. Only direct
+  conversations are settable — a group timer travels through group updates this connector's
+  upstream faces do not expose, so a group answers `INVALID_REQUEST` before any upstream call
+  (recorded boundary). The upstream payload follows the caller's engine mode verbatim: the
+  engine face's `setExpirationTimer {account, recipient, expirationInSeconds}` versus the
+  signal-cli face's `updateContact {account, recipient, expiration}` (single-string resolved
+  recipient on both). Same-value no-ops are upstream semantics — the passthrough never
+  pre-checks. A lost mutating result answers `SEND_OUTCOME_UNKNOWN`, never retried; on a
+  definite success the local mirror updates best-effort and the refreshed summary rides
+  `conversation.changed`. The upstream timer state stays the source of truth: the mirror only
+  speeds up local reads between events.
+- Link-time history import (§4.38 pipeline): a chat frame's `expirationTimerMs` (ms → s, rounded
+  up so an imported state never under-reports) seeds the conversation mirror; a message frame's
+  `expiresInMs` (same ms ladder) and `expireStartDate` (>0) fill the row's expire columns with
+  the deadline stamped at import; and the engine's direction-less `expirationTimerChange` frame
+  applies the announced state and renders the same timer-notice system row a live change lands
+  as — under the live system identity for that conversation, so a re-run, or a live change
+  stored first, dedupes through the existing identity tuple. The updater's ACI is deliberately
+  not part of the row identity: the notice is conversation-scoped state, the copy speaks the
+  timer value, not the actor (recorded boundary — a desktop that wants the actor needs a future
+  wire field, not an identity change).
+- Not implemented on purpose: group timer writes, per-message expiry timers (Signal's
+  disappear-on-read), and any upstream deletion trigger. The connector's sweeper is local
+  storage hygiene with host-visible events; the protocol's authoritative expiry stays upstream.
 
 ## 5. signal-cli Boundary
 

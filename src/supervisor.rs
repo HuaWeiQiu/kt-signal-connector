@@ -19,6 +19,7 @@ use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, ConversationsGetPinnedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
     ConversationsSetPinnedParams, GroupDetails, HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS,
     MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
     MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, SendTarget,
@@ -30,8 +31,8 @@ use crate::service::{
     store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
-    AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
-    Store, StoreError, SyncedContact,
+    AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
+    MessageRecord, Page, Store, StoreError, SyncedContact,
 };
 
 // Match link QR lifetime so a slow phone confirmation can still complete.
@@ -47,6 +48,9 @@ const RETENTION_BATCH_MESSAGES: u32 = 2_000;
 /// Breathing room between retention batches so receives and host requests get
 /// the store lock while a large history is being pruned.
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(50);
+/// Settle time before a group's first expire sweep after start (§4.41): the
+/// handshake must not share its few-second budget with a store pass.
+const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// Capacity of the auto delivery-receipt queue (contract revision 1.34):
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
@@ -138,6 +142,12 @@ pub struct RuntimeSupervisor {
     /// (plus its retention convergence) finishes. Shared with the spawned
     /// tasks, which outlive any borrow of `self`.
     history_import_running: Arc<AtomicBool>,
+    /// Disappearing-message sweep single flight (contract revision 1.42,
+    /// §4.41): at most one sweep pass per group at a time, shared with the
+    /// periodic task.
+    expire_sweep_running: Arc<AtomicBool>,
+    /// The periodic expire sweeper; never held across an await.
+    expire_sweeper: StdMutex<Option<JoinHandle<()>>>,
     /// Receiver of the bounded auto delivery-receipt queue; `Some` until
     /// `spawn_delivery_receipt_worker` takes it. The queue itself is created
     /// in `new` (the persistence loop holds the sender), but the worker can
@@ -216,6 +226,8 @@ impl RuntimeSupervisor {
             media_governor_pass: StdMutex::new(None),
             contacts_resync: StdMutex::new(None),
             history_import_running: Arc::new(AtomicBool::new(false)),
+            expire_sweep_running: Arc::new(AtomicBool::new(false)),
+            expire_sweeper: StdMutex::new(None),
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
@@ -310,6 +322,75 @@ impl RuntimeSupervisor {
                 ),
             }
         }));
+    }
+
+    /// Spawn the disappearing-message sweeper (contract 1.42, §4.41;
+    /// idempotent). One periodic task per group: after a short startup settle
+    /// it runs one full drain (bounded batches back to back), then sweeps on
+    /// the configured cadence. Store work runs on the blocking pool; each
+    /// pass is single-flight (`expire_sweep_running`) so a long drain never
+    /// overlaps the next tick. A conversation with no timer state costs
+    /// nothing: the partial index makes the "nothing due" probe a point query.
+    pub fn spawn_expire_sweeper(self: &Arc<Self>) {
+        let Ok(mut slot) = self.expire_sweeper.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        *slot = Some(tokio::spawn(async move {
+            sleep(EXPIRE_SWEEP_STARTUP_SETTLE).await;
+            loop {
+                supervisor.run_expire_sweep_pass().await;
+                sleep(supervisor.config.expire_sweep_interval).await;
+            }
+        }));
+    }
+
+    /// One sweep drain: bounded delete batches back to back until a batch
+    /// comes back under the cap (or the store fails), emitting one batched
+    /// `message.expired` event per touched conversation. Failures leave the
+    /// rest for the next tick and never take the sweeper down.
+    async fn run_expire_sweep_pass(&self) {
+        if self.expire_sweep_running.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let result = self.expire_sweep_batches().await;
+        self.expire_sweep_running.store(false, Ordering::Relaxed);
+        if let Err(error) = result {
+            tracing::warn!(
+                error_class = error.class(),
+                "expire sweep stopped: store unavailable"
+            );
+        }
+    }
+
+    async fn expire_sweep_batches(&self) -> Result<(), StoreError> {
+        loop {
+            let groups = tokio::task::spawn_blocking({
+                let store = Arc::clone(&self.store);
+                move || store.sweep_expired_messages(crate::link::now_ms(), EXPIRE_SWEEP_BATCH)
+            })
+            .await
+            .unwrap_or(Err(StoreError::Unavailable(None)))?;
+            // The cap bounds deleted rows, not conversations: a full batch is
+            // total ids across the returned groups (one group may hold the
+            // whole batch), so a backed-up drain keeps going immediately.
+            let deleted: usize = groups.iter().map(|group| group.message_ids.len()).sum();
+            let full_batch = deleted >= EXPIRE_SWEEP_BATCH as usize;
+            for group in groups {
+                let _ = self.host_events.send(HostSideEvent::MessageExpired {
+                    account_id: group.account_id,
+                    conversation_id: group.conversation_id,
+                    message_ids: group.message_ids,
+                });
+            }
+            if !full_batch {
+                return Ok(());
+            }
+            sleep(RETENTION_BATCH_PAUSE).await;
+        }
     }
 
     /// One media governor pass per process start (ADR 0002 trigger
@@ -1900,6 +1981,68 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// conversations.setExpireTimer (contract revision 1.42, §4.41): bounds +
+    /// resolution + the mode-shaped upstream payload under the service lock,
+    /// then the mutating engine call — reaction-class discipline, an unknown
+    /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried. On a
+    /// definite success the conversation's local mirror row updates and the
+    /// refreshed summary rides conversation.changed, so every window sees the
+    /// new timer without a re-read; the upstream timer state stays the source
+    /// of truth. The dual route follows the caller's engine mode:
+    /// `setExpirationTimer` (engine face) or `updateContact` (signal-cli
+    /// face) — same-value no-ops are upstream semantics, the passthrough
+    /// never pre-checks.
+    pub async fn set_conversation_expire_timer(
+        &self,
+        params: ConversationsSetExpireTimerParams,
+    ) -> Result<ConversationsSetExpireTimerResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let (upstream, seconds) = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_set_expire_timer(
+                &params.account_id,
+                &params.conversation_id,
+                params.expire_seconds,
+                self.config.mode,
+            )?
+        };
+        let method = match self.config.mode {
+            SignalCliMode::KtEngine => "setExpirationTimer",
+            _ => "updateContact",
+        };
+        match engine.call(method, upstream, CallClass::Mutating).await {
+            Ok(_) => {
+                // Local mirror best-effort: the upstream write is the state;
+                // a mirror failure only costs the next event its freshness.
+                if self
+                    .store
+                    .set_conversation_expire_timer(
+                        &params.account_id,
+                        &params.conversation_id,
+                        seconds,
+                    )
+                    .unwrap_or(false)
+                    && let Some(conversation) = self
+                        .store
+                        .conversation_summary(&params.account_id, &params.conversation_id)?
+                {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(conversation));
+                }
+                Ok(ConversationsSetExpireTimerResult {
+                    expire_timer_seconds: seconds,
+                })
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account
     /// resolution then the read-only engine call; the record list projects
     /// straight from the engine result with the KT entry cap (§4.34).
@@ -3339,6 +3482,8 @@ mod tests {
             read_at: None,
             admin_deleted: false,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -3438,6 +3583,8 @@ mod tests {
                 attachments: Vec::new(),
                 rich: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 control: None,
             })
             .await
@@ -4216,6 +4363,349 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.peer_key, "+15555550999");
+        supervisor.shutdown().await.unwrap();
+    }
+
+    // ---- Contract 1.42 (§4.41): expire sweep + timer route ----
+
+    fn due_record(
+        id: &str,
+        account_id: &str,
+        conversation_id: &str,
+        deadline_ms: u64,
+    ) -> MessageRecord {
+        MessageRecord {
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: deadline_ms,
+            received_at: Some(deadline_ms),
+            text: Some("vanishing".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+            sticker: None,
+            expire_seconds: Some(60),
+            expire_start_at: Some(deadline_ms.saturating_sub(60_000)),
+        }
+    }
+
+    /// One drain pass deletes a full batch's worth of due rows and keeps
+    /// draining immediately when the batch came back full (the cap bounds
+    /// rows, not conversations), emitting one batched `message.expired` event
+    /// per touched conversation; the follow-up pass is quiet.
+    #[tokio::test]
+    async fn expire_sweep_drains_full_batches_and_emits_grouped_events() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(temp.path());
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation_a = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let conversation_b = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
+            .unwrap();
+        // One full batch plus one, interleaved across two conversations: the
+        // first pass deletes exactly the cap, the second drains the rest, and
+        // both conversations must have been named by some event.
+        let total = super::EXPIRE_SWEEP_BATCH as usize + 1;
+        for index in 0..total {
+            let conversation = if index % 2 == 0 {
+                &conversation_a
+            } else {
+                &conversation_b
+            };
+            let record = due_record(
+                &format!("due-{index:04}"),
+                &account.id,
+                &conversation.id,
+                10_000 + index as u64,
+            );
+            store
+                .insert_message(&record, None, Some("vanishing"), true)
+                .unwrap();
+        }
+        // A live row the timer has not touched yet survives the whole drain:
+        // its countdown starts far beyond the real wall clock.
+        let mut waiting = due_record("waiting", &account.id, &conversation_a.id, 1_000_000);
+        waiting.expire_start_at = Some(crate::link::now_ms() + 100_000);
+        store
+            .insert_message(&waiting, None, Some("vanishing"), true)
+            .unwrap();
+
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            SignalCliConfig::new(
+                temp.path().join("unused-signal-cli"),
+                temp.path().join("unused-signal-data"),
+            ),
+            Arc::new(store),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        let mut host_events = supervisor.subscribe_host();
+        supervisor.run_expire_sweep_pass().await;
+
+        let mut expired_ids = std::collections::HashSet::new();
+        let mut conversations_seen = std::collections::HashSet::new();
+        while expired_ids.len() < total {
+            let event = timeout(Duration::from_secs(5), host_events.recv())
+                .await
+                .expect("expired events within timeout")
+                .unwrap();
+            let HostSideEvent::MessageExpired {
+                account_id,
+                conversation_id,
+                message_ids,
+            } = event
+            else {
+                continue;
+            };
+            assert_eq!(account_id, account.id);
+            assert!(!message_ids.is_empty(), "a group never ships empty");
+            conversations_seen.insert(conversation_id);
+            expired_ids.extend(message_ids);
+        }
+        assert_eq!(expired_ids.len(), total, "every due row swept exactly once");
+        assert_eq!(conversations_seen.len(), 2, "both conversations reported");
+
+        // The follow-up pass is quiet: the sweeper's event lane stays silent.
+        supervisor.run_expire_sweep_pass().await;
+        sleep(Duration::from_millis(150)).await;
+        assert!(host_events.try_recv().is_err(), "no second-wave events");
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// The signal-cli face routes the timer through the mutating
+    /// `updateContact` (`expiration`, single-string recipient), mirrors the
+    /// conversation state on the definite success, and rides the refreshed
+    /// summary out on conversation.changed.
+    #[tokio::test]
+    async fn set_expire_timer_routes_update_contact_and_mirrors_state() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut host_lane = supervisor.subscribe_host();
+
+        let result = supervisor
+            .set_conversation_expire_timer(crate::service::ConversationsSetExpireTimerParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                expire_seconds: 86_400,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.expire_timer_seconds, 86_400);
+
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.expire_timer_seconds, Some(86_400));
+        let event = timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        let HostSideEvent::ConversationChanged(changed) = event else {
+            panic!("expected a conversation.changed event");
+        };
+        assert_eq!(changed.expire_timer_seconds, Some(86_400));
+
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatch");
+        let dispatch: serde_json::Value = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|params: &serde_json::Value| params["expiration"] == 86_400)
+            .expect("the timer call must reach updateContact");
+        assert_eq!(dispatch["account"], "+15555550100");
+        assert_eq!(dispatch["recipient"], "+15555550101");
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// The engine face routes the same request through `setExpirationTimer`
+    /// (`expirationInSeconds`), mirroring the identical local state.
+    #[tokio::test]
+    async fn set_expire_timer_routes_set_expiration_timer_in_engine_mode() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.mode = crate::engine::SignalCliMode::KtEngine;
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        let result = supervisor
+            .set_conversation_expire_timer(crate::service::ConversationsSetExpireTimerParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                expire_seconds: 604_800,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.expire_timer_seconds, 604_800);
+
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatch");
+        let dispatch: serde_json::Value = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|params: &serde_json::Value| params["expirationInSeconds"] == 604_800)
+            .expect("the timer call must reach setExpirationTimer");
+        assert_eq!(dispatch["account"], "+15555550100");
+        assert_eq!(dispatch["recipient"], "+15555550101");
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.expire_timer_seconds, Some(604_800));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// The fixture exits with the max-legal timer call in flight, so the
+    /// upstream result is lost mid-call: setExpireTimer answers the explicit
+    /// SEND_OUTCOME_UNKNOWN — never a retry, and the local mirror stays
+    /// untouched (an unconfirmed upstream value is never projected).
+    #[tokio::test]
+    async fn set_expire_timer_with_a_lost_upstream_result_answers_unknown() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+
+        let outcome = supervisor
+            .set_conversation_expire_timer(crate::service::ConversationsSetExpireTimerParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                expire_seconds: i32::MAX as u32,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(outcome, crate::service::ServiceError::Api(ref api) if api.code == "SEND_OUTCOME_UNKNOWN"),
+            "a lost mutating result must answer SEND_OUTCOME_UNKNOWN"
+        );
+
+        // No mirror write: the summary's timer state stays unknown.
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.expire_timer_seconds, None);
         supervisor.shutdown().await.unwrap();
     }
 }

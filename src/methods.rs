@@ -120,6 +120,11 @@ pub const METHODS: &[MethodRow] = &[
     // — no engine call, no network, no mutation. The desktop polls it while
     // the state is `running`; there is deliberately no push event.
     ("history.importStatus", Lane::Read, false, "read"),
+    // Disappearing-message timer set (contract revision 1.42, §4.41):
+    // mutating, send-lane upstream traffic — the reaction class verbatim,
+    // same-account mutex and delete barrier included. Direct conversations
+    // only; the local timer mirror rides the success path.
+    ("conversations.setExpireTimer", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -164,14 +169,16 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// the sticker receive projection as present. `sticker-pack-browse` and
 /// `conversation-pin-sync` (contract revision 1.36) mark the two browse/sync
 /// faces of §4.32/§4.33, `sticker-pack-sync` (contract revision 1.37)
-/// marks the §4.34 account-scoped pack install face, and `view-once`
+/// marks the §4.34 account-scoped pack install face, `view-once`
 /// (contract revision 1.38) marks the §4.36/§4.37 view-once send, open-sync
-/// and burn faces, and `history-import` (contract revision 1.39) marks the
-/// §4.38 link-time import status face — desktops gate the new
-/// methods on these tags so an old connector answers a clean capability gap
-/// instead of `METHOD_NOT_ALLOWED`. They never join [`METHOD_NAMES`]: the
-/// schema request-frame method enum and the dispatch table describe real
-/// methods only.
+/// and burn faces, `history-import` (contract revision 1.39) marks the
+/// §4.38 link-time import status face, and `disappearing-messages`
+/// (contract revision 1.42) marks the §4.41 receive metadata, timer-notice
+/// and bounded-sweep faces plus `conversations.setExpireTimer` — desktops
+/// gate the new surface on this tag so an old connector answers a clean
+/// capability gap instead of `METHOD_NOT_ALLOWED`. They never join
+/// [`METHOD_NAMES`]: the schema request-frame method enum and the dispatch
+/// table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
     "send-sticker",
@@ -180,6 +187,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "sticker-pack-sync",
     "view-once",
     "history-import",
+    "disappearing-messages",
 ];
 
 #[cfg(test)]
@@ -226,6 +234,7 @@ mod tests {
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "conversations.setPinned",
+            "conversations.setExpireTimer",
             "stickerPacks.setSync",
         ];
         let mutating = [
@@ -248,6 +257,7 @@ mod tests {
             "presence.setTypingMessage",
             "accounts.deleteLocalData",
             "conversations.setPinned",
+            "conversations.setExpireTimer",
             "stickerPacks.setSync",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

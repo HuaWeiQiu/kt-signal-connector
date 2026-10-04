@@ -39,7 +39,8 @@ use crate::engine::{NormalizedAttachment, NormalizedQuote, truncate_utf8_bytes};
 use crate::ids::{mask_address, stable_hash_id};
 use crate::service::{MAX_HOST_TEXT_PREVIEW_BYTES, MAX_INBOUND_TEXT_BYTES};
 use crate::store::{
-    HistoryImportInsert, HistoryStageRecipient, ImportCounters, MessageRecord, Store,
+    HistoryImportInsert, HistoryStageChat, HistoryStageRecipient, ImportCounters, MessageRecord,
+    Store,
 };
 
 /// The engine's export artifact inside the account store directory.
@@ -280,7 +281,7 @@ fn pass_one(store: &Arc<Store>, account_id: &str, archive: &Path) -> Result<(), 
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut line_buf = Vec::with_capacity(8 * 1024);
     let mut recipients: Vec<HistoryStageRecipient> = Vec::with_capacity(BATCH_MESSAGES);
-    let mut chats: Vec<(u64, u64)> = Vec::with_capacity(BATCH_MESSAGES);
+    let mut chats: Vec<HistoryStageChat> = Vec::with_capacity(BATCH_MESSAGES);
     loop {
         let line = match read_bounded_line(&mut reader, &mut line_buf)? {
             BoundedLine::Eof => break,
@@ -416,10 +417,17 @@ impl<'a> Importer<'a> {
             .get("remoteDeleted")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // Direction-less backup items have no place in the two-sided model —
+        // except the timer-change notice (contract 1.42, §4.41): a
+        // conversation-scoped state update the engine exports exactly so the
+        // connector can mirror the timer state.
+        let timer_change = value
+            .get("expirationTimerChange")
+            .and_then(Value::as_object);
         let direction = match value.get("direction").and_then(Value::as_str) {
             Some("incoming") => "incoming",
             Some("outgoing") => "outgoing",
-            // Direction-less backup items have no place in the two-sided model.
+            _ if timer_change.is_some() => "system",
             _ => {
                 self.counters.skipped_messages += 1;
                 return Ok(());
@@ -429,6 +437,9 @@ impl<'a> Importer<'a> {
             // The unresolvable chat was skip-counted once at resolution time.
             return Ok(());
         };
+        if direction == "system" {
+            return self.handle_timer_change(timer_change.expect("checked above"), &chat, sent_at);
+        }
         let (sender_id, alt_sender_id, sender_name, author_source) = if direction == "outgoing" {
             (self.account_id.to_string(), None, None, None)
         } else {
@@ -503,6 +514,20 @@ impl<'a> Importer<'a> {
         let attachments = raw_attachments
             .map(|raws| self.import_attachments(raws, &message_id))
             .unwrap_or_default();
+        // The archive's disappearing-message metadata (contract 1.42,
+        // §4.41): `expiresInMs` converts to seconds rounding up — a row must
+        // never sweep before its real deadline — and `expireStartDate` (>0)
+        // is the countdown start; without it the deadline falls back to the
+        // import stamp, so an already-dead historical row sweeps on the next
+        // pass only when its stated start says so.
+        let expire_seconds = value
+            .get("expiresInMs")
+            .and_then(Value::as_u64)
+            .map(|ms| ms.div_ceil(1_000));
+        let expire_start_at = value
+            .get("expireStartDate")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0);
         let record = MessageRecord {
             id: message_id,
             account_id: self.account_id.to_string(),
@@ -542,6 +567,8 @@ impl<'a> Importer<'a> {
             read_at: None,
             admin_deleted: false,
             sticker: None,
+            expire_seconds,
+            expire_start_at,
         };
         let preview = record
             .text
@@ -571,6 +598,93 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// One direction-less timer-change frame (contract 1.42, §4.41): the
+    /// engine's export of a disappearing-timer update — `expiresInMs` is the
+    /// announced timer (0 = off; an absent key is the close form), applied to
+    /// the conversation state immediately and rendered as the same
+    /// timer-notice system row a live change lands as, with the live system
+    /// identity so a re-run (or a change live traffic stored first) dedupes
+    /// through the batch writer. The updater identity is deliberately not
+    /// part of the row: the notice is conversation-scoped state, and the
+    /// desktop copy speaks the timer value, not the actor.
+    fn handle_timer_change(
+        &mut self,
+        change: &serde_json::Map<String, Value>,
+        chat: &ResolvedChat,
+        sent_at: u64,
+    ) -> Result<(), ImportFailure> {
+        let seconds = change
+            .get("expiresInMs")
+            .and_then(Value::as_u64)
+            .map(|ms| ms.div_ceil(1_000))
+            .unwrap_or(0);
+        self.store.set_conversation_expire_timer(
+            self.account_id,
+            &chat.conversation_id,
+            seconds,
+        )?;
+        // The live system identity for this conversation: the same hash the
+        // receive path derives, so identities agree across surfaces.
+        let sender_id = stable_hash_id(&[self.account_id, chat.kind, &chat.peer_key]);
+        let message_id = stable_hash_id(&[
+            "signal-message-v2",
+            self.account_id,
+            &chat.conversation_id,
+            "system",
+            &sent_at.to_string(),
+            &sender_id,
+        ]);
+        let text = if seconds > 0 {
+            format!("已更新消息定时消失：{seconds} 秒")
+        } else {
+            "已更新消息定时消失：已关闭".to_string()
+        };
+        let record = MessageRecord {
+            id: message_id,
+            account_id: self.account_id.to_string(),
+            conversation_id: chat.conversation_id.clone(),
+            direction: "system",
+            sender_id,
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(crate::link::now_ms()),
+            text: Some(text.clone()),
+            text_bytes: Some(text.len().min(u32::MAX as usize) as u32),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                is_expiration_update: true,
+                ..Default::default()
+            }),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+            sticker: None,
+            // A timer notice never sweeps (§4.41): the columns stay NULL.
+            expire_seconds: None,
+            expire_start_at: None,
+        };
+        let preview = Some(text.chars().take(120).collect::<String>());
+        self.batch.push(HistoryImportInsert {
+            record,
+            preview,
+            alt_sender_id: None,
+        });
+        if self.batch.len() >= BATCH_MESSAGES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     /// Resolve one chat's store identity, once per run: the staged recipient
     /// maps onto a conversation through [`chat_identity`], the conversation
     /// is ensured in place (§6.5 skeleton reuse), and the result caches. An
@@ -584,23 +698,39 @@ impl<'a> Importer<'a> {
             .store
             .history_chat_recipient(self.account_id, chat_id)?
         {
-            Some(recipient) => match chat_identity(self.signal_account, &recipient) {
-                Some((kind, peer_key)) => {
-                    let title = match non_empty(&recipient.name) {
-                        Some(name) => truncate_utf8_bytes(name, CONVERSATION_TITLE_BYTES),
-                        None => mask_address(&peer_key),
-                    };
-                    let conversation =
-                        self.store
-                            .ensure_conversation(self.account_id, kind, &peer_key, &title)?;
-                    Some(ResolvedChat {
-                        conversation_id: conversation.id,
-                        kind,
-                        peer_key,
-                    })
+            Some((recipient, expire_timer_ms)) => {
+                match chat_identity(self.signal_account, &recipient) {
+                    Some((kind, peer_key)) => {
+                        let title = match non_empty(&recipient.name) {
+                            Some(name) => truncate_utf8_bytes(name, CONVERSATION_TITLE_BYTES),
+                            None => mask_address(&peer_key),
+                        };
+                        let conversation = self.store.ensure_conversation(
+                            self.account_id,
+                            kind,
+                            &peer_key,
+                            &title,
+                        )?;
+                        // The chat frame's disappearing timer seeds the
+                        // conversation state (§4.41): ms → seconds rounds up
+                        // so an imported state never sweeps early. `None`
+                        // leaves whatever state the live traffic last set.
+                        if let Some(timer_ms) = expire_timer_ms {
+                            self.store.set_conversation_expire_timer(
+                                self.account_id,
+                                &conversation.id,
+                                timer_ms.div_ceil(1_000),
+                            )?;
+                        }
+                        Some(ResolvedChat {
+                            conversation_id: conversation.id,
+                            kind,
+                            peer_key,
+                        })
+                    }
+                    None => None,
                 }
-                None => None,
-            },
+            }
             None => None,
         };
         if resolved.is_none() {
@@ -784,10 +914,20 @@ fn stage_recipient(value: &Value) -> Option<HistoryStageRecipient> {
 }
 
 /// One archive chat's staged `chat → recipient` edge.
-fn stage_chat(value: &Value) -> Option<(u64, u64)> {
+fn stage_chat(value: &Value) -> Option<HistoryStageChat> {
     let id = value.get("id").and_then(Value::as_u64)?;
     let recipient_id = value.get("recipientId").and_then(Value::as_u64)?;
-    Some((id, recipient_id))
+    // The chat frame's disappearing timer in ms (§4.41): stated, positive
+    // values stage; anything else leaves the conversation state untouched.
+    let expire_timer_ms = value
+        .get("expirationTimerMs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
+    Some(HistoryStageChat {
+        id,
+        recipient_id,
+        expire_timer_ms,
+    })
 }
 
 /// The engine may project e164 as a JSON number or a string; both normalize
@@ -1136,9 +1276,19 @@ mod tests {
             chat_identity(SIGNAL_ACCOUNT, &self_recipient),
             Some(("direct", SIGNAL_ACCOUNT.to_string()))
         );
+        let staged = stage_chat(&serde_json::json!({"id": 10, "recipientId": 1}));
         assert_eq!(
-            stage_chat(&serde_json::json!({"id": 10, "recipientId": 1})),
+            staged.as_ref().map(|chat| (chat.id, chat.recipient_id)),
             Some((10, 1))
+        );
+        assert_eq!(staged.unwrap().expire_timer_ms, None);
+        assert_eq!(
+            stage_chat(&serde_json::json!({
+                "id": 10, "recipientId": 1, "expirationTimerMs": 86400000
+            }))
+            .unwrap()
+            .expire_timer_ms,
+            Some(86_400_000)
         );
         assert_eq!(stage_chat(&serde_json::json!({"id": 10})), None);
     }
@@ -1394,6 +1544,8 @@ mod tests {
             read_at: None,
             admin_deleted: false,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
         assert!(store.insert_message(&live, None, None, true).unwrap());
 
@@ -1445,5 +1597,133 @@ mod tests {
         run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).expect_err("still missing");
         let row = store.history_import_row(&account.id).unwrap().unwrap();
         assert_eq!(row.attempts, 2);
+    }
+
+    /// Contract 1.42 (§4.41): the archive's disappearing-timer material
+    /// lands — a chat frame's `expirationTimerMs` seeds the conversation
+    /// state (ms → s, rounded up), a message frame's `expiresInMs`/
+    /// `expireStartDate` ride the row verbatim, and a direction-less
+    /// `expirationTimerChange` frame applies the announced state and renders
+    /// the same timer-notice system row (and identity) a live change lands
+    /// as — so a re-run or a live change at the same stamp dedupes.
+    #[test]
+    fn timer_frames_import_state_notice_rows_and_row_expire_columns() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "recipient", "id": 1, "kind": "contact",
+                                   "name": "Alice", "aci": ALICE_ACI, "e164": ALICE_E164})
+                .to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1,
+                                   "expirationTimerMs": 3_600_000})
+                .to_string(),
+                // A regular row that states its conversation's timer.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "vanishing",
+                    "expiresInMs": 1500, "expireStartDate": 500
+                })
+                .to_string(),
+                // The engine's timer-update export: direction-less, ms-keyed.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 2000,
+                    "expirationTimerChange": {"expiresInMs": 86_400_000}
+                })
+                .to_string(),
+                // The close form: no key inside the change reads as off.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "dateSent": 3000,
+                    "expirationTimerChange": {}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 3, "two notices and one regular row");
+        assert_eq!(counters.skipped_messages, 0);
+
+        let alice_conversation = alice_conversation_id(&account.id);
+        // The chat timer seeded 3600s, the change raised it to 86400s, the
+        // close form read it off — the final mirror is the last applied state.
+        let summary = store
+            .conversation_summary(&account.id, &alice_conversation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.expire_timer_seconds, Some(0));
+
+        // The regular row keeps the envelope-stated timer verbatim (ms → s
+        // rounded up), and its sweep deadline derives from the stated start.
+        let regular = store
+            .message_by_signal_identity(
+                &account.id,
+                &alice_conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("regular row");
+        assert_eq!(regular.expire_seconds, Some(2), "1500ms rounds up to 2s");
+        assert_eq!(regular.expire_start_at, Some(500));
+
+        // The notice rows carry the live system identity — a live change at
+        // the same stamp resolves to the same row — and never sweep.
+        let system_sender = stable_hash_id(&[&account.id, "direct", ALICE_E164]);
+        let notice = store
+            .message_by_signal_identity(
+                &account.id,
+                &alice_conversation,
+                "system",
+                2000,
+                &system_sender,
+                &system_sender,
+            )
+            .unwrap()
+            .expect("timer notice row");
+        assert_eq!(notice.text.as_deref(), Some("已更新消息定时消失：86400 秒"));
+        assert!(
+            notice
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.is_expiration_update)
+        );
+        assert_eq!(notice.expire_seconds, None);
+        let close = store
+            .message_by_signal_identity(
+                &account.id,
+                &alice_conversation,
+                "system",
+                3000,
+                &system_sender,
+                &system_sender,
+            )
+            .unwrap()
+            .expect("close notice row");
+        assert_eq!(close.text.as_deref(), Some("已更新消息定时消失：已关闭"));
+
+        // The deadlines the import stamped still sweep honestly: with the
+        // stated starts all in the past, both notice-free rows... the notice
+        // rows never appear (NULL deadline), only the regular row does.
+        let groups = store
+            .sweep_expired_messages(crate::link::now_ms(), crate::store::EXPIRE_SWEEP_BATCH)
+            .unwrap();
+        let swept: Vec<&str> = groups
+            .iter()
+            .flat_map(|group| group.message_ids.iter().map(String::as_str))
+            .collect();
+        assert_eq!(
+            swept,
+            vec![regular.id.as_str()],
+            "only the live-timer row sweeps"
+        );
     }
 }

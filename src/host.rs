@@ -27,16 +27,17 @@ use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailur
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsGetPinnedParams, ConversationsListParams,
-    ConversationsSetPinnedParams, GroupsGetParams, HistoryImportStatusParams, HostSideEvent,
-    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams,
+    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, GroupsGetParams,
+    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
+    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
+    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1314,6 +1315,25 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "conversations.setExpireTimer" => {
+            match serde_json::from_value::<ConversationsSetExpireTimerParams>(request.params) {
+                Ok(params) => match runtime.set_conversation_expire_timer(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.setExpireTimer params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "stickerPacks.getSyncs" => {
             match serde_json::from_value::<StickerPackGetSyncsParams>(request.params) {
                 Ok(params) => match runtime.get_sticker_pack_syncs(params).await {
@@ -1790,6 +1810,24 @@ where
                         "conversationId": conversation_id,
                         "messageId": message_id,
                         "openedAt": opened_at,
+                    }),
+                ),
+            )
+            .await
+        }
+        HostSideEvent::MessageExpired {
+            account_id,
+            conversation_id,
+            message_ids,
+        } => {
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "message.expired",
+                    json!({
+                        "accountId": account_id,
+                        "conversationId": conversation_id,
+                        "messageIds": message_ids,
                     }),
                 ),
             )

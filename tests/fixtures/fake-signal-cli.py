@@ -754,8 +754,22 @@ for line in sys.stdin:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         # One-shot crash with the mutating call in flight: the rename may or
         # may not have reached the server, which is the indeterminate case
-        # (engine-exit path).
+        # (engine-exit path). The same magic rides the timer route's max legal
+        # `expiration` value (contract 1.42 §4.41 unknown-outcome drill).
         if params.get("name") == "[fixture-crash-alias]":
+            os._exit(25)
+        if params.get("expiration") == 2147483647:
+            os._exit(25)
+        result = {}
+    elif method == "setExpirationTimer":
+        # Contract 1.42 §4.41: the engine-face timer route. Same
+        # dispatch-recording discipline as `updateContact` so tests can assert
+        # the seconds-keyed payload, and the same in-flight crash magic on the
+        # max legal value.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("expirationInSeconds") == 2147483647:
             os._exit(25)
         result = {}
     elif method == "sendTyping":

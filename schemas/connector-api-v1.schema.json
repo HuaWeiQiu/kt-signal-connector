@@ -48,6 +48,7 @@
             "conversations.list",
             "conversations.getPinned",
             "conversations.setPinned",
+            "conversations.setExpireTimer",
             "messages.list",
             "messages.search",
             "messages.getText",
@@ -179,6 +180,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/conversationsSetPinnedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.setExpireTimer" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsSetExpireTimerParams" }
             }
           }
         },
@@ -1159,6 +1171,27 @@
         }
       }
     },
+    "conversationsSetExpireTimerParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "expireSeconds"],
+      "description": "Set or clear one direct conversation's disappearing-message timer (contract revision 1.42, §4.41): the write follows the connector's engine mode — the engine face's setExpirationTimer {account, recipient, expirationInSeconds} or the signal-cli face's updateContact {account, recipient, expiration} (int seconds). Same-value sets are upstream no-ops (no broadcast, no version bump — official semantics); 0 turns the timer off; there is no toggle form. conversationId resolves through the local store (CONVERSATION_NOT_FOUND before any upstream call); only direct conversations are settable — a group timer change travels through group-update faces this connector does not expose, so a group conversation answers INVALID_REQUEST (recorded boundary). Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. On success the local conversation mirror updates and the refreshed summary rides conversation.changed; the result is {expireTimerSeconds: n}. Note the engine face validates recipient against registered contacts — an unregistered peer answers the upstream error verbatim (fail-closed UPSTREAM_ERROR family).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The direct conversation to set the timer on; resolved against the account before any upstream call."
+        },
+        "expireSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647,
+          "description": "The timer in seconds: 0 turns disappearing messages off; N counts down every message in the conversation from its own send/start time. Bounded by the shared upstream int face (i32::MAX)."
+        }
+      }
+    },
     "stickerPackGetSyncsParams": {
       "type": "object",
       "additionalProperties": false,
@@ -1303,7 +1336,8 @@
             "conversation.typing",
             "message.upserted",
             "message.statusChanged",
-            "message.viewOnceOpened"
+            "message.viewOnceOpened",
+            "message.expired"
           ]
         },
         "data": {
@@ -1432,6 +1466,32 @@
                   "openedAt": {
                     "type": "integer",
                     "description": "Connector wall-clock ms the burn stamped the row."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.expired" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "messageIds"],
+                "description": "Local disappearing-message sweep (contract 1.42, §4.41): the sweeper deleted rows whose expire deadline passed in one conversation. messageIds is non-empty and bounded by the sweep batch; a full batch drains immediately, so groups arrive per conversation with no global ordering guarantee. This is the connector-owned expiry of stored history, not a peer receipt and not the upstream burn notice path.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "messageIds": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/opaqueId" },
+                    "minItems": 1,
+                    "description": "Row ids removed in this sweep, grouped per conversation."
                   }
                 }
               }

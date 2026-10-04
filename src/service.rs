@@ -11,7 +11,8 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
-    ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, truncate_utf8_bytes,
+    ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, SignalCliMode,
+    truncate_utf8_bytes,
 };
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, stable_hash_id};
@@ -293,6 +294,15 @@ pub enum HostSideEvent {
         conversation_id: String,
         message_id: String,
         opened_at: u64,
+    },
+    /// One conversation's rows whose disappearing timer ran out were deleted
+    /// by the bounded sweep (contract 1.42, §4.41): batched per conversation
+    /// per pass, oldest deadline first. The host drops the rows it still
+    /// holds; a missed event self-heals on the next conversation read.
+    MessageExpired {
+        account_id: String,
+        conversation_id: String,
+        message_ids: Vec<String>,
     },
 }
 
@@ -1356,6 +1366,8 @@ impl ConnectorService {
             read_at: None,
             admin_deleted: false,
             sticker: Some(sticker),
+            expire_seconds: None,
+            expire_start_at: None,
         };
         let inserted = self
             .store
@@ -1465,6 +1477,8 @@ impl ConnectorService {
             read_at: None,
             admin_deleted: false,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -1588,6 +1602,66 @@ impl ConnectorService {
             "kind": kind,
             "pinned": pinned,
         }))
+    }
+
+    /// conversations.setExpireTimer (contract revision 1.42, §4.41): bounds,
+    /// resolution, and the mode-shaped upstream payload under the service
+    /// lock. Only direct conversations are settable — the timer change for a
+    /// group travels through group updates this connector's upstream faces do
+    /// not expose, so a group conversation answers INVALID_REQUEST before any
+    /// upstream call (the recorded §4.41 boundary). The payload follows the
+    /// caller's engine mode verbatim: the engine face's `setExpirationTimer`
+    /// takes `recipient` (a single string) + `expirationInSeconds`; the
+    /// signal-cli face's `updateContact` takes `recipient` + `expiration`
+    /// (int seconds) — same-value no-ops and broadcast semantics stay
+    /// upstream. Returns the upstream payload plus the resolved timer value
+    /// the success path mirrors into the conversation row.
+    pub fn prepare_conversations_set_expire_timer(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        expire_seconds: u32,
+        mode: SignalCliMode,
+    ) -> Result<(Value, u64), ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if expire_seconds > MAX_EXPIRE_TIMER_SECONDS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "expireSeconds exceeds the upstream int face",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        if conversation.kind != "direct" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "group disappearing timers are not settable through this connector",
+                false,
+            )));
+        }
+        let upstream = match mode {
+            SignalCliMode::KtEngine => json!({
+                "account": account.signal_account,
+                "recipient": conversation.peer_key,
+                "expirationInSeconds": expire_seconds,
+            }),
+            _ => json!({
+                "account": account.signal_account,
+                "recipient": conversation.peer_key,
+                "expiration": expire_seconds,
+            }),
+        };
+        Ok((upstream, u64::from(expire_seconds)))
     }
 
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account bounds
@@ -2841,6 +2915,22 @@ impl ConnectorService {
                 .rich
                 .as_ref()
                 .is_some_and(|rich| rich.mentions.iter().any(|m| m.author == signal_account));
+        // Contract 1.42 (§4.41): a timer-notice system row mirrors the
+        // conversation's new timer state before the row lands, so the summary
+        // refetched below for conversation.changed already carries it. The
+        // close form (no stated value) reads as off; the notice row itself
+        // never sweeps (its record carries no expire columns).
+        let is_timer_change = receive
+            .rich
+            .as_ref()
+            .is_some_and(|rich| rich.is_expiration_update);
+        if is_timer_change {
+            self.store.set_conversation_expire_timer(
+                &account.id,
+                &conversation.id,
+                receive.expire_seconds.unwrap_or(0),
+            )?;
+        }
         let message = MessageRecord {
             id: message_id,
             account_id: account.id.clone(),
@@ -2875,6 +2965,19 @@ impl ConnectorService {
             read_at: None,
             admin_deleted: false,
             sticker: receive.sticker,
+            // A timer notice records the announced value in the text and the
+            // conversation state only (§4.41); regular rows carry the
+            // envelope-stated timer and start verbatim.
+            expire_seconds: if is_timer_change {
+                None
+            } else {
+                receive.expire_seconds
+            },
+            expire_start_at: if is_timer_change {
+                None
+            } else {
+                receive.expire_start_at
+            },
         };
         let preview = message
             .text
@@ -4135,6 +4238,35 @@ pub struct ConversationsSetPinnedParams {
     pub pinned: bool,
 }
 
+/// `conversations.setExpireTimer` params (contract revision 1.42, §4.41):
+/// `expireSeconds` is required — `0` turns the timer off, there is no
+/// toggle form. The u32 type fails negative, fractional and over-range
+/// values at params deserialization; the shared engine `int` face is the
+/// ceiling the schema mirrors.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsSetExpireTimerParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub expire_seconds: u32,
+}
+
+/// Upper bound the connector accepts for a set timer: both upstream faces
+/// consume a signed 32-bit integer (`setExpirationTimer.expirationInSeconds`
+/// validates within u32 on the engine face, `updateContact.expiration` is a
+/// Java `int` on the signal-cli face), so the common denominator is
+/// `i32::MAX` seconds — about 68 years, far past any real timer and the value
+/// the schema `maximum` mirrors.
+pub const MAX_EXPIRE_TIMER_SECONDS: u32 = i32::MAX as u32;
+
+/// `conversations.setExpireTimer` result (contract revision 1.42, §4.41):
+/// the timer value the upstream accepted — `0` for the off form.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationsSetExpireTimerResult {
+    pub expire_timer_seconds: u64,
+}
+
 /// `stickerPacks.getSyncs` params (contract revision 1.37, §4.34).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -5369,6 +5501,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5436,6 +5570,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -5764,6 +5900,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         service
@@ -5891,6 +6029,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
 
@@ -5958,6 +6098,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         assert!(
@@ -6036,6 +6178,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
 
@@ -6305,6 +6449,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6498,6 +6644,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6680,6 +6828,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6797,6 +6947,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -6922,6 +7074,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -7196,6 +7350,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -7335,6 +7491,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -7507,6 +7665,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -8007,6 +8167,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -8399,6 +8561,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         for record in [
@@ -9459,6 +9623,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: Some(control),
         }
     }
@@ -9563,6 +9729,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             assert!(
@@ -9905,6 +10073,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         service
@@ -9961,6 +10131,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         service
@@ -10113,6 +10285,8 @@ mod tests {
                     attachments: Vec::new(),
                     rich: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     control: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
@@ -10335,6 +10509,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         service
@@ -10476,6 +10652,8 @@ mod tests {
             attachments: Vec::new(),
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         service
@@ -10530,6 +10708,8 @@ mod tests {
             }],
             rich: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             control: None,
         };
         service
@@ -10835,5 +11015,194 @@ mod tests {
         let mut decoded = Vec::new();
         base64_decode_to_vec(&base64_encode(&value), &mut decoded).unwrap();
         assert_eq!(decoded, value);
+    }
+
+    // ---- Contract 1.42 (§4.41): disappearing-message timer control ----
+
+    /// The upstream payload follows the caller's engine mode verbatim —
+    /// the engine face's `setExpirationTimer` (seconds) vs the signal-cli
+    /// face's `updateContact` (expiration, int seconds) — after bounds,
+    /// account, and direct-only conversation resolution. A group answers
+    /// INVALID_REQUEST before any upstream call, an unknown conversation
+    /// answers CONVERSATION_NOT_FOUND, and an out-of-face value answers
+    /// INVALID_REQUEST.
+    #[test]
+    fn set_expire_timer_preparation_shapes_upstream_by_mode() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+
+        let (engine, seconds) = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                &direct.id,
+                86_400,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap();
+        assert_eq!(seconds, 86_400);
+        assert_eq!(
+            engine,
+            json!({
+                "account": "+15555550100",
+                "recipient": "+15555550101",
+                "expirationInSeconds": 86_400,
+            })
+        );
+
+        let (signal_cli, _) = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                &direct.id,
+                604_800,
+                SignalCliMode::Jvm,
+            )
+            .unwrap();
+        assert_eq!(
+            signal_cli,
+            json!({
+                "account": "+15555550100",
+                "recipient": "+15555550101",
+                "expiration": 604_800,
+            })
+        );
+
+        let group_refusal = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                &group.id,
+                60,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(group_refusal, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST")
+        );
+
+        let missing = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                "conv-absent",
+                60,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+
+        let oversized = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                &direct.id,
+                MAX_EXPIRE_TIMER_SECONDS + 1,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(matches!(oversized, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+    }
+
+    /// A timer notice mirrors the conversation's new timer state before the
+    /// row lands (the conversation.changed summary already carries it), the
+    /// notice row itself never sweeps (its expire columns stay empty), and a
+    /// regular row carries the envelope-stated timer verbatim. The close
+    /// form — no stated value — reads the state off.
+    #[test]
+    fn ingest_timer_change_mirrors_state_and_lands_a_nonsweeping_row() {
+        let (_temp, mut service) = service();
+        let timer_change = NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "dataMessage",
+            direction: "system",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: Some("Peer".into()),
+            group_id: None,
+            text: Some("已更新消息定时消失：86400 秒".into()),
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                is_expiration_update: true,
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: Some(86_400),
+            expire_start_at: None,
+            control: None,
+        };
+        let events = service
+            .ingest_receive(timer_change.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .expect("timer notice row");
+        assert_eq!(upserted.direction, "system");
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("state mirror event");
+        assert_eq!(changed.expire_timer_seconds, Some(86_400));
+
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .list_conversations(&account.id, 10, None)
+            .unwrap()
+            .items
+            .remove(0);
+        let rows = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        assert_eq!(rows.items.len(), 1);
+        assert_eq!(rows.items[0].expire_seconds, None);
+        assert_eq!(rows.items[0].expire_start_at, None);
+
+        // The close form mirrors the off state and lands the closed copy (a
+        // distinct protocol timestamp: signal identity dedup would otherwise
+        // swallow the second notice).
+        let close = NormalizedReceive {
+            timestamp: Some(1727000000001),
+            text: Some("已更新消息定时消失：已关闭".into()),
+            expire_seconds: None,
+            ..timer_change
+        };
+        let events = service
+            .ingest_receive(close, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("close mirror event");
+        assert_eq!(changed.expire_timer_seconds, Some(0));
     }
 }

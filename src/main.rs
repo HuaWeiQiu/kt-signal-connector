@@ -96,12 +96,21 @@ enum CliCommand {
         #[arg(long = "proxy-group", value_name = "ID=HOST:PORT")]
         proxy_group: Vec<String>,
         /// Media ingest opt-in (ADR 0002): the spawned signal-cli keeps
-        /// inbound attachment downloads (no `--ignore-attachments`) under the
-        /// connector's bounded media governor and chunked handle delivery.
+        /// inbound attachment downloads (no `--ignore-attachments`) under
+        /// the connector's bounded media governor and chunked handle delivery.
         /// Without the flag the engine spawns byte-identical to the pre-PoC
         /// launcher and every media method answers CAPABILITY_UNAVAILABLE.
         #[arg(long, default_value_t = false)]
         media_ingest: bool,
+        /// Disappearing-message sweep cadence in ms (env:
+        /// KT_SIGNAL_EXPIRE_SWEEP_INTERVAL_MS). The production default (30s)
+        /// trades latency for quiet; integration tests tighten it.
+        #[arg(
+            long,
+            env = "KT_SIGNAL_EXPIRE_SWEEP_INTERVAL_MS",
+            default_value_t = 30_000
+        )]
+        expire_sweep_interval_ms: u64,
         #[arg(long)]
         signal_data_dir: PathBuf,
         #[arg(long)]
@@ -229,6 +238,7 @@ struct ServeOptions {
     socks_proxy: Option<SocksProxy>,
     proxy_group: Vec<String>,
     media_ingest: bool,
+    expire_sweep_interval_ms: u64,
     signal_data_dir: PathBuf,
     state_dir: PathBuf,
 }
@@ -265,6 +275,7 @@ async fn main() {
             socks_proxy,
             proxy_group,
             media_ingest,
+            expire_sweep_interval_ms,
             signal_data_dir,
             state_dir,
         } => serve_command(ServeOptions {
@@ -279,6 +290,7 @@ async fn main() {
             socks_proxy,
             proxy_group,
             media_ingest,
+            expire_sweep_interval_ms,
             signal_data_dir,
             state_dir,
         })
@@ -307,6 +319,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         socks_proxy,
         proxy_group,
         media_ingest,
+        expire_sweep_interval_ms,
         signal_data_dir,
         state_dir,
     } = options;
@@ -382,6 +395,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         store_key,
         signal_cli_mode,
         media_ingest,
+        Duration::from_millis(expire_sweep_interval_ms),
     )?;
     #[cfg(windows)]
     {

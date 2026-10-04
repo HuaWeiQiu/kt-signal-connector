@@ -12,7 +12,12 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
+/// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
+/// sweep transaction — the same bounded-batch family as retention and the
+/// delete-operation ledger, so a large backlog converges over several passes
+/// without ever holding the store lock long.
+pub const EXPIRE_SWEEP_BATCH: u32 = 256;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -60,6 +65,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   unread_mentions INTEGER NOT NULL DEFAULT 0,
   muted INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
+  expire_timer_seconds INTEGER,
   UNIQUE(account_id, kind, peer_key),
   FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -82,6 +88,9 @@ CREATE TABLE IF NOT EXISTS messages (
   attachments_json TEXT,
   rich_json TEXT,
   sticker_json TEXT,
+  expire_seconds INTEGER,
+  expire_start_at INTEGER,
+  expire_at INTEGER,
   edited_at INTEGER,
   sender_name TEXT,
   mentions_self INTEGER NOT NULL DEFAULT 0,
@@ -195,6 +204,7 @@ CREATE TABLE IF NOT EXISTS history_import_stage_chats (
   account_id TEXT NOT NULL,
   id INTEGER NOT NULL,
   recipient_id INTEGER NOT NULL,
+  expire_timer_ms INTEGER,
   PRIMARY KEY(account_id, id),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
@@ -204,6 +214,8 @@ CREATE TABLE IF NOT EXISTS history_import_stage_chats (
 const POST_MIGRATION_SCHEMA_DDL: &str = "
 CREATE INDEX IF NOT EXISTS messages_held_since
   ON messages(COALESCE(stored_at, received_at, sent_at));
+CREATE INDEX IF NOT EXISTS messages_expire_due
+  ON messages(expire_at) WHERE expire_at IS NOT NULL;
 ";
 /// Retention: newest rows a conversation keeps regardless of age.
 const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
@@ -438,6 +450,14 @@ pub struct ConversationSummary {
     /// the local history (retention) — an unrenderable pin is not surfaced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_message: Option<ConversationPinnedMessage>,
+    /// Contract 1.42 (§4.41): the conversation's current disappearing-message
+    /// timer in seconds as the last timer-change event set it — `0` is the
+    /// timer explicitly off, `N` counts down every message from its own
+    /// send/start time. Absent while nothing has stated a timer yet (pre-1.42
+    /// rows and conversations the connector never saw a timer event for), so
+    /// an unknown state stays unknown instead of masquerading as off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire_timer_seconds: Option<u64>,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -580,6 +600,19 @@ pub struct MessageRecord {
     /// `attachments`, so absent keys stay absent on plain and pre-1.35 rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sticker: Option<crate::engine::NormalizedSticker>,
+    /// Disappearing-message timer as the envelope stated it (contract
+    /// revision 1.42, §4.41): `Some(n)` with `n > 0` is a live timer,
+    /// `Some(0)` is the sender's timer explicitly off (every signal-cli
+    /// `JsonDataMessage` carries the key), `None` is no stated value (the
+    /// engine face omits the key, including its timer-off close form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire_seconds: Option<u64>,
+    /// Engine-reported countdown start (§4.41): wall-clock ms the sender's
+    /// timer began ticking, present only on engine surfaces that state it and
+    /// only for a positive stamp. The sweep deadline falls back to the row's
+    /// receive time when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire_start_at: Option<u64>,
 }
 
 /// One prior body of an edited message (contract 1.32): the text the edit
@@ -660,6 +693,17 @@ pub struct ConversationRow {
 pub struct HistoryPruneOutcome {
     pub messages_deleted: u64,
     pub conversations_repaired: u64,
+}
+
+/// One conversation's rows removed by an expire sweep (contract 1.42,
+/// §4.41): the addressing the `message.expired` host event needs, message
+/// ids oldest-deadline first. Deterministic `BTreeMap` grouping keeps a
+/// single sweep's events stable across runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpiredMessageGroup {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1356,7 +1400,7 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, unread_mentions, muted, pinned
+                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -1402,6 +1446,9 @@ impl Store {
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
+                        expire_timer_seconds: row
+                            .get::<_, Option<i64>>(10)?
+                            .map(|value| value.max(0) as u64),
                     })
                 },
             )
@@ -1475,7 +1522,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -1554,7 +1601,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -1594,7 +1641,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -1614,7 +1661,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -1642,7 +1689,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -1683,14 +1730,19 @@ impl Store {
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // Retention counts how long this machine has kept a row, so the
+        // stored-at stamp reads our clock here and never a peer's claimed
+        // time; the sweep deadline derives from the same clock when the
+        // envelope's own start stamp is absent (§4.41).
+        let stored_at = crate::link::now_ms();
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
                     quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name,
-                    mentions_self, sticker_json
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19, ?20, ?21)",
+                    mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     message.id,
                     message.account_id,
@@ -1705,9 +1757,7 @@ impl Store {
                     message.status,
                     client_request_id,
                     message.quote_message_id,
-                    // Retention counts how long this machine has kept a row, so
-                    // it reads our clock here and never a peer's claimed time.
-                    crate::link::now_ms() as i64,
+                    stored_at as i64,
                     message
                         .quote_snapshot
                         .as_ref()
@@ -1726,6 +1776,9 @@ impl Store {
                         .sticker
                         .as_ref()
                         .map(|sticker| serde_json::to_string(sticker).expect("sticker json")),
+                    message.expire_seconds.map(|value| value as i64),
+                    message.expire_start_at.map(|value| value as i64),
+                    expire_deadline(message, stored_at).map(|value| value as i64),
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1868,7 +1921,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1906,7 +1959,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -1999,7 +2052,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -2074,7 +2127,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2147,7 +2200,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -2190,7 +2243,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -2306,7 +2359,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -2501,7 +2554,7 @@ impl Store {
     pub fn stage_history_chats(
         &self,
         account_id: &str,
-        chats: &[(u64, u64)],
+        chats: &[HistoryStageChat],
     ) -> Result<(), StoreError> {
         if chats.is_empty() {
             return Ok(());
@@ -2510,13 +2563,18 @@ impl Store {
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        for (chat_id, recipient_id) in chats {
+        for chat in chats {
             transaction
                 .execute(
                     "INSERT OR REPLACE INTO history_import_stage_chats(
-                        account_id, id, recipient_id
-                     ) VALUES(?1, ?2, ?3)",
-                    params![account_id, *chat_id as i64, *recipient_id as i64],
+                        account_id, id, recipient_id, expire_timer_ms
+                     ) VALUES(?1, ?2, ?3, ?4)",
+                    params![
+                        account_id,
+                        chat.id as i64,
+                        chat.recipient_id as i64,
+                        chat.expire_timer_ms.map(|value| value as i64),
+                    ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
@@ -2544,21 +2602,35 @@ impl Store {
     }
 
     /// One staged conversation identity (pass-2 point lookup): the chat's
-    /// recipient row joined through the staging scratch.
+    /// recipient row joined through the staging scratch, plus the chat
+    /// frame's timer in ms (§4.41) — `None` when the frame stated none.
     pub fn history_chat_recipient(
         &self,
         account_id: &str,
         chat_id: u64,
-    ) -> Result<Option<HistoryStageRecipient>, StoreError> {
+    ) -> Result<Option<(HistoryStageRecipient, Option<u64>)>, StoreError> {
         self.lock_conn()?
             .query_row(
-                "SELECT r.id, r.kind, r.name, r.aci, r.e164, r.master_key
+                "SELECT r.id, r.kind, r.name, r.aci, r.e164, r.master_key, c.expire_timer_ms
                  FROM history_import_stage_chats c
                  JOIN history_import_stage_recipients r
                    ON r.account_id = c.account_id AND r.id = c.recipient_id
                  WHERE c.account_id=?1 AND c.id=?2",
                 params![account_id, chat_id as i64],
-                history_stage_recipient_from_row,
+                |row| {
+                    Ok((
+                        HistoryStageRecipient {
+                            id: row.get::<_, i64>(0)? as u64,
+                            kind: row.get(1)?,
+                            name: row.get(2)?,
+                            aci: row.get(3)?,
+                            e164: row.get(4)?,
+                            master_key: row.get(5)?,
+                        },
+                        row.get::<_, Option<i64>>(6)?
+                            .map(|value| value.max(0) as u64),
+                    ))
+                },
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))
@@ -2648,9 +2720,10 @@ impl Store {
                         id, account_id, conversation_id, direction, sender_id, sent_at,
                         received_at, stored_at, body, body_bytes, body_truncated, status,
                         client_request_id, quote_message_id, quote_snapshot, attachments_json,
-                        rich_json, edited_at, sender_name, mentions_self, sticker_json
+                        rich_json, edited_at, sender_name, mentions_self, sticker_json,
+                        expire_seconds, expire_start_at, expire_at
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                              ?13, ?14, NULL, NULL, ?15, ?16, NULL)",
+                              ?13, ?14, ?20, NULL, ?15, ?16, NULL, ?17, ?18, ?19)",
                     params![
                             record.id,
                             record.account_id,
@@ -2675,6 +2748,13 @@ impl Store {
                             }),
                             record.sender_name,
                             i64::from(record.mentions_self),
+                            record.expire_seconds.map(|value| value as i64),
+                            record.expire_start_at.map(|value| value as i64),
+                            expire_deadline(record, stored_at as u64).map(|value| value as i64),
+                            record
+                                .rich
+                                .as_ref()
+                                .map(|rich| serde_json::to_string(rich).expect("rich json")),
                         ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -2732,7 +2812,8 @@ impl Store {
             "SELECT m.id, m.account_id, m.conversation_id, m.direction, m.sender_id, m.sent_at, m.received_at,
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
-                    m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json
+                    m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
+                    m.expire_seconds, m.expire_start_at, m.expire_at
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -2814,7 +2895,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -2862,7 +2943,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -2946,7 +3027,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                  ORDER BY sent_at ASC, id ASC
@@ -2980,7 +3061,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -3459,7 +3540,7 @@ impl Store {
         let summary = conn
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, unread_mentions, muted, pinned
+                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
@@ -3480,6 +3561,9 @@ impl Store {
                         muted: row.get::<_, i64>(8)? != 0,
                         pinned: row.get::<_, i64>(9)? != 0,
                         pinned_message: None,
+                        expire_timer_seconds: row
+                            .get::<_, Option<i64>>(10)?
+                            .map(|value| value.max(0) as u64),
                     })
                 },
             )
@@ -4003,6 +4087,166 @@ impl Store {
             conversations_repaired: touched_conversations.len() as u64,
         })
     }
+
+    /// Record one conversation's current disappearing-message timer
+    /// (contract 1.42, §4.41): `0` off, `N` seconds. Written by the ingest of
+    /// a timer-change event and by the `conversations.setExpireTimer` success
+    /// path — the local mirror of upstream state, never a source of truth.
+    pub fn set_conversation_expire_timer(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        seconds: u64,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .lock_conn()?
+            .execute(
+                "UPDATE conversations SET expire_timer_seconds=?3
+                 WHERE id=?1 AND account_id=?2 AND (expire_timer_seconds IS NULL OR expire_timer_seconds != ?3)",
+                params![conversation_id, account_id, seconds as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// One bounded expire-sweep pass (contract 1.42, §4.41): delete at most
+    /// [`EXPIRE_SWEEP_BATCH`] rows whose deadline has passed, oldest deadline
+    /// first, then repair exactly the touched conversations' summaries — the
+    /// same last-message/unread clamp [`Self::prune_history`] applies — and
+    /// recompute the account aggregates in the same transaction, so a sweep
+    /// never leaves a summary promising a row the timer ate. Returns the
+    /// deletions grouped per conversation (empty = nothing was due; a full
+    /// batch means the caller should run another pass). Attachments stay
+    /// where retention leaves them: byte cleanup is the media governor's
+    /// existing discipline, identical to a retention prune.
+    pub fn sweep_expired_messages(
+        &self,
+        now_ms: u64,
+        cap: u32,
+    ) -> Result<Vec<ExpiredMessageGroup>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut deleted = transaction
+            .prepare(
+                "DELETE FROM messages WHERE id IN (
+                   SELECT id FROM messages
+                   WHERE expire_at IS NOT NULL AND expire_at <= ?1
+                   ORDER BY expire_at, id
+                   LIMIT ?2
+                 )
+                 RETURNING account_id, conversation_id, id",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = deleted
+            .query_map(params![now_ms as i64, cap], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let (account_id, conversation_id, id) =
+                row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            groups
+                .entry((account_id, conversation_id))
+                .or_default()
+                .push(id);
+        }
+        drop(deleted);
+        if groups.is_empty() {
+            transaction
+                .commit()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            return Ok(Vec::new());
+        }
+        // The newest row may be the one that expired: recompute each touched
+        // conversation's summary from what it still holds, then the account
+        // aggregates from the conversation maxima (prune_history's repair).
+        let mut repair = transaction
+            .prepare(
+                "UPDATE conversations
+                    SET last_message_at = (
+                          SELECT MAX(sent_at) FROM messages WHERE conversation_id=?1
+                        ),
+                        last_message_preview = (
+                          SELECT substr(body, 1, ?2) FROM messages
+                           WHERE conversation_id=?1
+                           ORDER BY sent_at DESC, id DESC
+                           LIMIT 1
+                        ),
+                        unread_count = MIN(unread_count, (
+                          SELECT COUNT(*) FROM messages
+                           WHERE conversation_id=?1 AND direction='incoming'
+                        ))
+                  WHERE id=?1",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        for (account_id, conversation_id) in groups.keys() {
+            let touched = repair
+                .execute(params![conversation_id, PREVIEW_CHARS])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if touched == 0 {
+                // The conversation row itself is gone (concurrent account
+                // delete): its group simply carries no event target anymore,
+                // but the ids were deleted, so the group stays for symmetry.
+                tracing::debug!(account = %account_id, "expire sweep outlived conversation");
+            }
+        }
+        drop(repair);
+        transaction
+            .execute(
+                "UPDATE accounts
+                    SET unread_count = COALESCE((
+                          SELECT SUM(unread_count) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        ), 0),
+                        last_message_at = (
+                          SELECT MAX(last_message_at) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        )",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(groups
+            .into_iter()
+            .map(
+                |((account_id, conversation_id), message_ids)| ExpiredMessageGroup {
+                    account_id,
+                    conversation_id,
+                    message_ids,
+                },
+            )
+            .collect())
+    }
+}
+
+/// The connector-computed sweep deadline for one row (contract 1.42, §4.41):
+/// wall-clock ms when a live timer (`expire_seconds > 0`) runs out. The
+/// countdown starts at the engine-reported start stamp when the envelope
+/// stated one, else at the row's receive time, else at the store's own
+/// insert-time clock (history rows carry the import stamp). Rows without a
+/// live timer — timer-off, no stated value, system/timer-notice rows — sweep
+/// never, so a conversation without disappearing messages costs no sweep work.
+fn expire_deadline(message: &MessageRecord, stored_at: u64) -> Option<u64> {
+    let seconds = message.expire_seconds.filter(|seconds| *seconds > 0)?;
+    let start = message
+        .expire_start_at
+        .or(message.received_at)
+        .unwrap_or(stored_at);
+    Some(
+        start
+            .saturating_add(seconds.saturating_mul(1_000))
+            .min(i64::MAX as u64),
+    )
 }
 
 fn prune_completed_account_deletes(
@@ -4530,6 +4774,35 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         // staging rows are per-account scratch that every import run clears,
         // and both cascade away with their account row.
     }
+    if current < 16 {
+        // Contract revision 1.42 (§4.41): disappearing-message metadata. All
+        // additive nullable columns — pre-1.42 rows legitimately carry none
+        // and are never backfilled, because the timer state a past envelope
+        // carried was never stored. `messages.expire_seconds` keeps the
+        // envelope-stated timer verbatim (0 = the sender's timer is off);
+        // `messages.expire_start_at` is the engine-reported countdown start
+        // (engine surfaces only); `messages.expire_at` is the connector's
+        // sweep deadline, written at insert for rows with a live timer only.
+        // `conversations.expire_timer_seconds` is the conversation's current
+        // timer (NULL unknown, 0 off, N seconds). The staging column rides
+        // the same run-scratch discipline as its table. The partial index is
+        // created by POST_MIGRATION_SCHEMA_DDL above.
+        for (table, column, kind) in [
+            ("messages", "expire_seconds", "INTEGER"),
+            ("messages", "expire_start_at", "INTEGER"),
+            ("messages", "expire_at", "INTEGER"),
+            ("conversations", "expire_timer_seconds", "INTEGER"),
+            ("history_import_stage_chats", "expire_timer_ms", "INTEGER"),
+        ] {
+            if !table_has_column(conn, table, column)? {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -4549,6 +4822,7 @@ fn table_has_column(
         "conversations" => "PRAGMA table_info(conversations)",
         "messages" => "PRAGMA table_info(messages)",
         "message_events" => "PRAGMA table_info(message_events)",
+        "history_import_stage_chats" => "PRAGMA table_info(history_import_stage_chats)",
         _ => return Err(StoreError::Unavailable(None)),
     };
     let mut stmt = conn
@@ -4863,6 +5137,17 @@ pub struct HistoryStageRecipient {
     pub master_key: Option<String>,
 }
 
+/// One pass-1 staged chat row (§4.38/§4.41): the chat→recipient identity
+/// plus the chat frame's disappearing-message timer in ms, if the frame
+/// stated one (`None` = no stated timer — the conversation state stays
+/// untouched).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryStageChat {
+    pub id: u64,
+    pub recipient_id: u64,
+    pub expire_timer_ms: Option<u64>,
+}
+
 /// One import batch row: the message record carries the resolved
 /// conversation/direction/sender identity, the preview is the
 /// conversation-summary projection, and `alt_sender_id` covers the
@@ -4940,6 +5225,12 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         sticker: row
             .get::<_, Option<String>>(22)?
             .and_then(|json| serde_json::from_str(&json).ok()),
+        expire_seconds: row
+            .get::<_, Option<i64>>(23)?
+            .map(|value| value.max(0) as u64),
+        expire_start_at: row
+            .get::<_, Option<i64>>(24)?
+            .map(|value| value.max(0) as u64),
     })
 }
 
@@ -5011,6 +5302,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         assert!(
@@ -5075,6 +5368,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
 
@@ -5229,6 +5524,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         for (id, sent_at, direction) in [
@@ -5657,6 +5954,8 @@ mod tests {
             read_at: None,
             admin_deleted: false,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
         };
 
         let mut sticker_row = base("sticker-row", 60);
@@ -5758,6 +6057,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         assert!(
@@ -5917,6 +6218,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         assert!(
@@ -6014,6 +6317,8 @@ mod tests {
                     delivered_at: None,
                     read_at: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     admin_deleted: false,
                 };
                 store.insert_message(&message, None, text, false).unwrap();
@@ -6142,6 +6447,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             store.insert_message(&message, None, text, false).unwrap();
@@ -6324,6 +6631,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             store.insert_message(&message, None, None, false).unwrap();
@@ -6434,6 +6743,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             store
@@ -6541,6 +6852,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store.insert_message(&plain, None, None, true).unwrap();
@@ -6634,6 +6947,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -6734,6 +7049,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
 
@@ -6802,6 +7119,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -6875,6 +7194,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -6932,6 +7253,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -7013,6 +7336,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             store
@@ -7090,6 +7415,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -7141,6 +7468,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -7233,6 +7562,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             if id == "attachment-only" {
@@ -7328,6 +7659,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
             store.insert_message(&message, None, None, false).unwrap();
@@ -7425,6 +7758,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store.insert_message(&message, None, None, false).unwrap();
@@ -7992,6 +8327,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8064,6 +8401,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8156,6 +8495,8 @@ mod tests {
                     delivered_at: None,
                     read_at: None,
                     sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
                     admin_deleted: false,
                 };
                 store
@@ -8305,6 +8646,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8378,6 +8721,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8446,6 +8791,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8517,6 +8864,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8940,6 +9289,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -8986,6 +9337,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -9237,6 +9590,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store.insert_message(&message, None, None, false).unwrap();
@@ -9376,6 +9731,8 @@ mod tests {
                 delivered_at: None,
                 read_at: None,
                 sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
                 admin_deleted: false,
             };
         for record in [
@@ -9485,6 +9842,8 @@ mod tests {
             delivered_at: None,
             read_at: None,
             sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
             admin_deleted: false,
         };
         store
@@ -9519,6 +9878,385 @@ mod tests {
                 .burn_view_once_message(&account.id, &peer.id, "m-absent", 1)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // ---- Contract 1.42 (§4.41): disappearing-message metadata ----
+
+    fn expire_record(id: &str, account_id: &str, conversation_id: &str) -> MessageRecord {
+        MessageRecord {
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 10,
+            received_at: None,
+            text: Some("vanishing".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+        }
+    }
+
+    /// A v15 store upgrades in place: every 1.42 column lands additively on
+    /// its table and the version stamp moves to 16 — pre-1.42 rows carry no
+    /// timer state and are never backfilled.
+    #[test]
+    fn schema_v16_upgrade_adds_expire_columns() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '15');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               proxy_group TEXT NOT NULL DEFAULT 'default'
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               last_message_preview TEXT,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               unread_mentions INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               UNIQUE(account_id, kind, peer_key),
+               FOREIGN KEY(account_id) REFERENCES accounts(id)
+             );
+             CREATE TABLE history_import_stage_chats (
+               account_id TEXT NOT NULL,
+               id INTEGER NOT NULL,
+               recipient_id INTEGER NOT NULL,
+               PRIMARY KEY(account_id, id),
+               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "expire_seconds").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "expire_start_at").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "expire_at").unwrap());
+        assert!(table_has_column(&store.conn(), "conversations", "expire_timer_seconds").unwrap());
+        assert!(
+            table_has_column(
+                &store.conn(),
+                "history_import_stage_chats",
+                "expire_timer_ms"
+            )
+            .unwrap()
+        );
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 16);
+    }
+
+    /// The sweep deadline picks the honest countdown start — the engine's
+    /// start stamp when stated, else the receive time, else the store's own
+    /// insert clock — and rows without a live timer never get one.
+    #[test]
+    fn expire_deadline_forms() {
+        let mut record = expire_record("m1", "a", "c");
+        let due = |record: &MessageRecord| expire_deadline(record, 1_000);
+        assert_eq!(due(&record), None);
+        record.expire_seconds = Some(0);
+        assert_eq!(due(&record), None);
+
+        record.expire_seconds = Some(60);
+        record.expire_start_at = Some(500);
+        assert_eq!(due(&record), Some(60_500));
+
+        record.expire_start_at = None;
+        record.received_at = Some(2_000);
+        assert_eq!(due(&record), Some(62_000));
+
+        record.received_at = None;
+        assert_eq!(due(&record), Some(61_000));
+    }
+
+    /// Expire fields round-trip through the row: the stored keys read back
+    /// verbatim, the sweep deadline is written at insert from the store clock
+    /// when the timer is live, and rows without a timer keep every expire
+    /// column NULL so the sweeper never sees them.
+    #[test]
+    fn expire_fields_round_trip_and_stamp_the_deadline() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+
+        let mut live = expire_record("m-live", &account.id, &conversation.id);
+        live.expire_seconds = Some(60);
+        live.expire_start_at = Some(500);
+        assert!(
+            store
+                .insert_message(&live, None, Some("vanishing"), true)
+                .unwrap()
+        );
+
+        let mut stated_off = expire_record("m-off", &account.id, &conversation.id);
+        stated_off.expire_seconds = Some(0);
+        assert!(
+            store
+                .insert_message(&stated_off, None, None, false)
+                .unwrap()
+        );
+
+        let page = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        assert_eq!(page.items.len(), 2);
+        let read_live = page
+            .items
+            .iter()
+            .find(|row| row.id == "m-live")
+            .expect("live row");
+        assert_eq!(read_live.expire_seconds, Some(60));
+        assert_eq!(read_live.expire_start_at, Some(500));
+        let read_off = page
+            .items
+            .iter()
+            .find(|row| row.id == "m-off")
+            .expect("off row");
+        assert_eq!(read_off.expire_seconds, Some(0));
+        assert_eq!(read_off.expire_start_at, None);
+
+        let observer = keyed_observer(&store);
+        // The deadline derives from the engine-stated start (500 + 60s), not
+        // from the store clock.
+        let live_expire_at: Option<i64> = observer
+            .query_row(
+                "SELECT expire_at FROM messages WHERE id='m-live'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_expire_at, Some(60_500));
+        let (off_expire_at, off_stored_expire): (Option<i64>, Option<i64>) = observer
+            .query_row(
+                "SELECT expire_at, expire_start_at FROM messages WHERE id='m-off'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(off_expire_at, None);
+        assert_eq!(off_stored_expire, None);
+    }
+
+    /// One sweep pass deletes exactly the due rows (deadline at or before the
+    /// clock), groups them per conversation, repairs each touched summary's
+    /// newest-row projection and the account aggregates, and leaves not-yet-due
+    /// and timerless rows alone. A quiet sweep answers empty.
+    #[test]
+    fn sweep_expired_messages_deletes_due_and_repairs_summaries() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let other = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
+            .unwrap();
+
+        // Due in conversation A, oldest deadline first.
+        let mut due_old = expire_record("m-due-old", &account.id, &conversation.id);
+        due_old.sent_at = 100;
+        due_old.expire_seconds = Some(60);
+        due_old.expire_start_at = Some(1_000);
+        let mut due_new = expire_record("m-due-new", &account.id, &conversation.id);
+        due_new.sent_at = 200;
+        due_new.expire_seconds = Some(60);
+        due_new.expire_start_at = Some(20_000);
+        // Not due: deadline far in the future.
+        let mut waiting = expire_record("m-waiting", &account.id, &conversation.id);
+        waiting.sent_at = 300;
+        waiting.expire_seconds = Some(3_600);
+        waiting.expire_start_at = Some(1_000_000_000_000);
+        // Timerless: never swept, stays the summary's newest row.
+        let mut keeper = expire_record("m-keeper", &account.id, &conversation.id);
+        keeper.sent_at = 400;
+        keeper.expire_seconds = None;
+        // Due in conversation B: one conversation's event stays its own.
+        let mut due_b = expire_record("m-due-b", &account.id, &other.id);
+        due_b.expire_seconds = Some(1);
+        due_b.expire_start_at = Some(1);
+
+        for record in [&due_old, &due_new, &waiting, &keeper, &due_b] {
+            assert!(
+                store
+                    .insert_message(
+                        record,
+                        None,
+                        Some(record.text.as_deref().unwrap_or("")),
+                        true
+                    )
+                    .unwrap()
+            );
+        }
+        // The due rows arrived unread: after the sweep the unread badge may
+        // only count what still exists.
+        store
+            .set_conversation_expire_timer(&account.id, &conversation.id, 60)
+            .unwrap();
+
+        let groups = store
+            .sweep_expired_messages(1_000_000, EXPIRE_SWEEP_BATCH)
+            .unwrap();
+        assert_eq!(groups.len(), 2, "one group per touched conversation");
+        let group_a = groups
+            .iter()
+            .find(|group| group.conversation_id == conversation.id)
+            .expect("conversation A group");
+        assert_eq!(group_a.account_id, account.id);
+        assert_eq!(group_a.message_ids, vec!["m-due-old", "m-due-new"]);
+        let group_b = groups
+            .iter()
+            .find(|group| group.conversation_id == other.id)
+            .expect("conversation B group");
+        assert_eq!(group_b.message_ids, vec!["m-due-b"]);
+
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .expect("summary");
+        assert_eq!(summary.last_message_at, Some(400));
+        assert_eq!(summary.last_message_preview.as_deref(), Some("vanishing"));
+        assert_eq!(
+            summary.unread_count, 2,
+            "unread clamps to the surviving rows"
+        );
+        assert_eq!(summary.expire_timer_seconds, Some(60));
+
+        let remaining = store
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap();
+        let ids: Vec<&str> = remaining.items.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-keeper", "m-waiting"]);
+
+        // The follow-up pass is quiet: nothing else was due.
+        assert!(
+            store
+                .sweep_expired_messages(1_000_000, EXPIRE_SWEEP_BATCH)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The conversation timer mirror writes only on real transitions: the
+    /// first write reports a change, rewriting the same value reports none,
+    /// and an unknown conversation never invents one.
+    #[test]
+    fn set_conversation_expire_timer_reports_transitions() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+
+        assert!(
+            store
+                .set_conversation_expire_timer(&account.id, &conversation.id, 86400)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.expire_timer_seconds, Some(86400));
+
+        assert!(
+            !store
+                .set_conversation_expire_timer(&account.id, &conversation.id, 86400)
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_conversation_expire_timer(&account.id, &conversation.id, 0)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.expire_timer_seconds, Some(0));
+
+        assert!(
+            !store
+                .set_conversation_expire_timer(&account.id, "conv-absent", 60)
+                .unwrap()
         );
     }
 }
