@@ -447,14 +447,21 @@ pub struct NormalizedPreview {
     pub image: Option<NormalizedAttachment>,
 }
 
-/// One inbound @mention range (contract 1.25): the author resolves to the
-/// mentioned peer; the styled range [start, start+length) is already part of
-/// the received body text.
+/// One inbound @mention range (contract 1.25; authorAci added in 1.40): the
+/// author resolves to the mentioned peer; the styled range
+/// [start, start+length) is already part of the received body text.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedMention {
     /// Mentioned peer's number, or UUID when the number is absent.
     pub author: String,
+    /// The mentioned peer's ACI when the connector can honestly name it
+    /// (contract 1.40, §4.40): the envelope `uuid` field, or the
+    /// number-keyed value when it is UUID-shaped (the engine-mode receive
+    /// face puts the ACI there). Absent keeps `author` the only identity,
+    /// byte-identical to pre-1.40 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_aci: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub start: u32,
@@ -1710,6 +1717,18 @@ fn normalized_sticker(
     ))
 }
 
+/// Strict UUID grammar (8-4-4-4-12 hex, case-insensitive) — the §4.40
+/// promotion test before an identity string is treated as an ACI. A phone
+/// number never matches, and neither does a truncated or decorated value.
+fn is_uuid_shaped(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
 /// Bounded rich-body payload (contract 1.25) off a dataMessage-shaped object:
 /// link previews, @mentions, text-style ranges and the view-once marker.
 /// Malformed or oversized entries drop individually; an all-default result is
@@ -1754,14 +1773,28 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
             .take(MAX_MENTIONS)
             .filter_map(|entry| {
                 let object = entry.as_object()?;
-                let author = ["number", "uuid"]
-                    .iter()
-                    .find_map(|key| object.get(*key).and_then(Value::as_str))
+                let number = object
+                    .get("number")
+                    .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+                    .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+                let uuid = object
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+                // Contract 1.40 (§4.40): the author keeps the pre-1.40
+                // number-first ladder; the ACI is promoted only when the
+                // upstream actually supplied one — the envelope `uuid`
+                // field, or a UUID-shaped number key (the engine-mode
+                // receive face puts the ACI there).
+                let author = number.clone().or_else(|| uuid.clone())?;
+                let author_aci = uuid.or_else(|| number.filter(|value| is_uuid_shaped(value)));
                 Some(NormalizedMention {
                     author,
+                    author_aci,
                     name: object
                         .get("name")
                         .and_then(Value::as_str)
@@ -3545,6 +3578,8 @@ mod tests {
         assert_eq!(rich.mentions[0].name.as_deref(), Some("Peer"));
         assert_eq!(rich.mentions[0].start, 6);
         assert_eq!(rich.mentions[0].length, 4);
+        // Contract 1.40 (§4.40): a number-only envelope has no honest ACI.
+        assert_eq!(rich.mentions[0].author_aci, None);
         assert_eq!(
             rich.text_styles
                 .iter()
@@ -3630,6 +3665,105 @@ mod tests {
             "viewOnce": false,
         }));
         assert!(none.rich.is_none());
+    }
+
+    /// The §4.40 authorAci promotion (contract 1.40): the ACI appears only
+    /// when the upstream honestly supplies one — the signal-cli `uuid` field,
+    /// or a UUID-shaped number key (the engine-mode receive face puts the
+    /// ACI there). The author value itself never moves off the pre-1.40
+    /// number-first ladder, and a phone number never promotes.
+    #[test]
+    fn mention_author_aci_promotes_only_from_honest_sources() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        // signal-cli shape: number + uuid — author keeps the number, the ACI
+        // rides authorAci.
+        let rich = normalize(json!({
+            "message": "hi",
+            "mentions": [{
+                "number": "+15555550101",
+                "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "name": "Peer",
+                "start": 0,
+                "length": 2,
+            }],
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(rich.mentions[0].author, "+15555550101");
+        assert_eq!(
+            rich.mentions[0].author_aci.as_deref(),
+            Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10")
+        );
+
+        // signal-cli shape with an unknown number: only the uuid — the author
+        // is the uuid and the ACI is the same value.
+        let rich = normalize(json!({
+            "message": "hi",
+            "mentions": [{
+                "uuid": "0B7FCA57-1234-4D0E-9B0F-4F6C1F8A2E10",
+                "start": 0,
+                "length": 2,
+            }],
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(
+            rich.mentions[0].author,
+            "0B7FCA57-1234-4D0E-9B0F-4F6C1F8A2E10"
+        );
+        assert_eq!(
+            rich.mentions[0].author_aci.as_deref(),
+            Some("0B7FCA57-1234-4D0E-9B0F-4F6C1F8A2E10"),
+            "the grammar is case-insensitive"
+        );
+
+        // Engine-mode receive face: the ACI under the number key — promoted
+        // by shape, author unchanged.
+        let rich = normalize(json!({
+            "message": "hi",
+            "mentions": [{
+                "number": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                "start": 0,
+                "length": 2,
+            }],
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(
+            rich.mentions[0].author,
+            "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"
+        );
+        assert_eq!(
+            rich.mentions[0].author_aci.as_deref(),
+            Some("d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1")
+        );
+
+        // Phone numbers, truncated and decorated values never promote.
+        let rich = normalize(json!({
+            "message": "hi",
+            "mentions": [
+                { "number": "+15555550101", "start": 0, "length": 2 },
+                { "number": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df", "start": 0, "length": 2 },
+                { "number": "not-a-uuid-at-all-00000000000000", "start": 0, "length": 2 },
+            ],
+        }))
+        .rich
+        .expect("rich payload");
+        assert!(
+            rich.mentions
+                .iter()
+                .all(|mention| mention.author_aci.is_none()),
+            "no entry in this envelope carries an honest ACI"
+        );
     }
 
     /// The multi-device sentMessage mirror carries the same rich payload as a

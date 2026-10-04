@@ -2171,6 +2171,141 @@ async fn missing_store_key_fails_closed_before_serving() {
 }
 
 #[tokio::test]
+async fn incoming_mentions_project_author_aci_on_the_wire_row() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [41_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // Two inbound mention envelopes injected through the runtime marker: one
+    // signal-cli-shaped (number + uuid), one engine-mode-shaped (the ACI
+    // under the number key). The row projection is the §4.40 desktop
+    // contract: author unchanged, authorAci only when honestly known.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "sourceName": "Alice",
+                "timestamp": 600,
+                "dataMessage": {
+                    "message": "hello @you",
+                    "mentions": [{
+                        "number": "+15555550101",
+                        "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                        "start": 6,
+                        "length": 3,
+                    }],
+                },
+            },
+            {
+                "source": "+15555550101",
+                "sourceName": "Alice",
+                "timestamp": 601,
+                "dataMessage": {
+                    "message": "engine face",
+                    "mentions": [{
+                        "number": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                        "start": 0,
+                        "length": 6,
+                    }],
+                },
+            },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-MentionAci" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The injected envelopes land as rows; poll the history read until both
+    // mention rows are visible (each poll drains any interleaved events).
+    let mut rows: Vec<Value> = Vec::new();
+    for attempt in 0..100 {
+        let _ = request(
+            &mut client,
+            &format!("poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("list-{attempt}"),
+            "messages.search",
+            json!({ "accountId": account_id, "query": "e", "limit": 50 }),
+        )
+        .await;
+        rows = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row.get("mentions").is_some())
+            .cloned()
+            .collect();
+        if rows.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(rows.len(), 2, "both mention envelopes landed: {rows:?}");
+    for row in &rows {
+        let mentions = row["mentions"].as_array().expect("mentions on the wire");
+        assert_eq!(mentions.len(), 1);
+        match row["sentAt"].as_u64().unwrap() {
+            600 => {
+                assert_eq!(mentions[0]["author"], "+15555550101");
+                assert_eq!(
+                    mentions[0]["authorAci"],
+                    "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"
+                );
+                assert_eq!(mentions[0]["start"], 6);
+                assert_eq!(mentions[0]["length"], 3);
+            }
+            601 => {
+                assert_eq!(
+                    mentions[0]["author"],
+                    "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"
+                );
+                assert_eq!(
+                    mentions[0]["authorAci"], "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1",
+                    "the engine-mode ACI promotes by shape"
+                );
+            }
+            other => panic!("unexpected row timestamp {other}"),
+        }
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
 async fn groups_get_projects_the_synced_group_cache() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();

@@ -1627,6 +1627,45 @@ capability.
   roster lives in the row the sync already writes, so its store cost is bounded by the groups
   the account is actually in at upstream roster scale.
 
+### 4.40 Mention author ACI projection (contract revision 1.40, 2026-10-05)
+
+The premise check this revision records first: the mission's "mention ranges are not persisted"
+no longer holds — §4.20 (contract 1.25) already persists the normalized mention ranges on the
+row (`messages.rich_json`, schema 9) and projects them on the wire row (`mentions:
+[{author, name?, start, length}]`, flattened), and both engines deliver them inbound: the pinned
+signal-cli 0.14.8 jsonRpc receive carries `JsonDataMessage.mentions` (`JsonMention{name, number,
+uuid, start, length}`, verified in the distribution jar), and kt-signal-engine projects the
+protocol `body_ranges` MentionAci entries as `{"number": <aci>, start, length}` (≤64, the P2
+receive-projection face, engine `3ac097a`). The §4.29 `mentionsSelf` marker and the §4.24 badge
+ride those same ranges. What is genuinely missing is the *canonical ACI*: official
+Signal-Desktop body ranges key the mentioned identity by ACI (`mentionId`), while the
+connector's `author` value is engine-dependent — signal-cli mode resolves it number-first
+(an ACI only when the number is unknown), engine mode puts the ACI into the same `author`
+string with no way for a host to tell which identity family it is reading.
+
+- `mentions[].authorAci?: string` (wire row field, contract 1.40): present only when the ACI is
+  honestly known — the envelope's `uuid` field (signal-cli mode), or the `number`-keyed value
+  when it is UUID-shaped (engine mode, where that value *is* the ACI by construction). `author`
+  keeps its exact pre-1.40 value and the number-first resolution, so every existing row and
+  consumer is byte-identical; `authorAci` is purely additive. A number that merely looks short
+  or malformed never promotes — only the strict UUID grammar (`8-4-4-4-12` hex, case-insensitive)
+  counts.
+- Persistence rides the existing `NormalizedRich` JSON in `messages.rich_json`: new rows carry
+  `authorAci` inside their mention entries, pre-1.40 rows deserialize without it and the key
+  stays absent on the wire — no store schema-version bump (the §4.37 additive precedent), no
+  new cap (the §4.20 per-row 64-mention cap and 128-char id cap already bound the payload),
+  no new method or event.
+- `mentionsSelf` semantics are deliberately unchanged: the §4.24 verdict stays number-based
+  receive-time, never recomputed, because the linked account's own ACI is not queryable on
+  either engine's jsonRpc surface (`listAccounts` returns numbers only). An engine-mode
+  self-mention (author = the account's ACI) still cannot be attributed to self — the recorded
+  under-count boundary stands; `authorAci` does not silently re-decide it.
+- Send chain untouched: outbound `messages.sendText` mentions (§4.34 ladder) already pass
+  through and this revision adds nothing to them.
+- Desktop consumption: an @-chip resolves against the §4.39 roster by `authorAci` when present,
+  falling back to `author` (which the roster's `id`/`uuid` pair joins in both engine modes);
+  the "@you" highlight keeps reading `mentionsSelf` and needs neither field.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

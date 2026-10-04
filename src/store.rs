@@ -5088,6 +5088,7 @@ mod tests {
             }],
             mentions: vec![NormalizedMention {
                 author: "+15555550101".into(),
+                author_aci: None,
                 name: Some("Peer".into()),
                 start: 0,
                 length: 4,
@@ -5119,6 +5120,50 @@ mod tests {
         assert_eq!(wire["mentions"][0]["author"], "+15555550101");
         assert_eq!(wire["textStyles"][0]["style"], "BOLD");
         assert_eq!(wire["viewOnce"], true);
+
+        // Contract 1.40 (§4.40): an authorAci on the mention round-trips and
+        // lands on the wire row beside the unchanged author; a mention
+        // without one stays byte-identical to the pre-1.40 wire shape.
+        let mut aci = base("rich-aci");
+        aci.rich = Some(NormalizedRich {
+            mentions: vec![NormalizedMention {
+                author: "+15555550101".into(),
+                author_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                name: None,
+                start: 0,
+                length: 4,
+            }],
+            ..crate::engine::NormalizedRich::default()
+        });
+        assert!(
+            store
+                .insert_message(&aci, None, Some("body"), true)
+                .unwrap()
+        );
+        let read = store
+            .message_by_id(&account.id, &conversation.id, "rich-aci")
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(wire["mentions"][0]["author"], "+15555550101");
+        assert_eq!(
+            wire["mentions"][0]["authorAci"],
+            "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"
+        );
+        let bare = serde_json::to_value(&read.rich.as_ref().unwrap().mentions[0]).unwrap();
+        assert_eq!(bare["author"], "+15555550101");
+        assert_eq!(bare["authorAci"], "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10");
+
+        // A pre-1.40 rich_json (no authorAci key) deserializes with the field
+        // absent and projects nothing — old rows need no rewrite.
+        let legacy: crate::engine::NormalizedRich = serde_json::from_str(
+            r#"{"mentions":[{"author":"+15555550101","start":0,"length":4}]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.mentions[0].author, "+15555550101");
+        assert_eq!(legacy.mentions[0].author_aci, None);
+        let legacy_wire = serde_json::to_value(&legacy.mentions[0]).unwrap();
+        assert!(legacy_wire.get("authorAci").is_none());
 
         assert!(
             store
@@ -6376,6 +6421,7 @@ mod tests {
                         .iter()
                         .map(|author| NormalizedMention {
                             author: (*author).into(),
+                            author_aci: None,
                             name: None,
                             start: 0,
                             length: 4,
@@ -6523,6 +6569,7 @@ mod tests {
             rich: Some(NormalizedRich {
                 mentions: vec![NormalizedMention {
                     author: "+15555550100".into(),
+                    author_aci: None,
                     name: None,
                     start: 0,
                     length: 4,
