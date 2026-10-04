@@ -273,6 +273,17 @@ pub enum HostSideEvent {
         conversation_id: String,
         action: String,
     },
+    /// A view-once message was viewed and its bytes erased (contract 1.38):
+    /// emitted exactly once per message on the first burn transition — sync
+    /// duplicates and replays emit nothing. Deliberately not folded into
+    /// `MessageStatusChanged`: this is the local viewed state, not a peer
+    /// receipt.
+    MessageViewOnceOpened {
+        account_id: String,
+        conversation_id: String,
+        message_id: String,
+        opened_at: u64,
+    },
 }
 
 /// Ephemeral typing notifications keep the event lane quiet: at most one
@@ -914,6 +925,7 @@ impl ConnectorService {
             mentions,
             None,
             Vec::new(),
+            false,
         )
     }
 
@@ -988,6 +1000,7 @@ impl ConnectorService {
             mentions,
             None,
             Vec::new(),
+            false,
         )
     }
 
@@ -1075,6 +1088,7 @@ impl ConnectorService {
         text: Option<&str>,
         quote_message_id: Option<&str>,
         voice_note: bool,
+        view_once: bool,
     ) -> Result<PreparedSend, ServiceError> {
         validate_attachment_send_payload(data_base64, size_bytes)?;
         validate_attachment_descriptor(filename, "filename")?;
@@ -1089,6 +1103,42 @@ impl ConnectorService {
                 "voiceNote requires an audio/* contentType",
                 false,
             )));
+        }
+        // §4.36: the view-once flag requires a photo or video, no caption, no
+        // quote, and no voice flag — the official view-once faces, enforced
+        // deterministically before the pending row exists (the single-
+        // attachment structure of §4.12 makes the combination unambiguous).
+        if view_once {
+            if !content_type
+                .is_some_and(|value| value.starts_with("image/") || value.starts_with("video/"))
+            {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "viewOnce requires an image/* or video/* contentType",
+                    false,
+                )));
+            }
+            if voice_note {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "viewOnce and voiceNote are mutually exclusive",
+                    false,
+                )));
+            }
+            if quote_message_id.is_some() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "viewOnce does not support quoteMessageId",
+                    false,
+                )));
+            }
+            if text.is_some_and(|caption| !caption.is_empty()) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "viewOnce does not support a caption",
+                    false,
+                )));
+            }
         }
         let caption = text.unwrap_or_default();
         if !caption.is_empty() {
@@ -1132,6 +1182,7 @@ impl ConnectorService {
             None,
             Some(vec![json!(data_uri)]),
             vec![descriptor],
+            view_once,
         )
     }
 
@@ -1359,6 +1410,7 @@ impl ConnectorService {
         mentions: Option<Vec<UpstreamSendMention>>,
         attachments: Option<Vec<Value>>,
         attachment_descriptors: Vec<NormalizedAttachment>,
+        view_once: bool,
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
@@ -1390,7 +1442,13 @@ impl ConnectorService {
             quote_snapshot: None,
             attachments: attachment_descriptors,
             edited_at: None,
-            rich: None,
+            // §4.36: a view-once send persists the marker on its own pending
+            // row, so the sender's bubble renders the view-once UI across
+            // restarts; every other send stays a plain row (None).
+            rich: view_once.then_some(crate::engine::NormalizedRich {
+                view_once: true,
+                ..crate::engine::NormalizedRich::default()
+            }),
             reactions: Vec::new(),
             edits: Vec::new(),
             delivered_at: None,
@@ -1430,6 +1488,7 @@ impl ConnectorService {
             attachments,
             quote,
             conversation,
+            view_once,
         );
         Ok(PreparedSend::Dispatch {
             pending_id,
@@ -1598,6 +1657,7 @@ impl ConnectorService {
     /// signal-cli JSON-RPC send quote parameters (verified against the pinned
     /// 0.14.7 distribution): quoteTimestamp is the quoted message's Signal
     /// timestamp, quoteAuthor its author's number — both required.
+    #[allow(clippy::too_many_arguments)]
     fn upstream_text_send_params(
         signal_account: &str,
         text: &str,
@@ -1606,6 +1666,7 @@ impl ConnectorService {
         attachments: Option<Vec<Value>>,
         quote: Option<(u64, String)>,
         conversation: &ConversationRow,
+        view_once: bool,
     ) -> Value {
         let mut params = json!({
             "account": signal_account,
@@ -1645,6 +1706,11 @@ impl ConnectorService {
         if let Some((quote_timestamp, quote_author)) = quote {
             params["quoteTimestamp"] = json!(quote_timestamp);
             params["quoteAuthor"] = json!(quote_author);
+        }
+        // §4.36: the view-once flag rides the send top level; the key is
+        // absent when false, so every existing wire shape stays byte-identical.
+        if view_once {
+            params["viewOnce"] = json!(true);
         }
         params
     }
@@ -1737,6 +1803,7 @@ impl ConnectorService {
             None,
             quote,
             &conversation,
+            false,
         );
         Ok(PreparedSend::Dispatch {
             pending_id: row.id,
@@ -2236,6 +2303,132 @@ impl ConnectorService {
         self.prepare_receipt(account_id, conversation_id, message_ids)
     }
 
+    /// messages.sendViewOnceOpen (contract revision 1.38, §4.36): bounds and
+    /// account resolution only — the bare engine `sendViewOnceOpen` face is a
+    /// passthrough with no local state. The upstream key is the resolved
+    /// `signal_account`, never the host's opaque id.
+    pub fn prepare_send_view_once_open(
+        &self,
+        params: &MessagesSendViewOnceOpenParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.sender_aci, "senderAci")?;
+        let account = self.resolve_account(&params.account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "senderAci": params.sender_aci,
+            "timestamp": params.timestamp,
+        }))
+    }
+
+    /// messages.markViewOnceOpened (contract revision 1.38, §4.37): the
+    /// desktop's single view-once trigger point. Resolves the target through
+    /// the shared ladder, refuses non-view-once rows deterministically, burns
+    /// the row bytes and media on the first transition (replays are a trivial
+    /// no-op), and returns the event list plus the best-effort upstream
+    /// fan-out plan — the supervisor sends the events and runs the official
+    /// VIEWED-then-ViewOnceOpen pair under receipt-class discipline, so an
+    /// upstream failure degrades `unknown` without touching the burn.
+    pub fn prepare_mark_view_once_opened(
+        &self,
+        params: &MessagesMarkViewOnceOpenedParams,
+    ) -> Result<PreparedMarkViewOnceOpened, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        validate_opaque_id(&params.message_id, "messageId")?;
+        let (account, conversation, record) = self.resolve_target(
+            &params.account_id,
+            &params.conversation_id,
+            &params.message_id,
+        )?;
+        let is_view_once = record
+            .rich
+            .as_ref()
+            .is_some_and(|rich| rich.view_once || rich.view_once_invalid);
+        if !is_view_once {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "message is not a view-once message",
+                false,
+            )));
+        }
+        let opened_at = now_ms();
+        let Some((_, changed)) = self.store.burn_view_once_message(
+            &record.account_id,
+            &record.conversation_id,
+            &record.id,
+            opened_at,
+        )?
+        else {
+            // The row vanished between the resolve and the burn (local data
+            // deletion raced the request): MESSAGE_NOT_FOUND is the honest
+            // answer, the same one a fully absent row would give.
+            return Err(StoreError::MessageNotFound.into());
+        };
+        let mut events = Vec::new();
+        if !changed {
+            // The replay: already burned — a trivial no-op with no event and
+            // no upstream fan-out (the supervisor's receipt-class discipline
+            // treats the skipped legs as complete and answers plain `sent`).
+            return Ok(PreparedMarkViewOnceOpened {
+                events,
+                account_signal: account.signal_account,
+                timestamp: record.sent_at,
+                receipt_recipient: None,
+                open_sender_aci: None,
+            });
+        }
+        self.burn_view_once_media(&record);
+        events.push(HostSideEvent::MessageViewOnceOpened {
+            account_id: record.account_id.clone(),
+            conversation_id: record.conversation_id.clone(),
+            message_id: record.id.clone(),
+            opened_at,
+        });
+        // The upstream fan-out plan. The receipt leg addresses the author of
+        // an incoming row — a direct conversation's incoming rows are all the
+        // peer's (the §4.29 model); a group row's author is unresolvable
+        // (§4.28) and both legs skip, while the burn still ran. An outgoing
+        // row has no author to receipt; its open sync names the account
+        // itself (the engine resolves the registered number to the own ACI).
+        let (receipt_recipient, open_sender_aci) = if record.direction == "outgoing" {
+            (None, Some(account.signal_account.clone()))
+        } else if conversation.kind == "direct" {
+            (
+                Some(conversation.peer_key.clone()),
+                Some(conversation.peer_key.clone()),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(PreparedMarkViewOnceOpened {
+            events,
+            account_signal: account.signal_account,
+            timestamp: record.sent_at,
+            receipt_recipient,
+            open_sender_aci,
+        })
+    }
+
+    /// Erase one view-once row's recoverable media channels (§4.37): the
+    /// attachment files and previews under the connector-owned directories,
+    /// then any open chunk-stream handle for the message. Best-effort — a
+    /// vanished file is success, and `--media-ingest` being off means there
+    /// is nothing on disk to erase.
+    fn burn_view_once_media(&self, record: &MessageRecord) {
+        let Some(media) = self.media.as_ref() else {
+            return;
+        };
+        for descriptor in &record.attachments {
+            if let Ok(sanitized_id) = sanitize_attachment_id(&descriptor.id) {
+                media.governor().delete_attachment(&sanitized_id);
+            }
+        }
+        media
+            .handles()
+            .close_for_message(&record.account_id, &record.id);
+    }
+
     /// Shared mark-read/mark-viewed body. Validation runs in the 1.33
     /// `resolve_pin_target` order — ids, account, conversation, then the
     /// bounded selection — so a bogus address answers its deterministic
@@ -2335,8 +2528,22 @@ impl ConnectorService {
             )));
         }
         let sanitized_id = sanitize_attachment_id(attachment_id)?;
-        let (_account, _conversation, _message) =
+        let (_account, _conversation, message) =
             self.resolve_target(account_id, conversation_id, message_id)?;
+        // §4.37: an opened view-once attachment answers exactly what a
+        // not-downloaded one answers — the burn erased the bytes, and the
+        // wire must not leak the state transition through a distinct error.
+        if message
+            .rich
+            .as_ref()
+            .is_some_and(|rich| rich.view_once_opened_at.is_some())
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "attachment is not available in the signal-cli data directory",
+                true,
+            )));
+        }
         let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
             return Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
@@ -2673,6 +2880,18 @@ impl ConnectorService {
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             message,
         ))];
+        // §4.37: record the ACI→peer-key identity the envelope revealed, so a
+        // later view-once open sync (which names the author by ACI only) can
+        // find this conversation. One bounded row per (account, ACI); only
+        // incoming envelopes carry someone else's identity, and only when the
+        // resolved peer key differs from the raw ACI.
+        if direction == "incoming"
+            && let Some(aci) = receive.source_uuid.as_deref()
+            && aci != peer_key
+        {
+            self.store
+                .upsert_peer_identity(&account.id, aci, &peer_key)?;
+        }
         if let Some(conversation) = self
             .store
             .conversation_summary(&account.id, &conversation.id)?
@@ -2715,6 +2934,18 @@ impl ConnectorService {
             Some(account) => account,
             None => return Ok(Vec::new()),
         };
+        // §4.37: the view-once open sync names its target by (author ACI,
+        // timestamp) across conversations — the envelope's own source is our
+        // account, so the generic conversation routing below would misroute
+        // it into a self-chat. Intercepted after account resolution, before
+        // the (kind, peer_key) ladder.
+        if let ControlReceive::ViewOnceOpen {
+            sender_aci,
+            timestamp,
+        } = &control
+        {
+            return self.apply_view_once_open_sync(&account, sender_aci, *timestamp);
+        }
         // Resolve the conversation: group id, or peer (incoming source /
         // outgoing destination). Control receives address existing
         // conversations only — they never create one.
@@ -2997,7 +3228,85 @@ impl ConnectorService {
                 }
                 Ok(events)
             }
+            ControlReceive::ViewOnceOpen { .. } => Ok(Vec::new()), // intercepted above
         }
+    }
+
+    /// Consume one view-once open sync (contract revision 1.38, §4.37): find
+    /// the view-once row the (author, timestamp) pair names through the
+    /// bounded candidate ladder and burn it on the first transition. Warn-only
+    /// on every miss — timestamp 0 is the official unknown marker, a sync
+    /// that arrived before its message has no staging (the sender's resync
+    /// cycle re-delivers it), and a duplicate envelope finds no transition and
+    /// emits nothing. Never sends upstream: the fan-out belongs to the
+    /// desktop's `messages.markViewOnceOpened` trigger, not to a sync echo.
+    fn apply_view_once_open_sync(
+        &mut self,
+        account: &AccountRow,
+        sender_aci: &str,
+        timestamp: u64,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if timestamp == 0 {
+            tracing::warn!(
+                kind = "view_once_open",
+                "open sync without a timestamp dropped"
+            );
+            return Ok(Vec::new());
+        }
+        // The candidate ladder: the ACI itself (the fixture and direct-identity
+        // shape), then the recorded ACI→peer-key mappings (§4.37), then
+        // contacts digit-suffix matches (the §4.29 mention resolution rule).
+        let mut peer_keys = vec![sender_aci.to_string()];
+        peer_keys.extend(self.store.peer_keys_for_aci(&account.id, sender_aci)?);
+        let digits = address_digits(sender_aci);
+        if !digits.is_empty() {
+            for key in self.store.contact_peer_keys(&account.id)? {
+                let candidate = address_digits(&key);
+                if !candidate.is_empty() && candidate.ends_with(&digits) {
+                    peer_keys.push(key);
+                }
+            }
+        }
+        peer_keys.sort();
+        peer_keys.dedup();
+        let candidates =
+            self.store
+                .view_once_open_candidates(&account.id, timestamp, &peer_keys)?;
+        let target = candidates.into_iter().find(|record| {
+            record
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.view_once || rich.view_once_invalid)
+        });
+        let Some(record) = target else {
+            tracing::warn!(
+                kind = "view_once_open",
+                "open sync matched no local view-once row; dropped"
+            );
+            return Ok(Vec::new());
+        };
+        let opened_at = now_ms();
+        let Some((_, changed)) = self.store.burn_view_once_message(
+            &record.account_id,
+            &record.conversation_id,
+            &record.id,
+            opened_at,
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        if !changed {
+            // The engine's pinned-rev resync re-delivers the same sync — the
+            // row is already burned, no second event.
+            return Ok(Vec::new());
+        }
+        self.burn_view_once_media(&record);
+        Ok(vec![HostSideEvent::MessageViewOnceOpened {
+            account_id: record.account_id,
+            conversation_id: record.conversation_id,
+            message_id: record.id,
+            opened_at,
+        }])
     }
 }
 
@@ -3277,6 +3586,24 @@ pub struct PreparedReceipts {
     pub conversation_id: String,
     pub account_signal: String,
     pub groups: Vec<ReceiptGroup>,
+}
+
+/// The `messages.markViewOnceOpened` prepare result (contract revision 1.38,
+/// §4.37): the burn already ran (the events carry the one
+/// `message.viewOnceOpened` the transition earned; empty on a replay), and
+/// the supervisor still owes the best-effort upstream pair. `timestamp` is
+/// the burned row's Signal timestamp both legs reference. A `None` leg skips:
+/// the receipt leg only ever addresses an incoming direct row's author, the
+/// open-sync leg names that author — or the account itself for an outgoing
+/// row — and an unresolvable group author skips both (§4.28) while the burn
+/// still ran.
+#[derive(Debug)]
+pub struct PreparedMarkViewOnceOpened {
+    pub events: Vec<HostSideEvent>,
+    pub account_signal: String,
+    pub timestamp: u64,
+    pub receipt_recipient: Option<String>,
+    pub open_sender_aci: Option<String>,
 }
 
 /// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
@@ -3611,6 +3938,12 @@ pub struct MessagesSendAttachmentParams {
     /// `audio/*` contentType, validated before the pending row exists.
     #[serde(default)]
     pub voice_note: bool,
+    /// §4.36 view-once marker: true sends the attachment as an official
+    /// view-once message (upstream `send` carries `viewOnce`). Requires
+    /// `image/*` or `video/*` contentType, an empty caption, no quote, and no
+    /// voiceNote — validated before the pending row exists.
+    #[serde(default)]
+    pub view_once: bool,
 }
 
 /// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
@@ -3811,6 +4144,32 @@ pub struct MessagesMarkViewedParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_ids: Option<Vec<String>>,
+}
+
+/// messages.sendViewOnceOpen params (contract revision 1.38, §4.36): the bare
+/// engine `sendViewOnceOpen {account, senderAci, timestamp}` passthrough.
+/// Receipt-class semantics — the result is `{status: sent|unknown}` and any
+/// failure degrades without retry. Outside the desktop flow:
+/// `messages.markViewOnceOpened` orchestrates both legs.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendViewOnceOpenParams {
+    pub account_id: String,
+    pub sender_aci: String,
+    pub timestamp: u64,
+}
+
+/// messages.markViewOnceOpened params (contract revision 1.38, §4.37): the
+/// desktop's single trigger point for the view-once flow — the connector
+/// burns the row bytes and media locally, emits `message.viewOnceOpened`
+/// once, and best-effort orchestrates the official upstream pair (the VIEWED
+/// receipt to the author, then the view-once open sync).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesMarkViewOnceOpenedParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
 }
 
 /// messages.attachments.open params (ADR 0002): the message-addressing triple
@@ -4887,6 +5246,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: Some("Peer".into()),
                     group_id: None,
                     text: Some(full_text.clone()),
@@ -4953,6 +5313,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some(oversized),
@@ -5280,6 +5641,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("same text is not identity".into()),
@@ -5406,6 +5768,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some(source.into()),
+            source_uuid: None,
             peer_name: None,
             group_id: Some("group-one".into()),
             text: Some(text.into()),
@@ -5472,6 +5835,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: Some("林菲菲".into()),
             group_id: Some("group-one".into()),
             text: Some("你好".into()),
@@ -5549,6 +5913,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("unstable identity".into()),
@@ -5817,6 +6182,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some("quoted text".into()),
@@ -6009,6 +6375,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550105".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
@@ -6190,6 +6557,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some("peer text".into()),
@@ -6306,6 +6674,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some("peer text".into()),
@@ -6430,6 +6799,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550105".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
@@ -6703,6 +7073,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some("peer pin target".into()),
@@ -6841,6 +7212,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550105".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: Some("group-one".into()),
                     text: Some("group text".into()),
@@ -7012,6 +7384,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some("peer pin target".into()),
@@ -7511,6 +7884,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: Some("Peer".into()),
                     group_id: None,
                     text: Some("hello".into()),
@@ -7550,6 +7924,7 @@ mod tests {
                 Some("see attachment"),
                 None,
                 false,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -7572,6 +7947,7 @@ mod tests {
                 Some("text/plain"),
                 Some("see attachment"),
                 None,
+                false,
                 false,
             )
             .unwrap();
@@ -7605,6 +7981,7 @@ mod tests {
                 Some("text/plain"),
                 Some("see attachment"),
                 None,
+                false,
                 false,
             )
             .unwrap();
@@ -7646,6 +8023,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
             )
             .unwrap();
         assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
@@ -7671,6 +8049,7 @@ mod tests {
                 None,
                 None,
                 false,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
@@ -7690,6 +8069,7 @@ mod tests {
                 None,
                 None,
                 true,
+                false,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -7725,6 +8105,7 @@ mod tests {
                 None,
                 None,
                 true,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -7735,6 +8116,273 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Contract 1.38 (§4.36): the `viewOnce` flag demands the official
+    /// view-once shape — an image/* or video/* contentType, no caption, no
+    /// quote, no voiceNote — and every violation rejects before a pending row
+    /// exists. A passing send carries the upstream `viewOnce` key and marks
+    /// its pending row's rich record so the sender's bubble renders the
+    /// view-once UI across restarts.
+    #[test]
+    fn prepare_send_attachment_view_once_validates_and_marks_the_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64 = "iVBORw0KGgo="; // canonical base64 of the 8 PNG magic bytes
+
+        // Every violation answers INVALID_REQUEST and leaves no pending row.
+        type Reject = (
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            bool,
+        );
+        let rejects: &[Reject] = &[
+            ("not media", "text/plain", None, None, false),
+            ("voice mix", "audio/ogg", None, None, true),
+            ("quote mix", "image/png", None, Some("m-quote"), false),
+            ("caption mix", "image/png", Some("caption"), None, false),
+        ];
+        for (label, content_type, caption, quote, voice) in rejects {
+            let error = service
+                .prepare_send_attachment(
+                    &account.id,
+                    &AttachmentSendTarget::Conversation(&conversation.id),
+                    "req-view",
+                    b64,
+                    8,
+                    None,
+                    Some(content_type),
+                    *caption,
+                    *quote,
+                    *voice,
+                    true,
+                )
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
+            assert!(
+                service
+                    .store
+                    .message_by_client_request(&account.id, "req-view")
+                    .unwrap()
+                    .is_none(),
+                "{label}"
+            );
+        }
+
+        // The passing shape dispatches with the upstream flag and persists
+        // the view-once marker on its own pending row.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-view-ok",
+                b64,
+                8,
+                None,
+                Some("image/png"),
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(params["viewOnce"], serde_json::json!(true));
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-view-ok")
+            .unwrap()
+            .expect("the pending view-once row exists");
+        let rich = row.rich.expect("the view-once marker persists");
+        assert!(rich.view_once);
+        assert!(rich.view_once_opened_at.is_none());
+
+        // A plain send (the flag false) keeps the upstream key absent — the
+        // pre-1.38 wire shape stays byte-identical.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-view-off",
+                b64,
+                8,
+                None,
+                Some("image/png"),
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert!(params.get("viewOnce").is_none());
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-view-off")
+            .unwrap()
+            .expect("the plain pending row exists");
+        assert!(row.rich.is_none());
+    }
+
+    /// Contract 1.38 (§4.37): `messages.markViewOnceOpened` refuses
+    /// non-view-once rows, burns the first call (one event, the fan-out plan
+    /// names the incoming direct row's author on both legs), answers a replay
+    /// with no event and no fan-out, sends the outgoing row's open sync to
+    /// the account itself, and skips both legs for an unresolvable group
+    /// author while the burn still ran.
+    #[test]
+    fn prepare_mark_view_once_opened_burns_and_plans_fanout() {
+        use crate::engine::{NormalizedAttachment, NormalizedRich};
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store
+            .ensure_conversation(&account.id, "group", "group-one", "group")
+            .unwrap();
+        let base = |id: &str, conversation_id: &str, direction: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation_id.into(),
+            direction,
+            sender_id: if direction == "outgoing" {
+                account.id.clone()
+            } else {
+                "peer-hash".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 99,
+            received_at: None,
+            text: Some("vanishing media".into()),
+            text_bytes: Some(16),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: vec![NormalizedAttachment {
+                id: "att-view-1".into(),
+                content_type: Some("image/jpeg".into()),
+                filename: Some("snap.jpg".into()),
+                size: Some(2048),
+                width: Some(64),
+                height: Some(32),
+                is_voice_note: false,
+            }],
+            rich: Some(NormalizedRich {
+                view_once: true,
+                ..NormalizedRich::default()
+            }),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            sticker: None,
+            admin_deleted: false,
+        };
+        for record in [
+            base("m-view-in", &conversation.id, "incoming"),
+            base("m-view-out", &conversation.id, "outgoing"),
+            base("m-view-group", &group.id, "incoming"),
+            // Same shapes without the marker: deterministic refusals.
+            {
+                let mut plain = base("m-plain", &conversation.id, "incoming");
+                plain.rich = None;
+                plain
+            },
+        ] {
+            service
+                .store
+                .insert_message(&record, None, Some("vanishing"), true)
+                .unwrap();
+        }
+        let mark = |message_id: &str| crate::service::MessagesMarkViewOnceOpenedParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            message_id: message_id.into(),
+        };
+
+        // A row that is not a view-once message answers INVALID_REQUEST and
+        // stays untouched.
+        let error = service
+            .prepare_mark_view_once_opened(&mark("m-plain"))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let row = service
+            .store
+            .message_by_id(&account.id, &conversation.id, "m-plain")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.text.as_deref(), Some("vanishing media"));
+
+        // The incoming direct row: one event, both fan-out legs address the
+        // author, the timestamp is the burned row's Signal timestamp.
+        let prepared = service
+            .prepare_mark_view_once_opened(&mark("m-view-in"))
+            .unwrap();
+        assert_eq!(prepared.events.len(), 1);
+        assert_eq!(prepared.account_signal, "+15555550100");
+        assert_eq!(prepared.timestamp, 99);
+        assert_eq!(prepared.receipt_recipient.as_deref(), Some("+15555550101"));
+        assert_eq!(prepared.open_sender_aci.as_deref(), Some("+15555550101"));
+        let opened_at = match &prepared.events[0] {
+            HostSideEvent::MessageViewOnceOpened { opened_at, .. } => *opened_at,
+            other => panic!("unexpected event {other:?}"),
+        };
+        let row = service
+            .store
+            .message_by_id(&account.id, &conversation.id, "m-view-in")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.text, None);
+        assert_eq!(row.rich.expect("rich").view_once_opened_at, Some(opened_at));
+        assert_eq!(row.attachments.len(), 1);
+
+        // The replay is a trivial no-op: no event, and both fan-out legs skip
+        // (the supervisor answers plain `sent` without touching upstream).
+        let replay = service
+            .prepare_mark_view_once_opened(&mark("m-view-in"))
+            .unwrap();
+        assert!(replay.events.is_empty());
+        assert!(replay.receipt_recipient.is_none());
+        assert!(replay.open_sender_aci.is_none());
+
+        // The outgoing row burns too; its open sync names our own account
+        // (the engine resolves the registered number to the own ACI) and no
+        // receipt leg exists — we are the author.
+        let prepared = service
+            .prepare_mark_view_once_opened(&mark("m-view-out"))
+            .unwrap();
+        assert_eq!(prepared.events.len(), 1);
+        assert!(prepared.receipt_recipient.is_none());
+        assert_eq!(prepared.open_sender_aci.as_deref(), Some("+15555550100"));
+
+        // A group row's author is unresolvable (§4.28): both legs skip, the
+        // burn still ran.
+        let prepared = service
+            .prepare_mark_view_once_opened(&crate::service::MessagesMarkViewOnceOpenedParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                message_id: "m-view-group".into(),
+            })
+            .unwrap();
+        assert_eq!(prepared.events.len(), 1);
+        assert!(prepared.receipt_recipient.is_none());
+        assert!(prepared.open_sender_aci.is_none());
+        let row = service
+            .store
+            .message_by_id(&account.id, &group.id, "m-view-group")
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.text, None);
     }
 
     /// prepare_send_sticker (contract revision 1.35, §4.31): bounds failures
@@ -8600,6 +9248,7 @@ mod tests {
             account_present: true,
             account: Some(account.into()),
             source: Some(source.into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: None,
@@ -9045,6 +9694,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("to be deleted".into()),
@@ -9100,6 +9750,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("before edit".into()),
@@ -9251,6 +9902,7 @@ mod tests {
                     account_present: true,
                     account: Some("+15555550100".into()),
                     source: Some("+15555550101".into()),
+                    source_uuid: None,
                     peer_name: None,
                     group_id: None,
                     text: Some("incoming stays".into()),
@@ -9472,6 +10124,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("v0".into()),
@@ -9612,6 +10265,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("peer says".into()),
@@ -9653,6 +10307,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("replying with a file".into()),

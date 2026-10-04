@@ -202,6 +202,26 @@ impl MediaGovernor {
         }
         stats
     }
+
+    /// Burn one view-once message's media (contract revision 1.38, §4.37):
+    /// delete the attachment file and its preview from every candidate
+    /// `attachments/` directory. Best-effort by design — a missing file is
+    /// success (the same `NotFound`-is-success rule the retention passes
+    /// follow), a real I/O failure logs by class and keeps the burn moving so
+    /// the row projection and the host event never depend on the filesystem
+    /// answering. Returns how many files were removed.
+    pub fn delete_attachment(&self, sanitized_id: &str) -> u64 {
+        let mut removed = 0_u64;
+        for dir in self.attachments_dirs() {
+            for suffix in ["", ".preview"] {
+                let candidate = dir.join(format!("{sanitized_id}{suffix}"));
+                if delete_file(&candidate) {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
 }
 
 fn collect_regular_files(dir: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>) {
@@ -391,6 +411,17 @@ impl MediaHandleTable {
         let mut entries = self.entries.lock().expect("media handle table mutex");
         let before = entries.len();
         entries.retain(|_, entry| entry.account_id != account_id);
+        before - entries.len()
+    }
+
+    /// Drop every handle bound to one message (contract revision 1.38):
+    /// a burned view-once message must not keep a readable stream open — the
+    /// chunk reads would otherwise outlive the bytes the burn just erased.
+    /// Returns how many handles were released.
+    pub fn close_for_message(&self, account_id: &str, message_id: &str) -> usize {
+        let mut entries = self.entries.lock().expect("media handle table mutex");
+        let before = entries.len();
+        entries.retain(|_, entry| entry.account_id != account_id || entry.message_id != message_id);
         before - entries.len()
     }
 

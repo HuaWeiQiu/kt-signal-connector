@@ -1455,6 +1455,7 @@ impl RuntimeSupervisor {
         text: Option<String>,
         quote_message_id: Option<String>,
         voice_note: bool,
+        view_once: bool,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -1484,9 +1485,95 @@ impl RuntimeSupervisor {
                 text.as_deref(),
                 quote_message_id.as_deref(),
                 voice_note,
+                view_once,
             )?
         };
         self.dispatch_prepared(&engine, prepared).await
+    }
+
+    /// messages.sendViewOnceOpen (contract revision 1.38, §4.36): the bare
+    /// engine `sendViewOnceOpen` passthrough under receipt-class discipline —
+    /// account resolution still fails deterministically, but every upstream
+    /// failure (engine down, method absent, unknown outcome) degrades to
+    /// `{status: "unknown"}` and nothing is ever retried (AGENTS.md).
+    pub async fn send_view_once_open(
+        &self,
+        params: crate::service::MessagesSendViewOnceOpenParams,
+    ) -> Result<&'static str, ServiceError> {
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_send_view_once_open(&params)?
+        };
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(_) => return Ok("unknown"),
+        };
+        match engine
+            .call("sendViewOnceOpen", prepared, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(_) => Ok("unknown"),
+        }
+    }
+
+    /// messages.markViewOnceOpened (contract revision 1.38, §4.37): the
+    /// desktop's single view-once trigger point. The burn already ran inside
+    /// prepare (it never depends on upstream); this method emits the one
+    /// `message.viewOnceOpened` event the transition earned, then runs the
+    /// official upstream pair — `sendViewedReceipt` to the author, then
+    /// `sendViewOnceOpen` — in order under receipt-class discipline: any
+    /// failure degrades the answer to `unknown`, and nothing is ever retried.
+    /// A replay (already burned) skips the fan-out and answers a trivial
+    /// `sent` no-op.
+    pub async fn mark_view_once_opened(
+        &self,
+        params: crate::service::MessagesMarkViewOnceOpenedParams,
+    ) -> Result<&'static str, ServiceError> {
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_mark_view_once_opened(&params)?
+        };
+        for event in prepared.events {
+            let _ = self.host_events.send(event);
+        }
+        if prepared.receipt_recipient.is_none() && prepared.open_sender_aci.is_none() {
+            return Ok("sent");
+        }
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(_) => return Ok("unknown"),
+        };
+        let mut all_confirmed = true;
+        if let Some(recipient) = &prepared.receipt_recipient {
+            let params = json!({
+                "account": prepared.account_signal,
+                "recipient": recipient,
+                "timestamps": [prepared.timestamp],
+            });
+            match engine
+                .call("sendViewedReceipt", params, CallClass::Mutating)
+                .await
+            {
+                Ok(_) => {}
+                Err(_) => all_confirmed = false,
+            }
+        }
+        if let Some(sender_aci) = &prepared.open_sender_aci {
+            let params = json!({
+                "account": prepared.account_signal,
+                "senderAci": sender_aci,
+                "timestamp": prepared.timestamp,
+            });
+            match engine
+                .call("sendViewOnceOpen", params, CallClass::Mutating)
+                .await
+            {
+                Ok(_) => {}
+                Err(_) => all_confirmed = false,
+            }
+        }
+        Ok(if all_confirmed { "sent" } else { "unknown" })
     }
 
     /// messages.sendSticker (contract revision 1.35, §4.31; quote face 1.37,
@@ -2929,6 +3016,7 @@ mod tests {
                 account_present: true,
                 account: Some("+15555550100".into()),
                 source: Some("+15555550101".into()),
+                source_uuid: None,
                 peer_name: Some("Peer".into()),
                 group_id: None,
                 text: Some("persist me".into()),

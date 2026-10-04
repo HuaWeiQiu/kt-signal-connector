@@ -65,6 +65,12 @@ pub const METHODS: &[MethodRow] = &[
     // still serialize it against sends on the same account.
     ("messages.markRead", Lane::Send, true, "send"),
     ("messages.markViewed", Lane::Send, true, "send"),
+    // View-once faces (contract 1.38): the bare open-sync passthrough and
+    // the burn trigger are both receipt-class — mutating, send-lane upstream
+    // traffic under the reaction-class write-lane mutex and delete barrier;
+    // an upstream failure degrades {status: unknown} and is never retried.
+    ("messages.sendViewOnceOpen", Lane::Send, true, "send"),
+    ("messages.markViewOnceOpened", Lane::Send, true, "send"),
     // Media ingest (ADR 0002): the chunked streaming triple rides the READ
     // lane — one bounded chunk per call, no mutation, no upstream traffic.
     // The one-shot base64 reader (`messages.attachments.get`, contract 1.10
@@ -152,8 +158,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `send-sticker` (contract revision 1.35) marks `messages.sendSticker` plus
 /// the sticker receive projection as present. `sticker-pack-browse` and
 /// `conversation-pin-sync` (contract revision 1.36) mark the two browse/sync
-/// faces of §4.32/§4.33, and `sticker-pack-sync` (contract revision 1.37)
-/// marks the §4.34 account-scoped pack install face — desktops gate the new
+/// faces of §4.32/§4.33, `sticker-pack-sync` (contract revision 1.37)
+/// marks the §4.34 account-scoped pack install face, and `view-once`
+/// (contract revision 1.38) marks the §4.36/§4.37 view-once send, open-sync
+/// and burn faces — desktops gate the new
 /// methods on these tags so an old connector answers a clean capability gap
 /// instead of `METHOD_NOT_ALLOWED`. They never join [`METHOD_NAMES`]: the
 /// schema request-frame method enum and the dispatch table describe real
@@ -164,6 +172,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "sticker-pack-browse",
     "conversation-pin-sync",
     "sticker-pack-sync",
+    "view-once",
 ];
 
 #[cfg(test)]
@@ -204,6 +213,8 @@ mod tests {
             "messages.sendAdminDelete",
             "messages.markRead",
             "messages.markViewed",
+            "messages.sendViewOnceOpen",
+            "messages.markViewOnceOpened",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "conversations.setPinned",
@@ -222,6 +233,8 @@ mod tests {
             "messages.sendAdminDelete",
             "messages.markRead",
             "messages.markViewed",
+            "messages.sendViewOnceOpen",
+            "messages.markViewOnceOpened",
             "contacts.sync",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",

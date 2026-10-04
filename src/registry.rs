@@ -656,6 +656,7 @@ impl ProxyGroupRuntime {
         text: Option<String>,
         quote_message_id: Option<String>,
         voice_note: bool,
+        view_once: bool,
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
@@ -670,6 +671,7 @@ impl ProxyGroupRuntime {
                 text,
                 quote_message_id,
                 voice_note,
+                view_once,
             )
             .await
     }
@@ -827,6 +829,28 @@ impl ProxyGroupRuntime {
                 params.message_ids,
             )
             .await
+    }
+
+    /// View-once open sync routing (contract revision 1.38): the owning
+    /// group's supervisor forwards the bare passthrough; receipt-class
+    /// semantics end to end.
+    pub async fn send_view_once_open(
+        &self,
+        params: crate::service::MessagesSendViewOnceOpenParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_view_once_open(params).await
+    }
+
+    /// View-once burn routing (contract revision 1.38): the owning group's
+    /// supervisor runs the burn-then-orchestrate flow against its own engine
+    /// and event lane.
+    pub async fn mark_view_once_opened(
+        &self,
+        params: crate::service::MessagesMarkViewOnceOpenedParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.mark_view_once_opened(params).await
     }
 
     pub async fn edit_message(

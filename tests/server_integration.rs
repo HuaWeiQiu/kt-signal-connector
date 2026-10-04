@@ -4658,6 +4658,394 @@ async fn sticker_pack_sync_and_sticker_quote_round_trip() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// The send-log lines one assertion cares about, re-read fresh each poll.
+struct SendLog {
+    contents: String,
+}
+
+impl SendLog {
+    fn receipt_lines(&self) -> Vec<Value> {
+        self.lines_with("timestamps")
+    }
+
+    fn view_once_open_lines(&self) -> Vec<Value> {
+        self.lines_with("senderAci")
+    }
+
+    fn view_once_send_lines(&self) -> Vec<Value> {
+        self.lines_with("viewOnce")
+    }
+
+    fn lines_with(&self, key: &str) -> Vec<Value> {
+        self.contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|entry| entry.get(key).is_some())
+            .collect()
+    }
+}
+
+async fn read_send_log(signal_data: &Path) -> Option<SendLog> {
+    fs::read_to_string(signal_data.join(".fixture-send-log.jsonl"))
+        .ok()
+        .map(|contents| SendLog { contents })
+}
+
+/// Frames the client until the named request's response arrives, collecting
+/// every `message.viewOnceOpened` event on the way — the deterministic
+/// "no further event" barrier: the connector writes events and responses to
+/// the same connection in emission order, so a response proves every event
+/// triggered before it was already delivered.
+async fn drain_until_response_collecting_opened(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    request_id: &str,
+) -> (Value, Vec<Value>) {
+    let mut opened: Vec<Value> = Vec::new();
+    loop {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame.get("event").and_then(Value::as_str) == Some("message.viewOnceOpened") {
+            opened.push(frame["data"].clone());
+            continue;
+        }
+        if frame.get("requestId").and_then(Value::as_str) == Some(request_id) {
+            return (frame, opened);
+        }
+    }
+}
+
+/// Frames the client until the first `message.viewOnceOpened` event arrives
+/// and returns it — the wait side of a burn whose transition must produce
+/// exactly one event (the "exactly once" side is the barrier drain).
+async fn drain_until_opened_event(client: &mut Framed<UnixStream, LinesCodec>) -> Value {
+    loop {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame.get("event").and_then(Value::as_str) == Some("message.viewOnceOpened") {
+            return frame["data"].clone();
+        }
+    }
+}
+
+/// Contract revision 1.38 end to end: a `viewOnce` attachment send carries the
+/// upstream flag and persists the marker row; `messages.markViewOnceOpened`
+/// burns an incoming view-once row once (the official VIEWED-then-ViewOnceOpen
+/// pair reaches the engine in order, one host event, the row loses its bytes
+/// but keeps its metadata, a replay is a trivial no-op with no fan-out); and
+/// the engine's own `syncMessage.viewOnceOpen` sync burns the sender's row
+/// through the local ladder with no upstream traffic — duplicate syncs and a
+/// sync naming a non-view-once row emit nothing.
+#[tokio::test]
+async fn view_once_send_mark_open_and_sync_burn_reach_the_upstream() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [37_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // Stage the peer's view-once media message (attachment descriptor, no
+    // body — the §4.36 official shape) behind the default link receive.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 70,
+                "dataMessage": {
+                    "viewOnce": true,
+                    "attachments": [{
+                        "id": "att-view-in-1",
+                        "contentType": "image/jpeg",
+                        "filename": "snap.jpg",
+                        "size": 2048
+                    }]
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ViewOnce" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+
+    // Drain the finish burst: the link answer plus the two incoming upserts
+    // (the default 42 plain receive and the staged 70 view-once receive).
+    let mut account_id: Option<String> = None;
+    let mut upserted: Vec<Value> = Vec::new();
+    timeout(Duration::from_secs(5), async {
+        while account_id.is_none() || upserted.len() < 2 {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                account_id = Some(frame["result"]["id"].as_str().unwrap().to_string());
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+            {
+                upserted.push(frame["data"].clone());
+            }
+        }
+    })
+    .await
+    .expect("the finish burst must deliver two incoming messages");
+    let account_id = account_id.unwrap();
+    let conversation_id = upserted[0]["conversationId"].as_str().unwrap().to_string();
+    let view_once_row_id = upserted
+        .iter()
+        .find(|row| row["sentAt"] == 70)
+        .expect("the staged view-once row")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // C1 (§4.36): the view-once attachment send carries the upstream flag and
+    // persists the marker on its own row; the fixture's send result pins the
+    // row's timestamp at 99.
+    let sent = request(
+        &mut client,
+        "view-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "view-once-send-1",
+            "dataBase64": "iVBORw0KGgo=",
+            "sizeBytes": 8,
+            "filename": "snap.png",
+            "contentType": "image/png",
+            "viewOnce": true
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["viewOnce"], true);
+    assert_eq!(sent["result"]["sentAt"], 99);
+    let sent_row_id = sent["result"]["id"].as_str().unwrap().to_string();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(log) = read_send_log(&signal_data).await {
+                if !log.view_once_send_lines().is_empty() {
+                    assert_eq!(log.view_once_send_lines()[0]["viewOnce"], true);
+                    assert_eq!(
+                        log.view_once_send_lines()[0]["recipient"],
+                        json!(["+15555550101"])
+                    );
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the view-once send must reach the engine with the flag");
+
+    // The finish burst's auto delivery receipts: one per incoming dataMessage.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(log) = read_send_log(&signal_data).await {
+                if log.receipt_lines().len() >= 2 {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("two auto delivery receipts must reach the engine");
+
+    // C3 (§4.37): marking the incoming view-once row burns it and runs the
+    // official pair — the VIEWED receipt to the author, then the open sync.
+    send_request_frame(
+        &mut client,
+        "mark-open-1",
+        "messages.markViewOnceOpened",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": view_once_row_id
+        }),
+    )
+    .await;
+    let (mark, opened) = drain_until_response_collecting_opened(&mut client, "mark-open-1").await;
+    assert_eq!(mark["result"]["status"], "sent");
+    assert_eq!(opened.len(), 1, "exactly one burn event: {opened:?}");
+    assert_eq!(opened[0]["accountId"], account_id);
+    assert_eq!(opened[0]["conversationId"], conversation_id);
+    assert_eq!(opened[0]["messageId"], view_once_row_id);
+    assert!(opened[0]["openedAt"].as_u64().is_some());
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(log) = read_send_log(&signal_data).await {
+                let receipts = log.receipt_lines();
+                let opens = log.view_once_open_lines();
+                if receipts.len() >= 3 && !opens.is_empty() {
+                    // The third receipt line is the VIEWED (delivery receipts
+                    // for rows 42 and 70 landed during the burst).
+                    assert_eq!(
+                        receipts[2]["recipient"], "+15555550101",
+                        "receipt lines: {receipts:?}"
+                    );
+                    assert_eq!(receipts[2]["timestamps"], json!([70]));
+                    assert_eq!(opens[0]["senderAci"], "+15555550101");
+                    assert_eq!(opens[0]["timestamp"], 70);
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the VIEWED receipt and open sync must reach the engine in order");
+
+    // The burned row keeps its metadata and carries the opened stamp.
+    let listed = request(
+        &mut client,
+        "list-burned",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let burned = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == view_once_row_id)
+        .expect("the burned row stays listed");
+    assert!(burned.get("text").is_none(), "the body bytes are erased");
+    assert!(burned["viewOnceOpenedAt"].as_u64().is_some());
+    assert_eq!(burned["attachments"].as_array().unwrap().len(), 1);
+
+    // The replay is a trivial no-op: `sent`, no event, no upstream legs.
+    let replay = request(
+        &mut client,
+        "mark-open-2",
+        "messages.markViewOnceOpened",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": view_once_row_id
+        }),
+    )
+    .await;
+    assert_eq!(replay["result"]["status"], "sent");
+    let (_, replay_opened) = send_status_barrier(&mut client, "barrier-1").await;
+    assert!(
+        replay_opened.is_empty(),
+        "a replay emits no event: {replay_opened:?}"
+    );
+
+    // C2 (§4.37): the engine's own view-once open syncs. Three duplicates
+    // naming the sender's row (timestamp 99) burn it exactly once; a fourth
+    // naming the plain row 42 matches nothing. No upstream traffic escapes.
+    let sync_envelope = |timestamp: u64| {
+        json!({
+            "source": "+15555550101",
+            "timestamp": 1000,
+            "syncMessage": {
+                "viewOnceOpen": {
+                    "senderAci": "+15555550101",
+                    "timestamp": timestamp
+                }
+            }
+        })
+    };
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            sync_envelope(99),
+            sync_envelope(99),
+            sync_envelope(99),
+            sync_envelope(42),
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let sync_opened = timeout(
+        Duration::from_secs(5),
+        drain_until_opened_event(&mut client),
+    )
+    .await
+    .expect("the sync burn must emit its event");
+    assert_eq!(sync_opened["messageId"], sent_row_id);
+    assert_eq!(sync_opened["conversationId"], conversation_id);
+    let (_, sync_settled) = send_status_barrier(&mut client, "barrier-2").await;
+    assert!(
+        sync_settled.is_empty(),
+        "replayed syncs and non-view-once targets emit nothing: {sync_settled:?}"
+    );
+    // The sync path never sends upstream: the log is unchanged.
+    let log = read_send_log(&signal_data).await.expect("the log exists");
+    assert_eq!(
+        log.receipt_lines().len(),
+        3,
+        "receipt lines after the sync phase: {:?}",
+        log.receipt_lines()
+    );
+    assert_eq!(log.view_once_open_lines().len(), 1);
+
+    // The sync-burned row carries the opened stamp too.
+    let listed = request(
+        &mut client,
+        "list-sync-burned",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let burned = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == sent_row_id)
+        .expect("the sync-burned row stays listed");
+    assert!(burned["viewOnceOpenedAt"].as_u64().is_some());
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// A `runtime.status` request used as an ordering barrier: returns the
+/// status response and every `message.viewOnceOpened` event that was
+/// delivered before it — the connector writes frames in emission order.
+async fn send_status_barrier(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    request_id: &str,
+) -> (Value, Vec<Value>) {
+    send_request_frame(client, request_id, "runtime.status", json!({})).await;
+    drain_until_response_collecting_opened(client, request_id).await
+}
+
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
     fs::write(path, bootstrap_payload(secret)).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();

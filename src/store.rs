@@ -160,6 +160,13 @@ CREATE TABLE IF NOT EXISTS conversation_pins (
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS peer_identities (
+  account_id TEXT NOT NULL,
+  aci TEXT NOT NULL,
+  peer_key TEXT NOT NULL,
+  PRIMARY KEY(account_id, aci),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
 ";
 /// DDL that must run after [`migrate_schema`], not in [`SCHEMA_DDL`], because
 /// it references columns that older stores only gain through a migration.
@@ -2281,6 +2288,168 @@ impl Store {
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(record.map(|record| (record, changed > 0)))
+    }
+
+    /// Record the ACI→peer-key identity an inbound envelope revealed
+    /// (contract revision 1.38, §4.37): the engine carries `sourceUuid` (the
+    /// sender's ACI) on every envelope while conversations key on the peer
+    /// identity the source resolved to (a phone number on a contacts hit, the
+    /// ACI itself otherwise). One row per (account, ACI) — the mapping is
+    /// bounded by the contacts scale and `INSERT OR REPLACE` keeps the newest
+    /// observation. Written by ingest; an older store simply lacks the row
+    /// and the §4.37 ladder falls back.
+    pub fn upsert_peer_identity(
+        &self,
+        account_id: &str,
+        aci: &str,
+        peer_key: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO peer_identities (account_id, aci, peer_key)
+             VALUES (?1, ?2, ?3)",
+            params![account_id, aci, peer_key],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// The peer keys one ACI has been observed as (contract revision 1.38):
+    /// the §4.37 ladder's second rung. Empty when the account has no recorded
+    /// mapping — the ACI itself stays the first rung.
+    pub fn peer_keys_for_aci(
+        &self,
+        account_id: &str,
+        aci: &str,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT peer_key FROM peer_identities WHERE account_id=?1 AND aci=?2")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, aci], |row| row.get::<_, String>(0))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// Bounded view-once burn candidates for one open-sync identity set
+    /// (contract revision 1.38, §4.37): rows at the synced timestamp whose
+    /// conversation matches one of the candidate peer keys (incoming — the
+    /// sync names the author), plus outgoing rows at the same timestamp (the
+    /// sender's own devices burn their sent copy). Incoming first, `LIMIT 16`
+    /// caps one sync's scan; the caller picks the first candidate whose rich
+    /// record carries the view-once marker.
+    pub fn view_once_open_candidates(
+        &self,
+        account_id: &str,
+        sent_at: u64,
+        peer_keys: &[String],
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        if peer_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let peer_keys = &peer_keys[..peer_keys.len().min(16)];
+        let placeholders = peer_keys.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT m.id, m.account_id, m.conversation_id, m.direction, m.sender_id, m.sent_at, m.received_at,
+                    m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
+                    m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
+                    m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json
+             FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
+             WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
+               AND (
+                 (m.direction = 'incoming' AND c.peer_key IN ({placeholders}))
+                 OR m.direction = 'outgoing'
+               )
+             ORDER BY CASE m.direction WHEN 'incoming' THEN 0 ELSE 1 END, m.id ASC
+             LIMIT 16"
+        );
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut bind: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(peer_keys.len() + 2);
+        bind.push(&account_id);
+        let sent_at_bound = sent_at as i64;
+        bind.push(&sent_at_bound);
+        for key in peer_keys {
+            bind.push(key);
+        }
+        let rows = stmt
+            .query_map(bind.as_slice(), message_record_from_row)
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// Burn one view-once row's bytes (contract revision 1.38, §4.37): clear
+    /// the body and rewrite the rich record with the opened stamp — the
+    /// metadata (attachment descriptors, quote snapshot, sticker identity)
+    /// stays so the row still renders as the viewed placeholder. The first
+    /// call performs the transition (`changed=true`); replays rewrite nothing
+    /// and report the already-burned row (`changed=false`), so exactly one
+    /// host event and one upstream fan-out escape per message. The caller
+    /// validated the view-once marker before calling (the service lock makes
+    /// that check race-free).
+    pub fn burn_view_once_message(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        opened_at: u64,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rich_json: Option<String> = transaction
+            .query_row(
+                "SELECT rich_json FROM messages
+                 WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(rich_json) = rich_json else {
+            return Ok(None);
+        };
+        let mut rich: crate::engine::NormalizedRich =
+            serde_json::from_str(&rich_json).unwrap_or_default();
+        let changed = rich.view_once_opened_at.is_none();
+        if changed {
+            rich.view_once_opened_at = Some(opened_at);
+            let burned = serde_json::to_string(&rich).map_err(|_| StoreError::Unavailable(None))?;
+            transaction
+                .execute(
+                    "UPDATE messages
+                     SET body=NULL, body_bytes=NULL, rich_json=?4
+                     WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                    params![message_id, account_id, conversation_id, burned],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
+                        delivered_at, read_at, admin_deleted, sticker_json
+                 FROM messages
+                 WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![message_id, account_id, conversation_id],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, changed)))
     }
 
     /// Upgrade earlier outgoing rows on an inbound peer receipt (delivery /
@@ -4426,6 +4595,7 @@ mod tests {
                 length: 4,
             }],
             view_once: true,
+            ..crate::engine::NormalizedRich::default()
         });
         assert!(
             store
@@ -8552,5 +8722,253 @@ mod tests {
             .items
             .remove(0);
         assert_eq!(listed.last_message_status, Some("delivered"));
+    }
+
+    /// Contract 1.38 (§4.37): the ACI→peer-key identity table records one row
+    /// per (account, ACI), replaces on re-observation, and never leaks across
+    /// accounts.
+    #[test]
+    fn peer_identities_upsert_replace_and_stay_per_account() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let other = store
+            .upsert_account_from_signal("+15555550200", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        assert!(
+            store
+                .peer_keys_for_aci(&account.id, "aci-1")
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .upsert_peer_identity(&account.id, "aci-1", "+15555550101")
+            .unwrap();
+        assert_eq!(
+            store.peer_keys_for_aci(&account.id, "aci-1").unwrap(),
+            vec!["+15555550101".to_string()]
+        );
+        // The newest observation wins; one row per (account, ACI).
+        store
+            .upsert_peer_identity(&account.id, "aci-1", "+15555550199")
+            .unwrap();
+        assert_eq!(
+            store.peer_keys_for_aci(&account.id, "aci-1").unwrap(),
+            vec!["+15555550199".to_string()]
+        );
+        // Another account's mapping of the same ACI is independent.
+        store
+            .upsert_peer_identity(&other.id, "aci-1", "+15555550300")
+            .unwrap();
+        assert_eq!(
+            store.peer_keys_for_aci(&account.id, "aci-1").unwrap(),
+            vec!["+15555550199".to_string()]
+        );
+        assert_eq!(
+            store.peer_keys_for_aci(&other.id, "aci-1").unwrap(),
+            vec!["+15555550300".to_string()]
+        );
+    }
+
+    /// Contract 1.38 (§4.37): the candidate ladder ranks incoming rows whose
+    /// conversation matches a candidate peer key ahead of outgoing rows at
+    /// the same timestamp, skips rows without a rich record, and ignores
+    /// conversations outside the candidate set. An empty candidate set is
+    /// answered without touching the database.
+    #[test]
+    fn view_once_open_candidates_rank_incoming_first() {
+        use crate::engine::NormalizedRich;
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let peer = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let stranger = store
+            .ensure_conversation(&account.id, "direct", "+15555550999", "contact")
+            .unwrap();
+        let base =
+            |id: &str, conversation_id: &str, direction: &'static str, rich: bool| MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation_id.into(),
+                direction,
+                sender_id: if direction == "outgoing" {
+                    "self".into()
+                } else {
+                    "peer".into()
+                },
+                sender_name: None,
+                mentions_self: false,
+                sent_at: 99,
+                received_at: None,
+                text: Some("burn me".into()),
+                text_bytes: Some(7),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: rich.then_some(NormalizedRich {
+                    view_once: true,
+                    ..NormalizedRich::default()
+                }),
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                sticker: None,
+                admin_deleted: false,
+            };
+        for record in [
+            base("m-incoming", &peer.id, "incoming", true),
+            // Gets a non-marker rich_json from the UPDATE below: the caller's
+            // marker filter must skip it even though the query surfaces it.
+            base("m-plain-rich", &peer.id, "incoming", true),
+            base("m-no-rich", &peer.id, "incoming", false),
+            base("m-outgoing", &peer.id, "outgoing", true),
+            base("m-stranger", &stranger.id, "incoming", true),
+        ] {
+            store
+                .insert_message(&record, None, Some("burn me"), true)
+                .unwrap();
+        }
+        // The non-view-once rich row: same shape, no marker — the caller's
+        // filter (first candidate carrying the marker) must not select it.
+        store
+            .lock_conn()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET rich_json='{\"previews\":[]}' WHERE id='m-plain-rich'",
+                [],
+            )
+            .unwrap();
+
+        let candidates = store
+            .view_once_open_candidates(
+                &account.id,
+                99,
+                &["+15555550101".to_string(), "aci-peer".to_string()],
+            )
+            .unwrap();
+        // Incoming rows first (id order), then the outgoing row. The
+        // non-marker rich row and the rich-less row both surface here —
+        // the marker filter is the caller's job (`apply_view_once_open_sync`
+        // takes the first candidate carrying `viewOnce`/`viewOnceInvalid`),
+        // and the stranger conversation's row never enters the scan.
+        let ids: Vec<&str> = candidates.iter().map(|record| record.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-incoming", "m-plain-rich", "m-outgoing"]);
+
+        // A candidate set that matches nothing (wrong timestamp, wrong keys)
+        // and the empty set both answer empty.
+        assert!(
+            store
+                .view_once_open_candidates(&account.id, 98, &["+15555550101".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .view_once_open_candidates(&account.id, 99, &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Contract 1.38 (§4.37): the first burn clears the body bytes, stamps
+    /// `openedAt` onto the rich record, and keeps the renderable metadata;
+    /// a replay rewrites nothing and reports `changed=false` — exactly-one
+    /// event and fan-out are the caller's contract, this is its foundation.
+    #[test]
+    fn burn_view_once_message_transitions_once_and_keeps_metadata() {
+        use crate::engine::{NormalizedAttachment, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let peer = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let record = MessageRecord {
+            id: "m-view".into(),
+            account_id: account.id.clone(),
+            conversation_id: peer.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 99,
+            received_at: None,
+            text: Some("self-destructing".into()),
+            text_bytes: Some(16),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: vec![NormalizedAttachment {
+                id: "att-view-1".into(),
+                content_type: Some("image/jpeg".into()),
+                filename: Some("snap.jpg".into()),
+                size: Some(2048),
+                width: Some(64),
+                height: Some(32),
+                is_voice_note: false,
+            }],
+            rich: Some(NormalizedRich {
+                view_once: true,
+                ..NormalizedRich::default()
+            }),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            sticker: None,
+            admin_deleted: false,
+        };
+        store
+            .insert_message(&record, None, Some("self-destructing"), true)
+            .unwrap();
+
+        let (burned, changed) = store
+            .burn_view_once_message(&account.id, &peer.id, "m-view", 12345)
+            .unwrap()
+            .expect("the row exists");
+        assert!(changed);
+        assert!(burned.text.is_none());
+        assert_eq!(burned.text_bytes, None);
+        assert_eq!(burned.attachments.len(), 1);
+        assert_eq!(burned.attachments[0].id, "att-view-1");
+        let rich = burned.rich.expect("rich survives the burn");
+        assert_eq!(rich.view_once_opened_at, Some(12345));
+        assert!(rich.view_once);
+
+        let (replayed, changed) = store
+            .burn_view_once_message(&account.id, &peer.id, "m-view", 99999)
+            .unwrap()
+            .expect("the row still exists");
+        assert!(!changed);
+        let rich = replayed.rich.expect("rich survives the replay");
+        assert_eq!(rich.view_once_opened_at, Some(12345));
+        assert_eq!(replayed.text, None);
+
+        // A missing row answers None both for the burn and for its replay.
+        assert!(
+            store
+                .burn_view_once_message(&account.id, &peer.id, "m-absent", 1)
+                .unwrap()
+                .is_none()
+        );
     }
 }

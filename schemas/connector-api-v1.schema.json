@@ -63,6 +63,8 @@
             "messages.sendAdminDelete",
             "messages.markRead",
             "messages.markViewed",
+            "messages.sendViewOnceOpen",
+            "messages.markViewOnceOpened",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
@@ -385,6 +387,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesMarkViewedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendViewOnceOpen" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendViewOnceOpenParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.markViewOnceOpened" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesMarkViewOnceOpenedParams" }
             }
           }
         },
@@ -799,6 +823,32 @@
         }
       }
     },
+    "messagesSendViewOnceOpenParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "senderAci", "timestamp"],
+      "description": "Forward the official view-once open notification (contract revision 1.38): the engine sendViewOnceOpen {account, senderAci, timestamp} face verbatim. Bare passthrough — the desktop flow does not call this directly (messages.markViewOnceOpened orchestrates both legs of the official order); result is receipt-class {status: sent|unknown} and failures degrade to unknown without retry.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "senderAci": { "$ref": "#/$defs/opaqueId" },
+        "timestamp": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The viewed message's upstream timestamp (ms); 0 carries the official unknown-marker semantics."
+        }
+      }
+    },
+    "messagesMarkViewOnceOpenedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageId"],
+      "description": "Burn a viewed view-once message (contract revision 1.38): erase the row body bytes and the connector-owned media files, close open media handles, downgrade the row projection to the viewed placeholder, emit message.viewOnceOpened once, then best-effort orchestrate the official upstream pair (sendViewedReceipt to the author, then sendViewOnceOpen) under receipt-class discipline — failures degrade and are never retried, the burn and the event are unaffected. The desktop's single trigger point for the view-once flow; calling messages.markViewed / messages.sendViewOnceOpen separately is unnecessary (protocol-idempotent if it happens).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "messagesAttachmentsOpenParams": {
       "type": "object",
       "additionalProperties": false,
@@ -902,6 +952,11 @@
           "type": "boolean",
           "default": false,
           "description": "Send the attachment as a voice note (contract revision 1.35): the data URI gains ;voice=true (engine maps it to the official VOICE_MESSAGE flag — the exact wire shape the official desktop recorder emits) and the sent descriptor records isVoiceNote. Requires contentType audio/*; anything else is INVALID_REQUEST before the pending row exists."
+        },
+        "viewOnce": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send the attachment as a view-once message (contract revision 1.38): the upstream send carries viewOnce=true and the sent row's rich record carries viewOnce so the sender's bubble renders the burn UI across restarts. Requires contentType image/* or video/*, an empty caption, no quoteMessageId, and no voiceNote; any violation is INVALID_REQUEST before the pending row exists."
         }
       }
     },
@@ -1226,7 +1281,8 @@
             "conversation.changed",
             "conversation.typing",
             "message.upserted",
-            "message.statusChanged"
+            "message.statusChanged",
+            "message.viewOnceOpened"
           ]
         },
         "data": {
@@ -1330,6 +1386,31 @@
                   "readAt": {
                     "type": "integer",
                     "description": "Contract 1.32: connector wall-clock ms the read/viewed receipt that triggered this event stamped the row. Absent on transitions that did not stamp it."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.viewOnceOpened" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "messageId", "openedAt"],
+                "description": "A view-once message was viewed and its bytes erased (contract 1.38): the body is gone, the media files are deleted, and the row renders as the viewed placeholder. Emitted exactly once per message on the first burn transition — sync-envelope duplicates and replays emit nothing. Deliberately not a message.statusChanged payload: this is the local viewed state, not a peer receipt.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "messageId": { "$ref": "#/$defs/opaqueId" },
+                  "openedAt": {
+                    "type": "integer",
+                    "description": "Connector wall-clock ms the burn stamped the row."
                   }
                 }
               }

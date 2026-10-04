@@ -364,6 +364,12 @@ pub struct NormalizedReceive {
     /// Peer: inbound source or multi-device sent destination.
     #[serde(skip)]
     pub source: Option<String>,
+    /// Envelope `sourceUuid` (contract 1.38): the sender's ACI identity as
+    /// the engine projects it — present on every engine inbound envelope even
+    /// when the legacy `source` field is absent. The service layer records the
+    /// ACI→peer-key mapping from it on ingest (§4.37 peer_identities).
+    #[serde(skip)]
+    pub source_uuid: Option<String>,
     /// Human label from signal-cli envelope.sourceName when present.
     #[serde(skip)]
     pub peer_name: Option<String>,
@@ -479,6 +485,17 @@ pub struct NormalizedRich {
     pub text_styles: Vec<NormalizedTextStyle>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub view_once: bool,
+    /// Metadata-only view-once marker (contract 1.25 shape): the sender
+    /// flagged the message view-once but the payload carried no renderable
+    /// media. The row still burns on the §4.37 flow.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view_once_invalid: bool,
+    /// Connector-set burn stamp (contract 1.38): wall-clock ms the row's
+    /// bytes were erased. Never set by receive parsing — written by the
+    /// service layer's markViewOnceOpened / viewOnceOpen consumption and read
+    /// back off the row to gate media opens and replays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_once_opened_at: Option<u64>,
 }
 
 impl NormalizedRich {
@@ -487,6 +504,8 @@ impl NormalizedRich {
             && self.mentions.is_empty()
             && self.text_styles.is_empty()
             && !self.view_once
+            && !self.view_once_invalid
+            && self.view_once_opened_at.is_none()
     }
 }
 
@@ -576,6 +595,15 @@ pub enum ControlReceive {
     AdminDelete {
         target_author: String,
         target_timestamp: u64,
+    },
+    /// A peer's client notified us their view-once message was viewed on one
+    /// of our own linked devices (contract 1.38): the official
+    /// `syncMessage.viewOnceOpen {senderAci, timestamp}` mirror. `timestamp`
+    /// normalizes to 0 when the envelope omits it (the official unknown
+    /// marker); the service layer drops that shape warn-only.
+    ViewOnceOpen {
+        sender_aci: String,
+        timestamp: u64,
     },
 }
 
@@ -680,6 +708,7 @@ impl NormalizedReceive {
         std::mem::size_of::<Self>()
             + self.account.as_ref().map_or(0, String::len)
             + self.source.as_ref().map_or(0, String::len)
+            + self.source_uuid.as_ref().map_or(0, String::len)
             + self.peer_name.as_ref().map_or(0, String::len)
             + self.group_id.as_ref().map_or(0, String::len)
             + self.text.as_ref().map_or(0, String::len)
@@ -1770,6 +1799,10 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
         .get("viewOnce")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    rich.view_once_invalid = message
+        .get("viewOnceInvalid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if rich.is_empty() {
         return None;
     }
@@ -1880,6 +1913,7 @@ fn normalize_receive(params: &Value) -> Result<Option<NormalizedReceive>, Engine
         .account
         .iter()
         .chain(normalized.source.iter())
+        .chain(normalized.source_uuid.iter())
         .chain(normalized.group_id.iter())
         .any(|id| id.chars().count() > MAX_RECEIVE_ID_CHARS)
     {
@@ -2060,6 +2094,12 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(64).collect::<String>());
+    let source_uuid = envelope
+        .get("sourceUuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let make = |timestamp: Option<u64>,
                 content_kind: &'static str,
@@ -2077,6 +2117,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         account_present,
         account: account.clone(),
         source,
+        source_uuid: source_uuid.clone(),
         peer_name: peer_name.clone(),
         group_id,
         text: text.as_ref().map(|value| value.value.clone()),
@@ -2114,6 +2155,48 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
 
     // Multi-device: phone/other linked device sent a text → show as our outgoing.
     if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
+        // Our own linked device received a peer's view-once open notification
+        // (contract 1.38): the service layer resolves the target row across
+        // conversations, so no session routing applies. A missing senderAci
+        // has no resolvable target — drop as skip rather than invent one.
+        if let Some(open) = sync.get("viewOnceOpen").and_then(Value::as_object) {
+            let sender_aci = open
+                .get("senderAci")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+            let Some(sender_aci) = sender_aci else {
+                return Ok(make(
+                    timestamp,
+                    "syncMessage",
+                    "skip",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                ));
+            };
+            let open_timestamp = open.get("timestamp").and_then(Value::as_u64).unwrap_or(0);
+            return Ok(make(
+                timestamp,
+                "control",
+                "incoming",
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                Some(ControlReceive::ViewOnceOpen {
+                    sender_aci,
+                    timestamp: open_timestamp,
+                }),
+            ));
+        }
         if let Some(sent) = sync.get("sentMessage").and_then(Value::as_object) {
             // JsonUnwrapped dataMessage fields sit on sentMessage itself.
             let text = data_message_text(sent);
@@ -2664,6 +2747,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
@@ -3003,6 +3087,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
@@ -3049,6 +3134,7 @@ mod tests {
             account_present: true,
             account: Some("+15555550100".into()),
             source: Some("+15555550101".into()),
+            source_uuid: None,
             peer_name: None,
             group_id: None,
             text: Some("a".repeat(MAX_INBOUND_TEXT_BYTES)),
@@ -3569,5 +3655,139 @@ mod tests {
         assert_eq!(normalized.direction, "outgoing");
         let rich = normalized.rich.expect("rich payload");
         assert_eq!(rich.previews[0].url, "https://example.com");
+    }
+
+    /// Contract 1.38 (§4.37): a peer's view-once open notification mirrors to
+    /// our own devices as `syncMessage.viewOnceOpen` — projected as an
+    /// incoming control addressed to no conversation (the service layer
+    /// resolves the target row by (author ACI, timestamp)).
+    #[test]
+    fn sync_view_once_open_projects_as_incoming_control() {
+        let normalized = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "viewOnceOpen": {
+                        "senderAci": "11111111-1111-1111-1111-111111111111",
+                        "timestamp": 1726999999000u64,
+                    },
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.content_kind, "control");
+        assert_eq!(normalized.direction, "incoming");
+        assert!(normalized.source.is_none());
+        let Some(ControlReceive::ViewOnceOpen {
+            sender_aci,
+            timestamp,
+        }) = normalized.control
+        else {
+            panic!("expected a view-once open control");
+        };
+        assert_eq!(sender_aci, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(timestamp, 1726999999000);
+    }
+
+    /// Contract 1.38: an open sync without a resolvable author has no target
+    /// the service layer could name — dropped as skip before persistence.
+    #[test]
+    fn sync_view_once_open_without_sender_aci_is_skip() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": { "viewOnceOpen": { "timestamp": 1726999999000u64 } },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.content_kind, "syncMessage");
+        assert_eq!(normalized.direction, "skip");
+        assert!(normalized.control.is_none());
+    }
+
+    /// Contract 1.38: the open sync's timestamp is the official unknown
+    /// marker (0) when the engine omits it — the service layer drops those.
+    #[test]
+    fn sync_view_once_open_defaults_missing_timestamp_to_zero() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "viewOnceOpen": { "senderAci": "11111111-1111-1111-1111-111111111111" },
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        let Some(ControlReceive::ViewOnceOpen { timestamp, .. }) = normalized.control else {
+            panic!("expected a view-once open control");
+        };
+        assert_eq!(timestamp, 0);
+    }
+
+    /// Contract 1.38 (§4.36): a metadata-only view-once marker
+    /// (`viewOnceInvalid`) parses onto the rich payload and marks the row
+    /// burnable even without renderable media. A dataMessage whose every
+    /// other payload is default keeps the §4.20 skip routing — the marker
+    /// alone does not manufacture a row.
+    #[test]
+    fn data_message_view_once_invalid_parses() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let rich = normalize(json!({ "message": "gone", "viewOnceInvalid": true }))
+            .rich
+            .expect("rich payload");
+        assert!(!rich.view_once);
+        assert!(rich.view_once_invalid);
+        assert!(rich.view_once_opened_at.is_none());
+
+        let bare = normalize(json!({ "viewOnceInvalid": true }));
+        assert_eq!(bare.direction, "skip");
+        assert!(bare.rich.is_none());
+    }
+
+    /// Contract 1.38 (§4.37): every receive envelope's `sourceUuid` is
+    /// captured — the raw author identity the service layer records into
+    /// `peer_identities` so later open syncs can resolve their target.
+    #[test]
+    fn receive_captures_source_uuid() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "sourceUuid": "11111111-1111-1111-1111-111111111111",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            normalized.source_uuid.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        // A normalized receive projected before contract 1.38 (or from an
+        // envelope without one) leaves the field empty.
+        let bare = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(bare.source_uuid.is_none());
     }
 }

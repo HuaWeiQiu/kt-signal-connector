@@ -217,6 +217,44 @@ def watch_load_marker():
 threading.Thread(target=watch_load_marker, daemon=True).start()
 
 
+# Contract 1.38 test hook: runtime envelope injection. The connector owns the
+# only JSON-RPC channels (the engine socket is private, ADR 0002), so a test
+# cannot call the engine's `emitEnvelope` face directly; it instead writes
+# `.fixture-emit-envelopes.json` holding {"envelopes": [...]} into this data
+# directory and each envelope is delivered verbatim to the receiving account
+# as a `receive` notification. The marker is deleted after delivery so a
+# later write injects again.
+EMIT_MARKER = SIGNAL_DATA_DIR / ".fixture-emit-envelopes.json"
+
+
+def watch_emit_marker():
+    while True:
+        try:
+            spec = json.loads(EMIT_MARKER.read_text())
+        except (OSError, ValueError):
+            time.sleep(0.05)
+            continue
+        envelopes = spec.get("envelopes") if isinstance(spec, dict) else None
+        if isinstance(envelopes, list) and envelopes:
+            account = spec.get("account") or receiving_account()
+            for envelope in envelopes:
+                emit_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "receive",
+                        "params": {"account": account, "envelope": envelope},
+                    }
+                )
+        try:
+            EMIT_MARKER.unlink()
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+
+threading.Thread(target=watch_emit_marker, daemon=True).start()
+
+
 def emit_json(value):
     with WRITE_LOCK:
         print(json.dumps(value, separators=(",", ":")), flush=True)
@@ -513,6 +551,20 @@ for line in sys.stdin:
         # (engine-exit path). Sentinel 425 keeps the sentinel space disjoint
         # from remoteDelete 421 / reaction 423 / pin 424.
         if 425 in (params.get("timestamps") or []):
+            os._exit(23)
+        result = {}
+    elif method == "sendViewOnceOpen":
+        # Contract 1.38 view-once open face: same dispatch-recording
+        # discipline as `send`: the exact upstream params, so tests can assert
+        # the {account, senderAci, timestamp} contract.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # One-shot crash with the mutating call in flight: the open sync may
+        # or may not have reached the server, which is the indeterminate case
+        # (engine-exit path). Sentinel 426 keeps the sentinel space disjoint
+        # from remoteDelete 421 / reaction 423 / pin 424 / receipt 425.
+        if params.get("timestamp") == 426:
             os._exit(23)
         result = {}
     elif method == "getStickerPackManifest":

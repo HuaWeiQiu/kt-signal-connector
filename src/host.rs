@@ -30,13 +30,13 @@ use crate::service::{
     ConversationsSetPinnedParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1180,6 +1180,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                 params.text,
                                 params.quote_message_id,
                                 params.voice_note,
+                                params.view_once,
                             )
                             .await
                         {
@@ -1475,6 +1476,42 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // View-once faces (contract revision 1.38): the bare open-sync
+        // passthrough answers {status: sent|unknown} like the receipt face;
+        // the burn trigger runs the local burn first and reports the
+        // best-effort upstream pair through the same receipt-class shape.
+        "messages.sendViewOnceOpen" => {
+            match serde_json::from_value::<MessagesSendViewOnceOpenParams>(request.params) {
+                Ok(params) => match runtime.send_view_once_open(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendViewOnceOpen params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.markViewOnceOpened" => {
+            match serde_json::from_value::<MessagesMarkViewOnceOpenedParams>(request.params) {
+                Ok(params) => match runtime.mark_view_once_opened(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.markViewOnceOpened params",
+                        false,
+                    ),
+                ),
+            }
+        }
         // Media ingest triple (ADR 0002): local chunked streaming behind the
         // `--media-ingest` launcher opt-in. Without it the service answers
         // CAPABILITY_UNAVAILABLE before any other check; with it, params
@@ -1718,6 +1755,26 @@ where
                 &HostEvent::new(
                     "conversation.typing",
                     json!({ "accountId": account_id, "conversationId": conversation_id, "action": action }),
+                ),
+            )
+            .await
+        }
+        HostSideEvent::MessageViewOnceOpened {
+            account_id,
+            conversation_id,
+            message_id,
+            opened_at,
+        } => {
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "message.viewOnceOpened",
+                    json!({
+                        "accountId": account_id,
+                        "conversationId": conversation_id,
+                        "messageId": message_id,
+                        "openedAt": opened_at,
+                    }),
                 ),
             )
             .await

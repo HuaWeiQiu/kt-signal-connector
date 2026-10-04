@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.37 (2026-10-04)
+- Contract revision: 1.38 (2026-10-04)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1400,6 +1400,104 @@ mutating classification, and §4.12 settlement (upstream-timestamp completion,
 `sendSticker` discipline verbatim. Bounds: `quoteMessageId` is the `opaqueId` family, the same
 schema bound the text face carries.
 
+### 4.36 Outbound view-once: attachments.send `viewOnce` + messages.sendViewOnceOpen (contract revision 1.38, 2026-10-04)
+
+The send-side view-once face: a view-once media message our client composes, plus the bare
+open-notification passthrough the official `sendViewOnceOpenSync` mirrors. Upstream extensions
+are provided by `kt-signal-engine` (behavior pinned to official Signal-Desktop view-once send
+semantics); against stock `signal-cli 0.14.8` the new keys and method fail upstream and surface
+through the existing error mapping — the declared swap boundary of §4.29.
+
+- `messages.attachments.send` (§4.12) gains an optional `viewOnce: boolean` (default false).
+  Constraints, all deterministic `INVALID_REQUEST` before the pending row exists: `viewOnce`
+  requires `contentType` to be `image/*` or `video/*` (the official view-once faces are photos
+  and videos only), requires `caption` to be empty, forbids `quoteMessageId`, and forbids
+  `voiceNote` (audio is never view-once; the single-attachment structure of §4.12 already makes
+  the combination unambiguous). A validated send projects a pending row whose rich record carries
+  `viewOnce: true`, so the sender's own bubble renders the view-once UI across restarts, and the
+  upstream `send` params carry `"viewOnce": true` at the top level beside the attachment data URI
+  (the key is absent when the flag is false — the wire shape stays byte-identical to the 1.13
+  send for every existing caller). Lane, account-scoped mutating classification, and §4.12
+  settlement are unchanged.
+- `messages.sendViewOnceOpen`: params `accountId`, `senderAci` (`opaqueId` family), `timestamp`
+  (u64 ms). Send lane, account-scoped mutating (the reaction-class write-lane mutex and delete
+  drain barrier verbatim). The connector resolves the account (the upstream key is the resolved
+  `signal_account`, never the host's opaque id) and forwards `{account, senderAci, timestamp}`
+  to the engine `sendViewOnceOpen`. Result follows the receipt precedent (§4.29):
+  `{"status": "sent"}` / `{"status": "unknown"}` — any upstream failure (engine down, method
+  absent, unknown outcome) degrades to `"unknown"` and is never retried (AGENTS.md). Bounds
+  (early `INVALID_REQUEST`, before any upstream call): `senderAci` non-empty, bounded by the
+  `opaqueId` length family; `timestamp` is u64 (out-of-range fails at params deserialization).
+  `ACCOUNT_NOT_FOUND` keeps its existing meaning when the account does not resolve.
+
+Handshake `capabilities` gains `view-once`. This face is a bare passthrough: the connector adds
+no queue, no dedup, and no persistence of its own. The desktop-facing orchestration that wraps
+it lives in §4.37.
+
+### 4.37 View-once burn: viewOnceOpen consumption + erasure + messages.markViewOnceOpened (contract revision 1.38, 2026-10-04)
+
+The receive-side view-once face: consuming a peer's open notification, erasing the viewed bytes,
+and the desktop-facing trigger that orchestrates both legs of the official view-once flow. The
+engine (kt-signal-engine) already projects the official `syncMessage.viewOnceOpen
+{senderAci, timestamp}` — the sender's client notifies every linked device when the recipient
+viewed the message — and re-delivers the same sync envelope once per resync cycle, so exactly-once
+is the connector's job.
+
+- Receive projection: the engine's sync branch parses `viewOnceOpen`; a missing `senderAci`
+  drops the envelope; an absent `timestamp` normalizes to 0 (the "unknown" marker). The
+  connector receives it as a new control receive kind `viewOnceOpen` (direction "incoming",
+  no session routing) and intercepts it in the control pipeline after account resolution but
+  before the `(kind, peer_key)` conversation routing — the sync envelope's own source is our
+  account, so generic routing would misroute it into a self-conversation.
+- Target ladder: `timestamp == 0` warns and drops. The candidate peer-key list is the literal
+  `senderAci` plus every stored identity that maps to it (a new bounded `peer_identities` table
+  captures the ACI→peer-key mapping from ingest from 1.38 forward — one row per ACI,
+  primary-keyed `(account_id, aci)`, written only when an incoming envelope's `sourceUuid`
+  differs from the stored peer key; rows before 1.38 rely on the ladder's fallbacks). The
+  candidate query joins conversations, caps at 16 rows (incoming-conversation rows first), and
+  takes the first row whose rich record carries `viewOnce: true`. No match warns and drops —
+  warn-only, no state, no error: the official clients stage open syncs until the message
+  arrives, this connector deliberately does not (no ViewOnceOpenSyncs staging; a sync that
+  arrives out of order is dropped and the sender's resync cycle re-delivers it).
+- Idempotency and the event: the first transition marks the row opened, clears the body bytes
+  (the row's projection downgrades to a viewed placeholder — the bytes are no longer available),
+  deletes the media file and preview under the connector-owned attachment directories, closes
+  any open media handle for the message, and emits exactly one new host event
+  `message.viewOnceOpened {accountId, conversationId, messageId, openedAt}`. Duplicate sync
+  envelopes (the engine's pinned-rev resync delivers the same envelope twice) find no
+  transition and emit nothing. The event is a local-viewed notice, deliberately not folded into
+  `message.statusChanged` (that carries peer receipts, not our own view state).
+- `messages.markViewOnceOpened`: params `accountId`, `conversationId`, `messageId`. The
+  connector resolves the target through the standard ladder (missing row `MESSAGE_NOT_FOUND`).
+  A row that is not a view-once message (`rich.viewOnce` absent — valid or invalid-flagged rows
+  both qualify) answers deterministic `INVALID_REQUEST`. The burn runs first: on a fresh
+  transition it erases the row bytes and media exactly as above and emits
+  `message.viewOnceOpened`; on a replay (already opened) it is a trivial `{"status": "sent"}`
+  no-op with no event and no upstream fan-out. After a successful burn the connector
+  best-effort sends the official notification pair, in the official order, under the §4.29
+  receipt discipline (any failure degrades `{"status": "unknown"}`, never retried; the burn and
+  the event are unaffected): for an incoming row with a resolvable author, engine
+  `sendViewedReceipt {recipient, timestamps: [sentAt]}`; then engine `sendViewOnceOpen
+  {senderAci, timestamp}` where `senderAci` is the author for incoming rows and our own account
+  for outgoing rows (the engine resolves the registered number to the own ACI). A group row
+  whose author cannot be resolved skips the receipt leg (the §4.28 boundary) but still burns.
+- Orchestration ownership (the §4.4 division, recorded): `messages.markViewOnceOpened` is the
+  desktop's single trigger point; the connector internally orchestrates the VIEWED receipt and
+  the ViewOnceOpen notification in the official order. The desktop does not need to call
+  `messages.markViewed` or `messages.sendViewOnceOpen` itself — a stray call is harmless
+  (protocol-idempotent) but sits outside the desktop flow; the bare faces of §4.29/§4.36 remain
+  available.
+- Media reads: `attachments.open` on a view-once row whose `viewOnceOpenedAt` is set answers
+  `UPSTREAM_ERROR` with the exact wording of the not-downloaded path, so an opened view-once
+  attachment is indistinguishable from one the engine never fetched — no new error surface
+  leaks the state transition. `viewOnceInvalid: true` rows (the metadata-only §4.20 marker) are
+  included in byte erasure the same way.
+
+No store schema-version bump: the `peer_identities` table is additive (`CREATE TABLE IF NOT
+EXISTS` runs on every open), and the row-level erasure reuses the existing rich/body columns.
+Bounds stay structural: candidate cap 16, peer-key list bounded by the contacts table, media
+deletion reuses the §4.12-best-effort discipline (missing files are success).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -1419,6 +1517,13 @@ Rules:
   §4.33 pinned-conversation list at 128 entries and the §4.34 sticker-pack sync list at 256
   entries — cloud order preserved, overflow truncated, entries missing the identity field
   dropped; the cloud record remains the source of truth and the connector persists neither list.
+- view-once erasure (§4.37) covers only the channels this connector can see: the row body bytes
+  in its store, the media files under the attachment directories it owns, and its own handle
+  table. The engine's protocol store and any CDN blob are outside connector reach — the same
+  receiving-side scope as the official view-once erase. No ViewOnceOpenSyncs staging: an open
+  sync that arrives before its message is warn-only dropped, and the sender's resync cycle
+  re-delivers it. `peer_identities` is bounded (one row per ACI, contacts scale); `senderUuid`
+  capture applies from 1.38 forward and earlier rows fall back through the §4.37 ladder.
 - `method=receive` is normalized as an event.
 - stderr is redacted diagnostic input, never protocol input.
 - read-only requests may be retried under policy; mutating requests are never retried automatically
