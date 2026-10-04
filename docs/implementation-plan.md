@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.36 (2026-10-04)
+- Contract revision: 1.37 (2026-10-04)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1324,6 +1324,82 @@ pin writes, and the engine projects no inbound pin event; the host pulls with
 persists no pinned list — the cloud record plus the desktop's own cache is the whole story; no
 new on-disk face, no store schema change.
 
+### 4.34 Sticker pack sync: stickerPacks.getSyncs + stickerPacks.setSync (contract revision 1.37, 2026-10-04)
+
+The account-scoped sticker-pack install face of contract 1.37: two host methods that read and
+write the official per-account sticker-pack sync records. Source of truth is the Signal Storage
+Service `StickerPackRecord` set (official mechanism): an installed pack is the record
+`packId + packKey + position`, an uninstall is the tombstone `packId + deletedAtTimestamp`
+(the engine stamps its own clock), and a re-install/update inserts the new key while the old
+key's record is deleted — the connector sees only the projected record list and adds no
+semantics of its own. Unlike the §4.32 browse face these records are account state: they live
+in the account's storage session and ride the account's engine.
+
+- `stickerPacks.getSyncs`: params `accountId`. Result `{packs: [{packId, packKey|null,
+  position|null, deletedAtTimestampMs|null}]}` — installed packs carry key and position,
+  uninstalled packs the tombstone timestamp. Read lane, non-mutating.
+- `stickerPacks.setSync`: params `accountId`, `packId`, `packKey` (optional), `installed`
+  (boolean, required), `position` (optional u32). Result: the same `{packs: [...]}` projection
+  read back after the upstream write, so the host sees the post-write cloud state instead of a
+  local echo. Send lane, account-scoped mutating (the reaction-class write-lane mutex and
+  delete drain barrier verbatim; an unknown mutating outcome answers `SEND_OUTCOME_UNKNOWN`
+  and is never retried, per AGENTS.md).
+
+Engine wire (frozen shapes, kt-signal-engine): `getStickerPackSyncs {account}` and
+`setStickerPackSync {account, packId, packKey|null, installed, position|null}`. Engine
+semantics: `installed=true` must carry a valid pack key (exactly 32 bytes); `installed=false`
+ignores `packKey`/`position` entirely and writes the tombstone with the engine's clock — the
+connector forwards null for both in that case, so the wire shape is deterministic regardless of
+what the caller supplied.
+
+Connector responsibilities are strictly bounded: forward, bounds-check, and resolve the account
+context (the account maps to its owning proxy group and engine through the normal routing; the
+upstream key is the resolved `signal_account`, never the host's opaque id). The connector does
+not interpret install semantics, keeps no pack list, and persists nothing — the cloud record
+plus the desktop's own cache is the whole story; no new on-disk face, no store schema change.
+
+Bounds (early `INVALID_REQUEST`, deterministic, before any upstream call): `packId` exactly 32
+hex characters (the §4.32 browse-face shape, `isPackIdValid`-aligned), `packKey` when present
+standard base64 decoding to exactly 32 bytes (44 padded characters), `installed` required
+boolean, `position` within the u32 range (out-of-range values fail at params deserialization),
+and the returned `packs` list is capped at 256 entries (KT bound — the official clients apply
+no explicit cap; the connector truncates beyond 256 to keep one host frame bounded and records
+the truncation in the §5 boundary notes). Entries missing the identity field (`packId`) drop;
+the optional fields project leniently beside it. Engine errors pass through structurally: the
+`STORAGE_*` family (`STORAGE_UNAVAILABLE` / `STORAGE_READ_FAILED` / `STORAGE_WRITE_FAILED`)
+maps verbatim with `retryable=true` — the allowlist and schema already declare these codes, the
+§4.4 classification tests stay total over the same set, and no new codes are introduced.
+Engine-down and method-absent follow the §4.32 mapping (`RUNTIME_NOT_RUNNING` /
+`CAPABILITY_UNAVAILABLE`). Handshake `capabilities` gains `sticker-pack-sync`.
+
+### 4.35 Sticker reply: sendSticker quote coexistence (contract revision 1.37, 2026-10-04)
+
+`messages.sendSticker` gains the optional `quoteMessageId` parameter: a sticker message that
+quotes one earlier message in the same conversation — the official `StagedStickerReply` shape
+(one upstream `send` carrying the sticker object and the quote identity together). The receive
+side needs no new face: an incoming sticker with a quote already lands as the ordinary sticker
+projection beside the ordinary quote projection (both engine normalizer fields have been
+independent since 1.15/1.31), so this section is send-side only.
+
+Resolution reuses the `dispatch_send` ladder verbatim (§4.4 wire order, no new errors): the
+quote targets a row in the same conversation; an unknown target answers `MESSAGE_NOT_FOUND`;
+a target whose Signal author is not established (unaddressable outgoing state, group incoming
+row, system row) answers the deterministic `INVALID_REQUEST`. The upstream keys are
+`quoteTimestamp` (the quoted row's Signal timestamp) and `quoteAuthor` at the top level of the
+`send` params beside the `sticker` object — the same wire keys the text face uses, because the
+quote belongs to the send, not to the sticker. Absent `quoteMessageId` is exactly the 1.35
+behavior (an unquoted sticker).
+
+Ordering discipline (a quote is part of send validation): resolution runs after the
+idempotency short-circuit and addressing resolution and before the pending row is inserted — a
+rejected quote leaves nothing behind, so the same `clientRequestId` stays a fresh
+(re-validated) request, while a replay of an already-inserted row keeps returning the existing
+row without re-resolving. The pending row records `quoteMessageId`; lane, account-scoped
+mutating classification, and §4.12 settlement (upstream-timestamp completion,
+`SEND_OUTCOME_UNKNOWN` with no automatic retry, failure marks the same row) are the 1.35
+`sendSticker` discipline verbatim. Bounds: `quoteMessageId` is the `opaqueId` family, the same
+schema bound the text face carries.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -1339,6 +1415,10 @@ Rules:
 - stdin writes one JSON-RPC object per line.
 - stdout is incrementally parsed with a hard line-size limit.
 - response IDs are matched to a bounded pending map.
+- cloud-backed list projections are capped connector-side so one host frame stays bounded: the
+  §4.33 pinned-conversation list at 128 entries and the §4.34 sticker-pack sync list at 256
+  entries — cloud order preserved, overflow truncated, entries missing the identity field
+  dropped; the cloud record remains the source of truth and the connector persists neither list.
 - `method=receive` is normalized as an event.
 - stderr is redacted diagnostic input, never protocol input.
 - read-only requests may be retried under policy; mutating requests are never retried automatically

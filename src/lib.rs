@@ -43,7 +43,8 @@ pub const PHASE2_CAPABILITIES: &[&str] = &methods::METHOD_NAMES;
 /// The handshake `capabilities` payload: every dispatchable method name in
 /// table order followed by the feature capability tags (contract revision
 /// 1.34: `send-receipts`; contract revision 1.35: `send-sticker`; contract
-/// revision 1.36: `sticker-pack-browse`, `conversation-pin-sync`).
+/// revision 1.36: `sticker-pack-browse`, `conversation-pin-sync`; contract
+/// revision 1.37: `sticker-pack-sync`).
 pub fn advertised_capabilities() -> Vec<&'static str> {
     [&methods::METHOD_NAMES[..], methods::FEATURE_CAPABILITIES].concat()
 }

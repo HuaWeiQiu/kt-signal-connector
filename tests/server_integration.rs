@@ -3399,6 +3399,9 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "conversations.getPinned",
         "conversations.setPinned",
         "conversation-pin-sync",
+        "stickerPacks.getSyncs",
+        "stickerPacks.setSync",
+        "sticker-pack-sync",
     ] {
         assert!(
             capabilities
@@ -4293,6 +4296,361 @@ async fn sticker_and_pin_methods_surface_engine_errors() {
             .count(),
         1,
         "an unknown pin outcome is never retried: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.37: the §4.34 sticker-pack sync faces (cloud read,
+/// install write with read-back, uninstall tombstone with the ignored
+/// key/position dropped, local bounds, structured STORAGE_* passthrough, the
+/// crash-with-in-flight-write unknown outcome and its no-retry discipline)
+/// and the §4.35 sticker-quote face (sendSticker quoteMessageId resolves
+/// through the same ladder as the text face — upstream quote keys beside the
+/// sticker object; a rejected quote leaves no row behind).
+#[tokio::test]
+async fn sticker_pack_sync_and_sticker_quote_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-PackSync" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let sync_calls = || {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("installed").is_some())
+            .collect::<Vec<_>>()
+    };
+
+    // Initial read: one installed pack (key + position) and one tombstone,
+    // projected structurally.
+    let initial = request(
+        &mut client,
+        "sync-read",
+        "stickerPacks.getSyncs",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let packs = initial["result"]["packs"].as_array().unwrap();
+    assert_eq!(packs.len(), 2);
+    assert_eq!(packs[0]["packId"], "abcdef0123456789abcdef0123456789");
+    assert_eq!(
+        packs[0]["packKey"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    );
+    assert_eq!(packs[0]["position"], 0);
+    assert!(packs[0]["deletedAtTimestampMs"].is_null());
+    assert_eq!(packs[1]["packId"], "11111111111111111111111111112222");
+    assert!(packs[1]["packKey"].is_null());
+    assert!(packs[1]["position"].is_null());
+    assert_eq!(packs[1]["deletedAtTimestampMs"], 1727000000000u64);
+
+    // Install a new pack: the result is the post-write cloud state read back
+    // with the new record first, and the exact upstream contract landed on
+    // the wire (resolved account, key, position, installed).
+    let new_pack_id = "23456789abcdef0123456789abcdef01";
+    let installed = request(
+        &mut client,
+        "sync-install",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": new_pack_id,
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "installed": true,
+            "position": 3
+        }),
+    )
+    .await;
+    let packs = installed["result"]["packs"].as_array().unwrap();
+    assert_eq!(packs.len(), 3);
+    assert_eq!(packs[0]["packId"], new_pack_id);
+    assert_eq!(
+        packs[0]["packKey"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    );
+    assert_eq!(packs[0]["position"], 3);
+    assert!(packs[0]["deletedAtTimestampMs"].is_null());
+    let calls = sync_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["account"], "+15555550100");
+    assert_eq!(calls[0]["packId"], new_pack_id);
+    assert_eq!(
+        calls[0]["packKey"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    );
+    assert_eq!(calls[0]["installed"], true);
+    assert_eq!(calls[0]["position"], 3);
+
+    // Uninstall: the tombstone clears key and position (the engine stamps
+    // its own clock), and the connector forwards nulls — the caller-supplied
+    // packKey/position decoys are dropped, never forwarded.
+    let uninstalled = request(
+        &mut client,
+        "sync-uninstall",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": new_pack_id,
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "installed": false,
+            "position": 3
+        }),
+    )
+    .await;
+    let packs = uninstalled["result"]["packs"].as_array().unwrap();
+    assert_eq!(packs.len(), 3);
+    let tombstone = packs
+        .iter()
+        .find(|entry| entry["packId"] == new_pack_id)
+        .unwrap();
+    assert!(tombstone["packKey"].is_null());
+    assert!(tombstone["position"].is_null());
+    assert!(tombstone["deletedAtTimestampMs"].as_u64().unwrap() > 0);
+    let calls = sync_calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[1]["packId"], new_pack_id);
+    assert_eq!(calls[1]["installed"], false);
+    assert!(calls[1]["packKey"].is_null());
+    assert!(calls[1]["position"].is_null());
+
+    // Local bounds reject before any upstream call: the 1.35 even-hex pack
+    // id shape is not valid here (32 hex exactly), an install without a key
+    // is refused, and a key decoding to 16 bytes fails the 32-byte rule.
+    let wrong_id = request(
+        &mut client,
+        "sync-wrong-id",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": "abcdef01",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "installed": true
+        }),
+    )
+    .await;
+    assert_eq!(wrong_id["error"]["code"], "INVALID_REQUEST");
+    let missing_key = request(
+        &mut client,
+        "sync-missing-key",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": new_pack_id,
+            "installed": true
+        }),
+    )
+    .await;
+    assert_eq!(missing_key["error"]["code"], "INVALID_REQUEST");
+    let short_key = request(
+        &mut client,
+        "sync-short-key",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": new_pack_id,
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "installed": true
+        }),
+    )
+    .await;
+    assert_eq!(short_key["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(sync_calls().len(), 2, "no upstream call for the rejects");
+
+    // Structured engine errors pass through verbatim (retryable): the
+    // fixture answers them on the all-f and all-0 pack ids.
+    let storage_down = request(
+        &mut client,
+        "sync-storage-down",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": "ffffffffffffffffffffffffffffffff",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "installed": true
+        }),
+    )
+    .await;
+    assert_eq!(storage_down["error"]["code"], "STORAGE_UNAVAILABLE");
+    assert_eq!(storage_down["error"]["retryable"], true);
+    let storage_read = request(
+        &mut client,
+        "sync-storage-read",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": "00000000000000000000000000000000",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "installed": true
+        }),
+    )
+    .await;
+    assert_eq!(storage_read["error"]["code"], "STORAGE_READ_FAILED");
+    assert_eq!(storage_read["error"]["retryable"], true);
+
+    // Crash with the mutating write in flight (fixture pack id all-1,
+    // os._exit(30)): the request answers SEND_OUTCOME_UNKNOWN and nothing is
+    // retried — after recovery the log shows exactly one crash call.
+    let crash = request(
+        &mut client,
+        "sync-crash",
+        "stickerPacks.setSync",
+        json!({
+            "accountId": account_id,
+            "packId": "11111111111111111111111111111111",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "installed": true
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-sync", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid);
+    let crash_calls = sync_calls();
+    assert_eq!(
+        crash_calls
+            .iter()
+            .filter(|call| call["packId"] == "11111111111111111111111111111111")
+            .count(),
+        1,
+        "an unknown sync outcome is never retried: {crash_calls:?}"
+    );
+
+    // §4.35 sticker quote: a text send materializes the conversation and the
+    // quoted row; the sticker send quoting it carries the upstream quote keys
+    // beside the sticker object and the row records the target.
+    let setup = request(
+        &mut client,
+        "quote-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "quote me",
+            "clientRequestId": "sticker-quote-setup"
+        }),
+    )
+    .await;
+    let quoted_message_id = setup["result"]["id"].as_str().unwrap().to_string();
+    let conversation_id = setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let quoted = request(
+        &mut client,
+        "sticker-quote",
+        "messages.sendSticker",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "sticker-quote-1",
+            "packId": "abcdef01",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "stickerId": 7,
+            "image": {
+                "dataBase64": "iVBORw0KGgo=",
+                "sizeBytes": 8,
+                "contentType": "image/png"
+            },
+            "quoteMessageId": quoted_message_id
+        }),
+    )
+    .await;
+    assert_eq!(quoted["result"]["status"], "sent");
+    assert_eq!(quoted["result"]["quoteMessageId"], quoted_message_id);
+    let sticker_calls: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("sticker").is_some())
+        .collect();
+    let quote_call = sticker_calls
+        .iter()
+        .find(|call| call["sticker"]["packId"] == "abcdef01")
+        .expect("the quoted sticker send reaches the upstream");
+    assert_eq!(quote_call["quoteTimestamp"], 99);
+    assert_eq!(quote_call["quoteAuthor"], "+15555550100");
+    assert!(
+        quote_call.get("message").is_none(),
+        "a quoted sticker send still carries no message body: {quote_call}"
+    );
+
+    // An unknown quote target answers MESSAGE_NOT_FOUND during validation —
+    // no upstream call, no pending row left behind.
+    let rejected = request(
+        &mut client,
+        "sticker-quote-missing",
+        "messages.sendSticker",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "sticker-quote-2",
+            "packId": "abcdef01",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "stickerId": 8,
+            "image": {
+                "dataBase64": "iVBORw0KGgo=",
+                "sizeBytes": 8,
+                "contentType": "image/png"
+            },
+            "quoteMessageId": "no-such-message"
+        }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], "MESSAGE_NOT_FOUND");
+    assert_eq!(rejected["error"]["retryable"], false);
+    let listed = request(
+        &mut client,
+        "list-after-reject",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row["clientRequestId"] != "sticker-quote-2"),
+        "a rejected quote leaves no row: {rows:?}"
     );
 
     drop(client);

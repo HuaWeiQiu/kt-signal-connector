@@ -21,8 +21,9 @@ use crate::service::{
     ConversationsSetPinnedParams, GroupDetails, HostSideEvent, MediaChunkView, MediaCloseView,
     MediaIngest, MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations,
     PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
-    StickerManifestEntry, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, account_limit_error, pinned_conversations_result, store_get_group,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    account_limit_error, pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
 };
@@ -1488,13 +1489,14 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
-    /// messages.sendSticker (contract revision 1.35, §4.31): the §4.12
-    /// attachment shape end to end — local prepare under the service lock
-    /// (addressing resolved like `messages.attachments.send`, exactly one
-    /// form), upstream `send` with the `sticker` object via the shared
-    /// `dispatch_prepared` settlement (success completes the pending row with
-    /// the upstream timestamp; an unknown mutating outcome answers
-    /// SEND_OUTCOME_UNKNOWN and is never retried).
+    /// messages.sendSticker (contract revision 1.35, §4.31; quote face 1.37,
+    /// §4.35): the §4.12 attachment shape end to end — local prepare under
+    /// the service lock (addressing resolved like `messages.attachments.send`,
+    /// exactly one form; the optional quote resolved through the shared
+    /// ladder before the pending row), upstream `send` with the `sticker`
+    /// object via the shared `dispatch_prepared` settlement (success completes
+    /// the pending row with the upstream timestamp; an unknown mutating
+    /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried).
     pub async fn send_sticker(
         &self,
         params: MessagesSendStickerParams,
@@ -1514,6 +1516,7 @@ impl RuntimeSupervisor {
                 sticker_id,
                 emoji,
                 image,
+                quote_message_id,
             } = params;
             let target = match (&conversation_id, &kind, &peer_key, &peer_title) {
                 (Some(conversation_id), None, None, None) => {
@@ -1543,6 +1546,7 @@ impl RuntimeSupervisor {
                 sticker_id,
                 emoji.as_deref(),
                 &image,
+                quote_message_id.as_deref(),
             )?
         };
         self.dispatch_prepared(&engine, prepared).await
@@ -1653,6 +1657,68 @@ impl RuntimeSupervisor {
             Ok(result) => Ok(pinned_conversations_result(
                 result
                     .get("pinned")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account
+    /// resolution then the read-only engine call; the record list projects
+    /// straight from the engine result with the KT entry cap (§4.34).
+    pub async fn get_sticker_pack_syncs(
+        &self,
+        params: StickerPackGetSyncsParams,
+    ) -> Result<StickerPackSyncs, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_sticker_pack_get_syncs(&params.account_id)?
+        };
+        let result = engine
+            .call("getStickerPackSyncs", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(sticker_pack_syncs_result(
+            result
+                .get("packs")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
+    }
+
+    /// stickerPacks.setSync (contract revision 1.37, §4.34): bounds under the
+    /// service lock, then the mutating engine call — reaction-class
+    /// discipline: an unknown outcome answers SEND_OUTCOME_UNKNOWN and is
+    /// never retried; the success result is the post-write cloud state read
+    /// back, not a local echo.
+    pub async fn set_sticker_pack_sync(
+        &self,
+        params: StickerPackSetSyncParams,
+    ) -> Result<StickerPackSyncs, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_sticker_pack_set_sync(
+                &params.account_id,
+                &params.pack_id,
+                params.pack_key.as_deref(),
+                params.installed,
+                params.position,
+            )?
+        };
+        match engine
+            .call("setStickerPackSync", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => Ok(sticker_pack_syncs_result(
+                result
+                    .get("packs")
                     .and_then(Value::as_array)
                     .ok_or(ServiceError::Engine(EngineError::Protocol))?,
             )),

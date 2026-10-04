@@ -102,6 +102,13 @@ pub const METHODS: &[MethodRow] = &[
     // barrier, no local persistence on either side.
     ("conversations.getPinned", Lane::Read, false, "read"),
     ("conversations.setPinned", Lane::Send, true, "send"),
+    // Sticker pack sync (contract 1.37, §4.34): getSyncs is a bounded
+    // cloud-backed read of the account's StickerPackRecord set; setSync is
+    // the mutating storage-service write — reaction-class write-lane mutex
+    // and delete barrier, no local persistence on either side (unlike the
+    // anonymous §4.32 browse face, these are account-scoped).
+    ("stickerPacks.getSyncs", Lane::Read, false, "read"),
+    ("stickerPacks.setSync", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -145,16 +152,18 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `send-sticker` (contract revision 1.35) marks `messages.sendSticker` plus
 /// the sticker receive projection as present. `sticker-pack-browse` and
 /// `conversation-pin-sync` (contract revision 1.36) mark the two browse/sync
-/// faces of §4.32/§4.33 — desktops gate the new methods on these tags so an
-/// old connector answers a clean capability gap instead of
-/// `METHOD_NOT_ALLOWED`. They never join [`METHOD_NAMES`]: the schema
-/// request-frame method enum and the dispatch table describe real methods
-/// only.
+/// faces of §4.32/§4.33, and `sticker-pack-sync` (contract revision 1.37)
+/// marks the §4.34 account-scoped pack install face — desktops gate the new
+/// methods on these tags so an old connector answers a clean capability gap
+/// instead of `METHOD_NOT_ALLOWED`. They never join [`METHOD_NAMES`]: the
+/// schema request-frame method enum and the dispatch table describe real
+/// methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
     "send-sticker",
     "sticker-pack-browse",
     "conversation-pin-sync",
+    "sticker-pack-sync",
 ];
 
 #[cfg(test)]
@@ -180,6 +189,7 @@ mod tests {
             "stickerPacks.getManifest",
             "stickerPacks.getImage",
             "conversations.getPinned",
+            "stickerPacks.getSyncs",
         ];
         let send_lane = [
             "messages.sendText",
@@ -197,6 +207,7 @@ mod tests {
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "conversations.setPinned",
+            "stickerPacks.setSync",
         ];
         let mutating = [
             "messages.sendText",
@@ -216,6 +227,7 @@ mod tests {
             "presence.setTypingMessage",
             "accounts.deleteLocalData",
             "conversations.setPinned",
+            "stickerPacks.setSync",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

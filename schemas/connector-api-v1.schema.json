@@ -68,6 +68,8 @@
             "messages.attachments.closeHandle",
             "stickerPacks.getManifest",
             "stickerPacks.getImage",
+            "stickerPacks.getSyncs",
+            "stickerPacks.setSync",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -196,6 +198,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/stickerPackImageParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stickerPacks.getSyncs" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/stickerPackGetSyncsParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stickerPacks.setSync" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/stickerPackSetSyncParams" }
             }
           }
         },
@@ -892,7 +916,7 @@
         "stickerId",
         "image"
       ],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one sticker (contract revision 1.35, mirroring the official sendStickerMessage face): packId is the official hex pack id (even length, 1-64 characters), packKey the standard-base64 pack key (1-128 characters), stickerId the pack-local id, emoji an optional ≤32-character label. image follows the messages.attachments.send budget family (dataBase64 standard padded base64, decoded size must equal sizeBytes, 1..104857600 bytes) with one sticker-specific rule: contentType must be image/* (the official client sniffs image MIME and refuses video/text). The upstream send carries only the sticker object — no message body, no regular attachments. Settlement follows messages.sendText: the response is the sent MessageRecord whose descriptor records the sticker image plus the pack identity, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one sticker (contract revision 1.35, mirroring the official sendStickerMessage face): packId is the official hex pack id (even length, 1-64 characters), packKey the standard-base64 pack key (1-128 characters), stickerId the pack-local id, emoji an optional ≤32-character label. image follows the messages.attachments.send budget family (dataBase64 standard padded base64, decoded size must equal sizeBytes, 1..104857600 bytes) with one sticker-specific rule: contentType must be image/* (the official client sniffs image MIME and refuses video/text). The upstream send carries only the sticker object — no message body, no regular attachments. The optional quoteMessageId (contract revision 1.37, §4.35) quotes one message in the same conversation: one upstream send carries the sticker object and the quote identity together (the official StagedStickerReply shape); settlement discipline is unchanged. Settlement follows messages.sendText: the response is the sent MessageRecord whose descriptor records the sticker image plus the pack identity, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -912,6 +936,10 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "Optional display title used when the peer send creates a new conversation."
+        },
+        "quoteMessageId": {
+          "$ref": "#/$defs/opaqueId",
+          "description": "Optional message to quote (contract revision 1.37, §4.35): resolves through the same ladder as messages.sendText — MESSAGE_NOT_FOUND for an unknown id, INVALID_REQUEST when the quoted author is not resolvable — and the upstream send carries quoteTimestamp/quoteAuthor beside the sticker object (the official StagedStickerReply shape). Absent means an unquoted sticker (the 1.35 behavior)."
         },
         "clientRequestId": { "$ref": "#/$defs/opaqueId" },
         "packId": {
@@ -1061,6 +1089,48 @@
         "pinned": {
           "type": "boolean",
           "description": "true pins the conversation, false unpins it. Required — there is no toggle form."
+        }
+      }
+    },
+    "stickerPackGetSyncsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's sticker-pack sync records (contract revision 1.37, §4.34): the engine reads the official Storage Service StickerPackRecord set — installed packs carry packId + packKey + position, uninstalled packs a deletedAtTimestampMs tombstone. The result projects {packs: [...]} in cloud order, capped at 256 entries (KT bound, overflow truncated, entries missing packId dropped). Read lane; the connector persists nothing — the cloud record plus the desktop's own cache is the whole story.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "stickerPackSetSyncParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "packId", "installed"],
+      "description": "Install or uninstall one sticker pack for the account (contract revision 1.37, §4.34): installed=true requires packKey (standard base64 decoding to exactly 32 bytes) and optionally positions the pack; installed=false writes the deletedAtTimestampMs tombstone and ignores packKey/position. The result is the post-write cloud state {packs: [...]} read back — not a local echo. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: the STORAGE_* family passed through verbatim (retryable); no new codes are introduced by this face.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "packId": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 32,
+          "pattern": "^[0-9A-Fa-f]{32}$",
+          "description": "Sticker pack id, exactly 32 hex characters (the §4.32 browse-face shape, aligned with the official isPackIdValid)."
+        },
+        "packKey": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 44,
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "description": "Pack key in standard base64 decoding to exactly 32 bytes (44 padded characters); required when installed is true, ignored (forwarded as null) otherwise."
+        },
+        "installed": {
+          "type": "boolean",
+          "description": "true installs the pack (packKey required), false uninstalls it (tombstone write). Required — there is no toggle form."
+        },
+        "position": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Optional cloud ordering position for an installed pack; u32 range. Ignored when installed is false."
         }
       }
     },

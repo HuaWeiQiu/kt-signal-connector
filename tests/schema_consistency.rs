@@ -38,6 +38,7 @@ use kt_signal_connector::service::{
     MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS,
     MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
     MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    STICKER_PACK_SYNC_KEY_B64_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -305,6 +306,10 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   `MAX_PINNED_CONVERSATIONS` = 128): same free-form-result situation,
 ///   enforced in `pinned_conversations_result` and pinned by the §4.33
 ///   integration test.
+/// - the sticker-pack sync list cap (contract 1.37, §4.34,
+///   `MAX_STICKER_PACK_SYNCS` = 256): same free-form-result situation,
+///   enforced in `sticker_pack_syncs_result` and pinned by the §4.34
+///   integration test.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
@@ -428,6 +433,19 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/conversationsSetPinnedParams/properties/conversationId",
             "maxLength",
             MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        // Sticker pack sync (contract 1.37, §4.34): the pack id is the §4.32
+        // browse-face 32-hex shape; the pack key when present is exactly the
+        // 44-character padded base64 of 32 bytes.
+        (
+            "/$defs/stickerPackSetSyncParams/properties/packId",
+            "maxLength",
+            STICKER_PACK_BROWSE_ID_HEX_CHARS as u64,
+        ),
+        (
+            "/$defs/stickerPackSetSyncParams/properties/packKey",
+            "maxLength",
+            STICKER_PACK_SYNC_KEY_B64_CHARS as u64,
         ),
         (
             "/$defs/conversationsListParams/properties/limit",

@@ -718,6 +718,25 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_conversation_pinned(params).await
     }
 
+    /// Sticker pack sync (contract 1.37, §4.34): account state — the records
+    /// live in the account's storage session, so both faces route through the
+    /// account's owning engine, unlike the anonymous §4.32 browse face.
+    pub async fn get_sticker_pack_syncs(
+        &self,
+        params: crate::service::StickerPackGetSyncsParams,
+    ) -> Result<crate::service::StickerPackSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_sticker_pack_syncs(params).await
+    }
+
+    pub async fn set_sticker_pack_sync(
+        &self,
+        params: crate::service::StickerPackSetSyncParams,
+    ) -> Result<crate::service::StickerPackSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_sticker_pack_sync(params).await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

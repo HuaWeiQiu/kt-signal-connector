@@ -35,7 +35,8 @@ use crate::service::{
     MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
     MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
     MessagesSendUnpinMessageParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackImageParams, StickerPackManifestParams,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1291,6 +1292,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid conversations.setPinned params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "stickerPacks.getSyncs" => {
+            match serde_json::from_value::<StickerPackGetSyncsParams>(request.params) {
+                Ok(params) => match runtime.get_sticker_pack_syncs(params).await {
+                    Ok(syncs) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(syncs).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stickerPacks.getSyncs params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "stickerPacks.setSync" => {
+            match serde_json::from_value::<StickerPackSetSyncParams>(request.params) {
+                Ok(params) => match runtime.set_sticker_pack_sync(params).await {
+                    Ok(syncs) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(syncs).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stickerPacks.setSync params",
                         false,
                     ),
                 ),

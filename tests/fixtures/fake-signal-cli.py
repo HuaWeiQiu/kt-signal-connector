@@ -42,6 +42,24 @@ PINNED_STATE = [
     {"conversationId": "+15555550101", "kind": "contact"},
     {"conversationId": "ZmFrZS1ncm91cC0x", "kind": "group"},
 ]
+# Contract 1.37 sticker-pack sync fixture state: the Storage Service
+# StickerPackRecord projection — one installed pack (key + position) and one
+# tombstone; setStickerPackSync mutates it in place so a read-back after a
+# write observes the write.
+PACK_SYNC_STATE = [
+    {
+        "packId": "abcdef0123456789abcdef0123456789",
+        "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "position": 0,
+        "deletedAtTimestampMs": None,
+    },
+    {
+        "packId": "11111111111111111111111111112222",
+        "packKey": None,
+        "position": None,
+        "deletedAtTimestampMs": 1727000000000,
+    },
+]
 
 
 def argument_value(name):
@@ -605,6 +623,67 @@ for line in sys.stdin:
             pinned.insert(0, {"conversationId": conversation_id, "kind": params.get("kind")})
         PINNED_STATE[:] = pinned
         result = {"pinned": list(PINNED_STATE)}
+    elif method == "getStickerPackSyncs":
+        # Contract 1.37 sticker-pack sync read: the record projection as a
+        # fixture constant (one installed pack + one tombstone).
+        result = {"packs": list(PACK_SYNC_STATE)}
+    elif method == "setStickerPackSync":
+        # Contract 1.37 sticker-pack sync write: record the exact upstream
+        # params (tests assert the resolved account/packId/packKey/position/
+        # installed contract), apply the write to the fixture record state,
+        # answer the post-write cloud state. Pack-id sentinels: "f"*32
+        # answers a structured STORAGE_UNAVAILABLE, "0"*32 answers
+        # STORAGE_READ_FAILED, "1"*32 crashes with the mutating call in
+        # flight (os._exit(30); disjoint from the pin-sync 29 and the
+        # sticker-send 23 paths).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        pack_id = params.get("packId")
+        if pack_id == "f" * 32:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        if pack_id == "0" * 32:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_READ_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if pack_id == "1" * 32:
+            os._exit(30)
+        packs = [entry for entry in PACK_SYNC_STATE if entry["packId"] != pack_id]
+        if params.get("installed"):
+            # Engine contract: an install carries the key (the connector
+            # validated it) and the optional position; the tombstone clears.
+            packs.insert(
+                0,
+                {
+                    "packId": pack_id,
+                    "packKey": params.get("packKey"),
+                    "position": params.get("position"),
+                    "deletedAtTimestampMs": None,
+                },
+            )
+        else:
+            # An uninstall ignores packKey/position entirely and writes the
+            # tombstone with the engine clock.
+            packs.append(
+                {
+                    "packId": pack_id,
+                    "packKey": None,
+                    "position": None,
+                    "deletedAtTimestampMs": int(time.time() * 1000),
+                }
+            )
+        PACK_SYNC_STATE[:] = packs
+        result = {"packs": list(PACK_SYNC_STATE)}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the single-string recipient contract.

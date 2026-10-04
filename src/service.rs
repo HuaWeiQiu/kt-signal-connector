@@ -60,6 +60,13 @@ pub const MAX_STICKER_IMAGE_BASE64_CHARS: usize = 4 * MAX_STICKER_IMAGE_BYTES.di
 /// explicit cap) so one response frame stays bounded.
 pub const MAX_PIN_CONVERSATION_ID_CHARS: usize = 256;
 pub const MAX_PINNED_CONVERSATIONS: usize = 128;
+/// Sticker pack sync bounds (contract revision 1.37, §4.34): the pack key
+/// when present is the §4.32 browse shape — exactly 32 bytes, whose padded
+/// standard-base64 encoding is exactly 44 characters — and the returned pack
+/// list is capped (KT bound; the official clients declare no explicit cap) so
+/// one response frame stays bounded.
+pub const STICKER_PACK_SYNC_KEY_B64_CHARS: usize = 44;
+pub const MAX_STICKER_PACK_SYNCS: usize = 256;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
@@ -1173,11 +1180,16 @@ impl ConnectorService {
         }
     }
 
-    /// messages.sendSticker (contract revision 1.35, §4.31): §4.12 settlement
-    /// discipline with a body-less upstream `send` carrying the `sticker`
-    /// object — pending row (sticker metadata + image descriptor) before the
-    /// upstream call, then the shared `dispatch_prepared` completion. Bounds
-    /// failures reject before the pending row exists.
+    /// messages.sendSticker (contract revision 1.35, §4.31; quote face 1.37,
+    /// §4.35): §4.12 settlement discipline with a body-less upstream `send`
+    /// carrying the `sticker` object — pending row (sticker metadata + image
+    /// descriptor) before the upstream call, then the shared
+    /// `dispatch_prepared` completion. Bounds failures reject before the
+    /// pending row exists. The optional quote resolves through the same
+    /// ladder as `dispatch_send` — after the idempotency short-circuit and
+    /// addressing resolution, before the pending row is inserted, so a
+    /// rejected quote leaves nothing behind while a replay keeps returning
+    /// the existing row without re-resolving.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_send_sticker(
         &self,
@@ -1189,6 +1201,7 @@ impl ConnectorService {
         sticker_id: u32,
         emoji: Option<&str>,
         image: &MessagesSendStickerImage,
+        quote_message_id: Option<&str>,
     ) -> Result<PreparedSend, ServiceError> {
         validate_sticker_pack_id(pack_id)?;
         validate_sticker_pack_key(pack_key)?;
@@ -1223,6 +1236,12 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_send_conversation(account_id, target)?;
+        // Quote resolution is part of send validation and runs before the
+        // pending row exists (§4.35): a rejected quote leaves nothing behind,
+        // so the same clientRequestId stays a fresh (re-validated) request.
+        let quote = quote_message_id
+            .map(|id| self.resolve_quote(&account, &conversation, id))
+            .transpose()?;
         let data_uri =
             build_attachment_data_uri(&image.data_base64, None, Some(&image.content_type), false)?;
         // The sent row's descriptor records the sticker image (metadata only)
@@ -1265,7 +1284,7 @@ impl ConnectorService {
             text_retrievable: false,
             status: "pending",
             client_request_id: Some(client_request_id.to_string()),
-            quote_message_id: None,
+            quote_message_id: quote_message_id.map(str::to_string),
             quote_snapshot: None,
             attachments: vec![descriptor],
             edited_at: None,
@@ -1312,6 +1331,13 @@ impl ConnectorService {
             "sticker": sticker_object,
         });
         set_upstream_target(&mut params, &conversation);
+        // The quote keys ride the send top level beside the sticker object —
+        // the quote belongs to the send, not to the sticker (§4.35, the same
+        // wire keys the text face uses).
+        if let Some((quote_timestamp, quote_author)) = quote {
+            params["quoteTimestamp"] = json!(quote_timestamp);
+            params["quoteAuthor"] = json!(quote_author);
+        }
         Ok(PreparedSend::Dispatch {
             pending_id,
             account_id: account_id.to_string(),
@@ -1492,6 +1518,60 @@ impl ConnectorService {
             "conversationId": conversation.peer_key,
             "kind": kind,
             "pinned": pinned,
+        }))
+    }
+
+    /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account bounds
+    /// and existence — the pack records live in the account's storage
+    /// session, the service reads nothing locally (no persistence on this
+    /// face).
+    pub fn prepare_sticker_pack_get_syncs(&self, account_id: &str) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// stickerPacks.setSync (contract revision 1.37, §4.34): pack identity
+    /// bounds and the installed-shape rule — `installed=true` requires the
+    /// §4.32 pack key (44-character base64 decoding to exactly 32 bytes);
+    /// `installed=false` writes the tombstone and ignores `packKey`/
+    /// `position`, so both forward as null regardless of what the caller
+    /// supplied (the engine contract: the uninstall path never reads them).
+    /// No local row is written: the cloud record is the whole state.
+    pub fn prepare_sticker_pack_set_sync(
+        &self,
+        account_id: &str,
+        pack_id: &str,
+        pack_key: Option<&str>,
+        installed: bool,
+        position: Option<u32>,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        validate_sticker_browse_pack_id(pack_id)?;
+        let key = match (installed, pack_key) {
+            (true, Some(key)) => {
+                validate_sticker_browse_pack_key(key)?;
+                Some(key)
+            }
+            (true, None) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "packKey is required when installed is true",
+                    false,
+                )));
+            }
+            // The uninstall path ignores key and position; the caller may
+            // still have echoed the old values back — they are dropped here
+            // so the upstream write is exactly the tombstone.
+            (false, _) => None,
+        };
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "packId": pack_id,
+            "packKey": key,
+            "installed": installed,
+            "position": if installed { position } else { None },
         }))
     }
 
@@ -3307,6 +3387,27 @@ pub struct PinnedConversations {
     pub pinned: Vec<PinnedConversation>,
 }
 
+/// One sticker-pack sync record of the §4.34 result: the Storage Service
+/// `StickerPackRecord` projected 1:1 — an installed pack carries the key and
+/// its cloud position, an uninstalled pack the tombstone timestamp.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickerPackSync {
+    pub pack_id: String,
+    pub pack_key: Option<String>,
+    pub position: Option<u32>,
+    pub deleted_at_timestamp_ms: Option<u64>,
+}
+
+/// The §4.34 result shape shared by `stickerPacks.getSyncs` and
+/// `stickerPacks.setSync`: the record list in cloud order, capped at
+/// [`MAX_STICKER_PACK_SYNCS`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickerPackSyncs {
+    pub packs: Vec<StickerPackSync>,
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -3545,6 +3646,9 @@ pub struct MessagesSendStickerParams {
     pub sticker_id: u32,
     pub emoji: Option<String>,
     pub image: MessagesSendStickerImage,
+    /// Optional quote target (contract revision 1.37, §4.35) — resolved
+    /// through the same ladder as the text face before the pending row.
+    pub quote_message_id: Option<String>,
 }
 
 /// `stickerPacks.getManifest` params (contract revision 1.36, §4.32): no
@@ -3583,6 +3687,29 @@ pub struct ConversationsSetPinnedParams {
     pub conversation_id: String,
     pub kind: String,
     pub pinned: bool,
+}
+
+/// `stickerPacks.getSyncs` params (contract revision 1.37, §4.34).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StickerPackGetSyncsParams {
+    pub account_id: String,
+}
+
+/// `stickerPacks.setSync` params (contract revision 1.37, §4.34):
+/// `installed` is required (absent fails params deserialization); `packKey`
+/// is required by the service when `installed` is true, and ignored —
+/// forwarded as null — otherwise; `position` carries the cloud ordering for
+/// an installed pack. The u32 type already fails non-integer/out-of-range
+/// values at params deserialization.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StickerPackSetSyncParams {
+    pub account_id: String,
+    pub pack_id: String,
+    pub pack_key: Option<String>,
+    pub installed: bool,
+    pub position: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4373,6 +4500,35 @@ pub(crate) fn pinned_conversations_result(entries: &[Value]) -> PinnedConversati
         })
         .collect();
     PinnedConversations { pinned }
+}
+
+/// Project the engine's sticker-pack record list onto the wire shape with the
+/// KT entry cap (§4.34): order is cloud order, entries beyond 256 are
+/// truncated — the connector adds no ordering of its own. `packId` is the
+/// identity field (missing it drops the entry); the optional fields project
+/// leniently beside it, and an out-of-u32 `position` degrades to absent
+/// rather than discarding an otherwise-identified record.
+pub(crate) fn sticker_pack_syncs_result(entries: &[Value]) -> StickerPackSyncs {
+    let packs = entries
+        .iter()
+        .take(MAX_STICKER_PACK_SYNCS)
+        .filter_map(|entry| {
+            let pack_id = entry.get("packId").and_then(Value::as_str)?;
+            Some(StickerPackSync {
+                pack_id: pack_id.to_string(),
+                pack_key: entry
+                    .get("packKey")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                position: entry
+                    .get("position")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                deleted_at_timestamp_ms: entry.get("deletedAtTimestampMs").and_then(Value::as_u64),
+            })
+        })
+        .collect();
+    StickerPackSyncs { packs }
 }
 
 /// Build the RFC 2397 data URI the pinned upstream accepts
@@ -7672,6 +7828,7 @@ mod tests {
                         width: Some(512),
                         height: None,
                     },
+                    None,
                 )
                 .unwrap_err();
             let api = error.into_api();
@@ -7706,6 +7863,7 @@ mod tests {
                     width: None,
                     height: None,
                 },
+                None,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -7735,6 +7893,7 @@ mod tests {
                     width: Some(512),
                     height: Some(512),
                 },
+                None,
             )
             .unwrap();
         let PreparedSend::Dispatch {
@@ -7811,6 +7970,7 @@ mod tests {
                     width: Some(512),
                     height: Some(512),
                 },
+                None,
             )
             .unwrap();
         assert!(matches!(replay, PreparedSend::Existing(_)));
@@ -7837,6 +7997,7 @@ mod tests {
                     width: None,
                     height: None,
                 },
+                None,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -7998,6 +8159,222 @@ mod tests {
         let result = pinned_conversations_result(&mixed);
         assert_eq!(result.pinned.len(), 2);
         assert_eq!(result.pinned[1].kind, "legacyGroup");
+    }
+
+    /// Sticker pack sync bounds (contract revision 1.37, §4.34): the pack id
+    /// is the §4.32 32-hex shape; installed=true requires the 32-byte pack
+    /// key; installed=false ignores packKey/position — the upstream write is
+    /// exactly the tombstone regardless of what the caller supplied.
+    #[test]
+    fn prepare_sticker_pack_sync_validates_bounds() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let good_id = "abcdef0123456789abcdef0123456789";
+        // Standard padded base64 of exactly 32 zero bytes.
+        let good_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+        // Happy install: the upstream account is the resolved signal account
+        // and the key/position ride through verbatim.
+        let params = service
+            .prepare_sticker_pack_set_sync(&account.id, good_id, Some(good_key), true, Some(3))
+            .unwrap();
+        assert_eq!(params["account"], "+15555550100");
+        assert_eq!(params["packId"], good_id);
+        assert_eq!(params["packKey"], good_key);
+        assert_eq!(params["installed"], true);
+        assert_eq!(params["position"], 3);
+
+        // Uninstall: supplied key/position are dropped — the wire carries
+        // exactly the tombstone shape (nulls) no matter what the caller sent.
+        let params = service
+            .prepare_sticker_pack_set_sync(&account.id, good_id, Some(good_key), false, Some(3))
+            .unwrap();
+        assert_eq!(params["installed"], false);
+        assert!(params["packKey"].is_null());
+        assert!(params["position"].is_null());
+
+        let get_params = service.prepare_sticker_pack_get_syncs(&account.id).unwrap();
+        assert_eq!(get_params["account"], "+15555550100");
+
+        // installed=true without a key: deterministic local rejection.
+        let error = service
+            .prepare_sticker_pack_set_sync(&account.id, good_id, None, true, Some(3))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // A key decoding to 16 bytes fails the install (the 1.35 send-face
+        // shape is not enough here).
+        let error = service
+            .prepare_sticker_pack_set_sync(
+                &account.id,
+                good_id,
+                Some("AAAAAAAAAAAAAAAAAAAAAA=="),
+                true,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // packId: the browse-face 32-hex rule on both faces.
+        let error = service
+            .prepare_sticker_pack_set_sync(&account.id, "abcdef01", Some(good_key), true, None)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // Unknown account answers ACCOUNT_NOT_FOUND on both faces.
+        let error = service
+            .prepare_sticker_pack_get_syncs("no-such-account")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+        let error = service
+            .prepare_sticker_pack_set_sync("no-such-account", good_id, Some(good_key), true, None)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// The pack-record projection (contract revision 1.37, §4.34): cloud
+    /// order preserved, the 256-entry KT cap truncates, and entries missing
+    /// packId drop rather than half-carried; the optional fields project
+    /// leniently (an out-of-u32 position degrades to absent instead of
+    /// discarding an otherwise-identified record).
+    #[test]
+    fn sticker_pack_syncs_result_caps_and_projects() {
+        let entries: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({
+                    "packId": format!("{index:032x}"),
+                    "packKey": if index % 2 == 0 {
+                        Value::Null
+                    } else {
+                        json!("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                    },
+                    "position": if index % 3 == 0 { Value::Null } else { json!(index) },
+                    "deletedAtTimestampMs": if index % 2 == 0 {
+                        json!(1727000000000u64 + index)
+                    } else {
+                        Value::Null
+                    },
+                })
+            })
+            .collect();
+        let result = sticker_pack_syncs_result(&entries);
+        assert_eq!(result.packs.len(), MAX_STICKER_PACK_SYNCS);
+        assert_eq!(result.packs[0].pack_id, format!("{:032x}", 0));
+        assert_eq!(result.packs[255].pack_id, format!("{:032x}", 255));
+        assert_eq!(result.packs[1].position, Some(1));
+        assert!(result.packs[0].deleted_at_timestamp_ms.is_some());
+        assert!(result.packs[1].deleted_at_timestamp_ms.is_none());
+
+        // Missing identity drops the entry; a position beyond u32 degrades
+        // to absent; a tombstone carries the timestamp without key/position.
+        let mixed = vec![
+            json!({
+                "packId": "a".repeat(32),
+                "packKey": Value::Null,
+                "position": 4294967296u64,
+                "deletedAtTimestampMs": Value::Null,
+            }),
+            json!({"packKey": "orphan"}),
+            json!({
+                "packId": "b".repeat(32),
+                "packKey": Value::Null,
+                "position": Value::Null,
+                "deletedAtTimestampMs": json!(1727000000000u64),
+            }),
+        ];
+        let result = sticker_pack_syncs_result(&mixed);
+        assert_eq!(result.packs.len(), 2);
+        assert_eq!(result.packs[0].pack_id, "a".repeat(32));
+        assert_eq!(result.packs[0].position, None);
+        assert_eq!(result.packs[1].pack_id, "b".repeat(32));
+        assert_eq!(result.packs[1].deleted_at_timestamp_ms, Some(1727000000000));
+    }
+
+    /// The §4.35 sticker-quote face: the quote resolves through the same
+    /// ladder as `dispatch_send` (upstream quoteTimestamp/quoteAuthor beside
+    /// the sticker object, the pending row records the target), an unknown
+    /// target answers MESSAGE_NOT_FOUND with no row left behind, and a
+    /// replay of an inserted row returns it without re-resolving the quote.
+    #[test]
+    fn prepare_send_sticker_resolves_quote_through_the_shared_ladder() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let quoted_id = seed_outgoing_sent(&mut service, &account.id, &conversation.id, 777);
+        let image = MessagesSendStickerImage {
+            data_base64: "iVBORw0KGgo=".to_string(),
+            size_bytes: 8,
+            content_type: "image/webp".to_string(),
+            width: None,
+            height: None,
+        };
+
+        // Happy path: the quote keys ride the send top level beside the
+        // sticker object; the pending row records the quoted target.
+        let prepared = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "sticker-quote-1",
+                "abcdef01",
+                "AAAAAAAAAAAAAAAAAAAAAA==",
+                7,
+                None,
+                &image,
+                Some(&quoted_id),
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(params["quoteTimestamp"], 777);
+        assert_eq!(params["quoteAuthor"], "+15555550100");
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "sticker-quote-1")
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(row.quote_message_id.as_deref(), Some(quoted_id.as_str()));
+
+        // Unknown target: MESSAGE_NOT_FOUND and nothing behind — the same
+        // clientRequestId stays a fresh request.
+        let error = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "sticker-quote-2",
+                "abcdef01",
+                "AAAAAAAAAAAAAAAAAAAAAA==",
+                7,
+                None,
+                &image,
+                Some("no-such-row"),
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "MESSAGE_NOT_FOUND");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "sticker-quote-2")
+                .unwrap()
+                .is_none()
+        );
+
+        // Replay: the inserted row returns as Existing without re-resolving
+        // — the quote validation ran once, before the row was inserted.
+        let replay = service
+            .prepare_send_sticker(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "sticker-quote-1",
+                "abcdef01",
+                "AAAAAAAAAAAAAAAAAAAAAA==",
+                7,
+                None,
+                &image,
+                Some("no-such-row"),
+            )
+            .unwrap();
+        assert!(matches!(replay, PreparedSend::Existing(_)));
     }
 
     /// groups.get (contract revision 1.9, implementation-plan §4.8): a pure
