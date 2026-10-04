@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,13 @@ if os.environ.get("KT_FAKE_EXPECT_NO_JAVA") is not None:
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
 WRITE_LOCK = threading.Lock()
+# Contract 1.36 pin-sync fixture state: the cloud-order pinned list the
+# engine would read from the storage record; setConversationPinned mutates it
+# in place so a read-back after a write observes the write.
+PINNED_STATE = [
+    {"conversationId": "+15555550101", "kind": "contact"},
+    {"conversationId": "ZmFrZS1ncm91cC0x", "kind": "group"},
+]
 
 
 def argument_value(name):
@@ -489,6 +497,114 @@ for line in sys.stdin:
         if 425 in (params.get("timestamps") or []):
             os._exit(23)
         result = {}
+    elif method == "getStickerPackManifest":
+        # Contract 1.36 browse face: deterministic manifest keyed by pack id.
+        # Sentinel packId ffffffffffffffffffffffffffffffff answers a
+        # structured key-invalid error; 0000... answers a retryable fetch
+        # failure; 1111... answers a codeless error (the degradation path);
+        # anything else returns the fixture manifest (2 stickers + cover).
+        if params.get("packId") == "f" * 32:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "STICKER_PACK_KEY_INVALID", "message": "fixture bad key"},
+            }
+            emit_json(response)
+            continue
+        if params.get("packId") == "0" * 32:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "STICKER_PACK_FETCH_FAILED", "message": "fixture fetch failed"},
+            }
+            emit_json(response)
+            continue
+        if params.get("packId") == "1" * 32:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "fixture malformed"},
+            }
+            emit_json(response)
+            continue
+        result = {
+            "title": "Fixture Pack",
+            "author": "KT Fixture",
+            "cover": {"id": 1, "emoji": "🎉", "contentType": "image/webp"},
+            "stickers": [
+                {"id": 1, "emoji": "🎉", "contentType": "image/webp"},
+                {"id": 2, "emoji": "🚀", "contentType": "image/png"},
+            ],
+            "stickerCount": 2,
+        }
+    elif method == "getStickerImage":
+        # Contract 1.36 browse face: a small deterministic base64 payload.
+        # Sentinels mirror the manifest error mapping; stickerId 413 answers
+        # STICKER_IMAGE_TOO_LARGE.
+        if params.get("packId") == "f" * 32:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "STICKER_PACK_KEY_INVALID", "message": "fixture bad key"},
+            }
+            emit_json(response)
+            continue
+        if params.get("stickerId") == 404:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "STICKER_PACK_MALFORMED", "message": "fixture malformed"},
+            }
+            emit_json(response)
+            continue
+        if params.get("stickerId") == 413:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "STICKER_IMAGE_TOO_LARGE", "message": "fixture too large"},
+            }
+            emit_json(response)
+            continue
+        payload = base64.b64encode(b"fixture-bytes").decode()
+        result = {"dataBase64": payload, "contentType": "image/webp", "size": 13}
+    elif method == "getPinnedConversations":
+        # Contract 1.36 pin sync read: the cloud order as a fixture constant.
+        result = {"pinned": list(PINNED_STATE)}
+    elif method == "setConversationPinned":
+        # Contract 1.36 pin sync write: record the exact upstream params
+        # (tests assert the resolved conversationId/kind/pinned), apply the
+        # write to the fixture pin state, answer the post-write cloud state.
+        # Peer-key sentinels (locally resolvable, so the connector forwards
+        # them): +15555550998 answers a structured STORAGE_UNAVAILABLE,
+        # +15555550997 answers CONVERSATION_NOT_RESOLVED, +15555550999
+        # crashes with the mutating call in flight.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        conversation_id = params.get("conversationId")
+        if conversation_id == "+15555550998":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "STORAGE_UNAVAILABLE", "message": "fixture storage down"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "+15555550997":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": "CONVERSATION_NOT_RESOLVED", "message": "fixture unresolved"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "+15555550999":
+            os._exit(29)
+        pinned = [entry for entry in PINNED_STATE if entry["conversationId"] != conversation_id]
+        if params.get("pinned"):
+            pinned.insert(0, {"conversationId": conversation_id, "kind": params.get("kind")})
+        PINNED_STATE[:] = pinned
+        result = {"pinned": list(PINNED_STATE)}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the single-string recipient contract.

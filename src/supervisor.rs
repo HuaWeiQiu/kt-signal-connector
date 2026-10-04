@@ -17,12 +17,14 @@ use crate::engine::{
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, GroupDetails, HostSideEvent,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MessagesSendStickerParams,
-    PeerTarget, PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams,
-    ServiceError, account_limit_error, store_get_group, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, ConversationsGetPinnedParams,
+    ConversationsSetPinnedParams, GroupDetails, HostSideEvent, MediaChunkView, MediaCloseView,
+    MediaIngest, MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations,
+    PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
+    StickerManifestEntry, StickerPackImage, StickerPackImageParams, StickerPackManifest,
+    StickerPackManifestParams, account_limit_error, pinned_conversations_result, store_get_group,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page,
@@ -1546,6 +1548,123 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
+    /// stickerPacks.getManifest (contract revision 1.36, §4.32): bounds
+    /// validation under the service lock, then the read-only engine call —
+    /// anonymous CDN work engine-side, no account context, nothing
+    /// persisted. A timeout answers the ordinary retryable UPSTREAM_TIMEOUT
+    /// (a read provably took no effect), and structured engine errors
+    /// (STICKER_*) surface through the §4.32 mapping.
+    pub async fn get_sticker_pack_manifest(
+        &self,
+        params: StickerPackManifestParams,
+    ) -> Result<StickerPackManifest, ServiceError> {
+        let engine = self.running_engine().await?;
+        {
+            let service = self.service.lock().await;
+            service.prepare_sticker_pack_manifest(&params)?;
+        }
+        let result = engine
+            .call(
+                "getStickerPackManifest",
+                json!({
+                    "packId": params.pack_id,
+                    "packKey": params.pack_key,
+                }),
+                CallClass::ReadOnly,
+            )
+            .await?;
+        manifest_from_engine(&result)
+    }
+
+    /// stickerPacks.getImage (contract revision 1.36, §4.32): the same
+    /// shape as the manifest face with the decrypted sticker bytes as the
+    /// result — base64 pass-through, `size` cross-checked against the
+    /// engine's declared byte count so a mismatching result fails as a
+    /// protocol error instead of shipping a truncated image.
+    pub async fn get_sticker_image(
+        &self,
+        params: StickerPackImageParams,
+    ) -> Result<StickerPackImage, ServiceError> {
+        let engine = self.running_engine().await?;
+        {
+            let service = self.service.lock().await;
+            service.prepare_sticker_pack_image(&params)?;
+        }
+        let result = engine
+            .call(
+                "getStickerImage",
+                json!({
+                    "packId": params.pack_id,
+                    "packKey": params.pack_key,
+                    "stickerId": params.sticker_id,
+                }),
+                CallClass::ReadOnly,
+            )
+            .await?;
+        image_from_engine(&result)
+    }
+
+    /// conversations.getPinned (contract revision 1.36, §4.33): account
+    /// resolution then the read-only engine call; the pinned list projects
+    /// straight from the engine result with the KT entry cap (§4.33).
+    pub async fn get_pinned_conversations(
+        &self,
+        params: ConversationsGetPinnedParams,
+    ) -> Result<PinnedConversations, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_get_pinned(&params.account_id)?
+        };
+        let result = engine
+            .call("getPinnedConversations", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(pinned_conversations_result(
+            result
+                .get("pinned")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
+    }
+
+    /// conversations.setPinned (contract revision 1.36, §4.33): bounds +
+    /// resolution under the service lock, then the mutating engine call —
+    /// reaction-class discipline: an unknown outcome answers
+    /// SEND_OUTCOME_UNKNOWN and is never retried; the success result is the
+    /// post-write cloud state read back, not a local echo.
+    pub async fn set_conversation_pinned(
+        &self,
+        params: ConversationsSetPinnedParams,
+    ) -> Result<PinnedConversations, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_set_pinned(
+                &params.account_id,
+                &params.conversation_id,
+                &params.kind,
+                params.pinned,
+            )?
+        };
+        match engine
+            .call("setConversationPinned", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => Ok(pinned_conversations_result(
+                result
+                    .get("pinned")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Best-effort "Delete for everyone" for one own sent message
     /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
     /// upstream `remoteDelete` call without it — the same shape as
@@ -2455,6 +2574,116 @@ fn compose_contact_display_name(item: &Value) -> Option<String> {
         .or(nick)
         .or(username)
         .map(|s| s.chars().take(64).collect())
+}
+
+/// Project the engine's `getStickerPackManifest` result (contract 1.36,
+/// §4.32): bounded title/author (KT 256-char bound, the official decoder
+/// applies none), the optional cover, and the sticker list truncated at the
+/// 1024-entry cap — the official decoder's truncation semantics, mirrored
+/// rather than rejected. A result missing a required field is a protocol
+/// error, not a partial manifest.
+fn manifest_from_engine(result: &Value) -> Result<StickerPackManifest, ServiceError> {
+    let title = bounded_manifest_text(
+        result,
+        "title",
+        crate::service::MAX_STICKER_MANIFEST_TITLE_CHARS,
+    )?;
+    let author = bounded_manifest_text(
+        result,
+        "author",
+        crate::service::MAX_STICKER_MANIFEST_AUTHOR_CHARS,
+    )?;
+    let cover = result.get("cover").map(manifest_entry_from_engine);
+    let stickers_json = result
+        .get("stickers")
+        .and_then(Value::as_array)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let stickers: Vec<StickerManifestEntry> = stickers_json
+        .iter()
+        .take(crate::service::MAX_STICKER_MANIFEST_ENTRIES)
+        .map(manifest_entry_from_engine)
+        .collect();
+    let sticker_count = result
+        .get("stickerCount")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    if sticker_count > u32::MAX as u64 {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    Ok(StickerPackManifest {
+        title,
+        author,
+        cover,
+        stickers,
+        sticker_count: sticker_count as u32,
+    })
+}
+
+/// One manifest entry (cover or sticker): id required, emoji/contentType
+/// optional and absent-on-absent so the wire matches the official optionality.
+fn manifest_entry_from_engine(entry: &Value) -> StickerManifestEntry {
+    let id = entry.get("id").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let emoji = entry
+        .get("emoji")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let content_type = entry
+        .get("contentType")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    StickerManifestEntry {
+        id,
+        emoji,
+        content_type,
+    }
+}
+
+fn bounded_manifest_text(
+    result: &Value,
+    key: &str,
+    max_chars: usize,
+) -> Result<String, ServiceError> {
+    let text = result
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    if text.chars().count() > max_chars {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    Ok(text.to_string())
+}
+
+/// Project the engine's `getStickerImage` result (contract 1.36, §4.32):
+/// base64/size/contentType pass through; the encoded length is checked
+/// against the 400 KB budget (300 KB CDN ceiling + base64 expansion), and a
+/// `size` that disagrees with the decoded byte count is a protocol error.
+fn image_from_engine(result: &Value) -> Result<StickerPackImage, ServiceError> {
+    let data_base64 = result
+        .get("dataBase64")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    if data_base64.len() > crate::service::MAX_STICKER_IMAGE_BASE64_CHARS {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    let content_type = result
+        .get("contentType")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?
+        .to_string();
+    let size = result
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let mut decoded = Vec::new();
+    let decodes = crate::service::base64_decode_to_vec(data_base64, &mut decoded);
+    if size > u32::MAX as u64 || decodes.is_err() || decoded.len() != size as usize {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    Ok(StickerPackImage {
+        data_base64: data_base64.to_string(),
+        content_type,
+        size: size as u32,
+    })
 }
 
 #[cfg(test)]

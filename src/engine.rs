@@ -286,6 +286,13 @@ pub enum EngineError {
     Upstream,
     #[error("signal-cli rejected the device credentials")]
     Unauthorized,
+    /// The engine answered a JSON-RPC error object with an upstream error
+    /// code (contract 1.36 sticker/pin faces): the code string is carried
+    /// structurally so the connector maps engine error codes onto the host
+    /// contract without swallowing them, while the message text stays
+    /// content-free (the code is a fixed literal, never user data).
+    #[error("signal-cli returned a structured error")]
+    UpstreamCode { code: &'static str },
 }
 
 impl EngineError {
@@ -302,6 +309,7 @@ impl EngineError {
             EngineError::Protocol => "protocol",
             EngineError::Upstream => "upstream",
             EngineError::Unauthorized => "unauthorized",
+            EngineError::UpstreamCode { .. } => "upstream_code",
         }
     }
 }
@@ -1389,6 +1397,15 @@ async fn handle_upstream_line(
                 });
             }
             let _ = request.response.send(Err(EngineError::Unauthorized));
+        } else if let Some(code) = upstream_error_code(object.get("error")) {
+            // Contract 1.36 faces: the engine answers structured errors with
+            // a code field (STICKER_*, STORAGE_*, CONVERSATION_NOT_RESOLVED
+            // families). The code is a fixed engine literal, carried as such;
+            // unrecognized codes degrade to the plain upstream error so an
+            // engine newer than this connector never invents host codes.
+            let _ = request
+                .response
+                .send(Err(EngineError::UpstreamCode { code }));
         } else {
             let _ = request.response.send(Err(EngineError::Upstream));
         }
@@ -1416,6 +1433,44 @@ fn upstream_error_is_unauthorized(error: Option<&Value>) -> bool {
                 || message.contains("Authorization failed")
         })
 }
+
+/// Known engine error codes the connector maps onto structured host errors
+/// (contract 1.36, §4.32/§4.33). The allowlist is the whole mapping surface:
+/// an engine code outside it degrades to the plain upstream error, so the
+/// host never sees a code this connector's schema does not declare, and a
+/// future engine adding codes cannot silently widen the host contract.
+const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
+    // §4.32 sticker pack browsing (engine-owned: key check, CDN fetch,
+    // decrypt/decode, image size budget).
+    "STICKER_PACK_KEY_INVALID",
+    "STICKER_PACK_FETCH_FAILED",
+    "STICKER_PACK_MALFORMED",
+    "STICKER_IMAGE_TOO_LARGE",
+    // §4.33 conversation pin sync (engine-owned: cloud reference resolution,
+    // storage-service failures surface under the engine's STORAGE_* family).
+    "CONVERSATION_NOT_RESOLVED",
+    "STORAGE_UNAVAILABLE",
+    "STORAGE_WRITE_FAILED",
+    "STORAGE_READ_FAILED",
+];
+
+/// Extract a known structured engine error code from a JSON-RPC error object.
+/// The code must be a string matching the allowlist above; anything else
+/// (missing code, non-string, unknown literal) answers `None` and the caller
+/// falls back to the plain upstream error.
+fn upstream_error_code(error: Option<&Value>) -> Option<&'static str> {
+    let code = error?.get("code")?.as_str()?;
+    ENGINE_STRUCTURED_ERROR_CODES
+        .iter()
+        .find(|known| **known == code)
+        .copied()
+}
+
+/// Test-only re-export of the allowlist so the service-layer mapping test can
+/// prove the two sides stay total over the same set (the constant itself
+/// stays private in normal builds).
+#[cfg(test)]
+pub(crate) const ENGINE_STRUCTURED_ERROR_CODES_FOR_TESTS: &[&str] = ENGINE_STRUCTURED_ERROR_CODES;
 
 fn envelope_peer_source(envelope: &serde_json::Map<String, Value>) -> Option<String> {
     envelope
@@ -3110,6 +3165,78 @@ mod tests {
 
         assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// Structured engine errors (contract 1.36): an error object carrying a
+    /// known string `code` surfaces as UpstreamCode with the allowlisted
+    /// code; an unknown code degrades to the plain Upstream classification
+    /// so an engine newer than this connector cannot widen the host
+    /// contract; a numeric (ordinary JSON-RPC) code stays plain as before.
+    #[tokio::test]
+    async fn structured_engine_errors_carry_the_allowlisted_code() {
+        let classify = |error: serde_json::Value| async move {
+            let (events, mut event_rx) = event_channel();
+            let (ingress, _receiver) = receive_channel();
+            let mut pending = HashMap::new();
+            let mut degraded = false;
+            let (response_tx, response_rx) = oneshot::channel();
+            pending.insert(
+                "kt-9".to_string(),
+                PendingRequest {
+                    class: CallClass::ReadOnly,
+                    account: None,
+                    response: response_tx,
+                },
+            );
+            let line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": "kt-9",
+                "error": error
+            }))
+            .unwrap();
+            handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+            assert!(event_rx.try_recv().is_err());
+            response_rx.await.unwrap()
+        };
+        // Structured codes ride the JSON-RPC error `code` field as a string
+        // (the numeric slot stays free for the engine's own JSON-RPC layer).
+        assert_eq!(
+            classify(json!({
+                "code": "STICKER_PACK_FETCH_FAILED",
+                "message": "fixture fetch failed"
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "STICKER_PACK_FETCH_FAILED"
+            })
+        );
+        assert_eq!(
+            classify(json!({
+                "code": "CONVERSATION_NOT_RESOLVED",
+                "message": "fixture unresolved"
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "CONVERSATION_NOT_RESOLVED"
+            })
+        );
+        // Unknown code: degrades to plain Upstream.
+        assert_eq!(
+            classify(json!({
+                "code": "SOME_FUTURE_ENGINE_CODE",
+                "message": "not in the allowlist"
+            }))
+            .await,
+            Err(EngineError::Upstream)
+        );
+        // Numeric code (the ordinary JSON-RPC error shape): unchanged plain
+        // Upstream.
+        assert_eq!(
+            classify(json!({ "code": -1, "message": "fixture malformed" })).await,
+            Err(EngineError::Upstream)
+        );
     }
 
     /// A peer receiptMessage envelope routes to `ControlReceive::Receipt`:

@@ -46,6 +46,8 @@
             "link.finish",
             "link.cancel",
             "conversations.list",
+            "conversations.getPinned",
+            "conversations.setPinned",
             "messages.list",
             "messages.search",
             "messages.getText",
@@ -64,6 +66,8 @@
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
+            "stickerPacks.getManifest",
+            "stickerPacks.getImage",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -148,6 +152,50 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/conversationsListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.getPinned" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsGetPinnedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.setPinned" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsSetPinnedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stickerPacks.getManifest" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/stickerPackManifestParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stickerPacks.getImage" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/stickerPackImageParams" }
             }
           }
         },
@@ -933,6 +981,89 @@
         }
       }
     },
+    "stickerPackManifestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packId", "packKey"],
+      "description": "Fetch one sticker pack's manifest (contract revision 1.36, §4.32): the engine performs the anonymous CDN GET and the official decrypt pipeline (WebAPI.preload.ts fetch, Crypto.node.ts HKDF 'Sticker Pack' → AES-256-CBC+HMAC) — the connector never touches key material beyond passing packKey through, and never persists either field. packId is exactly 32 hex characters (official isPackIdValid — stricter than the 1.35 send projection's ≤64 on purpose); packKey is standard base64 decoding to exactly 32 bytes. Read lane, no account context, no local state. Structured engine errors: STICKER_PACK_KEY_INVALID / STICKER_PACK_FETCH_FAILED / STICKER_PACK_MALFORMED.",
+      "properties": {
+        "packId": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 32,
+          "pattern": "^[0-9A-Fa-f]{32}$",
+          "description": "Sticker pack id, exactly 32 hex characters (official isPackIdValid)."
+        },
+        "packKey": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 44,
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "description": "Standard padded base64 of the 32-byte pack key: exactly 44 characters (11 base64 groups, one '=' pad — the only padded encoding whose decode is exactly 32 bytes)."
+        }
+      }
+    },
+    "stickerPackImageParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["packId", "packKey", "stickerId"],
+      "description": "Fetch one sticker's decrypted bytes (contract revision 1.36, §4.32): same pack identity rules as stickerPacks.getManifest plus the pack-local stickerId. The result is {dataBase64, contentType, size} — the decrypted image as standard base64 (≤ 409600 chars: the official 300 KB CDN ceiling plus base64 expansion), its media type, and the decoded byte count. The bytes exist only inside the engine and the response; nothing is persisted. Structured engine errors: the manifest family plus STICKER_IMAGE_TOO_LARGE.",
+      "properties": {
+        "packId": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 32,
+          "pattern": "^[0-9A-Fa-f]{32}$",
+          "description": "Sticker pack id, exactly 32 hex characters (official isPackIdValid)."
+        },
+        "packKey": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 44,
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "description": "Standard padded base64 of the 32-byte pack key: exactly 44 characters."
+        },
+        "stickerId": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Pack-local sticker id."
+        }
+      }
+    },
+    "conversationsGetPinnedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's pinned conversations (contract revision 1.36, §4.33): the engine reads the official Storage Service AccountRecord.pinnedConversations and the result projects {pinned: [{conversationId, kind}]} in cloud order — array order is the pin order, there are no timestamps. Read lane. The connector persists nothing: the host pulls at startup/refresh (poll-on-open, no live push on this face).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "conversationsSetPinnedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "kind", "pinned"],
+      "description": "Pin or unpin one conversation (contract revision 1.36, §4.33): the engine writes the official storage record (the same path the official desktop uses). conversationId resolves through the local store (CONVERSATION_NOT_FOUND before any upstream call); the result is the post-write cloud state {pinned: [...]} read back — not a local echo. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: CONVERSATION_NOT_RESOLVED (the cloud reference does not resolve) and the STORAGE_* family passed through verbatim. Message-level pins (messages.sendPinMessage, §4.28) are an orthogonal concept — this face pins conversations, not messages.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to pin or unpin; wider than the opaqueId family because the host may address a conversation not yet materialized locally. Resolved against the account before any upstream call."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "group", "legacyGroup"],
+          "description": "The upstream conversation reference taxonomy: direct chat, GroupsV2 group, or GroupsV1 legacy group."
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "true pins the conversation, false unpins it. Required — there is no toggle form."
+        }
+      }
+    },
     "groupsGetParams": {
       "type": "object",
       "additionalProperties": false,
@@ -1160,9 +1291,17 @@
             "ACCOUNT_LIMIT_REACHED",
             "ACCOUNT_NOT_FOUND",
             "CONVERSATION_NOT_FOUND",
+            "CONVERSATION_NOT_RESOLVED",
             "MESSAGE_NOT_FOUND",
             "GROUP_NOT_FOUND",
             "PROXY_GROUP_NOT_FOUND",
+            "STICKER_PACK_KEY_INVALID",
+            "STICKER_PACK_FETCH_FAILED",
+            "STICKER_PACK_MALFORMED",
+            "STICKER_IMAGE_TOO_LARGE",
+            "STORAGE_UNAVAILABLE",
+            "STORAGE_WRITE_FAILED",
+            "STORAGE_READ_FAILED",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",

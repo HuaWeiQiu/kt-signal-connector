@@ -426,6 +426,22 @@ impl ProxyGroupRuntime {
             })
     }
 
+    /// The reserved `default` group's slot, for account-less engine calls
+    /// (sticker pack browsing, §4.32): the launch plan always contains the
+    /// default group, so this cannot fail in practice.
+    fn default_slot(&self) -> Result<&ProxyGroupSlot, ServiceError> {
+        self.groups
+            .iter()
+            .find(|slot| slot.id == DEFAULT_PROXY_GROUP_ID)
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "RUNTIME_NOT_RUNNING",
+                    "the default proxy group is not configured in this connector",
+                    false,
+                ))
+            })
+    }
+
     pub async fn start_link(
         &self,
         device_name: String,
@@ -664,6 +680,42 @@ impl ProxyGroupRuntime {
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&params.account_id).await?;
         slot.supervisor.send_sticker(params).await
+    }
+
+    /// Sticker pack browsing (contract 1.36, §4.32): no account context, so
+    /// the call rides the default group's engine — pack browsing is
+    /// anonymous CDN traffic, not account state, and the single-group
+    /// deployment (the default profile) has exactly one engine to serve it.
+    pub async fn get_sticker_pack_manifest(
+        &self,
+        params: crate::service::StickerPackManifestParams,
+    ) -> Result<crate::service::StickerPackManifest, ServiceError> {
+        let slot = self.default_slot()?;
+        slot.supervisor.get_sticker_pack_manifest(params).await
+    }
+
+    pub async fn get_sticker_image(
+        &self,
+        params: crate::service::StickerPackImageParams,
+    ) -> Result<crate::service::StickerPackImage, ServiceError> {
+        let slot = self.default_slot()?;
+        slot.supervisor.get_sticker_image(params).await
+    }
+
+    pub async fn get_pinned_conversations(
+        &self,
+        params: crate::service::ConversationsGetPinnedParams,
+    ) -> Result<crate::service::PinnedConversations, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_pinned_conversations(params).await
+    }
+
+    pub async fn set_conversation_pinned(
+        &self,
+        params: crate::service::ConversationsSetPinnedParams,
+    ) -> Result<crate::service::PinnedConversations, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_conversation_pinned(params).await
     }
 
     pub async fn remote_delete(

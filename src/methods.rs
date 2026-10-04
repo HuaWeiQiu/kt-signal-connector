@@ -90,6 +90,18 @@ pub const METHODS: &[MethodRow] = &[
     ("groups.get", Lane::Read, false, "contacts"),
     ("contacts.setLocalAlias", Lane::Send, true, "send"),
     ("presence.setTypingMessage", Lane::Send, true, "send"),
+    // Sticker pack browsing (contract 1.36, §4.32): anonymous CDN traffic
+    // through the engine — no account, no mutation, no local state, so the
+    // READ lane and the read metrics class; the connector passes pack
+    // identity through and never touches key material beyond the parameter.
+    ("stickerPacks.getManifest", Lane::Read, false, "read"),
+    ("stickerPacks.getImage", Lane::Read, false, "read"),
+    // Conversation pin sync (contract 1.36, §4.33): getPinnedConversations is
+    // a bounded cloud-backed read; setConversationPinned is the mutating
+    // storage-service write — reaction-class write-lane mutex and delete
+    // barrier, no local persistence on either side.
+    ("conversations.getPinned", Lane::Read, false, "read"),
+    ("conversations.setPinned", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -131,10 +143,19 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// marks the outbound receipt face — `messages.markRead` /
 /// `messages.markViewed` plus the auto delivery receipt — as present, and
 /// `send-sticker` (contract revision 1.35) marks `messages.sendSticker` plus
-/// the sticker receive projection as present. They never join
-/// [`METHOD_NAMES`]: the schema request-frame method enum and the dispatch
-/// table describe real methods only.
-pub const FEATURE_CAPABILITIES: &[&str] = &["send-receipts", "send-sticker"];
+/// the sticker receive projection as present. `sticker-pack-browse` and
+/// `conversation-pin-sync` (contract revision 1.36) mark the two browse/sync
+/// faces of §4.32/§4.33 — desktops gate the new methods on these tags so an
+/// old connector answers a clean capability gap instead of
+/// `METHOD_NOT_ALLOWED`. They never join [`METHOD_NAMES`]: the schema
+/// request-frame method enum and the dispatch table describe real methods
+/// only.
+pub const FEATURE_CAPABILITIES: &[&str] = &[
+    "send-receipts",
+    "send-sticker",
+    "sticker-pack-browse",
+    "conversation-pin-sync",
+];
 
 #[cfg(test)]
 mod tests {
@@ -156,6 +177,9 @@ mod tests {
             "contacts.sync",
             "contacts.list",
             "groups.get",
+            "stickerPacks.getManifest",
+            "stickerPacks.getImage",
+            "conversations.getPinned",
         ];
         let send_lane = [
             "messages.sendText",
@@ -172,6 +196,7 @@ mod tests {
             "messages.markViewed",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
+            "conversations.setPinned",
         ];
         let mutating = [
             "messages.sendText",
@@ -190,6 +215,7 @@ mod tests {
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "accounts.deleteLocalData",
+            "conversations.setPinned",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

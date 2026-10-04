@@ -26,7 +26,8 @@ use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
-    ContactsSyncParams, ConversationsListParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
+    ContactsSyncParams, ConversationsGetPinnedParams, ConversationsListParams,
+    ConversationsSetPinnedParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
     LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
     MessagesListParams, MessagesMarkReadParams, MessagesMarkViewedParams,
@@ -34,6 +35,7 @@ use crate::service::{
     MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
     MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
     MessagesSendUnpinMessageParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackImageParams, StickerPackManifestParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1213,6 +1215,82 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.sendSticker params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "stickerPacks.getManifest" => {
+            match serde_json::from_value::<StickerPackManifestParams>(request.params) {
+                Ok(params) => match runtime.get_sticker_pack_manifest(params).await {
+                    Ok(manifest) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(manifest).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stickerPacks.getManifest params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "stickerPacks.getImage" => {
+            match serde_json::from_value::<StickerPackImageParams>(request.params) {
+                Ok(params) => match runtime.get_sticker_image(params).await {
+                    Ok(image) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(image).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stickerPacks.getImage params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.getPinned" => {
+            match serde_json::from_value::<ConversationsGetPinnedParams>(request.params) {
+                Ok(params) => match runtime.get_pinned_conversations(params).await {
+                    Ok(pinned) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(pinned).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.getPinned params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.setPinned" => {
+            match serde_json::from_value::<ConversationsSetPinnedParams>(request.params) {
+                Ok(params) => match runtime.set_conversation_pinned(params).await {
+                    Ok(pinned) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(pinned).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.setPinned params",
                         false,
                     ),
                 ),

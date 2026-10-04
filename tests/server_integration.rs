@@ -3339,10 +3339,11 @@ async fn receipt_upstream_failures_degrade_to_unknown_not_errors() {
 
 /// Contract revision 1.34 announcement and outbound mentions: the handshake
 /// capabilities carry the new methods plus the `send-receipts` feature tag
-/// (and the 1.35 `messages.sendSticker` method plus the `send-sticker` tag),
-/// and `messages.sendText` mentions reach the engine resolved — a UUID-shaped
-/// number and the cached contact pass verbatim, the unresolvable number is
-/// dropped locally — while an empty mention number fails the request closed.
+/// (and the 1.35 `messages.sendSticker` method plus the `send-sticker` tag,
+/// and the 1.36 browse/pin faces plus their tags), and `messages.sendText`
+/// mentions reach the engine resolved — a UUID-shaped number and the cached
+/// contact pass verbatim, the unresolvable number is dropped locally — while
+/// an empty mention number fails the request closed.
 #[tokio::test]
 async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
     let temp = TempDir::new().unwrap();
@@ -3392,6 +3393,12 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "send-receipts",
         "messages.sendSticker",
         "send-sticker",
+        "stickerPacks.getManifest",
+        "stickerPacks.getImage",
+        "sticker-pack-browse",
+        "conversations.getPinned",
+        "conversations.setPinned",
+        "conversation-pin-sync",
     ] {
         assert!(
             capabilities
@@ -3806,6 +3813,487 @@ async fn sticker_send_and_receive_round_trip() {
     assert_eq!(incoming["attachments"][0]["id"], "att-in-1");
     assert_eq!(incoming["attachments"][0]["contentType"], "image/webp");
     assert_eq!(incoming["attachments"][0]["width"], 256);
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.36 faces end to end: the two browse methods forward
+/// to the engine with bounds-validated pack identity and map structured
+/// engine errors (key-invalid deterministic, fetch-failed retryable); the
+/// two pin-sync methods resolve the conversation and account, forward with
+/// the resolved reference, answer the cloud-order list (entry cap
+/// enforced), a storage outage surfaces STORAGE_UNAVAILABLE verbatim, an
+/// unknown mutating pin outcome answers SEND_OUTCOME_UNKNOWN with no
+/// retry, and an old-engine (method-absent) browse answers CAPABILITY_
+/// UNAVAILABLE. Bounds failures reject before any upstream call.
+#[tokio::test]
+async fn sticker_pack_browse_and_pin_sync_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [37_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    // Browse works before any runtime start is not asserted: the engine must
+    // be up for the forward. Start the runtime and link the fixture account.
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-PinSync" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Happy-path manifest: the engine's projection comes through structured.
+    let manifest = request(
+        &mut client,
+        "browse-manifest",
+        "stickerPacks.getManifest",
+        json!({
+            "packId": "abcdef0123456789abcdef0123456789",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }),
+    )
+    .await;
+    assert_eq!(manifest["result"]["title"], "Fixture Pack");
+    assert_eq!(manifest["result"]["author"], "KT Fixture");
+    assert_eq!(manifest["result"]["cover"]["id"], 1);
+    assert_eq!(manifest["result"]["cover"]["emoji"], "🎉");
+    assert_eq!(manifest["result"]["stickers"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        manifest["result"]["stickers"][1]["contentType"],
+        "image/png"
+    );
+    assert_eq!(manifest["result"]["stickerCount"], 2);
+
+    // Happy-path image: base64/size/contentType pass through.
+    let image = request(
+        &mut client,
+        "browse-image",
+        "stickerPacks.getImage",
+        json!({
+            "packId": "abcdef0123456789abcdef0123456789",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "stickerId": 1
+        }),
+    )
+    .await;
+    assert_eq!(image["result"]["size"], 13);
+    assert_eq!(image["result"]["contentType"], "image/webp");
+    assert_eq!(image["result"]["dataBase64"], "Zml4dHVyZS1ieXRlcw==");
+
+    // Structured engine errors: key-invalid is deterministic, fetch-failed
+    // is retryable — the engine code maps without being swallowed or
+    // re-invented.
+    let bad_key = request(
+        &mut client,
+        "browse-bad-key",
+        "stickerPacks.getManifest",
+        json!({
+            "packId": "ffffffffffffffffffffffffffffffff",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }),
+    )
+    .await;
+    assert_eq!(bad_key["error"]["code"], "STICKER_PACK_KEY_INVALID");
+    assert_eq!(bad_key["error"]["retryable"], false);
+    let fetch_fail = request(
+        &mut client,
+        "browse-fetch-fail",
+        "stickerPacks.getManifest",
+        json!({
+            "packId": "00000000000000000000000000000000",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }),
+    )
+    .await;
+    assert_eq!(fetch_fail["error"]["code"], "STICKER_PACK_FETCH_FAILED");
+    assert_eq!(fetch_fail["error"]["retryable"], true);
+    let too_large = request(
+        &mut client,
+        "browse-too-large",
+        "stickerPacks.getImage",
+        json!({
+            "packId": "abcdef0123456789abcdef0123456789",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "stickerId": 413
+        }),
+    )
+    .await;
+    assert_eq!(too_large["error"]["code"], "STICKER_IMAGE_TOO_LARGE");
+
+    // Local bounds failures reject before any upstream call: a 64-hex send-
+    // projection pack id is NOT valid on the browse face (32 hex exactly),
+    // and a key decoding to 31 bytes is rejected.
+    let wrong_length_id = request(
+        &mut client,
+        "browse-wrong-id",
+        "stickerPacks.getManifest",
+        json!({
+            "packId": "abcdef01",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }),
+    )
+    .await;
+    assert_eq!(wrong_length_id["error"]["code"], "INVALID_REQUEST");
+    let wrong_key = request(
+        &mut client,
+        "browse-wrong-key",
+        "stickerPacks.getImage",
+        json!({
+            "packId": "abcdef0123456789abcdef0123456789",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+            "stickerId": 1
+        }),
+    )
+    .await;
+    assert_eq!(wrong_key["error"]["code"], "INVALID_REQUEST");
+
+    // Pin sync: the cloud-order read; then a write whose read-back observes
+    // the write in first position.
+    let pinned = request(
+        &mut client,
+        "get-pinned",
+        "conversations.getPinned",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let entries = pinned["result"]["pinned"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["conversationId"], "+15555550101");
+    assert_eq!(entries[0]["kind"], "contact");
+    assert_eq!(entries[1]["kind"], "group");
+
+    // Address a real conversation: materialize one with a text send first.
+    let sent = request(
+        &mut client,
+        "pin-setup-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "pin me",
+            "clientRequestId": "pin-setup-1"
+        }),
+    )
+    .await;
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let set_pinned = request(
+        &mut client,
+        "set-pinned",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "pinned": true
+        }),
+    )
+    .await;
+    let entries = set_pinned["result"]["pinned"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["conversationId"], "+15555550102");
+    assert_eq!(entries[0]["kind"], "contact");
+    // The exact upstream contract landed on the wire: resolved reference,
+    // kind, boolean.
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let pin_calls: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("pinned").is_some())
+        .collect();
+    assert_eq!(pin_calls.len(), 1, "{pin_calls:?}");
+    assert_eq!(pin_calls[0]["account"], "+15555550100");
+    assert_eq!(pin_calls[0]["conversationId"], "+15555550102");
+    assert_eq!(pin_calls[0]["kind"], "contact");
+    assert_eq!(pin_calls[0]["pinned"], true);
+
+    // Unpin: the write applies symmetrically.
+    let unpinned = request(
+        &mut client,
+        "set-unpinned",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "pinned": false
+        }),
+    )
+    .await;
+    let entries = unpinned["result"]["pinned"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["conversationId"] != "+15555550102"),
+        "the unpinned conversation must be gone: {entries:?}"
+    );
+
+    // Unknown conversation: the local ladder answers before any upstream
+    // call.
+    let unknown_conversation = request(
+        &mut client,
+        "pin-unknown",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "kind": "contact",
+            "pinned": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"],
+        "CONVERSATION_NOT_FOUND"
+    );
+
+    // Bounds: an illegal kind and a missing required boolean fail closed
+    // locally.
+    let bad_kind = request(
+        &mut client,
+        "pin-bad-kind",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "story",
+            "pinned": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_kind["error"]["code"], "INVALID_REQUEST");
+    let missing_pinned = request(
+        &mut client,
+        "pin-missing-bool",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(missing_pinned["error"]["code"], "INVALID_REQUEST");
+
+    // Storage outage surfaces the engine's STORAGE_* code verbatim
+    // (retryable): the fixture answers it on the +15555550998 peer. The
+    // peer send returns the conversation id directly.
+    let storage_setup = request(
+        &mut client,
+        "pin-storage-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550998",
+            "text": "storage sentinel",
+            "clientRequestId": "pin-storage-0"
+        }),
+    )
+    .await;
+    let storage_conversation = storage_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let storage_down = request(
+        &mut client,
+        "pin-storage-down",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": storage_conversation,
+            "kind": "contact",
+            "pinned": true
+        }),
+    )
+    .await;
+    assert_eq!(storage_down["error"]["code"], "STORAGE_UNAVAILABLE");
+    assert_eq!(storage_down["error"]["retryable"], true);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Engine-error degradation and the unresolved-reference face (contract
+/// 1.36): a codeless engine error degrades to UPSTREAM_ERROR (never a
+/// partial answer), and the engine's CONVERSATION_NOT_RESOLVED passes
+/// through structurally with retryable=false. The crash-with-in-flight-send
+/// path for the mutating write is covered by the sentinel peer
+/// +15555550999 in the fixture (os._exit(29)), exercised here to pin the
+/// SEND_OUTCOME_UNKNOWN answer and the no-auto-retry discipline.
+#[tokio::test]
+async fn sticker_and_pin_methods_surface_engine_errors() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [41_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-OldEngine" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Codeless engine error (the 0x11 pack id sentinel): degrades to the
+    // plain upstream error, never a partial manifest.
+    let degraded = request(
+        &mut client,
+        "browse-degraded",
+        "stickerPacks.getManifest",
+        json!({
+            "packId": "11111111111111111111111111111111",
+            "packKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }),
+    )
+    .await;
+    assert_eq!(degraded["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(degraded["error"]["retryable"], true);
+
+    // CONVERSATION_NOT_RESOLVED passes through verbatim: the fixture
+    // answers it on the +15555550997 peer (the conversation id comes
+    // straight from the peer send result).
+    let unresolved_setup = request(
+        &mut client,
+        "pin-unresolved-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550997",
+            "text": "unresolved sentinel",
+            "clientRequestId": "pin-unresolved-0"
+        }),
+    )
+    .await;
+    let unresolved_conversation = unresolved_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let unresolved = request(
+        &mut client,
+        "pin-unresolved",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": unresolved_conversation,
+            "kind": "contact",
+            "pinned": true
+        }),
+    )
+    .await;
+    assert_eq!(unresolved["error"]["code"], "CONVERSATION_NOT_RESOLVED");
+    assert_eq!(unresolved["error"]["retryable"], false);
+
+    // Crash with the mutating pin in flight (fixture peer +15555550999,
+    // os._exit(29)): the request answers SEND_OUTCOME_UNKNOWN and nothing
+    // is retried — the recovered log shows exactly one pin call for the
+    // sentinel peer.
+    let crash_setup = request(
+        &mut client,
+        "pin-crash-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550999",
+            "text": "crash sentinel",
+            "clientRequestId": "pin-crash-0"
+        }),
+    )
+    .await;
+    let crash_conversation = crash_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let crash = request(
+        &mut client,
+        "pin-crash",
+        "conversations.setPinned",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_conversation,
+            "kind": "contact",
+            "pinned": true
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+
+    // Recovery: an explicit start brings the engine back; the pin write is
+    // not replayed (exactly one crash call in the log).
+    let restarted = request(&mut client, "restart-pin", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid);
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let crash_calls: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("pinned").is_some())
+        .collect();
+    assert_eq!(
+        crash_calls
+            .iter()
+            .filter(|params| params["conversationId"] == "+15555550999")
+            .count(),
+        1,
+        "an unknown pin outcome is never retried: {crash_calls:?}"
+    );
 
     drop(client);
     wait_for_process_exit(recovered_pid).await;

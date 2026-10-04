@@ -35,8 +35,9 @@ use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
     MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
-    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_SEND_MENTIONS,
-    MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES,
+    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS,
+    MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
+    MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, STICKER_PACK_BROWSE_ID_HEX_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -293,6 +294,17 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   no natural schema numeric hook; pinned by
 ///   `group_count_is_hard_capped_at_eight_including_default` and
 ///   `eighth_account_links_but_a_ninth_is_refused_at_the_ceiling`.
+/// - sticker browse result bounds (contract 1.36, §4.32):
+///   `MAX_STICKER_MANIFEST_TITLE_CHARS` / `MAX_STICKER_MANIFEST_AUTHOR_CHARS`
+///   (256) and `MAX_STICKER_MANIFEST_ENTRIES` (1024), plus
+///   `MAX_STICKER_IMAGE_BASE64_CHARS` (409600) — the schema's `result` is a
+///   free-form object, so these live on the engine-result projection
+///   (`manifest_from_engine` / `image_from_engine`) and are pinned by the
+///   §4.32 integration test.
+/// - the pinned-list entry cap (contract 1.36, §4.33,
+///   `MAX_PINNED_CONVERSATIONS` = 128): same free-form-result situation,
+///   enforced in `pinned_conversations_result` and pinned by the §4.33
+///   integration test.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
@@ -397,6 +409,25 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesSendStickerParams/properties/image/properties/sizeBytes",
             "maximum",
             MAX_ATTACHMENT_BYTES as u64,
+        ),
+        // Sticker pack browsing (contract 1.36, §4.32): the browse-face pack
+        // id is exactly the official 32-hex form (both minLength and
+        // maxLength pinned to the constant); title/author carry the KT
+        // 256-char bound; the manifest entry cap is the schema maxItems.
+        (
+            "/$defs/stickerPackManifestParams/properties/packId",
+            "maxLength",
+            STICKER_PACK_BROWSE_ID_HEX_CHARS as u64,
+        ),
+        (
+            "/$defs/stickerPackImageParams/properties/packId",
+            "maxLength",
+            STICKER_PACK_BROWSE_ID_HEX_CHARS as u64,
+        ),
+        (
+            "/$defs/conversationsSetPinnedParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
         ),
         (
             "/$defs/conversationsListParams/properties/limit",

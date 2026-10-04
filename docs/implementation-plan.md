@@ -5,6 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.36 (2026-10-04)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1215,6 +1216,113 @@ control surfaces keeps working — the control plane is orthogonal (§4.28).
 
 Bounds failures are deterministic `INVALID_REQUEST` before the pending row exists; unknown
 mutating outcomes answer `SEND_OUTCOME_UNKNOWN` and are never retried.
+
+### 4.32 Sticker pack browsing: getStickerPackManifest + getStickerImage (contract revision 1.36, 2026-10-04)
+
+The browse face of contract 1.36: two additive Read-lane host methods through which the desktop
+fetches a sticker pack's manifest and one sticker's decrypted bytes on demand. Neither method
+takes an `accountId` — pack browsing is anonymous CDN traffic in the official client, entirely
+outside any linked account's session — and neither reads or writes connector state: no row, no
+cache, no event, no persistence. Both are engine-extension methods (the pinned signal-cli
+JSON-RPC has no sticker-pack face) forwarded 1:1 to the engine, which performs all network and
+crypto work.
+
+Official behavior reference (file-level): `ts/textsecure/WebAPI.preload.ts` (anonymous CDN GET
+of `manifest.proto`), `ts/Crypto.node.ts` (HKDF `"Sticker Pack"` → AES-256-CBC + HMAC-SHA256
+verify/decrypt), `ts/types/Stickers.preload.ts` (manifest decode, `isPackIdValid`, and the 200
+sticker display window). The engine owns the whole pipeline: anonymous CDN GET, digest
+verification, decryption, proto decode. The connector never touches key material beyond passing
+the pack key through as a parameter — the key exists on the wire only as the base64 the host
+supplied, is never persisted, never logged, and never leaves the request scope (the §6.7
+boundary's crypto wording, kept verbatim: bytes and keys both stay engine-side).
+
+- `getStickerPackManifest`: params `packId` (exactly 32 lowercase-or-uppercase hex characters),
+  `packKey` (standard base64 that decodes to exactly 32 bytes). Result `{title, author, cover,
+  stickers, stickerCount}` where `cover` is `{id, emoji?, contentType?} | null` and `stickers`
+  is `[{id, emoji?, contentType?}]`. Bounds: manifest entries are capped at 1024 — the official
+  decoder truncates over-long proto lists, the connector mirrors that truncation semantics
+  rather than rejecting (official behavior); `title`/`author` are ≤ 256 characters (KT bounds —
+  the official decoder applies no length validation; the connector keeps the early
+  `INVALID_REQUEST` fail-closed guard instead of passing absurd strings through). The 32-hex
+  packId is deliberately stricter than the 1.35 sendSticker receive projection (even-length hex
+  ≤ 64): the browse face aligns with the official `isPackIdValid`, which accepts exactly 32 hex
+  characters for pack ids minted by the official sticker creators.
+- `getStickerImage`: params `packId` (same 32-hex rule), `packKey` (same 32-byte rule),
+  `stickerId` (u32). Result `{dataBase64, contentType, size}` where `dataBase64` is the
+  decrypted standard-base64 image (≤ 400 KB encoded — the official sticker CDN caps uploads at
+  300 KB, and 4 × ceil(307200 / 3) = 409600 characters covers the base64 expansion with margin),
+  `contentType` is the manifest/sniffed image media type, `size` the decoded byte count. The
+  decoded bytes exist only inside the engine for the lifetime of the response; the connector
+  persists nothing and never decodes or re-encodes beyond the pass-through.
+
+Lane classification: both methods are **Read lane, non-mutating** — CDN fetches mutate no
+upstream state, so no account mutex, no delete barrier, no pending-row settlement, and a
+timeout answers the ordinary retryable `UPSTREAM_TIMEOUT` (unlike mutating calls, a read that
+did not answer provably took no effect). Error mapping: engine error codes surface through the
+structured connector codes — `STICKER_PACK_KEY_INVALID` / `STICKER_PACK_FETCH_FAILED` /
+`STICKER_PACK_MALFORMED` / `STICKER_IMAGE_TOO_LARGE` map to the connector's
+`STICKER_PACK_KEY_INVALID` / `STICKER_PACK_FETCH_FAILED` / `STICKER_PACK_MALFORMED` /
+`STICKER_IMAGE_TOO_LARGE` (`retryable=false` for key-invalid and too-large,
+`retryable=true` for fetch-failed and malformed — a malformed upstream proto may be fixed by a
+refetch; an invalid key never succeeds on retry), engine-down answers the existing
+`RUNTIME_NOT_RUNNING`, and an old engine without the method answers the existing
+`CAPABILITY_UNAVAILABLE` (same "engine does not support this face" mapping the §4.29
+engine-extension family uses; desktops gate on the handshake `capabilities` tag
+`sticker-pack-browse`, contract-gated discovery per §4.5 precedent).
+
+### 4.33 Conversation pin sync: getPinnedConversations + setConversationPinned (contract revision 1.36, 2026-10-04)
+
+The conversation-level pin face of contract 1.36: two host methods that read and write the
+official conversation-pinning state. Source of truth is the Signal Storage Service
+`AccountRecord.pinnedConversations` (official mechanism, `ts/services/storage.preload.ts`):
+the upstream stores an ordered list of conversation references, array order = pin order (no
+timestamps — pinnedAt ordering is a desktop render concern derived from list position), and the
+storage service write path is the same one the official desktop uses when the user pins or
+unpins a chat.
+
+- `getPinnedConversations`: params `accountId`. Result `{pinned:
+  [{conversationId, kind}]}` with `kind` the three-value enum `contact` | `group` |
+  `legacyGroup` (GroupsV1), order exactly the cloud order. Read lane, non-mutating.
+- `setConversationPinned`: params `accountId`, `conversationId`, `kind` (same enum), `pinned`
+  (boolean, required). Result: the same `{pinned: [...]}` projection read back after the
+  upstream write, so the host sees the post-write cloud state — including the server-applied
+  ordering — instead of a local guess. Send lane, account-scoped mutating (the reaction-class
+  write-lane mutex and delete drain barrier verbatim; an unknown mutating outcome answers
+  `SEND_OUTCOME_UNKNOWN` and is never retried, per AGENTS.md).
+
+Connector responsibilities are strictly bounded: forward, bounds-check, and resolve the
+conversation identity and account context. `conversationId` resolves through the existing
+ladder (§4.4 wire order: account, then conversation — `CONVERSATION_NOT_FOUND` before any
+upstream call) so the connector maps the host's opaque id to the upstream conversation
+reference the engine needs, mirroring the conversationId resolution every other method uses;
+`kind` is validated against the three-value enum; `accountId` resolves the owning proxy group
+and engine through the normal routing. The connector does not interpret pin semantics and adds
+no second ordering.
+
+Bounds (early `INVALID_REQUEST`, deterministic, before any upstream call): `conversationId` ≤
+256 characters (a conversation reference bound, wider than the local opaqueId family because
+the host may address a conversation it has not yet materialized locally), `kind` enum as above,
+`pinned` required boolean, and the returned `pinned` list is capped at 128 entries (KT bound —
+the official clients apply no explicit cap; the connector truncates beyond 128 to keep one
+host frame bounded and records the truncation in the §5 boundary notes). Engine errors pass
+through structurally: `CONVERSATION_NOT_RESOLVED` maps to the connector's
+`CONVERSATION_NOT_RESOLVED` (`retryable=false` — the cloud reference does not resolve against
+the account's storage state), storage-service failures surface under the engine's
+`STORAGE_*` codes verbatim (`retryable=true`; the connector neither swallows nor invents
+storage codes — the engine owns their final set), and engine-down / method-absent follow the
+§4.32 mapping (`RUNTIME_NOT_RUNNING` / `CAPABILITY_UNAVAILABLE`). Handshake `capabilities`
+gains `conversation-pin-sync`.
+
+Orthogonality and live-push boundaries: message-level pins (contract 1.33 `pinMessage` /
+`unpinMessage`, §4.28 — at most one pinned *message* per conversation, projected onto the
+conversation summary) and conversation-level pins (this face — ordered list of pinned
+*conversations* in the account record) are two unrelated protocol concepts that merely share
+the word; neither feeds the other, and the §4.28 `pinnedMessage` summary field is untouched by
+this face. Live push is out of scope for this face: the connector does not subscribe to storage-service
+pin writes, and the engine projects no inbound pin event; the host pulls with
+`getPinnedConversations` at startup/refresh (poll-on-open replaces push). The connector
+persists no pinned list — the cloud record plus the desktop's own cache is the whole story; no
+new on-disk face, no store schema change.
 
 ## 5. signal-cli Boundary
 

@@ -38,6 +38,28 @@ pub const MAX_EMOJI_BYTES: usize = 32;
 pub const MAX_STICKER_PACK_ID_CHARS: usize = 64;
 pub const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
 pub const MAX_STICKER_EMOJI_CHARS: usize = 32;
+/// Sticker pack browsing bounds (contract revision 1.36, §4.32): the browse
+/// face aligns with the official `isPackIdValid` (exactly 32 hex characters)
+/// and the official pack key (base64 decoding to exactly 32 bytes); title and
+/// author carry a 256-character KT bound the official decoder does not
+/// enforce; the manifest entry cap mirrors the official 200-sticker display
+/// truncation semantics at the decoder level.
+pub const STICKER_PACK_BROWSE_ID_HEX_CHARS: usize = 32;
+pub const STICKER_PACK_BROWSE_KEY_BYTES: usize = 32;
+pub const MAX_STICKER_MANIFEST_TITLE_CHARS: usize = 256;
+pub const MAX_STICKER_MANIFEST_AUTHOR_CHARS: usize = 256;
+pub const MAX_STICKER_MANIFEST_ENTRIES: usize = 1024;
+/// The decrypted sticker image budget (§4.32): the official CDN caps sticker
+/// uploads at 300 KB; the base64 result bound is the exact padded encoding of
+/// that ceiling — 4 * ceil(307200 / 3) = 409600 characters.
+pub const MAX_STICKER_IMAGE_BYTES: usize = 300 * 1024;
+pub const MAX_STICKER_IMAGE_BASE64_CHARS: usize = 4 * MAX_STICKER_IMAGE_BYTES.div_ceil(3);
+/// Conversation pin sync bounds (contract revision 1.36, §4.33): the host
+/// may address a conversation wider than the local opaqueId family, and the
+/// returned pin list is capped (KT bound; the official clients declare no
+/// explicit cap) so one response frame stays bounded.
+pub const MAX_PIN_CONVERSATION_ID_CHARS: usize = 256;
+pub const MAX_PINNED_CONVERSATIONS: usize = 128;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
@@ -145,6 +167,58 @@ impl ServiceError {
             ServiceError::Engine(EngineError::Upstream) => {
                 ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true)
             }
+            // Contract 1.36 structured engine errors (§4.32/§4.33): the code
+            // is a fixed engine literal from the engine.rs allowlist — mapped
+            // 1:1 onto the same-named host code, with the retryability the
+            // contract fixes per family (key-invalid/too-large/not-resolved
+            // are deterministic refusals; fetch/malformed/storage failures
+            // may succeed on a later attempt). STORAGE_* is the engine-final
+            // family (the connector declares the current members, it does not
+            // invent new ones); an engine code outside the allowlist never
+            // reaches this arm — it degrades to plain UPSTREAM_ERROR.
+            ServiceError::Engine(EngineError::UpstreamCode { code }) => match code {
+                "STICKER_PACK_KEY_INVALID" => ApiError::new(
+                    "STICKER_PACK_KEY_INVALID",
+                    "sticker pack key is invalid",
+                    false,
+                ),
+                "STICKER_PACK_FETCH_FAILED" => ApiError::new(
+                    "STICKER_PACK_FETCH_FAILED",
+                    "sticker pack could not be fetched",
+                    true,
+                ),
+                "STICKER_PACK_MALFORMED" => ApiError::new(
+                    "STICKER_PACK_MALFORMED",
+                    "sticker pack manifest is malformed",
+                    true,
+                ),
+                "STICKER_IMAGE_TOO_LARGE" => ApiError::new(
+                    "STICKER_IMAGE_TOO_LARGE",
+                    "sticker image exceeds the size budget",
+                    false,
+                ),
+                "CONVERSATION_NOT_RESOLVED" => ApiError::new(
+                    "CONVERSATION_NOT_RESOLVED",
+                    "conversation reference does not resolve for this account",
+                    false,
+                ),
+                "STORAGE_UNAVAILABLE" => ApiError::new(
+                    "STORAGE_UNAVAILABLE",
+                    "the engine's storage service is unavailable",
+                    true,
+                ),
+                "STORAGE_WRITE_FAILED" => ApiError::new(
+                    "STORAGE_WRITE_FAILED",
+                    "the engine's storage service write failed",
+                    true,
+                ),
+                "STORAGE_READ_FAILED" => ApiError::new(
+                    "STORAGE_READ_FAILED",
+                    "the engine's storage service read failed",
+                    true,
+                ),
+                _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
+            },
             ServiceError::Engine(EngineError::Unauthorized) => ApiError::new(
                 "ACCOUNT_UNLINKED",
                 "device was unlinked by the account holder",
@@ -1338,6 +1412,87 @@ impl ConnectorService {
             params,
             pending_sent_at: pending.sent_at,
         })
+    }
+
+    /// stickerPacks.getManifest (contract revision 1.36, §4.32): bounds
+    /// validation, then the engine call is composed by the supervisor — the
+    /// service contributes no state and returns nothing persistent. The
+    /// packId/packKey rules are the browse-face shapes (32-hex id, base64
+    /// key decoding to exactly 32 bytes), stricter than the 1.35 send
+    /// projection on purpose (§4.32).
+    pub fn prepare_sticker_pack_manifest(
+        &self,
+        params: &StickerPackManifestParams,
+    ) -> Result<(), ServiceError> {
+        validate_sticker_browse_pack_id(&params.pack_id)?;
+        validate_sticker_browse_pack_key(&params.pack_key)?;
+        Ok(())
+    }
+
+    /// stickerPacks.getImage (contract revision 1.36, §4.32): same pack
+    /// identity bounds plus the u32 stickerId — the u32 type already fails
+    /// non-integer/out-of-range values at params deserialization, so the
+    /// prepare step adds no second check.
+    pub fn prepare_sticker_pack_image(
+        &self,
+        params: &StickerPackImageParams,
+    ) -> Result<(), ServiceError> {
+        validate_sticker_browse_pack_id(&params.pack_id)?;
+        validate_sticker_browse_pack_key(&params.pack_key)?;
+        Ok(())
+    }
+
+    /// conversations.getPinned (contract revision 1.36, §4.33): account
+    /// bounds and existence — the pinned list itself lives upstream, the
+    /// service reads nothing locally (no persistence on this face).
+    pub fn prepare_conversations_get_pinned(
+        &self,
+        account_id: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// conversations.setPinned (contract revision 1.36, §4.33): bounds and
+    /// resolution only — the conversation id resolves through the shared
+    /// ladder (account, then conversation; CONVERSATION_NOT_FOUND before
+    /// any upstream call) and the kind enum is validated here, so the
+    /// upstream call carries a resolved reference and a legal kind. No
+    /// local row is written: the cloud record is the whole state.
+    pub fn prepare_conversations_set_pinned(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+        pinned: bool,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        validate_pinned_kind(kind)?;
+        let account = self.resolve_account(account_id)?;
+        // Resolution uses the plain ladder: only conversations already
+        // materialized locally resolve. A pinned reference for a conversation
+        // this connector has never seen is the engine's CONVERSATION_
+        // NOT_RESOLVED answer, not a local guess (§4.33). The upstream key is
+        // `conversationId` carrying the resolved upstream conversation
+        // reference (peer key, the identity every other group/direct
+        // addressing projects), never the host's opaque local id.
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "conversationId": conversation.peer_key,
+            "kind": kind,
+            "pinned": pinned,
+        }))
     }
 
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
@@ -3092,6 +3247,66 @@ pub struct GroupDetails {
     pub synced_at: u64,
 }
 
+/// One sticker entry of the `stickerPacks.getManifest` result (contract
+/// revision 1.36, §4.32): pack-local id plus optional emoji/contentType —
+/// the official `StickerPackRecord` projection fields the desktop renders
+/// with. `emoji`/`contentType` are absent when the pack did not declare
+/// them (the official proto treats both as optional).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickerManifestEntry {
+    pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+/// The `stickerPacks.getManifest` result (contract revision 1.36, §4.32).
+/// `cover` is absent when the pack declares none (the official manifest
+/// shape treats cover as optional).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickerPackManifest {
+    pub title: String,
+    pub author: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cover: Option<StickerManifestEntry>,
+    pub stickers: Vec<StickerManifestEntry>,
+    pub sticker_count: u32,
+}
+
+/// The `stickerPacks.getImage` result (contract revision 1.36, §4.32): the
+/// decrypted image bytes as standard base64 — pass-through of the engine's
+/// result, nothing persisted, nothing decoded or re-encoded connector-side.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StickerPackImage {
+    pub data_base64: String,
+    pub content_type: String,
+    pub size: u32,
+}
+
+/// One pinned-conversation entry of the §4.33 result: the upstream reference
+/// exactly as the cloud order carries it — `conversationId` is the engine's
+/// resolved conversation identifier, `kind` the three-value taxonomy
+/// (`contact` | `group` | `legacyGroup`).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedConversation {
+    pub conversation_id: String,
+    pub kind: String,
+}
+
+/// The §4.33 result shape shared by `conversations.getPinned` and
+/// `conversations.setPinned`: the pinned list in cloud order, capped at
+/// [`MAX_PINNED_CONVERSATIONS`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedConversations {
+    pub pinned: Vec<PinnedConversation>,
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -3330,6 +3545,44 @@ pub struct MessagesSendStickerParams {
     pub sticker_id: u32,
     pub emoji: Option<String>,
     pub image: MessagesSendStickerImage,
+}
+
+/// `stickerPacks.getManifest` params (contract revision 1.36, §4.32): no
+/// account context — pack browsing is anonymous CDN traffic engine-side.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StickerPackManifestParams {
+    pub pack_id: String,
+    pub pack_key: String,
+}
+
+/// `stickerPacks.getImage` params (contract revision 1.36, §4.32): same pack
+/// identity plus the pack-local sticker id.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StickerPackImageParams {
+    pub pack_id: String,
+    pub pack_key: String,
+    pub sticker_id: u32,
+}
+
+/// `conversations.getPinned` params (contract revision 1.36, §4.33).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsGetPinnedParams {
+    pub account_id: String,
+}
+
+/// `conversations.setPinned` params (contract revision 1.36, §4.33): the
+/// three-value kind enum mirrors the upstream storage reference taxonomy;
+/// `pinned` is required (absent fails params deserialization).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsSetPinnedParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub kind: String,
+    pub pinned: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3881,7 +4134,7 @@ fn base64_encode(data: &[u8]) -> String {
 /// Decode standard base64 (with padding) into `out`. Returns Err on any
 /// non-canonical input; the implementation mirrors the alphabet upstream's
 /// java.util.Base64 accepts.
-fn base64_decode_to_vec(input: &str, out: &mut Vec<u8>) -> Result<(), ()> {
+pub(crate) fn base64_decode_to_vec(input: &str, out: &mut Vec<u8>) -> Result<(), ()> {
     const INVALID: u8 = 0xFF;
     fn value(byte: u8) -> u8 {
         match byte {
@@ -4044,6 +4297,82 @@ fn validate_sticker_pack_key(pack_key: &str) -> Result<(), ServiceError> {
         )));
     }
     Ok(())
+}
+
+/// Sticker pack browsing pack identity bounds (contract revision 1.36,
+/// §4.32). Deliberately stricter than the 1.35 send projection: the browse
+/// face aligns with the official `isPackIdValid` — exactly 32 hex characters
+/// (`Stickers.preload.ts`) — and the pack key must decode to exactly 32
+/// bytes (the HKDF `"Sticker Pack"` input the engine feeds
+/// `Crypto.node.ts`-style). Both validate shape only; the connector never
+/// interprets the key material.
+fn validate_sticker_browse_pack_id(pack_id: &str) -> Result<(), ServiceError> {
+    let count = pack_id.chars().count();
+    if count != STICKER_PACK_BROWSE_ID_HEX_CHARS || !pack_id.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "packId must be exactly 32 hex characters",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_sticker_browse_pack_key(pack_key: &str) -> Result<(), ServiceError> {
+    let count = pack_key.chars().count();
+    // 32 bytes are exactly 44 padded base64 characters; the count guard
+    // rejects absurd sizes before the decode, the decode decides validity.
+    if count == 0 || count > MAX_STICKER_PACK_KEY_CHARS {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "packKey must contain between 1 and 128 characters",
+            false,
+        )));
+    }
+    let mut decoded = Vec::new();
+    match base64_decode_to_vec(pack_key, &mut decoded) {
+        Ok(()) if decoded.len() == STICKER_PACK_BROWSE_KEY_BYTES => Ok(()),
+        _ => Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "packKey must be standard base64 decoding to exactly 32 bytes",
+            false,
+        ))),
+    }
+}
+
+/// `conversations.setPinned` bounds (contract revision 1.36, §4.33): the
+/// kind enum is the upstream reference taxonomy and the conversation id
+/// bound is wider than the local opaqueId family because the host may
+/// address a conversation not yet materialized locally.
+fn validate_pinned_kind(kind: &str) -> Result<(), ServiceError> {
+    if !matches!(kind, "contact" | "group" | "legacyGroup") {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "kind must be 'contact', 'group', or 'legacyGroup'",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// Project the engine's pinned list onto the wire shape with the KT entry
+/// cap (§4.33): order is cloud order, entries beyond 128 are truncated —
+/// the connector adds no ordering of its own.
+pub(crate) fn pinned_conversations_result(entries: &[Value]) -> PinnedConversations {
+    let pinned = entries
+        .iter()
+        .take(MAX_PINNED_CONVERSATIONS)
+        .filter_map(|entry| {
+            let conversation_id = entry.get("conversationId").and_then(Value::as_str)?;
+            let kind = entry.get("kind").and_then(Value::as_str)?;
+            Some(PinnedConversation {
+                conversation_id: conversation_id.to_string(),
+                kind: kind.to_string(),
+            })
+        })
+        .collect();
+    PinnedConversations { pinned }
 }
 
 /// Build the RFC 2397 data URI the pinned upstream accepts
@@ -4333,6 +4662,43 @@ mod tests {
         let api = ServiceError::Engine(EngineError::Unauthorized).into_api();
         assert_eq!(api.code, "ACCOUNT_UNLINKED");
         assert!(!api.retryable);
+    }
+
+    /// Structured engine error mapping (contract 1.36, §4.32/§4.33): each
+    /// allowlisted engine code maps to the same-named connector code with
+    /// the contract-fixed retryability; the mapping is total over the
+    /// engine.rs allowlist, so no allowlisted code can fall through to the
+    /// generic answer.
+    #[test]
+    fn structured_engine_errors_map_to_same_named_connector_codes() {
+        let deterministic = [
+            "STICKER_PACK_KEY_INVALID",
+            "STICKER_IMAGE_TOO_LARGE",
+            "CONVERSATION_NOT_RESOLVED",
+        ];
+        for code in deterministic {
+            let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert!(!api.retryable, "{code}");
+        }
+        let retryable = [
+            "STICKER_PACK_FETCH_FAILED",
+            "STICKER_PACK_MALFORMED",
+            "STORAGE_UNAVAILABLE",
+            "STORAGE_WRITE_FAILED",
+            "STORAGE_READ_FAILED",
+        ];
+        for code in retryable {
+            let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert!(api.retryable, "{code}");
+        }
+        // The two allowlists must stay in lockstep: every code the engine
+        // layer can emit must map to itself here.
+        for code in crate::engine::ENGINE_STRUCTURED_ERROR_CODES_FOR_TESTS {
+            let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
+            assert_eq!(api.code, *code, "unmapped engine code {code}");
+        }
     }
 
     #[test]
@@ -7481,6 +7847,157 @@ mod tests {
         assert!(params["sticker"].get("emoji").is_none());
         assert!(params["sticker"].get("width").is_none());
         assert!(params["sticker"].get("height").is_none());
+    }
+
+    /// Sticker pack browsing bounds (contract revision 1.36, §4.32): the
+    /// browse-face pack identity is strictly the official 32-hex/32-byte
+    /// shape — a 1.35-legal 8-hex pack id or 16-byte key is rejected here.
+    #[test]
+    fn prepare_sticker_pack_browse_validates_bounds() {
+        let (_temp, service) = service();
+        let good_id = "abcdef0123456789abcdef0123456789";
+        // Standard padded base64 of exactly 32 zero bytes.
+        let good_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+        // Happy shapes validate.
+        service
+            .prepare_sticker_pack_manifest(&StickerPackManifestParams {
+                pack_id: good_id.to_string(),
+                pack_key: good_key.to_string(),
+            })
+            .unwrap();
+        service
+            .prepare_sticker_pack_image(&StickerPackImageParams {
+                pack_id: good_id.to_string(),
+                pack_key: good_key.to_string(),
+                sticker_id: 7,
+            })
+            .unwrap();
+
+        // Each parameter fails with at least one representative.
+        let rejects: &[(&str, &str, &str)] = &[
+            // packId: the 1.35 even-hex face is NOT enough on the browse face.
+            ("8-hex pack id (1.35 shape)", "abcdef01", good_key),
+            ("31 hex chars", &"a".repeat(31), good_key),
+            ("33 hex chars", &"a".repeat(33), good_key),
+            ("non-hex id", &"g".repeat(32), good_key),
+            // packKey: decodes to 16 bytes, not the required 32.
+            ("16-byte key", "AAAAAAAAAAAAAAAAAAAAAA==", good_key),
+            ("non-base64 key", good_id, "not base64!!"),
+            ("31-byte key", &"QQ".repeat(31), good_key),
+        ];
+        for (name, pack_id, pack_key) in rejects {
+            let error = service
+                .prepare_sticker_pack_manifest(&StickerPackManifestParams {
+                    pack_id: (*pack_id).to_string(),
+                    pack_key: (*pack_key).to_string(),
+                })
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{name}");
+            let error = service
+                .prepare_sticker_pack_image(&StickerPackImageParams {
+                    pack_id: (*pack_id).to_string(),
+                    pack_key: (*pack_key).to_string(),
+                    sticker_id: 7,
+                })
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{name}");
+        }
+    }
+
+    /// Conversation pin sync bounds (contract revision 1.36, §4.33): the
+    /// kind enum, the conversationId bound, and the required `pinned`
+    /// boolean; a resolved conversation projects the upstream reference
+    /// (peer key), never the host's opaque local id, and an unknown
+    /// conversation answers CONVERSATION_NOT_FOUND before any upstream
+    /// call.
+    #[test]
+    fn prepare_conversations_pinned_resolves_and_validates() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        // Happy path: the upstream params carry the resolved peer key.
+        let params = service
+            .prepare_conversations_set_pinned(&account.id, &conversation.id, "contact", true)
+            .unwrap();
+        assert_eq!(params["account"], "+15555550100");
+        assert_eq!(params["conversationId"], "+15555550101");
+        assert_eq!(params["kind"], "contact");
+        assert_eq!(params["pinned"], true);
+
+        let get_params = service
+            .prepare_conversations_get_pinned(&account.id)
+            .unwrap();
+        assert_eq!(get_params["account"], "+15555550100");
+
+        // kind enum: only the three upstream values pass.
+        for kind in ["group", "legacyGroup"] {
+            service
+                .prepare_conversations_set_pinned(&account.id, &conversation.id, kind, false)
+                .unwrap();
+        }
+        let error = service
+            .prepare_conversations_set_pinned(&account.id, &conversation.id, "story", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // conversationId bound: empty and >256 chars reject; the 256-char
+        // boundary value passes validation shape (then fails resolution).
+        let error = service
+            .prepare_conversations_set_pinned(&account.id, "", "contact", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_conversations_set_pinned(&account.id, &"x".repeat(257), "contact", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_conversations_set_pinned(&account.id, &"x".repeat(256), "contact", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+
+        // Unknown conversation answers before any upstream call.
+        let error = service
+            .prepare_conversations_set_pinned(&account.id, "no-such-conversation", "contact", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+
+        // Unknown account answers ACCOUNT_NOT_FOUND on both faces.
+        let error = service
+            .prepare_conversations_get_pinned("no-such-account")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// The pinned-list projection (contract revision 1.36, §4.33): cloud
+    /// order preserved, the 128-entry KT cap truncates, and entries missing
+    /// identity fields are dropped rather than half-carried.
+    #[test]
+    fn pinned_conversations_result_caps_and_projects() {
+        let entries: Vec<Value> = (0..150)
+            .map(|index| {
+                json!({
+                    "conversationId": format!("conv-{index}"),
+                    "kind": if index % 3 == 0 { "contact" } else if index % 3 == 1 { "group" } else { "legacyGroup" },
+                })
+            })
+            .collect();
+        let result = pinned_conversations_result(&entries);
+        assert_eq!(result.pinned.len(), MAX_PINNED_CONVERSATIONS);
+        assert_eq!(result.pinned[0].conversation_id, "conv-0");
+        assert_eq!(result.pinned[127].conversation_id, "conv-127");
+        assert_eq!(result.pinned[0].kind, "contact");
+
+        // Malformed entries drop instead of failing the whole read.
+        let mixed = vec![
+            json!({"conversationId": "conv-a", "kind": "contact"}),
+            json!({"kind": "group"}),
+            json!({"conversationId": "conv-b"}),
+            json!({"conversationId": "conv-c", "kind": "legacyGroup"}),
+        ];
+        let result = pinned_conversations_result(&mixed);
+        assert_eq!(result.pinned.len(), 2);
+        assert_eq!(result.pinned[1].kind, "legacyGroup");
     }
 
     /// groups.get (contract revision 1.9, implementation-plan §4.8): a pure
