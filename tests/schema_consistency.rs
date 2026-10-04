@@ -310,6 +310,12 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   `MAX_STICKER_PACK_SYNCS` = 256): same free-form-result situation,
 ///   enforced in `sticker_pack_syncs_result` and pinned by the §4.34
 ///   integration test.
+/// - the group roster cap (contract 1.40, §4.39, `MAX_GROUP_MEMBERS` = 1001)
+///   and the roster address cap (`MAX_GROUP_MEMBER_ID_CHARS` = 128): the
+///   schema's `result` is a free-form object, so the roster bounds live on
+///   the sync capture (`group_extra_json`, src/supervisor.rs) and the read
+///   projection (`project_group_roster`, src/service.rs), pinned by the §4.39
+///   unit and integration tests.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[

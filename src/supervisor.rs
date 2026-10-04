@@ -19,12 +19,13 @@ use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, ConversationsGetPinnedParams,
-    ConversationsSetPinnedParams, GroupDetails, HostSideEvent, MediaChunkView, MediaCloseView,
-    MediaIngest, MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations,
-    PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    account_limit_error, pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
+    ConversationsSetPinnedParams, GroupDetails, HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
+    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
+    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
+    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, account_limit_error,
+    pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
 };
@@ -2505,7 +2506,7 @@ async fn sync_contacts_with(
         let extra = item
             .get("members")
             .and_then(Value::as_array)
-            .map(|members| json!({ "memberCount": members.len() }).to_string());
+            .map(|members| group_extra_json(members, &item));
         synced.push(("group".to_string(), peer_key.to_string(), title, extra));
         group_count += 1;
     }
@@ -2532,6 +2533,78 @@ async fn sync_contacts_with(
         group_count,
         synced_at: now_ms,
     })
+}
+
+/// The cached group row's `extra` JSON (contract revision 1.40, §4.39): the
+/// member count the 1.9 sync already recorded, now beside the bounded roster
+/// the §4.39 projection reads. Member entries keep the connector-wide
+/// first-wins address ladder (`number` before `uuid`); a separate `uuid` key
+/// is stored only when the upstream supplied one that differs from `id`.
+/// `admin: true` is recorded when the pinned upstream marks the member — its
+/// per-member `isAdmin` flag or the group-level `admins` address set
+/// (`ListGroupsCommand$JsonGroupMember` / `$JsonGroup`, verified in the
+/// 0.14.8 distribution jar); engines without an admin face simply never set
+/// it. Entries without any address and entries past [`MAX_GROUP_MEMBERS`]
+/// drop — a hostile roster can never fail the sync.
+fn group_extra_json(members: &[Value], group: &Value) -> String {
+    let admin_ids: std::collections::BTreeSet<String> = group
+        .get("admins")
+        .and_then(Value::as_array)
+        .map(|admins| {
+            admins
+                .iter()
+                .take(MAX_GROUP_MEMBERS)
+                .filter_map(|entry| entry.as_object().and_then(member_address_id))
+                .collect()
+        })
+        .unwrap_or_default();
+    let roster: Vec<Value> = members
+        .iter()
+        .take(MAX_GROUP_MEMBERS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let id = member_address_id(object)?;
+            let uuid = ["uuid"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != id)
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                });
+            let admin = object.get("isAdmin").and_then(Value::as_bool) == Some(true)
+                || admin_ids.contains(&id);
+            let mut projected = serde_json::Map::with_capacity(3);
+            projected.insert("id".to_string(), json!(id));
+            if let Some(uuid) = uuid {
+                projected.insert("uuid".to_string(), json!(uuid));
+            }
+            if admin {
+                projected.insert("admin".to_string(), json!(true));
+            }
+            Some(Value::Object(projected))
+        })
+        .collect();
+    json!({ "memberCount": members.len(), "members": roster }).to_string()
+}
+
+/// One upstream roster address with the connector-wide first-wins ladder:
+/// `number` before `uuid`, trimmed, non-empty, bounded to the roster id cap.
+fn member_address_id(object: &serde_json::Map<String, Value>) -> Option<String> {
+    ["number", "uuid"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .chars()
+                .take(MAX_GROUP_MEMBER_ID_CHARS)
+                .collect::<String>()
+        })
 }
 
 impl Drop for RuntimeSupervisor {
@@ -3414,6 +3487,80 @@ mod tests {
         assert_eq!(
             compose_contact_display_name(&item).as_deref(),
             Some("signal.user")
+        );
+    }
+
+    /// The §4.39 roster capture (contract revision 1.40): the pinned
+    /// signal-cli member/admin shapes mark admins through both faces, the
+    /// engine-mode shape marks none, address-less entries drop individually,
+    /// and the roster cap holds while memberCount keeps the upstream length.
+    #[test]
+    fn group_extra_json_captures_the_bounded_roster() {
+        use super::group_extra_json;
+
+        // Pinned 0.14.8 shape: `members` carry {number, uuid, isAdmin}, the
+        // group carries a separate `admins` address set. Alice is marked by
+        // her per-member flag, Bob only through the admins set (his uuid),
+        // and the address-less entry drops without failing the batch.
+        let group = json!({
+            "id": "ZmFrZS1ncm91cC0x",
+            "name": "Fixture Group",
+            "isMember": true,
+            "admins": [{"uuid": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9"}],
+        });
+        let members = json!([
+            {"number": "+15555550100"},
+            {"number": "+15555550101", "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10", "isAdmin": true},
+            {"uuid": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9"},
+            {},
+            "not-an-object",
+        ]);
+        let extra: serde_json::Value =
+            serde_json::from_str(&group_extra_json(members.as_array().unwrap(), &group)).unwrap();
+        assert_eq!(extra["memberCount"], 5);
+        let roster = extra["members"].as_array().unwrap();
+        assert_eq!(
+            roster,
+            &[
+                json!({"id": "+15555550100"}),
+                json!({
+                    "id": "+15555550101",
+                    "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                    "admin": true,
+                }),
+                json!({"id": "0b7fca57-6c3d-4a9e-b3e8-2f14c5d6a7b9", "admin": true}),
+            ]
+        );
+
+        // Engine-mode shape (kt-signal-engine listGroups): bare number
+        // entries, no uuid key, no admin face — the projection difference
+        // §4.39 records.
+        let engine_group = json!({"id": "aWQ", "name": "g", "isMember": true});
+        let engine_members = json!([{"number": "+15555550100"}, {"number": "+15555550101"}]);
+        let extra: serde_json::Value = serde_json::from_str(&group_extra_json(
+            engine_members.as_array().unwrap(),
+            &engine_group,
+        ))
+        .unwrap();
+        assert_eq!(
+            extra["members"],
+            json!([{"id": "+15555550100"}, {"id": "+15555550101"}])
+        );
+
+        // The roster cap is the official group-size ceiling; memberCount
+        // keeps the upstream length even when the roster truncates.
+        let flood: Vec<serde_json::Value> = (0..crate::service::MAX_GROUP_MEMBERS + 10)
+            .map(|index| json!({"number": format!("+1555555{index:04}")}))
+            .collect();
+        let extra: serde_json::Value = serde_json::from_str(&group_extra_json(
+            &flood,
+            &json!({"id": "aWQ", "isMember": true}),
+        ))
+        .unwrap();
+        assert_eq!(extra["memberCount"], crate::service::MAX_GROUP_MEMBERS + 10);
+        assert_eq!(
+            extra["members"].as_array().unwrap().len(),
+            crate::service::MAX_GROUP_MEMBERS
         );
     }
 

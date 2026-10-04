@@ -431,12 +431,22 @@ for line in sys.stdin:
             },
         ]
     elif method == "listGroups":
+        # Member shape mirrors the pinned 0.14.8 JsonGroupMember record
+        # (number, uuid, isAdmin — NON_NULL omissions included), so the §4.39
+        # roster capture and projection run against the real wire shape.
         result = [
             {
                 "id": "ZmFrZS1ncm91cC0x",
                 "name": "Fixture Group",
                 "isMember": True,
-                "members": [{"number": LINKED_ACCOUNT}, {"number": "+15555550101"}],
+                "members": [
+                    {"number": LINKED_ACCOUNT},
+                    {
+                        "number": "+15555550101",
+                        "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                        "isAdmin": True,
+                    },
+                ],
             },
             {
                 "id": "bm90LWEtbWVtYmVy",

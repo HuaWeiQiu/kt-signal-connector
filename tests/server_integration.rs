@@ -2230,6 +2230,22 @@ async fn groups_get_projects_the_synced_group_cache() {
     assert_eq!(group["result"]["title"], "Fixture Group");
     assert_eq!(group["result"]["memberCount"], 2);
     assert!(group["result"]["syncedAt"].as_u64().unwrap() > 0);
+    // Contract 1.40 (§4.39): the roster the sync captured projects beside
+    // memberCount — the number-based self marker on the linked account's own
+    // entry, the contacts-cache name plus the upstream uuid and admin mark on
+    // Alice's.
+    assert_eq!(
+        group["result"]["members"],
+        json!([
+            {"id": "+15555550100", "self": true},
+            {
+                "id": "+15555550101",
+                "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "name": "Alice Example",
+                "admin": true,
+            },
+        ])
+    );
 
     // A group the account has left is filtered out of the cache at sync time
     // (isMember=false), so it answers the deterministic cache miss.

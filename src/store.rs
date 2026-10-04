@@ -3679,6 +3679,37 @@ impl Store {
         Ok(row)
     }
 
+    /// The cached `kind='contact'` display names of one account, keyed by
+    /// peer_key (§4.39): the roster projection resolves member names from
+    /// this map at read time instead of copying them into the group row, so
+    /// the roster shows the same titles the next sync already improved. The
+    /// map is bounded by the contacts cache itself — one entry per cached
+    /// contact, the scale the §6.5 sync already maintains.
+    pub fn contact_title_map(
+        &self,
+        account_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT peer_key, title
+                 FROM contacts
+                 WHERE account_id=?1 AND kind='contact'",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (peer_key, title) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+            map.insert(peer_key, title);
+        }
+        Ok(map)
+    }
+
     /// Read-only paged view of the contacts cache, ordered by (kind, peer_key).
     /// `query` is an optional case-insensitive substring filter over title/peer_key.
     pub fn list_contacts(

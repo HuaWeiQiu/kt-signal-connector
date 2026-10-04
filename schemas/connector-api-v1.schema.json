@@ -1205,7 +1205,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "groupKey"],
-      "description": "Read-only projection (contract revision 1.9) of the local contacts cache for one group: {peerKey, title, memberCount?, syncedAt}. Served entirely from the rows written by contacts.sync — the connector never calls the upstream for this method, so an unsynced or departed group (the sync filters isMember=false) answers GROUP_NOT_FOUND; syncedAt lets the host judge staleness itself. Metrics classify it as contacts; no event is emitted.",
+      "description": "Read-only projection (contract revision 1.9, roster added in 1.40) of the local contacts cache for one group: {peerKey, title, memberCount?, members?, syncedAt}. Served entirely from the rows written by contacts.sync — the connector never calls the upstream for this method, so an unsynced or departed group (the sync filters isMember=false) answers GROUP_NOT_FOUND; syncedAt lets the host judge staleness itself. members (contract 1.40, §4.39) is the bounded roster the sync captured (cap 1001, the official GroupsV2 group-size ceiling): entries carry id (the connector-wide number-before-uuid address ladder), optional uuid (only when the upstream supplied one), optional name (resolved at read time from the same account's contacts cache; absent when unknown), self (true when id is the linked account's number; absent otherwise), and admin (only when the upstream marks the member — absent on engines without an admin face). Rows synced before 1.40 carry no members key. Metrics classify it as contacts; no event is emitted.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "groupKey": {

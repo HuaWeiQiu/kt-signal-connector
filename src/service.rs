@@ -108,6 +108,13 @@ pub const MARK_RECEIPT_MESSAGE_IDS_LIMIT: usize = 512;
 /// projection cap mirrored — entries beyond 64 are dropped, mirroring the
 /// official bounded BodyRange list.
 pub const MAX_SEND_MENTIONS: usize = 64;
+/// The group roster cap (contract revision 1.40, §4.39): the official
+/// GroupsV2 group-size ceiling. The contacts sync projects at most this many
+/// members into the cached group row; entries past the cap drop.
+pub const MAX_GROUP_MEMBERS: usize = 1001;
+/// One roster member address (contract 1.40): a number or UUID-shaped ACI,
+/// bounded like the opaqueId family it must stay joinable against.
+pub const MAX_GROUP_MEMBER_ID_CHARS: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -3353,9 +3360,9 @@ pub(crate) fn store_get_group(
 ) -> Result<GroupDetails, ServiceError> {
     validate_opaque_id(account_id, "accountId")?;
     validate_opaque_id(group_key, "groupKey")?;
-    if store.account_by_id(account_id)?.is_none() {
-        return Err(ServiceError::Store(StoreError::AccountNotFound));
-    }
+    let account = store
+        .account_by_id(account_id)?
+        .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
     let Some((title, extra, synced_at)) = store.contact_by_peer(account_id, "group", group_key)?
     else {
         return Err(ServiceError::Api(ApiError::new(
@@ -3364,16 +3371,82 @@ pub(crate) fn store_get_group(
             false,
         )));
     };
-    let member_count = extra
+    let extra = extra
         .as_deref()
-        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok());
+    let member_count = extra
+        .as_ref()
         .and_then(|extra| extra.get("memberCount").and_then(Value::as_u64));
+    // Contract 1.40 (§4.39): the bounded roster the sync captured, resolved
+    // against the contact cache at read time. A malformed or absent roster
+    // (every pre-1.40 row) leaves `members` absent — the response stays
+    // byte-identical to the §4.8 shape.
+    let members = extra
+        .as_ref()
+        .and_then(|extra| extra.get("members"))
+        .and_then(Value::as_array)
+        .map(|roster| project_group_roster(store, account_id, &account, roster))
+        .transpose();
     Ok(GroupDetails {
         peer_key: group_key.to_string(),
         title,
         member_count,
+        members: members?,
         synced_at,
     })
+}
+
+/// One projected roster entry (§4.39): the stored identity, the read-time
+/// contacts-cache name, the number-based self marker, and the admin flag the
+/// sync captured from the upstream (absent when the engine exposes none).
+/// Stored entries without an address drop individually.
+fn project_group_roster(
+    store: &Store,
+    account_id: &str,
+    account: &AccountRow,
+    roster: &[Value],
+) -> Result<Vec<GroupMemberView>, ServiceError> {
+    let titles = store.contact_title_map(account_id)?;
+    Ok(roster
+        .iter()
+        .take(MAX_GROUP_MEMBERS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let id = ["id"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                })?;
+            let uuid = ["uuid"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != id)
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                });
+            let name = titles
+                .get(&id)
+                .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
+                .cloned();
+            Some(GroupMemberView {
+                is_self: id == account.signal_account,
+                id,
+                uuid,
+                name,
+                admin: object.get("admin").and_then(Value::as_bool) == Some(true),
+            })
+        })
+        .collect())
 }
 
 pub(crate) fn store_list_messages(
@@ -3648,13 +3721,42 @@ pub struct MediaCloseView {
 /// contacts row projected for the host. `member_count` is absent when the
 /// sync batch captured no member list; `synced_at` is the row's last sync
 /// timestamp — the response is exactly as fresh as that sync, nothing more.
+/// `members` (contract revision 1.40, §4.39) is the bounded roster the sync
+/// captured; absent on pre-1.40 rows, where the response stays byte-identical
+/// to the §4.8 shape.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDetails {
     pub peer_key: String,
     pub title: String,
     pub member_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<GroupMemberView>>,
     pub synced_at: u64,
+}
+
+/// One projected group member (contract revision 1.40, §4.39): the official
+/// member row's minimal set. `id` follows the connector-wide first-wins
+/// address ladder so roster entries join against contact peer keys, message
+/// senders, and mention authors; `uuid` is present only when the upstream
+/// supplied one; `name` resolves from the contacts cache at read time and is
+/// absent for a peer the cache does not know; `self` is the number-based §4.24
+/// boundary (the own ACI is not queryable upstream); `admin` is the upstream
+/// admin mark the sync captured, collapsed to an absent key when false or
+/// never provided (engine-mode rosters carry none — §4.39 records the
+/// projection difference).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemberView {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(rename = "self", skip_serializing_if = "std::ops::Not::not")]
+    pub is_self: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub admin: bool,
 }
 
 /// One sticker entry of the `stickerPacks.getManifest` result (contract
@@ -9076,6 +9178,94 @@ mod tests {
         assert_eq!(group.title, "Fixture Group");
         assert_eq!(group.member_count, Some(2));
         assert_eq!(group.synced_at, 1725300000);
+        // A pre-1.40 row (memberCount only, contract 1.9 shape) keeps the
+        // §4.8 response: no members key.
+        assert_eq!(group.members, None);
+
+        // Contract 1.40 (§4.39): a synced roster projects identities, the
+        // read-time contacts names, the number-based self marker, and the
+        // upstream admin mark. The wire shape carries only the informative
+        // keys: unknown name, foreign uuid, non-self, non-admin all collapse
+        // to absent; entries without an address drop individually.
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "cm9zdGVyLWdyb3Vw",
+                "Roster Group",
+                Some(
+                    json!({
+                        "memberCount": 5,
+                        "members": [
+                            {"id": "+15555550100"},
+                            {"id": "+15555550101", "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10", "admin": true},
+                            {"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"},
+                            {"uuid": "no-address-entry"},
+                            "not-an-object",
+                        ],
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300001,
+            )
+            .unwrap();
+        let roster = service.get_group(&account.id, "cm9zdGVyLWdyb3Vw").unwrap();
+        assert_eq!(roster.member_count, Some(5));
+        let members = roster.members.unwrap();
+        assert_eq!(members.len(), 3);
+        let wire = serde_json::to_value(&members).unwrap();
+        // Self member: id is the linked account's number; no contacts row
+        // exists for self, so the name stays absent.
+        assert_eq!(
+            wire[0],
+            json!({"id": "+15555550100", "self": true}),
+            "self member projects the number-based marker"
+        );
+        // Alice: contacts-cache name at read time, upstream uuid and admin
+        // mark captured by the sync.
+        assert_eq!(
+            wire[1],
+            json!({
+                "id": "+15555550101",
+                "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "name": "Alice Contact",
+                "admin": true,
+            })
+        );
+        // An ACI-keyed member the cache does not know: bare identity only.
+        assert_eq!(
+            wire[2],
+            json!({"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"})
+        );
+
+        // The roster cap holds even for a hostile oversized capture: the
+        // projection returns at most the official group-size ceiling.
+        let flood: Vec<Value> = (0..MAX_GROUP_MEMBERS + 50)
+            .map(|index| json!({"id": format!("+1555555{index:04}")}))
+            .collect();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "Zmxvb2QtZ3JvdXA",
+                "Flood Group",
+                Some(
+                    json!({"memberCount": flood.len(), "members": flood})
+                        .to_string()
+                        .as_str(),
+                ),
+                1725300002,
+            )
+            .unwrap();
+        let flooded = service.get_group(&account.id, "Zmxvb2QtZ3JvdXA").unwrap();
+        assert_eq!(
+            flooded.members.as_ref().map(Vec::len),
+            Some(MAX_GROUP_MEMBERS)
+        );
+        assert_eq!(flooded.member_count, Some((MAX_GROUP_MEMBERS + 50) as u64));
 
         // A group row without a captured member list omits memberCount.
         service

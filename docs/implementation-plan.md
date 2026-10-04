@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.39 (2026-10-04)
+- Contract revision: 1.40 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1577,6 +1577,55 @@ documented data-directory artifact instead of an RPC surface.
   with its error class until the account is deleted or re-linked (only-first-link semantics,
   ADR 0005 §风险与边界). The connector never deletes or rewrites the engine's archive file; the
   completed row in the connector store is the consumption marker.
+
+### 4.39 Group member roster: groups.get `members` (contract revision 1.40, 2026-10-05)
+
+The official conversation-info page and the composer @-mention picker both render the group's
+member roster. The §4.8 projection carries only `memberCount` — the sync captures the upstream
+member list solely to count it (supervisor `sync_contacts_with`, contract 1.9) — so the desktop
+has no identity, display-name, self, or admin information for any member. This revision extends
+`groups.get` instead of adding a second method: the roster belongs to the same cached row, the
+same read-lane, and the same `syncedAt` staleness story; a separate `groups.getMembers` would
+duplicate the targeting, the error family, and the cache-read classification for no new
+capability.
+
+- Decision — capture at sync, resolve at read: `contacts.sync` keeps the upstream member array
+  it already walks, this time inside the group row's `extra` JSON beside `memberCount`
+  (`{"memberCount": N, "members": [{"id", "uuid"?, "admin"?}, ...]}` — no store schema-version
+  bump; `extra` is the additive channel §4.8 already uses). `groups.get` stays upstream-free
+  (§4.8) and projects the array, resolving each member's display name at read time from the same
+  account's cached `kind='contact'` rows — one lookup per response, no name copy in the roster
+  row, so a name the next sync improves is reflected without a roster rewrite. The result gains
+  an optional `members` array; rows synced before this revision carry no `members` key, and the
+  response stays byte-identical for them.
+- Member shape (the official member row's minimal set): `id` — the member address with the
+  connector-wide first-wins convention (`number` before `uuid`, the same ladder the contacts
+  sync and the §4.20 mention author use, so roster ids join against contact peer keys, message
+  senders, and mention authors without a second identity mapping); `uuid` — present only when
+  the upstream supplied it separately (the pinned signal-cli 0.14.8 member record does;
+  absent otherwise); `name` — the contacts-cache title, absent when the member is not in the
+  cache (a group-only or not-yet-synced peer) — the pinned upstream member records carry no name
+  field of their own, so there is no engine raw name to fall back to and none is invented;
+  `self` — true when `id` equals the linked account's number (number-based, the §4.24 recorded
+  boundary: the own ACI is not queryable upstream, an ACI-keyed roster entry cannot be marked);
+  `admin` — present only when the upstream marks the member: pinned signal-cli ships both a
+  per-member `isAdmin` flag and a separate group-level `admins` address set (verified in the
+  0.14.8 distribution jar, `ListGroupsCommand$JsonGroupMember` / `$JsonGroup`), so the connector
+  records `admin: true` when either names the member. `false`/absent collapses to an absent key,
+  like `mentionsSelf` (§4.29).
+- Engine-mode projection difference (recorded, not worked around): `kt-signal-engine`'s
+  `listGroups` returns `members: [{number}]` — one address per member (number first, the ACI
+  string where the contacts map has no number), no separate uuid, no admin face. In that mode
+  roster entries carry `id` only (plus a read-time `name` when the cache knows the number), and
+  `admin`/`uuid` are honestly absent. Neither engine's member record exposes the official
+  member label/emoji badges; they are not projected.
+- Bounds: the roster cap is the official GroupsV2 group-size ceiling, 1001 members
+  (`MAX_GROUP_MEMBERS`); entries past the cap drop, entries with no address drop individually,
+  and every address is capped at 128 chars — a hostile upstream payload can never fail the sync
+  or the read (the §4.13 discipline). `memberCount` keeps its existing meaning (the upstream
+  array length), even in the pathological case where it exceeds the projected roster. The
+  roster lives in the row the sync already writes, so its store cost is bounded by the groups
+  the account is actually in at upstream roster scale.
 
 ## 5. signal-cli Boundary
 
