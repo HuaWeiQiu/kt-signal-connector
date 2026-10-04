@@ -2183,8 +2183,37 @@ async fn incoming_mentions_project_author_aci_on_the_wire_row() {
     // signal-cli-shaped (number + uuid), one engine-mode-shaped (the ACI
     // under the number key). The row projection is the §4.40 desktop
     // contract: author unchanged, authorAci only when honestly known.
+    // The marker is written only AFTER link.finish (the established
+    // convention, see the view-once chain test): injection is single-shot
+    // (the fake engine deletes the marker after emitting), so an envelope
+    // emitted before the account is registered is dropped fail-closed and
+    // the test would flap on load.
     let signal_data = temp.path().join("signal-data");
     fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-MentionAci" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
     fs::write(
         signal_data.join(".fixture-emit-envelopes.json"),
         json!({ "envelopes": [
@@ -2220,33 +2249,13 @@ async fn incoming_mentions_project_author_aci_on_the_wire_row() {
     )
     .unwrap();
 
-    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
-    wait_for_path(&endpoint).await;
-    let stream = UnixStream::connect(&endpoint).await.unwrap();
-    let mut client = Framed::new(stream, LinesCodec::new());
-    authenticate(&mut client, &secret).await;
-    let started = request(&mut client, "start", "runtime.start", json!({})).await;
-    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
-    let link = request(
-        &mut client,
-        "link-start",
-        "link.start",
-        json!({ "deviceName": "KT-MentionAci" }),
-    )
-    .await;
-    let finished = request(
-        &mut client,
-        "link-finish",
-        "link.finish",
-        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
-    )
-    .await;
-    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
-
     // The injected envelopes land as rows; poll the history read until both
     // mention rows are visible (each poll drains any interleaved events).
+    // 全量并发下引擎/连接器处理信封需要真实时间，轮询间隔给处理让路
+    // （仓内既有轮询惯例，见 groups/history 各用例的 20-50ms sleep）。
     let mut rows: Vec<Value> = Vec::new();
-    for attempt in 0..100 {
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
         let _ = request(
             &mut client,
             &format!("poll-{attempt}"),
