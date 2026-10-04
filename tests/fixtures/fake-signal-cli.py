@@ -507,7 +507,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "STICKER_PACK_KEY_INVALID", "message": "fixture bad key"},
+                "error": {"code": -1, "message": "STICKER_PACK_KEY_INVALID"},
             }
             emit_json(response)
             continue
@@ -515,7 +515,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "STICKER_PACK_FETCH_FAILED", "message": "fixture fetch failed"},
+                "error": {"code": -1, "message": "STICKER_PACK_FETCH_FAILED"},
             }
             emit_json(response)
             continue
@@ -545,7 +545,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "STICKER_PACK_KEY_INVALID", "message": "fixture bad key"},
+                "error": {"code": -1, "message": "STICKER_PACK_KEY_INVALID"},
             }
             emit_json(response)
             continue
@@ -553,7 +553,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "STICKER_PACK_MALFORMED", "message": "fixture malformed"},
+                "error": {"code": -1, "message": "STICKER_PACK_MALFORMED"},
             }
             emit_json(response)
             continue
@@ -561,7 +561,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "STICKER_IMAGE_TOO_LARGE", "message": "fixture too large"},
+                "error": {"code": -1, "message": "STICKER_IMAGE_TOO_LARGE"},
             }
             emit_json(response)
             continue
@@ -586,7 +586,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "STORAGE_UNAVAILABLE", "message": "fixture storage down"},
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
             }
             emit_json(response)
             continue
@@ -594,7 +594,7 @@ for line in sys.stdin:
             response = {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "error": {"code": "CONVERSATION_NOT_RESOLVED", "message": "fixture unresolved"},
+                "error": {"code": -1, "message": "CONVERSATION_NOT_RESOLVED"},
             }
             emit_json(response)
             continue

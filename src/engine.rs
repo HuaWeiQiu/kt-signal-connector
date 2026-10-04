@@ -1455,15 +1455,27 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.
-/// The code must be a string matching the allowlist above; anything else
-/// (missing code, non-string, unknown literal) answers `None` and the caller
-/// falls back to the plain upstream error.
+/// The real engine carries the literal in `message` with a numeric `code`
+/// (-1; JSON-RPC 2.0 keeps error codes numeric), e.g. `{"code": -1,
+/// "message": "STICKER_PACK_KEY_INVALID"}`. A string `code` field carrying
+/// the literal is accepted as a fallback. The literal must match the
+/// allowlist exactly; anything else (missing fields, unknown literals)
+/// answers `None` and the caller falls back to the plain upstream error.
 fn upstream_error_code(error: Option<&Value>) -> Option<&'static str> {
-    let code = error?.get("code")?.as_str()?;
-    ENGINE_STRUCTURED_ERROR_CODES
-        .iter()
-        .find(|known| **known == code)
-        .copied()
+    let error = error?;
+    let candidates = [
+        error.get("message").and_then(Value::as_str),
+        error.get("code").and_then(Value::as_str),
+    ];
+    for literal in candidates.into_iter().flatten() {
+        if let Some(known) = ENGINE_STRUCTURED_ERROR_CODES
+            .iter()
+            .find(|known| **known == literal)
+        {
+            return Some(known);
+        }
+    }
+    None
 }
 
 /// Test-only re-export of the allowlist so the service-layer mapping test can
@@ -3167,11 +3179,13 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
-    /// Structured engine errors (contract 1.36): an error object carrying a
-    /// known string `code` surfaces as UpstreamCode with the allowlisted
-    /// code; an unknown code degrades to the plain Upstream classification
-    /// so an engine newer than this connector cannot widen the host
-    /// contract; a numeric (ordinary JSON-RPC) code stays plain as before.
+    /// Structured engine errors (contract 1.36): the real engine carries the
+    /// allowlisted literal in the error `message` with a numeric `code` (-1,
+    /// JSON-RPC 2.0 numeric slot); it surfaces as UpstreamCode with the
+    /// allowlisted code. A string `code` carrying the literal is accepted as
+    /// a fallback. An unknown literal degrades to the plain Upstream
+    /// classification so an engine newer than this connector cannot widen
+    /// the host contract; an unrelated message stays plain as before.
     #[tokio::test]
     async fn structured_engine_errors_carry_the_allowlisted_code() {
         let classify = |error: serde_json::Value| async move {
@@ -3200,12 +3214,12 @@ mod tests {
             assert!(event_rx.try_recv().is_err());
             response_rx.await.unwrap()
         };
-        // Structured codes ride the JSON-RPC error `code` field as a string
-        // (the numeric slot stays free for the engine's own JSON-RPC layer).
+        // Real engine wire shape: numeric code, allowlisted literal in
+        // `message`.
         assert_eq!(
             classify(json!({
-                "code": "STICKER_PACK_FETCH_FAILED",
-                "message": "fixture fetch failed"
+                "code": -1,
+                "message": "STICKER_PACK_FETCH_FAILED"
             }))
             .await,
             Err(EngineError::UpstreamCode {
@@ -3214,25 +3228,35 @@ mod tests {
         );
         assert_eq!(
             classify(json!({
-                "code": "CONVERSATION_NOT_RESOLVED",
-                "message": "fixture unresolved"
+                "code": -1,
+                "message": "CONVERSATION_NOT_RESOLVED"
             }))
             .await,
             Err(EngineError::UpstreamCode {
                 code: "CONVERSATION_NOT_RESOLVED"
             })
         );
-        // Unknown code: degrades to plain Upstream.
+        // Fallback shape: string `code` carrying the literal directly.
         assert_eq!(
             classify(json!({
-                "code": "SOME_FUTURE_ENGINE_CODE",
-                "message": "not in the allowlist"
+                "code": "STORAGE_WRITE_FAILED",
+                "message": "fixture write failed"
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "STORAGE_WRITE_FAILED"
+            })
+        );
+        // Unknown literal: degrades to plain Upstream.
+        assert_eq!(
+            classify(json!({
+                "code": -1,
+                "message": "SOME_FUTURE_ENGINE_CODE"
             }))
             .await,
             Err(EngineError::Upstream)
         );
-        // Numeric code (the ordinary JSON-RPC error shape): unchanged plain
-        // Upstream.
+        // Ordinary JSON-RPC error shape (unrelated message): plain Upstream.
         assert_eq!(
             classify(json!({ "code": -1, "message": "fixture malformed" })).await,
             Err(EngineError::Upstream)
