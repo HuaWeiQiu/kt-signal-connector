@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,8 +12,8 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::engine::{
     CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
-    NormalizedReceive, QueuedReceive, ReceiveIngress, SignalCliConfig, event_channel,
-    receive_channel,
+    NormalizedReceive, QueuedReceive, ReceiveIngress, SignalCliConfig, SignalCliMode,
+    event_channel, receive_channel,
 };
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
@@ -130,6 +131,12 @@ pub struct RuntimeSupervisor {
     /// One-shot contacts/groups re-sync pass (once per process start);
     /// never held across an await.
     contacts_resync: StdMutex<Option<JoinHandle<()>>>,
+    /// Link-time history import single flight (contract revision 1.39,
+    /// §4.38): at most one import per group at a time — claimed by the
+    /// `link.finish` watcher or the startup sweep, released when the import
+    /// (plus its retention convergence) finishes. Shared with the spawned
+    /// tasks, which outlive any borrow of `self`.
+    history_import_running: Arc<AtomicBool>,
     /// Receiver of the bounded auto delivery-receipt queue; `Some` until
     /// `spawn_delivery_receipt_worker` takes it. The queue itself is created
     /// in `new` (the persistence loop holds the sender), but the worker can
@@ -207,6 +214,7 @@ impl RuntimeSupervisor {
             retention: StdMutex::new(None),
             media_governor_pass: StdMutex::new(None),
             contacts_resync: StdMutex::new(None),
+            history_import_running: Arc::new(AtomicBool::new(false)),
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
@@ -423,10 +431,139 @@ impl RuntimeSupervisor {
         }));
     }
 
+    // -------------------------------------------------------------------------
+    // Link-time history import (contract revision 1.39, §4.38): the kt-engine
+    // backup5 archive face. The engine downloads and decrypts in the
+    // background after `link.finish`; the connector watches for the file
+    // (plus a once-per-start sweep for restarts-in-between) and imports one
+    // account at a time under the bounded-batch discipline. The status face
+    // is store-only and never touches the engine.
+    // -------------------------------------------------------------------------
+
+    /// History import exists only under kt-engine mode: the signal-cli
+    /// JVM/native face has no backup5 capability at all.
+    fn history_import_capable(&self) -> bool {
+        self.config.mode == SignalCliMode::KtEngine
+    }
+
+    /// Once-per-start sweep: import any group account whose archive exists
+    /// but has no completed row — the connector may have restarted between
+    /// link and import, or a previous attempt failed. Settles first so the
+    /// fresh engine's own startup work lands, then imports one account at a
+    /// time (the group's single slot).
+    fn spawn_history_import_pass(&self) {
+        if !self.history_import_capable() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let group_id = self.group_id.clone();
+        let data_dir = self.config.data_dir.clone();
+        let running = Arc::clone(&self.history_import_running);
+        tokio::spawn(async move {
+            // Let the fresh engine settle and any link-time inline sync land
+            // before the first import pass claims store batches.
+            sleep(Duration::from_secs(5)).await;
+            let accounts = match tokio::task::spawn_blocking({
+                let store = Arc::clone(&store);
+                let group_id = group_id.clone();
+                move || store.list_accounts_in_group(&group_id)
+            })
+            .await
+            {
+                Ok(Ok(accounts)) => accounts,
+                _ => {
+                    tracing::warn!("history import sweep account listing failed");
+                    return;
+                }
+            };
+            for account in accounts {
+                let probe = tokio::task::spawn_blocking({
+                    let store = Arc::clone(&store);
+                    let data_dir = data_dir.clone();
+                    let account_id = account.id.clone();
+                    move || probe_history_import(&store, &data_dir, &account_id)
+                })
+                .await
+                .unwrap_or(HistoryImportProbe::Done);
+                let HistoryImportProbe::Ready(job) = probe else {
+                    continue;
+                };
+                // A busy slot skips this account: the next start (or the link
+                // watcher's tick for freshly linked accounts) retries.
+                let _ = claim_and_run_history_import(Arc::clone(&running), Arc::clone(&store), job)
+                    .await;
+            }
+        });
+    }
+
+    /// After a kt-engine `link.finish`, watch for the archive the engine is
+    /// downloading in the background (§4.38): poll every few seconds for at
+    /// most [`crate::history_import::LINK_WAIT_MS`], import when the file
+    /// appears. A busy group slot retries on the next tick. Best-effort: the
+    /// import never fails the link flow.
+    fn spawn_history_import_watch(&self, account_id: String) {
+        if !self.history_import_capable() {
+            return;
+        }
+        let store = Arc::clone(&self.store);
+        let data_dir = self.config.data_dir.clone();
+        let running = Arc::clone(&self.history_import_running);
+        tokio::spawn(async move {
+            let deadline =
+                Instant::now() + Duration::from_millis(crate::history_import::LINK_WAIT_MS);
+            loop {
+                if Instant::now() >= deadline {
+                    tracing::info!(
+                        account_id = %account_id,
+                        "history archive did not appear within the link-time window"
+                    );
+                    return;
+                }
+                sleep(Duration::from_secs(5)).await;
+                let probe = tokio::task::spawn_blocking({
+                    let store = Arc::clone(&store);
+                    let data_dir = data_dir.clone();
+                    let account_id = account_id.clone();
+                    move || probe_history_import(&store, &data_dir, &account_id)
+                })
+                .await
+                .unwrap_or(HistoryImportProbe::Done);
+                match probe {
+                    HistoryImportProbe::Waiting => continue,
+                    HistoryImportProbe::Done => return,
+                    HistoryImportProbe::Ready(job) => {
+                        if claim_and_run_history_import(
+                            Arc::clone(&running),
+                            Arc::clone(&store),
+                            job,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        // Slot busy: the next tick retries.
+                    }
+                }
+            }
+        });
+    }
+
+    /// history.importStatus (contract revision 1.39, §4.38): the honest
+    /// minimal projection the desktop polls — store-only, never the engine,
+    /// never the network.
+    pub async fn history_import_status(&self, account_id: String) -> Result<Value, ServiceError> {
+        let store = Arc::clone(&self.store);
+        let data_dir = self.config.data_dir.clone();
+        let capable = self.history_import_capable();
+        blocking_service(move || {
+            history_import_status_projection(&store, &data_dir, capable, &account_id)
+        })
+        .await
+    }
+
     pub fn subscribe_engine(&self) -> broadcast::Receiver<EngineEvent> {
         self.events.subscribe()
     }
-
     pub fn subscribe_host(&self) -> broadcast::Receiver<HostSideEvent> {
         self.host_events.subscribe()
     }
@@ -463,6 +600,7 @@ impl RuntimeSupervisor {
         drop(slot);
         if status.state == EngineState::Running {
             self.spawn_contacts_resync();
+            self.spawn_history_import_pass();
         }
         Ok(status)
     }
@@ -776,6 +914,10 @@ impl RuntimeSupervisor {
                 "initial contacts sync after link failed"
             );
         }
+        // §4.38: the engine starts the backup5 archive download in the
+        // background when finishLink returns; watch for the file and import.
+        // Best-effort — a watcher failure never fails the link flow.
+        self.spawn_history_import_watch(account.id.clone());
         let _ = self
             .host_events
             .send(HostSideEvent::AccountChanged(account.clone()));
@@ -823,6 +965,7 @@ impl RuntimeSupervisor {
         *slot = Some(engine);
         drop(slot);
         self.spawn_contacts_resync_with(fresh);
+        self.spawn_history_import_pass();
         Ok(())
     }
 
@@ -2437,6 +2580,202 @@ where
         Ok(result) => result,
         Err(_) => Err(ServiceError::Store(StoreError::Unavailable(None))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Link-time history import plumbing (contract revision 1.39, §4.38).
+// ---------------------------------------------------------------------------
+
+/// One importable account: the identity the blocking import needs to open
+/// the engine's archive through the registry.
+#[derive(Clone)]
+struct HistoryImportJob {
+    account_id: String,
+    signal_account: String,
+    archive: PathBuf,
+}
+
+/// What the blocking eligibility probe decided for one account.
+enum HistoryImportProbe {
+    /// Archive present, no completed row, attempts inside the budget.
+    Ready(HistoryImportJob),
+    /// No archive on the engine face yet — the link watcher keeps polling.
+    Waiting,
+    /// Nothing to do: account gone, completed row, or attempt budget spent.
+    Done,
+}
+
+fn probe_history_import(
+    store: &Arc<Store>,
+    data_dir: &Path,
+    account_id: &str,
+) -> HistoryImportProbe {
+    let Ok(Some(account)) = store.account_by_id(account_id) else {
+        return HistoryImportProbe::Done;
+    };
+    let Some(archive) = crate::history_import::archive_path(data_dir, &account.signal_account)
+    else {
+        // No registry entry for this number: the engine face cannot name an
+        // archive path, so there is nothing to watch for.
+        return HistoryImportProbe::Done;
+    };
+    if !crate::history_import::archive_ready(&archive) {
+        return HistoryImportProbe::Waiting;
+    }
+    match store.history_import_row(account_id) {
+        // Store trouble must not spin the watcher: treat as nothing-to-do.
+        Err(_) => HistoryImportProbe::Done,
+        Ok(Some(row)) if row.state == "completed" => HistoryImportProbe::Done,
+        Ok(Some(row)) if row.attempts >= crate::history_import::MAX_ATTEMPTS => {
+            HistoryImportProbe::Done
+        }
+        _ => HistoryImportProbe::Ready(HistoryImportJob {
+            account_id: account_id.to_string(),
+            signal_account: account.signal_account,
+            archive,
+        }),
+    }
+}
+
+/// Claim the group's single import slot, run the import on the blocking pool,
+/// and converge retention after a completed run (§4.38). `false` means
+/// another import holds the slot; the caller retries later.
+async fn claim_and_run_history_import(
+    running: Arc<AtomicBool>,
+    store: Arc<Store>,
+    job: HistoryImportJob,
+) -> bool {
+    if running
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+    run_history_import(&store, &job).await;
+    running.store(false, Ordering::Release);
+    true
+}
+
+async fn run_history_import(store: &Arc<Store>, job: &HistoryImportJob) {
+    let outcome = tokio::task::spawn_blocking({
+        let store = Arc::clone(store);
+        let job = job.clone();
+        move || {
+            crate::history_import::run_import(
+                &store,
+                &job.account_id,
+                &job.signal_account,
+                &job.archive,
+            )
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(counters)) => {
+            tracing::info!(
+                account_id = %job.account_id,
+                imported = counters.imported,
+                skipped_lines = counters.skipped_lines,
+                skipped_chats = counters.skipped_chats,
+                skipped_messages = counters.skipped_messages,
+                "history import completed"
+            );
+            converge_history_retention(Arc::clone(store)).await;
+        }
+        Ok(Err(failure)) => {
+            tracing::warn!(
+                account_id = %job.account_id,
+                error_class = failure.class(),
+                "history import failed"
+            );
+        }
+        Err(_) => {
+            // The blocking task died without landing a terminal state; record
+            // an honest failure so the face never shows a phantom `running`.
+            let _ = store.complete_history_import(
+                &job.account_id,
+                "failed",
+                &crate::store::ImportCounters::default(),
+                Some("internal"),
+                crate::link::now_ms(),
+            );
+            tracing::warn!(account_id = %job.account_id, "history import task died");
+        }
+    }
+}
+
+/// §4.38: one bounded retention pass after a completed import, so the store
+/// converges to the per-conversation cap within the same session. Same batch
+/// discipline as the once-per-start retention pass.
+async fn converge_history_retention(store: Arc<Store>) {
+    let now = crate::link::now_ms();
+    loop {
+        let outcome = tokio::task::spawn_blocking({
+            let store = Arc::clone(&store);
+            move || store.prune_history(now, RETENTION_BATCH_MESSAGES)
+        })
+        .await
+        .unwrap_or(Err(StoreError::Unavailable(None)));
+        match outcome {
+            Ok(outcome) => {
+                if outcome.messages_deleted < u64::from(RETENTION_BATCH_MESSAGES) {
+                    return;
+                }
+                sleep(RETENTION_BATCH_PAUSE).await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// The `history.importStatus` projection (§4.38). Priority order is the
+/// contract's: a persisted ledger row (running/completed/failed) always
+/// answers; otherwise the archive presence or the link-time wait window
+/// decides between `pending` and `unavailable` — the engine's failure modes
+/// are indistinguishable from "the phone had nothing to transfer" and are
+/// reported as such, never guessed.
+fn history_import_status_projection(
+    store: &Arc<Store>,
+    data_dir: &Path,
+    capable: bool,
+    account_id: &str,
+) -> Result<Value, ServiceError> {
+    let account = store
+        .account_by_id(account_id)?
+        .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+    if !capable {
+        return Ok(json!({
+            "accountId": account_id,
+            "state": "unavailable",
+            "reason": "engine-mode",
+        }));
+    }
+    if let Some(row) = store.history_import_row(account_id)? {
+        return serde_json::to_value(row)
+            .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)));
+    }
+    let on_disk = crate::history_import::archive_path(data_dir, &account.signal_account)
+        .map(|path| crate::history_import::archive_ready(&path))
+        .unwrap_or(false);
+    if on_disk {
+        // Archive present, no run has claimed it yet: the sweep or the link
+        // watcher picks it up within seconds.
+        return Ok(json!({ "accountId": account_id, "state": "pending" }));
+    }
+    let linked_at = store
+        .account_summary(account_id)?
+        .and_then(|summary| summary.linked_at);
+    let inside_window = linked_at.is_some_and(|linked_at| {
+        crate::link::now_ms().saturating_sub(linked_at) < crate::history_import::LINK_WAIT_MS
+    });
+    if inside_window {
+        return Ok(json!({ "accountId": account_id, "state": "pending" }));
+    }
+    Ok(json!({
+        "accountId": account_id,
+        "state": "unavailable",
+        "reason": "no-archive",
+    }))
 }
 
 /// Receive one stderr line, skipping lag gaps; None means the stream closed.

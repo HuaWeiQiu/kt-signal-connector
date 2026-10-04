@@ -28,8 +28,11 @@ use crate::store::{
 /// each constant against its schema constraint, so the two cannot drift
 /// apart silently.
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
-const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
-const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
+/// Receive text ladder (§6.4/§4.38): a body at or below this bound persists in
+/// full; anything larger keeps only the bounded preview (shared by the
+/// link-time history import, which has no engine copy to fetch on demand).
+pub(crate) const MAX_INBOUND_TEXT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_HOST_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 pub const MAX_DEVICE_NAME_BYTES: usize = 64;
 pub const MAX_EMOJI_BYTES: usize = 32;
 /// messages.sendSticker bounds (contract revision 1.35, §4.31): the official
@@ -3801,6 +3804,14 @@ pub struct ConversationsListParams {
     pub account_id: String,
     pub cursor: Option<String>,
     pub limit: u32,
+}
+
+/// history.importStatus params (contract revision 1.39, §4.38): the account
+/// whose link-time import status is polled.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryImportStatusParams {
+    pub account_id: String,
 }
 
 #[derive(Debug, Deserialize)]

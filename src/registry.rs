@@ -565,6 +565,15 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// history.importStatus (contract revision 1.39, §4.38): routed to the
+    /// owning group's supervisor like every store-only read — all supervisors
+    /// share one store, but the owning slot keeps the account-scoped shape
+    /// uniform (unknown accounts answer ACCOUNT_NOT_FOUND the same way).
+    pub async fn history_import_status(&self, account_id: String) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor.history_import_status(account_id).await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,

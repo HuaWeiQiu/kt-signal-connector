@@ -27,8 +27,8 @@ use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailur
 use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsGetPinnedParams, ConversationsListParams,
-    ConversationsSetPinnedParams, GroupsGetParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
+    ConversationsSetPinnedParams, GroupsGetParams, HistoryImportStatusParams, HostSideEvent,
+    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
     MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
     MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
@@ -990,6 +990,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid conversations.list params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "history.importStatus" => {
+            match serde_json::from_value::<HistoryImportStatusParams>(request.params) {
+                Ok(params) => match runtime.history_import_status(params.account_id).await {
+                    Ok(status) => HostResponse::success(request_id, status),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid history.importStatus params",
                         false,
                     ),
                 ),

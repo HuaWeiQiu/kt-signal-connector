@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.38 (2026-10-04)
+- Contract revision: 1.39 (2026-10-04)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1498,6 +1498,86 @@ EXISTS` runs on every open), and the row-level erasure reuses the existing rich/
 Bounds stay structural: candidate cap 16, peer-key list bounded by the contacts table, media
 deletion reuses the §4.12-best-effort discipline (missing files are success).
 
+### 4.38 Link-time history import: backup5 archive consumption + history.importStatus (contract revision 1.39, 2026-10-04)
+
+The connector side of kt-signal-engine ADR 0005 S3: consuming the NDJSON export the engine's S2
+stage streams after a `backup5` link, importing it into the store under the same identity and
+bounded-batch discipline as live traffic, and exposing an honest status face for the desktop's
+S4 import UI. The engine face is file-based by design (engine 0eedc8c: "the consumer decides by
+file presence") — no engine JSON-RPC method or event changes, so the connector consumes a
+documented data-directory artifact instead of an RPC surface.
+
+- Engine face (consumption contract, complementing the layout already recorded in §5): after a
+  `backup5` link the engine best-effort downloads and decrypts the transfer archive and streams
+  `history-import.ndjson` into the account's store directory (`<engine data-dir>/accounts/<dir>/`,
+  with `<dir>` recorded per number in the engine's `engine-state.json` registry, compat §1).
+  Export failure leaves the file absent; an engine crash mid-export can leave a partial file
+  (no completion marker exists on the v1 face). The connector parses the one-JSON-object-per-line
+  records — `recipient {id, kind: contact|group|self|other, name, aci?, e164?, masterKey?}`,
+  `chat {id, recipientId}`, `message {chatId, authorId, dateSent, direction, text?, attachments?,
+  quote?, remoteDeleted?, pinnedAtTimestamp?, ...}` — tolerantly: malformed lines, unknown types,
+  and over-long lines are counted and skipped, never fatal. The recipient-level service identity
+  fields (`aci`, `e164`, `masterKey`) are required for conversation attribution and are NOT yet
+  projected by the engine's S2 export (kt-signal-engine gap, registered for the engine-side S3
+  task): until the engine lands them, every import run completes with all chats skip-counted
+  (`skippedChats`), which the status face reports honestly. The connector consumes the fields
+  when present, so the engine addition needs no further connector change.
+- Decision — independent status method, not `link.finish` fields: the engine's archive download
+  starts in the background when `finishLink` returns (long-poll plus CDN transfer, minutes) and
+  is best-effort, so `link.finish` cannot carry the import outcome without lying or blocking;
+  `link.finish`'s result is the stable account summary with its own non-retryable outcome
+  discipline (`LINK_OUTCOME_UNKNOWN`), while the import is an idempotent, retryable background
+  task with a different lifecycle. The official desktop has the same shape: linking completes
+  first, the history import runs behind the main UI. The status method gives the S4 UI the
+  pending → running → completed/failed progression it needs; there is deliberately no new event
+  in 1.39 — the desktop polls `history.importStatus` while the state is `running` (the UI
+  requirement is one number ticking, not low-latency delivery).
+- `history.importStatus` params `{accountId}`; result `{accountId, state, ...}` with state
+  `unavailable` (`reason: "engine-mode"` under signal-cli JVM/native, which has no backup5
+  capability at all; `reason: "no-archive"` when the link-time wait window has expired with no
+  archive produced — the engine's best-effort failure modes are indistinguishable from "the
+  phone had nothing to transfer" and are reported as such, never guessed), `pending` (linked,
+  inside the wait window, archive not on disk yet), `running` / `completed` / `failed` (from the
+  persisted import row, which carries `importedMessages`, `skippedLines`, `skippedChats`,
+  `skippedMessages`, `attempts`, `errorClass`, `startedAt`, `updatedAt`). Unknown account:
+  `ACCOUNT_NOT_FOUND`. The method is read-lane, read metrics class; no new error codes.
+- Store: one `history_imports` row per account (schema version 15, FK cascade with the account),
+  plus the bounded import writer. Message rows are written with exactly the live-receive
+  identity — the message id is the same `signal-message-v2` stable hash over
+  `(account, conversation, direction, sent_at, sender)`, `sent_at` being the Signal timestamp
+  the archive carries (`dateSent`) — so `INSERT OR IGNORE` deduplicates against rows that live
+  traffic already wrote (or will write): re-running an import, or a later live envelope for the
+  same message, lands on the same identity and inserts nothing. Chats attach through
+  `ensure_conversation`, so a contacts-sync skeleton (§6.5) is filled in place — no second
+  conversation row; the title keeps the §6.5 upgrade policy.
+- Bounded discipline (ADR 0002): the archive is read as a line stream with a hard per-line cap;
+  pass 1 stages recipient/chat identity maps into bounded SQLite temp tables (dropped at the
+  end), pass 2 streams messages in fixed-size batches (256 rows per transaction, store lock
+  released between batches on the blocking pool). Nothing proportional to the archive is held in
+  memory. Imported rows do not bump unread badges and emit no per-message host events (a
+  100k-message import would otherwise flood the host lane); the desktop refreshes
+  conversations/messages after the status reaches a terminal state. Imported text follows the
+  receive size ladder (oversized bodies keep only the truncated preview, marked not-retrievable —
+  there is no engine copy to fetch); attachment descriptors are metadata-only mirrors of §4.13
+  (their ids are synthetic: opening one answers the normal not-found failure — no bytes were
+  ever downloaded, §6.7). Quotes resolve their target row when it is already imported or live
+  (click-to-scroll works) and always carry the bounded snapshot. `remoteDeleted` items import as
+  `remote-deleted` tombstone rows; pinned items import into the conversation-pins table;
+  direction-less items, long-text-only bodies (metadata-only overflow), and messages whose
+  author/chat cannot be resolved to a stored peer identity are skip-counted. Imported rows carry
+  fresh `stored_at`, so the §7.1.1 age rule treats them like any other local copy; one bounded
+  retention pass runs after a completed import so the store converges to the per-conversation
+  cap within the same session.
+- Orchestration: at most one import runs per group at a time. After `link.finish` succeeds in
+  kt-engine mode, a bounded watcher polls for the archive (every few seconds, at most ten
+  minutes — the engine's own transfer long-poll plus transfer budget) and starts the import when
+  the file appears; once per supervisor start, a sweep imports any account whose archive exists
+  but has no completed row (connector restarted between link and import, or a previous attempt
+  failed). A failed run is retried on a later start up to three attempts, then stays `failed`
+  with its error class until the account is deleted or re-linked (only-first-link semantics,
+  ADR 0005 §风险与边界). The connector never deletes or rewrites the engine's archive file; the
+  completed row in the connector store is the consumption marker.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -1761,17 +1841,19 @@ when the first real message lands. Message history is still never backfilled (§
 only becomes an active conversation through a real message. The pre-1.14 behavior —
 conversations created only by the first sent or received message — remains true for entries the
 upstream has not synced (unknown numbers that message the account create their conversation on
-arrival as before).
+arrival as before). Since contract revision 1.39 the other half of the skeleton story is the
+link-time history import (§4.38, §6.6): a skeleton conversation is never duplicated by the
+import — the archive's chats resolve to the same `(account, kind, peer_key)` identity and fill
+the existing row in place through `ensure_conversation`, upgrading the title through the normal
+policy when the archive knows a better name.
 
-### 6.6 History limitation
+### 6.6 History limitation and link-time import (backup5)
 
 The connector only promises history it has persisted. `sendSyncRequest` can synchronize contacts and
 groups but is not treated as complete phone/Desktop message-history backfill. Product UI must not
-promise pre-link history until a separately verified upstream capability exists. Since contract
+promise pre-link history beyond what the import below actually lands. Since contract
 revision 1.14 the synced chats do surface as empty conversation skeletons (§6.5); their message
-lists stay empty until real messages arrive. Official Signal added an optional full-history
-"Link & Sync" archive transfer in 2025; pinned signal-cli 0.14.7 has no such capability, so the
-connector cannot offer it.
+lists stay empty until real messages arrive or the link-time import fills them.
 
 Verified against official sources (2026-10-03, Signal-Desktop v8.31.0-alpha.1): the mechanism is
 the `backup5` link capability (`ts/textsecure/Provisioner.preload.ts` — advertised in the link QR
@@ -1797,9 +1879,26 @@ engine on 2026-10-04 (kt-signal-engine 0eedc8c, ADR 0005 §5): the link flow byp
 `provisioning::link_device` directly with `capabilities=backup5` on the QR URL, persists the
 registration through the official store format, then best-effort long-polls the transfer
 archive, decrypts it (official `libsignal-message-backup` v0.99.0 primitives) and streams a
-frame-by-frame NDJSON export to the account store directory (`history-import.ndjson`). Until
-the connector consumes that file (S3, contract pending), the connector keeps serving skeletons
-only (§6.5); the NDJSON presence is the import-result signal the S3 consumer will use.
+frame-by-frame NDJSON export to the account store directory (`history-import.ndjson`).
+
+**Contract revision 1.39 (2026-10-04) consumes that face (§4.38)**: the connector imports the
+archive into its store after link — bounded batched writes, live-traffic identity dedupe
+(same `signal-message-v2` stable id, `sent_at` = the archive's Signal timestamp, so history and
+live envelopes of the same message collapse to one row), existing §6.5 skeletons filled in place
+through `ensure_conversation`, no unread-badge or host-event flood, retention converged by the
+normal §7.1.1 pass. The import is best-effort and honest end to end: the desktop reads
+`history.importStatus` (§4.38) — `unavailable` under signal-cli modes (pinned signal-cli 0.14.x
+has no such capability; the kt-engine mode is the only import-capable face) or when no archive
+was produced, `pending` during the link-time wait, `running`/`completed`/`failed` from the
+persisted row with real counters. Attachments stay metadata-only (§6.7 philosophy — the archive
+carries no bytes and the connector never downloads any). The archive itself is never mirrored in
+full: imported rows live under the same §7.1.1 retention bounds as every other stored message
+(age measured on local `stored_at`, per-conversation cap converged right after import), so the
+product promise is "the phone's recent history, to the connector's normal retention bounds", not
+a full-archive shadow. Engine-side dependency registered for the engine's S3 task: the S2 export
+does not yet project recipient service identity (`aci`/`e164`/`masterKey`), so against the
+current engine build a run completes with every chat skip-counted; the connector consumes the
+fields the moment the engine adds them (no further connector change).
 
 ### 6.7 Media limitation
 

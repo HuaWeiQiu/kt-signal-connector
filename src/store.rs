@@ -12,7 +12,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const MAX_COMPLETED_ACCOUNT_DELETE_OPERATIONS: i64 = 256;
 /// Storage engine: SQLCipher (rusqlite `bundled-sqlcipher`), keyed per profile.
 const DATABASE_FILE_NAME: &str = "connector.sqlite3";
@@ -165,6 +165,37 @@ CREATE TABLE IF NOT EXISTS peer_identities (
   aci TEXT NOT NULL,
   peer_key TEXT NOT NULL,
   PRIMARY KEY(account_id, aci),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS history_imports (
+  account_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK(state IN ('running', 'completed', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  imported_messages INTEGER NOT NULL DEFAULT 0,
+  skipped_lines INTEGER NOT NULL DEFAULT 0,
+  skipped_chats INTEGER NOT NULL DEFAULT 0,
+  skipped_messages INTEGER NOT NULL DEFAULT 0,
+  error_class TEXT,
+  started_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS history_import_stage_recipients (
+  account_id TEXT NOT NULL,
+  id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  name TEXT NOT NULL,
+  aci TEXT,
+  e164 TEXT,
+  master_key TEXT,
+  PRIMARY KEY(account_id, id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS history_import_stage_chats (
+  account_id TEXT NOT NULL,
+  id INTEGER NOT NULL,
+  recipient_id INTEGER NOT NULL,
+  PRIMARY KEY(account_id, id),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 ";
@@ -2334,6 +2365,351 @@ impl Store {
         Ok(rows)
     }
 
+    // -------------------------------------------------------------------------
+    // Link-time history import (contract revision 1.39, §4.38): the status row
+    // plus the bounded batch writer and per-run staging scratch. The writer
+    // keeps the live-receive identity discipline — the same signal-message-v2
+    // stable id over (account, conversation, direction, sent_at, sender) — so
+    // an import, a re-run, and live envelopes of the same Signal message all
+    // collapse onto one row. The record types live at module scope beside
+    // `MessageRecord`.
+    // -------------------------------------------------------------------------
+
+    /// Start (or restart) one import run: resets the counters, bumps the
+    /// attempt counter, and flips the state to `running`.
+    pub fn begin_history_import(
+        &self,
+        account_id: &str,
+        now_ms: u64,
+    ) -> Result<HistoryImportRow, StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO history_imports(
+                    account_id, state, attempts, imported_messages, skipped_lines,
+                    skipped_chats, skipped_messages, error_class, started_at, updated_at
+                 ) VALUES(?1, 'running', 1, 0, 0, 0, 0, NULL, ?2, ?2)
+                 ON CONFLICT(account_id) DO UPDATE SET
+                   state='running',
+                   attempts=history_imports.attempts + 1,
+                   imported_messages=0,
+                   skipped_lines=0,
+                   skipped_chats=0,
+                   skipped_messages=0,
+                   error_class=NULL,
+                   started_at=excluded.started_at,
+                   updated_at=excluded.updated_at",
+                params![account_id, now_ms as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        self.history_import_row(account_id)?
+            .ok_or(StoreError::AccountNotFound)
+    }
+
+    /// Land the terminal state of one import run with the final counters.
+    pub fn complete_history_import(
+        &self,
+        account_id: &str,
+        state: &str,
+        counters: &ImportCounters,
+        error_class: Option<&str>,
+        now_ms: u64,
+    ) -> Result<(), StoreError> {
+        debug_assert!(matches!(state, "completed" | "failed"));
+        let changed = self
+            .lock_conn()?
+            .execute(
+                "UPDATE history_imports
+                 SET state=?2, imported_messages=?3, skipped_lines=?4, skipped_chats=?5,
+                     skipped_messages=?6, error_class=?7, updated_at=?8
+                 WHERE account_id=?1",
+                params![
+                    account_id,
+                    state,
+                    counters.imported as i64,
+                    counters.skipped_lines as i64,
+                    counters.skipped_chats as i64,
+                    counters.skipped_messages as i64,
+                    error_class,
+                    now_ms as i64,
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if changed == 0 {
+            return Err(StoreError::AccountNotFound);
+        }
+        Ok(())
+    }
+
+    pub fn history_import_row(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<HistoryImportRow>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT account_id, state, attempts, imported_messages, skipped_lines, \
+                        skipped_chats, skipped_messages, error_class, started_at, updated_at
+                 FROM history_imports WHERE account_id=?1",
+                params![account_id],
+                history_import_row_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Append one batch of pass-1 recipient staging rows (bounded: the caller
+    /// streams the archive and flushes one batch at a time; nothing
+    /// proportional to the archive is held in memory). The caller clears the
+    /// account's scratch at the start of every run via [`Self::clear_history_stage`]
+    /// so a crashed predecessor never leaves stale mappings behind.
+    pub fn stage_history_recipients(
+        &self,
+        account_id: &str,
+        recipients: &[HistoryStageRecipient],
+    ) -> Result<(), StoreError> {
+        if recipients.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        for recipient in recipients {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO history_import_stage_recipients(
+                        account_id, id, kind, name, aci, e164, master_key
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        account_id,
+                        recipient.id as i64,
+                        recipient.kind,
+                        recipient.name,
+                        recipient.aci,
+                        recipient.e164,
+                        recipient.master_key,
+                    ],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Append one batch of pass-1 chat→recipient staging rows.
+    pub fn stage_history_chats(
+        &self,
+        account_id: &str,
+        chats: &[(u64, u64)],
+    ) -> Result<(), StoreError> {
+        if chats.is_empty() {
+            return Ok(());
+        }
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        for (chat_id, recipient_id) in chats {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO history_import_stage_chats(
+                        account_id, id, recipient_id
+                     ) VALUES(?1, ?2, ?3)",
+                    params![account_id, *chat_id as i64, *recipient_id as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Drop the account's staging scratch (called on every exit path; the
+    /// tables stay empty between runs).
+    pub fn clear_history_stage(&self, account_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        for table in [
+            "history_import_stage_recipients",
+            "history_import_stage_chats",
+        ] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE account_id=?1"),
+                params![account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        Ok(())
+    }
+
+    /// One staged conversation identity (pass-2 point lookup): the chat's
+    /// recipient row joined through the staging scratch.
+    pub fn history_chat_recipient(
+        &self,
+        account_id: &str,
+        chat_id: u64,
+    ) -> Result<Option<HistoryStageRecipient>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT r.id, r.kind, r.name, r.aci, r.e164, r.master_key
+                 FROM history_import_stage_chats c
+                 JOIN history_import_stage_recipients r
+                   ON r.account_id = c.account_id AND r.id = c.recipient_id
+                 WHERE c.account_id=?1 AND c.id=?2",
+                params![account_id, chat_id as i64],
+                history_stage_recipient_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// One staged recipient identity (pass-2 author lookup).
+    pub fn history_recipient(
+        &self,
+        account_id: &str,
+        recipient_id: u64,
+    ) -> Result<Option<HistoryStageRecipient>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT id, kind, name, aci, e164, master_key
+                 FROM history_import_stage_recipients
+                 WHERE account_id=?1 AND id=?2",
+                params![account_id, recipient_id as i64],
+                history_stage_recipient_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Write one bounded import batch in a single transaction
+    /// (§4.38 bounded discipline). Rows carry their final identity; the
+    /// writer deduplicates on both the stable id (`INSERT OR IGNORE`) and the
+    /// live identity tuple (sender id or its number/ACI alternate), then
+    /// advances the touched conversations' summaries monotonically (a backfill
+    /// must never regress `last_message_at`) and recomputes the account
+    /// summary from the conversation maxima in the same transaction.
+    pub fn insert_history_batch(
+        &self,
+        rows: &[HistoryImportInsert],
+    ) -> Result<HistoryBatchOutcome, StoreError> {
+        let mut outcome = HistoryBatchOutcome::default();
+        if rows.is_empty() {
+            return Ok(outcome);
+        }
+        let stored_at = crate::link::now_ms() as i64;
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        for row in rows {
+            let record = &row.record;
+            // Identity dedupe across the number/ACI duality: live receive may
+            // have stored this Signal message under the number-derived sender
+            // hash while the import resolved the ACI form (or the reverse), so
+            // both candidate hashes qualify as "already stored".
+            let sender_clause = match row.alt_sender_id {
+                Some(_) => "IN (?5, ?6)",
+                None => "IN (?5)",
+            };
+            let sql = format!(
+                "SELECT 1 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction=?3
+                   AND sent_at=?4 AND sender_id {sender_clause}
+                 LIMIT 1"
+            );
+            let mut stmt = transaction
+                .prepare(&sql)
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            let exists = {
+                let sent_at = record.sent_at as i64;
+                let mut all_params: Vec<&dyn rusqlite::ToSql> = vec![
+                    &record.account_id,
+                    &record.conversation_id,
+                    &record.direction,
+                    &sent_at,
+                    &record.sender_id,
+                ];
+                if let Some(alt) = &row.alt_sender_id {
+                    all_params.push(alt);
+                }
+                stmt.query_row(all_params.as_slice(), |_| Ok(()))
+                    .optional()
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?
+                    .is_some()
+            };
+            if exists {
+                outcome.duplicates += 1;
+                continue;
+            }
+            let inserted = transaction
+                .execute(
+                    "INSERT OR IGNORE INTO messages(
+                        id, account_id, conversation_id, direction, sender_id, sent_at,
+                        received_at, stored_at, body, body_bytes, body_truncated, status,
+                        client_request_id, quote_message_id, quote_snapshot, attachments_json,
+                        rich_json, edited_at, sender_name, mentions_self, sticker_json
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
+                              ?13, ?14, NULL, NULL, ?15, ?16, NULL)",
+                    params![
+                            record.id,
+                            record.account_id,
+                            record.conversation_id,
+                            record.direction,
+                            record.sender_id,
+                            record.sent_at as i64,
+                            stored_at,
+                            record.text,
+                            record.text_bytes.map(i64::from),
+                            i64::from(record.text_truncated && !record.text_retrievable),
+                            record.status,
+                            record.quote_message_id,
+                            record
+                                .quote_snapshot
+                                .as_ref()
+                                .map(|quote| serde_json::to_string(quote)
+                                    .expect("quote snapshot json")),
+                            (!record.attachments.is_empty()).then(|| {
+                                serde_json::to_string(&record.attachments)
+                                    .expect("attachments json")
+                            }),
+                            record.sender_name,
+                            i64::from(record.mentions_self),
+                        ],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if inserted == 0 {
+                outcome.duplicates += 1;
+                continue;
+            }
+            outcome.inserted += 1;
+            // Backfill never regresses a summary: only advance when the
+            // imported row is newer than what the conversation already shows.
+            transaction
+                .execute(
+                    "UPDATE conversations
+                     SET last_message_preview=?2, last_message_at=?3
+                     WHERE id=?1 AND (last_message_at IS NULL OR last_message_at < ?3)",
+                    params![record.conversation_id, row.preview, record.sent_at as i64],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+        transaction
+            .execute(
+                "UPDATE accounts
+                 SET last_message_at=(
+                     SELECT MAX(last_message_at) FROM conversations WHERE account_id=?1
+                 )
+                 WHERE id=?1",
+                params![rows[0].record.account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(outcome)
+    }
+
     /// Bounded view-once burn candidates for one open-sync identity set
     /// (contract revision 1.38, §4.37): rows at the synced timestamp whose
     /// conversation matches one of the candidate peer keys (incoming — the
@@ -4116,6 +4492,13 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 15 {
+        // Contract revision 1.39 (§4.38): link-time history import. The
+        // `history_imports` status row and the two per-run staging tables are
+        // created by CREATE TABLE IF NOT EXISTS above — no data migration;
+        // staging rows are per-account scratch that every import run clears,
+        // and both cascade away with their account row.
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -4385,6 +4768,95 @@ fn conversation_last_message_meta(
         status: wire_status,
         author_name,
         reactions,
+    })
+}
+
+fn history_import_row_from_row(row: &Row<'_>) -> rusqlite::Result<HistoryImportRow> {
+    Ok(HistoryImportRow {
+        account_id: row.get(0)?,
+        state: row.get(1)?,
+        attempts: row.get::<_, i64>(2)?.max(0) as u32,
+        imported_messages: row.get::<_, i64>(3)?.max(0) as u64,
+        skipped_lines: row.get::<_, i64>(4)?.max(0) as u64,
+        skipped_chats: row.get::<_, i64>(5)?.max(0) as u64,
+        skipped_messages: row.get::<_, i64>(6)?.max(0) as u64,
+        error_class: row.get(7)?,
+        started_at: row.get::<_, i64>(8)?.max(0) as u64,
+        updated_at: row.get::<_, i64>(9)?.max(0) as u64,
+    })
+}
+
+/// Terminal per-run counters of one import (§4.38): what landed, and every
+/// skip class that keeps the projection honest. The ledger row stores them
+/// verbatim on completion.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImportCounters {
+    pub imported: u64,
+    pub skipped_lines: u64,
+    pub skipped_chats: u64,
+    pub skipped_messages: u64,
+}
+
+/// Persisted import state for one account (§4.38): at most one row, the
+/// honest minimal projection the desktop polls through
+/// `history.importStatus`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryImportRow {
+    pub account_id: String,
+    /// running | completed | failed
+    pub state: String,
+    pub attempts: u32,
+    pub imported_messages: u64,
+    pub skipped_lines: u64,
+    pub skipped_chats: u64,
+    pub skipped_messages: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    pub started_at: u64,
+    pub updated_at: u64,
+}
+
+/// One archive recipient's staged identity (pass 1 scratch): the fields
+/// the engine's NDJSON face projects — `kind`/`name` always, and the
+/// service-identity fields the engine's S3 task must add (§4.38). A
+/// recipient without any resolvable identity yields no conversation and
+/// its messages are skip-counted.
+#[derive(Clone, Debug)]
+pub struct HistoryStageRecipient {
+    pub id: u64,
+    pub kind: String,
+    pub name: String,
+    pub aci: Option<String>,
+    pub e164: Option<String>,
+    pub master_key: Option<String>,
+}
+
+/// One import batch row: the message record carries the resolved
+/// conversation/direction/sender identity, the preview is the
+/// conversation-summary projection, and `alt_sender_id` covers the
+/// number/ACI duality — a stored row matching either sender hash counts
+/// as the same Signal message.
+pub struct HistoryImportInsert {
+    pub record: MessageRecord,
+    pub preview: Option<String>,
+    pub alt_sender_id: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct HistoryBatchOutcome {
+    pub inserted: u64,
+    pub duplicates: u64,
+}
+
+fn history_stage_recipient_from_row(row: &Row<'_>) -> rusqlite::Result<HistoryStageRecipient> {
+    Ok(HistoryStageRecipient {
+        id: row.get::<_, i64>(0)?.max(0) as u64,
+        kind: row.get(1)?,
+        name: row.get(2)?,
+        aci: row.get(3)?,
+        e164: row.get(4)?,
+        master_key: row.get(5)?,
     })
 }
 

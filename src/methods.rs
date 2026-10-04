@@ -115,6 +115,11 @@ pub const METHODS: &[MethodRow] = &[
     // anonymous §4.32 browse face, these are account-scoped).
     ("stickerPacks.getSyncs", Lane::Read, false, "read"),
     ("stickerPacks.setSync", Lane::Send, true, "send"),
+    // Link-time history import status (contract revision 1.39, §4.38): a
+    // store-only read over the import ledger and the archive presence signal
+    // — no engine call, no network, no mutation. The desktop polls it while
+    // the state is `running`; there is deliberately no push event.
+    ("history.importStatus", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -161,7 +166,8 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// faces of §4.32/§4.33, `sticker-pack-sync` (contract revision 1.37)
 /// marks the §4.34 account-scoped pack install face, and `view-once`
 /// (contract revision 1.38) marks the §4.36/§4.37 view-once send, open-sync
-/// and burn faces — desktops gate the new
+/// and burn faces, and `history-import` (contract revision 1.39) marks the
+/// §4.38 link-time import status face — desktops gate the new
 /// methods on these tags so an old connector answers a clean capability gap
 /// instead of `METHOD_NOT_ALLOWED`. They never join [`METHOD_NAMES`]: the
 /// schema request-frame method enum and the dispatch table describe real
@@ -173,6 +179,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "conversation-pin-sync",
     "sticker-pack-sync",
     "view-once",
+    "history-import",
 ];
 
 #[cfg(test)]
@@ -199,6 +206,7 @@ mod tests {
             "stickerPacks.getImage",
             "conversations.getPinned",
             "stickerPacks.getSyncs",
+            "history.importStatus",
         ];
         let send_lane = [
             "messages.sendText",
