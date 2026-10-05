@@ -5,13 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.55 (2026-10-06; §4.49.1 call-signaling legacy bare-frame face +
-  urgency pass-through — `calls.sendSignal` payload becomes optional for the legacy
-  busy/hangup bare frames and the `urgency` parameter rides through to the engine;
-  rebumped from this batch's 1.53 which collided with the same-day 1.54 §4.51
-  (link-time import progress + manual retry) and 1.53 §4.50 appendix (groups.get
-  isTerminated read face); 1.52 was the §4.50 group-termination write batch, whose
-  Status-header bump covered the 1.51 call-signaling miss)
+- Contract revision: 1.56 (2026-10-06; §4.38 attachv2 — link-time import
+  attachment pointer faces: the engine's NDJSON export stops discarding
+  `FilePointer.LocatorInfo` (transfer archives carry no media bytes; the
+  pointer three-piece key/transit-CDN/integrity is what makes media
+  recoverable after import, per the official import pipeline), the connector
+  parses it into a new internal `messages.attachment_locators` column
+  (schema version 18) beside the byte-identical wire descriptors — ingest
+  only this batch, the download wiring (step 3) is registered as follow-up;
+  1.55 was §4.49.1 call-signaling legacy bare-frame face + urgency
+  pass-through (`calls.sendSignal` payload becomes optional for the legacy
+  busy/hangup bare frames and the `urgency` parameter rides through to the
+  engine), itself rebumped from 1.53 which collided with the same-day 1.54
+  §4.51 (link-time import progress + manual retry) and 1.53 §4.50 appendix
+  (groups.get isTerminated read face); 1.52 was the §4.50 group-termination
+  write batch, whose Status-header bump covered the 1.51 call-signaling miss)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1563,8 +1571,12 @@ documented data-directory artifact instead of an RPC surface.
   `skippedMessages`, `attempts`, `errorClass`, `startedAt`, `updatedAt`). Unknown account:
   `ACCOUNT_NOT_FOUND`. The method is read-lane, read metrics class; no new error codes.
   (Contract 1.54, §4.51, extends the `running` state with the optional `progress` object and
-  adds the `history.importRetry` manual face — that section owns the widened shape.)
-- Store: one `history_imports` row per account (schema version 15, FK cascade with the account),
+  adds the `history.importRetry` manual face — that section owns the widened shape. Contract
+  1.56, attachv2 above, widens the import payload itself with the attachment pointer faces;
+  the status/progress/retry faces are untouched by it.)
+- Store: one `history_imports` row per account (schema version 15, FK cascade with the account;
+  the import's attachment pointer faces ride `messages.attachment_locators`, schema 18,
+  contract 1.56 — see the attachv2 bullet above),
   plus the bounded import writer. Message rows are written with exactly the live-receive
   identity — the message id is the same `signal-message-v2` stable hash over
   `(account, conversation, direction, sent_at, sender)`, `sent_at` being the Signal timestamp
@@ -1573,6 +1585,45 @@ documented data-directory artifact instead of an RPC surface.
   same message, lands on the same identity and inserts nothing. Chats attach through
   `ensure_conversation`, so a contacts-sync skeleton (§6.5) is filled in place — no second
   conversation row; the title keeps the §6.5 upgrade policy.
+- Attachment pointer faces (contract 1.56, attachv2, 2026-10-06; engine counterpart recorded in
+  kt-signal-engine `docs/jsonrpc-compat.md` §5): the transfer archive carries no media bytes —
+  recoverability rides the frame's `FilePointer.LocatorInfo` pointer face (key / transit
+  cdnKey+cdnNumber / integrity digest|plaintextHash; official anchor
+  `convertFilePointerToAttachment`, `ts/services/backups/util/filePointers.preload.ts:51-168`,
+  and the four-piece transit download gate `isDownloadableFromTransitTier`,
+  `ts/util/Attachment.std.ts:806-825`), which the engine's v1 export discarded. The pinned
+  engine now projects a `locator` object per attachment row (plus width/height/caption/blurHash/
+  incrementalMac+chunkSize/clientUuid), and this connector consumes it ingest-side only:
+  faces land in a new internal `messages.attachment_locators` JSON column (schema version 18,
+  additive nullable, never backfilled) index-aligned with the `attachments` descriptors —
+  a key-less face (official Locator::Invalid) stays in its position as an honest hole, and a
+  message with no locator keys at all stores no row (no `[{}]` noise). Key material rides the
+  internal column only; the host wire descriptor keeps its exact pre-1.56 shape (byte-identical
+  `attachments_json` — width/height/caption/blurHash ride it only when a future batch widens
+  the wire face, which 1.56 deliberately does not). Ingest caps mirror the §4.13 discipline:
+  base64 fields ≤512 chars, hex ≤128 chars, cdnNumber within u32, uploadTimestamp > 0, unknown
+  keys ignored, wrong-shaped keys dropped individually (never fatal, never guessed). The
+  descriptors themselves stay the §6.7 metadata-only faces this batch: nothing downloads,
+  opening one still answers the normal not-found failure; consuming the faces (transit CDN
+  download → plaintextHash-or-digest verify → attachment storage, on-demand per click/preview,
+  the official `queueAttachmentDownloads`/`AttachmentDownloadManager` semantics —
+  `ts/services/backups/import.preload.ts:725-767`) is registered as the attachv2 step-3
+  follow-up batch. Schema description updated with the schema-18 column.
+- Step-3 pre-ruling, integrity verification (recorded now so the follow-up batch executes
+  rather than re-decides; the research doc's open question #2): transit downloads verify in
+  two layers when both faces ride the row — ciphertext integrity first, streaming
+  HMAC-SHA256 over the downloaded body compared against `digest` (the sender-original
+  encryptedDigest; the transit protocol's terminal HMAC — official download path
+  `AttachmentCipherInputStream` semantics), then plaintext SHA-256 compared against
+  `plaintextHash` after decryption (official `Bytes.toHex` pairing,
+  `filePointers.preload.ts:147-158` keeps both forms). A row carrying only plaintextHash
+  (the downloaded-once form, transit pointers possibly absent) is the media-tier face and is
+  not transit-downloadable by this ruling — the four-piece transit gate
+  (`isDownloadableFromTransitTier`, `ts/util/Attachment.std.ts:806-825`) requires digest OR
+  plaintextHash plus key+cdnKey+cdnNumber; when only the hash rides, the download may still
+  proceed but a hash mismatch is terminal (no digest re-check possible). Failure degrades
+  honestly: verification failure or transit 404 keeps the message and answers the attachment
+  placeholder (the official tap-to-retry face); nothing auto-retries.
 - Bounded discipline (ADR 0002): the archive is read as a line stream with a hard per-line cap;
   pass 1 stages recipient/chat identity maps into bounded SQLite temp tables (dropped at the
   end), pass 2 streams messages in fixed-size batches (256 rows per transaction, store lock

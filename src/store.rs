@@ -6,13 +6,13 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS messages (
   quote_message_id TEXT,
   quote_snapshot TEXT,
   attachments_json TEXT,
+  attachment_locators TEXT,
   rich_json TEXT,
   sticker_json TEXT,
   expire_seconds INTEGER,
@@ -2820,6 +2821,37 @@ impl Store {
         Ok(())
     }
 
+    /// The stored attachment pointer faces of one imported message
+    /// (contract 1.55, §4.38 attachv2) — the download wiring's future input
+    /// (§4.38 step 3, not wired this batch). NULL column or pre-1.55 row
+    /// answers an empty vector; a malformed JSON cell is storage corruption
+    /// of an internal column and surfaces as `Unavailable`, never silently
+    /// swallowed (the faces are the download's key material — failing closed
+    /// beats failing wrong).
+    pub fn history_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<HistoryAttachmentLocator>, StoreError> {
+        let cell: Option<String> = self
+            .lock_conn()?
+            .query_row(
+                "SELECT attachment_locators FROM messages
+                 WHERE account_id=?1 AND id=?2",
+                params![account_id, message_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        cell.map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                StoreError::Unavailable(Some(rusqlite::Error::ToSqlConversionFailure(error.into())))
+            })
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+    }
+
     /// Append one batch of pass-1 recipient staging rows (bounded: the caller
     /// streams the archive and flushes one batch at a time; nothing
     /// proportional to the archive is held in memory). The caller clears the
@@ -3031,10 +3063,10 @@ impl Store {
                         id, account_id, conversation_id, direction, sender_id, sent_at,
                         received_at, stored_at, body, body_bytes, body_truncated, status,
                         client_request_id, quote_message_id, quote_snapshot, attachments_json,
-                        rich_json, edited_at, sender_name, mentions_self, sticker_json,
-                        expire_seconds, expire_start_at, expire_at, server_guid
+                        attachment_locators, rich_json, edited_at, sender_name, mentions_self,
+                        sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                              ?13, ?14, ?20, NULL, ?15, ?16, NULL, ?17, ?18, ?19, NULL)",
+                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, NULL, ?17, ?18, ?19, NULL)",
                     params![
                             record.id,
                             record.account_id,
@@ -3066,6 +3098,10 @@ impl Store {
                                 .rich
                                 .as_ref()
                                 .map(|rich| serde_json::to_string(rich).expect("rich json")),
+                            (!row.locators.is_empty()).then(|| {
+                                serde_json::to_string(&row.locators)
+                                    .expect("attachment locators json")
+                            }),
                         ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -5186,6 +5222,24 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 18 {
+        // Contract revision 1.55 (§4.38 attachv2): link-time import
+        // attachment pointer faces. One additive nullable JSON column beside
+        // `attachments_json` — a strict subset projection of the engine's
+        // NDJSON locator object (the wire-facing attachment descriptor stays
+        // byte-identical; §4.38). Key material rides only this internal
+        // column and never the host wire. Pre-1.55 rows (and live receives,
+        // which carry no pointer) keep NULL and are never backfilled. The
+        // ingest-side caps live in the import parser, so the column only
+        // ever holds what §4.38 bounded.
+        if !table_has_column(conn, "messages", "attachment_locators")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN attachment_locators TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -5540,6 +5594,41 @@ pub struct HistoryImportInsert {
     pub record: MessageRecord,
     pub preview: Option<String>,
     pub alt_sender_id: Option<String>,
+    /// Contract 1.55 (§4.38 attachv2): the archive attachments' ingest-side
+    /// pointer faces, aligned by index with `record.attachments`. Key
+    /// material rides this field and the internal `attachment_locators`
+    /// column only — never the host wire (`attachments_json` keeps its
+    /// byte-identical v1 shape). Empty = no pointers on this message.
+    pub locators: Vec<HistoryAttachmentLocator>,
+}
+
+/// The ingest-side attachment pointer face of one imported attachment
+/// (contract 1.55, §4.38): the strict subset of the engine's NDJSON locator
+/// object the connector can honestly consume today. Serialize-safe
+/// (`attachment_locators` JSON) and wire-free — the host-facing attachment
+/// descriptor never carries key material (§4.38 decision). Integrity is
+/// one-of: the archive's `digest` (encrypted, standard base64) or
+/// `plaintextHash` (lowercase hex), or neither when the locator was absent.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryAttachmentLocator {
+    /// The attachment encryption key (base64). Required for any download;
+    /// absent means the pointer face is unknown/invalid (kept only for
+    /// index alignment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdn_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdn_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_timestamp: Option<u64>,
+    /// Encrypted-digest integrity face (base64) — the sender-original form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Plaintext-hash integrity face (lowercase hex) — the downloaded form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plaintext_hash: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq)]

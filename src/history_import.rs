@@ -20,11 +20,14 @@
 //! Nothing proportional to the archive is held in memory: the archive is read
 //! as a line stream with a hard per-line cap, staged through per-account
 //! scratch tables, and written one bounded transaction at a time (ADR 0002
-//! bounded discipline). The engine-side dependency registered in §4.38 stands:
-//! the S2 export does not yet project recipient service identity
-//! (`aci`/`e164`/`masterKey`), so against the current engine build every run
-//! completes with all chats skip-counted; the parser consumes those fields the
-//! moment the engine adds them, with no further connector change.
+//! bounded discipline). The engine-side dependency registered in §4.38
+//! (recipient service identity) landed engine-side in E5. Since contract
+//! 1.55 (§4.38 attachv2) the message frames' attachment objects also carry
+//! the pointer face (`locator`: key/cdnKey/cdnNumber/uploadTimestamp/
+//! digest|plaintextHash plus caption/blurHash/incrementalMac) — parsed into
+//! the internal `attachment_locators` column, ingest only: the download
+//! wiring (step 3) is a later batch, so descriptors keep answering the §6.7
+//! not-found failure.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -39,8 +42,8 @@ use crate::engine::{NormalizedAttachment, NormalizedQuote, truncate_utf8_bytes};
 use crate::ids::{mask_address, stable_hash_id};
 use crate::service::{MAX_HOST_TEXT_PREVIEW_BYTES, MAX_INBOUND_TEXT_BYTES};
 use crate::store::{
-    HistoryImportInsert, HistoryStageChat, HistoryStageRecipient, ImportCounters, MessageRecord,
-    Store,
+    HistoryAttachmentLocator, HistoryImportInsert, HistoryStageChat, HistoryStageRecipient,
+    ImportCounters, MessageRecord, Store,
 };
 
 /// The engine's export artifact inside the account store directory.
@@ -511,7 +514,7 @@ impl<'a> Importer<'a> {
         } else {
             None
         };
-        let attachments = raw_attachments
+        let (attachments, locators) = raw_attachments
             .map(|raws| self.import_attachments(raws, &message_id))
             .unwrap_or_default();
         // The archive's disappearing-message metadata (contract 1.42,
@@ -581,6 +584,7 @@ impl<'a> Importer<'a> {
             record,
             preview,
             alt_sender_id,
+            locators,
         });
         if value
             .get("pinnedAtTimestamp")
@@ -682,6 +686,7 @@ impl<'a> Importer<'a> {
             record,
             preview,
             alt_sender_id: None,
+            locators: Vec::new(),
         });
         if self.batch.len() >= BATCH_MESSAGES {
             self.flush()?;
@@ -827,14 +832,33 @@ impl<'a> Importer<'a> {
         Ok(None)
     }
 
-    /// Metadata-only attachment descriptors (§4.13 mirror): synthetic stable
-    /// ids, no bytes behind them (§6.7 — opening one answers the normal
-    /// not-found failure), capped at the live receive ceiling.
-    fn import_attachments(&self, raws: &[Value], message_id: &str) -> Vec<NormalizedAttachment> {
-        raws.iter()
-            .take(MAX_IMPORT_ATTACHMENTS)
-            .enumerate()
-            .map(|(index, raw)| NormalizedAttachment {
+    /// Attachment descriptors (§4.13 mirror) plus their ingest-side pointer
+    /// faces (contract 1.55, §4.38 attachv2). Descriptors keep the v1 shape
+    /// byte-for-byte (synthetic stable ids, no bytes behind them — §6.7:
+    /// opening one still answers the normal not-found failure; nothing
+    /// downloads this batch). The pointer faces land beside them in
+    /// `record.attachments` index order and ride the internal
+    /// `attachment_locators` column only — never the host wire. Caps: the
+    /// live receive ceiling (32) and the per-face bounds below mirror the
+    /// §4.13 discipline — a hostile archive line cannot inflate the row.
+    ///
+    /// Ingest caps (recorded in §4.38): key/digest base64 ≤512 chars,
+    /// plaintextHash hex ≤128 chars, cdnKey ≤512 chars, index-aligned
+    /// entries only. A face without a descriptor position (engine emitted
+    /// more locator faces than the cap kept) drops; a descriptor without a
+    /// face is the honest v1 shape (locator absent on the engine row). A
+    /// key-less face (official Locator::Invalid) stays index-aligned and
+    /// key-less — the future download wiring must see the hole, not a
+    /// shifted row.
+    fn import_attachments(
+        &self,
+        raws: &[Value],
+        message_id: &str,
+    ) -> (Vec<NormalizedAttachment>, Vec<HistoryAttachmentLocator>) {
+        let mut descriptors = Vec::new();
+        let mut locators = Vec::new();
+        for (index, raw) in raws.iter().take(MAX_IMPORT_ATTACHMENTS).enumerate() {
+            descriptors.push(NormalizedAttachment {
                 id: stable_hash_id(&["history-attachment", message_id, &index.to_string()]),
                 content_type: raw
                     .get("contentType")
@@ -851,8 +875,21 @@ impl<'a> Importer<'a> {
                 height: None,
                 is_voice_note: raw.get("flag").and_then(Value::as_i64)
                     == Some(ATTACHMENT_FLAG_VOICE_MESSAGE),
-            })
-            .collect()
+            });
+            locators.push(import_locator(raw.get("locator")));
+        }
+        // A message whose attachments all lacked a locator key (v1-shape or
+        // Invalid-only) stores no locator row at all — `[{}]` noise never
+        // reaches the column. Alignment is preserved where it matters: any
+        // message with a real face carries the full index-aligned list
+        // (key-less holes included).
+        if locators
+            .iter()
+            .all(|face| *face == HistoryAttachmentLocator::default())
+        {
+            return (descriptors, Vec::new());
+        }
+        (descriptors, locators)
     }
 
     /// Land one bounded batch: message rows in a single store transaction,
@@ -1011,6 +1048,69 @@ fn non_empty(text: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+/// Ingest-cap constants for the pointer faces (§4.38 attachv2): the engine's
+/// projection is 32B keys (base64 44 chars), 32B digests (44) and hashes
+/// (64 hex) — the caps are generous multiples over the real shapes, tight
+/// enough that a hostile line cannot bloat the column. cdnKey is an opaque
+/// server string (official URLs carry ~40-80 chars).
+const MAX_LOCATOR_BASE64_CHARS: usize = 512;
+const MAX_LOCATOR_HEX_CHARS: usize = 128;
+
+/// Parse one engine NDJSON attachment's `locator` object into the ingest
+/// face (contract 1.55). Proto-only discipline on the connector side too:
+/// unknown keys are ignored, wrong-shaped keys are dropped (never guessed),
+/// an absent/empty object answers a key-less face — the official
+/// Locator::Invalid form the download wiring must keep seeing as a hole.
+/// Integrity faces are kept one-of as the engine projected them (digest
+/// base64 / plaintextHash hex); both arriving together cannot happen from
+/// the pinned engine (oneof upstream) and would serialize as-is — the
+/// download wiring's step-3 gate owns refusing that combination.
+fn import_locator(raw: Option<&Value>) -> HistoryAttachmentLocator {
+    let mut face = HistoryAttachmentLocator {
+        key: None,
+        cdn_key: None,
+        cdn_number: None,
+        upload_timestamp: None,
+        digest: None,
+        plaintext_hash: None,
+    };
+    let Some(object) = raw.and_then(Value::as_object) else {
+        return face;
+    };
+    let bounded_b64 = |name: &str| {
+        object
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty() && text.len() <= MAX_LOCATOR_BASE64_CHARS)
+            .map(str::to_string)
+    };
+    face.key = bounded_b64("key");
+    face.cdn_key = bounded_b64("cdnKey");
+    face.digest = bounded_b64("digest");
+    face.plaintext_hash = object
+        .get("plaintextHash")
+        .and_then(Value::as_str)
+        .filter(|text| {
+            !text.is_empty()
+                && text.len() <= MAX_LOCATOR_HEX_CHARS
+                && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map(|text| text.to_ascii_lowercase())
+        // The engine projects lowercase; an uppercase archive value would
+        // only come from a hostile line — normalize, don't store verbatim.
+        ;
+    face.cdn_number = object
+        .get("cdnNumber")
+        .and_then(Value::as_u64)
+        .filter(|number| *number <= u32::MAX as u64)
+        .map(|number| number as u32);
+    face.upload_timestamp = object
+        .get("uploadTimestamp")
+        .and_then(Value::as_u64)
+        .filter(|timestamp| *timestamp > 0);
+    face
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1238,250 @@ mod tests {
 
     fn group_conversation_id(account_id: &str) -> String {
         stable_hash_id(&[account_id, "group", GROUP_MASTER_KEY])
+    }
+
+    /// Contract 1.55 (§4.38 attachv2): the engine's attachment pointer faces
+    /// land in the internal column — full transit face (key/cdnKey/
+    /// cdnNumber 0/uploadTimestamp/digest|plaintextHash), the digest form
+    /// (sender-original attachment), a partial face, and the official
+    /// Locator::Invalid forms (no locator / empty object → key-less aligned
+    /// hole). The host wire descriptor stays byte-identical to v1 (no key
+    /// material on `attachments_json`), width/height are not projected by
+    /// the pinned engine face (recorded), and a re-run collapses onto the
+    /// same rows (identity discipline covers the new column implicitly).
+    #[test]
+    fn imported_attachments_carry_pointer_faces_in_internal_column_only() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let key_b64 = "q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=";
+        let digest_b64 = "dpDdCNlXKpo1VUFTWDbNWByz2CbtLIrwQ3THlMcpS2w=";
+        let hash_hex = "a".repeat(64);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // Full transit face, plaintextHash integrity (downloaded form).
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "pic",
+                    "attachments": [{
+                        "contentType": "image/png", "fileName": "p.png", "flag": 0, "size": 12,
+                        "caption": "hello", "blurHash": "LEHV6nWB2yk8pyo0adR*.7kCMdnj",
+                        "incrementalMac": "AQIDBA==", "chunkSize": 8192,
+                        "locator": {
+                            "key": key_b64, "cdnKey": "t1a2b3c", "cdnNumber": 0,
+                            "uploadTimestamp": 1_700_000_000_000_u64,
+                            "plaintextHash": hash_hex
+                        }
+                    }]
+                })
+                .to_string(),
+                // Digest form (sender-original) with transit pointers.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming", "text": "video",
+                    "attachments": [{
+                        "contentType": "video/mp4", "fileName": "v.mp4", "flag": 0, "size": 99,
+                        "locator": {
+                            "key": key_b64, "cdnKey": "k2", "cdnNumber": 3,
+                            "digest": digest_b64
+                        }
+                    }]
+                })
+                .to_string(),
+                // Partial face (key + hash, no transit) beside an Invalid one.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 3000,
+                    "direction": "incoming", "text": "mixed",
+                    "attachments": [
+                        {"contentType": "application/pdf", "fileName": "d.pdf", "size": 7,
+                         "locator": {"key": key_b64, "plaintextHash": hash_hex}},
+                        {"contentType": "image/webp", "fileName": "gone.webp", "size": 4,
+                         "locator": {}}
+                    ]
+                })
+                .to_string(),
+                // v1 shape attachment (no locator key at all) — descriptors
+                // only, no locators column entry, byte-identical wire row.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 4000,
+                    "direction": "incoming", "text": "legacy",
+                    "attachments": [
+                        {"contentType": "audio/aac", "fileName": "v.aac", "flag": 1, "size": 9}
+                    ]
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 4);
+        let conversation = alice_conversation_id(&account.id);
+
+        let message_at = |sent_at: u64| {
+            store
+                .message_by_signal_identity(
+                    &account.id,
+                    &conversation,
+                    "incoming",
+                    sent_at,
+                    &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+                )
+                .unwrap()
+                .expect("imported row")
+        };
+
+        // Full face: locator persisted in the internal column; the wire
+        // descriptor carries caption/blurHash but never key material.
+        let full = message_at(1000);
+        let faces = store
+            .history_attachment_locators(&account.id, &full.id)
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        let face = &faces[0];
+        assert_eq!(face.key.as_deref(), Some(key_b64));
+        assert_eq!(face.cdn_key.as_deref(), Some("t1a2b3c"));
+        assert_eq!(face.cdn_number, Some(0), "CDN0 is a legal cdn number");
+        assert_eq!(face.upload_timestamp, Some(1_700_000_000_000));
+        assert_eq!(face.plaintext_hash.as_deref(), Some(hash_hex.as_str()));
+        assert_eq!(face.digest, None);
+        let full_attachment = &full.attachments[0];
+        assert_eq!(full_attachment.content_type.as_deref(), Some("image/png"));
+        assert_eq!(full_attachment.size, Some(12));
+        assert_eq!(
+            full.id,
+            stable_hash_id(&[
+                "signal-message-v2",
+                &account.id,
+                &conversation,
+                "incoming",
+                "1000",
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164])
+            ]),
+            "identity discipline unchanged"
+        );
+        let wire: serde_json::Value =
+            serde_json::to_value(&full.attachments).expect("wire descriptor");
+        let wire_text = wire.to_string();
+        assert!(
+            !wire_text.contains("q83vLNoecho"),
+            "key material never rides the host wire descriptor"
+        );
+        assert!(
+            !wire_text.contains("locator"),
+            "locator faces are not part of the wire descriptor"
+        );
+
+        // Digest form (sender-original): digest face one-of, no plaintext.
+        let video = message_at(2000);
+        let faces = store
+            .history_attachment_locators(&account.id, &video.id)
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].digest.as_deref(), Some(digest_b64));
+        assert_eq!(faces[0].plaintext_hash, None);
+        assert_eq!(faces[0].cdn_number, Some(3));
+
+        // Mixed: index-aligned faces including the key-less Invalid hole —
+        // the future download wiring must see the hole, not a shifted row.
+        let mixed = message_at(3000);
+        let faces = store
+            .history_attachment_locators(&account.id, &mixed.id)
+            .unwrap();
+        assert_eq!(faces.len(), 2, "faces stay index-aligned with descriptors");
+        assert_eq!(faces[0].key.as_deref(), Some(key_b64));
+        assert_eq!(faces[1].key, None, "Invalid locator stays a key-less hole");
+        assert_eq!(faces[1].cdn_key, None);
+        // v1 metadata (size ladder) intact beside the faces.
+        assert_eq!(mixed.attachments.len(), 2);
+        assert_eq!(mixed.attachments[1].size, Some(4));
+
+        // v1-shape message: descriptors only, no locators row at all.
+        let legacy = message_at(4000);
+        assert!(legacy.attachments[0].is_voice_note);
+        assert_eq!(
+            store
+                .history_attachment_locators(&account.id, &legacy.id)
+                .unwrap(),
+            Vec::new(),
+            "no locator key on the engine row → empty face list"
+        );
+
+        // A re-run converges onto the same rows (identity dedupe) — the new
+        // column never duplicates.
+        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(second.imported, 0);
+        let faces = store
+            .history_attachment_locators(&account.id, &full.id)
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].key.as_deref(), Some(key_b64));
+    }
+
+    /// Ingest caps and shape gates on the pointer faces (§4.38 attachv2):
+    /// oversized key/digest/cdnKey, oversized or non-hex plaintextHash, a
+    /// cdnNumber past u32, and uploadTimestamp 0 (the engine never projects
+    /// it; a hostile line would) all drop — never stored, never fatal.
+    #[test]
+    fn locator_ingest_caps_drop_hostile_shapes() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "hostile",
+                    "attachments": [{
+                        "contentType": "image/png", "size": 1,
+                        "locator": {
+                            "key": "x".repeat(600),
+                            "cdnKey": "y".repeat(600),
+                            "digest": "z".repeat(600),
+                            "plaintextHash": "G".repeat(200),
+                            "cdnNumber": 4294967296_u64,
+                            "uploadTimestamp": 0
+                        }
+                    }]
+                })
+                .to_string(),
+            ],
+        );
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 1, "caps drop fields, never the message");
+        let conversation = alice_conversation_id(&account.id);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("row");
+        // Every field over-cap/malformed → the face collapses to empty and
+        // the message stores no locator row at all (the `no faces at all`
+        // normalization); the descriptor and the row itself are untouched.
+        assert_eq!(
+            store
+                .history_attachment_locators(&account.id, &row.id)
+                .unwrap(),
+            Vec::new()
+        );
     }
 
     #[test]
