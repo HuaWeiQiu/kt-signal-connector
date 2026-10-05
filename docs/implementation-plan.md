@@ -5,7 +5,8 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.50 (2026-10-06)
+- Contract revision: 1.52 (2026-10-06; §4.50 group termination — the 1.51 call-signaling
+  batch's Status-header bump was missed then, this line records the live revision)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2458,6 +2459,89 @@ group; `conversationId` bounded and resolved; `type` against the five-value enum
 boundaries: no row, no cache, no store schema change; the signaling material exists only
 inside the engine, the response, and the event, and never reaches a log line (the
 AGENTS.md redaction boundary; neither path logs payload content).
+
+### 4.50 Group termination: groups.terminate (contract revision 1.52, 2026-10-06)
+
+The desktop matrix item 「终止群（isGroupTerminated）待协议核实」 closes as **verified with
+an upstream face**: the official desktop's conversation-info page does carry the action
+(`ConversationDetailsActions.dom.tsx` L144-154, the "End group" destructive item), and the
+pinned signal-cli 0.14.8 JSON-RPC surface carries the matching write natively — no
+invention needed, this batch is behavior alignment with zero upstream source copied.
+
+Verification record (2026-10-06, all line anchors read from the pinned upstream trees):
+
+- Official behavior anchor (Signal-Desktop `v8.31.0-alpha.1`, AGPL — semantics only): the
+  action is `onTerminateGroup` → the `terminateGroup` duck (`state/ducks/conversations.preload.ts`
+  L3105, wrapped in a `longRunningTaskWrapper` with the `icu:GroupV2--terminate-group-in-progress`
+  spinner, failures route to the `TerminateGroupFailedModal` retry dialog) → the model's
+  `terminateGroup()` (`models/conversations.preload.ts` L5131, GroupV2-only) →
+  `buildTerminateChange` (`groups.preload.ts` L1472) — **a GroupsV2 group change, not a
+  dedicated RPC**: `{version: revision+1, terminateGroup: {}}` uploaded through
+  `modifyGroupV2` → `WebAPI.modifyGroup` (`textsecure/WebAPI.preload.ts` L4919, the zkgroup
+  credential-authenticated `PATCH /v1/groups` protobuf call). Availability gate:
+  `canTerminateGroup = isTerminateGroupEnabled && !isGroupTerminated && isAdmin`
+  (`ConversationDetails.dom.tsx` L256, behind the server-driven featured flags
+  `desktop.groupTerminate.send.beta` / `.prod`). Post-termination official state: the
+  composer is blocked (`icu:CompositionArea--group-terminated`), leave/block hide, archive
+  + delete show, members render as former members, and a terminated group's inbound
+  messages are dropped (`icu:GroupV2--terminated--you|other|unknown` timeline copy; the
+  terminated flag can only ever move false→true, `groups.preload.ts` L5008).
+- Upstream face (signal-cli `v0.14.8`, the pinned engine baseline — introduced upstream in
+  `13819c8f` 2026-08-08 "Support the GroupsV2 end group (terminate) feature" #2098): the
+  JSON-RPC local command `terminateGroup` (`TerminateGroupCommand.java`, dests
+  `-g/--group-id/--group` + the standard `account`) → `ManagerImpl.terminateGroup` L614 →
+  `GroupHelper.terminateGroup` L366 (GroupV2-only — a v1 group answers the
+  "only supported for Signal group v2 groups" IO error; a revision `ConflictException`
+  refreshes the group and retries once *inside the engine*, upstream-owned semantics the
+  connector neither sees nor repeats) → `GroupV2Helper.terminateGroup` L546 → libsignal
+  `createTerminateGroup()`; the result is the send fan-out (`SendGroupMessageResults`,
+  same shape family as `updateGroup`/`quitGroup`). Error faces: non-admin termination is
+  refused by the GroupsV2 service (the `GroupSendingNotAllowedException` user-error
+  family), unknown/departed groups answer `GroupNotFoundException` /
+  `NotAGroupMemberException` — all forward verbatim as `UPSTREAM_ERROR`, never invented
+  locally. Reading the terminated state: `listGroups` JSON carries `isTerminated`
+  (`ListGroupsCommand.java` JsonGroup L168), and the engine refuses sends to a terminated
+  group locally (`SendHelper` L578) and drops inbound messages addressed to one
+  (`IncomingMessageHandler` L839).
+- presage/libsignal-service stack: **no separate RPC exists at any layer — by protocol
+  design**. Termination is a GroupsV2 group-change action (`GroupChange.Actions.terminateGroup`),
+  so the only "wrapper" is a generic group-change builder. The connector's upstream is
+  signal-cli (JVM/native) which now builds that action natively; no presage face is needed
+  or consulted (presage is not in this repository's dependency tree — recorded so the
+  matrix item does not reopen).
+- kt-engine mode: the engine face has no `terminateGroup` outbound method (the same
+  engine-batch debt `groups.quit` carries), so engine mode answers
+  `CAPABILITY_UNAVAILABLE` (`retryable=false`) after local validation — the §4.44
+  media-ingest downgrade precedent. The engine batch removes the gate without a connector
+  contract change.
+
+- `groups.terminate` (host method, capability `group-terminate`, send lane, account-scoped
+  mutating): params `{accountId, conversationId, operationId?}` — the groups.quit shape
+  verbatim (the action itself carries no parameters, so the change set is empty by
+  construction). The group is addressed by conversation id like every other conversation
+  face and must resolve to a `kind='group'` row before any upstream call (direct answers
+  `INVALID_REQUEST`, unknown answers `CONVERSATION_NOT_FOUND`); `operationId?` is
+  validated by shape and never persisted (the §4.5 convention). The upstream payload is
+  the pinned dests verbatim: `{"account", "groupId"}` (peer key = the group id).
+- Result semantics (the §4.44 mutating discipline): a definite success answers
+  `{"status": "sent"}` — the engine's `SendGroupMessageResults` body is not interpreted;
+  an indeterminate upstream outcome (engine exit or timeout with the call in flight)
+  answers the `SEND_OUTCOME_UNKNOWN` error, never retried by the connector. Zero local
+  writes: the terminated state converges through the §4.44 group-update receive
+  projection when the change's own envelope lands, and after termination the engine
+  refuses/drops that group's traffic upstream (the honest near-silence the desktop
+  renders from the terminated banner — desktop presentation is the consume batch's).
+- Read-face boundary (recorded, deliberately not widened in this batch): the connector's
+  `groups.get` cache row (§4.8/§4.39) still carries `memberCount` + `members` only — the
+  sync's `group_extra_json` does not capture the upstream `isTerminated` flag yet, and the
+  §4.44 receive envelope (`JsonGroupInfo`) exposes no terminated field. A desktop that
+  needs the terminated marker reads the next consume batch's projection work; this batch
+  ships the write face only, so the matrix item's protocol question is closed without
+  inventing a read surface the desktop has not asked the connector for.
+- Capability tag: `group-terminate` joins `FEATURE_CAPABILITIES`; the desktop consume
+  batch gates the method on it (a pre-1.52 connector answers a clean capability gap
+  instead of `METHOD_NOT_ALLOWED`). Schema: the method enum, the `groupsTerminateParams`
+  def, and the allOf dispatch branch land together with the code.
 
 ## 5. signal-cli Boundary
 

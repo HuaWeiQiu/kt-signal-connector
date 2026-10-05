@@ -8234,3 +8234,306 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     wait_for_process_exit(recovered_pid).await;
     assert_clean_exit(&mut connector).await;
 }
+
+/// Contract 1.52 (§4.50): the groups.terminate round trip. The handshake
+/// advertises the method plus the `group-terminate` capability; the terminate
+/// addresses the resolved group row and dispatches the pinned 0.14.8
+/// `terminateGroup {account, groupId}` payload verbatim; the refusal ladder
+/// (unknown conversation, direct addressing) answers before any upstream
+/// call; the upstream non-admin refusal forwards verbatim (UPSTREAM_ERROR);
+/// the crash-with-in-flight-write path pins the SEND_OUTCOME_UNKNOWN answer
+/// and the no-retry discipline across the engine restart.
+#[tokio::test]
+async fn groups_terminate_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["groups.terminate", "group-terminate"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupTerm" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Stage three extra groups through the runtime injection marker (the
+    // fixture's background watcher delivers each envelope verbatim; a group
+    // dataMessage materializes the group row): the upstream-refusal group
+    // (the fixture answers the non-admin user error) and the crash group
+    // (the fixture crashes with the mutating call in flight), plus one
+    // ordinary terminable group.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 70,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-terminate-forbidden]",
+                        "type": "UPDATE",
+                        "groupName": "forbidden group",
+                        "revision": 3
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 71,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-terminate-crash]",
+                        "type": "UPDATE",
+                        "groupName": "crash group",
+                        "revision": 3
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 72,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "ZmFlLXRlcm0tZ3JvdXA=",
+                        "type": "UPDATE",
+                        "groupName": "terminable group",
+                        "revision": 3
+                    }
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The injected envelopes land asynchronously; poll until all three
+    // staged rows materialize (each poll drains interleaved frames).
+    let mut groups: Vec<(String, String)> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("group-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("group-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        groups = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["type"] == "group")
+            .filter_map(|row| {
+                Some((
+                    row["id"].as_str()?.to_string(),
+                    row["title"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let titles: Vec<&str> = groups.iter().map(|(_, name)| name.as_str()).collect();
+        if titles.contains(&"terminable group")
+            && titles.contains(&"forbidden group")
+            && titles.contains(&"crash group")
+        {
+            break;
+        }
+    }
+    let by_title = |title: &str| {
+        groups
+            .iter()
+            .find(|(_, name)| name == title)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| panic!("the staged {title} row must materialize: {groups:?}"))
+    };
+    let terminable = by_title("terminable group");
+    let forbidden = by_title("forbidden group");
+    let crash_group = by_title("crash group");
+
+    // The refusal ladder, each before any upstream call.
+    let unknown = request(
+        &mut client,
+        "terminate-unknown",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+    let bad_params = request(
+        &mut client,
+        "terminate-bad-params",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": terminable,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_params["error"]["code"], "INVALID_REQUEST");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-term-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "terminate-direct",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let terminate_calls = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| {
+                params.get("groupId").is_some()
+                    && params.get("name").is_none()
+                    && params.get("expiration").is_none()
+            })
+            .collect()
+    };
+    let calls_before = terminate_calls().len();
+    let _ = calls_before;
+
+    // The upstream non-admin refusal forwards verbatim: the engine's user
+    // error lands as the UPSTREAM_ERROR family (retryable, like every
+    // upstream protocol refusal the connector forwards).
+    let refused = request(
+        &mut client,
+        "terminate-forbidden",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": forbidden
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(refused["error"]["retryable"], true);
+
+    // The definite success: the resolved group row dispatches the pinned
+    // dests verbatim and answers {status: "sent"}.
+    let terminated = request(
+        &mut client,
+        "terminate-group",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": terminable,
+            "operationId": "group-term-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(terminated["result"]["status"], "sent", "{terminated}");
+    let success_calls: Vec<Value> = terminate_calls()
+        .into_iter()
+        .filter(|params| params["groupId"] == "ZmFlLXRlcm0tZ3JvdXA=")
+        .collect();
+    assert_eq!(success_calls.len(), 1, "{:?}", terminate_calls());
+    assert_eq!(success_calls[0]["account"], "+15555550100");
+    assert_eq!(success_calls[0]["groupId"], "ZmFlLXRlcm0tZ3JvdXA=");
+
+    // Crash with the mutating terminate in flight (fixture sentinel,
+    // os._exit(35)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
+    // call in the recovered log across the restart.
+    let crash = request(
+        &mut client,
+        "terminate-crash",
+        "groups.terminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_group
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    assert_eq!(crash["error"]["retryable"], false);
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-term", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+    let crash_calls: Vec<Value> = terminate_calls()
+        .into_iter()
+        .filter(|params| params["groupId"] == "[fixture-terminate-crash]")
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown termination outcome is never retried: {crash_calls:?}"
+    );
+    assert_eq!(
+        crash_calls[0]["account"], "+15555550100",
+        "the crashing call carried the resolved payload: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}

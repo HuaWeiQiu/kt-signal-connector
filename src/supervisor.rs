@@ -24,17 +24,17 @@ use crate::service::{
     ConnectorService, ContactsSyncOutcome, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsUpdateParams,
-    HostSideEvent, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MessagesReportSpamParams,
-    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, ReportSpamFailure,
-    ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    account_limit_error, blocked_conversations_result, pinned_conversations_result,
-    sticker_pack_syncs_result, store_get_group, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsTerminateParams,
+    GroupsUpdateParams, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
+    MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget, PinnedConversations,
+    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
+    SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, account_limit_error, blocked_conversations_result,
+    pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2123,6 +2123,35 @@ impl RuntimeSupervisor {
         };
         match engine
             .call("quitGroup", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.terminate (contract revision 1.52, §4.50, capability
+    /// group-terminate): resolution under the service lock, then the
+    /// mutating `terminateGroup` call — the same unknown-outcome discipline
+    /// as groups.update/groups.quit. Zero local writes: the terminated state
+    /// converges through the receive projection when the change's own
+    /// group-update envelope lands.
+    pub async fn terminate_group(
+        &self,
+        params: GroupsTerminateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_terminate(&params)?
+        };
+        match engine
+            .call("terminateGroup", upstream, CallClass::Mutating)
             .await
         {
             Ok(_) => Ok("sent"),

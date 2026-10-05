@@ -85,6 +85,7 @@
             "groups.get",
             "groups.update",
             "groups.quit",
+            "groups.terminate",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "history.importStatus",
@@ -603,6 +604,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/groupsQuitParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.terminate" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsTerminateParams" }
             }
           }
         },
@@ -1756,6 +1768,29 @@
           "description": "The group conversation to leave; resolved against the account before any upstream call."
         },
         "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "groupsTerminateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountId",
+        "conversationId"
+      ],
+      "description": "Terminate one group conversation for every member (contract revision 1.52, \u00a74.50, capability group-terminate): the upstream terminateGroup {account, groupId} write \u2014 the pinned 0.14.8 JSON-RPC face (TerminateGroupCommand, a JsonRpcLocalCommand) wrapping GroupHelper.terminateGroup \u2192 GroupV2Helper.terminateGroup \u2192 libsignal createTerminateGroup(). conversationId must resolve to a kind='group' row before any upstream call (direct answers INVALID_REQUEST). Upstream requires admin privileges; a non-admin answers the GroupsV2 UNAUTHORIZED face and a v1 group answers the v1-only refusal \u2014 both forward verbatim as the UPSTREAM_ERROR family, never invented locally. The action is irreversible on the Signal service: afterwards nobody can send messages or start calls in the group, and members keep read access to the existing history (official \u201cEnd group\u201d behavior anchors). JVM/native modes dispatch terminateGroup directly; the kt-engine face is the pinned engine's gap and answers CAPABILITY_UNAVAILABLE (retryable=false) after local validation. Send lane, account-scoped mutating: result is {status: 'sent'} on a definite success; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Zero local writes: the terminated state converges through the group-update receive projection (\u00a74.44).",
+      "properties": {
+        "accountId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation to terminate; resolved against the account before any upstream call."
+        },
+        "operationId": {
+          "$ref": "#/$defs/opaqueId"
+        }
       }
     },
     "contactsSetLocalAliasParams": {

@@ -1104,6 +1104,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.quit_group(params).await
     }
 
+    /// groups.terminate (contract revision 1.52, §4.50, capability
+    /// group-terminate): the terminated group state lives with the account's
+    /// engine, so the write routes through the account's owning supervisor
+    /// like every other mutating face.
+    pub async fn terminate_group(
+        &self,
+        params: crate::service::GroupsTerminateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.terminate_group(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

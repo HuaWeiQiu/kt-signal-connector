@@ -32,9 +32,9 @@ use crate::service::{
     ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
     ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    GroupsGetParams, GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams,
-    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    GroupsGetParams, GroupsQuitParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
+    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
     MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
     MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
     MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
@@ -1897,6 +1897,23 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid groups.quit params", false),
             ),
         },
+        // Group termination (contract revision 1.52, §4.50, capability
+        // group-terminate): the groups.quit dispatch shape — params shape
+        // errors answer INVALID_REQUEST, the definite success is
+        // {"status": "sent"}, and an indeterminate upstream outcome is the
+        // SEND_OUTCOME_UNKNOWN error, never retried.
+        "groups.terminate" => {
+            match serde_json::from_value::<GroupsTerminateParams>(request.params) {
+                Ok(params) => match runtime.terminate_group(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid groups.terminate params", false),
+                ),
+            }
+        }
         "messages.reportSpam" => {
             match serde_json::from_value::<MessagesReportSpamParams>(request.params) {
                 Ok(params) => match runtime.report_spam(params).await {

@@ -1008,6 +1008,36 @@ for line in sys.stdin:
             emit_json(response)
             continue
         result = {"timestamp": 99, "results": []}
+    elif method == "terminateGroup":
+        # Contract 1.52 §4.50: the group-termination write route. Same
+        # recording discipline as updateGroup/quitGroup: the exact upstream
+        # params land in SEND_LOG so tests assert the {account, groupId}
+        # payload verbatim. Sentinel magics (disjoint from the quit-fail
+        # group): the forbidden group id answers the upstream non-admin
+        # refusal (GroupSendingNotAllowedException user error →
+        # UPSTREAM_ERROR family), "[fixture-terminate-crash]" rides the
+        # groupId and crashes with the mutating call in flight
+        # (os._exit(35); disjoint from 25/29/30/31/32/33/34) — the
+        # indeterminate case. Success answers the SendGroupMessageResults
+        # shape (a timestamp plus the per-recipient fan-out list).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("groupId") == "[fixture-terminate-forbidden]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "UserErrorException: Failed to terminate group: "
+                    "GroupSendingNotAllowedException",
+                },
+            }
+            emit_json(response)
+            continue
+        if params.get("groupId") == "[fixture-terminate-crash]":
+            os._exit(35)
+        result = {"timestamp": 99, "results": []}
     elif method == "reportSpam":
         # Contract 1.49 §4.48: the report write route. Same recording
         # discipline as `send`: the exact upstream params land in SEND_LOG so

@@ -2057,6 +2057,51 @@ impl ConnectorService {
         }
     }
 
+    /// groups.terminate (contract revision 1.52, §4.50, capability
+    /// group-terminate): resolution ladder then the upstream `terminateGroup
+    /// {account, groupId}` payload — the pinned 0.14.8 JSON-RPC face
+    /// (`TerminateGroupCommand`, a `JsonRpcLocalCommand`) wrapping
+    /// `GroupHelper.terminateGroup` → `GroupV2Helper.terminateGroup` →
+    /// libsignal `createTerminateGroup()`. The upstream command answers
+    /// `GroupSendingNotAllowedException` (non-admin, the GroupsV2
+    /// UNAUTHORIZED face) and `NotAGroupMemberException` /
+    /// `GroupNotFoundException` as user errors — all forward verbatim as the
+    /// UPSTREAM_ERROR family; the v1-group refusal ("only supported for
+    /// Signal group v2 groups") rides the same family. Zero local writes: the
+    /// terminated state converges through the receive projection like every
+    /// group change (the §4.44 discipline).
+    pub fn prepare_groups_terminate(
+        &self,
+        params: &GroupsTerminateParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "groups.terminate addresses a group conversation",
+                false,
+            )));
+        }
+        Ok(json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+        }))
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolve the direct conversation's rows to the engine's
     /// `reportSpam {account, targetAci, serverGuids}` payload. The report is
@@ -5648,6 +5693,18 @@ pub struct GroupsUpdateParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GroupsQuitParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub operation_id: Option<String>,
+}
+
+/// groups.terminate params (contract revision 1.52, §4.50, capability
+/// group-terminate): the addressing pair plus the optional audit id — the
+/// groups.quit shape verbatim; the action itself carries no parameters, so
+/// the change set is empty by construction.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsTerminateParams {
     pub account_id: String,
     pub conversation_id: String,
     pub operation_id: Option<String>,
@@ -13525,6 +13582,79 @@ mod tests {
             missing,
             ServiceError::Store(StoreError::ConversationNotFound)
         ));
+    }
+
+    // ---- Contract 1.52 (§4.50): group termination face ----
+
+    /// prepare_groups_terminate resolves the group and answers the bare
+    /// upstream payload (the pinned 0.14.8 `terminateGroup` dests); the
+    /// refusal ladder answers before any upstream call — bad ids, an unknown
+    /// conversation, and direct addressing. No mode gate: the face exists on
+    /// every engine mode's shared jsonRpc surface.
+    #[test]
+    fn groups_terminate_preparation_addresses_the_group_and_refuses_non_groups() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let terminate = |conversation_id: String| GroupsTerminateParams {
+            account_id: account.id.clone(),
+            conversation_id,
+            operation_id: None,
+        };
+        assert_eq!(
+            service
+                .prepare_groups_terminate(&terminate(group.id.clone()))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+            })
+        );
+        // The operationId is validated by shape and never persisted; a legal
+        // one changes nothing on the wire.
+        assert_eq!(
+            service
+                .prepare_groups_terminate(&GroupsTerminateParams {
+                    operation_id: Some("term-op-1".into()),
+                    ..terminate(group.id.clone())
+                })
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+            })
+        );
+        let error = service
+            .prepare_groups_terminate(&terminate(direct.id.clone()))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let missing = service
+            .prepare_groups_terminate(&terminate("conv-absent".into()))
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+        let bad_operation = service
+            .prepare_groups_terminate(&GroupsTerminateParams {
+                operation_id: Some("x".repeat(MAX_OPAQUE_ID_BYTES + 1)),
+                ..terminate(group.id.clone())
+            })
+            .unwrap_err();
+        assert!(
+            matches!(bad_operation, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
+            "an over-bound operationId is a shape refusal: {bad_operation:?}"
+        );
     }
 
     // ---- Contract 1.49 (§4.48): report spam face ----
