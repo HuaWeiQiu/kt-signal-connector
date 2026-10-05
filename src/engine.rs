@@ -414,6 +414,13 @@ pub struct NormalizedReceive {
     /// never carry it — the deadline then falls back to receive time.
     #[serde(skip)]
     pub expire_start_at: Option<u64>,
+    /// Envelope `serverGuid` (contract revision 1.49, §4.48): the
+    /// server-assigned message GUID — the upstream report API's path
+    /// parameter, captured at receive and persisted on the row so
+    /// `messages.reportSpam` resolves it later. Connector-internal, never
+    /// serialized; absent on envelopes without the key.
+    #[serde(skip)]
+    pub server_guid: Option<String>,
 }
 
 /// Inbound quote snapshot: the quoted message's upstream identity plus a
@@ -1572,6 +1579,9 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "BACKUP_ARTIFACT_INVALID",
     "BACKUP_SNAPSHOT_EXISTS",
     "BACKUP_IO_FAILED",
+    // §4.48 report spam (engine-owned: the upstream report API refused the
+    // batch — every id's serverGuid was rejected).
+    "REPORT_SPAM_FAILED",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.
@@ -2330,6 +2340,15 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    // The reportSpam companion bit (contract revision 1.49, §4.48): the
+    // engine projects the server-assigned message GUID on the envelope's
+    // public metadata when present (proto only projects, never invents).
+    let server_guid = envelope
+        .get("serverGuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
 
     let make = |timestamp: Option<u64>,
                 content_kind: &'static str,
@@ -2360,6 +2379,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         control,
         expire_seconds: None,
         expire_start_at: None,
+        server_guid: server_guid.clone(),
     };
 
     // Typing and body-less reaction / remote-delete receives carry no message
@@ -3082,6 +3102,7 @@ mod tests {
             control: None,
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
 
         let mut admitted = 0;
@@ -3431,6 +3452,7 @@ mod tests {
             control: None,
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
 
         let mut admitted = 0;
@@ -3481,6 +3503,7 @@ mod tests {
             control: None,
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
 
         while matches!(
@@ -4391,6 +4414,47 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(bare.source_uuid.is_none());
+    }
+
+    /// Contract 1.49 (§4.48): every receive envelope's `serverGuid` is
+    /// captured — the server-assigned message GUID the reportSpam face
+    /// persists row-level and addresses the upstream report API with. It is
+    /// connector-internal (never serialized), trimmed, capped at the id
+    /// budget, and an envelope without one normalizes to None.
+    #[test]
+    fn receive_captures_server_guid() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "serverGuid": "  guid-abc  ",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.server_guid.as_deref(), Some("guid-abc"));
+        let bare = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(bare.server_guid.is_none());
+        let blank = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "serverGuid": "   ",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(blank.server_guid.is_none());
     }
 
     /// Contract 1.42 (§4.41): a dataMessage states its conversation's

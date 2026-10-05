@@ -39,8 +39,8 @@ use kt_signal_connector::service::{
     MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
     MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
     MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
-    MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, STICKER_PACK_BROWSE_ID_HEX_CHARS,
-    STICKER_PACK_SYNC_KEY_B64_CHARS,
+    MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT,
+    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -614,6 +614,23 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesMarkViewedParams/properties/messageIds",
             "maxItems",
             MARK_RECEIPT_MESSAGE_IDS_LIMIT as u64,
+        ),
+        // Report spam (contract 1.49, §4.48): the addressing pair and the
+        // per-id list bounds mirror the prepare ladder's constants.
+        (
+            "/$defs/messagesReportSpamParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesReportSpamParams/properties/messageIds",
+            "maxItems",
+            REPORT_SPAM_MESSAGE_IDS_LIMIT as u64,
+        ),
+        (
+            "/$defs/messagesReportSpamParams/properties/messageIds/items",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
         ),
     ];
     assert!(!pairs.is_empty());

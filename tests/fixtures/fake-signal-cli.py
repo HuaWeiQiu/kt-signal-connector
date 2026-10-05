@@ -994,6 +994,33 @@ for line in sys.stdin:
             emit_json(response)
             continue
         result = {"timestamp": 99, "results": []}
+    elif method == "reportSpam":
+        # Contract 1.49 §4.48: the report write route. Same recording
+        # discipline as `send`: the exact upstream params land in SEND_LOG so
+        # tests assert the {account, targetAci, serverGuids} payload verbatim.
+        # Sentinel magic on the serverGuid values: `guid-crash` exits with the
+        # report in flight (the indeterminate case), `guid-reject-all` answers
+        # the structured per-batch refusal (the engine's whole-batch-rejected
+        # shape), and `guid-partial` rides back as one server-rejected entry
+        # (status 400) inside an otherwise successful batch — the per-id
+        # failure shape.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        guids = params.get("serverGuids") or []
+        if "guid-crash" in guids:
+            os._exit(25)
+        if "guid-reject-all" in guids:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "REPORT_SPAM_FAILED"},
+            }
+            emit_json(response)
+            continue
+        reported = len(guids)
+        failures = [{"serverGuid": "guid-partial", "status": 400}] if "guid-partial" in guids else []
+        result = {"reported": reported, "failures": failures}
     elif method == "sendTyping":
         # Contract 1.27 hook: deliver extra receives appended to the marker
         # after link time before answering. Typing indicators change no

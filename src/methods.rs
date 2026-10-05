@@ -164,6 +164,11 @@ pub const METHODS: &[MethodRow] = &[
     ("backups.exportFile.open", Lane::Read, false, "read"),
     ("backups.exportFile.readChunk", Lane::Read, false, "read"),
     ("backups.exportFile.closeHandle", Lane::Read, false, "read"),
+    // Report spam (contract revision 1.49, §4.48): mutating, send-lane
+    // upstream traffic — the groups class verbatim, same-account mutex and
+    // delete barrier included; advertised through `report-spam`. Zero local
+    // writes: the report is an upstream protocol action only.
+    ("messages.reportSpam", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -222,9 +227,11 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (contract revision 1.46) mark the §4.45 account-record write faces and
 /// the blocked-list read face, and `backup-export` (contract revision 1.47)
 /// marks the §4.46 Android local-backup export face (`backups.export`,
-/// `backups.exportStatus`, the `backups.exportFile` three-chain), and
+/// `backups.exportStatus`, the `backups.exportFile` three-chain);
 /// `avatar-fetch` / `blocked-write` (contract revision 1.48) mark the §4.47
-/// avatar download and blocked-bit write faces. They never
+/// avatar download and blocked-bit write faces; `report-spam` (contract
+/// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
+/// the row-level serverGuid persistence). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -242,6 +249,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "backup-export",
     "avatar-fetch",
     "blocked-write",
+    "report-spam",
 ];
 
 #[cfg(test)]
@@ -301,6 +309,7 @@ mod tests {
             "conversations.setExpireTimer",
             "groups.update",
             "groups.quit",
+            "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
         ];
@@ -331,6 +340,7 @@ mod tests {
             "conversations.setExpireTimer",
             "groups.update",
             "groups.quit",
+            "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
         ];

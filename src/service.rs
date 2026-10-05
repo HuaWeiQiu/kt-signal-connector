@@ -310,6 +310,9 @@ impl ServiceError {
                     "the backup export hit a filesystem failure",
                     true,
                 ),
+                "REPORT_SPAM_FAILED" => {
+                    ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
+                }
                 _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
             },
             ServiceError::Engine(EngineError::Unauthorized) => ApiError::new(
@@ -1443,6 +1446,7 @@ impl ConnectorService {
             sticker: Some(sticker),
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
         let inserted = self
             .store
@@ -1554,6 +1558,7 @@ impl ConnectorService {
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -2000,6 +2005,97 @@ impl ConnectorService {
                 "groupId": conversation.peer_key,
             })),
         }
+    }
+
+    /// messages.reportSpam (contract revision 1.49, §4.48, capability
+    /// report-spam): resolve the direct conversation's rows to the engine's
+    /// `reportSpam {account, targetAci, serverGuids}` payload. The report is
+    /// an upstream protocol action — zero local writes; rows that never
+    /// carried a serverGuid (sent rows, history imports) cannot be reported
+    /// and land in the caller's per-id failures instead. A group
+    /// conversation is refused before any upstream call, and a numeric peer
+    /// without a recorded ACI mapping is a deterministic refusal — the
+    /// report would mis-address upstream.
+    pub fn prepare_report_spam(
+        &self,
+        params: &MessagesReportSpamParams,
+    ) -> Result<PreparedReportSpam, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if params.message_ids.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "messageIds must carry at least one id",
+                false,
+            )));
+        }
+        if params.message_ids.len() > REPORT_SPAM_MESSAGE_IDS_LIMIT
+            || params
+                .message_ids
+                .iter()
+                .any(|id| id.is_empty() || id.chars().count() > MAX_OPAQUE_ID_BYTES)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "messageIds must carry at most 64 entries of 1-128 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "direct" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "messages.reportSpam addresses a direct conversation",
+                false,
+            )));
+        }
+        let target_aci = self.report_target_aci(&account.id, &conversation.peer_key)?;
+        let guids =
+            self.store
+                .server_guids_by_ids(&account.id, &conversation.id, &params.message_ids)?;
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "targetAci": target_aci,
+        });
+        let pairs = params
+            .message_ids
+            .iter()
+            .zip(guids)
+            .filter_map(|(message_id, server_guid)| {
+                server_guid.map(|guid| (message_id.clone(), guid))
+            })
+            .collect::<Vec<_>>();
+        upstream["serverGuids"] = json!(pairs.iter().map(|(_, guid)| guid).collect::<Vec<_>>());
+        Ok(PreparedReportSpam { upstream, pairs })
+    }
+
+    /// The report address (contract revision 1.49, §4.48): a UUID-shaped
+    /// peer key is the ACI itself; otherwise the ingest-recorded
+    /// ACI↔peer-key mapping answers. A numeric peer with no recorded
+    /// mapping never falls back to the number — the upstream targetAci
+    /// parses only ServiceIds, and guessing would mis-address the report.
+    fn report_target_aci(&self, account_id: &str, peer_key: &str) -> Result<String, ServiceError> {
+        if is_uuid_shaped(peer_key) {
+            return Ok(peer_key.to_string());
+        }
+        self.store
+            .aci_for_peer_key(account_id, peer_key)?
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "report target ACI is not resolvable for this conversation",
+                    false,
+                ))
+            })
     }
 
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account bounds
@@ -3568,6 +3664,12 @@ impl ConnectorService {
             } else {
                 receive.expire_start_at
             },
+            // The reportSpam companion (contract revision 1.49, §4.48): the
+            // envelope's server-assigned GUID rides the row; the report face
+            // resolves it at call time. Outgoing mirrors/system rows carry the
+            // envelope key too when the engine projected one (the sync shape
+            // shares the public metadata), honest verbatim.
+            server_guid: receive.server_guid,
         };
         let preview = message
             .text
@@ -5081,6 +5183,55 @@ pub struct ConversationsSetBlockedParams {
     pub blocked: bool,
 }
 
+/// `messages.reportSpam` params (contract revision 1.49, §4.48, capability
+/// report-spam): the addressing pair plus the rows to report. The array
+/// bounds (1–64 entries of 1–128 characters) fail at params
+/// deserialization through the type and the service's explicit checks; the
+/// schema mirrors both.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesReportSpamParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Vec<String>,
+}
+
+/// One per-id report failure (contract revision 1.49, §4.48): the caller's
+/// message id plus the engine's server status code when the server answered
+/// (absent on transport failures — never invented as 0).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportSpamFailure {
+    pub message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<u64>,
+}
+
+/// The `messages.reportSpam` result: the engine `{reported, failures}`
+/// projection verbatim, keyed by the caller's message ids.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportSpamResult {
+    pub reported: u64,
+    pub failures: Vec<ReportSpamFailure>,
+}
+
+/// `messages.reportSpam` constants (contract revision 1.49, §4.48): the
+/// KT UI batch bound — one screen's selection, far below the engine's own
+/// 1000-per-batch upstream ceiling — and the per-id address bound (the
+/// opaqueId family).
+pub const REPORT_SPAM_MESSAGE_IDS_LIMIT: usize = 64;
+
+/// The prepared `messages.reportSpam` call (contract revision 1.49, §4.48):
+/// the upstream payload plus the ordered id↔serverGuid pairs the result's
+/// per-id failures project back onto. Guid-less rows stay out of the
+/// upstream list and reappear as failures keyed by their message id.
+#[derive(Debug)]
+pub struct PreparedReportSpam {
+    pub upstream: Value,
+    pub pairs: Vec<(String, String)>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesEditParams {
@@ -6105,6 +6256,42 @@ mod tests {
         (temp, ConnectorService::new(Arc::new(store)))
     }
 
+    /// A minimal incoming `MessageRecord` for report-spam preparation tests;
+    /// `server_guid` stays None until the test stamps one.
+    fn expire_record_fixture(account_id: &str, conversation_id: &str, id: &str) -> MessageRecord {
+        MessageRecord {
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 10,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        }
+    }
+
     #[test]
     fn cancelled_link_cannot_complete_or_create_an_account() {
         let (_temp, mut service) = service();
@@ -6402,6 +6589,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -6471,6 +6659,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -6801,6 +6990,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         service
             .ingest_receive(sync_receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -6930,6 +7120,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
 
         let first = receive("peer-a", "first");
@@ -6999,6 +7190,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         assert!(
             !service
@@ -7039,6 +7231,7 @@ mod tests {
             source: Some("group-one".into()),
             text: Some("好的".into()),
             text_bytes: Some(6),
+            server_guid: None,
             ..receive
         };
         assert!(
@@ -7079,6 +7272,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
 
         assert!(
@@ -7350,6 +7544,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -7545,6 +7740,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -7729,6 +7925,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -7848,6 +8045,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -7975,6 +8173,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -8251,6 +8450,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -8392,6 +8592,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -8566,6 +8767,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -9068,6 +9270,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -9462,6 +9665,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             admin_deleted: false,
+            server_guid: None,
         };
         for record in [
             base("m-view-in", &conversation.id, "incoming"),
@@ -10890,6 +11094,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: Some(control),
+            server_guid: None,
         }
     }
 
@@ -10996,6 +11201,7 @@ mod tests {
                 expire_seconds: None,
                 expire_start_at: None,
                 admin_deleted: false,
+                server_guid: None,
             };
             assert!(
                 service
@@ -11340,6 +11546,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         service
             .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
@@ -11398,6 +11605,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -11552,6 +11760,7 @@ mod tests {
                     expire_seconds: None,
                     expire_start_at: None,
                     control: None,
+                    server_guid: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -11776,6 +11985,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -11919,6 +12129,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         service
             .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
@@ -11975,6 +12186,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
@@ -12456,6 +12668,7 @@ mod tests {
             expire_seconds: Some(86_400),
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         let events = service
             .ingest_receive(timer_change.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -12502,6 +12715,7 @@ mod tests {
             timestamp: Some(1727000000001),
             text: Some("已更新消息定时消失：已关闭".into()),
             expire_seconds: None,
+            server_guid: None,
             ..timer_change
         };
         let events = service
@@ -12903,6 +13117,142 @@ mod tests {
         ));
     }
 
+    // ---- Contract 1.49 (§4.48): report spam face ----
+
+    /// prepare_report_spam resolves the direct conversation's rows to the
+    /// engine payload: only rows carrying a persisted serverGuid join
+    /// `serverGuids` (order preserved, caller's id paired for the result
+    /// projection); the refusal ladder answers before any upstream call —
+    /// empty/oversized id lists, bad ids, unknown conversations, group
+    /// addressing, a numeric peer with no recorded ACI mapping — while a
+    /// UUID-shaped peer key addresses the report directly.
+    #[test]
+    fn report_spam_preparation_resolves_guid_rows_and_refuses_gaps() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        // A UUID-shaped peer key: the ACI itself, no mapping needed.
+        let aci = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", aci, "Peer")
+            .unwrap();
+        let mut guided = expire_record_fixture(&account.id, &direct.id, "m1");
+        guided.server_guid = Some("guid-1".into());
+        service
+            .store_ref()
+            .insert_message(&guided, None, None, true)
+            .unwrap();
+        let plain = expire_record_fixture(&account.id, &direct.id, "m2");
+        service
+            .store_ref()
+            .insert_message(&plain, None, None, true)
+            .unwrap();
+
+        let params = |conversation_id: String, message_ids: Vec<String>| MessagesReportSpamParams {
+            account_id: account.id.clone(),
+            conversation_id,
+            message_ids,
+        };
+
+        let prepared = service
+            .prepare_report_spam(&params(
+                direct.id.clone(),
+                vec!["m1".into(), "m2".into(), "missing".into()],
+            ))
+            .unwrap();
+        assert_eq!(
+            prepared.upstream,
+            json!({
+                "account": "+15555550100",
+                "targetAci": aci,
+                "serverGuids": ["guid-1"],
+            })
+        );
+        assert_eq!(
+            prepared.pairs,
+            vec![("m1".to_string(), "guid-1".to_string())]
+        );
+
+        // Empty and oversized id lists.
+        let error = service
+            .prepare_report_spam(&params(direct.id.clone(), Vec::new()))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let error = service
+            .prepare_report_spam(&params(
+                direct.id.clone(),
+                (0..REPORT_SPAM_MESSAGE_IDS_LIMIT + 1)
+                    .map(|index| format!("m{index}"))
+                    .collect(),
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        // Per-id bounds: an empty entry and an over-budget id.
+        let error = service
+            .prepare_report_spam(&params(direct.id.clone(), vec!["".into()]))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let error = service
+            .prepare_report_spam(&params(
+                direct.id.clone(),
+                vec!["x".repeat(MAX_OPAQUE_ID_BYTES + 1)],
+            ))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // A numeric peer without a recorded ACI mapping refuses before any
+        // upstream call — the report would mis-address upstream.
+        let numeric = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Numeric")
+            .unwrap();
+        let error = service
+            .prepare_report_spam(&params(numeric.id.clone(), vec!["m1".into()]))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "INVALID_REQUEST" && !api.retryable));
+
+        // The recorded ACI↔peer-key mapping resolves the numeric peer.
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "33333333-3333-3333-3333-333333333333",
+                "+15555550102",
+            )
+            .unwrap();
+        let prepared = service
+            .prepare_report_spam(&params(numeric.id.clone(), vec!["m1".into()]))
+            .unwrap();
+        assert_eq!(
+            prepared.upstream["targetAci"],
+            json!("33333333-3333-3333-3333-333333333333")
+        );
+
+        // A group conversation refuses before any upstream call.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let error = service
+            .prepare_report_spam(&params(group.id.clone(), vec!["m1".into()]))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // Unknown conversations answer the ladder step.
+        let error = service
+            .prepare_report_spam(&params("conv-absent".into(), vec!["m1".into()]))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+    }
+
     /// A group-update row mirrors the engine's post-change title into the
     /// conversation row (the summary riding conversation.changed already
     /// carries it), lands as a system row, and leaves the title untouched
@@ -12943,6 +13293,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             control: None,
+            server_guid: None,
         };
         let events = service
             .ingest_receive(group_update.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -12980,6 +13331,7 @@ mod tests {
                 is_group_update: true,
                 ..Default::default()
             }),
+            server_guid: None,
             ..group_update.clone()
         };
         let events = service
@@ -13011,6 +13363,7 @@ mod tests {
                 group_name: Some("Renamed Group".into()),
                 ..Default::default()
             }),
+            server_guid: None,
             ..group_update
         };
         let events = service
@@ -13060,6 +13413,7 @@ mod tests {
             account: Some("+15555550100".into()),
             source: None,
             source_uuid: None,
+            server_guid: None,
             peer_name: None,
             group_id: Some("group-id-1".into()),
             text: None,
@@ -13173,6 +13527,7 @@ mod tests {
                     account: Some("+15555550100".into()),
                     source: None,
                     source_uuid: None,
+                    server_guid: None,
                     peer_name: None,
                     group_id: Some("dW5rbm93bi1ncm91cA==".into()),
                     text: None,

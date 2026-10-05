@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.48 (2026-10-06)
+- Contract revision: 1.49 (2026-10-06)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2292,6 +2292,72 @@ row, no cache, no event, no store schema change; the avatar bytes exist only ins
 engine and the response, the blocked state lives in the account's storage records, and the
 connector persists neither. No avatar bytes and no blocked-list contents ever reach a log
 line (the AGENTS.md redaction boundary; neither path logs payload content).
+### 4.48 Report spam: messages.reportSpam + row-level serverGuid persistence (contract revision 1.49, 2026-10-06)
+
+The connector side of the engine's report face (kt-signal-engine
+`docs/jsonrpc-compat.md` §3/§5 `reportSpam` registration, 2026-10-06 real KT extension):
+reporting a message to Signal's anti-spam pipeline needs the server-assigned message GUID —
+the engine projects it on the receive envelope's public metadata (`serverGuid`, proto
+projection only, never invented), and the upstream REST call is
+`POST v1/messages/report/{senderAci}/{serverGuid}` per entry. The GUID therefore must be
+persisted per message row at receive time, and the report method resolves it from those rows:
+the desktop never sees or carries a server GUID. This revision lands both halves — the
+persistence (schema v17) and the wire method — as connector-first scope; the desktop
+consumption is a separate batch.
+
+- Row-level persistence (schema v17): `messages.server_guid TEXT NULL`, a pure additive
+  migration on the `table_has_column` pattern — a pre-1.49 store gains the column on open,
+  old rows keep NULL, and the column is never backfilled (a GUID a past envelope carried was
+  never stored; inventing one would report the wrong upstream message). Every message SELECT
+  column list gains the column (the 1.42 expire-column precedent), and `NormalizedReceive`
+  carries `server_guid` (serde-skipped, connector-internal — never on the wire) so the
+  ingest path writes the envelope's `serverGuid` verbatim into the row, including the
+  multi-device sent mirror and system rows when the envelope carries the key. Link-time
+  history import (§4.38) stays live-receive-only: the backup5 archive frames carry no server
+  GUID (the engine's backup export contract has no such field — verified against the engine's
+  chat_item line set), so imported rows keep NULL and the column rides the batch insert as an
+  explicit NULL.
+- `messages.reportSpam`: params `{accountId, conversationId, messageIds: string[]}`. Send
+  lane, account-scoped mutating (reaction-class write-lane mutex and delete drain barrier) —
+  the engine face is a protocol uplink under the account's credentials, not a read. Bounds:
+  `messageIds` 1–64 entries (the KT UI batch — one screen's selection; the engine's own
+  per-batch ceiling is 1000, far above), each 1–128 characters (the opaqueId family);
+  `conversationId` within the 256-char pin-face bound.
+- Local validation ladder, all before any upstream call: account resolution
+  (`ACCOUNT_NOT_FOUND`), conversation resolution (`CONVERSATION_NOT_FOUND`), non-empty
+  `messageIds` within bounds (`INVALID_REQUEST`), then per-id GUID resolution from the
+  conversation's rows. **A missing row or a NULL `server_guid` refuses that id into the
+  per-id failure list instead of failing the request** — partial persistence is an honest
+  partial report, and a whole-batch refusal would let one stale row veto the rest. The
+  report target (the peer's ACI/PNI, the engine `targetAci` parameter) resolves from the
+  conversation: a direct conversation whose `peer_key` is already a UUID passes it verbatim;
+  otherwise the §4.37 `peer_identities` mapping resolves the peer key's ACI (the same ladder
+  the view-once open sync uses, in reverse); number-shaped keys with no recorded ACI answer
+  `INVALID_REQUEST` (the engine requires a ServiceId and the connector cannot invent one).
+  Group conversations answer `INVALID_REQUEST` before any upstream call: the engine face
+  reports individual senders, and v1 exposes no per-sender selection inside a group.
+- Upstream shape: the connector calls the engine `reportSpam
+  {account, targetAci, serverGuids: [...normalized], token?}` (engine parameter names per the
+  engine compat doc; `token` is not exposed this revision — the envelope-level report token
+  is dropped by the engine's own projection, so callers have none to pass). The engine
+  answers `{reported, failures: [{serverGuid, status?}]}` (status = the server's HTTP status
+  code, absent on transport failures) and the connector projects that result verbatim onto
+  its own response `{reported, failures: [{messageId, code?}]}` — the per-id failure key is
+  the caller's `messageId`, the value is the engine's status code when the server answered
+  and absent otherwise; zero message content ever crosses. When the whole batch fails the
+  engine answers the structured error `REPORT_SPAM_FAILED` (`-1` + message), which joins the
+  connector structured whitelist verbatim (retryable=false — the server rejected the
+  report; the desktop should not blindly re-report). The engine's parameter-face `-32603`
+  stays inside the plain `UPSTREAM_ERROR` fold like every account-domain method; engine-down
+  / method-absent follow the §4.32 mapping (`RUNTIME_NOT_RUNNING` / `CAPABILITY_UNAVAILABLE`).
+  Zero local writes: the report action itself never touches a row.
+- Dispatch log discipline: the engine logs the dispatch on its side (protocol uplink, the
+  send family); the connector adds no local log line and no event.
+- Capability tag `report-spam` joins `FEATURE_CAPABILITIES` and the handshake capability
+  list — desktops gate the method on it so an old connector answers a clean capability gap
+  instead of `METHOD_NOT_ALLOWED`. Schema: method enum + request branch +
+  `messagesReportSpamParams` (messageIds array bounds mirrored in the schema) this batch;
+  the matrix reference is left for the desktop consumption batch.
 
 ## 5. signal-cli Boundary
 

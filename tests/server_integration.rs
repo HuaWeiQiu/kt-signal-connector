@@ -4065,6 +4065,8 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "avatar-fetch",
         "conversations.setBlocked",
         "blocked-write",
+        "messages.reportSpam",
+        "report-spam",
     ] {
         assert!(
             capabilities
@@ -5414,6 +5416,468 @@ async fn groups_update_quit_round_trip_and_guards() {
         crash_calls.len(),
         1,
         "an unknown group-update outcome is never retried: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.49 (§4.48): the reportSpam round trip. Envelopes staged
+/// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
+/// values; the report addresses the persisted rows, guid-less rows answer
+/// per-id failures (no invented code), group conversations refuse before
+/// any upstream call, unknown ids fail per-id, the structured
+/// REPORT_SPAM_FAILED maps through the host face, the crash sentinel pins
+/// SEND_OUTCOME_UNKNOWN with the no-retry discipline, and the handshake
+/// advertises the method plus the `report-spam` capability.
+#[tokio::test]
+async fn report_spam_round_trip_persists_server_guids_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [46_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.reportSpam", "report-spam"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ReportSpam" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Stage one guid-carrying envelope and one guid-less envelope for the
+    // fixture peer, then flush them through the typing hook.
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 70,
+                "serverGuid": "guid-live-1",
+                "dataMessage": { "message": "spam candidate one" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 71,
+                "dataMessage": { "message": "sent-row twin" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "report guard",
+            "clientRequestId": "report-spam-0"
+        }),
+    )
+    .await;
+    let conversation_id = setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    request(
+        &mut client,
+        "flush-receives",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+
+    // The flush response can outrun the receive processing; wait for both
+    // staged rows' upsert events before reading the list.
+    let upserted = timeout(Duration::from_secs(5), async {
+        let mut seen: Vec<Value> = Vec::new();
+        while seen.len() < 2 {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+            {
+                seen.push(frame["data"].clone());
+            }
+        }
+        seen
+    })
+    .await
+    .expect("both staged envelopes must land rows");
+    let guided_id = upserted
+        .iter()
+        .find(|row| row["sentAt"] == 70)
+        .expect("the guid-carrying envelope lands a row")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_id = upserted
+        .iter()
+        .find(|row| row["sentAt"] == 71)
+        .expect("the guid-less envelope lands a row")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let listed = request(
+        &mut client,
+        "list-rows",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .any(|row| row["direction"] == "incoming" && row["sentAt"] == 70),
+        "the guid-carrying row is listable"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["direction"] == "incoming" && row["sentAt"] == 71),
+        "the guid-less row is listable"
+    );
+
+    // Group addressing refuses before any upstream call. The link sync
+    // materialized the fixture group; its rows address the refusal.
+    let listed_groups = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed_groups["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with the fixture group");
+    let group_report = request(
+        &mut client,
+        "group-report",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "messageIds": ["any-id"]
+        }),
+    )
+    .await;
+    assert_eq!(group_report["error"]["code"], "INVALID_REQUEST");
+
+    // The mixed report: the guided row reports, the guid-less twin and the
+    // unknown id answer per-id failures without a code.
+    let reported = request(
+        &mut client,
+        "report-mixed",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [guided_id, plain_id, "msg-unknown"]
+        }),
+    )
+    .await;
+    assert_eq!(reported["result"]["reported"], 1);
+    let failures = reported["result"]["failures"].as_array().unwrap();
+    assert_eq!(
+        failures.len(),
+        2,
+        "the guid-less twin and the unknown id fail: {failures:?}"
+    );
+    for failure in failures {
+        assert_eq!(
+            failure["code"],
+            Value::Null,
+            "no invented status: {failure:?}"
+        );
+        assert!(
+            failure.get("code").is_none(),
+            "the code key stays absent on transport-class failures: {failure:?}"
+        );
+    }
+    let failed_ids: Vec<&str> = failures
+        .iter()
+        .map(|failure| failure["messageId"].as_str().unwrap())
+        .collect();
+    assert!(failed_ids.contains(&plain_id.as_str()));
+    assert!(failed_ids.contains(&"msg-unknown"));
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let report_call: Value = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("serverGuids").is_some())
+        .expect("the report must reach reportSpam");
+    assert_eq!(report_call["account"], "+15555550100");
+    // The fixture peer's ACI comes from the envelope's sourceUuid (the peer
+    // identity the ingest recorded), not the numeric peer key.
+    assert_eq!(
+        report_call["targetAci"],
+        "22222222-2222-2222-2222-222222222222"
+    );
+    assert_eq!(report_call["serverGuids"], json!(["guid-live-1"]));
+
+    // A partial failure rides the success result: the server rejected one
+    // guid with status 400, keyed back onto the caller's message id. The
+    // fixture's marker cursor is positional, so the appended envelope rides
+    // the same array (the first two entries were already emitted).
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 70,
+                "serverGuid": "guid-live-1",
+                "dataMessage": { "message": "spam candidate one" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 71,
+                "dataMessage": { "message": "sent-row twin" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 72,
+                "serverGuid": "guid-partial",
+                "dataMessage": { "message": "partial reject" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 73,
+                "serverGuid": "guid-reject-all",
+                "dataMessage": { "message": "batch reject" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    request(
+        &mut client,
+        "flush-partial",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    let staged_tail = timeout(Duration::from_secs(5), async {
+        let mut seen: Vec<Value> = Vec::new();
+        while seen.len() < 2 {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+            {
+                seen.push(frame["data"].clone());
+            }
+        }
+        seen
+    })
+    .await
+    .expect("both staged tail envelopes must land rows");
+    let partial_id = staged_tail
+        .iter()
+        .find(|row| row["sentAt"] == 72)
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the partial envelope lands a row");
+    let reject_all_id = staged_tail
+        .iter()
+        .find(|row| row["sentAt"] == 73)
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the reject-all envelope lands a row");
+    let partial = request(
+        &mut client,
+        "report-partial",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [partial_id]
+        }),
+    )
+    .await;
+    assert_eq!(partial["result"]["reported"], 1);
+    assert_eq!(partial["result"]["failures"][0]["messageId"], partial_id);
+    assert_eq!(partial["result"]["failures"][0]["code"], 400);
+
+    // The structured refusal: the whole batch rejected maps onto the host
+    // code verbatim, retryable=false.
+    let refused = request(
+        &mut client,
+        "report-refused",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [reject_all_id]
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "REPORT_SPAM_FAILED");
+    assert_eq!(refused["error"]["retryable"], false);
+
+    // Crash with the mutating report in flight (fixture magic guid):
+    // SEND_OUTCOME_UNKNOWN, never retried — exactly one such call in the
+    // recovered log. The crash needs a row carrying the magic guid.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 70,
+                "serverGuid": "guid-live-1",
+                "dataMessage": { "message": "spam candidate one" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 71,
+                "dataMessage": { "message": "sent-row twin" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 72,
+                "serverGuid": "guid-partial",
+                "dataMessage": { "message": "partial reject" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 73,
+                "serverGuid": "guid-reject-all",
+                "dataMessage": { "message": "batch reject" }
+            },
+            {
+                "source": "+15555550102",
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "timestamp": 74,
+                "serverGuid": "guid-crash",
+                "dataMessage": { "message": "crash carrier" }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    request(
+        &mut client,
+        "flush-crash",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "stop": true
+        }),
+    )
+    .await;
+    let crash_id = timeout(Duration::from_secs(5), async {
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["direction"] == "incoming"
+                && frame["data"]["sentAt"] == 74
+            {
+                return frame["data"]["id"].as_str().unwrap().to_string();
+            }
+        }
+    })
+    .await
+    .expect("the crash-carrier envelope lands a row");
+    let crash_setup = request(
+        &mut client,
+        "report-crash",
+        "messages.reportSpam",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageIds": [crash_id]
+        }),
+    )
+    .await;
+    assert_eq!(crash_setup["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-report", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid);
+    let crash_calls: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| {
+            params
+                .get("serverGuids")
+                .and_then(Value::as_array)
+                .is_some_and(|guids| guids.contains(&json!("guid-crash")))
+        })
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown report outcome is never retried: {crash_calls:?}"
     );
 
     drop(client);
@@ -7235,6 +7699,16 @@ fn process_exists(pid: u32) -> bool {
 }
 
 async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8; 32]) {
+    let (_challenge, response) = authenticate_capture(client, secret).await;
+    assert_eq!(response["result"]["apiVersion"], API_VERSION);
+}
+
+/// The authentication round trip with the handshake response returned —
+/// tests that assert on the advertised `capabilities` reuse it.
+async fn authenticate_capture(
+    client: &mut Framed<UnixStream, LinesCodec>,
+    secret: &[u8; 32],
+) -> (Value, Value) {
     let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
@@ -7259,7 +7733,7 @@ async fn authenticate(client: &mut Framed<UnixStream, LinesCodec>, secret: &[u8;
         .await
         .unwrap();
     let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-    assert_eq!(response["result"]["apiVersion"], API_VERSION);
+    (challenge, response)
 }
 
 async fn reject_authentication(client: &mut Framed<UnixStream, LinesCodec>) {

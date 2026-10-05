@@ -72,6 +72,7 @@
             "messages.markViewed",
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
+            "messages.reportSpam",
             "messages.attachments.open",
             "messages.attachments.readChunk",
             "messages.attachments.closeHandle",
@@ -501,6 +502,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesMarkViewOnceOpenedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.reportSpam" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesReportSpamParams" }
             }
           }
         },
@@ -1112,6 +1124,33 @@
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "messageId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "messagesReportSpamParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "messageIds"],
+      "description": "Report conversation messages to the Signal anti-spam pipeline (contract revision 1.49, §4.48, capability report-spam): the engine reportSpam face verbatim — POST v1/messages/report/{senderAci}/{serverGuid} per entry, the server-assigned GUID resolved from the message rows the receive envelopes persisted (schema v17 persistence). The desktop never sees or carries a server GUID. Per-id failures are honest and partial: an id with no row, a NULL-GUID row (pre-1.49 rows or envelopes without the key), or a server rejection enters failures as {messageId, code?} (code = the server's HTTP status when it answered, absent on transport failures) while the rest of the batch still reports; the whole request fails only when the engine reports every GUID rejected (REPORT_SPAM_FAILED, retryable=false). Group conversations answer INVALID_REQUEST (the face reports individual senders; v1 exposes no per-sender selection); a direct peer whose ACI is not resolvable from local data answers INVALID_REQUEST before any upstream call. Zero local writes; the result is the engine projection {reported, failures} verbatim.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation the messages belong to; direct conversations only (groups answer INVALID_REQUEST)."
+        },
+        "messageIds": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "A conversation message row id; unresolvable ids fail individually into failures."
+          },
+          "description": "The rows to report; each must belong to this conversation."
+        }
       }
     },
     "messagesAttachmentsOpenParams": {
@@ -2002,6 +2041,7 @@
             "BACKUP_SNAPSHOT_EXISTS",
             "BACKUP_IO_FAILED",
             "BACKUP_SNAPSHOT_MISSING",
+            "REPORT_SPAM_FAILED",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",

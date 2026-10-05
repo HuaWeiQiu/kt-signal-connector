@@ -26,8 +26,9 @@ use crate::service::{
     ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, GroupDetails,
     GroupsQuitParams, GroupsUpdateParams, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend,
-    SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
+    MediaOpenView, MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget,
+    PinnedConversations, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
     StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
     StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, account_limit_error,
     blocked_conversations_result, pinned_conversations_result, sticker_pack_syncs_result,
@@ -2133,6 +2134,79 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// messages.reportSpam (contract revision 1.49, §4.48, capability
+    /// report-spam): resolution and row reads under the service lock, then
+    /// the mutating `reportSpam` call — the groups face's unknown-outcome
+    /// discipline (a lost answer is the SEND_OUTCOME_UNKNOWN error and is
+    /// never retried). The confirmed result projects the engine's
+    /// `{reported, failures}` back onto the caller's message ids; rows
+    /// without a serverGuid never reached upstream and answer as failures.
+    pub async fn report_spam(
+        &self,
+        params: MessagesReportSpamParams,
+    ) -> Result<ReportSpamResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_report_spam(&params)?
+        };
+        match engine
+            .call("reportSpam", prepared.upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => {
+                let reported = result
+                    .get("reported")
+                    .and_then(Value::as_u64)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+                let answered = result
+                    .get("failures")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+                // The engine answers failures by serverGuid with an optional
+                // status (absent on transport failures — never invented as 0).
+                let answered_by_guid = answered
+                    .iter()
+                    .filter_map(|entry| {
+                        let guid = entry.get("serverGuid")?.as_str()?;
+                        Some((guid, entry.get("status").and_then(Value::as_u64)))
+                    })
+                    .collect::<Vec<_>>();
+                let mut failures = prepared
+                    .pairs
+                    .iter()
+                    .filter_map(|(message_id, guid)| {
+                        answered_by_guid
+                            .iter()
+                            .find(|(answered_guid, _)| answered_guid == guid)
+                            .map(|(_, code)| ReportSpamFailure {
+                                message_id: message_id.clone(),
+                                code: *code,
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                // Rows without a persisted serverGuid never reached upstream
+                // (sent rows, history imports, unknown ids) — honest per-id
+                // failures with no code, not a dropped or failed request.
+                for message_id in &params.message_ids {
+                    if !prepared.pairs.iter().any(|(id, _)| id == message_id) {
+                        failures.push(ReportSpamFailure {
+                            message_id: message_id.clone(),
+                            code: None,
+                        });
+                    }
+                }
+                Ok(ReportSpamResult { reported, failures })
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account
     /// resolution then the read-only engine call; the record list projects
     /// straight from the engine result with the KT entry cap (§4.34).
@@ -4130,6 +4204,7 @@ mod tests {
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -4232,6 +4307,7 @@ mod tests {
                 expire_seconds: None,
                 expire_start_at: None,
                 control: None,
+                server_guid: None,
             })
             .await
             .unwrap();
@@ -5049,6 +5125,7 @@ mod tests {
             sticker: None,
             expire_seconds: Some(60),
             expire_start_at: Some(deadline_ms.saturating_sub(60_000)),
+            server_guid: None,
         }
     }
 

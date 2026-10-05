@@ -569,6 +569,9 @@ impl<'a> Importer<'a> {
             sticker: None,
             expire_seconds,
             expire_start_at,
+            // The §4.38 archive frames carry no server GUID — the report face
+            // stays a live-receive surface; imported rows keep NULL (§4.48).
+            server_guid: None,
         };
         let preview = record
             .text
@@ -672,6 +675,7 @@ impl<'a> Importer<'a> {
             // A timer notice never sweeps (§4.41): the columns stay NULL.
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
         let preview = Some(text.chars().take(120).collect::<String>());
         self.batch.push(HistoryImportInsert {
@@ -1546,6 +1550,7 @@ mod tests {
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
+            server_guid: None,
         };
         assert!(store.insert_message(&live, None, None, true).unwrap());
 

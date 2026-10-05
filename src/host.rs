@@ -36,12 +36,12 @@ use crate::service::{
     MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
     MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
     MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams,
+    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1874,6 +1874,28 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid groups.quit params", false),
             ),
         },
+        "messages.reportSpam" => {
+            match serde_json::from_value::<MessagesReportSpamParams>(request.params) {
+                Ok(params) => match runtime.report_spam(params).await {
+                    Ok(result) => match serde_json::to_value(result) {
+                        Ok(value) => HostResponse::success(request_id, value),
+                        Err(_) => HostResponse::failure(
+                            request_id,
+                            ApiError::new("INTERNAL_ERROR", "result serialization failed", false),
+                        ),
+                    },
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.reportSpam params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "contacts.setLocalAlias" => {
             match serde_json::from_value::<ContactsSetLocalAliasParams>(request.params) {
                 Ok(params) => match runtime.set_local_alias(params).await {

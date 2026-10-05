@@ -1083,6 +1083,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.quit_group(params).await
     }
 
+    /// messages.reportSpam (contract revision 1.49, §4.48, capability
+    /// report-spam): the reported rows live with the account's engine, so
+    /// the write routes through the account's owning supervisor like every
+    /// other mutating face.
+    pub async fn report_spam(
+        &self,
+        params: crate::service::MessagesReportSpamParams,
+    ) -> Result<crate::service::ReportSpamResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.report_spam(params).await
+    }
+
     pub async fn set_local_alias(
         &self,
         params: crate::service::ContactsSetLocalAliasParams,
