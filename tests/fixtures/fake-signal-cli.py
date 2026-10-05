@@ -936,11 +936,47 @@ for line in sys.stdin:
         # with the change in flight — the indeterminate case (engine-exit
         # path). Success answers the updateGroup result shape (a timestamp
         # plus the per-recipient fan-out list).
+        #
+        # 2026-10-06 group-timer batch (engine main @ 216a4c7 parity): the
+        # `expiration` route is the engine face's updateGroup {expiration}
+        # form. Its crash magic is the timer twin "[fixture-crash-group-timer]"
+        # (os._exit(34); disjoint from 25/29/30/31/32/33), and the
+        # server-rejection faces mirror the engine's GROUP_UPDATE_FAILED data
+        # mapping: groupId "[fixture-group-forbidden]" answers data.status=403
+        # (non-admin), "[fixture-group-conflict]" answers data.status=409
+        # (revision race).
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         if params.get("name") == "[fixture-crash-group]":
             os._exit(25)
+        if params.get("expiration") is not None:
+            if params.get("groupId") == "[fixture-crash-group-timer]":
+                os._exit(34)
+            if params.get("groupId") == "[fixture-group-forbidden]":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -1,
+                        "message": "GROUP_UPDATE_FAILED",
+                        "data": {"status": 403},
+                    },
+                }
+                emit_json(response)
+                continue
+            if params.get("groupId") == "[fixture-group-conflict]":
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -1,
+                        "message": "GROUP_UPDATE_FAILED",
+                        "data": {"status": 409},
+                    },
+                }
+                emit_json(response)
+                continue
         result = {"timestamp": 99, "results": []}
     elif method == "quitGroup":
         # Contract 1.45 §4.44: same recording discipline; the magic group id
@@ -976,6 +1012,15 @@ for line in sys.stdin:
             os._exit(27)
         result = {}
     elif method == "emitReceive":
+        result = {"method": method}
+    elif method == "emitGroupUpdated":
+        # 2026-10-06 group-timer batch: inject the engine's `groupUpdated`
+        # projection verbatim (kt-signal-engine main @ 216a4c7, compat §4) —
+        # one receive notification whose envelope carries `groupUpdated`
+        # {groupId, revision, expireTimerSeconds, editor?} instead of a
+        # message body. Params mirror the projection keys; absent keys take
+        # the fixture group / revision 1 / off defaults, so the common case
+        # needs no params at all.
         result = {"method": method}
     elif method == "emitStderr":
         emit_stderr_websocket_error()
@@ -1219,6 +1264,27 @@ for line in sys.stdin:
         emit_json(response)
     if method == "emitReceive" or emit_receive_after:
         emit_receive()
+    if method == "emitGroupUpdated":
+        # The emitReceive twin for the groupUpdated projection: emitted after
+        # the response, same receive-notification channel.
+        update = {
+            "groupId": params.get("groupId") or "ZmFrZS1ncm91cC0x",
+            "revision": params.get("revision", 1),
+            "expireTimerSeconds": params.get("expireTimerSeconds", 0),
+        }
+        if "editor" in params and params.get("editor") is not None:
+            update["editor"] = params.get("editor")
+        emit_json({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "account": receiving_account(),
+                "envelope": {
+                    "timestamp": int(time.time() * 1000),
+                    "groupUpdated": update,
+                },
+            },
+        })
     if method == "emitEnvelope":
         # Contract 1.15 test hook: inject arbitrary envelope receives so a
         # test can exercise reaction / remote-delete / typing / edit /

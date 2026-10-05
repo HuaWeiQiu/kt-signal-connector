@@ -1680,20 +1680,22 @@ impl ConnectorService {
     }
 
     /// conversations.setExpireTimer (contract revision 1.42, §4.41; group
-    /// route re-cut by contract revision 1.45, §4.44): bounds, resolution, and
-    /// the mode-shaped upstream payload under the service lock. A direct
-    /// conversation routes per mode — the engine face's `setExpirationTimer`
-    /// takes `recipient` (a single string) + `expirationInSeconds`; the
-    /// signal-cli face's `updateContact` takes `recipient` + `expiration`
-    /// (int seconds) — same-value no-ops and broadcast semantics stay
-    /// upstream. A group conversation now routes the timer change through the
-    /// group-management write it always traveled by upstream: the signal-cli
-    /// face's `updateGroup {account, groupId, expiration}` (the §4.41
-    /// group refusal is overturned); the kt-engine face still has no group
-    /// update method and answers INVALID_REQUEST after local validation (the
-    /// engine-batch boundary, recorded). Returns the upstream method name,
-    /// the payload, and the resolved timer value the success path mirrors
-    /// into the conversation row.
+    /// route re-cut by contract revision 1.45, §4.44; kt-engine gate lifted
+    /// by the 2026-10-06 dated note): bounds, resolution, and the mode-shaped
+    /// upstream payload under the service lock. A direct conversation routes
+    /// per mode — the engine face's `setExpirationTimer` takes `recipient`
+    /// (a single string) + `expirationInSeconds`; the signal-cli face's
+    /// `updateContact` takes `recipient` + `expiration` (int seconds) —
+    /// same-value no-ops and broadcast semantics stay upstream. A group
+    /// conversation routes the timer change through the group-management
+    /// write it always traveled by upstream: `updateGroup {account, groupId,
+    /// expiration}` (the §4.41 group refusal is overturned) — in every mode
+    /// since the engine batch landed `updateGroup {expiration}` (engine main
+    /// @ 216a4c7, compat §3/§5 registration block), so the former kt-engine
+    /// INVALID_REQUEST debt is retired and all three faces share one group
+    /// payload. Returns the upstream method name, the payload, and the
+    /// resolved timer value the success path mirrors into the conversation
+    /// row.
     pub fn prepare_conversations_set_expire_timer(
         &self,
         account_id: &str,
@@ -1721,22 +1723,15 @@ impl ConnectorService {
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
         if conversation.kind != "direct" {
-            return match mode {
-                SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "group disappearing timers are not available on the kt-engine face yet",
-                    false,
-                ))),
-                _ => Ok((
-                    "updateGroup",
-                    json!({
-                        "account": account.signal_account,
-                        "groupId": conversation.peer_key,
-                        "expiration": expire_seconds,
-                    }),
-                    u64::from(expire_seconds),
-                )),
-            };
+            return Ok((
+                "updateGroup",
+                json!({
+                    "account": account.signal_account,
+                    "groupId": conversation.peer_key,
+                    "expiration": expire_seconds,
+                }),
+                u64::from(expire_seconds),
+            ));
         }
         let (method, upstream) = match mode {
             SignalCliMode::KtEngine => (
@@ -3662,12 +3657,32 @@ impl ConnectorService {
         } else if let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) {
             ("direct", peer)
         } else {
+            // The groupUpdated projection always names its group; a timer
+            // update with no group reference has nothing to converge and is
+            // warn-only dropped like the unknown-group drop below.
+            if matches!(control, ControlReceive::GroupTimerUpdate { .. }) {
+                tracing::warn!(
+                    account_id = %account.id,
+                    "groupUpdated carries no group reference; dropping the timer convergence"
+                );
+            }
             return Ok(Vec::new());
         };
         let Ok(conversation) = self.store.conversation_by_peer(&account.id, kind, peer_key) else {
             return Ok(Vec::new());
         };
         let Some(conversation) = conversation else {
+            // The engine's groupUpdated projection addresses a group master
+            // key (2026-10-06 engine batch): a group nothing local resolves is
+            // warn-only dropped — better to converge late than to invent a
+            // row (宁缺勿错). Every other control family keeps its silent
+            // skip discipline.
+            if matches!(control, ControlReceive::GroupTimerUpdate { .. }) {
+                tracing::warn!(
+                    account_id = %account.id,
+                    "groupUpdated names an unknown group; dropping the timer convergence"
+                );
+            }
             return Ok(Vec::new());
         };
         match control {
@@ -3933,6 +3948,34 @@ impl ConnectorService {
                     {
                         events.push(HostSideEvent::ConversationChanged(summary));
                     }
+                }
+                Ok(events)
+            }
+            ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds,
+            } => {
+                // The engine's groupUpdated projection (2026-10-06 engine
+                // batch): the group timer changed upstream — this group's own
+                // edit or a member's — and the conversation mirror converges
+                // exactly like the §4.41 direct timer-notice path (0 = off;
+                // the setter stores 0 literally, never NULL). The notification
+                // is state convergence, not chat content: no message row, no
+                // system row — the group timer change rides the change event,
+                // and the notice-row presentation stays a later desktop
+                // decision (the §4.44 dated note records it). A same-value
+                // event changes nothing (the setter is idempotent); the
+                // summary still re-pushes so a lagging window converges.
+                self.store.set_conversation_expire_timer(
+                    &account.id,
+                    &conversation.id,
+                    u64::from(expire_timer_seconds),
+                )?;
+                let mut events = Vec::new();
+                if let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
                 }
                 Ok(events)
             }
@@ -12244,11 +12287,11 @@ mod tests {
     /// the engine face's `setExpirationTimer` (seconds) vs the signal-cli
     /// face's `updateContact` (expiration, int seconds) — after bounds,
     /// account, and conversation resolution. A direct conversation carries
-    /// the direct route; a group now routes `updateGroup {account, groupId,
-    /// expiration}` on the signal-cli faces and answers INVALID_REQUEST on
-    /// the kt-engine face (no group update method there yet), an unknown
-    /// conversation answers CONVERSATION_NOT_FOUND, and an out-of-face value
-    /// answers INVALID_REQUEST.
+    /// the direct route; a group routes `updateGroup {account, groupId,
+    /// expiration}` in every mode since the engine batch landed
+    /// `updateGroup {expiration}` (2026-10-06 dated note; engine main @
+    /// 216a4c7), an unknown conversation answers CONVERSATION_NOT_FOUND, and
+    /// an out-of-face value answers INVALID_REQUEST.
     #[test]
     fn set_expire_timer_preparation_shapes_upstream_by_mode() {
         use crate::engine::SignalCliMode;
@@ -12303,7 +12346,7 @@ mod tests {
             })
         );
 
-        // Group route (§4.44): the signal-cli faces travel by updateGroup.
+        // Group route (§4.44): the signal-cli JVM face travels by updateGroup.
         let (group_method, group_payload, group_seconds) = service
             .prepare_conversations_set_expire_timer(
                 &account.id,
@@ -12323,17 +12366,39 @@ mod tests {
             })
         );
 
-        // ... while the kt-engine face keeps the recorded boundary.
-        let group_refusal = service
+        // Native shares the JVM face one-to-one (the §4.32-§4.34 swap
+        // boundary): same method, same payload.
+        let (native_method, native_payload, _) = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                &group.id,
+                3600,
+                SignalCliMode::Native,
+            )
+            .unwrap();
+        assert_eq!(native_method, "updateGroup");
+        assert_eq!(native_payload, group_payload);
+
+        // ... and the kt-engine face converges on the same group payload —
+        // the engine-batch gate is lifted (2026-10-06 dated note), the one
+        // updateGroup shape in every mode.
+        let (kt_group_method, kt_group_payload, kt_group_seconds) = service
             .prepare_conversations_set_expire_timer(
                 &account.id,
                 &group.id,
                 60,
                 SignalCliMode::KtEngine,
             )
-            .unwrap_err();
-        assert!(
-            matches!(group_refusal, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST")
+            .unwrap();
+        assert_eq!(kt_group_method, "updateGroup");
+        assert_eq!(kt_group_seconds, 60);
+        assert_eq!(
+            kt_group_payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "expiration": 60,
+            })
         );
 
         let missing = service
@@ -12968,5 +13033,164 @@ mod tests {
                 .title,
             "Renamed Group"
         );
+    }
+
+    /// The engine's groupUpdated projection (2026-10-06 engine batch) is
+    /// state convergence, not chat content: the mirror lands with the
+    /// conversation.changed summary carrying the new timer (0 = off included),
+    /// no message row and no system row exists, and a same-value event changes
+    /// nothing but still re-pushes the summary so a lagging window converges.
+    #[test]
+    fn ingest_group_timer_update_mirrors_state_without_a_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+
+        let group_timer = NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "control",
+            direction: "control",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: None,
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-id-1".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: Some(ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds: 3600,
+            }),
+        };
+        let events = service
+            .ingest_receive(group_timer.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
+            "a timer notification is not a message row"
+        );
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("the mirror rides conversation.changed");
+        assert_eq!(changed.id, conversation.id);
+        assert_eq!(changed.expire_timer_seconds, Some(3600));
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .expire_timer_seconds,
+            Some(3600)
+        );
+
+        // The off form stores 0 literally (the §4.41 setter discipline), never
+        // NULL, and the summary reports the off state.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    control: Some(ControlReceive::GroupTimerUpdate {
+                        expire_timer_seconds: 0,
+                    }),
+                    ..group_timer.clone()
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("the off form notifies too");
+        assert_eq!(changed.expire_timer_seconds, Some(0));
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .expire_timer_seconds,
+            Some(0)
+        );
+
+        // A same-value event changes nothing but still re-pushes the summary.
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    control: Some(ControlReceive::GroupTimerUpdate {
+                        expire_timer_seconds: 0,
+                    }),
+                    ..group_timer
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::ConversationChanged(_))),
+            "the same-value event still re-pushes the summary"
+        );
+    }
+
+    /// A groupUpdated naming a group nothing local resolves is warn-only
+    /// dropped — better to converge late than to invent a row (宁缺勿错). The
+    /// resolvable twin of this drop path is the mirror test above.
+    #[test]
+    fn ingest_group_timer_update_for_an_unknown_group_drops() {
+        let (_temp, mut service) = service();
+        service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let events = service
+            .ingest_receive(
+                NormalizedReceive {
+                    timestamp: Some(1727000000000),
+                    content_kind: "control",
+                    direction: "control",
+                    account_present: true,
+                    account: Some("+15555550100".into()),
+                    source: None,
+                    source_uuid: None,
+                    peer_name: None,
+                    group_id: Some("dW5rbm93bi1ncm91cA==".into()),
+                    text: None,
+                    text_bytes: None,
+                    text_truncated: false,
+                    quote: None,
+                    attachments: Vec::new(),
+                    rich: None,
+                    sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    control: Some(ControlReceive::GroupTimerUpdate {
+                        expire_timer_seconds: 3600,
+                    }),
+                },
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "an unknown group converges nothing");
     }
 }

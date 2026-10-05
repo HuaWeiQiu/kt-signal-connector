@@ -2096,6 +2096,229 @@ async fn native_mode_serves_without_a_jvm_environment() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// conversations.setExpireTimer end to end in kt-engine mode (2026-10-06
+/// group-timer batch; engine main @ 216a4c7): the group form no longer answers
+/// the recorded INVALID_REQUEST gate — it dispatches `updateGroup {account,
+/// groupId, expiration}` verbatim (SEND_LOG), the groupUpdated projection the
+/// engine emits after the change injects through the fixture and converges the
+/// mirror, and `conversation.changed` carries the new timer. Spawned via
+/// `KT_SIGNAL_CLI_ENGINE=kt-engine` with a JAVA_HOME that only Jvm mode
+/// validates: kt-engine ignores it with a warning, and the fixture's no-Java
+/// guard would exit 94 if either JAVA_* variable leaked into the child env.
+#[tokio::test]
+async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [15_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_SIGNAL_CLI_ENGINE", "kt-engine")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupTimer" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The fixture links with one known group conversation in place; find it
+    // and set its timer: the call must not answer the former INVALID_REQUEST
+    // gate but the ordinary success.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let group_timer = request(
+        &mut client,
+        "group-timer",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "expireSeconds": 3600
+        }),
+    )
+    .await;
+    assert_eq!(group_timer["result"]["expireTimerSeconds"], 3600);
+
+    // The success mirror rides conversation.changed first — drain it so the
+    // groupUpdated assertion below can only pass through its own path.
+    let mut saw_send_mirror = false;
+    for _ in 0..16 {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == group_conversation.as_str()
+            && frame["data"]["expireTimerSeconds"] == 3600
+        {
+            saw_send_mirror = true;
+            break;
+        }
+    }
+    assert!(
+        saw_send_mirror,
+        "the send-path mirror must ride conversation.changed"
+    );
+
+    // The exact upstream contract landed on the engine wire.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let group_timer_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("groupId").is_some() && params.get("expiration").is_some())
+        .expect("the group timer must reach updateGroup");
+    assert_eq!(group_timer_call["account"], "+15555550100");
+    assert_eq!(group_timer_call["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group_timer_call["expiration"], 3600);
+
+    // Inject the engine's groupUpdated projection (the real engine emits it
+    // after the change lands — here a member changed the timer to 86400)
+    // through the extra-receives marker, delivered by the sendTyping flush
+    // (a typing indicator changes no conversation state — the clean post-link
+    // flush trigger): the mirror converges through the receive path alone.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([{
+            "timestamp": 1727000000000_u64,
+            "groupUpdated": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "revision": 2,
+                "expireTimerSeconds": 86400
+            }
+        }])
+        .to_string(),
+    )
+    .unwrap();
+    request(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation
+        }),
+    )
+    .await;
+    let mut saw_timer_change = false;
+    for _ in 0..16 {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == group_conversation.as_str()
+            && frame["data"]["expireTimerSeconds"] == 86400
+        {
+            saw_timer_change = true;
+            break;
+        }
+    }
+    assert!(
+        saw_timer_change,
+        "the groupUpdated projection must converge the mirror through conversation.changed"
+    );
+
+    // conversations.list agrees with the receive-path mirror.
+    let listed = request(
+        &mut client,
+        "list-after-update",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == group_conversation.as_str())
+        .expect("the conversation is listed")
+        .clone();
+    assert_eq!(row["expireTimerSeconds"], 86400);
+
+    // The off form (0) routes the same updateGroup write — the engine face
+    // validates 0 = off verbatim.
+    let off_timer = request(
+        &mut client,
+        "group-timer-off",
+        "conversations.setExpireTimer",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "expireSeconds": 0
+        }),
+    )
+    .await;
+    assert_eq!(off_timer["result"]["expireTimerSeconds"], 0);
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let off_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("expiration") == Some(&json!(0)))
+        .expect("the off timer must reach updateGroup");
+    assert_eq!(off_call["groupId"], "ZmFrZS1ncm91cC0x");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_dies() {
     let temp = TempDir::new().unwrap();

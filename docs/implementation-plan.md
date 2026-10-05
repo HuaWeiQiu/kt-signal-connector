@@ -1751,9 +1751,12 @@ stored history, the host-facing control method, and the archive import.
   not part of the row identity: the notice is conversation-scoped state, the copy speaks the
   timer value, not the actor (recorded boundary — a desktop that wants the actor needs a future
   wire field, not an identity change).
-- Not implemented on purpose: group timer writes, per-message expiry timers (Signal's
-  disappear-on-read), and any upstream deletion trigger. The connector's sweeper is local
-  storage hygiene with host-visible events; the protocol's authoritative expiry stays upstream.
+- Not implemented on purpose: per-message expiry timers (Signal's disappear-on-read) and any
+  upstream deletion trigger. The connector's sweeper is local storage hygiene with
+  host-visible events; the protocol's authoritative expiry stays upstream. (Group timer
+  writes: §4.41 originally recorded them as not implemented; §4.44 opened the
+  `updateGroup {expiration}` route and the 2026-10-06 dated note there lifted the last
+  mode gate.)
 
 ### 4.42 Note to Self: the self conversation skeleton + the `isSelf` marker (contract revision 1.43, 2026-10-05)
 
@@ -1931,6 +1934,41 @@ kt-engine gap honestly; the engine batch (separate repository) owns the method p
   `setExpirationTimer` is recipient-shaped only — with the reason updated from "not settable
   through this connector" to the engine-batch debt ("engine face pending"); the desktop batch
   owns the matrix wording fix. Direct conversations are untouched in both modes.
+
+> **Dated note (2026-10-06, group-timer consume batch):** the kt-engine gate above is lifted.
+> The engine batch landed `updateGroup {account, groupId, expiration}` on the engine face
+> (kt-signal-engine `main` @ `216a4c7`, `docs/jsonrpc-compat.md` §3 registration row + §5
+> "群 expiration 批"; `{status: "sent"}` success, 0 = off, `GROUP_UPDATE_FAILED` with
+> `data.status` = the HTTP status passed through honestly — 403 non-admin / 409 revision
+> race / 401 credentials / 400 shape — plus `-32603` parameter faces and
+> `STORAGE_UNAVAILABLE`), so all three modes share the one group payload:
+> `prepare_conversations_set_expire_timer` collapses its group arm to the same
+> `updateGroup` tuple in Jvm/Native/KtEngine, and the former "engine face pending"
+> INVALID_REQUEST no longer exists in any mode. No new host method, no schema shape change:
+> the method enum, params, and result faces of §4.44 already declare this form, so the
+> contract revision stays 1.48 (no version bump; 1.49 remains reserved for the serverGuid
+> batch).
+>
+> The engine batch also opened the receive side: a decrypted group change carrying the
+> expiration-timer action is envelope-replaced into `groupUpdated {groupId, revision,
+> expireTimerSeconds, editor?}` (groupId = the group master key, standard base64 — the
+> `listGroups` id form; expireTimerSeconds = 0 means off; epoch > 7 changes are skipped
+> engine-side). The connector consumes it on the receive path (normalized as a control
+> receive, the §4.37 view-once precedent): the conversation mirror updates through the
+> §4.41 setter — `conversations.expire_timer_seconds` = the announced value, 0 stored
+> literally as off, never NULL — and the refreshed summary rides `conversation.changed`,
+> so a member's timer edit converges exactly like this group's own edit from the send
+> path. The notification is state convergence, not chat content: **no message row and no
+> system row lands** (the direct-face timer-notice row is envelope-level semantics; the
+> desktop's presentation choice for group timer changes is deferred to the desktop batch
+> — recorded here as the open presentation-policy boundary), and a `groupUpdated` naming
+> a group nothing local resolves is warn-only dropped (宁缺勿错, no row invented).
+> `revision`/`editor` are not persisted: the mirror stores the timer value only, the same
+> material the §4.41 direct notice carries (recorded boundary — the desktop can join the
+> actor from a future wire field if the presentation batch needs one). The hermetic
+> kt-engine end-to-end (`kt_engine_mode_serves_group_expire_timer_and_group_updated`)
+> exercises the full ladder: no INVALID_REQUEST → SEND_LOG verbatim → projection inject →
+> conversation.changed with the new timer.
 
 ### 4.45 Account settings writes + blocked read: accounts.updateConfiguration, accounts.setProfile, accounts.setExpireTimer, conversations.getBlocked (contract revision 1.46, 2026-10-05)
 

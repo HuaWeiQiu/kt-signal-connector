@@ -649,6 +649,17 @@ pub enum ControlReceive {
         sender_aci: String,
         timestamp: u64,
     },
+    /// The engine's `groupUpdated {groupId, revision, expireTimerSeconds,
+    /// editor?}` projection (2026-10-06 engine batch, kt-signal-engine main
+    /// @ 216a4c7): a decrypted group change carrying the expiration-timer
+    /// action, envelope-replaced before it ever reaches the connector. The
+    /// service layer mirrors `expireTimerSeconds` into the conversation row
+    /// (0 = off) and converges through `conversation.changed`; no message row
+    /// exists for the notification — the group timer change rides the change
+    /// event, and the notice-row presentation is a later desktop decision.
+    GroupTimerUpdate {
+        expire_timer_seconds: u32,
+    },
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -2125,6 +2136,32 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
         }
         // A body-less editUpdate rides editMessage at the envelope level; a
         // dataMessage with only editUpdate content has no local meaning.
+    }
+    // The engine's `groupUpdated` projection (2026-10-06 engine batch): a
+    // decrypted group expiration-timer change envelope-replaced before it
+    // reaches the connector — the notification carries no message row of its
+    // own. It routes as a control receive addressed by the group master key;
+    // the missing-`expireTimerSeconds`/non-u32 shapes fail closed (the
+    // projection guarantees the key, so its absence is a protocol error, not
+    // an unknown-timer state). `groupId` absence routes warn-only drop at the
+    // service layer like every unresolvable group reference.
+    if let Some(update) = envelope.get("groupUpdated").and_then(Value::as_object) {
+        let expire_timer_seconds = update
+            .get("expireTimerSeconds")
+            .and_then(Value::as_u64)
+            .and_then(|seconds| u32::try_from(seconds).ok())?;
+        let group_id = update
+            .get("groupId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id,
+            control: ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds,
+            },
+        });
     }
     // Ephemeral typing indicator.
     if let Some(typing) = envelope.get("typingMessage").and_then(Value::as_object) {
@@ -3870,6 +3907,93 @@ mod tests {
         assert!(routing(json!({ "pinMessage": { "targetAuthor": "+15555550101" } })).is_none());
         assert!(routing(json!({ "unpinMessage": { "targetAuthor": "+15555550101" } })).is_none());
         assert!(routing(json!({ "adminDelete": { "targetSentTimestamp": 1 } })).is_none());
+    }
+
+    /// The engine's `groupUpdated` projection (2026-10-06 engine batch,
+    /// kt-signal-engine main @ 216a4c7) routes as a control receive off the
+    /// envelope-level key: the timer value normalizes through the u32 face,
+    /// 0 = off rides verbatim, and the shapes the projection never produces —
+    /// missing or non-u32 `expireTimerSeconds` — drop instead of inventing
+    /// timer state.
+    #[test]
+    fn group_updated_projection_routes_to_a_control_receive() {
+        let routing = |envelope: serde_json::Value| {
+            control_routing(envelope.as_object().unwrap())
+                .map(|routing| (routing.control, routing.group_id, routing.direction))
+        };
+
+        let (control, group_id, direction) = routing(json!({
+            "timestamp": 1727000000000u64,
+            "groupUpdated": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "revision": 5,
+                "expireTimerSeconds": 3600,
+                "editor": "9d7762bb-1fb5-4cfd-9b15-aef4f8ef9c14",
+            },
+        }))
+        .expect("groupUpdated routes");
+        assert!(matches!(
+            control,
+            ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds: 3600,
+            }
+        ));
+        assert_eq!(group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+        assert_eq!(direction, "incoming");
+
+        // 0 = off rides verbatim (the projection guarantees the key).
+        let (control, _, _) = routing(json!({
+            "timestamp": 1727000000000u64,
+            "groupUpdated": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "revision": 6,
+                "expireTimerSeconds": 0,
+            },
+        }))
+        .expect("the off form routes");
+        assert!(matches!(
+            control,
+            ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds: 0,
+            }
+        ));
+
+        // Shapes the projection never produces drop (fail closed): the key is
+        // guaranteed present, so its absence is a protocol error, and no timer
+        // state is invented from a malformed value.
+        assert!(
+            routing(json!({
+                "timestamp": 1727000000000u64,
+                "groupUpdated": { "groupId": "ZmFrZS1ncm91cC0x", "revision": 7 },
+            }))
+            .is_none()
+        );
+        assert!(
+            routing(json!({
+                "timestamp": 1727000000000u64,
+                "groupUpdated": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "revision": 7,
+                    "expireTimerSeconds": 4294967296u64,
+                },
+            }))
+            .is_none()
+        );
+
+        // A missing groupId still routes the control (the value is honest);
+        // the service layer drops it warn-only when nothing resolves.
+        let (control, group_id, _) = routing(json!({
+            "timestamp": 1727000000000u64,
+            "groupUpdated": { "revision": 8, "expireTimerSeconds": 60 },
+        }))
+        .expect("the value survives a missing group reference");
+        assert!(matches!(
+            control,
+            ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds: 60,
+            }
+        ));
+        assert!(group_id.is_none());
     }
 
     /// Rich-body fields (contract 1.25) ride a dataMessage through
