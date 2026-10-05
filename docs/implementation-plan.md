@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.46 (2026-10-05)
+- Contract revision: 1.47 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2011,6 +2011,122 @@ connector change: the connector's storage-write faces (`conversations.setPinned`
 `stickerPacks.setSync`, and this batch) forward only semantic parameters — no record bytes
 ever cross the connector boundary — so there is no passthrough surface the fix could regress;
 the existing pin/sync integration tests staying green is the regression check.
+
+### 4.46 Android local backup export: backups.export, backups.exportStatus, backups.exportFile.open/readChunk/closeHandle (contract revision 1.47, 2026-10-05) — documentation batch, connector implementation lands in the follow-up batch
+
+The connector side of the engine's Android local-backup export (kt-signal-engine
+`docs/backup-export-contract.md` §10 — the consumption wiring both sides document): the
+connector exports its message store into a one-JSON-object-per-line artifact in the engine's
+per-account data directory, starts the engine's background export task over that artifact,
+polls the task to a terminal state, and streams the produced snapshot's two files (metadata,
+main) back through a media-three-chain-shaped file face for delivery to an Android device.
+This revision is **documentation-first only**: the method shapes, lanes, capability tag,
+bounds, skip-count semantics, and error mapping below are the binding plan; the wire
+registration (request-frame method enum, dispatch literals, `FEATURE_CAPABILITIES` entry,
+structured-error whitelist additions, and the schema-consistency bound pairs) lands with the
+connector implementation batch, per the repo rule that the plan or schema changes before
+code. The schema registers the five params defs and their bounds now (descriptions marked
+"contract revision 1.47, §4.46"); the request-frame enum deliberately stays untouched this
+batch because the schema-consistency gate hard-diffs the method enum against dispatch
+literals in src/host.rs — adding enum entries without code would fail the suite, and code
+is out of scope here.
+
+- IPC shape (engine-side ruling, backup-export-contract §10.1): file-artifact handoff + engine
+  background task + connector polling. The engine's backup module is store-free by design, the
+  engine's 1 MiB JSON-RPC line cap rules out inline bulk RPC, and the artifact channel has the
+  `history-import.ndjson` precedent (§4.38) in the opposite direction. The artifact is
+  transitional: the engine deletes it when the export task leaves `running` (success or any
+  failure), because the engine must not persist chat content (its AGENTS.md boundary); the
+  connector therefore treats the artifact as write-once, never re-reads it, and rebuilds it
+  before each export attempt.
+- Artifact contract (engine backup-export-contract §10.2): path
+  `<engine data-dir>/<account store dir>/backup-export-input.ndjson` — the same directory the
+  engine's `history-import.ndjson` uses, resolved through the engine's `engine-state.json`
+  registry (`<dir>` per number, compat §1). Line format: first line exactly one
+  `{"type":"account", profileKey, givenName?, familyName?, bioText?, bioEmoji?}`; then
+  `contact {id, aci?, pni?, e164?, username?, profileKey?, givenName?, familyName?,
+  registration?}` (givenName/familyName map to the Contact proto's profileGivenName/
+  profileFamilyName — the Contact proto has no bio fields, bio belongs to the account line
+  only), `group {id, masterKey}`, `chat {id, recipient}`, `chat_item
+  {chat, author, dateSent, direction, dateReceived, read?, body}`, `all_chat_folder {}`
+  (optional — the engine auto-appends it when absent). 16-byte fields are 32-char lowercase
+  hex, 32-byte fields 64-char lowercase hex; `e164` is a non-zero number; reference ids are
+  connector-chosen `u64 ≥ 1` with `0` reserved for the engine's self recipient; every
+  referenced row must precede its referencing row. The engine never drops a line silently:
+  any unknown type, order violation, dangling reference, duplicate id, bad hex, or empty/
+  oversized body fails the whole task (`BACKUP_ARTIFACT_INVALID`) — skip decisions belong to
+  the connector at artifact-build time and are counted per cause (below).
+- Artifact caps (identical numbers in the engine contract §10.2, the schema defs, and the
+  future implementation constants — the schema-consistency pairs for the implementable ones
+  land with the implementation batch): per-line ≤ 1 MiB (1,048,576 bytes); total ≤ 4,000,000
+  lines; total ≤ 2 GiB (2,147,483,648 bytes); `chat_item.body` ≤ 128 KiB (131,072 bytes,
+  engine state-machine enforced); `exportStatus` snapshot list ≤ 32 entries.
+- `backups.export`: params `accountId`. Send lane, account-scoped mutating (joins the
+  reaction-class write-lane mutex and delete drain barrier verbatim — the engine-side export
+  is account-mutating state). The connector resolves the account, (re)builds the artifact from
+  its store, then calls the engine `backup.export` (engine extension method per the engine's
+  jsonrpc-compat §3/§5 registration; against stock signal-cli it answers `UPSTREAM_ERROR` per
+  the §4.32–§4.34 swap boundary). Result `{"status": "started"}` forwarded from the engine's
+  `{"status": "started"}`. Before the engine call the connector runs its deterministic ladder:
+  account resolution (`ACCOUNT_NOT_FOUND`), artifact build success (a store read failure
+  surfaces `STORAGE_READ_FAILED` — the artifact is a store projection), artifact caps
+  self-check (`INVALID_REQUEST` if the connector's own build exceeds a cap — the engine would
+  fail-closed anyway).
+- `backups.exportStatus`: params `accountId`. Read lane, non-mutating, read-metrics class;
+  no new error codes for the method itself (unknown account `ACCOUNT_NOT_FOUND`). Result
+  mirrors the engine's `backup.exportStatus` honestly:
+  `{state: idle|running|completed|failed, artifactPresent, startedAtMs?, finishedAtMs?,
+  lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name,
+  mainBytes, frames?}]}`. Desktops poll while `running` — deliberately no push event (§4.38
+  precedent: one number ticking, not low-latency delivery). Engine restart resets the task
+  registry to `idle`; on-disk snapshots remain and stay listed.
+- `backups.exportFile.open` / `readChunk` / `closeHandle`: the media three-chain shape
+  (§ messages.attachments.open/readChunk/closeHandle, ADR 0002) reused verbatim — open
+  `{accountId, file: "metadata" | "main"}` → `{fileHandle, sizeBytes, chunkBytes}`;
+  readChunk `{fileHandle, offset}` strictly sequential → `{dataBase64, sizeBytes, eof}`;
+  closeHandle `{fileHandle}` → `{released}` (idempotent). Read lane. **Only the latest
+  snapshot's two fixed file names are addressable** — there is no path parameter and the
+  connector never exposes arbitrary paths (AGENTS.md boundary): `file` is a two-value enum,
+  and "latest snapshot" is the newest `signal-backup-<UTC ts>` directory in the account's
+  `SignalBackups/` root as reported by `backups.exportStatus.snapshots`. Bounds mirror the
+  media chain: chunkBytes 262144 raw (dataBase64 ≤ 349,528 chars), handle TTL 300 s,
+  ≤ 8 live handles per account, early release idempotent, unknown/closed handle
+  `INVALID_REQUEST`, snapshot vanished mid-stream `UPSTREAM_ERROR`. No snapshot exists yet →
+  `BACKUP_SNAPSHOT_MISSING` (new connector code, below).
+- Snapshot lifecycle (engine backup-export-contract §10.6): cleanup ownership is the
+  connector's — keep the most recent snapshot, delete older ones (and any `-tmp` residue)
+  before starting the next export. The engine never deletes snapshots; it only lists them in
+  `exportStatus`. Same-second snapshot collisions fail the engine task with
+  `BACKUP_SNAPSHOT_EXISTS`; the connector clears and retries.
+- Skip-count semantics (connector-side, at artifact build; the engine has no skip face): every
+  store row or column that cannot be projected into the v1 artifact line set is counted per
+  cause and reported through `backups.exportStatus` extension counters in the implementation
+  batch (`skippedReactions` from `message_events`, `skippedEdits` from `message_edits`,
+  `skippedQuotes` from `messages.quote_message_id/quote_snapshot`, `skippedAttachments` from
+  `messages.attachments_json`, `skippedViewOnce` from view-once rows, `skippedStickers` from
+  `messages.sticker_json`, `skippedSkeletonChats` for contacts-sync skeletons without peer
+  identity (§6.5), `skippedBodyTruncated` for `messages.body_truncated = 1` rows — a
+  truncated preview must not become the canonical restored body). Exported rows: direction,
+  sender resolution (`sender_id` → contact/group ref, self → 0), `sent_at` → `dateSent`,
+  `received_at` → `dateReceived`, `body` (the persisted body, ≤ 128 KiB by the store bound),
+  per-conversation `expire_timer_seconds` is a v1 gap (the engine's chat line set has no
+  timer fields this batch — registered as an implementation-batch item with the engine's
+  chat-timer frame face).
+- Capability tag `backup-export` joins `FEATURE_CAPABILITIES` and the handshake capability
+  assertion with the implementation batch; desktops gate all five methods on it.
+- Error mapping plan (engine codes map verbatim into the connector structured whitelist —
+  the whitelist edit itself is an implementation-batch code change): `BACKUP_EXPORT_ALREADY_RUNNING`
+  (retryable=false — poll `backups.exportStatus` instead of retrying),
+  `BACKUP_ARTIFACT_MISSING` (false — rebuild the artifact first),
+  `BACKUP_ARTIFACT_INVALID` (false — the engine deleted the artifact; fix the builder),
+  `BACKUP_SNAPSHOT_EXISTS` (true — clear and retry), `BACKUP_IO_FAILED` (true), plus the new
+  connector-side `BACKUP_SNAPSHOT_MISSING` (false — nothing exported yet) for the file face.
+  The engine's parameter-face `-32603` (unregistered/fake account, missing AEP) stays inside
+  the plain `UPSTREAM_ERROR` fold like every account-domain method; engine-down /
+  method-absent follow the §4.32 mapping (`RUNTIME_NOT_RUNNING` / `CAPABILITY_UNAVAILABLE`).
+  Schema error-enum additions for the six codes land with the implementation batch together
+  with their `ApiError` literals (the schema-consistency error-code gate hard-diffs the enum
+  against code literals).
 
 ## 5. signal-cli Boundary
 
