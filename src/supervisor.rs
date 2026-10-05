@@ -2614,13 +2614,12 @@ async fn sync_contacts_with(
         let Some(peer_key) = peer_key else {
             continue;
         };
-        // The linked account itself appears in its own contact list
-        // (signal-cli "note to self" entry); it must not become a
-        // conversation skeleton — not even a cache row, matching the
-        // pre-1.14 sync shape.
-        if peer_key == number {
-            continue;
-        }
+        // Contract 1.43 (§4.42): the linked account's own entry (the
+        // signal-cli "note to self" contact) flows through the same skeleton
+        // path as every other contact. Its composed title is the account's
+        // own profile name — raw material the desktop replaces with its
+        // localized Note to Self label off the summary's `isSelf` marker; the
+        // connector ships no copy of its own.
         let title = compose_contact_display_name(&item)
             .unwrap_or_else(|| crate::ids::mask_address(peer_key));
         synced.push(("contact".to_string(), peer_key.to_string(), title, None));

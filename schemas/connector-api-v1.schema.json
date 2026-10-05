@@ -578,6 +578,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "limit"],
+      "description": "Read lane over the local conversation cache; ordered by newest message, page-bounded, cursor-resumable. Contract 1.43 (\u00a74.42): the result includes the linked account's own Note to Self direct conversation \u2014 the contacts sync no longer drops the self entry, so its skeleton materializes like any contact's \u2014 and every summary row carries isSelf (always-serialized boolean): true exactly for the direct conversation whose peerKey equals the account's own number (number-based, the \u00a74.24 boundary: the own ACI is not queryable upstream, so a UUID-keyed row cannot be marked), false on every other row including groups. The self row's title is raw contact material (the account's own profile name); the desktop localizes the Note to Self title and avatar from isSelf \u2014 the connector ships no copy.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "cursor": { "type": "string", "maxLength": 256 },

@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.42 (2026-10-05)
+- Contract revision: 1.43 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1739,6 +1739,57 @@ stored history, the host-facing control method, and the archive import.
 - Not implemented on purpose: group timer writes, per-message expiry timers (Signal's
   disappear-on-read), and any upstream deletion trigger. The connector's sweeper is local
   storage hygiene with host-visible events; the protocol's authoritative expiry stays upstream.
+
+### 4.42 Note to Self: the self conversation skeleton + the `isSelf` marker (contract revision 1.43, 2026-10-05)
+
+The premise this revision removes is a connector gate, not an upstream limit. Signal treats the
+chat with oneself as a first-class 1:1 conversation: signal-cli ships `RecipientIdentifier.NoteToSelf`
+as a first-class recipient and routes a send addressed to the own number/uuid to the account's own
+recipient id (`ManagerImpl` send path, pinned 0.14.8), the kt-engine maps the own number to the
+Note to Self recipient in its storage sync, and the linked account appears in its own
+`listContacts` output. The connector deliberately dropped that entry since the contract-1.14
+skeleton sync ("must not become a conversation skeleton"), so the desktop had no entry point and
+no data source for Note to Self (desktop plan P1-18). The upstream behavior needs no engine change
+in either mode; this revision stops swallowing the entry and marks the resulting conversation on
+the wire.
+
+- Contact sync keeps the self entry: the `peer_key == account number` skip in the contacts-sync
+  loop is gone, and the linked account's own entry flows through the exact same skeleton path as
+  any contact — a cached `kind='contact'` row plus the direct conversation skeleton (§6.5). The
+  sync's title composition stays untouched: for the self entry it resolves the account's own
+  profile name, and that name is *material*, not presentation — the official client renders the
+  conversation title as a localized "Note to Self" and never the own profile name. The desktop
+  localizes from `isSelf`; the connector ships no Note to Self copy in any language (the same
+  material-vs-copy split the §4.41 timer-notice rows use).
+- `isSelf` on every conversation summary (wire key `isSelf`, always serialized like
+  `muted`/`pinned`): true exactly when the row is a direct conversation whose `peerKey` equals the
+  linked account's number. Computed at read time in the store's summary constructors — zero
+  migration, zero storage, and the receive path's existing self-keyed rows (a `sentMessage` mirror
+  addressed to the own number) light up without a rewrite. The match is number-based by the
+  §4.24 recorded boundary: the own ACI is not queryable on either engine's jsonRpc surface
+  (`listAccounts` returns numbers only), so a direct row keyed only by a UUID cannot be marked —
+  the contacts-sync address ladder prefers the number, which is the form the self entry carries.
+  Groups are never self. History-import rows need no new handling: the §4.38 chat resolver already
+  maps the archive's `self` chat onto the direct conversation keyed by the own number, so an
+  imported self chat is marked on read like any live one.
+- Send-to-self needs no connector change and gets none: `messages.sendText` addressed with the own
+  number (by conversation id, or by `peerKey`) passes the ordinary direct-chat path and dispatches
+  the upstream `send` verbatim; the pinned upstream routes it to the own recipient (the
+  Note-to-Self path), from where it mirrors back to every linked device. There is no recipient
+  whitelist in the connector to relax — self was never intercepted on this face.
+- Engine-mode contact sync shares the same loop and therefore the same change; the hermetic suite
+  exercises it through the engine-mode engine configuration. Whether the real kt-signal-engine
+  `listContacts` includes the own entry is an engine-repository fact outside this repo's hermetic
+  reach — if a deployed engine face omits it, engine-mode simply has no skeleton until the first
+  self message lands (the receive path creates the row either way), and that is a recorded
+  boundary, not a connector gap.
+- Not implemented on purpose (projected differences, desktop D-batch owns the presentation):
+  the syncStorage cloud bits `noteToSelfArchived`/`noteToSelfMarkedUnread` stay unprojected
+  (KT archive/unread is local state by §6.7); the official "send state always complete" and
+  "voice note always played" self special cases are not special-cased (the optimistic send chain
+  is shared with every chat, and voice notes are a prior batch's boundary); no separate
+  Note-to-Self entry page or pin exists here or upstream — the entry point is the contact list
+  row plus search, exactly like the official client.
 
 ## 5. signal-cli Boundary
 

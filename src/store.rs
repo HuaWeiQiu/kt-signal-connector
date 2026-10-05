@@ -458,6 +458,15 @@ pub struct ConversationSummary {
     /// an unknown state stays unknown instead of masquerading as off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expire_timer_seconds: Option<u64>,
+    /// Contract 1.43 (§4.42): true exactly for the linked account's own
+    /// Note to Self chat — a direct conversation whose peer key equals the
+    /// account's number. Computed at read time from the row plus the account
+    /// record (zero storage), never persisted. The match is number-based by
+    /// the §4.24 recorded boundary: the own ACI is not queryable upstream, so
+    /// a direct row keyed only by a UUID cannot be marked. Groups are never
+    /// self. The row's title stays raw contact material (the account's own
+    /// profile name); the desktop localizes the presentation from this flag.
+    pub is_self: bool,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -479,6 +488,16 @@ pub struct ConversationPinnedMessage {
 /// absent key so pre-1.29 hosts read byte-identical summaries.
 fn u32_is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// Contract 1.43 (§4.42): the Note-to-Self predicate for a conversation row —
+/// the direct chat whose peer key is the linked account's own number. Pure
+/// read-time derivation over (kind, peer_key) plus the account record; no
+/// column exists because the answer follows the keys it derives from. The
+/// number-only match is the §4.24 recorded boundary (the own ACI is not
+/// queryable on either engine's jsonRpc surface), and groups are never self.
+fn summary_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> bool {
+    kind == "direct" && signal_account == Some(peer_key)
 }
 
 /// One aggregated reaction pill projected onto a message row (contract
@@ -1397,10 +1416,21 @@ impl Store {
         let cursor_sent_at = decoded.as_ref().and_then(|value| value.1);
         let cursor_id = decoded.as_ref().map(|value| value.2.as_str());
         let conn = self.lock_conn()?;
+        // Contract 1.43 (§4.42): is_self derives the row from the account's
+        // own number at read time — one lookup per page, through the already
+        // held connection guard.
+        let signal_account: Option<String> = conn
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds
+                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -1429,10 +1459,12 @@ impl Store {
                     fetch as i64,
                 ],
                 |row| {
+                    let kind = static_kind(row.get::<_, String>(2)?);
+                    let peer_key: String = row.get(11)?;
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
-                        kind: static_kind(row.get::<_, String>(2)?),
+                        kind,
                         title: row.get(3)?,
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
@@ -1449,6 +1481,7 @@ impl Store {
                         expire_timer_seconds: row
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
+                        is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
                     })
                 },
             )
@@ -3537,17 +3570,29 @@ impl Store {
         conversation_id: &str,
     ) -> Result<Option<ConversationSummary>, StoreError> {
         let conn = self.lock_conn()?;
+        // Contract 1.43 (§4.42): the same read-time is_self derivation the
+        // list applies, through the already held connection guard.
+        let signal_account: Option<String> = conn
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let summary = conn
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds
+                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
+                    let kind = static_kind(row.get::<_, String>(2)?);
+                    let peer_key: String = row.get(11)?;
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
-                        kind: static_kind(row.get::<_, String>(2)?),
+                        kind,
                         title: row.get(3)?,
                         last_message_preview: row.get(4)?,
                         last_message_kind: None,
@@ -3564,6 +3609,7 @@ impl Store {
                         expire_timer_seconds: row
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
+                        is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
                     })
                 },
             )
@@ -5243,6 +5289,92 @@ mod tests {
     /// Every unit-test store is encrypted: the fixture key exercises the same
     /// keyed-open path production uses (optimization-plan Phase 3).
     const TEST_KEY_BYTES: [u8; 32] = [0x5A; 32];
+
+    /// Contract 1.43 (§4.42): `isSelf` marks exactly the linked account's own
+    /// direct chat — the number match — and never a sibling contact, a
+    /// UUID-keyed row (the §4.24 boundary: the own ACI is not queryable), a
+    /// group, or another account's conversation. The list and the single-row
+    /// read derive the same answer.
+    #[test]
+    fn conversation_summary_is_self_marks_only_the_own_direct_chat() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let own = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Test User")
+            .unwrap();
+        let contact = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Alice")
+            .unwrap();
+        let uuid_peer = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "Aci Peer",
+            )
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "Group")
+            .unwrap();
+
+        let summary = |conversation_id: &str| {
+            store
+                .conversation_summary(&account.id, conversation_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(summary(&own.id).is_self);
+        assert!(!summary(&contact.id).is_self);
+        assert!(!summary(&uuid_peer.id).is_self);
+        assert!(!summary(&group.id).is_self);
+
+        let listed = store.list_conversations(&account.id, 10, None).unwrap();
+        let marked: Vec<_> = listed.items.iter().filter(|row| row.is_self).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].id, own.id);
+        assert_eq!(marked[0].kind, "direct");
+        for row in &listed.items {
+            assert_eq!(row.is_self, summary(&row.id).is_self);
+        }
+
+        // The same peer key means different things per owning account: under
+        // the second account, +15555550199 is its own Note to Self chat, while
+        // under the first account it is just a contact.
+        let other = store
+            .upsert_account_from_signal("+15555550199", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let other_own = store
+            .ensure_conversation(&other.id, "direct", "+15555550199", "Other Self")
+            .unwrap();
+        assert!(
+            store
+                .conversation_summary(&other.id, &other_own.id)
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+        let contact_view = store
+            .ensure_conversation(&account.id, "direct", "+15555550199", "Bob")
+            .unwrap();
+        assert!(
+            !store
+                .conversation_summary(&account.id, &contact_view.id)
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+        let other_listed = store.list_conversations(&other.id, 10, None).unwrap();
+        let other_marked: Vec<_> = other_listed
+            .items
+            .iter()
+            .filter(|row| row.is_self)
+            .collect();
+        assert_eq!(other_marked.len(), 1);
+        assert_eq!(other_marked[0].id, other_own.id);
+    }
 
     fn test_store_key() -> StoreKey {
         StoreKey::from_bytes(TEST_KEY_BYTES)

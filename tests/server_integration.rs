@@ -224,9 +224,10 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     // Fixture finishLink emits one receive notification (+15555550101) after
     // the JSON-RPC result. Contract revision 1.14: the inline contacts.sync
-    // also materializes skeletons for Alice, Bob, and the fixture group, so
-    // the listing has 3 rows — the messaged conversation first (history
-    // ordering), then the two empty skeletons.
+    // materializes skeletons for Alice, Bob, and the fixture group; contract
+    // 1.43 (§4.42) adds the linked account's own Note to Self skeleton, so
+    // the listing has 4 rows — the messaged conversation first (history
+    // ordering), then the empty skeletons.
     sleep(Duration::from_millis(50)).await;
     let conversations = request(
         &mut client,
@@ -236,7 +237,7 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     )
     .await;
     let items = conversations["result"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 4);
     // The messaged conversation first; its title follows the sync cache's
     // profile-name preference ("Alice Example" over the envelope peer name).
     assert_eq!(items[0]["title"], "Alice Example");
@@ -545,8 +546,8 @@ async fn contacts_sync_list_and_send_by_peer() {
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
 
     // finish_link already ran a best-effort sync; an explicit contacts.sync
-    // inside the 60s window returns the cached counts. The self entry from
-    // listContacts is excluded (contract 1.14): 2 contacts + 1 group.
+    // inside the 60s window returns the cached counts. Contract 1.43 (§4.42):
+    // the self entry from listContacts joins the cache — 3 contacts + 1 group.
     let synced = request(
         &mut client,
         "contacts-sync",
@@ -554,7 +555,7 @@ async fn contacts_sync_list_and_send_by_peer() {
         json!({ "accountId": account_id }),
     )
     .await;
-    assert_eq!(synced["result"]["contactCount"], 2);
+    assert_eq!(synced["result"]["contactCount"], 3);
     assert_eq!(synced["result"]["groupCount"], 1);
     assert!(synced["result"]["syncedAt"].as_u64().unwrap() > 0);
 
@@ -566,8 +567,15 @@ async fn contacts_sync_list_and_send_by_peer() {
     )
     .await;
     let items = listed["result"]["items"].as_array().unwrap();
-    // The self entry is excluded since contract 1.14.
-    assert_eq!(items.len(), 3);
+    // The self entry rides the contact cache since contract 1.43; its title
+    // material is the account's own profile name.
+    assert_eq!(items.len(), 4);
+    let self_contact = items
+        .iter()
+        .find(|item| item["peerKey"] == "+15555550100")
+        .unwrap();
+    assert_eq!(self_contact["kind"], "contact");
+    assert_eq!(self_contact["title"], "Test User");
     let alice = items
         .iter()
         .find(|item| item["peerKey"] == "+15555550101")
@@ -603,7 +611,7 @@ async fn contacts_sync_list_and_send_by_peer() {
         json!({ "accountId": account_id, "limit": 10, "cursor": cursor }),
     )
     .await;
-    assert_eq!(second_page["result"]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(second_page["result"]["items"].as_array().unwrap().len(), 2);
     assert!(second_page["result"].get("nextCursor").is_none());
 
     // contacts.list is read-only: an unknown account is a cache miss, not an
@@ -654,6 +662,17 @@ async fn contacts_sync_list_and_send_by_peer() {
         .unwrap();
     assert_eq!(created["title"], "Fresh Peer");
     assert_eq!(created["type"], "direct");
+    // Contract 1.43 (§4.42): every summary row carries isSelf; the contact
+    // send's row is a peer, and exactly the own direct chat is marked.
+    assert_eq!(created["isSelf"], false);
+    let conv_items = conversations["result"]["items"].as_array().unwrap();
+    let self_rows: Vec<_> = conv_items
+        .iter()
+        .filter(|item| item["isSelf"] == true)
+        .collect();
+    assert_eq!(self_rows.len(), 1);
+    assert_eq!(self_rows[0]["type"], "direct");
+    assert_eq!(self_rows[0]["title"], "Test User");
 
     // A second send to the same peer reuses the same conversation.
     let sent_again = request(
@@ -713,6 +732,138 @@ async fn contacts_sync_list_and_send_by_peer() {
     )
     .await;
     assert_eq!(bad_kind["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.43 (§4.42) end to end: the contacts sync keeps the linked
+/// account's own entry, `conversations.list` marks exactly that skeleton
+/// `isSelf`, and `messages.sendText` addressed to the own number takes the
+/// ordinary direct-chat path — the upstream `send` dispatch carries the self
+/// recipient verbatim (the pinned upstream routes it to the Note-to-Self
+/// recipient, from where it mirrors back to every linked device). The
+/// connector adds no interception and no copy.
+#[tokio::test]
+async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [12_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-NoteToSelf" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The cached-counts answer proves the sync transaction (rows + marker)
+    // committed, so the skeletons below are deterministic.
+    let synced = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(synced["result"]["contactCount"], 3);
+
+    let listed = request(
+        &mut client,
+        "conv-list-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let items = listed["result"]["items"].as_array().unwrap();
+    let self_rows: Vec<_> = items.iter().filter(|item| item["isSelf"] == true).collect();
+    assert_eq!(
+        self_rows.len(),
+        1,
+        "exactly the own direct chat is marked: {items:?}"
+    );
+    let self_row = &self_rows[0];
+    assert_eq!(self_row["type"], "direct");
+    // Title material is the account's own profile name; the desktop
+    // localizes the Note to Self presentation from the marker.
+    assert_eq!(self_row["title"], "Test User");
+    assert_eq!(self_rows[0]["muted"], false);
+    assert_eq!(self_rows[0]["pinned"], false);
+    let conversation_id = self_row["id"].as_str().unwrap().to_string();
+
+    // Send-to-self by peer key: the ordinary direct path, no connector
+    // interception — the response settles on the same conversation the
+    // skeleton materialized (stable identity on both paths).
+    let sent = request(
+        &mut client,
+        "send-self",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "direct",
+            "peerKey": "+15555550100",
+            "text": "note to myself",
+            "clientRequestId": "self-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    assert_eq!(sent["result"]["conversationId"], conversation_id);
+
+    // The upstream dispatch carries the self recipient verbatim.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let dispatch: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|entry: &Value| entry["message"] == "note to myself")
+        .expect("the self send must reach the upstream engine");
+    assert_eq!(dispatch["account"], "+15555550100");
+    assert_eq!(dispatch["recipient"], json!(["+15555550100"]));
+
+    // The row landed on the self conversation and the marker stays.
+    let relisted = request(
+        &mut client,
+        "conv-list-2",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let after = relisted["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == conversation_id)
+        .unwrap()
+        .clone();
+    assert_eq!(after["isSelf"], true);
+    assert_eq!(after["lastMessagePreview"], "note to myself");
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
@@ -2377,11 +2528,14 @@ async fn groups_get_projects_the_synced_group_cache() {
     // Contract 1.40 (§4.39): the roster the sync captured projects beside
     // memberCount — the number-based self marker on the linked account's own
     // entry, the contacts-cache name plus the upstream uuid and admin mark on
-    // Alice's.
+    // Alice's. Contract 1.43 (§4.42): the self entry itself now lives in the
+    // contacts cache, so its read-time name resolves to the account's own
+    // profile name material (the official roster has no self name special
+    // case either).
     assert_eq!(
         group["result"]["members"],
         json!([
-            {"id": "+15555550100", "self": true},
+            {"id": "+15555550100", "name": "Test User", "self": true},
             {
                 "id": "+15555550101",
                 "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
