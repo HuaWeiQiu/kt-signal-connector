@@ -3832,6 +3832,12 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "account-settings",
         "conversations.getBlocked",
         "blocked-conversations",
+        "backups.export",
+        "backups.exportStatus",
+        "backups.exportFile.open",
+        "backups.exportFile.readChunk",
+        "backups.exportFile.closeHandle",
+        "backup-export",
     ] {
         assert!(
             capabilities

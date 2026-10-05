@@ -26,20 +26,21 @@ use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
     AccountDeleteLocalDataParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
-    AccountsUpdateConfigurationParams, ContactsListParams, ContactsSetLocalAliasParams,
-    ContactsSyncParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsListParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    GroupsGetParams, GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams,
-    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
-    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams,
+    AccountsUpdateConfigurationParams, BackupsExportFileCloseHandleParams,
+    BackupsExportFileOpenParams, BackupsExportFileReadChunkParams, BackupsExportParams,
+    BackupsExportStatusParams, ContactsListParams, ContactsSetLocalAliasParams, ContactsSyncParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
+    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, GroupsGetParams,
+    GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams, HostSideEvent,
+    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1057,6 +1058,90 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid history.importStatus params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.export" => match serde_json::from_value::<BackupsExportParams>(request.params) {
+            Ok(params) => match runtime.export_local_backup(&params.account_id).await {
+                Ok(result) => HostResponse::success(request_id, result),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid backups.export params", false),
+            ),
+        },
+        "backups.exportStatus" => {
+            match serde_json::from_value::<BackupsExportStatusParams>(request.params) {
+                Ok(params) => match runtime.export_backup_status(&params.account_id).await {
+                    Ok(status) => HostResponse::success(request_id, status),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.exportStatus params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.exportFile.open" => {
+            match serde_json::from_value::<BackupsExportFileOpenParams>(request.params) {
+                Ok(params) => {
+                    match runtime
+                        .export_file_open(&params.account_id, &params.file)
+                        .await
+                    {
+                        Ok(view) => HostResponse::success(request_id, view),
+                        Err(error) => HostResponse::failure(request_id, error.into_api()),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.exportFile.open params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.exportFile.readChunk" => {
+            match serde_json::from_value::<BackupsExportFileReadChunkParams>(request.params) {
+                Ok(params) => {
+                    match runtime
+                        .export_file_read_chunk(&params.file_handle, params.offset)
+                        .await
+                    {
+                        Ok(chunk) => HostResponse::success(request_id, chunk),
+                        Err(error) => HostResponse::failure(request_id, error.into_api()),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.exportFile.readChunk params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.exportFile.closeHandle" => {
+            match serde_json::from_value::<BackupsExportFileCloseHandleParams>(request.params) {
+                Ok(params) => match runtime.export_file_close_handle(&params.file_handle).await {
+                    Ok(view) => HostResponse::success(request_id, view),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.exportFile.closeHandle params",
                         false,
                     ),
                 ),

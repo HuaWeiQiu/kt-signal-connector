@@ -900,6 +900,171 @@ for line in sys.stdin:
     elif method == "emitStderr":
         emit_stderr_websocket_error()
         result = {"method": method}
+    elif method == "backup.export":
+        # §4.46 export-task face: the engine reads the connector's artifact
+        # from the registered account directory, fail-closed on the start
+        # ladder (account registered → artifact present → first line parses).
+        # The directory comes from this process's own registry, exactly what
+        # the real engine reads.
+        registry = SIGNAL_DATA_DIR / "engine-state.json"
+        account_dir = None
+        try:
+            state = json.loads(registry.read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    account_dir = SIGNAL_DATA_DIR / entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            account_dir = None
+        if account_dir is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        artifact = account_dir / "backup-export-input.ndjson"
+        if not artifact.is_file() or artifact.stat().st_size == 0:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "BACKUP_ARTIFACT_MISSING"},
+            }
+            emit_json(response)
+            continue
+        lines = artifact.read_text().splitlines()
+        first = json.loads(lines[0]) if lines else None
+        if not isinstance(first, dict) or first.get("type") != "account":
+            artifact.unlink(missing_ok=True)
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "BACKUP_ARTIFACT_INVALID"},
+            }
+            emit_json(response)
+            continue
+        given_name = first.get("givenName") or ""
+        # Export-task sentinels ride the account line's givenName — the one
+        # field the connector's builder derives from store data, so a seeded
+        # display name steers the failure ladder without a second channel.
+        if given_name == "[fixture-artifact-missing]":
+            artifact.unlink(missing_ok=True)
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "BACKUP_ARTIFACT_MISSING"},
+            }
+            emit_json(response)
+            continue
+        if given_name == "[fixture-artifact-invalid]":
+            artifact.write_text("not-json\n")
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "BACKUP_ARTIFACT_INVALID"},
+            }
+            emit_json(response)
+            continue
+        if given_name == "[fixture-crash-backup]":
+            os._exit(33)
+        if given_name == "[fixture-snapshot-exists]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "BACKUP_SNAPSHOT_EXISTS"},
+            }
+            emit_json(response)
+            continue
+        if given_name == "[fixture-io-failed]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "BACKUP_IO_FAILED"},
+            }
+            emit_json(response)
+            continue
+        # The happy path: the task runs in the background — writes the §5
+        # snapshot shape (metadata + main under SignalBackups/signal-backup-
+        # <ts>), then deletes the transitional artifact on leaving running
+        # (§10.2), and `started` is answered immediately. A
+        # `.fixture-backup-running` marker holds the task in `running` for
+        # exportStatus polls until the task finishes.
+        running_marker = SIGNAL_DATA_DIR / ".fixture-backup-running"
+        running_marker.touch()
+
+        def run_backup_task(account_dir=account_dir, running_marker=running_marker):
+            time.sleep(0.2)
+            snapshot = account_dir / (
+                "SignalBackups/signal-backup-"
+                + time.strftime("%Y-%m-%d-%H-%M-%S", time.gmtime())
+            )
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / "metadata").write_bytes(b"fixture-snapshot-metadata")
+            (snapshot / "main").write_bytes(b"fixture-snapshot-main-bytes-0123456789")
+            artifact.unlink(missing_ok=True)
+            running_marker.unlink(missing_ok=True)
+
+        threading.Thread(target=run_backup_task, daemon=True).start()
+        result = {"status": "started"}
+    elif method == "backup.exportStatus":
+        # §4.46 status face: the task registry is process memory, mirrored by
+        # the `.fixture-backup-running` marker; snapshots are listed from disk
+        # (name + main size, newest first, ≤ 32). Keys are honest-absence —
+        # `lines`/`frames`/`snapshot`/`error` only when they have a referent.
+        running_marker = SIGNAL_DATA_DIR / ".fixture-backup-running"
+        account_dir = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    account_dir = SIGNAL_DATA_DIR / entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            account_dir = None
+        if account_dir is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        snapshot_root = account_dir / "SignalBackups"
+        names = []
+        if snapshot_root.is_dir():
+            for entry in sorted(snapshot_root.iterdir(), reverse=True):
+                if entry.is_dir() and entry.name.startswith("signal-backup-") and not entry.name.endswith("-tmp"):
+                    names.append(entry.name)
+        names = names[:32]
+        snapshots = []
+        for name in names:
+            main = snapshot_root / name / "main"
+            snapshots.append({
+                "name": name,
+                "mainBytes": main.stat().st_size if main.is_file() else 0,
+            })
+        artifact = account_dir / "backup-export-input.ndjson"
+        if running_marker.exists():
+            result = {
+                "state": "running",
+                "artifactPresent": artifact.is_file(),
+            }
+        elif snapshots:
+            newest = snapshots[0]
+            result = {
+                "state": "completed",
+                "artifactPresent": False,
+                "finishedAtMs": int(time.time() * 1000),
+                "snapshot": dict(newest),
+                "snapshots": snapshots,
+            }
+        else:
+            result = {
+                "state": "idle",
+                "artifactPresent": False,
+                "snapshots": snapshots,
+            }
     elif method == "getUserStatus":
         if AUTH_FAILED_MARKER.exists():
             # Contract 1.21: the account holder unlinked this device. The

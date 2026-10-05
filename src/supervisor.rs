@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -159,6 +160,15 @@ pub struct RuntimeSupervisor {
     delivery_receipt_worker: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
+    /// The §4.46 backup file three-chain: `Some` when the launcher armed the
+    /// backup-export capability. Process-wide like the media table (the
+    /// registry hands every group the same `Arc` — `readChunk`/`closeHandle`
+    /// carry no accountId, so handle resolution must not depend on routing).
+    backup_handles: Option<Arc<crate::backup_export::BackupFileHandleTable>>,
+    /// Per-account skip counters from the most recent successful artifact
+    /// build; published after `build_artifact` writes the artifact, merged
+    /// into `backups.exportStatus` answers. Content-free numbers only.
+    backup_counters: StdMutex<HashMap<String, crate::backup_export::SkipCounters>>,
 }
 
 impl RuntimeSupervisor {
@@ -167,6 +177,20 @@ impl RuntimeSupervisor {
         store: Arc<Store>,
         group_id: String,
         media_handles: Option<Arc<MediaHandleTable>>,
+    ) -> Self {
+        Self::with_backup_handles(config, store, group_id, media_handles, None)
+    }
+
+    /// Launcher entry carrying the §4.46 backup-handle table: `Some` arms the
+    /// backup-export capability (every group receives the same process-wide
+    /// table — see `backup_handles`). `new` is the media-only compatibility
+    /// form the tests use.
+    pub fn with_backup_handles(
+        config: SignalCliConfig,
+        store: Arc<Store>,
+        group_id: String,
+        media_handles: Option<Arc<MediaHandleTable>>,
+        backup_handles: Option<Arc<crate::backup_export::BackupFileHandleTable>>,
     ) -> Self {
         let (events, _) = event_channel();
         let (host_events, _) = broadcast::channel(1024);
@@ -233,6 +257,8 @@ impl RuntimeSupervisor {
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
+            backup_handles,
+            backup_counters: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -1336,6 +1362,9 @@ impl RuntimeSupervisor {
                             .lock()
                             .await
                             .clear_media_handles_for_account(&account_id);
+                        if let Some(handles) = self.backup_handles.as_ref() {
+                            handles.clear_account(&account_id);
+                        }
                         return Ok(json!({}));
                     }
                     AccountDeletePlan::Dispatch {
@@ -1360,6 +1389,9 @@ impl RuntimeSupervisor {
                 let mut service = self.service.lock().await;
                 service.complete_account_delete(&account_id, operation_id.as_deref())?;
                 service.clear_media_handles_for_account(&account_id);
+            }
+            if let Some(handles) = self.backup_handles.as_ref() {
+                handles.clear_account(&account_id);
             }
             return Ok(json!({}));
         }
@@ -1396,8 +1428,12 @@ impl RuntimeSupervisor {
             let mut service = self.service.lock().await;
             service.complete_account_delete(&account_id, operation_id.as_deref())?;
             // ADR 0002 gate 3: a chunk-stream handle cannot outlive the
-            // account session it was opened from.
+            // account session it was opened from — media and §4.46 backup
+            // file streams alike.
             service.clear_media_handles_for_account(&account_id);
+        }
+        if let Some(handles) = self.backup_handles.as_ref() {
+            handles.clear_account(&account_id);
         }
         Ok(json!({}))
     }
@@ -2623,6 +2659,230 @@ impl RuntimeSupervisor {
         self.service.lock().await.close_media_handle(&media_handle)
     }
 
+    // ---------------------------------------------------------------------
+    // Android local-backup export (contract revision 1.47, §4.46,
+    // capability backup-export).
+    // ---------------------------------------------------------------------
+
+    fn backup_handles(
+        &self,
+    ) -> Result<Arc<crate::backup_export::BackupFileHandleTable>, ServiceError> {
+        self.backup_handles.clone().ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "backup export is not enabled for this connector",
+                false,
+            ))
+        })
+    }
+
+    /// backups.export: build (or rebuild) the transitional artifact locally,
+    /// run the connector's snapshot cleanup, then start the engine's export
+    /// task. The artifact build and the snapshot walk are pure filesystem +
+    /// store work and run on the blocking pool; the engine call is Mutating,
+    /// so an indeterminate outcome answers SEND_OUTCOME_UNKNOWN — the task
+    /// may already be writing a snapshot, and restarting it automatically
+    /// could race the running one. On any pre-engine failure the artifact is
+    /// either absent (never built) or removed by `build_artifact` itself, so
+    /// the engine never sees a stale one.
+    pub async fn export_local_backup(&self, account_id: &str) -> Result<Value, ServiceError> {
+        self.backup_handles()?;
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        let store = Arc::clone(&self.store);
+        let data_dir = self.config.data_dir.clone();
+        let account = account_id.to_string();
+        let counters = tokio::task::spawn_blocking({
+            let signal_account = signal_account.clone();
+            move || {
+                crate::backup_export::build_artifact(&store, &data_dir, &account, &signal_account)
+            }
+        })
+        .await
+        .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)))?
+        .map_err(ServiceError::from)?;
+        let account_dir =
+            crate::history_import::engine_account_dir(&self.config.data_dir, &signal_account)
+                .ok_or(ServiceError::from(
+                    crate::backup_export::BuildError::NoEngineDirectory,
+                ))?;
+        crate::backup_export::prepare_snapshots_for_export(&account_dir);
+        self.backup_counters
+            .lock()
+            .expect("backup counters mutex")
+            .insert(account_id.to_string(), counters);
+        let engine = self.running_engine().await?;
+        match engine
+            .call(
+                "backup.export",
+                json!({ "account": signal_account }),
+                CallClass::Mutating,
+            )
+            .await
+        {
+            Ok(value) => {
+                if value.get("status").and_then(Value::as_str) == Some("started") {
+                    Ok(json!({ "status": "started" }))
+                } else {
+                    Err(ServiceError::Api(ApiError::new(
+                        "UPSTREAM_PROTOCOL_ERROR",
+                        "backup.export answered without a started status",
+                        true,
+                    )))
+                }
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "backup.export outcome is unknown; poll backups.exportStatus",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// backups.exportStatus: poll the engine read-only and project the
+    /// answer — the upstream `account` echo is stripped (the raw number never
+    /// crosses the host boundary, §4.46), `accountId` rides in its place,
+    /// and the connector's own skip counters merge in after a successful
+    /// build. Read-only, so an unknown outcome degrades honestly to the same
+    /// shape as an idle engine rather than inventing a state.
+    pub async fn export_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        self.backup_handles()?;
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        let upstream = match self.running_engine().await {
+            Ok(engine) => Some(
+                engine
+                    .call(
+                        "backup.exportStatus",
+                        json!({ "account": signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await,
+            ),
+            // Engine down (or the read raced a crash): the snapshots live on
+            // disk — report the store-side projection rather than failing the
+            // poll. Read-only, so this is honest, not a guess.
+            Err(_) => None,
+        };
+        match upstream {
+            Some(Ok(result)) => {
+                let counters = self
+                    .backup_counters
+                    .lock()
+                    .expect("backup counters mutex")
+                    .get(account_id)
+                    .copied();
+                Ok(export_status_projection(
+                    account_id,
+                    &signal_account,
+                    result,
+                    counters,
+                ))
+            }
+            // Read-only, so an indeterminate outcome degrades to the same
+            // disk-truth projection as an engine that is down (§4.46: never
+            // invent a task state).
+            Some(Err(EngineError::UnknownOutcome)) | None => {
+                let data_dir = self.config.data_dir.clone();
+                let account = account_id.to_string();
+                blocking_service(move || {
+                    export_status_idle_projection(&data_dir, &account, &signal_account)
+                })
+                .await
+            }
+            Some(Err(error)) => Err(error.into()),
+        }
+    }
+
+    /// backups.exportFile.open: mint a chunk-stream handle for one fixed file
+    /// (`metadata`/`main`) of the latest snapshot. Pure local resolution —
+    /// the engine is not consulted; the snapshot directory is the addressable
+    /// unit, its name is the newest one on disk (the same rule the engine's
+    /// exportStatus list applies).
+    pub async fn export_file_open(
+        &self,
+        account_id: &str,
+        file: &str,
+    ) -> Result<Value, ServiceError> {
+        let handles = self.backup_handles()?;
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        let store = Arc::clone(&self.store);
+        let data_dir = self.config.data_dir.clone();
+        let account = account_id.to_string();
+        let file = file.to_string();
+        blocking_service(move || {
+            let snapshot = export_latest_snapshot(&store, &data_dir, &account, &signal_account)?;
+            let path = match file.as_str() {
+                "metadata" => snapshot.join("metadata"),
+                "main" => snapshot.join("main"),
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "file must be \"metadata\" or \"main\"",
+                        false,
+                    )));
+                }
+            };
+            let size_bytes = std::fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .map_err(|_| {
+                    ServiceError::Api(ApiError::new(
+                        "BACKUP_SNAPSHOT_MISSING",
+                        "the snapshot file is not on disk",
+                        false,
+                    ))
+                })?;
+            let file_handle = handles
+                .open(&account, path, size_bytes)
+                .map_err(map_backup_handle_error)?;
+            Ok(json!({
+                "fileHandle": file_handle,
+                "sizeBytes": size_bytes,
+                "chunkBytes": crate::backup_export::CHUNK_BYTES,
+            }))
+        })
+        .await
+    }
+
+    /// backups.exportFile.readChunk: one sequential chunk from a live handle.
+    /// The handle table is process-wide, so this answers identically no
+    /// matter which group's supervisor the registry routed it through.
+    pub async fn export_file_read_chunk(
+        &self,
+        file_handle: &str,
+        offset: u64,
+    ) -> Result<Value, ServiceError> {
+        let handles = self.backup_handles()?;
+        crate::service::validate_backup_handle(file_handle)?;
+        let chunk = handles
+            .read_chunk(file_handle, offset)
+            .map_err(map_backup_handle_error)?;
+        Ok(json!({
+            "dataBase64": crate::backup_export::encode_chunk(&chunk.data),
+            "sizeBytes": chunk.data.len() as u64,
+            "eof": chunk.eof,
+        }))
+    }
+
+    /// backups.exportFile.closeHandle: explicit early release; idempotent,
+    /// TTL is the backstop.
+    pub async fn export_file_close_handle(&self, file_handle: &str) -> Result<Value, ServiceError> {
+        self.backup_handles()?;
+        crate::service::validate_backup_handle(file_handle)?;
+        let handles = self.backup_handles()?;
+        Ok(json!({
+            "released": handles.close(file_handle),
+        }))
+    }
+
     /// Read-only view of the contacts cache; never triggers an upstream call.
     pub async fn list_contacts(
         &self,
@@ -3152,6 +3412,132 @@ fn history_import_status_projection(
         "state": "unavailable",
         "reason": "no-archive",
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Android local-backup export plumbing (contract revision 1.47, §4.46).
+// ---------------------------------------------------------------------------
+
+/// Map the backup handle table's content-free failures onto the wire codes —
+/// the media chain's ladder: caller mistakes are `INVALID_REQUEST` (one
+/// indistinguishable unknown-handle answer so handle space cannot be probed),
+/// a mid-stream I/O failure is the transient `UPSTREAM_ERROR`.
+fn map_backup_handle_error(error: crate::backup_export::BackupHandleError) -> ServiceError {
+    let (code, message, retryable) = match error {
+        crate::backup_export::BackupHandleError::NotFound => (
+            "INVALID_REQUEST",
+            "fileHandle is unknown, expired, or already closed",
+            false,
+        ),
+        crate::backup_export::BackupHandleError::NotSequential { .. } => (
+            "INVALID_REQUEST",
+            "offset must match the bytes already read on this handle",
+            false,
+        ),
+        crate::backup_export::BackupHandleError::Exhausted => (
+            "INVALID_REQUEST",
+            "the account already holds the maximum number of open backup file handles",
+            false,
+        ),
+        crate::backup_export::BackupHandleError::Io => {
+            ("UPSTREAM_ERROR", "snapshot file read failed", true)
+        }
+    };
+    ServiceError::Api(ApiError::new(code, message, retryable))
+}
+
+/// Resolve the account and its latest snapshot directory, or answer the
+/// no-snapshot code. Store work only — the caller runs it on the blocking
+/// pool.
+fn export_latest_snapshot(
+    store: &Arc<Store>,
+    data_dir: &Path,
+    account_id: &str,
+    signal_account: &str,
+) -> Result<PathBuf, ServiceError> {
+    let account = store
+        .account_by_id(account_id)?
+        .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+    if account.signal_account != signal_account {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    let account_dir = crate::history_import::engine_account_dir(data_dir, signal_account).ok_or(
+        ServiceError::from(crate::backup_export::BuildError::NoEngineDirectory),
+    )?;
+    crate::backup_export::latest_snapshot(&account_dir)
+        .map(|entry| {
+            account_dir
+                .join(crate::backup_export::SNAPSHOT_ROOT)
+                .join(entry.name)
+        })
+        .ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "BACKUP_SNAPSHOT_MISSING",
+                "the account has no local-backup snapshot yet",
+                false,
+            ))
+        })
+}
+
+/// The engine-down / unknown-outcome `backups.exportStatus` answer: the disk
+/// truth (snapshot list) plus `idle` — the task registry is engine-process
+/// memory, so without an engine there is provably no running task (§10.4).
+fn export_status_idle_projection(
+    data_dir: &Path,
+    account_id: &str,
+    signal_account: &str,
+) -> Result<Value, ServiceError> {
+    let account_dir = crate::history_import::engine_account_dir(data_dir, signal_account);
+    let snapshots = account_dir
+        .as_ref()
+        .map(|dir| crate::backup_export::list_snapshots(dir))
+        .unwrap_or_default();
+    let snapshots = snapshots
+        .iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "mainBytes": entry.main_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "accountId": account_id,
+        "state": "idle",
+        "artifactPresent": false,
+        "snapshots": snapshots,
+    });
+    if let Some(dir) = &account_dir {
+        if let Some(entry) = crate::backup_export::latest_snapshot(dir) {
+            result["snapshot"] = json!({
+                "name": entry.name,
+                "mainBytes": entry.main_bytes,
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// The engine-answering `backups.exportStatus` projection (§4.46): the engine
+/// payload mirrors honestly, minus the raw `account` echo (the number never
+/// crosses the host boundary) — `accountId` rides in its place, and the
+/// connector's own skip counters merge in when a build has run.
+fn export_status_projection(
+    account_id: &str,
+    _signal_account: &str,
+    mut result: Value,
+    counters: Option<crate::backup_export::SkipCounters>,
+) -> Value {
+    let object = result.as_object_mut().expect("engine result object");
+    object.remove("account");
+    object.insert(
+        "accountId".to_string(),
+        Value::String(account_id.to_string()),
+    );
+    if let Some(counters) = counters {
+        counters.merge_into(&mut result);
+    }
+    result
 }
 
 /// Receive one stderr line, skipping lag gaps; None means the stream closed.

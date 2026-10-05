@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod auth;
+pub mod backup_export;
 pub mod datalock;
 pub mod engine;
 pub mod groups;

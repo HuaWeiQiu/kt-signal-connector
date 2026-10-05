@@ -84,7 +84,12 @@
             "groups.quit",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
-            "history.importStatus"
+            "history.importStatus",
+            "backups.export",
+            "backups.exportStatus",
+            "backups.exportFile.open",
+            "backups.exportFile.readChunk",
+            "backups.exportFile.closeHandle"
           ]
         },
         "params": {
@@ -593,6 +598,65 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/historyImportStatusParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.export" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsExportParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.exportStatus" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsExportStatusParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.exportFile.open" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsExportFileOpenParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "backups.exportFile.readChunk" }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsExportFileReadChunkParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "backups.exportFile.closeHandle" }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsExportFileCloseHandleParams" }
             }
           }
         }
@@ -1578,7 +1642,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId"],
-      "description": "Start the engine's Android local-backup export for the account (contract revision 1.47, §4.46, capability backup-export): the connector (re)builds the transitional NDJSON artifact in the engine's per-account data directory (same directory as the backup5 history-import artifact, resolved through the engine's engine-state.json registry; the engine deletes it when the task leaves running — the engine never persists chat content), then forwards to the engine's backup.export, which runs a dedicated background thread (the receive pipeline stays live throughout). One task per account at a time; a second start answers BACKUP_EXPORT_ALREADY_RUNNING (poll backups.exportStatus instead of retrying). Result {status: 'started'}; progress and the snapshot list come from backups.exportStatus. Caps the connector enforces on its own artifact build: per-line 1048576 bytes, 4000000 lines, 2147483648 bytes total, chat_item body 131072 bytes (mirroring engine backup-export-contract §10.2). Documentation batch (contract revision 1.47): this def and its bounds are registered now; the request-frame method enum, dispatch literals, FEATURE_CAPABILITIES tag, and structured-error whitelist additions land with the connector implementation batch (§4.46 plan) — the schema-consistency gate hard-diffs the method enum against src/host.rs dispatch literals, so enum registration cannot precede code.",
+      "description": "Start the engine's Android local-backup export for the account (contract revision 1.47, §4.46, capability backup-export): the connector (re)builds the transitional NDJSON artifact in the engine's per-account data directory (same directory as the backup5 history-import artifact, resolved through the engine's engine-state.json registry; the engine deletes it when the task leaves running — the engine never persists chat content), then forwards to the engine's backup.export, which runs a dedicated background thread (the receive pipeline stays live throughout). One task per account at a time; a second start answers BACKUP_EXPORT_ALREADY_RUNNING (poll backups.exportStatus instead of retrying). Result {status: 'started'}; progress and the snapshot list come from backups.exportStatus. Caps the connector enforces on its own artifact build: per-line 1048576 bytes, 4000000 lines, 2147483648 bytes total, chat_item body 131072 bytes (mirroring engine backup-export-contract §10.2). Request-frame method enum, dispatch literals, FEATURE_CAPABILITIES tag, and structured-error whitelist registered with the connector implementation batch (implemented 2026-10-06, §4.46 plan).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
@@ -1587,7 +1651,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId"],
-      "description": "Poll the engine's Android local-backup export task (contract revision 1.47, §4.46, capability backup-export): result mirrors the engine honestly — {state: idle|running|completed|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]} with absent keys omitted rather than zero-filled; snapshots lists at most 32 entries newest-first and the engine only reports, never deletes (cleanup ownership is the connector's: keep the latest snapshot, clear older ones and -tmp residue before the next export). Desktops poll while running; deliberately no push event (§4.38 precedent). The task registry is engine-process memory: an engine restart reads idle while on-disk snapshots stay listed. Documentation batch (contract revision 1.47): wire-frame registration lands with the connector implementation batch (§4.46 plan); see backupsExportParams.",
+      "description": "Poll the engine's Android local-backup export task (contract revision 1.47, §4.46, capability backup-export): result mirrors the engine honestly — {state: idle|running|completed|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]} with absent keys omitted rather than zero-filled; snapshots lists at most 32 entries newest-first and the engine only reports, never deletes (cleanup ownership is the connector's: keep the latest snapshot, clear older ones and -tmp residue before the next export). Desktops poll while running; deliberately no push event (§4.38 precedent). The task registry is engine-process memory: an engine restart reads idle while on-disk snapshots stay listed. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
@@ -1596,7 +1660,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "file"],
-      "description": "Open a chunked stream for one file of the latest local-backup snapshot (contract revision 1.47, §4.46, capability backup-export): the media three-chain shape (messages.attachments.open, ADR 0002) reused verbatim — response {fileHandle, sizeBytes, chunkBytes} with chunkBytes 262144, handle TTL 300 s, at most 8 live handles per account, released early by backups.exportFile.closeHandle. file is a two-value enum: only the latest snapshot's fixed file names are addressable — there is no path parameter and the connector never exposes arbitrary paths; 'latest snapshot' is the newest signal-backup-<UTC ts> directory in the account's SignalBackups/ root as reported by backups.exportStatus.snapshots. No snapshot exists yet answers BACKUP_SNAPSHOT_MISSING. Documentation batch (contract revision 1.47): wire-frame registration lands with the connector implementation batch (§4.46 plan); see backupsExportParams.",
+      "description": "Open a chunked stream for one file of the latest local-backup snapshot (contract revision 1.47, §4.46, capability backup-export): the media three-chain shape (messages.attachments.open, ADR 0002) reused verbatim — response {fileHandle, sizeBytes, chunkBytes} with chunkBytes 262144, handle TTL 300 s, at most 8 live handles per account, released early by backups.exportFile.closeHandle. file is a two-value enum: only the latest snapshot's fixed file names are addressable — there is no path parameter and the connector never exposes arbitrary paths; 'latest snapshot' is the newest signal-backup-<UTC ts> directory in the account's SignalBackups/ root as reported by backups.exportStatus.snapshots. No snapshot exists yet answers BACKUP_SNAPSHOT_MISSING. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "file": {
@@ -1609,7 +1673,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["fileHandle", "offset"],
-      "description": "Read the next chunk of a snapshot file stream opened with backups.exportFile.open (contract revision 1.47, §4.46, capability backup-export): identical ladder to messages.attachments.readChunk — offsets strictly sequential (offset must equal the bytes already delivered on this handle, so a handle can never become a random-access scan oracle), response {dataBase64, sizeBytes, eof} with sizeBytes at most chunkBytes = 262144 and dataBase64 at most 349528 characters; a closed, expired, or unknown handle answers INVALID_REQUEST; a snapshot removed under the stream (connector cleanup) terminates with a short chunk and eof, a vanished root answers UPSTREAM_ERROR. Documentation batch (contract revision 1.47): wire-frame registration lands with the connector implementation batch (§4.46 plan); see backupsExportParams.",
+      "description": "Read the next chunk of a snapshot file stream opened with backups.exportFile.open (contract revision 1.47, §4.46, capability backup-export): identical ladder to messages.attachments.readChunk — offsets strictly sequential (offset must equal the bytes already delivered on this handle, so a handle can never become a random-access scan oracle), response {dataBase64, sizeBytes, eof} with sizeBytes at most chunkBytes = 262144 and dataBase64 at most 349528 characters; a closed, expired, or unknown handle answers INVALID_REQUEST; a snapshot removed under the stream (connector cleanup) terminates with a short chunk and eof, a vanished root answers UPSTREAM_ERROR. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
       "properties": {
         "fileHandle": { "$ref": "#/$defs/opaqueId" },
         "offset": {
@@ -1623,7 +1687,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["fileHandle"],
-      "description": "Release a snapshot file stream before its 300 s TTL (contract revision 1.47, §4.46, capability backup-export): idempotent like messages.attachments.closeHandle — response {released}, false when the handle was already gone. Handles are also released when their account's local data is deleted; the TTL backstops every other kind of abandonment. Documentation batch (contract revision 1.47): wire-frame registration lands with the connector implementation batch (§4.46 plan); see backupsExportParams.",
+      "description": "Release a snapshot file stream before its 300 s TTL (contract revision 1.47, §4.46, capability backup-export): idempotent like messages.attachments.closeHandle — response {released}, false when the handle was already gone. Handles are also released when their account's local data is deleted; the TTL backstops every other kind of abandonment. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
       "properties": {
         "fileHandle": { "$ref": "#/$defs/opaqueId" }
       }
@@ -1866,6 +1930,12 @@
             "STORAGE_UNAVAILABLE",
             "STORAGE_WRITE_FAILED",
             "STORAGE_READ_FAILED",
+            "BACKUP_EXPORT_ALREADY_RUNNING",
+            "BACKUP_ARTIFACT_MISSING",
+            "BACKUP_ARTIFACT_INVALID",
+            "BACKUP_SNAPSHOT_EXISTS",
+            "BACKUP_IO_FAILED",
+            "BACKUP_SNAPSHOT_MISSING",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",

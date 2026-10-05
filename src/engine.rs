@@ -1546,6 +1546,16 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "STORAGE_UNAVAILABLE",
     "STORAGE_WRITE_FAILED",
     "STORAGE_READ_FAILED",
+    // §4.46 Android local-backup export (engine backup-export-contract
+    // §10.7): the start-ladder and task-failure codes. ALREADY_RUNNING is
+    // deliberately not retryable — the desktop polls backups.exportStatus
+    // instead of re-starting; SNAPSHOT_EXISTS/IO_FAILED are transient disk
+    // races/failures the desktop may retry after the connector clears.
+    "BACKUP_EXPORT_ALREADY_RUNNING",
+    "BACKUP_ARTIFACT_MISSING",
+    "BACKUP_ARTIFACT_INVALID",
+    "BACKUP_SNAPSHOT_EXISTS",
+    "BACKUP_IO_FAILED",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.

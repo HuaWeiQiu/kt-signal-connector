@@ -253,6 +253,36 @@ impl ServiceError {
                     "the engine's storage service read failed",
                     true,
                 ),
+                // §4.46 Android local-backup export (engine backup-export
+                // contract §10.7): the engine's task faces pass through under
+                // their own literals. ALREADY_RUNNING/ARTIFACT_* are
+                // deterministic states (poll, rebuild, fix the builder);
+                // SNAPSHOT_EXISTS/IO_FAILED are transient disk conditions.
+                "BACKUP_EXPORT_ALREADY_RUNNING" => ApiError::new(
+                    "BACKUP_EXPORT_ALREADY_RUNNING",
+                    "a backup export task is already running for this account",
+                    false,
+                ),
+                "BACKUP_ARTIFACT_MISSING" => ApiError::new(
+                    "BACKUP_ARTIFACT_MISSING",
+                    "the backup export artifact is missing",
+                    false,
+                ),
+                "BACKUP_ARTIFACT_INVALID" => ApiError::new(
+                    "BACKUP_ARTIFACT_INVALID",
+                    "the backup export artifact is invalid",
+                    false,
+                ),
+                "BACKUP_SNAPSHOT_EXISTS" => ApiError::new(
+                    "BACKUP_SNAPSHOT_EXISTS",
+                    "a backup snapshot for this second already exists",
+                    true,
+                ),
+                "BACKUP_IO_FAILED" => ApiError::new(
+                    "BACKUP_IO_FAILED",
+                    "the backup export hit a filesystem failure",
+                    true,
+                ),
                 _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
             },
             ServiceError::Engine(EngineError::Unauthorized) => ApiError::new(
@@ -2166,6 +2196,15 @@ impl ConnectorService {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
         Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// backups.export / backups.exportStatus (contract revision 1.47, §4.46):
+    /// resolve the account and name the engine face. The upstream account key
+    /// is always the resolved signal number; the raw number never reaches the
+    /// host (the exportStatus projection strips the engine's `account` echo).
+    pub fn prepare_backups_account(&self, account_id: &str) -> Result<String, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        Ok(self.resolve_account(account_id)?.signal_account)
     }
 
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
@@ -4517,6 +4556,42 @@ pub struct HistoryImportStatusParams {
     pub account_id: String,
 }
 
+/// backups.export / backups.exportStatus (contract revision 1.47, §4.46):
+/// the account-addressed faces of the Android local-backup export.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsExportParams {
+    pub account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsExportStatusParams {
+    pub account_id: String,
+}
+
+/// backups.exportFile.open (contract revision 1.47, §4.46): `file` is the
+/// two-value snapshot-file enum — no path component is accepted anywhere.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsExportFileOpenParams {
+    pub account_id: String,
+    pub file: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsExportFileReadChunkParams {
+    pub file_handle: String,
+    pub offset: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsExportFileCloseHandleParams {
+    pub file_handle: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagesListParams {
@@ -5311,6 +5386,12 @@ fn validate_opaque_id(value: &str, field: &str) -> Result<(), ServiceError> {
     Ok(())
 }
 
+/// Opaque-id validation for faces the supervisor serves directly (the §4.46
+/// backup file handles): same ladder as the service-internal callers.
+pub fn validate_backup_handle(value: &str) -> Result<(), ServiceError> {
+    validate_opaque_id(value, "fileHandle")
+}
+
 /// signal-cli `AttachmentStore.sanitizeId` parity (ADR 0002 security gate 3).
 /// Upstream resolves an attachment id as
 /// `new File(attachmentsPath, sanitizeId(id))` where `sanitizeId` replaces
@@ -5423,8 +5504,10 @@ fn validate_attachment_send_payload(
 /// Encode standard padded base64 — the same canonical form
 /// `build_attachment_data_uri` re-encodes to and `base64_decode_to_vec`
 /// accepts. The chunked media delivery (ADR 0002) uses it per 256 KiB chunk:
-/// 349_528 characters worst case, bounded and frame-safe.
-fn base64_encode(data: &[u8]) -> String {
+/// 349_528 characters worst case, bounded and frame-safe. Public for the
+/// §4.46 test suite (the backup chunk encoder shares the alphabet; the
+/// function itself stays out of the host surface).
+pub(crate) fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {

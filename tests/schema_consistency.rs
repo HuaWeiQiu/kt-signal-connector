@@ -333,6 +333,18 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   maximum 4294967295 is enforced structurally by the `u32` type at params
 ///   deserialization (same situation as `stickerPackSetSyncParams.position`);
 ///   the schema `maximum` mirrors the type.
+/// - the §4.46 backup-export caps (contract 1.47): the artifact caps
+///   (`MAX_ARTIFACT_LINE_BYTES` 1 MiB / `MAX_ARTIFACT_LINES` 4M /
+///   `MAX_ARTIFACT_TOTAL_BYTES` 2 GiB / `MAX_ARTIFACT_BODY_BYTES` 128 KiB)
+///   bind the connector's own artifact build against the engine's §10.2
+///   gate — there is no params-side schema number to pair them with (the
+///   result mirrors the engine honestly). The wire-side bounds that exist —
+///   `backupsExportFileReadChunkParams.offset` `minimum` 0 (a `u64`, checked
+///   by the sequential-offset rule, not by a constant) and the `file` enum
+///   {metadata, main} (structural, enforced by the two-value match before
+///   the filesystem is touched) — are enforced by mechanism, not by a named
+///   constant. The chunk ceiling (`CHUNK_BYTES` 262_144) is pinned by the
+///   §4.46 integration test's `chunkBytes` assertion.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[

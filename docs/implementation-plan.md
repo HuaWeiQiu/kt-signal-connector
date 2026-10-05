@@ -2012,7 +2012,7 @@ connector change: the connector's storage-write faces (`conversations.setPinned`
 ever cross the connector boundary — so there is no passthrough surface the fix could regress;
 the existing pin/sync integration tests staying green is the regression check.
 
-### 4.46 Android local backup export: backups.export, backups.exportStatus, backups.exportFile.open/readChunk/closeHandle (contract revision 1.47, 2026-10-05) — documentation batch, connector implementation lands in the follow-up batch
+### 4.46 Android local backup export: backups.export, backups.exportStatus, backups.exportFile.open/readChunk/closeHandle (contract revision 1.47, 2026-10-05) — implemented 2026-10-06 (connector implementation batch)
 
 The connector side of the engine's Android local-backup export (kt-signal-engine
 `docs/backup-export-contract.md` §10 — the consumption wiring both sides document): the
@@ -2020,16 +2020,15 @@ connector exports its message store into a one-JSON-object-per-line artifact in 
 per-account data directory, starts the engine's background export task over that artifact,
 polls the task to a terminal state, and streams the produced snapshot's two files (metadata,
 main) back through a media-three-chain-shaped file face for delivery to an Android device.
-This revision is **documentation-first only**: the method shapes, lanes, capability tag,
-bounds, skip-count semantics, and error mapping below are the binding plan; the wire
-registration (request-frame method enum, dispatch literals, `FEATURE_CAPABILITIES` entry,
-structured-error whitelist additions, and the schema-consistency bound pairs) lands with the
-connector implementation batch, per the repo rule that the plan or schema changes before
-code. The schema registers the five params defs and their bounds now (descriptions marked
-"contract revision 1.47, §4.46"); the request-frame enum deliberately stays untouched this
-batch because the schema-consistency gate hard-diffs the method enum against dispatch
-literals in src/host.rs — adding enum entries without code would fail the suite, and code
-is out of scope here.
+The 2026-10-05 documentation batch registered the five params defs, lanes, capability tag,
+bounds, skip-count semantics, and error mapping; the 2026-10-06 implementation batch landed
+the wire registration (request-frame method enum, host dispatch literals,
+`FEATURE_CAPABILITIES` `backup-export` tag, the five engine structured-error codes in the
+`ENGINE_STRUCTURED_ERROR_CODES` allowlist plus the connector-local `BACKUP_SNAPSHOT_MISSING`
+`ApiError` literal, schema method-enum entries, allOf param branches, and error-enum entries)
+and the code: `src/backup_export.rs` (artifact builder + snapshot caretaker + backup file
+handle table), the supervisor faces, the registry routing, and the tests. The schema-consistency
+gates pass both ways: method enum ↔ dispatch literals, error enum ↔ `ApiError` literals.
 
 - IPC shape (engine-side ruling, backup-export-contract §10.1): file-artifact handoff + engine
   background task + connector polling. The engine's backup module is store-free by design, the
@@ -2100,20 +2099,25 @@ is out of scope here.
   `BACKUP_SNAPSHOT_EXISTS`; the connector clears and retries.
 - Skip-count semantics (connector-side, at artifact build; the engine has no skip face): every
   store row or column that cannot be projected into the v1 artifact line set is counted per
-  cause and reported through `backups.exportStatus` extension counters in the implementation
-  batch (`skippedReactions` from `message_events`, `skippedEdits` from `message_edits`,
+  cause and reported through `backups.exportStatus` extension counters (implemented as the
+  `SkipCounters` block merged into every status answer after the first successful build —
+  zeros included, absent before any build): `skippedReactions` from `message_events`,
+  `skippedEdits` from `message_edits`,
   `skippedQuotes` from `messages.quote_message_id/quote_snapshot`, `skippedAttachments` from
   `messages.attachments_json`, `skippedViewOnce` from view-once rows, `skippedStickers` from
   `messages.sticker_json`, `skippedSkeletonChats` for contacts-sync skeletons without peer
   identity (§6.5), `skippedBodyTruncated` for `messages.body_truncated = 1` rows — a
-  truncated preview must not become the canonical restored body). Exported rows: direction,
+  truncated preview must not become the canonical restored body — and `skippedRows` for
+  every other cause (system rows, remote/admin-delete tombstones, unconfirmed outgoing
+  rows, empty bodies, and items whose author does not resolve to a projected contact).
+  Exported rows: direction,
   sender resolution (`sender_id` → contact/group ref, self → 0), `sent_at` → `dateSent`,
   `received_at` → `dateReceived`, `body` (the persisted body, ≤ 128 KiB by the store bound),
   per-conversation `expire_timer_seconds` is a v1 gap (the engine's chat line set has no
   timer fields this batch — registered as an implementation-batch item with the engine's
   chat-timer frame face).
 - Capability tag `backup-export` joins `FEATURE_CAPABILITIES` and the handshake capability
-  assertion with the implementation batch; desktops gate all five methods on it.
+  assertion; desktops gate all five methods on it.
 - Error mapping plan (engine codes map verbatim into the connector structured whitelist —
   the whitelist edit itself is an implementation-batch code change): `BACKUP_EXPORT_ALREADY_RUNNING`
   (retryable=false — poll `backups.exportStatus` instead of retrying),
@@ -2127,6 +2131,48 @@ is out of scope here.
   Schema error-enum additions for the six codes land with the implementation batch together
   with their `ApiError` literals (the schema-consistency error-code gate hard-diffs the enum
   against code literals).
+
+Implementation batch record (2026-10-06) — deviations and decisions as built:
+
+- **Roster members ride the contact set.** A group's §4.39 roster (`extra.members`, `id` +
+  optional `uuid` per member) projects its non-self members into the contact set so group
+  chat items resolve their authors; one member's two spellings merge into one identity, and
+  the linked account's own membership form is skipped (self is the engine's reserved
+  recipient, never a contact row). The plan text above ("sender resolution → contact/group
+  ref") is realized exactly this way; the alternative — no roster contacts — would have
+  skipped every group item as `skippedRows`.
+- **`read` is never emitted on chat items.** The store has no inbound read state (contract
+  1.32 read receipts stamp only outgoing rows), so the artifact omits the optional `read`
+  field rather than fabricating it; restored Android reads stay unread, which matches what
+  this connector can honestly know.
+- **Counters publish with zeros.** The `SkipCounters` block merges into every
+  `exportStatus` answer after the first successful build (zeros included); before any build
+  the block stays absent — honest absence, never fabricated zeros.
+- **JVM/native group-id decode boundary.** The group id decode mirrors the engine's
+  `decode_group_id` (standard base64 of the 32-byte master key → 64-hex `masterKey`); an
+  id that does not decode to 32 bytes is a counted skeleton. On JVM/native signal-cli
+  engines (no `backup.export`) the start call answers `UPSTREAM_ERROR` (retryable) under
+  the §4.32 swap boundary — the export capability is a kt-engine feature, and this
+  connector build targets it; the JVM/native path fails honestly rather than guessing.
+- **Delete paths release backup handles.** All three `deleteLocalAccountData` completion
+  paths (idempotent replay, reconcile short-circuit, confirmed delete) clear the account's
+  live backup file handles beside the media handles (ADR 0002 gate 3 verbatim).
+- **Unknown start outcome.** `backup.export` is Mutating: an indeterminate outcome answers
+  `SEND_OUTCOME_UNKNOWN` (retryable=false) — the task may already be running upstream; the
+  desktop polls `backups.exportStatus` to learn the truth. An engine-down or
+  unknown-outcome status poll degrades to the store-side disk-truth projection (`idle` +
+  snapshot list) instead of inventing a task state.
+- **Author resolution covers every store spelling.** The sender reverse map registers each
+  contact's canonical forms plus the raw peer-key/roster strings under both conversation
+  namespaces (`stable_hash_id([accountId, kind, source])` is what the receive path stamps),
+  so an incoming row resolves whichever spelling its envelope carried; an unresolvable
+  author is a counted `skippedRows`, never a dangling reference.
+- Tests: `tests/backup_export.rs` (end-to-end over the fixture engine: artifact shape,
+  snapshot streaming, sentinel error ladder, group/Note-to-Self projection, per-cause skip
+  counters, `BACKUP_SNAPSHOT_MISSING` on the empty account), `src/backup_export.rs` unit
+  tests (identity parsing, timestamp shape, snapshot caretaker, handle-table ladder), the
+  handshake capability assertion in `tests/server_integration.rs`, and the
+  schema-consistency gates (methods, error codes, bounds inventory).
 
 ## 5. signal-cli Boundary
 

@@ -671,6 +671,41 @@ pub type MessageQuoteSnapshot = crate::engine::NormalizedQuote;
 /// engine normalization produces — inbound and outbound sends alike).
 pub type MessageAttachmentInfo = crate::engine::NormalizedAttachment;
 
+/// Contacts-cache row for the §4.46 backup export build (store columns
+/// verbatim; the builder decides what projects and what counts as skipped).
+pub struct BackupContactRow {
+    pub kind: &'static str,
+    pub peer_key: String,
+    pub title: String,
+    pub extra: Option<String>,
+}
+
+/// Conversation row the export chats/chat items over.
+pub struct BackupConversationRow {
+    pub id: String,
+    pub kind: &'static str,
+    pub peer_key: String,
+    pub title: String,
+}
+
+/// Message row flattened to the columns the v1 artifact (and its skip
+/// counters) can see. Raw JSON markers stay strings; the builder interprets
+/// them.
+pub struct BackupMessageRow {
+    pub direction: &'static str,
+    pub sender_id: String,
+    pub sent_at: u64,
+    pub received_at: Option<u64>,
+    pub body: Option<String>,
+    pub body_truncated: bool,
+    pub status: &'static str,
+    pub admin_deleted: bool,
+    pub has_quote: bool,
+    pub attachments_json: Option<String>,
+    pub rich_json: Option<String>,
+    pub sticker_json: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactSummary {
@@ -2485,6 +2520,161 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let rows = stmt
             .query_map(params![account_id, aci], |row| row.get::<_, String>(0))
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    // -------------------------------------------------------------------------
+    // Android local-backup export raw reads (contract revision 1.47, §4.46).
+    // The artifact builder walks the account's rows in bulk on the blocking
+    // pool; the read projections here return the stored columns verbatim
+    // (no per-row enrichment), because the builder — not the store — decides
+    // what projects into the artifact and what counts as skipped. The row
+    // structs live at module scope beside `MessageRecord`.
+    // -------------------------------------------------------------------------
+
+    /// One contacts-cache row: kind (`contact`/`group`), peer key, title, and
+    /// the opaque sync marker (`members` roster for groups).
+    pub fn backup_contact_rows(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<BackupContactRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, peer_key, title, extra FROM contacts
+                 WHERE account_id=?1 ORDER BY kind, peer_key",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok(BackupContactRow {
+                    kind: static_contact_kind(row.get::<_, String>(0)?),
+                    peer_key: row.get(1)?,
+                    title: row.get(2)?,
+                    extra: row.get(3)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// All conversation rows for the account (id/kind/peer/title only).
+    pub fn backup_conversation_rows(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<BackupConversationRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, peer_key, title FROM conversations
+                 WHERE account_id=?1 ORDER BY id",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok(BackupConversationRow {
+                    id: row.get(0)?,
+                    kind: static_kind(row.get::<_, String>(1)?),
+                    peer_key: row.get(2)?,
+                    title: row.get(3)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// All message rows of one conversation, oldest first — the artifact's
+    /// per-chat emission order. Bounded by the retention cap
+    /// (`MAX_MESSAGES_PER_CONVERSATION`); the builder's own caps fail closed
+    /// before any runaway can reach disk.
+    pub fn backup_message_rows(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<BackupMessageRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT direction, sender_id, sent_at, received_at, body, body_truncated,
+                        status, admin_deleted, quote_message_id, attachments_json,
+                        rich_json, sticker_json
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2
+                 ORDER BY sent_at ASC, id ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, conversation_id], |row| {
+                Ok(BackupMessageRow {
+                    direction: static_direction(row.get::<_, String>(0)?),
+                    sender_id: row.get(1)?,
+                    sent_at: row.get::<_, i64>(2)?.max(0) as u64,
+                    received_at: row.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u64),
+                    body: row.get(4)?,
+                    body_truncated: row.get::<_, i64>(5)? != 0,
+                    status: static_status(row.get::<_, String>(6)?),
+                    admin_deleted: row.get::<_, i64>(7)? != 0,
+                    has_quote: row.get::<_, Option<String>>(8)?.is_some(),
+                    attachments_json: row.get(9)?,
+                    rich_json: row.get(10)?,
+                    sticker_json: row.get(11)?,
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// Every `message_events` row of the account — v1 artifacts carry no
+    /// reaction face, so the builder counts them all as skipped.
+    pub fn count_reaction_events(&self, account_id: &str) -> Result<u64, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_events WHERE account_id=?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Every `message_edits` row of the account — v1 artifacts carry no edit
+    /// face (the row body is the latest body), so the builder counts them all
+    /// as skipped.
+    pub fn count_message_edits(&self, account_id: &str) -> Result<u64, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_edits WHERE account_id=?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// The observed aci ↔ peer-key pairs of the account: the builder hashes
+    /// both identity forms of a peer so an incoming row's `sender_id` resolves
+    /// no matter which spelling the receive envelope used.
+    pub fn backup_peer_identity_rows(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT aci, peer_key FROM peer_identities WHERE account_id=?1")
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
             .map_err(|error| StoreError::Unavailable(Some(error)))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;

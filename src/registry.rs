@@ -963,6 +963,53 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// backups.export / backups.exportStatus (contract revision 1.47, §4.46,
+    /// capability backup-export): account-addressed, routed to the owning
+    /// group's supervisor like every account-scoped face.
+    pub async fn export_local_backup(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.export_local_backup(account_id).await
+    }
+
+    pub async fn export_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.export_backup_status(account_id).await
+    }
+
+    /// backups.exportFile.open: account-addressed — the snapshot lives in the
+    /// owning group's engine data directory, so the owning group resolves it.
+    pub async fn export_file_open(
+        &self,
+        account_id: &str,
+        file: &str,
+    ) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.export_file_open(account_id, file).await
+    }
+
+    /// `readChunk` carries no accountId on the wire (§4.46 reuses the ADR 0002
+    /// shape): the process-wide backup handle table is the single-origin
+    /// authority, so any supervisor's table resolves it identically. The
+    /// first group serves.
+    pub async fn export_file_read_chunk(
+        &self,
+        file_handle: &str,
+        offset: u64,
+    ) -> Result<Value, ServiceError> {
+        self.groups[0]
+            .supervisor
+            .export_file_read_chunk(file_handle, offset)
+            .await
+    }
+
+    /// `closeHandle` — same process-wide-table reasoning as `readChunk`.
+    pub async fn export_file_close_handle(&self, file_handle: &str) -> Result<Value, ServiceError> {
+        self.groups[0]
+            .supervisor
+            .export_file_close_handle(file_handle)
+            .await
+    }
+
     pub async fn sync_contacts(
         &self,
         account_id: &str,
@@ -1087,6 +1134,10 @@ pub fn open_group_runtime(
     let media_ingest = effective_media_ingest(signal_cli_mode, media_ingest);
     let store = Arc::new(Store::open(state_dir, store_key)?);
     let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
+    // §4.46: one process-wide backup file-handle table for every group —
+    // `readChunk`/`closeHandle` carry no accountId, so handle resolution must
+    // not depend on which supervisor the registry routed a request through.
+    let backup_handles = Arc::new(crate::backup_export::BackupFileHandleTable::new());
     let mut slots = Vec::with_capacity(plan.groups.len());
     for entry in &plan.groups {
         let mut config = SignalCliConfig::new(signal_cli.clone(), entry.data_dir.clone());
@@ -1095,11 +1146,12 @@ pub fn open_group_runtime(
         config.mode = signal_cli_mode;
         config.media_ingest = media_ingest;
         config.expire_sweep_interval = expire_sweep_interval;
-        let supervisor = Arc::new(RuntimeSupervisor::new(
+        let supervisor = Arc::new(RuntimeSupervisor::with_backup_handles(
             config,
             store.clone(),
             entry.id.clone(),
             media_ingest.then(|| media_handles.clone()),
+            Some(backup_handles.clone()),
         ));
         supervisor.spawn_watchdog();
         supervisor.spawn_media_governor();

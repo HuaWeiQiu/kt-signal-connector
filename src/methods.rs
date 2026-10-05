@@ -143,6 +143,16 @@ pub const METHODS: &[MethodRow] = &[
     // state converges through the group-update receive projection.
     ("groups.update", Lane::Send, true, "send"),
     ("groups.quit", Lane::Send, true, "send"),
+    // Android local-backup export (contract revision 1.47, §4.46): the
+    // engine's background export task is account-mutating state, so the
+    // start face rides the send lane behind the reaction-class write-lane
+    // mutex and delete barrier; the status poll and the media-three-chain
+    // file face are bounded reads. Advertised through `backup-export`.
+    ("backups.export", Lane::Send, true, "accounts"),
+    ("backups.exportStatus", Lane::Read, false, "read"),
+    ("backups.exportFile.open", Lane::Read, false, "read"),
+    ("backups.exportFile.readChunk", Lane::Read, false, "read"),
+    ("backups.exportFile.closeHandle", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -199,9 +209,11 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// tag so an old connector answers a clean capability gap instead of
 /// `METHOD_NOT_ALLOWED`. `account-settings` and `blocked-conversations`
 /// (contract revision 1.46) mark the §4.45 account-record write faces and
-/// the blocked-list read face. They never join
-/// [`METHOD_NAMES`]: the schema request-frame method enum and the dispatch
-/// table describe real methods only.
+/// the blocked-list read face, and `backup-export` (contract revision 1.47)
+/// marks the §4.46 Android local-backup export face (`backups.export`,
+/// `backups.exportStatus`, the `backups.exportFile` three-chain). They never
+/// join [`METHOD_NAMES`]: the schema request-frame method enum and the
+/// dispatch table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
     "send-sticker",
@@ -214,6 +226,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-management",
     "account-settings",
     "blocked-conversations",
+    "backup-export",
 ];
 
 #[cfg(test)]
@@ -242,6 +255,10 @@ mod tests {
             "conversations.getPinned",
             "stickerPacks.getSyncs",
             "history.importStatus",
+            "backups.exportStatus",
+            "backups.exportFile.open",
+            "backups.exportFile.readChunk",
+            "backups.exportFile.closeHandle",
         ];
         let send_lane = [
             "messages.sendText",
@@ -268,6 +285,7 @@ mod tests {
             "groups.update",
             "groups.quit",
             "stickerPacks.setSync",
+            "backups.export",
         ];
         let mutating = [
             "messages.sendText",
@@ -296,6 +314,7 @@ mod tests {
             "groups.update",
             "groups.quit",
             "stickerPacks.setSync",
+            "backups.export",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {
