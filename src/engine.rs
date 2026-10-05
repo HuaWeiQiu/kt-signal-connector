@@ -1501,6 +1501,22 @@ async fn handle_upstream_line(
 /// engine boundary stays content-free. A local-only failure (e.g. listAccounts
 /// never touches the network) cannot match, so the classification is safe to
 /// trust as "the server rejected this device's credentials".
+/// Upstream (signal-cli JSON-RPC) error shapes that mean the LOCAL account's
+/// linked-device credential is dead — classified `EngineError::Unauthorized`
+/// and attributed to the request's account (contract 1.21 §4.17). Two
+/// surfaces, one root cause:
+///
+/// 1. live authorization failure: upstream wraps `AuthorizationFailedException`
+///    in an UnexpectedErrorException (-32603) ("Authorization failed!").
+/// 2. post-mortem short-circuit: after the first authorization failure
+///    signal-cli persists `registered=false` (signal-cli
+///    `AccountHelper.java:119`) and every later account-scoped command fails
+///    LOCALLY with `UserErrorException("User <account> is not registered.")`
+///    (`App.java:342` wrapping `NotRegisteredException`) before any network
+///    call — the 0-17 ms instant-failure form. Matched by the strict prefix/
+///    suffix pair; the recipient-level "The user <id> is not registered."
+///    (unblock/updateContact/sendPoll* family) starts "The user " and must
+///    NOT mark the account unlinked.
 fn upstream_error_is_unauthorized(error: Option<&Value>) -> bool {
     error
         .and_then(|value| value.get("message"))
@@ -1508,6 +1524,7 @@ fn upstream_error_is_unauthorized(error: Option<&Value>) -> bool {
         .is_some_and(|message| {
             message.contains("AuthorizationFailedException")
                 || message.contains("Authorization failed")
+                || (message.starts_with("User ") && message.ends_with(" is not registered."))
         })
 }
 
@@ -3499,6 +3516,83 @@ mod tests {
             event_rx.recv().await.unwrap(),
             EngineEvent::AccountUnauthorized { ref account } if account == "+15555550100"
         ));
+    }
+
+    /// The post-mortem short-circuit form ("User <account> is not
+    /// registered.", signal-cli App.java:342 after persisted
+    /// `registered=false`) classifies as Unauthorized and is attributed to
+    /// the account exactly like the live authorization-failure form.
+    #[tokio::test]
+    async fn unregistered_post_mortem_error_is_classified_and_attributed() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-1".to_string(),
+            PendingRequest {
+                class: CallClass::ReadOnly,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-1",
+            "error": {
+                "code": -1,
+                "message": "User +15555550100 is not registered."
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Unauthorized));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::AccountUnauthorized { ref account } if account == "+15555550100"
+        ));
+    }
+
+    /// The recipient-level form ("The user <id> is not registered.",
+    /// unblock/updateContact/sendPoll* family) targets a CONTACT, not the
+    /// local account: it must stay a generic upstream error and must not
+    /// emit an account-unauthorized event.
+    #[tokio::test]
+    async fn recipient_not_registered_error_stays_unclassified() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-1".to_string(),
+            PendingRequest {
+                class: CallClass::ReadOnly,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-1",
+            "error": {
+                "code": -1,
+                "message": "The user +15555550200 is not registered."
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
+        assert!(event_rx.try_recv().is_err());
     }
 
     /// Any other upstream error keeps the generic Upstream classification and

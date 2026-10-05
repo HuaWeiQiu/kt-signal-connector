@@ -85,6 +85,7 @@ STDERR_MARKER = SIGNAL_DATA_DIR / ".fixture-stderr-websocket-error"
 FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
 FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-count"
 AUTH_FAILED_MARKER = SIGNAL_DATA_DIR / ".fixture-auth-failed-user-status"
+UNREGISTERED_MARKER = SIGNAL_DATA_DIR / ".fixture-unregistered-user-status"
 SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
@@ -835,6 +836,24 @@ for line in sys.stdin:
                 "error": {
                     "code": -32603,
                     "message": "Failed to send message: Authorization failed! (AuthorizationFailedException)",
+                },
+            }
+            emit_json(response)
+            continue
+        if UNREGISTERED_MARKER.exists():
+            # Post-mortem unlink form (contract 1.21 §4.17, C2 widening):
+            # after the first authorization failure signal-cli persists
+            # registered=false and every later account-scoped command fails
+            # LOCALLY with UserErrorException "User <account> is not
+            # registered." (USER_ERROR = -1) before any network call — the
+            # 0-17 ms instant-failure form. Must classify as Unauthorized
+            # exactly like the live form above.
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": f"User {LINKED_ACCOUNT} is not registered.",
                 },
             }
             emit_json(response)

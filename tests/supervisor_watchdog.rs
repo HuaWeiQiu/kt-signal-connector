@@ -220,6 +220,49 @@ async fn unauthorized_ping_marks_account_device_unlinked_without_restart() {
     supervisor.shutdown().await.unwrap();
 }
 
+/// The post-mortem unlink form: after the first authorization failure
+/// signal-cli persists `registered=false` and every later command fails
+/// locally with "User <account> is not registered." (USER_ERROR -1) — the
+/// 0-17 ms instant-failure shape that previously slipped past the
+/// unauthorized classification and churned restarts forever. Same contract
+/// 1.21 outcome as the live form: pid stays put, account flips
+/// `device_unlinked`.
+#[tokio::test]
+async fn unregistered_post_mortem_ping_marks_account_device_unlinked_without_restart() {
+    let temp = TempDir::new().unwrap();
+    {
+        let seed = test_store(temp.path());
+        seed.upsert_account_from_signal(
+            "+15555550100",
+            Some(1),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap();
+    }
+    let (supervisor, data_dir) = watchdog_supervisor(&temp);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join(".fixture-unregistered-user-status"), "").unwrap();
+
+    let pid = supervisor.start().await.unwrap().pid.unwrap();
+    // Several watchdog ticks: post-mortem failures never count as ping failures.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        supervisor.status().await.pid,
+        Some(pid),
+        "a dead credential must not churn engine restarts"
+    );
+
+    let store = test_store(temp.path());
+    let account = store
+        .list_accounts()
+        .unwrap()
+        .into_iter()
+        .find(|account| account.state == "device_unlinked")
+        .expect("unregistered ping must mark the account device_unlinked");
+    assert_eq!(account.unread_count, 0);
+    supervisor.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn watchdog_leaves_a_healthy_engine_alone() {
     let temp = TempDir::new().unwrap();

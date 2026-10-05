@@ -705,6 +705,21 @@ Connector behavior, all inside the existing process/watchdog boundary (no new IP
 - upstream error classification: engine responses carrying
   `AuthorizationFailedException` / `Authorization failed` map to
   `EngineError::Unauthorized` instead of a generic upstream error.
+  Post-mortem widening (2026-10-05, field incident): after the first
+  authorization failure signal-cli persists `registered=false`
+  (`AccountHelper.java:119`) and every later account-scoped command fails
+  LOCALLY with `UserErrorException("User <account> is not registered.")`
+  (`App.java:342` wrapping `NotRegisteredException`; JSON-RPC
+  `USER_ERROR = -1`) before any network call — the 0-17 ms instant-failure
+  shape. That text previously missed the classification, so a phone-side
+  unlink churned watchdog restarts forever and the desktop only saw generic
+  `UPSTREAM_ERROR`. The classification now also matches the strict
+  `User … is not registered.` prefix/suffix pair; the recipient-level
+  `The user <id> is not registered.` (unblock/updateContact/sendPoll*
+  family) deliberately does NOT match (starts "The user ") so a bad contact
+  can never flip the account state. Covered by the
+  `.fixture-unregistered-user-status` marker and two engine unit tests plus
+  a `supervisor_watchdog` integration test.
 - attribution: because `send`-family failures arrive without a caller context, the engine
   attaches the owning account (from the request params' `account` field) to the failure and
   emits a new internal `AccountUnauthorized { account }` event; requests with no account
