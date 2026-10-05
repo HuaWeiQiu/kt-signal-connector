@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.43 (2026-10-05)
+- Contract revision: 1.44 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1790,6 +1790,41 @@ the wire.
   is shared with every chat, and voice notes are a prior batch's boundary); no separate
   Note-to-Self entry page or pin exists here or upstream — the entry point is the contact list
   row plus search, exactly like the official client.
+
+### 4.43 Contacts-list `isSelf`: the Note-to-Self marker on the compose contact list (contract revision 1.44, 2026-10-05)
+
+§4.42 (contract 1.43) put the self skeleton on the conversations face but left the entry point
+unmarked where the official flow begins: the compose/new-chat contact list. The self entry has
+ridden the contacts cache since 1.43 (the sync no longer drops it, §6.5), so `contacts.list`
+already returns the row — but with no marker the desktop cannot tell it apart from any other
+contact and cannot render the localized "Note to Self" title/avatar the official client shows in
+the composer. The marker must agree across the two faces: they are two views of the same entry,
+and a desktop that cross-references them (list row → conversation skeleton) would otherwise see
+self-ness appear on one face and vanish on the other.
+
+- `isSelf` on every contacts.list row (wire key `isSelf`, always serialized — the §4.42
+  convention, no skip-when-false key-absence ambiguity): true exactly when the row is a
+  `kind='contact'` entry whose `peerKey` equals the linked account's number — the self entry the
+  1.43 sync admission put in the cache. Computed at read time in the store's contact projection
+  from the row plus the account record — zero migration, zero storage, and the cached self row
+  needs no rewrite; the predicate is the same number match the conversation summaries run, shared
+  as one helper so the two faces cannot drift apart.
+- Number-based by the §4.24 recorded boundary: the own ACI is not queryable on either engine's
+  jsonRpc surface (`listAccounts` returns numbers only), so a UUID-keyed contact row cannot be
+  marked — the contacts-sync address ladder prefers the number, which is the form the self entry
+  carries, exactly as on the conversations face. Group rows (`kind='group'`) are never self: the
+  predicate keeps the kind gate regardless of what a group id collides with.
+- The row's `title` stays raw material (the account's own profile name, unchanged since 1.43);
+  the desktop localizes the Note-to-Self presentation from `isSelf`, and the connector ships no
+  copy in any language (the §4.42 material-vs-copy split).
+- Purely additive on a free-form result face (the §4.37/§4.40 precedent): the result row gains
+  one always-present key; pre-1.44 hosts that ignore unknown keys read every other field
+  byte-identically. No new method, event, error code, or capability key; no cursor change (the
+  page key stays `(kind, peer_key)`); no store schema-version bump and no `contacts.sync` change
+  — the cache row stores no `isSelf` column, so a resync neither computes nor erases the marker
+  (it does not exist at rest). The list assembly stays store-only on the read lane (§6.5): the
+  account's own number is read from the account row through the already-held connection guard —
+  one lookup per page, the same discipline the §4.42 summary list applies.
 
 ## 5. signal-cli Boundary
 

@@ -870,6 +870,113 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.44 (§4.43) end to end: the compose contact list marks exactly
+/// the linked account's own entry `isSelf`, the bare bool is always
+/// serialized on every row (no skip-when-false key absence), and the marker
+/// is same-source with the conversations face — both lists derive from the
+/// one shared number predicate and mark the same entry, so a desktop
+/// cross-referencing a list row against its conversation skeleton sees the
+/// same self-ness on both faces (identical title material, the §4.42 split).
+#[tokio::test]
+async fn contacts_list_marks_the_own_entry_is_self_same_source_with_conversations() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [13_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ContactsSelf" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The cached-counts answer proves the sync transaction committed, so the
+    // listed rows below are deterministic.
+    let synced = request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(synced["result"]["contactCount"], 3);
+
+    let listed = request(
+        &mut client,
+        "contacts-list",
+        "contacts.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let contact_rows = listed["result"]["items"].as_array().unwrap();
+    let self_contacts: Vec<_> = contact_rows
+        .iter()
+        .filter(|row| row["isSelf"] == true)
+        .collect();
+    assert_eq!(self_contacts.len(), 1, "contact rows: {contact_rows:?}");
+    assert_eq!(self_contacts[0]["kind"], "contact");
+    assert_eq!(self_contacts[0]["peerKey"], "+15555550100");
+    assert_eq!(self_contacts[0]["title"], "Test User");
+    // The bare bool is always serialized: every row carries the key, and
+    // every non-self row — peer contacts and the group alike — reads false.
+    for row in contact_rows {
+        assert!(
+            row.get("isSelf").is_some(),
+            "isSelf must always serialize: {row:?}"
+        );
+        if row["peerKey"] != "+15555550100" {
+            assert_eq!(row["isSelf"], false, "non-self row: {row:?}");
+        }
+    }
+
+    // Same-source consistency: the conversations face marks exactly one row
+    // too, and both marked rows are the same entry — the shared title
+    // material (the account's own profile name) on both faces.
+    let conversations = request(
+        &mut client,
+        "conv-list-consistency",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let conv_rows = conversations["result"]["items"].as_array().unwrap();
+    let self_convs: Vec<_> = conv_rows
+        .iter()
+        .filter(|row| row["isSelf"] == true)
+        .collect();
+    assert_eq!(self_convs.len(), 1, "conversation rows: {conv_rows:?}");
+    assert_eq!(self_convs[0]["type"], "direct");
+    assert_eq!(self_convs[0]["title"], self_contacts[0]["title"]);
+    for row in conv_rows {
+        assert!(row.get("isSelf").is_some());
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Phase 0 happy-path smoke gap (docs/optimization-plan.md): the existing
 /// phase2 test proves receive persistence through `messages.list`, but nothing
 /// asserted the normalized host event stream, and `messages.getText` had no

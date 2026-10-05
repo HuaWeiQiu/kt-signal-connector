@@ -490,14 +490,32 @@ fn u32_is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+/// The number-only self match both wire faces share (§4.42/§4.43): the peer
+/// key equals the linked account's own number. Number-based by the §4.24
+/// recorded boundary — the own ACI is not queryable on either engine's
+/// jsonRpc surface, so a UUID-shaped peer key cannot be marked.
+fn peer_key_is_self(peer_key: &str, signal_account: Option<&str>) -> bool {
+    signal_account == Some(peer_key)
+}
+
 /// Contract 1.43 (§4.42): the Note-to-Self predicate for a conversation row —
 /// the direct chat whose peer key is the linked account's own number. Pure
 /// read-time derivation over (kind, peer_key) plus the account record; no
 /// column exists because the answer follows the keys it derives from. The
-/// number-only match is the §4.24 recorded boundary (the own ACI is not
-/// queryable on either engine's jsonRpc surface), and groups are never self.
+/// number-only match is the shared [`peer_key_is_self`] boundary, and groups
+/// are never self.
 fn summary_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> bool {
-    kind == "direct" && signal_account == Some(peer_key)
+    kind == "direct" && peer_key_is_self(peer_key, signal_account)
+}
+
+/// Contract 1.44 (§4.43): the Note-to-Self predicate for a contacts-cache row
+/// — the `kind='contact'` entry whose peer key is the linked account's own
+/// number. Same read-time derivation and the same shared [`peer_key_is_self`]
+/// match as the conversation summaries, so the compose list and the
+/// conversation list cannot disagree about the same entry; the kind gate
+/// keeps a group row unmarked no matter what its group id collides with.
+fn contact_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> bool {
+    kind == "contact" && peer_key_is_self(peer_key, signal_account)
 }
 
 /// One aggregated reaction pill projected onto a message row (contract
@@ -660,6 +678,17 @@ pub struct ContactSummary {
     pub kind: &'static str,
     pub peer_key: String,
     pub title: String,
+    /// Contract 1.44 (§4.43): true exactly for the linked account's own entry
+    /// — the `kind='contact'` row whose peer key equals the account's number,
+    /// the Note-to-Self entry the 1.43 sync admission keeps in the cache.
+    /// Computed at read time from the row plus the account record (zero
+    /// storage), never persisted, through the same number match the
+    /// conversation summaries run. The match is number-based by the §4.24
+    /// recorded boundary: the own ACI is not queryable upstream, so a
+    /// UUID-keyed contact row cannot be marked. Groups are never self. The
+    /// row's title stays raw contact material (the account's own profile
+    /// name); the desktop localizes the presentation from this flag.
+    pub is_self: bool,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -3859,6 +3888,17 @@ impl Store {
         let cursor_peer_key = decoded.as_ref().map(|value| value.1.as_str());
         let like = query.map(escape_like);
         let conn = self.lock_conn()?;
+        // Contract 1.44 (§4.43): is_self derives the row from the account's
+        // own number at read time — one lookup per page, through the already
+        // held connection guard (the §4.42 summary-list discipline).
+        let signal_account: Option<String> = conn
+            .query_row(
+                "SELECT signal_account FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, peer_key, title
@@ -3889,10 +3929,13 @@ impl Store {
                     fetch as i64,
                 ],
                 |row| {
+                    let kind = static_contact_kind(row.get::<_, String>(1)?);
+                    let peer_key: String = row.get(2)?;
                     Ok(ContactSummary {
                         id: row.get(0)?,
-                        kind: static_contact_kind(row.get::<_, String>(1)?),
-                        peer_key: row.get(2)?,
+                        kind,
+                        is_self: contact_is_self(kind, &peer_key, signal_account.as_deref()),
+                        peer_key,
                         title: row.get(3)?,
                     })
                 },
@@ -5374,6 +5417,112 @@ mod tests {
             .collect();
         assert_eq!(other_marked.len(), 1);
         assert_eq!(other_marked[0].id, other_own.id);
+    }
+
+    /// Contract 1.44 (§4.43): `contacts.list` marks exactly the linked
+    /// account's own entry — the `kind='contact'` row whose peer key is the
+    /// account's number — and never a sibling contact, a UUID-keyed row (the
+    /// §4.24 boundary), a group, or another account's entry. The marker is a
+    /// read-time projection: the cache row stores nothing, a resync that
+    /// rewrites the row in place neither computes nor erases it, and the
+    /// cursor path marks its page rows like the first page does.
+    #[test]
+    fn contact_list_is_self_marks_only_the_own_contact_entry() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550100",
+                "Test User",
+                None,
+                10,
+            )
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Alice", None, 10)
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "Aci Peer",
+                None,
+                10,
+            )
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "group", "Z3JvdXAtaWQ=", "Group", None, 10)
+            .unwrap();
+
+        let listed = store.list_contacts(&account.id, None, 10, None).unwrap();
+        let marked: Vec<_> = listed.items.iter().filter(|row| row.is_self).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].kind, "contact");
+        assert_eq!(marked[0].peer_key, "+15555550100");
+        // Title material is the account's own profile name (§4.42); the
+        // desktop localizes the Note-to-Self presentation from the marker.
+        assert_eq!(marked[0].title, "Test User");
+
+        // A resync rewrites the row in place (upsert, same title) and the
+        // marker is unchanged — nothing about it is stored.
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Alice A.", None, 11)
+            .unwrap();
+        let relisted = store.list_contacts(&account.id, None, 10, None).unwrap();
+        let still_marked: Vec<_> = relisted.items.iter().filter(|row| row.is_self).collect();
+        assert_eq!(still_marked.len(), 1);
+        assert_eq!(still_marked[0].peer_key, "+15555550100");
+        assert_eq!(relisted.items.len(), listed.items.len());
+
+        // Cursor pagination derives the same marker on the second page: the
+        // account lookup rides whichever page the guard is held for.
+        let first = store.list_contacts(&account.id, None, 2, None).unwrap();
+        assert_eq!(first.items.len(), 2);
+        let cursor = first.next_cursor.clone().unwrap();
+        let second = store
+            .list_contacts(&account.id, None, 10, Some(&cursor))
+            .unwrap();
+        for row in second.items.iter().chain(first.items.iter()) {
+            assert_eq!(row.is_self, row.peer_key == "+15555550100");
+        }
+
+        // The same peer key means different things per owning account: under
+        // the second account, +15555550199 is its own entry, while under the
+        // first account it is just another contact.
+        let other = store
+            .upsert_account_from_signal("+15555550199", Some(2), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_contact(&other.id, "contact", "+15555550199", "Other Self", None, 10)
+            .unwrap();
+        let other_listed = store.list_contacts(&other.id, None, 10, None).unwrap();
+        let other_marked: Vec<_> = other_listed
+            .items
+            .iter()
+            .filter(|row| row.is_self)
+            .collect();
+        assert_eq!(other_marked.len(), 1);
+        assert_eq!(other_marked[0].peer_key, "+15555550199");
+
+        store
+            .upsert_contact(&account.id, "contact", "+15555550199", "Bob", None, 10)
+            .unwrap();
+        let account_view = store.list_contacts(&account.id, None, 10, None).unwrap();
+        assert_eq!(
+            account_view
+                .items
+                .iter()
+                .filter(|row| row.is_self)
+                .map(|row| row.peer_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["+15555550100"]
+        );
     }
 
     fn test_store_key() -> StoreKey {

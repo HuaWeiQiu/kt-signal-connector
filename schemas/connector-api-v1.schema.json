@@ -695,6 +695,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "limit"],
+      "description": "Read lane over the local contacts cache (§6.5: never calls upstream); ordered by (kind, peerKey), page-bounded, cursor-resumable. Contract 1.44 (§4.43): every result row carries isSelf (always-serialized boolean): true exactly for the kind='contact' entry whose peerKey equals the account's own number — the Note to Self entry the 1.43 contacts sync keeps in the cache, so the desktop can render the localized Note to Self title/avatar in the compose list. Number-based by the §4.24 boundary (the own ACI is not queryable upstream, a UUID-keyed row cannot be marked); group rows are never self. The self row's title stays raw material (the account's own profile name); the desktop localizes the presentation from isSelf — the connector ships no copy. Read-time derivation over the row plus the account record: nothing is stored on the cache row, contacts.sync is unchanged, and the page cursor key stays (kind, peerKey).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "query": {
