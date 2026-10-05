@@ -675,6 +675,20 @@ pub enum ControlReceive {
     GroupTimerUpdate {
         expire_timer_seconds: u32,
     },
+    /// Call signaling (contract 1.51, §4.49): the engine's `callMessage`
+    /// envelope projection — the official Content.callMessage=3 face. The
+    /// connector is a signaling pipe: `call_id` is the 1:1 call identity the
+    /// RingRTC frames share, `signal_type` mirrors the projected frame
+    /// family (`offer` / `answer` / `ice` / `busy` / `hangup`, `opaque`
+    /// when only the modern opaque payload rides), and `payload` is the
+    /// bounded signaling material passed through byte-for-byte — never
+    /// parsed or interpreted connector-side (the engine projects, the
+    /// RingRTC state machine consumes).
+    Call {
+        call_id: u64,
+        signal_type: &'static str,
+        payload: Value,
+    },
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -707,6 +721,15 @@ const MAX_STICKER_EMOJI_CHARS: usize = 32;
 /// resulting `groupName` truncates to the same 64-char budget the envelope's
 /// `sourceName` peer-name material uses before it rides the rich payload.
 const GROUP_UPDATE_TITLE_MIRROR_CHARS: usize = 64;
+/// Call-signaling bounds (contract 1.50, §4.48): the engine's legacy-frame
+/// projection (`offer`/`answer`/`iceUpdate`/`busy`/`hangup` id fields) and
+/// the bounded opaque payloads the connector forwards without parsing. The
+/// base64 cap is the same coarse guard the §4.12 attachment envelope rides
+/// (a RingRTC SDP offer/ICE batch stays orders of magnitude below it); the
+/// frame count caps the legacy `iceUpdate` list projection.
+const MAX_CALL_ID: u64 = u32::MAX as u64;
+const MAX_CALL_OPAQUE_CHARS: usize = 3 * 1024 * 1024;
+const MAX_CALL_ICE_FRAMES: usize = 64;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -2075,6 +2098,78 @@ fn normalized_admin_delete(value: &Value) -> Option<ControlReceive> {
     })
 }
 
+/// Call signaling (contract 1.50, §4.48): the engine's `callMessage` face —
+/// the official Content.callMessage=3 projection. The modern line rides
+/// `opaque` (base64 + urgency); the legacy 1:1 frames project when present.
+/// A blank CallMessage (nothing projectable) routes nothing — the envelope
+/// falls through to the plain skip like any other unclaimed face, never
+/// invented into content.
+fn normalized_call_message(call: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
+    // The modern wire face first: the opaque signaling payload is the
+    // framing the current desktop ships; the engine already dropped a blank
+    // one (宁缺勿错), so an `opaque` key here always carries material.
+    if let Some(data) = call.get("opaque").and_then(Value::as_str) {
+        if data.is_empty() || data.chars().count() > MAX_CALL_OPAQUE_CHARS {
+            return None;
+        }
+        return Some(ControlReceive::Call {
+            call_id: 0,
+            signal_type: "opaque",
+            payload: json!({
+                "opaque": data,
+                "urgency": call.get("urgency").and_then(Value::as_str).unwrap_or("droppable"),
+                "destinationDeviceId": call.get("destinationDeviceId").cloned().unwrap_or(Value::Null),
+            }),
+        });
+    }
+    // The legacy 1:1 frames, present-keyed: the id is the frame's call
+    // identity, the payload is the projected face verbatim. An unparseable
+    // id fails the whole face (宁缺勿错 — a frame without a call id has no
+    // state machine to address).
+    let call_id = |key: &str| -> Option<u64> {
+        call.get(key)
+            .and_then(Value::as_object)
+            .and_then(|frame| frame.get("id"))
+            .and_then(Value::as_u64)
+            .filter(|id| *id > 0 && *id <= MAX_CALL_ID)
+    };
+    for (key, signal_type) in [
+        ("offer", "offer"),
+        ("answer", "answer"),
+        ("busy", "busy"),
+        ("hangup", "hangup"),
+    ] {
+        if let Some(id) = call_id(key) {
+            let payload = json!({ key: call.get(key) });
+            return Some(ControlReceive::Call {
+                call_id: id,
+                signal_type,
+                payload,
+            });
+        }
+    }
+    // The legacy ICE list: the first frame names the call, the whole bounded
+    // list rides the payload.
+    if let Some(ice) = call.get("iceUpdate").and_then(Value::as_array) {
+        let first = ice.first().and_then(Value::as_object).and_then(|frame| {
+            frame
+                .get("id")
+                .and_then(Value::as_u64)
+                .filter(|id| *id > 0 && *id <= MAX_CALL_ID)
+        });
+        if let Some(id) = first {
+            let mut frames = ice.to_vec();
+            frames.truncate(MAX_CALL_ICE_FRAMES);
+            return Some(ControlReceive::Call {
+                call_id: id,
+                signal_type: "ice",
+                payload: json!({ "iceUpdate": frames }),
+            });
+        }
+    }
+    None
+}
+
 fn normalize_receive(params: &Value) -> Result<Option<NormalizedReceive>, EngineError> {
     let normalized = normalize_receive_fields(params)?;
     // Identifier fields route conversations; an oversized one would exhaust the receive
@@ -2192,6 +2287,22 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             control: ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds,
             },
+        });
+    }
+    // Call signaling (contract 1.51, §4.49): the engine's callMessage
+    // projection routes like every body-less control face — an empty or
+    // out-of-budget face returns None and the envelope falls through to the
+    // plain skip.
+    if let Some(call) = envelope
+        .get("callMessage")
+        .and_then(Value::as_object)
+        .and_then(normalized_call_message)
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: envelope_peer_source(envelope),
+            group_id: None,
+            control: call,
         });
     }
     // Ephemeral typing indicator.
@@ -4403,6 +4514,108 @@ mod tests {
             panic!("expected a view-once open control");
         };
         assert_eq!(timestamp, 0);
+    }
+
+    /// Call signaling (contract 1.50, §4.48): the engine's `callMessage`
+    /// envelope face routes as a body-less control receive — the modern
+    /// opaque payload first, the legacy frames keyed by presence, ICE by
+    /// its list head. An out-of-budget or blank face routes nothing and the
+    /// envelope falls through to the plain skip.
+    #[test]
+    fn call_message_envelopes_route_to_call_controls() {
+        let routing = |envelope: serde_json::Value| {
+            control_routing(envelope.as_object().unwrap()).map(|routing| routing.control)
+        };
+        let envelope = |call: serde_json::Value| {
+            json!({
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "sourceDevice": 1,
+                "callMessage": call,
+            })
+        };
+
+        // The modern opaque face: id-less by design — the RingRTC payload
+        // carries its own call identity; urgency defaults to the official
+        // droppable when the engine leaves it out.
+        let Some(ControlReceive::Call {
+            call_id,
+            signal_type,
+            payload,
+        }) = routing(envelope(json!({ "opaque": "c2RwLW9mZmVy" })))
+        else {
+            panic!("expected a call control");
+        };
+        assert_eq!(call_id, 0);
+        assert_eq!(signal_type, "opaque");
+        assert_eq!(payload["opaque"], "c2RwLW9mZmVy");
+        assert_eq!(payload["urgency"], "droppable");
+        assert_eq!(payload["destinationDeviceId"], Value::Null);
+
+        // urgency + destinationDeviceId pass through verbatim when present.
+        let Some(ControlReceive::Call { payload, .. }) = routing(envelope(json!({
+            "opaque": "c2RwLWFuc3dlcg==",
+            "urgency": "handleImmediately",
+            "destinationDeviceId": 2u64,
+        }))) else {
+            panic!("expected a call control");
+        };
+        assert_eq!(payload["urgency"], "handleImmediately");
+        assert_eq!(payload["destinationDeviceId"], 2u64);
+
+        // The legacy frames: the id is the frame's call identity, the
+        // projected face rides verbatim under its own key.
+        for (key, signal_type, id) in [
+            ("offer", "offer", 7u64),
+            ("answer", "answer", 7u64),
+            ("busy", "busy", 7u64),
+            ("hangup", "hangup", 7u64),
+        ] {
+            let Some(ControlReceive::Call {
+                call_id,
+                signal_type: kind,
+                payload,
+            }) = routing(envelope(json!({ key: { "id": id, "opaque": "eA==" } })))
+            else {
+                panic!("expected a call control for {key}");
+            };
+            assert_eq!(call_id, id);
+            assert_eq!(kind, signal_type);
+            assert_eq!(payload[key]["id"], id);
+            assert_eq!(payload[key]["opaque"], "eA==");
+        }
+
+        // The legacy ICE list: the first frame names the call, the list
+        // rides bounded.
+        let Some(ControlReceive::Call {
+            call_id,
+            signal_type,
+            payload,
+        }) = routing(envelope(json!({
+            "iceUpdate": [
+                { "id": 7u64, "opaque": "aWNlLTE=" },
+                { "id": 7u64, "opaque": "aWNlLTI=" },
+            ],
+        })))
+        else {
+            panic!("expected a call control");
+        };
+        assert_eq!(call_id, 7);
+        assert_eq!(signal_type, "ice");
+        assert_eq!(payload["iceUpdate"].as_array().unwrap().len(), 2);
+
+        // Blank / unaddressable faces route nothing: no opaque, frames
+        // without a parsable id, an id beyond the u32 call-id face, and an
+        // over-budget opaque payload.
+        assert!(routing(envelope(json!({}))).is_none());
+        assert!(routing(envelope(json!({ "offer": { "opaque": "eA==" } }))).is_none());
+        assert!(routing(envelope(json!({ "offer": { "id": "x" } }))).is_none());
+        assert!(
+            routing(envelope(json!({ "offer": { "id": 4294967296u64 } }))).is_none(),
+            "the call-id face is u32 — beyond it the frame is unaddressable"
+        );
+        let oversized = "A".repeat(3 * 1024 * 1024 + 1);
+        assert!(routing(envelope(json!({ "opaque": oversized }))).is_none());
     }
 
     /// Contract 1.38 (§4.36): a metadata-only view-once marker

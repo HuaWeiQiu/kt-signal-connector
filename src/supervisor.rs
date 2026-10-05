@@ -20,20 +20,21 @@ use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsUpdateConfigurationParams,
-    AttachmentSendTarget, AvatarDownload, BlockedConversations, ConnectorService,
-    ContactsSyncOutcome, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
-    ConversationsGetPinnedParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, GroupDetails,
-    GroupsQuitParams, GroupsUpdateParams, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
-    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget,
-    PinnedConversations, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, account_limit_error,
-    blocked_conversations_result, pinned_conversations_result, sticker_pack_syncs_result,
-    store_get_group, store_get_message_text, store_list_contacts, store_list_conversations,
-    store_list_messages, store_search_messages, validate_account_delete_operation_id,
+    AttachmentSendTarget, AvatarDownload, BlockedConversations, CallsSendSignalParams,
+    ConnectorService, ContactsSyncOutcome, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
+    ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsUpdateParams,
+    HostSideEvent, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MessagesReportSpamParams,
+    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, ReportSpamFailure,
+    ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    account_limit_error, blocked_conversations_result, pinned_conversations_result,
+    sticker_pack_syncs_result, store_get_group, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2433,6 +2434,62 @@ impl RuntimeSupervisor {
             ))),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// calls.sendSignal (contract revision 1.50, §4.48, capability
+    /// call-signaling): the shape gate + resolution under the service lock,
+    /// then the mutating engine `sendCallMessage` call — the reaction-class
+    /// discipline verbatim (same-account mutex, delete barrier, an unknown
+    /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried). The
+    /// signaling envelope travels byte-for-byte: the connector neither
+    /// parses nor logs the payload. The result is the engine's envelope
+    /// timestamp, echoed as `{sentAt}` — the send ack, not call state (the
+    /// connector keeps none).
+    pub async fn send_call_signal(
+        &self,
+        params: CallsSendSignalParams,
+    ) -> Result<Value, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_calls_send_signal(
+                &params.account_id,
+                &params.conversation_id,
+                &params.signal_type,
+                params.call_id,
+                &params.payload,
+            )?
+        };
+        match engine
+            .call("sendCallMessage", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => {
+                let sent_at = result
+                    .get("timestamp")
+                    .and_then(Value::as_u64)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+                Ok(json!({ "sentAt": sent_at }))
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// calls.getState (contract revision 1.50, §4.48, capability
+    /// call-signaling): a store-only read — no engine call, no network, no
+    /// mutation (the `history.importStatus` class). The connector's call
+    /// registry is the honest empty state: the connector is the signaling
+    /// pipe between the engine's transport and the desktop + calling
+    /// sidecar's RingRTC state machine, not a state owner.
+    pub async fn call_state(&self, account_id: String) -> Result<Value, ServiceError> {
+        let service = self.service.lock().await;
+        let state = service.prepare_calls_get_state(&account_id)?;
+        Ok(serde_json::to_value(state).unwrap_or(Value::Null))
     }
 
     /// Best-effort "Delete for everyone" for one own sent message

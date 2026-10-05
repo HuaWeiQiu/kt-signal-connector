@@ -169,6 +169,16 @@ pub const METHODS: &[MethodRow] = &[
     // delete barrier included; advertised through `report-spam`. Zero local
     // writes: the report is an upstream protocol action only.
     ("messages.reportSpam", Lane::Send, true, "send"),
+    // Call signaling (contract revision 1.51, §4.49): the send face is
+    // mutating send-lane upstream traffic — the reaction class verbatim,
+    // same-account mutex and delete barrier included; the signaling payload
+    // is shape-gated (type enum / callId / opaque payload) and forwarded
+    // byte-for-byte, never interpreted. The state face is a store-only
+    // read: the connector is a signaling pipe, the call state machine
+    // lives in the desktop + calling sidecar (the honest near-empty
+    // registry). Advertised through `call-signaling`.
+    ("calls.sendSignal", Lane::Send, true, "send"),
+    ("calls.getState", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -231,7 +241,9 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `avatar-fetch` / `blocked-write` (contract revision 1.48) mark the §4.47
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
-/// the row-level serverGuid persistence). They never
+/// the row-level serverGuid persistence); `call-signaling` (contract
+/// revision 1.51) marks the §4.49 call signaling faces
+/// (`calls.sendSignal` plus the `call.incoming` event). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -250,6 +262,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "avatar-fetch",
     "blocked-write",
     "report-spam",
+    "call-signaling",
 ];
 
 #[cfg(test)]
@@ -283,6 +296,7 @@ mod tests {
             "backups.exportFile.open",
             "backups.exportFile.readChunk",
             "backups.exportFile.closeHandle",
+            "calls.getState",
         ];
         let send_lane = [
             "messages.sendText",
@@ -312,6 +326,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "calls.sendSignal",
         ];
         let mutating = [
             "messages.sendText",
@@ -343,6 +358,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "calls.sendSignal",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

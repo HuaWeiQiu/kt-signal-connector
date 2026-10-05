@@ -2213,8 +2213,6 @@ Implementation batch record (2026-10-06) — deviations and decisions as built:
   schema-consistency gates (methods, error codes, bounds inventory).
 
 ### 4.47 Conversation avatar read + blocked write: conversations.getAvatar, conversations.setBlocked (contract revision 1.48, 2026-10-06)
-
-The alignment batch ③a connector side (kt-signal-engine `main` @ `1ce131d`,
 `docs/jsonrpc-compat.md` §3/§5 registration + §4.36-anchored error faces): the desktop-facing
 wire methods for the engine's two alignment capabilities — the conversation avatar download
 and the per-conversation blocked-bit write. Both are engine-extension methods (the pinned
@@ -2387,6 +2385,79 @@ real engine. This revision lands both halves:
 - Tests: the schema-consistency error-code gate covers the new literal; the allowlist
   totality test (`ENGINE_STRUCTURED_ERROR_CODES_FOR_TESTS`) proves the service mapping stays
   total; with-data / without-data / non-object-data classification tests pin the boundary.
+
+### 4.49 Call signaling: calls.sendSignal, calls.getState, the call.incoming event (contract revision 1.51, 2026-10-06)
+
+The P1 signaling-passthrough batch (kt-signal-engine `main` @ `8eabf67`,
+`docs/jsonrpc-compat.md` §3 `sendCallMessage` + the §5 通话消息块 receive projections,
+2026-10-06 real). Official anchor: Signal-Desktop's 1:1 calling rides RingRTC whose wire
+face is the Content.callMessage=3 CallMessage (offer/answer/hangup/busy/iceCandidates
+frames keyed by a callId, the modern face an opaque Signal-RTC signaling blob with a
+droppable/handleImmediately urgency) — this batch is **behavior alignment, AGPL zero
+copy**: the connector transparently forwards the signaling material and implements no
+calling logic of its own.
+
+Projection boundary (recorded honestly): the connector is the signaling **pipe** between
+the engine's transport and the desktop + calling sidecar's RingRTC state machine. The
+connector does not run a RingRTC state machine, does not parse or negotiate SDP, does not
+configure TURN/STUN, and keeps no call state — those live in the desktop + calling
+sidecar (P2 batch, separate repo) and in the engine's transport. Group calls (SFU
+signaling) are out of scope through P3 and land no earlier than P4; the upstream
+`sendCallMessage` face is contact-only fail-closed and the connector refuses group
+conversations locally on the same shape.
+
+- `calls.sendSignal`: params `accountId`, `conversationId` (the shared 1..256 bound),
+  `type` (the five-value frame-family enum `offer|answer|ice|busy|hangup`), `callId`
+  (positive u32 — the legacy frames' id face and the state machines' shared address
+  space; 0 is the no-call marker and is rejected), `payload` (non-empty string ≤
+  3,145,728 chars — the same coarse budget the receive face enforces). The shape gate is
+  the connector's entire validation: the signaling content itself is never parsed,
+  classified, or logged (the engine owns the transport face, RingRTC parses the frames).
+  The conversation resolves through the local ladder (`CONVERSATION_NOT_FOUND` before
+  any upstream call) and must be `direct` — a group conversation answers
+  `INVALID_REQUEST` locally (the upstream fail-closed, mirrored). The upstream call is
+  the engine's `sendCallMessage` with `{account: resolved signal number, recipient:
+  peer reference, data: payload}` — the resolved upstream reference, never the host's
+  opaque local id (the §4.33 discipline). Send lane, account-scoped mutating — the
+  reaction-class write-lane mutex and delete drain barrier verbatim; an indeterminate
+  outcome answers `SEND_OUTCOME_UNKNOWN` and is never retried. Result `{sentAt}` — the
+  engine's envelope timestamp as the send ack, not call state. The `type` value gates
+  but does not travel: the opaque payload is self-describing on the modern face.
+- `calls.getState`: params `accountId`. Read lane, repeatable, store-only — no engine
+  call, no network, no mutation (the `history.importStatus` class). The result is the
+  honest empty registry: `{calls: [], projection: "connector-pipe"}`. The connector
+  registers no call state because it owns none; the `calls` array and the `projection`
+  note are the stable face a desktop builds against if a later batch ever gives the
+  connector a real registry to project (the projection note names the actual state
+  owner class so the answer cannot be mistaken for a lie of omission).
+- `call.incoming` event: the inbound half of the pipe. The engine's `callMessage`
+  envelope projection routes through the same body-less control plane as typing and
+  reactions (conversation resolved via the shared (account, kind, peer) ladder,
+  unresolvable signaling dropped silently), and lands as one transient
+  `HostEvent::new("call.incoming", ...)` carrying `{accountId, conversationId, callId,
+  type, payload}` — `type` is the projected frame family (`offer`/`answer`/`ice`/
+  `busy`/`hangup`, or `opaque` when only the modern opaque framing rides; `callId` is 0
+  there because the RingRTC payload carries its own identity), `payload` is the
+  engine's projected face verbatim (bounded: opaque ≤ 3 MiB chars, legacy ICE list ≤ 64
+  frames, out-of-budget or unaddressable faces never route). Nothing persists and no
+  row is written, so a missed event is not self-healed — the RingRTC layer re-signals,
+  which is the official recovery story for lossy datagram-framed signaling.
+
+Receive-face bounds (engine.rs): `MAX_CALL_ID` = u32::MAX (an engine frame beyond the
+face is unaddressable and routes nothing), `MAX_CALL_OPAQUE_CHARS` = 3,145,728,
+`MAX_CALL_ICE_FRAMES` = 64. Engine structured errors need none new: the send face's
+parameter/refusal ladder is local, and engine `-32603` parameter faces fold into
+`UPSTREAM_ERROR` through the existing fallback (`RUNTIME_NOT_RUNNING` /
+`CAPABILITY_UNAVAILABLE` / `SEND_OUTCOME_UNKNOWN` per the §4.32/反应类 discipline).
+
+Capability tag: `call-signaling` joins `FEATURE_CAPABILITIES` and the handshake
+capability assertion; desktops gate both methods and the event on it. Local validation
+ladder: `accountId` through the opaque-id validator and resolved to the owning proxy
+group; `conversationId` bounded and resolved; `type` against the five-value enum;
+`callId` ≥ 1; `payload` non-empty and bounded (sendSignal). Persistence and cross-face
+boundaries: no row, no cache, no store schema change; the signaling material exists only
+inside the engine, the response, and the event, and never reaches a log line (the
+AGENTS.md redaction boundary; neither path logs payload content).
 
 ## 5. signal-cli Boundary
 

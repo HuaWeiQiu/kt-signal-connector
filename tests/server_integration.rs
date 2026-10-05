@@ -4067,6 +4067,9 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "blocked-write",
         "messages.reportSpam",
         "report-spam",
+        "calls.sendSignal",
+        "calls.getState",
+        "call-signaling",
     ] {
         assert!(
             capabilities
@@ -7791,4 +7794,443 @@ async fn send_request_frame(
         )
         .await
         .unwrap();
+}
+
+/// Contract revision 1.50 (§4.48, capability call-signaling): the connector's
+/// call-signaling pipe. Outbound: `calls.sendSignal` shape-gates the envelope
+/// (the five-value type enum, the positive-u32 callId, the non-empty bounded
+/// payload) and forwards the resolved direct peer reference plus the payload
+/// verbatim as the engine `sendCallMessage` upstream face — every illegal
+/// shape refuses locally (refusals never dial upstream), a group conversation
+/// fails closed, an engine crash with the mutating call in flight answers
+/// SEND_OUTCOME_UNKNOWN and is never retried across the restart. Inbound: the
+/// engine's `callMessage` envelope face lands as exactly one `call.incoming`
+/// event carrying the projected payload verbatim — no row, nothing persisted.
+/// The state face: the honest empty registry, repeatable, and the crash drill
+/// proves the send face's no-retry discipline.
+#[tokio::test]
+async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-CallP1" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Materialize the peer conversation the way every send face does.
+    let sent = request(
+        &mut client,
+        "call-setup-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "call me",
+            "clientRequestId": "call-setup-0"
+        }),
+    )
+    .await;
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Stage a group envelope so the 1:1-only refusal has a real local group
+    // row to address (the runtime marker delivers it like every injected
+    // envelope; the group message materializes the group row).
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 80,
+                "dataMessage": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "message": "callless group"
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut group_id = String::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("group-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("group-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        if let Some(found) = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["type"] == "group")
+            .and_then(|row| row["id"].as_str())
+        {
+            group_id = found.to_string();
+            break;
+        }
+    }
+    assert!(
+        !group_id.is_empty(),
+        "the staged group row must materialize"
+    );
+
+    // getState before any signaling: the honest empty registry, repeatable.
+    for request_id in ["state-before", "state-again"] {
+        let state = request(
+            &mut client,
+            request_id,
+            "calls.getState",
+            json!({ "accountId": account_id }),
+        )
+        .await;
+        assert_eq!(
+            state["result"]["calls"].as_array().unwrap().len(),
+            0,
+            "{state}"
+        );
+        assert_eq!(state["result"]["projection"], "connector-pipe", "{state}");
+    }
+
+    // The offer round trip: the resolved peer reference and the payload
+    // verbatim land on the wire; the answer is the engine's envelope
+    // timestamp as {sentAt}.
+    let offered = request(
+        &mut client,
+        "call-offer",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "offer",
+            "callId": 7,
+            "payload": "c2RwLW9mZmVy"
+        }),
+    )
+    .await;
+    assert_eq!(offered["result"]["sentAt"], 1727000000000u64, "{offered}");
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let call_lines = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("data").is_some())
+            .collect()
+    };
+    assert_eq!(call_lines().len(), 1, "{:?}", call_lines());
+    assert_eq!(call_lines()[0]["account"], "+15555550100");
+    assert_eq!(call_lines()[0]["recipient"], "+15555550102");
+    assert_eq!(call_lines()[0]["data"], "c2RwLW9mZmVy");
+
+    // The rest of the frame family rides the same pipe; ICE, busy, and
+    // hangup keep the u32 ceiling legal and the payload opaque.
+    for (request_id, signal_type, call_id, payload) in [
+        ("call-answer", "answer", 7u64, "c2RwLWFuc3dlcg=="),
+        ("call-ice", "ice", 4294967295u64, "aWNlLTE="),
+        ("call-busy", "busy", 7u64, "YnVzeQ=="),
+        ("call-hangup", "hangup", 7u64, "aGFuZ3Vw"),
+    ] {
+        let signaled = request(
+            &mut client,
+            request_id,
+            "calls.sendSignal",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": signal_type,
+                "callId": call_id,
+                "payload": payload
+            }),
+        )
+        .await;
+        assert_eq!(signaled["result"]["sentAt"], 1727000000000u64, "{signaled}");
+    }
+    assert_eq!(call_lines().len(), 5, "{:?}", call_lines());
+
+    // The shape gate, locally: unknown type, callId 0, empty payload, an
+    // over-bound payload, an unknown conversation — every refusal precedes
+    // any upstream call, so the log stays at five lines.
+    let oversized = "A".repeat(3 * 1024 * 1024 + 1);
+    for (request_id, expected_code, params) in [
+        (
+            "signal-bad-type",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "sdp",
+                "callId": 7,
+                "payload": "eA=="
+            }),
+        ),
+        (
+            "signal-type-case",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "OFFER",
+                "callId": 7,
+                "payload": "eA=="
+            }),
+        ),
+        (
+            "signal-zero-call",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 0,
+                "payload": "eA=="
+            }),
+        ),
+        (
+            "signal-empty-payload",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7,
+                "payload": ""
+            }),
+        ),
+        (
+            "signal-over-bound-payload",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7,
+                "payload": oversized
+            }),
+        ),
+        (
+            "signal-unknown-conversation",
+            "CONVERSATION_NOT_FOUND",
+            json!({
+                "accountId": account_id,
+                "conversationId": "no-such-conversation",
+                "type": "offer",
+                "callId": 7,
+                "payload": "eA=="
+            }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "calls.sendSignal", params).await;
+        assert_eq!(
+            rejected["error"]["code"], expected_code,
+            "{request_id}: {rejected}"
+        );
+        assert_eq!(
+            rejected["error"]["retryable"], false,
+            "{request_id}: {rejected}"
+        );
+    }
+    assert_eq!(
+        call_lines().len(),
+        5,
+        "refusals never dial upstream: {:?}",
+        call_lines()
+    );
+
+    // The 1:1-only face: a group conversation fails closed locally — the
+    // staged group row is real local state.
+    let rejected = request(
+        &mut client,
+        "signal-group",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "type": "offer",
+            "callId": 7,
+            "payload": "eA=="
+        }),
+    )
+    .await;
+    assert_eq!(rejected["error"]["code"], "INVALID_REQUEST", "{rejected}");
+
+    // Crash with the mutating signaling in flight (fixture sentinel,
+    // os._exit(33)): SEND_OUTCOME_UNKNOWN, never retried across the restart.
+    let crash = request(
+        &mut client,
+        "signal-crash",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "offer",
+            "callId": 9,
+            "payload": "[fixture-call-crash]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-call", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+
+    // No-retry audit: exactly one crashing call across the restart.
+    let crash_calls: Vec<Value> = call_lines()
+        .into_iter()
+        .filter(|params| params["data"] == "[fixture-call-crash]")
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown signaling outcome is never retried: {crash_calls:?}"
+    );
+
+    // getState after everything: still the empty registry — the send face
+    // registers no state by design (the connector is the pipe).
+    let state = request(
+        &mut client,
+        "state-after",
+        "calls.getState",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(state["result"]["calls"].as_array().unwrap().len(), 0);
+    assert_eq!(state["result"]["projection"], "connector-pipe");
+
+    // Inbound: the engine's callMessage face arrives as exactly one
+    // call.incoming event with the payload verbatim — and no message row.
+    let envelope_offer = json!({
+        "source": "+15555550102",
+        "timestamp": 1727000001000u64,
+        "callMessage": {
+            "offer": { "id": 7u64, "type": "audio", "opaque": "aW5ib3VuZC1vZmZlcg==" }
+        }
+    });
+    let envelope_ice = json!({
+        "source": "+15555550102",
+        "timestamp": 1727000002000u64,
+        "callMessage": {
+            "iceUpdate": [{ "id": 7u64, "opaque": "aW5ib3VuZC1pY2U=" }]
+        }
+    });
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [envelope_offer, envelope_ice] }).to_string(),
+    )
+    .unwrap();
+
+    // Drain until both events arrive (the injected envelopes land
+    // asynchronously; each poll drains interleaved frames).
+    let mut incoming: Vec<Value> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = send_request_frame(
+            &mut client,
+            &format!("poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        loop {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("event").and_then(Value::as_str) == Some("call.incoming") {
+                incoming.push(frame["data"].clone());
+                continue;
+            }
+            if frame.get("requestId").and_then(Value::as_str)
+                == Some(format!("poll-{attempt}").as_str())
+            {
+                break;
+            }
+        }
+        if incoming.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        incoming.len(),
+        2,
+        "both signaling frames must arrive: {incoming:?}"
+    );
+    assert_eq!(incoming[0]["accountId"], account_id);
+    assert_eq!(incoming[0]["conversationId"], conversation_id);
+    assert_eq!(incoming[0]["callId"], 7);
+    assert_eq!(incoming[0]["type"], "offer");
+    assert_eq!(
+        incoming[0]["payload"]["offer"]["opaque"],
+        "aW5ib3VuZC1vZmZlcg=="
+    );
+    assert_eq!(incoming[1]["type"], "ice");
+    assert_eq!(
+        incoming[1]["payload"]["iceUpdate"][0]["opaque"],
+        "aW5ib3VuZC1pY2U="
+    );
+
+    // No row was created by the signaling envelopes.
+    let listed = request(
+        &mut client,
+        "list-after-call",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "limit": 50
+        }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row["sentAt"].as_u64().unwrap_or(0) < 1727000001000),
+        "call signaling must not create message rows: {rows:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
 }

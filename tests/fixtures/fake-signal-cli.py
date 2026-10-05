@@ -902,6 +902,20 @@ for line in sys.stdin:
             blocked.append({"conversationId": conversation_id, "kind": kind})
         BLOCKED_STATE[:] = blocked
         result = {"blocked": list(BLOCKED_STATE)}
+    elif method == "sendCallMessage":
+        # Contract 1.50 §4.48 call-signaling outbound face: record the exact
+        # upstream params (tests assert the resolved recipient + verbatim
+        # payload), answer the engine's {timestamp} envelope. The engine
+        # parses no signaling content and neither does this fixture — the
+        # data string ships as-is. Sentinel payloads: "[fixture-call-crash]"
+        # crashes with the mutating call in flight (os._exit(33); disjoint
+        # from 25/29/30/31/32).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("data") == "[fixture-call-crash]":
+            os._exit(33)
+        result = {"timestamp": 1727000000000}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the single-string recipient contract.

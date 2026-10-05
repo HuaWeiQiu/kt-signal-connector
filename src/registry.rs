@@ -820,6 +820,27 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_conversation_blocked(params).await
     }
 
+    /// calls.sendSignal (contract 1.50, §4.48): the signaling envelope is
+    /// account-scoped upstream traffic, so the send routes through the
+    /// account's owning engine like every other send face.
+    pub async fn send_call_signal(
+        &self,
+        params: crate::service::CallsSendSignalParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_call_signal(params).await
+    }
+
+    /// calls.getState (contract 1.50, §4.48): a store-only read scoped to
+    /// the account's owning connector slot — no engine call, no network.
+    pub async fn call_state(
+        &self,
+        params: crate::service::CallsGetStateParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.call_state(params.account_id).await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

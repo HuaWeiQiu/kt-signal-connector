@@ -89,6 +89,18 @@ pub const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
 /// and cross-checking `byteSize`, not by this length.
 pub const MAX_AVATAR_DATA_URI_CHARS: usize = 13_981_080;
 pub const MAX_BLOCKED_CONVERSATIONS: usize = 256;
+/// Call signaling (contract revision 1.50, §4.48): the `calls.sendSignal`
+/// shape gate. `type` is the five-value RingRTC frame-family enum, `callId`
+/// is a positive u32 (the legacy frames' `id` face and the state machines'
+/// address space), and the opaque payload is a non-empty string kept under
+/// the same coarse 3 MiB budget the receive face enforces — the connector
+/// validates the envelope, never the signaling content (the engine and the
+/// RingRTC layer each validate their own half).
+pub const CALL_SIGNAL_TYPES: [&str; 5] = ["offer", "answer", "ice", "busy", "hangup"];
+pub const MAX_CALL_SIGNAL_PAYLOAD_CHARS: usize = 3 * 1024 * 1024;
+/// The `calls.getState` projection note (contract revision 1.50, §4.48):
+/// one honest sentence about where the call state machine actually lives.
+pub const CALL_STATE_PROJECTION_NOTE: &str = "connector-pipe";
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
@@ -406,6 +418,19 @@ pub enum HostSideEvent {
         account_id: String,
         conversation_id: String,
         message_ids: Vec<String>,
+    },
+    /// Inbound call signaling (contract 1.50, §4.48): the engine's
+    /// `callMessage` envelope face forwarded as a transient event — the
+    /// connector keeps no call state, so there is nothing to self-heal from
+    /// a missed delivery and the event never persists. The payload is the
+    /// bounded signaling material verbatim; the desktop + calling sidecar
+    /// run the RingRTC state machine that consumes it.
+    CallIncoming {
+        account_id: String,
+        conversation_id: String,
+        call_id: u64,
+        signal_type: &'static str,
+        payload: Value,
     },
 }
 
@@ -2412,6 +2437,84 @@ impl ConnectorService {
         }))
     }
 
+    /// calls.sendSignal (contract revision 1.50, §4.48): the shape gate
+    /// plus resolution — the signaling envelope (`recipient`, `data`,
+    /// `urgency`, `destinationDeviceId`) is the engine `sendCallMessage`
+    /// face verbatim; the connector forwards it and never inspects the
+    /// signaling content. `type` gates against the five-value frame-family
+    /// enum (the enum value itself does not travel — the RingRTC payload is
+    /// self-describing), `callId` a positive u32, `payload` a non-empty
+    /// bounded string. Group shapes answer INVALID_REQUEST here (the
+    /// upstream 1:1 face is contact-only — its official fail-closed).
+    pub fn prepare_calls_send_signal(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        signal_type: &str,
+        call_id: u32,
+        payload: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if !CALL_SIGNAL_TYPES.contains(&signal_type) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "type must be one of offer, answer, ice, busy, hangup",
+                false,
+            )));
+        }
+        if call_id == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "callId must be a positive integer",
+                false,
+            )));
+        }
+        if payload.is_empty() || payload.chars().count() > MAX_CALL_SIGNAL_PAYLOAD_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "payload must contain between 1 and 3145728 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        if conversation.kind != "direct" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "call signaling is 1:1 only — group conversations are not addressable",
+                false,
+            )));
+        }
+        Ok(json!({
+            "account": account.signal_account,
+            "recipient": conversation.peer_key,
+            "data": payload,
+        }))
+    }
+
+    /// calls.getState (contract revision 1.50, §4.48): the honest
+    /// projection of what this connector knows — always the empty registry.
+    /// The call state machine lives in the desktop + calling sidecar and
+    /// the engine transports; the connector is the signaling pipe between
+    /// them and persists no call state of its own.
+    pub fn prepare_calls_get_state(
+        &self,
+        account_id: &str,
+    ) -> Result<CallStateRegistry, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        self.resolve_account(account_id)?;
+        Ok(CallStateRegistry::default())
+    }
+
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
     /// and same-row retry (`prepare_retry_text`) — one owner for the wire key
     /// names so the two paths cannot drift.
@@ -4106,7 +4209,27 @@ impl ConnectorService {
                 }
                 Ok(events)
             }
-            ControlReceive::ViewOnceOpen { .. } => Ok(Vec::new()), // intercepted above
+            // The view-once open sync is intercepted before the conversation
+            // ladder (it addresses rows across conversations by author +
+            // timestamp), so this arm is the unreachable fall-through.
+            ControlReceive::ViewOnceOpen { .. } => Ok(Vec::new()),
+            // Call signaling (contract 1.51, §4.49): no row, no local state
+            // — the signaling payload forwards as the transient
+            // `call.incoming` event addressed by the conversation it routed
+            // to; unresolvable conversations drop silently like every other
+            // control face (the caller has no conversation with this
+            // account, or the row predates the link).
+            ControlReceive::Call {
+                call_id,
+                signal_type,
+                payload,
+            } => Ok(vec![HostSideEvent::CallIncoming {
+                account_id: account.id,
+                conversation_id: conversation.id,
+                call_id,
+                signal_type,
+                payload,
+            }]),
         }
     }
 
@@ -4739,6 +4862,41 @@ pub struct AvatarDownload {
     pub byte_size: u64,
 }
 
+/// The §4.48 result of `calls.getState` (contract revision 1.50): the
+/// connector's call-state registry, honestly empty — the connector is a
+/// signaling pipe; the RingRTC state machine lives in the desktop + calling
+/// sidecar, upstream call state lives in the engine's transport, and this
+/// connector persists neither. The `calls` list and the projection note are
+/// the stable face a desktop builds against once a later batch gives the
+/// connector a real registry to project.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallStateRegistry {
+    pub calls: Vec<CallStateEntry>,
+    /// Where the real state machine lives — the honest projection note the
+    /// §4.48 contract records (connector ≠ RingRTC state owner).
+    pub projection: &'static str,
+}
+
+/// One registered call (presently never produced — see
+/// [`CallStateRegistry`]).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallStateEntry {
+    pub call_id: u64,
+    pub conversation_id: String,
+    pub signal_type: &'static str,
+}
+
+impl Default for CallStateRegistry {
+    fn default() -> Self {
+        Self {
+            calls: Vec::new(),
+            projection: CALL_STATE_PROJECTION_NOTE,
+        }
+    }
+}
+
 /// `accounts.setProfile` avatar tri-state (contract revision 1.46, §4.45):
 /// `Keep` (key absent) forwards no avatar key, `Remove` (explicit null)
 /// forwards `avatar: null`, `Replace` (a data URI) forwards the validated
@@ -5211,7 +5369,6 @@ pub struct ConversationsSetBlockedParams {
 /// `messages.reportSpam` params (contract revision 1.49, §4.48, capability
 /// report-spam): the addressing pair plus the rows to report. The array
 /// bounds (1–64 entries of 1–128 characters) fail at params
-/// deserialization through the type and the service's explicit checks; the
 /// schema mirrors both.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -5255,6 +5412,31 @@ pub const REPORT_SPAM_MESSAGE_IDS_LIMIT: usize = 64;
 pub struct PreparedReportSpam {
     pub upstream: Value,
     pub pairs: Vec<(String, String)>,
+}
+
+/// `calls.sendSignal` params (contract revision 1.51, §4.49): `type` is the
+/// five-value RingRTC frame-family enum, `callId` a positive u32, and
+/// `payload` the non-empty opaque signaling material the connector
+/// shape-gates and forwards verbatim — the engine validates the transport
+/// face and the RingRTC layer parses the content, the connector parses
+/// neither.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsSendSignalParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    #[serde(rename = "type")]
+    pub signal_type: String,
+    pub call_id: u32,
+    pub payload: String,
+}
+
+/// `calls.getState` params (contract revision 1.51, §4.49): account-scoped
+/// read over the connector's (near-empty) call-state registry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsGetStateParams {
+    pub account_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -10759,6 +10941,156 @@ mod tests {
                 "{broken}"
             );
         }
+    }
+
+    /// Call signaling (contract revision 1.50, §4.48): the sendSignal shape
+    /// gate (type enum / positive callId / non-empty bounded payload), the
+    /// resolved direct peer reference as the upstream `recipient`, the
+    /// group-shape refusal, and the honest empty state registry.
+    #[test]
+    fn prepare_call_signal_gates_and_forwards_the_envelope() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        // The happy path: resolved number as recipient, payload verbatim.
+        let upstream = service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "offer", 7, "c2RwLW9mZmVy")
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["recipient"], conversation.peer_key);
+        assert_eq!(upstream["data"], "c2RwLW9mZmVy");
+
+        // The type enum: every legal value passes, an unknown one and a
+        // wrong-typed one fail closed.
+        for legal in CALL_SIGNAL_TYPES {
+            service
+                .prepare_calls_send_signal(&account.id, &conversation.id, legal, 7, "eA==")
+                .unwrap();
+        }
+        for illegal in ["offerx", "", "OFFER", "sdp"] {
+            let error = service
+                .prepare_calls_send_signal(&account.id, &conversation.id, illegal, 7, "eA==")
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{illegal}");
+        }
+
+        // The callId face: 0 is the no-call marker and is rejected; the u32
+        // ceiling is legal.
+        let error = service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "offer", 0, "eA==")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "hangup", u32::MAX, "eA==")
+            .unwrap();
+
+        // The payload face: empty, wrong type, and over-budget all reject
+        // before any resolution.
+        for (label, call_id, payload) in [
+            ("payload-empty", 7u32, ""),
+            ("payload-over-bound", 7u32, &"A".repeat(3 * 1024 * 1024 + 1)),
+        ] {
+            let error = service
+                .prepare_calls_send_signal(&account.id, &conversation.id, "offer", call_id, payload)
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
+        }
+
+        // The local ladder: unknown account and conversation refuse before
+        // any upstream shape is built.
+        let error = service
+            .prepare_calls_send_signal("no-such-account", &conversation.id, "offer", 7, "eA==")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+        let error = service
+            .prepare_calls_send_signal(&account.id, "no-such-conversation", "offer", 7, "eA==")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+
+        // The 1:1-only face: a group conversation fails closed locally.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
+            .unwrap();
+        let error = service
+            .prepare_calls_send_signal(&account.id, &group.id, "offer", 7, "eA==")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The state face: the honest empty registry, idempotent across
+        // repeats, and an unknown account still refuses.
+        let state = service.prepare_calls_get_state(&account.id).unwrap();
+        assert!(state.calls.is_empty());
+        assert_eq!(state.projection, "connector-pipe");
+        let again = service.prepare_calls_get_state(&account.id).unwrap();
+        assert_eq!(again.calls.len(), state.calls.len());
+        let error = service
+            .prepare_calls_get_state("no-such-account")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// The inbound call event (contract revision 1.50, §4.48): a Call
+    /// control receive routes by the shared conversation ladder and emits
+    /// exactly one transient CallIncoming event carrying the payload
+    /// verbatim — no row, no store write, nothing else on the lane.
+    #[test]
+    fn call_control_receive_emits_one_transient_event() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let receive = crate::engine::NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "control",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            control: Some(crate::engine::ControlReceive::Call {
+                call_id: 7,
+                signal_type: "offer",
+                payload: json!({ "offer": { "id": 7, "opaque": "c2Rw" } }),
+            }),
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+        };
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallIncoming {
+            account_id,
+            conversation_id,
+            call_id,
+            signal_type,
+            payload,
+        } = &events[0]
+        else {
+            panic!("expected a CallIncoming event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(conversation_id, &conversation.id);
+        assert_eq!(*call_id, 7);
+        assert_eq!(*signal_type, "offer");
+        assert_eq!(payload["offer"]["opaque"], "c2Rw");
+
+        // Nothing persisted: no row, no store write, nothing to self-heal.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(listed.items.is_empty(), "no row may be created");
     }
 
     /// The §4.35 sticker-quote face: the quote resolves through the same

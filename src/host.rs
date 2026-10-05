@@ -28,12 +28,13 @@ use crate::service::{
     AccountDeleteLocalDataParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
     AccountsUpdateConfigurationParams, BackupsExportFileCloseHandleParams,
     BackupsExportFileOpenParams, BackupsExportFileReadChunkParams, BackupsExportParams,
-    BackupsExportStatusParams, ContactsListParams, ContactsSetLocalAliasParams, ContactsSyncParams,
-    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, GroupsGetParams, GroupsQuitParams, GroupsUpdateParams,
-    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    BackupsExportStatusParams, CallsGetStateParams, CallsSendSignalParams, ContactsListParams,
+    ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    GroupsGetParams, GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams,
+    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
     MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
     MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
     MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
@@ -1470,6 +1471,28 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "calls.sendSignal" => {
+            match serde_json::from_value::<CallsSendSignalParams>(request.params) {
+                Ok(params) => match runtime.send_call_signal(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid calls.sendSignal params", false),
+                ),
+            }
+        }
+        "calls.getState" => match serde_json::from_value::<CallsGetStateParams>(request.params) {
+            Ok(params) => match runtime.call_state(params).await {
+                Ok(state) => HostResponse::success(request_id, state),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid calls.getState params", false),
+            ),
+        },
         "conversations.getPinned" => {
             match serde_json::from_value::<ConversationsGetPinnedParams>(request.params) {
                 Ok(params) => match runtime.get_pinned_conversations(params).await {
@@ -2063,6 +2086,28 @@ where
                         "accountId": account_id,
                         "conversationId": conversation_id,
                         "messageIds": message_ids,
+                    }),
+                ),
+            )
+            .await
+        }
+        HostSideEvent::CallIncoming {
+            account_id,
+            conversation_id,
+            call_id,
+            signal_type,
+            payload,
+        } => {
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "call.incoming",
+                    json!({
+                        "accountId": account_id,
+                        "conversationId": conversation_id,
+                        "callId": call_id,
+                        "type": signal_type,
+                        "payload": payload,
                     }),
                 ),
             )

@@ -92,7 +92,9 @@
             "backups.exportStatus",
             "backups.exportFile.open",
             "backups.exportFile.readChunk",
-            "backups.exportFile.closeHandle"
+            "backups.exportFile.closeHandle",
+            "calls.sendSignal",
+            "calls.getState"
           ]
         },
         "params": {
@@ -693,6 +695,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/backupsExportFileCloseHandleParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.sendSignal" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsSendSignalParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.getState" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsGetStateParams" }
             }
           }
         }
@@ -1462,8 +1486,49 @@
         },
         "blocked": {
           "type": "boolean",
-          "description": "true blocks the conversation, false unblocks it. Required \u2014 there is no toggle form."
+          "description": "true blocks the conversation, false unblocks it. Required — there is no toggle form."
         }
+      }
+    },
+    "callsSendSignalParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "type", "callId", "payload"],
+      "description": "Forward one outbound call-signaling frame (contract revision 1.51, §4.49, capability call-signaling): the connector shape-gates the envelope — type against the RingRTC 1:1 frame-family enum, callId a positive integer (u32 face, the legacy frames' id address space), payload the non-empty opaque signaling material (≤ 3,145,728 chars, the coarse envelope of the same budget the receive face enforces) — resolves the local conversation row (CONVERSATION_NOT_FOUND before any upstream call; direct conversations only, the upstream sendCallMessage face is contact-only and a group shape fails closed) and forwards the signaling payload byte-for-byte as the engine's {account, recipient, data} upstream face. The connector never parses, validates, or logs the signaling content: the engine owns the transport face (Content.callMessage=3, official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) and the desktop + calling sidecar's RingRTC state machine parses the frames. Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. The result {sentAt} is the engine's envelope timestamp — a send ack, not call state.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The direct conversation the signaling addresses; resolved against the account before any upstream call."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["offer", "answer", "ice", "busy", "hangup"],
+          "description": "The RingRTC 1:1 frame family the payload carries. Gated but not forwarded — the opaque payload is self-describing; the enum keeps desktop-side logging/routing honest."
+        },
+        "callId": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "The 1:1 call identity the RingRTC frames share (the legacy frames' id face). Positive u32; 0 is the no-call marker and is rejected."
+        },
+        "payload": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 3145728,
+          "description": "The opaque signaling material (RingRTC-serialized), forwarded byte-for-byte. The connector validates the envelope shape only — never the content."
+        }
+      }
+    },
+    "callsGetStateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the connector's call-state registry (contract revision 1.51, §4.49, capability call-signaling): account-scoped, repeatable, store-only — no engine call, no network. The honest projection: the connector is the signaling pipe between the engine's transport and the desktop + calling sidecar's RingRTC state machine; it persists no call state, so the registry reads {calls: [], projection: \"connector-pipe\"} — the stable face a later batch fills if the connector ever learns to register state. Read lane.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "conversationsGetPinnedParams": {
@@ -1835,7 +1900,8 @@
             "message.upserted",
             "message.statusChanged",
             "message.viewOnceOpened",
-            "message.expired"
+            "message.expired",
+            "call.incoming"
           ]
         },
         "data": {
@@ -1990,6 +2056,41 @@
                     "items": { "$ref": "#/$defs/opaqueId" },
                     "minItems": 1,
                     "description": "Row ids removed in this sweep, grouped per conversation."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "call.incoming" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "callId", "type", "payload"],
+                "description": "Inbound call signaling (contract 1.51, §4.49, capability call-signaling): the engine's callMessage envelope face (official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) forwarded as a transient event — nothing persists, so a missed delivery is not self-healed (the RingRTC layer re-signals; the connector keeps no call state to reconcile). type is the projected frame family (opaque when only the modern opaque payload rides); payload is the bounded signaling material verbatim — the connector neither parses nor logs it. Delivered to a conversation the connector already resolves; unresolvable signaling drops silently.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "callId": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295,
+                    "description": "The 1:1 call identity the frames share; 0 on the modern opaque face (the RingRTC payload carries its own identity)."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["offer", "answer", "ice", "busy", "hangup", "opaque"],
+                    "description": "The projected frame family: the legacy frame keys, or opaque for the modern Content.callMessage framing."
+                  },
+                  "payload": {
+                    "type": "object",
+                    "description": "The engine's projected signaling face verbatim: {opaque, urgency, destinationDeviceId} on the modern face, the projected frame under its own key (offer/answer/busy/hangup) or {iceUpdate: [...]} on the legacy faces. The connector never parses the RingRTC content."
                   }
                 }
               }
