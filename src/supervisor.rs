@@ -3317,17 +3317,21 @@ async fn sync_contacts_with(
     })
 }
 
-/// The cached group row's `extra` JSON (contract revision 1.40, §4.39): the
-/// member count the 1.9 sync already recorded, now beside the bounded roster
-/// the §4.39 projection reads. Member entries keep the connector-wide
-/// first-wins address ladder (`number` before `uuid`); a separate `uuid` key
+/// The cached group row's `extra` JSON (contract revision 1.40, §4.39; the
+/// terminated flag added in 1.53, §4.50 appendix): the member count the 1.9
+/// sync already recorded, now beside the bounded roster the §4.39 projection
+/// reads. Member entries keep the connector-wide first-wins address ladder
+/// (`number` before `uuid`); a separate `uuid` key
 /// is stored only when the upstream supplied one that differs from `id`.
 /// `admin: true` is recorded when the pinned upstream marks the member — its
 /// per-member `isAdmin` flag or the group-level `admins` address set
 /// (`ListGroupsCommand$JsonGroupMember` / `$JsonGroup`, verified in the
 /// 0.14.8 distribution jar); engines without an admin face simply never set
 /// it. Entries without any address and entries past [`MAX_GROUP_MEMBERS`]
-/// drop — a hostile roster can never fail the sync.
+/// drop — a hostile roster can never fail the sync. `isTerminated: true` is
+/// recorded when the upstream `JsonGroup` carries it (the §4.50 verified read
+/// source; false and absent collapse to absent, the same informative-keys
+/// discipline as `admin` — the read projection answers the default false).
 fn group_extra_json(members: &[Value], group: &Value) -> String {
     let admin_ids: std::collections::BTreeSet<String> = group
         .get("admins")
@@ -3370,7 +3374,13 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
             Some(Value::Object(projected))
         })
         .collect();
-    json!({ "memberCount": members.len(), "members": roster }).to_string()
+    let mut extra = serde_json::Map::with_capacity(3);
+    extra.insert("memberCount".to_string(), json!(members.len()));
+    extra.insert("members".to_string(), Value::Array(roster));
+    if group.get("isTerminated").and_then(Value::as_bool) == Some(true) {
+        extra.insert("isTerminated".to_string(), json!(true));
+    }
+    Value::Object(extra).to_string()
 }
 
 /// One upstream roster address with the connector-wide first-wins ladder:
@@ -4517,6 +4527,23 @@ mod tests {
             extra["members"].as_array().unwrap().len(),
             crate::service::MAX_GROUP_MEMBERS
         );
+
+        // Contract 1.53 (§4.50 appendix): the upstream isTerminated flag is
+        // captured only when true — false and absent collapse to absent (the
+        // informative-keys discipline), engines without the flag never set
+        // it.
+        let plain = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "isTerminated": false}),
+        ))
+        .unwrap();
+        assert!(plain.get("isTerminated").is_none());
+        let terminated = serde_json::from_str::<serde_json::Value>(&group_extra_json(
+            members.as_array().unwrap(),
+            &json!({"id": "aWQ", "isMember": true, "isTerminated": true}),
+        ))
+        .unwrap();
+        assert_eq!(terminated["isTerminated"], serde_json::json!(true));
     }
 
     #[test]

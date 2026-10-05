@@ -450,11 +450,20 @@ for line in sys.stdin:
         # Member shape mirrors the pinned 0.14.8 JsonGroupMember record
         # (number, uuid, isAdmin — NON_NULL omissions included), so the §4.39
         # roster capture and projection run against the real wire shape.
+        # isTerminated rides the JsonGroup record the same way (the §4.50
+        # verified read source); KT_FAKE_TERMINATED_GROUPS lists the group
+        # ids that answer it true, so the sync-capture path is exercisable.
+        terminated_ids = {
+            value.strip()
+            for value in os.environ.get("KT_FAKE_TERMINATED_GROUPS", "").split(",")
+            if value.strip()
+        }
         result = [
             {
                 "id": "ZmFrZS1ncm91cC0x",
                 "name": "Fixture Group",
                 "isMember": True,
+                "isTerminated": "ZmFrZS1ncm91cC0x" in terminated_ids,
                 "members": [
                     {"number": LINKED_ACCOUNT},
                     {

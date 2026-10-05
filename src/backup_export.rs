@@ -552,17 +552,15 @@ pub fn build_artifact(
     // Contacts follow canonical-key order, groups master-key order, chats
     // conversation store-id order; every id allocates only after all sources
     // have contributed, so no reference can dangle.
-    let mut next_id = 1_u64;
-    for entry in contacts.values_mut() {
-        entry.id = next_id;
-        next_id += 1;
+    let next_id = 1_u64;
+    for (i, entry) in (0_u64..).zip(contacts.values_mut()) {
+        entry.id = next_id + i;
     }
-    let mut group_ids: HashMap<&str, u64> = HashMap::new();
-    let mut next_id = 1_u64;
-    for master_key in groups.keys() {
-        group_ids.insert(master_key, next_id);
-        next_id += 1;
-    }
+    let group_ids: HashMap<&str, u64> = groups
+        .keys()
+        .enumerate()
+        .map(|(i, master_key)| (master_key.as_str(), 1_u64 + i as u64))
+        .collect();
 
     // The sender reverse map: every registered spelling of every contact under
     // both conversation namespaces, because the receive path stamps

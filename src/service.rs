@@ -844,7 +844,8 @@ impl ConnectorService {
     }
 
     /// Read-only projection of one cached group row (contract revision 1.9,
-    /// implementation-plan §4.8): served entirely from the contacts cache
+    /// implementation-plan §4.8; the terminated flag added in 1.53, §4.50
+    /// appendix): served entirely from the contacts cache
     /// written by contacts.sync — the upstream is never called, so an unsynced
     /// or departed group answers a deterministic GROUP_NOT_FOUND instead of a
     /// listGroups round trip. `syncedAt` lets the host judge staleness itself;
@@ -4423,11 +4424,19 @@ pub(crate) fn store_get_group(
         .and_then(Value::as_array)
         .map(|roster| project_group_roster(store, account_id, &account, roster))
         .transpose();
+    // Contract 1.53 (§4.50 appendix): the terminated flag the sync captured
+    // from the upstream JsonGroup — stored only when true, so absent
+    // (pre-1.53 rows, engines without the flag) answers the default false.
+    let is_terminated = extra
+        .as_ref()
+        .and_then(|extra| extra.get("isTerminated").and_then(Value::as_bool))
+        == Some(true);
     Ok(GroupDetails {
         peer_key: group_key.to_string(),
         title,
         member_count,
         members: members?,
+        is_terminated,
         synced_at,
     })
 }
@@ -4759,7 +4768,12 @@ pub struct MediaCloseView {
 /// timestamp — the response is exactly as fresh as that sync, nothing more.
 /// `members` (contract revision 1.40, §4.39) is the bounded roster the sync
 /// captured; absent on pre-1.40 rows, where the response stays byte-identical
-/// to the §4.8 shape.
+/// to the §4.8 shape. `is_terminated` (contract revision 1.53, §4.50
+/// appendix) is the upstream `JsonGroup.isTerminated` flag as of the row's
+/// last sync — false for every pre-1.53 row and every engine without the
+/// flag, and the receive chain cannot refresh it (the `JsonGroupInfo`
+/// envelope exposes no terminated field), so `synced_at` remains the only
+/// staleness signal for it too.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDetails {
@@ -4768,6 +4782,7 @@ pub struct GroupDetails {
     pub member_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<GroupMemberView>>,
+    pub is_terminated: bool,
     pub synced_at: u64,
 }
 
@@ -11280,6 +11295,10 @@ mod tests {
         // A pre-1.40 row (memberCount only, contract 1.9 shape) keeps the
         // §4.8 response: no members key.
         assert_eq!(group.members, None);
+        // Contract 1.53 (§4.50 appendix): a row without the captured
+        // terminated flag (pre-1.53 shape, engines without the upstream
+        // face) answers the default false.
+        assert!(!group.is_terminated);
 
         // Contract 1.40 (§4.39): a synced roster projects identities, the
         // read-time contacts names, the number-based self marker, and the
@@ -11384,6 +11403,32 @@ mod tests {
         assert_eq!(bare.title, "No Members");
         assert_eq!(bare.member_count, None);
         assert_eq!(bare.synced_at, 7);
+
+        // Contract 1.53 (§4.50 appendix): the terminated flag the sync
+        // captured projects as a plain bool — true only when the upstream
+        // JsonGroup carried it, alongside the still-absent members list.
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "dGVybWluYXRlZC1ncm91cA",
+                "Ended Group",
+                Some(r#"{"memberCount":4,"isTerminated":true}"#),
+                1725300003,
+            )
+            .unwrap();
+        let ended = service
+            .get_group(&account.id, "dGVybWluYXRlZC1ncm91cA")
+            .unwrap();
+        assert!(ended.is_terminated);
+        assert_eq!(ended.member_count, Some(4));
+        assert_eq!(ended.members, None);
+        // The wire shape carries the plain bool even when false.
+        let wire = serde_json::to_value(&ended).unwrap();
+        assert_eq!(wire["isTerminated"], json!(true));
+        let plain = serde_json::to_value(&group).unwrap();
+        assert_eq!(plain["isTerminated"], json!(false));
 
         // A contact peer key is not a group row: deterministic GROUP_NOT_FOUND.
         let contact = service.get_group(&account.id, "+15555550101").unwrap_err();

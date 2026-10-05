@@ -5,8 +5,9 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.52 (2026-10-06; §4.50 group termination — the 1.51 call-signaling
-  batch's Status-header bump was missed then, this line records the live revision)
+- Contract revision: 1.53 (2026-10-06; §4.50 appendix — the groups.get read face widens with
+  the synced isTerminated flag; 1.52 was the §4.50 group-termination write batch, whose
+  Status-header bump covered the 1.51 call-signaling miss)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2542,6 +2543,35 @@ Verification record (2026-10-06, all line anchors read from the pinned upstream 
   batch gates the method on it (a pre-1.52 connector answers a clean capability gap
   instead of `METHOD_NOT_ALLOWED`). Schema: the method enum, the `groupsTerminateParams`
   def, and the allOf dispatch branch land together with the code.
+
+> **Dated appendix (2026-10-06, group-terminate consume batch, contract revision 1.53):
+> the read face opens.** The read-face boundary above is lifted for the sync path: the
+> contacts sync now captures the upstream `JsonGroup.isTerminated` flag it already reads
+> (`ListGroupsCommand.java` JsonGroup L168, the §4.50 verification) into the cached group
+> row's `group_extra_json` — stored only when true, the same informative-keys discipline
+> as the roster's `admin` mark — and `groups.get` projects it as a plain bool
+> `isTerminated` (always present; false for every pre-1.53 row and every engine whose
+> `listGroups` face carries no flag). The receive-side half of the boundary stays exactly
+> as recorded: the §4.44 receive envelope (`JsonGroupInfo`) exposes no terminated field
+> and the engine's `groupUpdated` projection names timer fields only, so there is no
+> honest receive-chain source for the flag — the projection cannot see a termination
+> happen, it can only read the state the upstream itself exposes, which is `listGroups`.
+> Consequences recorded honestly: a group this account terminates answers `{"status":
+> "sent"}` while its cached row still reads `isTerminated: false` until the next
+> `contacts.sync` (the flag is as fresh as the sync — the §4.44 staleness boundary for
+> the whole cache row, `syncedAt` remains the signal; the desktop consumes the flag with
+> its own sync-on-open rhythm, the same freshness contract `memberCount`/`members`
+> already carry). The flag's lifetime follows the row, not the action: rows are rewritten
+> wholesale at each sync from what the upstream answers, so no connector-side latch is
+> added and the terminated flag can only change at a sync boundary. No
+> schema shape change beyond the one result key, no new method, no new capability: the
+> read face rides `groups.get` (an ungated pre-capability read method) and the
+> `group-terminate` tag the write face already carries — one capability for one protocol
+> action, its read and write halves together. Tests: the sync-capture unit faces
+> (`group_extra_json` true/false/absent), the projection unit face (pre-1.53 row false,
+> flagged row true, wire bool on both), and two server integrations (the default
+> fixture row answers false; the `KT_FAKE_TERMINATED_GROUPS` stub hook answers true
+> through the full listGroups → cache → groups.get ladder).
 
 ## 5. signal-cli Boundary
 

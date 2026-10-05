@@ -2855,6 +2855,9 @@ async fn groups_get_projects_the_synced_group_cache() {
     assert_eq!(group["result"]["title"], "Fixture Group");
     assert_eq!(group["result"]["memberCount"], 2);
     assert!(group["result"]["syncedAt"].as_u64().unwrap() > 0);
+    // Contract 1.53 (§4.50 appendix): the plain terminated bool — false on
+    // the default fixture row (the stub carries the upstream flag).
+    assert_eq!(group["result"]["isTerminated"], false);
     // Contract 1.40 (§4.39): the roster the sync captured projects beside
     // memberCount — the number-based self marker on the linked account's own
     // entry, the contacts-cache name plus the upstream uuid and admin mark on
@@ -2929,6 +2932,79 @@ async fn groups_get_projects_the_synced_group_cache() {
     )
     .await;
     assert_eq!(unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+#[tokio::test]
+async fn groups_get_carries_the_sync_terminated_flag() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [38_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // The stub answers the upstream JsonGroup.isTerminated true for the
+    // fixture group (the §4.50 verified listGroups read source), so the sync
+    // capture path runs end to end: listGroups → group_extra_json → the
+    // groups.get projection.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_TERMINATED_GROUPS", "ZmFrZS1ncm91cC0x")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Terminated" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    // The terminated flag survives the whole ladder as the plain bool.
+    assert_eq!(group["result"]["isTerminated"], true);
+    // The roster still projects beside it — the flag adds one key, it does
+    // not replace the §4.39 face.
+    assert_eq!(group["result"]["memberCount"], 2);
+    assert_eq!(group["result"]["members"].as_array().unwrap().len(), 2);
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
