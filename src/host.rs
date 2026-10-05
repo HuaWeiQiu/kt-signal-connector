@@ -28,16 +28,16 @@ use crate::service::{
     AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsGetPinnedParams, ConversationsListParams,
     ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, GroupsGetParams,
-    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
-    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams,
+    GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams, HostSideEvent,
+    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1659,6 +1659,26 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             Err(_) => HostResponse::failure(
                 request_id,
                 ApiError::new("INVALID_REQUEST", "invalid groups.get params", false),
+            ),
+        },
+        "groups.update" => match serde_json::from_value::<GroupsUpdateParams>(request.params) {
+            Ok(params) => match runtime.update_group(params).await {
+                Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid groups.update params", false),
+            ),
+        },
+        "groups.quit" => match serde_json::from_value::<GroupsQuitParams>(request.params) {
+            Ok(params) => match runtime.quit_group(params).await {
+                Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid groups.quit params", false),
             ),
         },
         "contacts.setLocalAlias" => {

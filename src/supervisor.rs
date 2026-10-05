@@ -20,13 +20,13 @@ use crate::protocol::ApiError;
 use crate::service::{
     AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, ConversationsGetPinnedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, GroupDetails, HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
-    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, account_limit_error,
-    pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
+    ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsUpdateParams,
+    HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView,
+    MediaIngest, MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations,
+    PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    account_limit_error, pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
 };
@@ -1997,7 +1997,7 @@ impl RuntimeSupervisor {
         params: ConversationsSetExpireTimerParams,
     ) -> Result<ConversationsSetExpireTimerResult, ServiceError> {
         let engine = self.running_engine().await?;
-        let (upstream, seconds) = {
+        let (method, upstream, seconds) = {
             let service = self.service.lock().await;
             service.prepare_conversations_set_expire_timer(
                 &params.account_id,
@@ -2005,10 +2005,6 @@ impl RuntimeSupervisor {
                 params.expire_seconds,
                 self.config.mode,
             )?
-        };
-        let method = match self.config.mode {
-            SignalCliMode::KtEngine => "setExpirationTimer",
-            _ => "updateContact",
         };
         match engine.call(method, upstream, CallClass::Mutating).await {
             Ok(_) => {
@@ -2034,6 +2030,61 @@ impl RuntimeSupervisor {
                     expire_timer_seconds: seconds,
                 })
             }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.update (contract revision 1.45, §4.44, capability
+    /// group-management): full local validation + resolution under the
+    /// service lock, then the mutating `updateGroup` call — reaction-class
+    /// discipline with the timer face's unknown-outcome honesty: an
+    /// indeterminate answer is the SEND_OUTCOME_UNKNOWN error and is never
+    /// retried. Zero local writes: the group row converges through the
+    /// receive projection when the change's own group-update envelope lands.
+    pub async fn update_group(
+        &self,
+        params: GroupsUpdateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_update(&params, self.config.mode)?
+        };
+        match engine
+            .call("updateGroup", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.quit (contract revision 1.45, §4.44, capability
+    /// group-management): resolution under the service lock, then the
+    /// mutating `quitGroup` call — the same unknown-outcome discipline as
+    /// groups.update. The local conversation row is kept; non-member state is
+    /// upstream convergence.
+    pub async fn quit_group(&self, params: GroupsQuitParams) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_quit(&params, self.config.mode)?
+        };
+        match engine
+            .call("quitGroup", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",

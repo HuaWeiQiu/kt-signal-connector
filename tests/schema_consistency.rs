@@ -33,12 +33,13 @@ use serde_json::Value;
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
+    GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES, GROUP_NAME_MAX_BYTES,
     MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
-    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS,
-    MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
-    MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, STICKER_PACK_BROWSE_ID_HEX_CHARS,
-    STICKER_PACK_SYNC_KEY_B64_CHARS,
+    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
+    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS,
+    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES,
+    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -311,11 +312,13 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   enforced in `sticker_pack_syncs_result` and pinned by the §4.34
 ///   integration test.
 /// - the group roster cap (contract 1.40, §4.39, `MAX_GROUP_MEMBERS` = 1001)
-///   and the roster address cap (`MAX_GROUP_MEMBER_ID_CHARS` = 128): the
-///   schema's `result` is a free-form object, so the roster bounds live on
-///   the sync capture (`group_extra_json`, src/supervisor.rs) and the read
-///   projection (`project_group_roster`, src/service.rs), pinned by the §4.39
-///   unit and integration tests.
+///   and the roster address cap (`MAX_GROUP_MEMBER_ID_CHARS` = 128): on the
+///   §4.39 sync/read faces the schema's `result` is a free-form object, so
+///   the bounds live on the sync capture (`group_extra_json`,
+///   src/supervisor.rs) and the read projection (`project_group_roster`,
+///   src/service.rs), pinned by the §4.39 unit and integration tests; the
+///   §4.44 group-management write face (contract 1.45) mirrors both caps in
+///   the schema and is pinned by the pairs below.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
@@ -439,6 +442,61 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/conversationsSetPinnedParams/properties/conversationId",
             "maxLength",
             MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        // Group management (contract 1.45, §4.44): the schema mirrors every
+        // bound the service enforces — the addressing pair, the string
+        // bounds, the emoji grapheme budget, and the roster caps on the
+        // member arrays (the six arrays share one service loop, so one
+        // maxItems and one items pin stand for all six).
+        (
+            "/$defs/groupsUpdateParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/groupsQuitParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/groupName",
+            "maxLength",
+            GROUP_NAME_MAX_BYTES as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/groupDescription",
+            "maxLength",
+            GROUP_DESCRIPTION_MAX_BYTES as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/memberLabel",
+            "maxLength",
+            GROUP_MEMBER_LABEL_MAX_BYTES as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/memberLabelEmoji",
+            "maxLength",
+            MAX_EMOJI_BYTES as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/addMembers",
+            "maxItems",
+            MAX_GROUP_MEMBERS as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/removeMembers",
+            "maxItems",
+            MAX_GROUP_MEMBERS as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/addMembers/items",
+            "maxLength",
+            MAX_GROUP_MEMBER_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/groupsUpdateParams/properties/removeMembers/items",
+            "maxLength",
+            MAX_GROUP_MEMBER_ID_CHARS as u64,
         ),
         // Sticker pack sync (contract 1.37, §4.34): the pack id is the §4.32
         // browse-face 32-hex shape; the pack key when present is exactly the

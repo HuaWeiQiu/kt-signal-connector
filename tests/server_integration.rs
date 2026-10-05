@@ -3823,6 +3823,9 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "stickerPacks.getSyncs",
         "stickerPacks.setSync",
         "sticker-pack-sync",
+        "groups.update",
+        "groups.quit",
+        "group-management",
     ] {
         assert!(
             capabilities
@@ -4572,12 +4575,14 @@ async fn sticker_pack_browse_and_pin_sync_round_trip() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// conversations.setExpireTimer end to end (contract 1.42, §4.41): the
-/// mutating call lands on the signal-cli face's `updateContact` with the
-/// int-seconds `expiration`, the success mirrors the timer into the
-/// conversation and rides `conversation.changed`, the result carries the
-/// resolved value; a group conversation answers INVALID_REQUEST before any
-/// upstream call and an unknown conversation answers CONVERSATION_NOT_FOUND.
+/// conversations.setExpireTimer end to end (contract 1.42, §4.41; group
+/// route re-cut by contract 1.45, §4.44): the direct call lands on the
+/// signal-cli face's `updateContact` with the int-seconds `expiration`, the
+/// success mirrors the timer into the conversation and rides
+/// `conversation.changed`, the result carries the resolved value; a group
+/// conversation routes the same mirror through `updateGroup {account,
+/// groupId, expiration}`; an unknown conversation answers
+/// CONVERSATION_NOT_FOUND.
 #[tokio::test]
 async fn conversations_set_expire_timer_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -4695,8 +4700,12 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     assert_eq!(timer_call["recipient"], "+15555550102");
     assert_eq!(timer_call["expiration"], 86400);
 
-    // A group conversation answers INVALID_REQUEST before any upstream call:
-    // the fixture links with one known group conversation in place.
+    // A group conversation routes the timer change through the same
+    // group-management write it always traveled by upstream (contract 1.45,
+    // §4.44 overturns the §4.41 group refusal): the fixture links with one
+    // known group conversation in place, the call lands on `updateGroup` with
+    // the int-seconds `expiration`, and the mirror + summary behave exactly
+    // like the direct route.
     let listed = request(
         &mut client,
         "list-for-group",
@@ -4718,12 +4727,40 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
         json!({
             "accountId": account_id,
             "conversationId": group_conversation,
-            "expireSeconds": 60
+            "expireSeconds": 3600
         }),
     )
     .await;
-    assert_eq!(group_timer["error"]["code"], "INVALID_REQUEST");
-    assert_eq!(group_timer["error"]["retryable"], false);
+    assert_eq!(group_timer["result"]["expireTimerSeconds"], 3600);
+    let mut saw_group_timer_change = false;
+    for _ in 0..8 {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == group_conversation
+            && frame["data"]["expireTimerSeconds"] == 3600
+        {
+            saw_group_timer_change = true;
+            break;
+        }
+    }
+    assert!(
+        saw_group_timer_change,
+        "the group route must mirror the timer like the direct route"
+    );
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let group_timer_call: Value = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("groupId").is_some() && params.get("expiration").is_some())
+        .expect("the group timer must reach updateGroup");
+    assert_eq!(group_timer_call["account"], "+15555550100");
+    assert_eq!(group_timer_call["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group_timer_call["expiration"], 3600);
 
     // Unknown conversation answers CONVERSATION_NOT_FOUND locally.
     let unknown = request(
@@ -4769,13 +4806,382 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// Engine-error degradation and the unresolved-reference face (contract
-/// 1.36): a codeless engine error degrades to UPSTREAM_ERROR (never a
-/// partial answer), and the engine's CONVERSATION_NOT_RESOLVED passes
-/// through structurally with retryable=false. The crash-with-in-flight-send
-/// path for the mutating write is covered by the sentinel peer
-/// +15555550999 in the fixture (os._exit(29)), exercised here to pin the
-/// SEND_OUTCOME_UNKNOWN answer and the no-auto-retry discipline.
+/// groups.update / groups.quit end to end (contract 1.45, §4.44, capability
+/// group-management): the full change set lands on the upstream `updateGroup`
+/// keys verbatim (including the enabled-without-approval → "enabled" link
+/// mapping), the local refusal ladder answers before any upstream call, and
+/// the receive projection converges the group row — the bodyless UPDATE
+/// envelope lands as a system row carrying `isGroupUpdate` + the resulting
+/// title, and `conversation.changed` mirrors the new title. groups.quit
+/// dispatches `{account, groupId}`, a last-admin quit answers the upstream
+/// user error verbatim (UPSTREAM_ERROR), and the crash-with-in-flight-write
+/// path pins the SEND_OUTCOME_UNKNOWN answer and the no-retry discipline.
+#[tokio::test]
+async fn groups_update_quit_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupMgmt" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The link sync materialized the fixture group; a staged envelope also
+    // creates the quit-fail group so the UPSTREAM_ERROR drill has a real
+    // local row to address.
+    let extra_receives = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-extra-receives.json");
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        &extra_receives,
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 60,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "ZmFrZS1ncm91cC0x",
+                        "type": "UPDATE",
+                        "groupName": "Renamed Fixture",
+                        "revision": 7
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 61,
+                "dataMessage": {
+                    "groupId": "ZmFhaWwtZ3JvdXAtMg==",
+                    "message": "quit-fail group"
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let listed = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group" && row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with the fixture group");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-mgmt-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The refusal ladder, each before any upstream call.
+    let empty = request(
+        &mut client,
+        "update-empty",
+        "groups.update",
+        json!({ "accountId": account_id, "conversationId": group_conversation }),
+    )
+    .await;
+    assert_eq!(empty["error"]["code"], "INVALID_REQUEST");
+    let absent_semantics = request(
+        &mut client,
+        "update-reset-false",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "resetLink": false
+        }),
+    )
+    .await;
+    assert_eq!(absent_semantics["error"]["code"], "INVALID_REQUEST");
+    let empty_members = request(
+        &mut client,
+        "update-empty-members",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "addMembers": []
+        }),
+    )
+    .await;
+    assert_eq!(empty_members["error"]["code"], "INVALID_REQUEST");
+    let bad_link = request(
+        &mut client,
+        "update-bad-link",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "linkState": "open"
+        }),
+    )
+    .await;
+    assert_eq!(bad_link["error"]["code"], "INVALID_REQUEST");
+    let direct = request(
+        &mut client,
+        "update-direct",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "groupName": "Not A Group"
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+    let unknown = request(
+        &mut client,
+        "update-unknown",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "groupName": "Nowhere"
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+
+    // The full change set: every family lands on its upstream key verbatim,
+    // the connector-facing names are the caller's, the upstream names are
+    // the wire's.
+    let updated = request(
+        &mut client,
+        "update-all",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "groupName": "Renamed Fixture",
+            "groupDescription": "KT ops group",
+            "addMembers": ["+15555550102"],
+            "removeMembers": ["+15555550102"],
+            "promoteAdmins": ["+15555550101"],
+            "demoteAdmins": ["+15555550101"],
+            "banMembers": ["+15555550102"],
+            "unbanMembers": ["+15555550102"],
+            "linkState": "enabled-without-approval",
+            "resetLink": true,
+            "permissionAddMember": "only-admins",
+            "permissionEditDetails": "every-member",
+            "permissionSendMessages": "only-admins",
+            "memberLabel": "KT",
+            "memberLabelEmoji": "🛠️",
+            "operationId": "group-mgmt-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(updated["result"]["status"], "sent");
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let update_call: Value = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("name") == Some(&json!("Renamed Fixture")))
+        .expect("the full change set must reach updateGroup");
+    assert_eq!(update_call["account"], "+15555550100");
+    assert_eq!(update_call["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(update_call["description"], "KT ops group");
+    assert_eq!(update_call["members"], json!(["+15555550102"]));
+    assert_eq!(update_call["removeMembers"], json!(["+15555550102"]));
+    assert_eq!(update_call["admins"], json!(["+15555550101"]));
+    assert_eq!(update_call["removeAdmins"], json!(["+15555550101"]));
+    assert_eq!(update_call["bans"], json!(["+15555550102"]));
+    assert_eq!(update_call["unbans"], json!(["+15555550102"]));
+    assert_eq!(update_call["link"], "enabled");
+    assert_eq!(update_call["resetLink"], true);
+    assert_eq!(update_call["setPermissionAddMember"], "only-admins");
+    assert_eq!(update_call["setPermissionEditDetails"], "every-member");
+    assert_eq!(update_call["setPermissionSendMessages"], "only-admins");
+    assert_eq!(update_call["memberLabel"], "KT");
+    assert_eq!(update_call["memberLabelEmoji"], "🛠️");
+
+    // Flush the staged envelopes through the typing hook (the receive burst
+    // rides the request): the UPDATE envelope lands as a system row and the
+    // conversation.changed summary already carries the mirrored title.
+    request(
+        &mut client,
+        "flush-update",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "stop": true
+        }),
+    )
+    .await;
+    let mut saw_title_change = false;
+    for _ in 0..16 {
+        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        if frame["event"] == "conversation.changed"
+            && frame["data"]["id"] == group_conversation
+            && frame["data"]["title"] == "Renamed Fixture"
+        {
+            saw_title_change = true;
+            break;
+        }
+    }
+    assert!(
+        saw_title_change,
+        "the group update receive must mirror the new title"
+    );
+    let messages = request(
+        &mut client,
+        "list-update-rows",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "limit": 50
+        }),
+    )
+    .await;
+    let update_row = messages["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["isGroupUpdate"] == true)
+        .expect("the bodyless update must land a system row");
+    assert_eq!(update_row["direction"], "system");
+    assert_eq!(update_row["text"], "群聊信息已更新");
+    assert_eq!(update_row["groupName"], "Renamed Fixture");
+
+    // groups.quit leaves the fixture group; the quit-fail group (its local
+    // row materialized by the staged timestamp-61 envelope) answers the
+    // upstream user error verbatim — the last-admin quit the connector
+    // forwards faithfully.
+    let quit = request(
+        &mut client,
+        "quit-group",
+        "groups.quit",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "operationId": "group-mgmt-op-2"
+        }),
+    )
+    .await;
+    assert_eq!(quit["result"]["status"], "sent");
+    let quit_call: Value = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|params| params.get("groupId").is_some() && params.get("name").is_none())
+        .expect("the quit must reach quitGroup");
+    assert_eq!(quit_call["account"], "+15555550100");
+    assert_eq!(quit_call["groupId"], "ZmFrZS1ncm91cC0x");
+    let listed = request(
+        &mut client,
+        "list-for-quit-fail",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let fail_group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group" && row["id"] != group_conversation)
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the staged envelope must materialize the quit-fail group");
+    let quit_upstream_error = request(
+        &mut client,
+        "quit-fail-group",
+        "groups.quit",
+        json!({
+            "accountId": account_id,
+            "conversationId": fail_group_conversation
+        }),
+    )
+    .await;
+    assert_eq!(quit_upstream_error["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(quit_upstream_error["error"]["retryable"], true);
+
+    // Crash with the mutating update in flight (fixture magic group name,
+    // os._exit(25)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
+    // call in the recovered log.
+    let crash = request(
+        &mut client,
+        "update-crash",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "groupName": "[fixture-crash-group]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-group", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid);
+    let crash_calls: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("name") == Some(&json!("[fixture-crash-group]")))
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown group-update outcome is never retried: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn sticker_and_pin_methods_surface_engine_errors() {
     let temp = TempDir::new().unwrap();

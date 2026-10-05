@@ -772,6 +772,36 @@ for line in sys.stdin:
         if params.get("expirationInSeconds") == 2147483647:
             os._exit(25)
         result = {}
+    elif method == "updateGroup":
+        # Contract 1.45 §4.44: the group-management write route. Same
+        # dispatch-recording discipline as `send`/`updateContact`: the exact
+        # upstream params land in SEND_LOG so tests assert the change-set keys
+        # verbatim. The alias crash magic gets a group twin: the crash fires
+        # with the change in flight — the indeterminate case (engine-exit
+        # path). Success answers the updateGroup result shape (a timestamp
+        # plus the per-recipient fan-out list).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("name") == "[fixture-crash-group]":
+            os._exit(25)
+        result = {"timestamp": 99, "results": []}
+    elif method == "quitGroup":
+        # Contract 1.45 §4.44: same recording discipline; the magic group id
+        # answers the upstream user error a last-admin quit produces
+        # (UPSTREAM_ERROR family), every other id leaves the group cleanly.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("groupId") == "ZmFhaWwtZ3JvdXAtMg==":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "UserErrorException: Last group admin"},
+            }
+            emit_json(response)
+            continue
+        result = {"timestamp": 99, "results": []}
     elif method == "sendTyping":
         # Contract 1.27 hook: deliver extra receives appended to the marker
         # after link time before answering. Typing indicators change no

@@ -123,8 +123,16 @@ pub const METHODS: &[MethodRow] = &[
     // Disappearing-message timer set (contract revision 1.42, §4.41):
     // mutating, send-lane upstream traffic — the reaction class verbatim,
     // same-account mutex and delete barrier included. Direct conversations
-    // only; the local timer mirror rides the success path.
+    // route setExpirationTimer/updateContact by mode; groups route the
+    // updateGroup expiration write since contract 1.45 (§4.44).
     ("conversations.setExpireTimer", Lane::Send, true, "send"),
+    // Group management writes (contract revision 1.45, §4.44): mutating,
+    // send-lane upstream traffic — the setExpireTimer class verbatim,
+    // same-account mutex and delete barrier included; advertised through
+    // `group-management`. No local row is written by the send path; group
+    // state converges through the group-update receive projection.
+    ("groups.update", Lane::Send, true, "send"),
+    ("groups.quit", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -172,11 +180,14 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// marks the §4.34 account-scoped pack install face, `view-once`
 /// (contract revision 1.38) marks the §4.36/§4.37 view-once send, open-sync
 /// and burn faces, `history-import` (contract revision 1.39) marks the
-/// §4.38 link-time import status face, and `disappearing-messages`
+/// §4.38 link-time import status face, `disappearing-messages`
 /// (contract revision 1.42) marks the §4.41 receive metadata, timer-notice
-/// and bounded-sweep faces plus `conversations.setExpireTimer` — desktops
-/// gate the new surface on this tag so an old connector answers a clean
-/// capability gap instead of `METHOD_NOT_ALLOWED`. They never join
+/// and bounded-sweep faces plus `conversations.setExpireTimer`, and
+/// `group-management` (contract revision 1.45) marks the §4.44 group write
+/// face (`groups.update` / `groups.quit` / the group route of
+/// `conversations.setExpireTimer`) — desktops gate the new surface on this
+/// tag so an old connector answers a clean capability gap instead of
+/// `METHOD_NOT_ALLOWED`. They never join
 /// [`METHOD_NAMES`]: the schema request-frame method enum and the dispatch
 /// table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -188,6 +199,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "view-once",
     "history-import",
     "disappearing-messages",
+    "group-management",
 ];
 
 #[cfg(test)]
@@ -235,6 +247,8 @@ mod tests {
             "presence.setTypingMessage",
             "conversations.setPinned",
             "conversations.setExpireTimer",
+            "groups.update",
+            "groups.quit",
             "stickerPacks.setSync",
         ];
         let mutating = [
@@ -258,6 +272,8 @@ mod tests {
             "accounts.deleteLocalData",
             "conversations.setPinned",
             "conversations.setExpireTimer",
+            "groups.update",
+            "groups.quit",
             "stickerPacks.setSync",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

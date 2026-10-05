@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.44 (2026-10-05)
+- Contract revision: 1.45 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1825,6 +1825,97 @@ self-ness appear on one face and vanish on the other.
   (it does not exist at rest). The list assembly stays store-only on the read lane (§6.5): the
   account's own number is read from the account row through the already-held connection guard —
   one lookup per page, the same discipline the §4.42 summary list applies.
+
+### 4.44 Group management writes: groups.update, groups.quit, conversations.setExpireTimer group extension (contract revision 1.45, 2026-10-05)
+
+The official conversation-info page manages the group itself — rename, description, membership,
+admin grants, bans, the invite link, permissions, member labels — and the desktop G-batch needs a
+write face for it. The premise audit (desktop plan §1.2) verified the pinned signal-cli 0.14.8
+JSON-RPC surface reaches nearly all of it through `updateGroup` (`UpdateGroupCommand`, a
+`JsonRpcLocalCommand`) and `quitGroup` (`QuitGroupCommand`), and corrected one recorded boundary:
+§4.41's "group timer travels through group updates this connector's upstream faces do not
+expose" was wrong — the parameter is named `expiration`, not `expire`, and it flows the timer
+through `updateGroup` verbatim (`UpdateGroupCommand.java` L127 → L162 `withExpirationTimer`).
+This revision opens the write face on the signal-cli JVM/native modes and records the
+kt-engine gap honestly; the engine batch (separate repository) owns the method parity later.
+
+- `groups.update` (host method, capability `group-management`, send lane, account-scoped
+  mutating): params `{accountId, conversationId, ...changes}` — the group is addressed by
+  conversation id like every other conversation face and must resolve to a `kind='group'` row
+  before any upstream call (a direct conversation answers `INVALID_REQUEST`); `operationId?` is
+  validated by shape and never persisted (the §4.5 convention). The change set is the upstream
+  multi-parameter shape, one optional key per concern: `groupName?`, `groupDescription?`,
+  `addMembers?`, `removeMembers?`, `promoteAdmins?`, `demoteAdmins?`, `banMembers?`,
+  `unbanMembers?`, `linkState?` (`enabled-with-approval` | `enabled-without-approval` |
+  `disabled`), `resetLink?` (boolean), `permissionAddMember?` / `permissionEditDetails?` /
+  `permissionSendMessages?` (`every-member` | `only-admins`), `memberLabel?`,
+  `memberLabelEmoji?`. At least one change parameter must be present — an empty change set
+  answers `INVALID_REQUEST` (`resetLink: false` counts as absent: upstream reads the primitive
+  as "no reset"). The upstream payload follows the pinned jsonRpc parameter names verbatim
+  (verified against `UpdateGroupCommand` dests and the `JsonRpcNamespace` camelCase fallback,
+  plus the documented 0.14.8 example): `groupId`, `name`, `description`, `members`,
+  `removeMembers`, `admins`, `removeAdmins`, `bans`, `unbans`, `resetLink`, `link`,
+  `setPermissionAddMember`, `setPermissionEditDetails`, `setPermissionSendMessages`,
+  `memberLabel`, `memberLabelEmoji`. The connector's `linkState` value
+  `enabled-without-approval` maps to the upstream choice `enabled` (the upstream spellings are
+  `enabled` / `enabled-with-approval` / `disabled`); permission values pass through verbatim.
+  Group avatar is deliberately absent: upstream takes a local file path, the connector has no
+  host-file upload channel (the media face is download-only, §6.7), and inventing a temporary
+  file boundary is out of budget — recorded projection difference.
+- Bounds and empty-set semantics: member arrays carry at most 1001 entries (the official
+  GroupsV2 ceiling, `MAX_GROUP_MEMBERS`), each entry 1–128 chars (the roster address cap);
+  `groupName`/`memberLabel` are 1–256 bytes, `groupDescription` up to 4096 bytes,
+  `memberLabelEmoji` follows the reaction emoji rule (one grapheme cluster, ≤32 bytes). An empty
+  array is `INVALID_REQUEST`: upstream reads absence as "no change" (`UpdateGroup` builder
+  fields are null-when-absent) and an explicit empty set would commit a no-delta group change —
+  a revision bump broadcast to every member for nothing — so the connector refuses it and the
+  host omits the key instead. Payload shape is otherwise the host's: member addresses pass
+  through verbatim and the upstream resolves/rejects them (the `contacts.setLocalAlias`
+  recipient discipline).
+- Engine modes: JVM/native dispatch `updateGroup` directly. The kt-engine face has no
+  `updateGroup`/`quitGroup` outbound method (engine methods.rs audit, desktop plan §1.2), so in
+  engine mode both methods answer `CAPABILITY_UNAVAILABLE` (`retryable=false`) after local
+  param/conversation validation — the media-ingest engine-downgrade precedent
+  (`effective_media_ingest`): an advertised face the selected engine cannot serve fails closed
+  with a structured error instead of an upstream protocol error. Local shape errors stay
+  `INVALID_REQUEST` in both modes; the mode gate sits behind them so hosts get deterministic
+  param errors first. The engine batch removes the gate without a connector contract change.
+- Result semantics (the §4.41 mutating discipline, not the pin family's): a definite success
+  answers `{"status": "sent"}`; an indeterminate upstream outcome (engine exit or timeout with
+  the call in flight) answers the `SEND_OUTCOME_UNKNOWN` error, never retried by the connector.
+  No local row is written by the send path itself: group state converges through the receive
+  projection below, so the desktop's optimistic update reconciles against the change envelope
+  like any other member's edit.
+- Group-change receive projection (the contract-1.42 system-row discipline): a bodyless
+  `dataMessage` whose `groupInfo.type` is `UPDATE` was dropped as `"skip"` before this revision —
+  group changes were invisible locally. They now land as a `system` row whose rich record
+  carries `isGroupUpdate: true` as its marker and whose text material speaks the envelope's
+  honest content — `群聊信息已更新` (the pinned `JsonGroupInfo` carries `{groupId, groupName,
+  revision, type}` only: no actor name, no old/new diff, so no finer copy is invented; the
+  desktop localizes presentation from the marker, the §4.41 material-vs-copy split). When the
+  envelope states a `groupName`, the conversation's title mirrors it best-effort before the row
+  inserts, so the `conversation.changed` the landing already pushes carries the new name without
+  a poll (the §4.41 timer-mirror slot); the `groups.get` cache row stays exactly as synced until
+  the next sync — `syncedAt` remains the staleness signal, recorded boundary. A timer-notice
+  envelope (§4.41) still wins when both flags ride one envelope; the generic projection only
+  takes what the timer path leaves.
+- `groups.quit` (same lane, capability, and result discipline): params
+  `{accountId, conversationId, operationId?}`, group conversations only, payload
+  `{"account", "groupId"}` — the pinned upstream `quitGroup` dests. The upstream `--delete`
+  local-data flag and the `--admin` last-admin handoff list are deliberately not exposed: the
+  official client keeps the conversation as a non-member after leaving (the G-batch renders
+  that state), and a last-admin quit without a handoff answers the upstream
+  `UserErrorException` verbatim (`UPSTREAM_ERROR` family) — recorded boundary, not a connector
+  error code.
+- `conversations.setExpireTimer` group extension (the §1.2 翻案, correcting §4.41's recorded
+  boundary): a group conversation no longer answers `INVALID_REQUEST` on the JVM/native modes —
+  the route becomes the `updateGroup {"account", "groupId", "expiration"}` write (the
+  upstream group-update face, int seconds, the same `CallClass::Mutating` discipline,
+  `SEND_OUTCOME_UNKNOWN` never retried, mirror + `conversation.changed` unchanged). In
+  kt-engine mode the group form keeps a structured `INVALID_REQUEST` — the engine face's
+  `setExpirationTimer` is recipient-shaped only — with the reason updated from "not settable
+  through this connector" to the engine-batch debt ("engine face pending"); the desktop batch
+  owns the matrix wording fix. Direct conversations are untouched in both modes.
 
 ## 5. signal-cli Boundary
 

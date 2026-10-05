@@ -76,6 +76,8 @@
             "contacts.sync",
             "contacts.list",
             "groups.get",
+            "groups.update",
+            "groups.quit",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "history.importStatus"
@@ -488,6 +490,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/groupsGetParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.update" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsUpdateParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.quit" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsQuitParams" }
             }
           }
         },
@@ -1177,7 +1201,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "expireSeconds"],
-      "description": "Set or clear one direct conversation's disappearing-message timer (contract revision 1.42, §4.41): the write follows the connector's engine mode — the engine face's setExpirationTimer {account, recipient, expirationInSeconds} or the signal-cli face's updateContact {account, recipient, expiration} (int seconds). Same-value sets are upstream no-ops (no broadcast, no version bump — official semantics); 0 turns the timer off; there is no toggle form. conversationId resolves through the local store (CONVERSATION_NOT_FOUND before any upstream call); only direct conversations are settable — a group timer change travels through group-update faces this connector does not expose, so a group conversation answers INVALID_REQUEST (recorded boundary). Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. On success the local conversation mirror updates and the refreshed summary rides conversation.changed; the result is {expireTimerSeconds: n}. Note the engine face validates recipient against registered contacts — an unregistered peer answers the upstream error verbatim (fail-closed UPSTREAM_ERROR family).",
+      "description": "Set or clear one conversation's disappearing-message timer (contract revision 1.42, §4.41; group conversations since 1.45, §4.44): a direct conversation follows the connector's engine mode — the engine face's setExpirationTimer {account, recipient, expirationInSeconds} or the signal-cli face's updateContact {account, recipient, expiration} (int seconds); a group conversation (1.45) routes the signal-cli face's updateGroup {account, groupId, expiration} on JVM/native modes — the §4.41 'group timers are unreachable' boundary is overturned (the upstream parameter is named expiration). Same-value sets are upstream no-ops (no broadcast, no version bump — official semantics); 0 turns the timer off; there is no toggle form. conversationId resolves through the local store (CONVERSATION_NOT_FOUND before any upstream call). In kt-engine mode a group conversation keeps a structured INVALID_REQUEST: the engine face's setExpirationTimer is recipient-shaped only and the engine has no updateGroup method yet (engine-batch debt, recorded). Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. On success the local conversation mirror updates and the refreshed summary rides conversation.changed; the result is {expireTimerSeconds: n}. Note the engine face validates recipient against registered contacts — an unregistered peer answers the upstream error verbatim (fail-closed UPSTREAM_ERROR family).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": {
@@ -1249,6 +1273,122 @@
           "maxLength": 128,
           "description": "The upstream group id, exactly the peerKey of the cached kind='group' contacts row."
         }
+      }
+    },
+    "groupsUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Apply one group-management change set to one group conversation (contract revision 1.45, §4.44, capability group-management). The change keys are individually optional and mirror the pinned signal-cli updateGroup jsonRpc surface verbatim: name (from groupName), description (from groupDescription), members (from addMembers), removeMembers, admins (from promoteAdmins), removeAdmins (from demoteAdmins), bans (from banMembers), unbans (from unbanMembers), resetLink, link (from linkState: the connector's enabled-without-approval maps to the upstream choice 'enabled'), setPermissionAddMember / setPermissionEditDetails / setPermissionSendMessages (every-member | only-admins), memberLabel, memberLabelEmoji. At least one change parameter must be present (an empty change set answers INVALID_REQUEST; resetLink=false counts as absent). An empty member array is INVALID_REQUEST — upstream reads absence as 'no change' and an explicit empty set would commit a no-delta group change broadcast. Member arrays carry at most 1001 entries (the official GroupsV2 ceiling), each 1-128 chars, forwarded verbatim (the upstream resolves and rejects unknown addresses). groupName/memberLabel 1-256 bytes, groupDescription up to 4096 bytes, memberLabelEmoji one emoji grapheme cluster (<=32 bytes). conversationId must resolve to a kind='group' row before any upstream call (direct answers INVALID_REQUEST). Group avatar is not exposed: upstream takes a local file path and the connector has no host-file upload channel (recorded boundary). JVM/native modes dispatch updateGroup directly; the kt-engine face has no updateGroup method and answers CAPABILITY_UNAVAILABLE (retryable=false) after local validation — engine-batch debt. Send lane, account-scoped mutating: result is {status: 'sent'} on a definite success; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Group state converges through the receive projection: a bodyless groupInfo type=UPDATE envelope lands as a system row (rich marker isGroupUpdate) and conversation.changed carries the mirrored title.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation to update; resolved against the account before any upstream call."
+        },
+        "groupName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "New group name; upstream key 'name'."
+        },
+        "groupDescription": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "New group description; upstream key 'description'."
+        },
+        "addMembers": {
+          "type": "array",
+          "maxItems": 1001,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Members to add; upstream key 'members'."
+        },
+        "removeMembers": {
+          "type": "array",
+          "maxItems": 1001,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Members to remove; upstream key 'removeMembers'."
+        },
+        "promoteAdmins": {
+          "type": "array",
+          "maxItems": 1001,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Members to promote to admin; upstream key 'admins'."
+        },
+        "demoteAdmins": {
+          "type": "array",
+          "maxItems": 1001,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Admins to demote; upstream key 'removeAdmins'."
+        },
+        "banMembers": {
+          "type": "array",
+          "maxItems": 1001,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Members to ban; upstream key 'bans'."
+        },
+        "unbanMembers": {
+          "type": "array",
+          "maxItems": 1001,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "description": "Members to unban; upstream key 'unbans'."
+        },
+        "linkState": {
+          "type": "string",
+          "enum": ["enabled-with-approval", "enabled-without-approval", "disabled"],
+          "description": "Group invite-link state; upstream key 'link'. The connector's enabled-without-approval maps to the upstream choice 'enabled'."
+        },
+        "resetLink": {
+          "type": "boolean",
+          "description": "Reset the group link and create a new link password; upstream key 'resetLink'. false carries no change semantics (absent)."
+        },
+        "permissionAddMember": {
+          "type": "string",
+          "enum": ["every-member", "only-admins"],
+          "description": "Who may add members; upstream key 'setPermissionAddMember'."
+        },
+        "permissionEditDetails": {
+          "type": "string",
+          "enum": ["every-member", "only-admins"],
+          "description": "Who may edit group details; upstream key 'setPermissionEditDetails'."
+        },
+        "permissionSendMessages": {
+          "type": "string",
+          "enum": ["every-member", "only-admins"],
+          "description": "Who may send messages; upstream key 'setPermissionSendMessages'."
+        },
+        "memberLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group's member label string; upstream key 'memberLabel'."
+        },
+        "memberLabelEmoji": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "The group's member label emoji: exactly one unicode grapheme cluster of at most 32 UTF-8 bytes; upstream key 'memberLabelEmoji'."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "groupsQuitParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Leave one group conversation (contract revision 1.45, §4.44, capability group-management): the upstream quitGroup {account, groupId} write. conversationId must resolve to a kind='group' row before any upstream call (direct answers INVALID_REQUEST). The upstream --delete local-data flag and the --admin last-admin handoff list are deliberately not exposed: the official client keeps the conversation as a non-member after leaving, and a last-admin quit without a handoff answers the upstream UserErrorException verbatim (UPSTREAM_ERROR family). JVM/native modes dispatch quitGroup directly; the kt-engine face has no quitGroup method and answers CAPABILITY_UNAVAILABLE (retryable=false) after local validation — engine-batch debt. Send lane, account-scoped mutating: result is {status: 'sent'} on a definite success; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. The local conversation row is kept (non-member state is upstream convergence, like groups.update).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation to leave; resolved against the account before any upstream call."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "contactsSetLocalAliasParams": {

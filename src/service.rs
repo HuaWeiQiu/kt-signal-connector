@@ -116,6 +116,13 @@ pub const MAX_GROUP_MEMBERS: usize = 1001;
 /// One roster member address (contract 1.40): a number or UUID-shaped ACI,
 /// bounded like the opaqueId family it must stay joinable against.
 pub const MAX_GROUP_MEMBER_ID_CHARS: usize = 128;
+/// Group-management string bounds (contract 1.45, §4.44): the display-name
+/// and member-label byte ceiling, the description byte ceiling. The schema
+/// mirrors them as character bounds; the service enforces bytes (stricter or
+/// equal for every input).
+pub const GROUP_NAME_MAX_BYTES: usize = 256;
+pub const GROUP_DESCRIPTION_MAX_BYTES: usize = 4096;
+pub const GROUP_MEMBER_LABEL_MAX_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -1604,25 +1611,28 @@ impl ConnectorService {
         }))
     }
 
-    /// conversations.setExpireTimer (contract revision 1.42, §4.41): bounds,
-    /// resolution, and the mode-shaped upstream payload under the service
-    /// lock. Only direct conversations are settable — the timer change for a
-    /// group travels through group updates this connector's upstream faces do
-    /// not expose, so a group conversation answers INVALID_REQUEST before any
-    /// upstream call (the recorded §4.41 boundary). The payload follows the
-    /// caller's engine mode verbatim: the engine face's `setExpirationTimer`
+    /// conversations.setExpireTimer (contract revision 1.42, §4.41; group
+    /// route re-cut by contract revision 1.45, §4.44): bounds, resolution, and
+    /// the mode-shaped upstream payload under the service lock. A direct
+    /// conversation routes per mode — the engine face's `setExpirationTimer`
     /// takes `recipient` (a single string) + `expirationInSeconds`; the
     /// signal-cli face's `updateContact` takes `recipient` + `expiration`
     /// (int seconds) — same-value no-ops and broadcast semantics stay
-    /// upstream. Returns the upstream payload plus the resolved timer value
-    /// the success path mirrors into the conversation row.
+    /// upstream. A group conversation now routes the timer change through the
+    /// group-management write it always traveled by upstream: the signal-cli
+    /// face's `updateGroup {account, groupId, expiration}` (the §4.41
+    /// group refusal is overturned); the kt-engine face still has no group
+    /// update method and answers INVALID_REQUEST after local validation (the
+    /// engine-batch boundary, recorded). Returns the upstream method name,
+    /// the payload, and the resolved timer value the success path mirrors
+    /// into the conversation row.
     pub fn prepare_conversations_set_expire_timer(
         &self,
         account_id: &str,
         conversation_id: &str,
         expire_seconds: u32,
         mode: SignalCliMode,
-    ) -> Result<(Value, u64), ServiceError> {
+    ) -> Result<(&'static str, Value, u64), ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         if conversation_id.is_empty()
             || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
@@ -1643,25 +1653,290 @@ impl ConnectorService {
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
         if conversation.kind != "direct" {
+            return match mode {
+                SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "group disappearing timers are not available on the kt-engine face yet",
+                    false,
+                ))),
+                _ => Ok((
+                    "updateGroup",
+                    json!({
+                        "account": account.signal_account,
+                        "groupId": conversation.peer_key,
+                        "expiration": expire_seconds,
+                    }),
+                    u64::from(expire_seconds),
+                )),
+            };
+        }
+        let (method, upstream) = match mode {
+            SignalCliMode::KtEngine => (
+                "setExpirationTimer",
+                json!({
+                    "account": account.signal_account,
+                    "recipient": conversation.peer_key,
+                    "expirationInSeconds": expire_seconds,
+                }),
+            ),
+            _ => (
+                "updateContact",
+                json!({
+                    "account": account.signal_account,
+                    "recipient": conversation.peer_key,
+                    "expiration": expire_seconds,
+                }),
+            ),
+        };
+        Ok((method, upstream, u64::from(expire_seconds)))
+    }
+
+    /// groups.update (contract revision 1.45, §4.44, capability
+    /// group-management): the full local validation + resolution ladder, then
+    /// the mode-shaped upstream `updateGroup` payload under the service lock.
+    /// Field bounds mirror the schema; the change keys are individually
+    /// optional, at least one must be present (`resetLink: false` counts as
+    /// absent), and explicit empty member arrays are refused — upstream reads
+    /// absence as "no change" and an empty set would commit a no-delta group
+    /// change broadcast. The conversation id must resolve to a kind='group'
+    /// row (direct answers INVALID_REQUEST before any upstream call); the
+    /// member addresses forward verbatim — resolving and rejecting unknown
+    /// addresses is upstream work. The kt-engine face has no updateGroup
+    /// method and answers CAPABILITY_UNAVAILABLE (retryable=false) after the
+    /// local validation completed — engine-batch debt, honest by design.
+    /// Zero local writes: group state converges through the receive
+    /// projection.
+    pub fn prepare_groups_update(
+        &self,
+        params: &GroupsUpdateParams,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "group disappearing timers are not settable through this connector",
+                "conversationId must contain between 1 and 256 characters",
                 false,
             )));
         }
-        let upstream = match mode {
-            SignalCliMode::KtEngine => json!({
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        let bounded = |value: &str, max: usize| !value.is_empty() && value.len() <= max;
+        let mut changes: Vec<(&'static str, Value)> = Vec::new();
+        if let Some(name) = params.group_name.as_deref() {
+            if !bounded(name, GROUP_NAME_MAX_BYTES) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "groupName must contain between 1 and 256 bytes",
+                    false,
+                )));
+            }
+            changes.push(("name", json!(name)));
+        }
+        if let Some(description) = params.group_description.as_deref() {
+            if !bounded(description, GROUP_DESCRIPTION_MAX_BYTES) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "groupDescription must contain between 1 and 4096 bytes",
+                    false,
+                )));
+            }
+            changes.push(("description", json!(description)));
+        }
+        for (field, list) in [
+            ("addMembers", &params.add_members),
+            ("removeMembers", &params.remove_members),
+            ("promoteAdmins", &params.promote_admins),
+            ("demoteAdmins", &params.demote_admins),
+            ("banMembers", &params.ban_members),
+            ("unbanMembers", &params.unban_members),
+        ] {
+            let Some(members) = list else {
+                continue;
+            };
+            if members.is_empty() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "an empty member array carries no change upstream; omit the key instead",
+                    false,
+                )));
+            }
+            if members.len() > MAX_GROUP_MEMBERS
+                || members.iter().any(|member| {
+                    member.is_empty() || member.chars().count() > MAX_GROUP_MEMBER_ID_CHARS
+                })
+            {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "member arrays carry at most 1001 entries of 1-128 characters",
+                    false,
+                )));
+            }
+            let key = match field {
+                "addMembers" => "members",
+                "promoteAdmins" => "admins",
+                "demoteAdmins" => "removeAdmins",
+                "banMembers" => "bans",
+                "unbanMembers" => "unbans",
+                _ => "removeMembers",
+            };
+            changes.push((key, json!(members)));
+        }
+        if let Some(link_state) = params.link_state.as_deref() {
+            // The connector's enabled-without-approval is the upstream
+            // "enabled" choice under a stricter name: the official link state
+            // knows enabled / enabled-with-approval / disabled (pinned
+            // UpdateGroupCommand --link choices).
+            let upstream = match link_state {
+                "enabled-with-approval" => "enabled-with-approval",
+                "enabled-without-approval" => "enabled",
+                "disabled" => "disabled",
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "linkState must be one of enabled-with-approval, enabled-without-approval, disabled",
+                        false,
+                    )));
+                }
+            };
+            changes.push(("link", json!(upstream)));
+        }
+        if params.reset_link == Some(true) {
+            changes.push(("resetLink", json!(true)));
+        }
+        for (value, key) in [
+            (
+                params.permission_add_member.as_deref(),
+                "setPermissionAddMember",
+            ),
+            (
+                params.permission_edit_details.as_deref(),
+                "setPermissionEditDetails",
+            ),
+            (
+                params.permission_send_messages.as_deref(),
+                "setPermissionSendMessages",
+            ),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            match value {
+                // The pinned upstream accepts both spellings per choice
+                // (every-member/everyMember); the connector forwards its
+                // schema vocabulary verbatim.
+                "every-member" | "only-admins" => changes.push((key, json!(value))),
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "permission values must be every-member or only-admins",
+                        false,
+                    )));
+                }
+            }
+        }
+        if let Some(label) = params.member_label.as_deref() {
+            if !bounded(label, GROUP_MEMBER_LABEL_MAX_BYTES) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "memberLabel must contain between 1 and 256 bytes",
+                    false,
+                )));
+            }
+            changes.push(("memberLabel", json!(label)));
+        }
+        if let Some(emoji) = params.member_label_emoji.as_deref() {
+            validate_emoji(emoji)?;
+            changes.push(("memberLabelEmoji", json!(emoji)));
+        }
+        if changes.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "at least one group change is required",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "groups.update addresses a group conversation",
+                false,
+            )));
+        }
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no updateGroup method yet",
+                false,
+            ))),
+            _ => {
+                let mut upstream = json!({
+                    "account": account.signal_account,
+                    "groupId": conversation.peer_key,
+                });
+                if let Some(object) = upstream.as_object_mut() {
+                    for (key, value) in changes {
+                        object.insert(key.to_string(), value);
+                    }
+                }
+                Ok(upstream)
+            }
+        }
+    }
+
+    /// groups.quit (contract revision 1.45, §4.44, capability
+    /// group-management): resolution ladder then the upstream `quitGroup
+    /// {account, groupId}` payload. The upstream --delete local-data flag and
+    /// the --admin last-admin handoff list are deliberately not exposed: the
+    /// official client keeps the conversation as a non-member after leaving,
+    /// and a last-admin quit without a handoff answers the upstream user
+    /// error verbatim (UPSTREAM_ERROR family). The kt-engine face has no
+    /// quitGroup method and answers CAPABILITY_UNAVAILABLE after local
+    /// validation. The local conversation row is kept — non-member state is
+    /// upstream convergence, like groups.update.
+    pub fn prepare_groups_quit(
+        &self,
+        params: &GroupsQuitParams,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "groups.quit addresses a group conversation",
+                false,
+            )));
+        }
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no quitGroup method yet",
+                false,
+            ))),
+            _ => Ok(json!({
                 "account": account.signal_account,
-                "recipient": conversation.peer_key,
-                "expirationInSeconds": expire_seconds,
-            }),
-            _ => json!({
-                "account": account.signal_account,
-                "recipient": conversation.peer_key,
-                "expiration": expire_seconds,
-            }),
-        };
-        Ok((upstream, u64::from(expire_seconds)))
+                "groupId": conversation.peer_key,
+            })),
+        }
     }
 
     /// stickerPacks.getSyncs (contract revision 1.37, §4.34): account bounds
@@ -2930,6 +3205,23 @@ impl ConnectorService {
                 &conversation.id,
                 receive.expire_seconds.unwrap_or(0),
             )?;
+        }
+        // Contract 1.45 (§4.44): a group-update row mirrors the engine's
+        // post-change title into the conversation row before the summary for
+        // conversation.changed is refetched. The engine group state is the
+        // upstream truth, so the raw setter bypasses the placeholder-only
+        // title upgrade rule; every UPDATE row with title material converges
+        // the mirror (a body-carrying update keeps its message row and still
+        // mirrors), and direct conversations carry no group state.
+        if kind == "group"
+            && let Some(group_name) = receive
+                .rich
+                .as_ref()
+                .filter(|rich| rich.is_group_update)
+                .and_then(|rich| rich.group_name.as_deref())
+        {
+            self.store
+                .set_conversation_title(&conversation.id, group_name)?;
         }
         let message = MessageRecord {
             id: message_id,
@@ -4463,6 +4755,45 @@ pub struct ContactsListParams {
 pub struct GroupsGetParams {
     pub account_id: String,
     pub group_key: String,
+}
+
+/// groups.update params (contract revision 1.45, §4.44, capability
+/// group-management): every change key is individually optional — an absent
+/// key is "no change" upstream, an all-absent change set is refused by the
+/// service (`resetLink: false` counts as absent). Member arrays carry the
+/// §4.39 roster bounds; the schema mirrors every bound this struct's
+/// deserialization plus the service checks enforce.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsUpdateParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub group_name: Option<String>,
+    pub group_description: Option<String>,
+    pub add_members: Option<Vec<String>>,
+    pub remove_members: Option<Vec<String>>,
+    pub promote_admins: Option<Vec<String>>,
+    pub demote_admins: Option<Vec<String>>,
+    pub ban_members: Option<Vec<String>>,
+    pub unban_members: Option<Vec<String>>,
+    pub link_state: Option<String>,
+    pub reset_link: Option<bool>,
+    pub permission_add_member: Option<String>,
+    pub permission_edit_details: Option<String>,
+    pub permission_send_messages: Option<String>,
+    pub member_label: Option<String>,
+    pub member_label_emoji: Option<String>,
+    pub operation_id: Option<String>,
+}
+
+/// groups.quit params (contract revision 1.45, §4.44, capability
+/// group-management): the addressing pair plus the optional audit id.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsQuitParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub operation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -11017,15 +11348,17 @@ mod tests {
         assert_eq!(decoded, value);
     }
 
-    // ---- Contract 1.42 (§4.41): disappearing-message timer control ----
+    // ---- Contract 1.42 (§4.41); group route re-cut by contract 1.45 (§4.44) ----
 
     /// The upstream payload follows the caller's engine mode verbatim —
     /// the engine face's `setExpirationTimer` (seconds) vs the signal-cli
     /// face's `updateContact` (expiration, int seconds) — after bounds,
-    /// account, and direct-only conversation resolution. A group answers
-    /// INVALID_REQUEST before any upstream call, an unknown conversation
-    /// answers CONVERSATION_NOT_FOUND, and an out-of-face value answers
-    /// INVALID_REQUEST.
+    /// account, and conversation resolution. A direct conversation carries
+    /// the direct route; a group now routes `updateGroup {account, groupId,
+    /// expiration}` on the signal-cli faces and answers INVALID_REQUEST on
+    /// the kt-engine face (no group update method there yet), an unknown
+    /// conversation answers CONVERSATION_NOT_FOUND, and an out-of-face value
+    /// answers INVALID_REQUEST.
     #[test]
     fn set_expire_timer_preparation_shapes_upstream_by_mode() {
         use crate::engine::SignalCliMode;
@@ -11043,7 +11376,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "group-id-1", "group")
             .unwrap();
 
-        let (engine, seconds) = service
+        let (engine_method, engine_payload, seconds) = service
             .prepare_conversations_set_expire_timer(
                 &account.id,
                 &direct.id,
@@ -11051,9 +11384,10 @@ mod tests {
                 SignalCliMode::KtEngine,
             )
             .unwrap();
+        assert_eq!(engine_method, "setExpirationTimer");
         assert_eq!(seconds, 86_400);
         assert_eq!(
-            engine,
+            engine_payload,
             json!({
                 "account": "+15555550100",
                 "recipient": "+15555550101",
@@ -11061,7 +11395,7 @@ mod tests {
             })
         );
 
-        let (signal_cli, _) = service
+        let (signal_cli, signal_cli_payload, _) = service
             .prepare_conversations_set_expire_timer(
                 &account.id,
                 &direct.id,
@@ -11069,8 +11403,9 @@ mod tests {
                 SignalCliMode::Jvm,
             )
             .unwrap();
+        assert_eq!(signal_cli, "updateContact");
         assert_eq!(
-            signal_cli,
+            signal_cli_payload,
             json!({
                 "account": "+15555550100",
                 "recipient": "+15555550101",
@@ -11078,6 +11413,27 @@ mod tests {
             })
         );
 
+        // Group route (§4.44): the signal-cli faces travel by updateGroup.
+        let (group_method, group_payload, group_seconds) = service
+            .prepare_conversations_set_expire_timer(
+                &account.id,
+                &group.id,
+                3600,
+                SignalCliMode::Jvm,
+            )
+            .unwrap();
+        assert_eq!(group_method, "updateGroup");
+        assert_eq!(group_seconds, 3600);
+        assert_eq!(
+            group_payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "expiration": 3600,
+            })
+        );
+
+        // ... while the kt-engine face keeps the recorded boundary.
         let group_refusal = service
             .prepare_conversations_set_expire_timer(
                 &account.id,
@@ -11204,5 +11560,523 @@ mod tests {
             })
             .expect("close mirror event");
         assert_eq!(changed.expire_timer_seconds, Some(0));
+    }
+
+    // ---- Contract 1.45 (§4.44): group management write face ----
+
+    /// Every change family maps to its upstream `updateGroup` key verbatim
+    /// (the connector-facing names are the caller's; the upstream names are
+    /// the wire's), member arrays keep the roster bounds, and the refusal
+    /// ladder answers before any upstream call: empty change sets, explicit
+    /// empty member arrays, oversized strings and rosters, bad enums, direct
+    /// addressing, unknown conversations, a malformed operationId.
+    #[test]
+    fn groups_update_preparation_maps_change_families_and_refuses_gaps() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let base = |conversation_id: &str| GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation_id.into(),
+            group_name: None,
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state: None,
+            reset_link: None,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: None,
+            member_label: None,
+            member_label_emoji: None,
+            operation_id: None,
+        };
+
+        // One payload per change family, verbatim key mapping.
+        assert_eq!(
+            service
+                .prepare_groups_update(
+                    &GroupsUpdateParams {
+                        group_name: Some("New Name".into()),
+                        ..base(&group.id)
+                    },
+                    SignalCliMode::Jvm
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "name": "New Name",
+            })
+        );
+        assert_eq!(
+            service
+                .prepare_groups_update(
+                    &GroupsUpdateParams {
+                        group_description: Some("A description".into()),
+                        ..base(&group.id)
+                    },
+                    SignalCliMode::Jvm
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "description": "A description",
+            })
+        );
+        for (connector_key, upstream_key, members) in [
+            ("addMembers", "members", vec!["+15555550101"]),
+            ("removeMembers", "removeMembers", vec!["+15555550102"]),
+            ("promoteAdmins", "admins", vec!["+15555550101"]),
+            ("demoteAdmins", "removeAdmins", vec!["+15555550101"]),
+            ("banMembers", "bans", vec!["+15555550102"]),
+            ("unbanMembers", "unbans", vec!["+15555550102"]),
+        ] {
+            let members: Vec<String> = members.into_iter().map(str::to_string).collect();
+            let params = GroupsUpdateParams {
+                add_members: (connector_key == "addMembers").then(|| members.clone()),
+                remove_members: (connector_key == "removeMembers").then(|| members.clone()),
+                promote_admins: (connector_key == "promoteAdmins").then(|| members.clone()),
+                demote_admins: (connector_key == "demoteAdmins").then(|| members.clone()),
+                ban_members: (connector_key == "banMembers").then(|| members.clone()),
+                unban_members: (connector_key == "unbanMembers").then(|| members.clone()),
+                ..base(&group.id)
+            };
+            let mut expected = json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+            });
+            expected[upstream_key] = json!(members);
+            assert_eq!(
+                service
+                    .prepare_groups_update(&params, SignalCliMode::Jvm)
+                    .unwrap(),
+                expected,
+                "family {connector_key} must land on upstream key {upstream_key}"
+            );
+        }
+
+        // Link state: the connector's enabled-without-approval maps to the
+        // upstream "enabled" choice; the other two pass verbatim.
+        for (connector, upstream) in [
+            ("enabled-with-approval", "enabled-with-approval"),
+            ("enabled-without-approval", "enabled"),
+            ("disabled", "disabled"),
+        ] {
+            assert_eq!(
+                service
+                    .prepare_groups_update(
+                        &GroupsUpdateParams {
+                            link_state: Some(connector.into()),
+                            ..base(&group.id)
+                        },
+                        SignalCliMode::Jvm
+                    )
+                    .unwrap(),
+                json!({
+                    "account": "+15555550100",
+                    "groupId": "group-id-1",
+                    "link": upstream,
+                })
+            );
+        }
+        // resetLink: only the true form carries a change.
+        assert_eq!(
+            service
+                .prepare_groups_update(
+                    &GroupsUpdateParams {
+                        reset_link: Some(true),
+                        ..base(&group.id)
+                    },
+                    SignalCliMode::Jvm
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "resetLink": true,
+            })
+        );
+        for (value, key) in [
+            ("every-member", "setPermissionAddMember"),
+            ("only-admins", "setPermissionEditDetails"),
+            ("only-admins", "setPermissionSendMessages"),
+        ] {
+            let params = GroupsUpdateParams {
+                permission_add_member: (key == "setPermissionAddMember").then(|| value.into()),
+                permission_edit_details: (key == "setPermissionEditDetails").then(|| value.into()),
+                permission_send_messages: (key == "setPermissionSendMessages")
+                    .then(|| value.into()),
+                ..base(&group.id)
+            };
+            assert_eq!(
+                service
+                    .prepare_groups_update(&params, SignalCliMode::Jvm)
+                    .unwrap(),
+                json!({
+                    "account": "+15555550100",
+                    "groupId": "group-id-1",
+                    key: value,
+                })
+            );
+        }
+        assert_eq!(
+            service
+                .prepare_groups_update(
+                    &GroupsUpdateParams {
+                        member_label: Some("Builders".into()),
+                        member_label_emoji: Some("🛠️".into()),
+                        ..base(&group.id)
+                    },
+                    SignalCliMode::Jvm
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "memberLabel": "Builders",
+                "memberLabelEmoji": "🛠️",
+            })
+        );
+
+        // The refusal ladder — each before any upstream call.
+        let refused = |params: GroupsUpdateParams| {
+            let error = service
+                .prepare_groups_update(&params, SignalCliMode::Jvm)
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
+                "expected INVALID_REQUEST"
+            );
+        };
+        refused(GroupsUpdateParams {
+            group_name: Some(String::new()),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            group_name: None,
+            ..base(&group.id)
+        }); // no change at all
+        refused(GroupsUpdateParams {
+            reset_link: Some(false),
+            ..base(&group.id)
+        }); // false is absence, not a change
+        refused(GroupsUpdateParams {
+            add_members: Some(Vec::new()),
+            ..base(&group.id)
+        }); // explicit empty member array
+        refused(GroupsUpdateParams {
+            add_members: Some(vec!["+15555550101".into(); MAX_GROUP_MEMBERS + 1]),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            add_members: Some(vec!["x".repeat(MAX_GROUP_MEMBER_ID_CHARS + 1)]),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            group_name: Some("長".repeat(GROUP_NAME_MAX_BYTES / 3 + 1)),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            group_description: Some("d".repeat(GROUP_DESCRIPTION_MAX_BYTES + 1)),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            member_label: Some("".into()),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            member_label_emoji: Some("👍👍".into()),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            link_state: Some("open".into()),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            permission_send_messages: Some("nobody".into()),
+            ..base(&group.id)
+        });
+        refused(GroupsUpdateParams {
+            operation_id: Some("".into()),
+            ..base(&group.id)
+        });
+        // Direct addressing and unknown conversations answer their ladder
+        // steps, not the group payload.
+        refused(GroupsUpdateParams {
+            conversation_id: direct.id.clone(),
+            group_name: Some("New Name".into()),
+            ..base(&group.id)
+        });
+        let missing = service
+            .prepare_groups_update(
+                &GroupsUpdateParams {
+                    conversation_id: "conv-absent".into(),
+                    group_name: Some("New Name".into()),
+                    ..base(&group.id)
+                },
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+    }
+
+    /// The kt-engine face has no group-management methods: a fully valid
+    /// change set still answers CAPABILITY_UNAVAILABLE (retryable=false)
+    /// after the local validation, while an invalid one keeps its
+    /// INVALID_REQUEST — the honest degradation, never a silent rewrite.
+    #[test]
+    fn groups_update_and_quit_refuse_the_engine_face_after_validation() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let named = GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            group_name: Some("New Name".into()),
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state: None,
+            reset_link: None,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: None,
+            member_label: None,
+            member_label_emoji: None,
+            operation_id: None,
+        };
+        let error = service
+            .prepare_groups_update(&named, SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        // Validation outranks the capability gate.
+        let invalid = GroupsUpdateParams {
+            group_name: None,
+            ..named
+        };
+        let error = service
+            .prepare_groups_update(&invalid, SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        let quit = GroupsQuitParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            operation_id: None,
+        };
+        let error = service
+            .prepare_groups_quit(&quit, SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+    }
+
+    /// groups.quit resolves the group and answers the bare upstream payload;
+    /// direct addressing and unknown conversations answer their ladder steps.
+    #[test]
+    fn groups_quit_preparation_addresses_the_group_and_refuses_non_groups() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let quit = |conversation_id: String| GroupsQuitParams {
+            account_id: account.id.clone(),
+            conversation_id,
+            operation_id: None,
+        };
+        assert_eq!(
+            service
+                .prepare_groups_quit(&quit(group.id.clone()), SignalCliMode::Jvm)
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+            })
+        );
+        let error = service
+            .prepare_groups_quit(&quit(direct.id.clone()), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let missing = service
+            .prepare_groups_quit(&quit("conv-absent".into()), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+    }
+
+    /// A group-update row mirrors the engine's post-change title into the
+    /// conversation row (the summary riding conversation.changed already
+    /// carries it), lands as a system row, and leaves the title untouched
+    /// when the update carried no name material. A body-carrying update keeps
+    /// its ordinary message row and still mirrors.
+    #[test]
+    fn ingest_group_update_mirrors_title_and_lands_a_system_row() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let group_update = NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "dataMessage",
+            direction: "system",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: Some("Peer".into()),
+            group_id: Some("group-id-1".into()),
+            text: Some("群聊信息已更新".into()),
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                is_group_update: true,
+                group_name: Some("Fixture Group".into()),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+        };
+        let events = service
+            .ingest_receive(group_update.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .expect("group update row");
+        assert_eq!(upserted.direction, "system");
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("title mirror event");
+        assert_eq!(changed.title, "Fixture Group");
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Fixture Group"
+        );
+
+        // An update with no name material lands its row and converges nothing.
+        let nameless = NormalizedReceive {
+            timestamp: Some(1727000000001),
+            rich: Some(crate::engine::NormalizedRich {
+                is_group_update: true,
+                ..Default::default()
+            }),
+            ..group_update.clone()
+        };
+        let events = service
+            .ingest_receive(nameless, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_)))
+        );
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Fixture Group"
+        );
+
+        // A body-carrying update is an ordinary incoming row — and still
+        // mirrors the title.
+        let with_body = NormalizedReceive {
+            timestamp: Some(1727000000002),
+            direction: "incoming",
+            text: Some("renamed us".into()),
+            rich: Some(crate::engine::NormalizedRich {
+                is_group_update: true,
+                group_name: Some("Renamed Group".into()),
+                ..Default::default()
+            }),
+            ..group_update
+        };
+        let events = service
+            .ingest_receive(with_body, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(message) => Some(message),
+                _ => None,
+            })
+            .expect("body row");
+        assert_eq!(upserted.direction, "incoming");
+        assert_eq!(
+            service
+                .store_ref()
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            "Renamed Group"
+        );
     }
 }

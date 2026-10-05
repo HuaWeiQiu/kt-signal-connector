@@ -525,6 +525,18 @@ pub struct NormalizedRich {
     /// carry the flag keeps it beside the rest.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_expiration_update: bool,
+    /// Group-state-change marker (contract 1.45, §4.44): the dataMessage's
+    /// `groupInfo.type` was `UPDATE`. Bodyless updates project as system rows
+    /// (the pre-1.45 skip path swallowed them); a body-carrying update keeps
+    /// its normal row and the marker rides beside the rest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_group_update: bool,
+    /// The engine's post-change group title off the update's `groupInfo`
+    /// (contract 1.45, §4.44): the receive face's `JsonGroupInfo` exposes only
+    /// the resulting name — no actor, no before/after — so the desktop gets it
+    /// as mirror material, not as a diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
 }
 
 impl NormalizedRich {
@@ -536,6 +548,8 @@ impl NormalizedRich {
             && !self.view_once_invalid
             && self.view_once_opened_at.is_none()
             && !self.is_expiration_update
+            && !self.is_group_update
+            && self.group_name.is_none()
     }
 }
 
@@ -663,6 +677,10 @@ const MAX_MENTION_NAME_BYTES: usize = 128;
 const MAX_STICKER_PACK_ID_CHARS: usize = 64;
 const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
 const MAX_STICKER_EMOJI_CHARS: usize = 32;
+/// Group-update title mirror cap (contract 1.45, §4.44): the update's
+/// resulting `groupName` truncates to the same 64-char budget the envelope's
+/// `sourceName` peer-name material uses before it rides the rich payload.
+const GROUP_UPDATE_TITLE_MIRROR_CHARS: usize = 64;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -1863,6 +1881,25 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
         .get("isExpirationUpdate")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Group-state change (contract 1.45, §4.44): `JsonGroupInfo.type == UPDATE`
+    // marks a group edit; the resulting title is mirror material only. DELIVER
+    // (every normal group message) and the absent key leave both fields off.
+    if let Some(info) = message.get("groupInfo").and_then(Value::as_object) {
+        rich.is_group_update = info
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "UPDATE");
+        rich.group_name = info
+            .get("groupName")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.chars()
+                    .take(GROUP_UPDATE_TITLE_MIRROR_CHARS)
+                    .collect::<String>()
+            });
+    }
     if rich.is_empty() {
         return None;
     }
@@ -2158,6 +2195,24 @@ fn timer_change_rich() -> NormalizedRich {
     }
 }
 
+/// The group-update system row's text material (contract 1.45, §4.44): the
+/// receive face's `JsonGroupInfo` carries no actor and no before/after, so
+/// the copy is one generic line the desktop localizes — the resulting title
+/// rides `rich.group_name` as mirror material, never as rendered text.
+fn group_update_text() -> Option<NormalizedText> {
+    normalized_text("群聊信息已更新")
+}
+
+/// The rich marker a group-update row carries (§4.44): the flag plus the
+/// engine's post-change title when the update supplied one.
+fn group_update_rich(group_name: Option<String>) -> NormalizedRich {
+    NormalizedRich {
+        is_group_update: true,
+        group_name,
+        ..Default::default()
+    }
+}
+
 /// Our own multi-device control echo inside `syncMessage.sentMessage`: edit /
 /// remote delete / reaction of an earlier message we sent from the phone.
 fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
@@ -2374,6 +2429,30 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     expire_start_at,
                 ));
             }
+            // Our own device edited the group from the phone (contract 1.45,
+            // §4.44): the bodyless mirror lands as the same generic system row
+            // a peer's change does — the title mirror is the service layer's
+            // job off the rich material. A timer flag outranks it.
+            if text.is_none()
+                && quote.is_none()
+                && attachments.is_empty()
+                && rich.as_ref().is_some_and(|rich| rich.is_group_update)
+            {
+                return Ok(make(
+                    sent_ts,
+                    "syncMessage",
+                    "system",
+                    destination,
+                    group_id,
+                    group_update_text(),
+                    None,
+                    Vec::new(),
+                    Some(group_update_rich(
+                        rich.as_ref().and_then(|rich| rich.group_name.clone()),
+                    )),
+                    None,
+                ));
+            }
             if let Some(text) = text {
                 return Ok(with_expire(
                     make(
@@ -2532,6 +2611,26 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 ),
                 expire_seconds,
                 expire_start_at,
+            ));
+        }
+        // Bodyless group-state change (contract 1.45, §4.44): the pre-1.45
+        // shape fell through to the skip below and was swallowed. It projects
+        // as a generic system row; the rich marker carries the resulting
+        // title for the service layer's conversation-title mirror.
+        if rich.as_ref().is_some_and(|rich| rich.is_group_update) {
+            return Ok(make(
+                timestamp,
+                "dataMessage",
+                "system",
+                peer_source,
+                group_id,
+                group_update_text(),
+                None,
+                Vec::new(),
+                Some(group_update_rich(
+                    rich.as_ref().and_then(|rich| rich.group_name.clone()),
+                )),
+                None,
             ));
         }
         return Ok(make(
@@ -4187,5 +4286,142 @@ mod tests {
         }));
         assert_eq!(sent.direction, "outgoing");
         assert_eq!(sent.expire_seconds, Some(3600));
+    }
+
+    /// Contract 1.45 (§4.44): a bodyless group-state change
+    /// (`groupInfo.type == UPDATE`) projects as a generic system row — the
+    /// pre-1.45 shape fell to skip and was swallowed. The resulting title
+    /// rides `rich.groupName` (camelCase on the wire) capped at 64 chars; a
+    /// DELIVER envelope (every normal group message) stays marker-free and a
+    /// body-carrying UPDATE keeps its ordinary row with the marker beside it.
+    #[test]
+    fn peer_group_update_projects_system_row() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let update = normalize(json!({
+            "groupInfo": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "type": "UPDATE",
+                "groupName": "Fixture Group",
+                "revision": 7u64,
+            },
+        }));
+        assert_eq!(update.direction, "system");
+        assert_eq!(update.content_kind, "dataMessage");
+        assert_eq!(update.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+        assert_eq!(update.text.as_deref(), Some("群聊信息已更新"));
+        let rich = update.rich.expect("group-update row carries rich");
+        assert!(rich.is_group_update);
+        assert_eq!(rich.group_name.as_deref(), Some("Fixture Group"));
+        assert!(!rich.is_expiration_update);
+
+        // The title mirrors the engine's post-change value, capped at 64.
+        let long = normalize(json!({
+            "groupInfo": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "type": "UPDATE",
+                "groupName": "長".repeat(80),
+            },
+        }));
+        let rich = long.rich.expect("long title still projects");
+        assert_eq!(rich.group_name.as_deref(), Some("長".repeat(64).as_str()));
+
+        // A bodyless DELIVER stays a skip — only UPDATE marks a group edit.
+        let deliver = normalize(json!({
+            "groupInfo": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "type": "DELIVER",
+            },
+        }));
+        assert_eq!(deliver.direction, "skip");
+        assert!(deliver.rich.is_none());
+
+        // A body-carrying UPDATE is an ordinary message row; the marker and
+        // title ride beside the body instead of replacing it.
+        let body = normalize(json!({
+            "message": "renamed us",
+            "groupInfo": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "type": "UPDATE",
+                "groupName": "New Name",
+            },
+        }));
+        assert_eq!(body.direction, "incoming");
+        assert_eq!(body.text.as_deref(), Some("renamed us"));
+        let rich = body.rich.expect("body row carries the marker");
+        assert!(rich.is_group_update);
+        assert_eq!(rich.group_name.as_deref(), Some("New Name"));
+    }
+
+    /// Contract 1.45 (§4.44): our own phone-side group edit mirrors through
+    /// `syncMessage.sentMessage` as the same generic system row a peer's
+    /// change lands as, keyed by the sent group — every linked device's
+    /// history agrees.
+    #[test]
+    fn sync_sent_group_update_projects_system_row() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "account": "+15555550100",
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": { "sentMessage": data },
+                },
+            }))
+            .unwrap()
+        };
+        let update = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "groupInfo": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "type": "UPDATE",
+                "groupName": "Fixture Group",
+            },
+        }));
+        assert_eq!(update.direction, "system");
+        assert_eq!(update.content_kind, "syncMessage");
+        assert_eq!(update.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+        assert_eq!(update.text.as_deref(), Some("群聊信息已更新"));
+        let rich = update.rich.expect("group-update mirror carries rich");
+        assert!(rich.is_group_update);
+        assert_eq!(rich.group_name.as_deref(), Some("Fixture Group"));
+    }
+
+    /// Contract 1.45 (§4.44): a timer change outranks a group update — the
+    /// §4.41 timer notice keeps its row when the envelope happens to carry
+    /// both markers.
+    #[test]
+    fn timer_change_outranks_group_update() {
+        let normalize = normalize_receive_fields(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "isExpirationUpdate": true,
+                    "expiresInSeconds": 3600u64,
+                    "groupInfo": {
+                        "groupId": "ZmFrZS1ncm91cC0x",
+                        "type": "UPDATE",
+                        "groupName": "Fixture Group",
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(normalize.direction, "system");
+        assert_eq!(
+            normalize.text.as_deref(),
+            Some("已更新消息定时消失：3600 秒")
+        );
+        let rich = normalize.rich.expect("timer row carries rich");
+        assert!(rich.is_expiration_update);
+        assert!(!rich.is_group_update);
     }
 }

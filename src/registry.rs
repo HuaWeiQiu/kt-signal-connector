@@ -956,6 +956,26 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// groups.update / groups.quit (contract revision 1.45, §4.44,
+    /// capability group-management): the group state lives with the account's
+    /// engine, so both writes route through the account's owning supervisor
+    /// like every other mutating face.
+    pub async fn update_group(
+        &self,
+        params: crate::service::GroupsUpdateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.update_group(params).await
+    }
+
+    pub async fn quit_group(
+        &self,
+        params: crate::service::GroupsQuitParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.quit_group(params).await
+    }
+
     pub async fn set_local_alias(
         &self,
         params: crate::service::ContactsSetLocalAliasParams,
