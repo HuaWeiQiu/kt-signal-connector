@@ -1226,6 +1226,17 @@ impl Store {
         if exists {
             transaction
                 .execute(
+                    // Reactions first: message_events carries a plain
+                    // conversation_id FK (no cascade, unlike every other
+                    // account-scoped table), so dropping conversations before
+                    // it aborts the whole delete — the production stuck-logout
+                    // on stores holding any reaction row.
+                    "DELETE FROM message_events WHERE account_id=?1",
+                    params![account_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            transaction
+                .execute(
                     "DELETE FROM messages WHERE account_id=?1",
                     params![account_id],
                 )
@@ -8049,6 +8060,37 @@ mod tests {
         assert!(!store.delete_account_cascade(&account.id).unwrap());
         assert!(store.account_by_id(&account.id).unwrap().is_none());
         assert!(store.list_accounts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn account_delete_cascades_reaction_events_with_foreign_keys_on() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        store
+            .upsert_reaction_event(
+                &account.id,
+                &conversation.id,
+                "❤️",
+                10,
+                "+15555550101",
+                false,
+                Some("Peer"),
+            )
+            .unwrap();
+
+        // complete_account_delete drops conversations before accounts; a
+        // message_events row (FK conversation_id → conversations, no cascade)
+        // must not abort the whole transaction — this is the production
+        // stuck-logout failure (INTERNAL_ERROR on every retry, INTERNAL log
+        // 2026-10-05).
+        assert!(store.delete_account_cascade(&account.id).unwrap());
+        assert!(store.account_by_id(&account.id).unwrap().is_none());
     }
 
     #[test]
