@@ -5046,6 +5046,14 @@ pub struct HistoryImportStatusParams {
     pub account_id: String,
 }
 
+/// history.importRetry params (contract revision 1.53, §4.38): the account
+/// whose failed link-time import is manually retried.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryImportRetryParams {
+    pub account_id: String,
+}
+
 /// backups.export / backups.exportStatus (contract revision 1.47, §4.46):
 /// the account-addressed faces of the Android local-backup export.
 #[derive(Debug, Deserialize)]

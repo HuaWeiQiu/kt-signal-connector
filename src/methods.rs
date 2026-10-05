@@ -139,8 +139,20 @@ pub const METHODS: &[MethodRow] = &[
     // Link-time history import status (contract revision 1.39, §4.38): a
     // store-only read over the import ledger and the archive presence signal
     // — no engine call, no network, no mutation. The desktop polls it while
-    // the state is `running`; there is deliberately no push event.
+    // the state is `running`; there is deliberately no push event. Since
+    // contract revision 1.53 a `running` state may carry the `progress`
+    // object (the engine's transfer-download byte snapshot — one bounded
+    // read-only call — or the connector's own import pass); every other
+    // state stays store/disk-only.
     ("history.importStatus", Lane::Read, false, "read"),
+    // Link-time history import manual retry (contract revision 1.53, §4.38):
+    // clears the account's `failed` ledger row and re-arms the orchestration
+    // (the archive on disk returns to `pending` for the sweep/watcher).
+    // Mutating, send lane behind the reaction-class write-lane mutex and
+    // delete drain barrier — same account-mutating class as backups.export;
+    // no upstream traffic. Advertised through the existing `history-import`
+    // tag (no new capability bit).
+    ("history.importRetry", Lane::Send, true, "accounts"),
     // Disappearing-message timer set (contract revision 1.42, §4.41):
     // mutating, send-lane upstream traffic — the reaction class verbatim,
     // same-account mutex and delete barrier included. Direct conversations
@@ -232,7 +244,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// marks the §4.34 account-scoped pack install face, `view-once`
 /// (contract revision 1.38) marks the §4.36/§4.37 view-once send, open-sync
 /// and burn faces, `history-import` (contract revision 1.39) marks the
-/// §4.38 link-time import status face, `disappearing-messages`
+/// §4.38 link-time import status face — widened in place by revision 1.53
+/// (the `running` `progress` object plus the `history.importRetry` manual
+/// retry face; no new capability bit, so a 1.39-aware desktop keeps gating
+/// on the same tag) — `disappearing-messages`
 /// (contract revision 1.42) marks the §4.41 receive metadata, timer-notice
 /// and bounded-sweep faces plus `conversations.setExpireTimer`, and
 /// `group-management` (contract revision 1.45) marks the §4.44 group write
@@ -336,6 +351,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "history.importRetry",
             "calls.sendSignal",
         ];
         let mutating = [
@@ -369,6 +385,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "history.importRetry",
             "calls.sendSignal",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

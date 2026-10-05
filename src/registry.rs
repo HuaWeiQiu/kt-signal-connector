@@ -575,6 +575,15 @@ impl ProxyGroupRuntime {
         slot.supervisor.history_import_status(account_id).await
     }
 
+    /// history.importRetry (contract revision 1.53, §4.38): the failed row
+    /// and the archive face live with the account's group, so the re-arm
+    /// routes through the account's owning supervisor like every other
+    /// mutating face.
+    pub async fn history_import_retry(&self, account_id: String) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor.history_import_retry(account_id).await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,

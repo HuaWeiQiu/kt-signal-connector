@@ -1270,6 +1270,27 @@ for line in sys.stdin:
                 "artifactPresent": False,
                 "snapshots": snapshots,
             }
+    elif method == "transfer.downloadStatus":
+        # §4.38 progress face (contract 1.53): the real engine answers from an
+        # in-process per-account download snapshot. The fixture mirrors that
+        # shape from marker files in the signal data dir —
+        # `.fixture-transfer-running` (present = a download is in flight) and
+        # `.fixture-transfer-bytes` ("<read> [<total>]", total optional), both
+        # written by the driving test. Absent markers answer {present: false},
+        # the honest no-download answer.
+        result = {"present": False}
+        running_marker = SIGNAL_DATA_DIR / ".fixture-transfer-running"
+        bytes_marker = SIGNAL_DATA_DIR / ".fixture-transfer-bytes"
+        if running_marker.exists():
+            try:
+                parts = bytes_marker.read_text().split()
+                bytes_read = max(int(parts[0]), 0)
+            except (OSError, ValueError, IndexError):
+                parts = []
+                bytes_read = 0
+            result = {"present": True, "bytesRead": bytes_read}
+            if len(parts) > 1:
+                result["bytesTotal"] = max(int(parts[1]), 0)
     elif method == "getUserStatus":
         if AUTH_FAILED_MARKER.exists():
             # Contract 1.21: the account holder unlinked this device. The

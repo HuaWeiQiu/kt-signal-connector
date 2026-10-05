@@ -5,9 +5,12 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.53 (2026-10-06; §4.50 appendix — the groups.get read face widens with
-  the synced isTerminated flag; 1.52 was the §4.50 group-termination write batch, whose
-  Status-header bump covered the 1.51 call-signaling miss)
+- Contract revision: 1.54 (2026-10-06; §4.51 link-time import progress + manual retry — the
+  `history.importStatus` `running` face gains the `progress` object and the `history.importRetry`
+  mutating face lands, kt-signal-engine batch contract; rebumped from H1's 1.53 which collided
+  with the same-day §4.50 appendix — the groups.get read face widening with the synced
+  isTerminated flag; 1.52 was the §4.50 group-termination write batch, whose Status-header
+  bump covered the 1.51 call-signaling miss)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1558,6 +1561,8 @@ documented data-directory artifact instead of an RPC surface.
   persisted import row, which carries `importedMessages`, `skippedLines`, `skippedChats`,
   `skippedMessages`, `attempts`, `errorClass`, `startedAt`, `updatedAt`). Unknown account:
   `ACCOUNT_NOT_FOUND`. The method is read-lane, read metrics class; no new error codes.
+  (Contract 1.54, §4.51, extends the `running` state with the optional `progress` object and
+  adds the `history.importRetry` manual face — that section owns the widened shape.)
 - Store: one `history_imports` row per account (schema version 15, FK cascade with the account),
   plus the bounded import writer. Message rows are written with exactly the live-receive
   identity — the message id is the same `signal-message-v2` stable hash over
@@ -2572,6 +2577,67 @@ Verification record (2026-10-06, all line anchors read from the pinned upstream 
 > flagged row true, wire bool on both), and two server integrations (the default
 > fixture row answers false; the `KT_FAKE_TERMINATED_GROUPS` stub hook answers true
 > through the full listGroups → cache → groups.get ladder).
+
+### 4.51 Link-time import progress + manual retry: `history.importStatus.progress`, `history.importRetry` (contract revision 1.54, 2026-10-06)
+
+The S4 UI gap the desktop batch named against the official import screen: the official
+Download stage renders a real "X of Y + %" byte progress (`icu:BackupImportScreen__progressbar-hint`
+with `currentSize`/`totalSize`, the reducer payload `{backupStep, currentBytes, totalBytes}`
+in `ts/state/ducks/installer.preload.ts` L143-152, applied at L642-675), and the official
+failure dialog carries a manual Retry (`retryBackupImport` L495-505 →
+`backupsService.retryDownload()`, the `InstallScreenBackupError.Retriable` dialog's confirm
+button in `InstallScreenBackupImportStep.dom.tsx` L107-135). The connector's 1.39 face had
+neither: `history.importStatus` was state + counters only, and a failed import waited for
+the next connector start (the ≤3-attempt sweep) with no desktop trigger. This revision
+closes both gaps without touching the ledger's honesty rules. Official source is read for
+behavior semantics and anchors only (AGPL, `/Users/tanye/test/Signal-Desktop-src`,
+zero copy).
+
+- `progress` object (contract shape, byte-for-byte as the desktop batch pins it):
+  `{stage: "downloading"|"processing", bytesTransferred?, bytesTotal?}`, present only while
+  `state === "running"`. `downloading` is the engine's transfer-archive byte snapshot: the
+  connector queries the kt-engine's `transfer.downloadStatus` (one bounded read-only call,
+  new kt-signal-engine extension — the engine's per-account in-process snapshot registry,
+  no files, no disk persistence; engine crash/restart reads as absent). The byte fields
+  ride together or not at all: the engine reports both only when it read a content-length;
+  otherwise `stage` alone — never a zero-filled total (the official UI keeps a spinning
+  bar when the server sends no length; we render stage copy the desktop side).
+  `processing` is the connector's own NDJSON import pass (a `running` row with no engine
+  download snapshot) and never carries byte fields — the official Process stage renders
+  copy without numbers (`InstallScreenBackupImportStep.dom.tsx` L287-296).
+  `pending`/`completed`/`failed`/`unavailable` never carry `progress`. Shape gate: the
+  snapshot is engine output, not trusted input — `present` must be a true boolean, byte
+  fields non-negative integers within u64, `bytesTransferred ≤ bytesTotal` when both ride;
+  a malformed snapshot drops the `progress` object and keeps the state (better to omit
+  than to get it wrong). JVM/native modes keep answering the plain shape (no engine call
+  is possible there).
+- `history.importRetry` (host method, capability `history-import` — widened in place, no
+  new bit: a 1.39-aware desktop keeps gating on the same tag): params
+  `{accountId}`; result `{armed: true, state: "pending"}`. Semantics: clear the account's
+  `failed` ledger row and re-arm the orchestration — with the archive on the engine face
+  the state returns to `pending` and the sweep (next engine start) or the link watcher
+  picks it up; `begin_history_import` re-inserts the row with `attempts + 1` (the ≤3
+  automatic budget stays supervisor-owned; the manual face is unbounded like the official
+  dialog). Error ladder: shape errors `INVALID_REQUEST` (retryable=false, the params-gate
+  arm); a ledger row that is not `failed` (pending/running/completed) or a JVM/native
+  face `NOT_RETRYABLE` (retryable=false — completed is the consumption marker, running
+  belongs to the live pass, pending waits inside its own window); no importable archive
+  on the engine face (a failed row whose archive vanished, or no row at all with no
+  archive) `NO_ARCHIVE` (retryable=false). Unknown account: `ACCOUNT_NOT_FOUND` (the
+  shared store path).
+  Send lane, account-scoped mutating — the reaction-class write-lane mutex and delete
+  drain barrier serialize it against every other account mutation (the `backups.export`
+  class; the store delete is the only local write). Metrics class `accounts`. No upstream
+  traffic, no engine call in the retry itself; the re-armed import consumes the same
+  bounded orchestration as the link-time flow.
+- Store: `clear_failed_history_import` — `DELETE FROM history_imports WHERE account_id=?
+  AND state='failed'`; the caller owns the state gate, and a 0-changed-rows delete is a
+  benign same-account race (the row is already gone). Schema version unchanged (the
+  1.39 table already carries every column the retry needs).
+- The engine face (`transfer.downloadStatus`) is a kt-signal-engine extension registered
+  in the engine's own compat doc (`docs/jsonrpc-compat.md` §3) — the connector treats it
+  as an untrusted projection source and keeps working when the engine predates it (the
+  call fails or answers a foreign shape → no `progress`, the pre-1.53 answer byte-for-byte).
 
 ## 5. signal-cli Boundary
 

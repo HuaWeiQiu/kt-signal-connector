@@ -89,6 +89,7 @@
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "history.importStatus",
+            "history.importRetry",
             "backups.export",
             "backups.exportStatus",
             "backups.exportFile.open",
@@ -648,6 +649,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/historyImportStatusParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "history.importRetry" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/historyImportRetryParams" }
             }
           }
         },
@@ -1835,7 +1847,16 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId"],
-      "description": "Link-time history import status (contract revision 1.39, §4.38): the honest minimal projection of the backup5 archive import (ADR 0005 S3) for the desktop's S4 UI. Read-only over local state — it never touches the engine or the network. States: 'pending' (linked inside the link-time wait window, the engine's best-effort archive download has not produced the archive file yet), 'running'/'completed'/'failed' (from the persisted import row with real counters), 'unavailable' with reason 'engine-mode' (signal-cli JVM/native has no backup5 capability) or 'no-archive' (wait window expired with no archive — the engine's failure modes are indistinguishable from 'the phone had nothing to transfer' and are reported as such, never guessed). The desktop polls while state is 'running'; there is deliberately no push event in this revision.",
+      "description": "Link-time history import status (contract revision 1.39, §4.38; progress extended by revision 1.54): the honest minimal projection of the backup5 archive import (ADR 0005 S3) for the desktop's S4 UI. Read-only over local state — it never touches the network. States: 'pending' (linked inside the link-time wait window, the engine's best-effort archive download has not produced the archive file yet), 'running'/'completed'/'failed' (from the persisted import row with real counters), 'unavailable' with reason 'engine-mode' (signal-cli JVM/native has no backup5 capability) or 'no-archive' (wait window expired with no archive — the engine's failure modes are indistinguishable from 'the phone had nothing to transfer' and are reported as such, never guessed). While state is 'running' the result may carry progress {stage: 'downloading'|'processing', bytesTransferred?, bytesTotal?} — 'downloading' is the engine's transfer-archive byte snapshot (bytes ride together only when the engine read a content-length; otherwise stage alone, never a zero-filled guess), 'processing' is the connector's own NDJSON import pass and never carries byte fields (the official Process stage renders copy, not numbers); pending/completed/failed/unavailable never carry progress, and a malformed engine snapshot drops the object while keeping the state. The desktop polls while state is 'running'; there is deliberately no push event in this revision.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "historyImportRetryParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Manually retry one account's failed link-time history import (contract revision 1.54, §4.38, capability history-import): the official failure dialog's Retry action (Signal-Desktop installer.preload.ts retryBackupImport → backupsService.retryDownload, AGPL semantics anchor) mapped onto the connector face. Clears the account's 'failed' ledger row and re-arms the orchestration — with the archive still on the engine face the state returns to 'pending' and the sweep (next engine start) or the link watcher picks it up; attempts keep counting across retries (the ≤3 automatic budget stays supervisor-owned, the manual face is unbounded like the official dialog). Result {armed: true, state: 'pending'}. Errors: shape errors INVALID_REQUEST (retryable=false); a ledger row that is not 'failed' (pending/running/completed) or a JVM/native face answers NOT_RETRYABLE (retryable=false); no importable archive on the engine face (a failed row whose archive vanished, or no row at all with no archive — the download never landed) answers NO_ARCHIVE (retryable=false); unknown accounts answer ACCOUNT_NOT_FOUND through the shared store path. Send lane, account-scoped mutating (the reaction-class write-lane mutex and delete drain barrier serialize it against every other account mutation) — no upstream traffic, no engine call in the retry itself.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
@@ -2189,6 +2210,8 @@
             "SEND_OUTCOME_UNKNOWN",
             "RETRY_NOT_ALLOWED",
             "RETRY_IN_FLIGHT",
+            "NOT_RETRYABLE",
+            "NO_ARCHIVE",
             "INTERNAL_ERROR"
           ]
         },

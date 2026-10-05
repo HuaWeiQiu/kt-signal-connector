@@ -33,16 +33,17 @@ use crate::service::{
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
     ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
     GroupsGetParams, GroupsQuitParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
-    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, LinkSessionParams,
+    LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
+    MessagesSendStickerParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1060,6 +1061,27 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid history.importStatus params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Link-time history import manual retry (contract revision 1.53,
+        // §4.38): the params-gate arm — shape errors answer INVALID_REQUEST
+        // before any state inspection; the ladder (NOT_RETRYABLE /
+        // NO_ARCHIVE) rides the runtime call; the definite success is
+        // {"armed": true, "state": "pending"}.
+        "history.importRetry" => {
+            match serde_json::from_value::<HistoryImportRetryParams>(request.params) {
+                Ok(params) => match runtime.history_import_retry(params.account_id).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid history.importRetry params",
                         false,
                     ),
                 ),

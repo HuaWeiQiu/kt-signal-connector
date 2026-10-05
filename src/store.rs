@@ -2804,6 +2804,22 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
+    /// Clear one account's `failed` import row (contract revision 1.53,
+    /// §4.38 retry face). Only a `failed` row qualifies — the caller owns the
+    /// state gate; the delete returning 0 changed rows is the same-account
+    /// race answer, not an error. Clearing re-arms the orchestration: the
+    /// sweep (next start) or the link watcher picks the archive up and
+    /// `begin_history_import` re-inserts the row with attempts+1.
+    pub fn clear_failed_history_import(&self, account_id: &str) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "DELETE FROM history_imports WHERE account_id=?1 AND state='failed'",
+                params![account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
     /// Append one batch of pass-1 recipient staging rows (bounded: the caller
     /// streams the archive and flushes one batch at a time; nothing
     /// proportional to the archive is held in memory). The caller clears the

@@ -148,6 +148,13 @@ pub struct RuntimeSupervisor {
     /// (plus its retention convergence) finishes. Shared with the spawned
     /// tasks, which outlive any borrow of `self`.
     history_import_running: Arc<AtomicBool>,
+    /// Which account holds the import slot right now (contract 1.53): the
+    /// `processing` stage of `history.importStatus` must name the polled
+    /// account, not just "the group is busy" — a crashed run's stale
+    /// `running` row on a second account must not borrow another account's
+    /// live pass as its progress. Set/cleared inside the same claim/release
+    /// window as the single-flight flag.
+    history_import_holder: Arc<StdMutex<Option<String>>>,
     /// Disappearing-message sweep single flight (contract revision 1.42,
     /// §4.41): at most one sweep pass per group at a time, shared with the
     /// periodic task.
@@ -255,6 +262,7 @@ impl RuntimeSupervisor {
             media_governor_pass: StdMutex::new(None),
             contacts_resync: StdMutex::new(None),
             history_import_running: Arc::new(AtomicBool::new(false)),
+            history_import_holder: Arc::new(StdMutex::new(None)),
             expire_sweep_running: Arc::new(AtomicBool::new(false)),
             expire_sweeper: StdMutex::new(None),
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
@@ -572,6 +580,7 @@ impl RuntimeSupervisor {
         let group_id = self.group_id.clone();
         let data_dir = self.config.data_dir.clone();
         let running = Arc::clone(&self.history_import_running);
+        let holder = Arc::clone(&self.history_import_holder);
         tokio::spawn(async move {
             // Let the fresh engine settle and any link-time inline sync land
             // before the first import pass claims store batches.
@@ -603,8 +612,13 @@ impl RuntimeSupervisor {
                 };
                 // A busy slot skips this account: the next start (or the link
                 // watcher's tick for freshly linked accounts) retries.
-                let _ = claim_and_run_history_import(Arc::clone(&running), Arc::clone(&store), job)
-                    .await;
+                let _ = claim_and_run_history_import(
+                    Arc::clone(&running),
+                    Arc::clone(&holder),
+                    Arc::clone(&store),
+                    job,
+                )
+                .await;
             }
         });
     }
@@ -621,6 +635,7 @@ impl RuntimeSupervisor {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
         let running = Arc::clone(&self.history_import_running);
+        let holder = Arc::clone(&self.history_import_holder);
         tokio::spawn(async move {
             let deadline =
                 Instant::now() + Duration::from_millis(crate::history_import::LINK_WAIT_MS);
@@ -647,6 +662,7 @@ impl RuntimeSupervisor {
                     HistoryImportProbe::Ready(job) => {
                         if claim_and_run_history_import(
                             Arc::clone(&running),
+                            Arc::clone(&holder),
                             Arc::clone(&store),
                             job,
                         )
@@ -661,15 +677,93 @@ impl RuntimeSupervisor {
         });
     }
 
+    /// Whether the group's import slot is held by THIS account's run (the
+    /// `processing` stage must not borrow another account's live pass — the
+    /// group slot is single-flight but a crashed run's stale `running` row on
+    /// a second account is not a live pass, contract 1.53).
+    fn history_import_pass_active_for(&self, account_id: &str) -> bool {
+        self.history_import_running.load(Ordering::Acquire)
+            && self
+                .history_import_holder
+                .lock()
+                .map(|holder| holder.as_deref() == Some(account_id))
+                .unwrap_or(false)
+    }
+
     /// history.importStatus (contract revision 1.39, §4.38): the honest
-    /// minimal projection the desktop polls — store-only, never the engine,
-    /// never the network.
+    /// minimal projection the desktop polls — store-first, never the network.
+    /// Since contract 1.53 a `running` row also consults the engine's
+    /// transfer-download snapshot (one bounded read-only call) so the
+    /// Download stage can report byte progress; every other state is
+    /// store/disk-only exactly as before.
     pub async fn history_import_status(&self, account_id: String) -> Result<Value, ServiceError> {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
         let capable = self.history_import_capable();
+        let row_account_id = account_id.clone();
+        let (mut status, signal_account) = blocking_service(move || {
+            let status =
+                history_import_status_projection(&store, &data_dir, capable, &row_account_id)?;
+            let signal_account = if status["state"] == "running" {
+                store
+                    .account_by_id(&row_account_id)
+                    .ok()
+                    .flatten()
+                    .map(|account| account.signal_account)
+            } else {
+                None
+            };
+            Ok((status, signal_account))
+        })
+        .await?;
+        // Download-stage progress: only while the row says `running`, and
+        // only if this group's engine is answering. A down engine reads as no
+        // snapshot — the projection stays honest without the bytes rather
+        // than guessing a state the store does not hold. When the engine
+        // answers "no download in flight" but this group's own NDJSON import
+        // pass holds the slot, the stage is `processing` (the official
+        // Process stage renders copy, not numbers). Neither signal present:
+        // the pre-1.53 shape, no progress invented.
+        if status["state"] == "running" {
+            let mut downloading = None;
+            if let Some(signal_account) = signal_account
+                && let Ok(engine) = self.running_engine().await
+                && let Ok(snapshot) = engine
+                    .call(
+                        "transfer.downloadStatus",
+                        json!({ "account": signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await
+                && let Some(progress) = import_progress_from_engine_snapshot(&snapshot)
+            {
+                downloading = Some(progress);
+            }
+            let stage = compose_import_progress(
+                downloading,
+                self.history_import_pass_active_for(&account_id),
+            );
+            if let (Some(progress), Some(object)) = (stage, status.as_object_mut()) {
+                object.insert("progress".to_owned(), progress);
+            }
+        }
+        Ok(status)
+    }
+
+    /// history.importRetry (contract revision 1.53, §4.38): clear the
+    /// account's `failed` import row and re-arm the orchestration — the
+    /// archive on disk returns to `pending` and the sweep (next engine start)
+    /// or the link watcher (fresh spawn) picks it up. Mutating face: the
+    /// account-scoped write-lane mutex and delete drain barrier serialize it
+    /// against every other account mutation (host `acquire`); the store work
+    /// runs on the blocking pool. A non-`failed` row is NOT_RETRYABLE; no
+    /// archive on the engine face is NO_ARCHIVE.
+    pub async fn history_import_retry(&self, account_id: String) -> Result<Value, ServiceError> {
+        let store = Arc::clone(&self.store);
+        let data_dir = self.config.data_dir.clone();
+        let capable = self.history_import_capable();
         blocking_service(move || {
-            history_import_status_projection(&store, &data_dir, capable, &account_id)
+            history_import_retry_projection(&store, &data_dir, capable, &account_id)
         })
         .await
     }
@@ -3504,9 +3598,12 @@ fn probe_history_import(
 
 /// Claim the group's single import slot, run the import on the blocking pool,
 /// and converge retention after a completed run (§4.38). `false` means
-/// another import holds the slot; the caller retries later.
+/// another import holds the slot; the caller retries later. The holder name
+/// rides the claim window so `history.importStatus` can attribute the
+/// `processing` stage to the polled account (contract 1.53).
 async fn claim_and_run_history_import(
     running: Arc<AtomicBool>,
+    holder: Arc<StdMutex<Option<String>>>,
     store: Arc<Store>,
     job: HistoryImportJob,
 ) -> bool {
@@ -3516,7 +3613,13 @@ async fn claim_and_run_history_import(
     {
         return false;
     }
+    if let Ok(mut slot) = holder.lock() {
+        *slot = Some(job.account_id.clone());
+    }
     run_history_import(&store, &job).await;
+    if let Ok(mut slot) = holder.lock() {
+        *slot = None;
+    }
     running.store(false, Ordering::Release);
     true
 }
@@ -3641,6 +3744,124 @@ fn history_import_status_projection(
         "state": "unavailable",
         "reason": "no-archive",
     }))
+}
+
+/// The contract 1.53 `progress` object the desktop gets while
+/// `state === "running"`: `downloading` (byte progress from the engine's
+/// transfer snapshot) or `processing` (the connector's own NDJSON import pass
+/// — the official Process stage renders copy, not numbers, so no byte fields
+/// ride this shape). `None` means the caller's projection stays without
+/// `progress` — the honest "nothing observable" answer, never a guess.
+///
+/// Byte fields ride together or not at all (the contract's two brothers):
+/// the engine only reports both when it read a content-length, so a snapshot
+/// with a total presents `bytesTransferred` + `bytesTotal`, and one without
+/// presents `stage` only.
+///
+/// Shape gate (`transfer.downloadStatus` is engine output, not trusted
+/// input): `present` must be a true boolean and `bytesRead` a non-negative
+/// integer within u64; `bytesTotal`, when present, the same; when both ride,
+/// `bytesRead <= bytesTotal` must hold. A malformed snapshot drops the
+/// `progress` object entirely — the state projection is never sacrificed for
+/// a malformed ornament ("better to omit than to get it wrong").
+fn import_progress_from_engine_snapshot(snapshot: &Value) -> Option<Value> {
+    if snapshot.get("present") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    let bytes_read = snapshot.get("bytesRead").and_then(Value::as_u64);
+    let bytes_total = snapshot.get("bytesTotal").and_then(Value::as_u64);
+    // A present-but-malformed byte field kills the object (better to omit
+    // than to get it wrong); transferred > total is unrenderable the same way.
+    if snapshot.get("bytesRead").is_some() && bytes_read.is_none() {
+        return None;
+    }
+    if snapshot.get("bytesTotal").is_some() && bytes_total.is_none() {
+        return None;
+    }
+    if let (Some(read), Some(total)) = (bytes_read, bytes_total)
+        && read > total
+    {
+        return None;
+    }
+    let mut progress = serde_json::Map::new();
+    progress.insert("stage".to_owned(), json!("downloading"));
+    if let (Some(read), Some(total)) = (bytes_read, bytes_total) {
+        progress.insert("bytesTransferred".to_owned(), json!(read));
+        progress.insert("bytesTotal".to_owned(), json!(total));
+    }
+    Some(Value::Object(progress))
+}
+
+/// The `running`-state progress composition (contract 1.53): the engine's
+/// download snapshot wins (stage downloading), else an active connector
+/// import pass answers stage processing, else the pre-1.53 shape — no
+/// progress invented.
+fn compose_import_progress(downloading: Option<Value>, import_pass_active: bool) -> Option<Value> {
+    if downloading.is_some() {
+        return downloading;
+    }
+    if import_pass_active {
+        return Some(json!({ "stage": "processing" }));
+    }
+    None
+}
+
+/// The `history.importRetry` service (contract revision 1.53, §4.38): the
+/// state ladder answers before anything else — a non-`failed` row (or a
+/// `running` row's absence of a re-armable state) is NOT_RETRYABLE; a failed
+/// row (or a failed-engine-download face with no row at all) re-arms only
+/// when the archive is still on the engine face, else NO_ARCHIVE. Success is
+/// the re-armed answer `{armed: true, state: "pending"}`.
+fn history_import_retry_projection(
+    store: &Arc<Store>,
+    data_dir: &Path,
+    capable: bool,
+    account_id: &str,
+) -> Result<Value, ServiceError> {
+    let account = store
+        .account_by_id(account_id)?
+        .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+    if !capable {
+        return Err(ServiceError::Api(ApiError::new(
+            "NOT_RETRYABLE",
+            "history import is not available in this engine mode",
+            false,
+        )));
+    }
+    let on_disk = crate::history_import::archive_path(data_dir, &account.signal_account)
+        .map(|path| crate::history_import::archive_ready(&path))
+        .unwrap_or(false);
+    let row = store.history_import_row(account_id)?;
+    match row.as_ref().map(|row| row.state.as_str()) {
+        // A failed row with its archive still on disk: clear and re-arm.
+        Some("failed") if on_disk => {
+            store.clear_failed_history_import(account_id)?;
+            Ok(json!({ "armed": true, "state": "pending" }))
+        }
+        // A failed row whose archive is gone: nothing to re-import.
+        Some("failed") => Err(ServiceError::Api(ApiError::new(
+            "NO_ARCHIVE",
+            "the transfer archive is no longer on the engine face",
+            false,
+        ))),
+        // Completed/running rows are not retryable by definition (completed
+        // is the consumption marker; running belongs to the live pass).
+        Some(_) => Err(ServiceError::Api(ApiError::new(
+            "NOT_RETRYABLE",
+            "the import is not in a failed state",
+            false,
+        ))),
+        // No row: the archive face decides. An archive that never completed a
+        // run (the engine's best-effort download failed, or the connector
+        // died mid-run leaving no row) re-arms when the file is there;
+        // otherwise there is nothing to retry — the honest NO_ARCHIVE.
+        None if on_disk => Ok(json!({ "armed": true, "state": "pending" })),
+        None => Err(ServiceError::Api(ApiError::new(
+            "NO_ARCHIVE",
+            "no transfer archive has been produced for this account",
+            false,
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4222,11 +4443,38 @@ mod tests {
 
     use tokio::time::{sleep, timeout};
 
-    use super::{RuntimeSupervisor, compose_contact_display_name, is_receive_fatal_stderr};
+    use super::{
+        RuntimeSupervisor, compose_contact_display_name, compose_import_progress,
+        is_receive_fatal_stderr,
+    };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
     use crate::service::HostSideEvent;
     use crate::store::{MessageRecord, Store, StoreKey};
+
+    /// Contract 1.53: the running-state progress composition — download
+    /// wins, else THIS account's active import pass renders stage
+    /// processing, else the pre-1.53 shape.
+    #[test]
+    fn import_progress_composition_prefers_download_then_processing() {
+        let downloading = json!({"stage": "downloading", "bytesTransferred": 1, "bytesTotal": 2});
+        assert_eq!(
+            compose_import_progress(Some(downloading.clone()), true),
+            Some(downloading.clone())
+        );
+        assert_eq!(
+            compose_import_progress(Some(downloading), false),
+            Some(json!({"stage": "downloading", "bytesTransferred": 1, "bytesTotal": 2}))
+        );
+        assert_eq!(
+            compose_import_progress(None, true),
+            Some(json!({ "stage": "processing" }))
+        );
+        // Neither signal (including: the group slot is busy with another
+        // account's pass — the boolean is already account-attributed by the
+        // caller): the honest pre-1.53 shape, no progress invented.
+        assert_eq!(compose_import_progress(None, false), None);
+    }
 
     /// Every test store is encrypted (Phase 3); secondary observer connections
     /// to the same file must present the same key.
