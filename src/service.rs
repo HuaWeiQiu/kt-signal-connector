@@ -219,102 +219,127 @@ impl ServiceError {
             // family (the connector declares the current members, it does not
             // invent new ones); an engine code outside the allowlist never
             // reaches this arm — it degrades to plain UPSTREAM_ERROR.
-            ServiceError::Engine(EngineError::UpstreamCode { code }) => match code {
-                "STICKER_PACK_KEY_INVALID" => ApiError::new(
-                    "STICKER_PACK_KEY_INVALID",
-                    "sticker pack key is invalid",
-                    false,
-                ),
-                "STICKER_PACK_FETCH_FAILED" => ApiError::new(
-                    "STICKER_PACK_FETCH_FAILED",
-                    "sticker pack could not be fetched",
-                    true,
-                ),
-                "STICKER_PACK_MALFORMED" => ApiError::new(
-                    "STICKER_PACK_MALFORMED",
-                    "sticker pack manifest is malformed",
-                    true,
-                ),
-                "STICKER_IMAGE_TOO_LARGE" => ApiError::new(
-                    "STICKER_IMAGE_TOO_LARGE",
-                    "sticker image exceeds the size budget",
-                    false,
-                ),
-                // §4.47 avatar face (contract 1.48): UNAVAILABLE is the
-                // honest no-avatar answer (peer/group has none, profile key
-                // never synced, server 403/404) — the state is the answer,
-                // not a failure, so not retryable; FETCH_FAILED is
-                // network/download/decrypt and may succeed on a later
-                // attempt; TOO_LARGE is deterministic (the same avatar does
-                // not shrink between attempts).
-                "AVATAR_UNAVAILABLE" => ApiError::new(
-                    "AVATAR_UNAVAILABLE",
-                    "the conversation has no downloadable avatar",
-                    false,
-                ),
-                "AVATAR_FETCH_FAILED" => {
-                    ApiError::new("AVATAR_FETCH_FAILED", "the avatar download failed", true)
+            ServiceError::Engine(EngineError::UpstreamCode { code, data }) => {
+                // Contract 1.50: PROFILE_UPLOAD_FAILED carries the engine's
+                // partial-success data object ({retryable, textSaved})
+                // verbatim — the only code whose host face depends on the
+                // payload. Every other allowlisted code keeps the fixed
+                // content-free face below; their data (if any) is dropped
+                // here rather than leaking engine internals unpromised.
+                if code == "PROFILE_UPLOAD_FAILED" {
+                    if let Some(data) = data {
+                        return ApiError::with_data(
+                            "PROFILE_UPLOAD_FAILED",
+                            "the profile avatar upload failed after the text face was saved",
+                            data,
+                        );
+                    }
                 }
-                "AVATAR_TOO_LARGE" => ApiError::new(
-                    "AVATAR_TOO_LARGE",
-                    "the avatar exceeds the 10 MiB download budget",
-                    false,
-                ),
-                "CONVERSATION_NOT_RESOLVED" => ApiError::new(
-                    "CONVERSATION_NOT_RESOLVED",
-                    "conversation reference does not resolve for this account",
-                    false,
-                ),
-                "STORAGE_UNAVAILABLE" => ApiError::new(
-                    "STORAGE_UNAVAILABLE",
-                    "the engine's storage service is unavailable",
-                    true,
-                ),
-                "STORAGE_WRITE_FAILED" => ApiError::new(
-                    "STORAGE_WRITE_FAILED",
-                    "the engine's storage service write failed",
-                    true,
-                ),
-                "STORAGE_READ_FAILED" => ApiError::new(
-                    "STORAGE_READ_FAILED",
-                    "the engine's storage service read failed",
-                    true,
-                ),
-                // §4.46 Android local-backup export (engine backup-export
-                // contract §10.7): the engine's task faces pass through under
-                // their own literals. ALREADY_RUNNING/ARTIFACT_* are
-                // deterministic states (poll, rebuild, fix the builder);
-                // SNAPSHOT_EXISTS/IO_FAILED are transient disk conditions.
-                "BACKUP_EXPORT_ALREADY_RUNNING" => ApiError::new(
-                    "BACKUP_EXPORT_ALREADY_RUNNING",
-                    "a backup export task is already running for this account",
-                    false,
-                ),
-                "BACKUP_ARTIFACT_MISSING" => ApiError::new(
-                    "BACKUP_ARTIFACT_MISSING",
-                    "the backup export artifact is missing",
-                    false,
-                ),
-                "BACKUP_ARTIFACT_INVALID" => ApiError::new(
-                    "BACKUP_ARTIFACT_INVALID",
-                    "the backup export artifact is invalid",
-                    false,
-                ),
-                "BACKUP_SNAPSHOT_EXISTS" => ApiError::new(
-                    "BACKUP_SNAPSHOT_EXISTS",
-                    "a backup snapshot for this second already exists",
-                    true,
-                ),
-                "BACKUP_IO_FAILED" => ApiError::new(
-                    "BACKUP_IO_FAILED",
-                    "the backup export hit a filesystem failure",
-                    true,
-                ),
-                "REPORT_SPAM_FAILED" => {
-                    ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
+                match code {
+                    "STICKER_PACK_KEY_INVALID" => ApiError::new(
+                        "STICKER_PACK_KEY_INVALID",
+                        "sticker pack key is invalid",
+                        false,
+                    ),
+                    "STICKER_PACK_FETCH_FAILED" => ApiError::new(
+                        "STICKER_PACK_FETCH_FAILED",
+                        "sticker pack could not be fetched",
+                        true,
+                    ),
+                    "STICKER_PACK_MALFORMED" => ApiError::new(
+                        "STICKER_PACK_MALFORMED",
+                        "sticker pack manifest is malformed",
+                        true,
+                    ),
+                    "STICKER_IMAGE_TOO_LARGE" => ApiError::new(
+                        "STICKER_IMAGE_TOO_LARGE",
+                        "sticker image exceeds the size budget",
+                        false,
+                    ),
+                    // §4.47 avatar face (contract 1.48): UNAVAILABLE is the
+                    // honest no-avatar answer (peer/group has none, profile key
+                    // never synced, server 403/404) — the state is the answer,
+                    // not a failure, so not retryable; FETCH_FAILED is
+                    // network/download/decrypt and may succeed on a later
+                    // attempt; TOO_LARGE is deterministic (the same avatar does
+                    // not shrink between attempts).
+                    "AVATAR_UNAVAILABLE" => ApiError::new(
+                        "AVATAR_UNAVAILABLE",
+                        "the conversation has no downloadable avatar",
+                        false,
+                    ),
+                    "AVATAR_FETCH_FAILED" => {
+                        ApiError::new("AVATAR_FETCH_FAILED", "the avatar download failed", true)
+                    }
+                    "AVATAR_TOO_LARGE" => ApiError::new(
+                        "AVATAR_TOO_LARGE",
+                        "the avatar exceeds the 10 MiB download budget",
+                        false,
+                    ),
+                    "CONVERSATION_NOT_RESOLVED" => ApiError::new(
+                        "CONVERSATION_NOT_RESOLVED",
+                        "conversation reference does not resolve for this account",
+                        false,
+                    ),
+                    "STORAGE_UNAVAILABLE" => ApiError::new(
+                        "STORAGE_UNAVAILABLE",
+                        "the engine's storage service is unavailable",
+                        true,
+                    ),
+                    "STORAGE_WRITE_FAILED" => ApiError::new(
+                        "STORAGE_WRITE_FAILED",
+                        "the engine's storage service write failed",
+                        true,
+                    ),
+                    "STORAGE_READ_FAILED" => ApiError::new(
+                        "STORAGE_READ_FAILED",
+                        "the engine's storage service read failed",
+                        true,
+                    ),
+                    // §4.46 Android local-backup export (engine backup-export
+                    // contract §10.7): the engine's task faces pass through under
+                    // their own literals. ALREADY_RUNNING/ARTIFACT_* are
+                    // deterministic states (poll, rebuild, fix the builder);
+                    // SNAPSHOT_EXISTS/IO_FAILED are transient disk conditions.
+                    "BACKUP_EXPORT_ALREADY_RUNNING" => ApiError::new(
+                        "BACKUP_EXPORT_ALREADY_RUNNING",
+                        "a backup export task is already running for this account",
+                        false,
+                    ),
+                    "BACKUP_ARTIFACT_MISSING" => ApiError::new(
+                        "BACKUP_ARTIFACT_MISSING",
+                        "the backup export artifact is missing",
+                        false,
+                    ),
+                    "BACKUP_ARTIFACT_INVALID" => ApiError::new(
+                        "BACKUP_ARTIFACT_INVALID",
+                        "the backup export artifact is invalid",
+                        false,
+                    ),
+                    "BACKUP_SNAPSHOT_EXISTS" => ApiError::new(
+                        "BACKUP_SNAPSHOT_EXISTS",
+                        "a backup snapshot for this second already exists",
+                        true,
+                    ),
+                    "BACKUP_IO_FAILED" => ApiError::new(
+                        "BACKUP_IO_FAILED",
+                        "the backup export hit a filesystem failure",
+                        true,
+                    ),
+                    "REPORT_SPAM_FAILED" => {
+                        ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
+                    }
+                    // No data object (or an older engine face): the code still
+                    // maps — retryable=true per the engine's contract note (the
+                    // desktop may retry the avatar face), textSaved unknowable.
+                    "PROFILE_UPLOAD_FAILED" => ApiError::new(
+                        "PROFILE_UPLOAD_FAILED",
+                        "the profile avatar upload failed after the text face was saved",
+                        true,
+                    ),
+                    _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
                 }
-                _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
-            },
+            }
             ServiceError::Engine(EngineError::Unauthorized) => ApiError::new(
                 "ACCOUNT_UNLINKED",
                 "device was unlinked by the account holder",
@@ -6519,7 +6544,8 @@ mod tests {
             "AVATAR_TOO_LARGE",
         ];
         for code in deterministic {
-            let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
             assert_eq!(api.code, code, "{code}");
             assert!(!api.retryable, "{code}");
         }
@@ -6534,16 +6560,68 @@ mod tests {
             "AVATAR_FETCH_FAILED",
         ];
         for code in retryable {
-            let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
             assert_eq!(api.code, code, "{code}");
             assert!(api.retryable, "{code}");
         }
         // The two allowlists must stay in lockstep: every code the engine
         // layer can emit must map to itself here.
         for code in crate::engine::ENGINE_STRUCTURED_ERROR_CODES_FOR_TESTS {
-            let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
             assert_eq!(api.code, *code, "unmapped engine code {code}");
         }
+    }
+
+    #[test]
+    fn profile_upload_failed_carries_engine_data_verbatim() {
+        // Contract 1.50: the partial-success data object rides through and
+        // drives the retryable bit (the engine's truth, not the connector's).
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PROFILE_UPLOAD_FAILED",
+            data: Some(json!({ "retryable": true, "textSaved": true })),
+        })
+        .into_api();
+        assert_eq!(api.code, "PROFILE_UPLOAD_FAILED");
+        assert!(api.retryable);
+        assert_eq!(
+            api.data,
+            Some(json!({ "retryable": true, "textSaved": true }))
+        );
+
+        // textSaved=false keeps the payload (the desktop's plain-error
+        // branch reads it) — retryable re-read from the data object.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PROFILE_UPLOAD_FAILED",
+            data: Some(json!({ "retryable": true, "textSaved": false })),
+        })
+        .into_api();
+        assert_eq!(
+            api.data,
+            Some(json!({ "retryable": true, "textSaved": false }))
+        );
+
+        // A data-less older-engine face: the fixed retryable=true face, no
+        // data member.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PROFILE_UPLOAD_FAILED",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(api.code, "PROFILE_UPLOAD_FAILED");
+        assert!(api.retryable);
+        assert!(api.data.is_none());
+
+        // Any other code never gains a data member even when the engine
+        // sent one — the payload face is PROFILE_UPLOAD_FAILED-only.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "STICKER_PACK_FETCH_FAILED",
+            data: Some(json!({ "secret": 1 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "STICKER_PACK_FETCH_FAILED");
+        assert!(api.data.is_none());
     }
 
     #[test]

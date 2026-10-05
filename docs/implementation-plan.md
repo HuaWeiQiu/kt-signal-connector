@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.49 (2026-10-06)
+- Contract revision: 1.50 (2026-10-06)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2358,6 +2358,35 @@ consumption is a separate batch.
   instead of `METHOD_NOT_ALLOWED`. Schema: method enum + request branch +
   `messagesReportSpamParams` (messageIds array bounds mirrored in the schema) this batch;
   the matrix reference is left for the desktop consumption batch.
+
+### 4.49 Structured-error data pass-through: PROFILE_UPLOAD_FAILED (contract revision 1.50, 2026-10-06)
+
+The connector side of the engine profile batch ② (8eabf67) error face: `setProfile`'s avatar
+upload chain can fail after the text face landed, and the engine answers
+`PROFILE_UPLOAD_FAILED` (`-1` + message literal) with a data object
+`{retryable: true, textSaved}` — the honest partial-success report. Before this revision the
+connector's `ENGINE_STRUCTURED_ERROR_CODES` allowlist did not carry the literal (the error
+degraded to plain `UPSTREAM_ERROR` and the engine's `error.data` was dropped at the
+`EngineError` boundary), which made the desktop's partial-success dialog dead code against a
+real engine. This revision lands both halves:
+
+- Allowlist: `PROFILE_UPLOAD_FAILED` joins `ENGINE_STRUCTURED_ERROR_CODES` (and the schema
+  error enum — the schema-consistency gate now proves both sides stay total).
+- Data pass-through: the engine's `error.data` object (when present and an object) rides the
+  `EngineError::UpstreamCode` variant verbatim into `into_api`, which maps
+  `PROFILE_UPLOAD_FAILED` through `ApiError::with_data` — retryable re-read from
+  `data.retryable` (falling back to false when absent), the payload serialized on the host
+  error frame's optional `data` member. Every other allowlisted code keeps its fixed
+  content-free face; their engine-side data (if any) is dropped here rather than leaking
+  engine internals unpromised. A `PROFILE_UPLOAD_FAILED` without a data object (an older
+  engine face) maps to the fixed retryable=true face with no `data` member.
+- Shape discipline: the connector never invents a `data` object and never strips keys from
+  one the engine sent; hosts predating this revision ignore the unknown member. No other
+  method, event, capability, or schema face changes in 1.50 — the revision records the error
+  frame widening only.
+- Tests: the schema-consistency error-code gate covers the new literal; the allowlist
+  totality test (`ENGINE_STRUCTURED_ERROR_CODES_FOR_TESTS`) proves the service mapping stays
+  total; with-data / without-data / non-object-data classification tests pin the boundary.
 
 ## 5. signal-cli Boundary
 

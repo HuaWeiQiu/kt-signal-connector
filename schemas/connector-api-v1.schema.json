@@ -2042,6 +2042,7 @@
             "BACKUP_IO_FAILED",
             "BACKUP_SNAPSHOT_MISSING",
             "REPORT_SPAM_FAILED",
+            "PROFILE_UPLOAD_FAILED",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",
@@ -2061,6 +2062,10 @@
         },
         "retryable": {
           "type": "boolean"
+        },
+        "data": {
+          "type": "object",
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); the connector never invents or strips keys. Absent on every other error face of engines at this revision."
         }
       }
     }

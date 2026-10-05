@@ -297,8 +297,16 @@ pub enum EngineError {
     /// structurally so the connector maps engine error codes onto the host
     /// contract without swallowing them, while the message text stays
     /// content-free (the code is a fixed literal, never user data).
+    /// Contract 1.50: the engine's optional `error.data` object rides along
+    /// verbatim (`profileKeyUpdate`-era partial-success facts such as
+    /// PROFILE_UPLOAD_FAILED's `{retryable, textSaved}`); a missing data
+    /// object serializes as None and older hosts see the 1.49 shape.
     #[error("signal-cli returned a structured error")]
-    UpstreamCode { code: &'static str },
+    UpstreamCode {
+        code: &'static str,
+        #[allow(dead_code)]
+        data: Option<Value>,
+    },
 }
 
 impl EngineError {
@@ -1498,9 +1506,18 @@ async fn handle_upstream_line(
             // families). The code is a fixed engine literal, carried as such;
             // unrecognized codes degrade to the plain upstream error so an
             // engine newer than this connector never invents host codes.
+            // Contract 1.50: the engine's error.data object (structured
+            // facts such as PROFILE_UPLOAD_FAILED's {retryable, textSaved})
+            // rides along verbatim when present — pass-through only, no
+            // key invention, no stripping.
+            let data = object
+                .get("error")
+                .and_then(|error| error.get("data"))
+                .filter(|data| data.is_object())
+                .cloned();
             let _ = request
                 .response
-                .send(Err(EngineError::UpstreamCode { code }));
+                .send(Err(EngineError::UpstreamCode { code, data }));
         } else {
             let _ = request.response.send(Err(EngineError::Upstream));
         }
@@ -1582,6 +1599,10 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // §4.48 report spam (engine-owned: the upstream report API refused the
     // batch — every id's serverGuid was rejected).
     "REPORT_SPAM_FAILED",
+    // §4.45 profile write partial-success face (engine alignment batch ②):
+    // the text face landed but the avatar upload chain failed; the engine's
+    // data object carries {retryable, textSaved} verbatim (contract 1.50).
+    "PROFILE_UPLOAD_FAILED",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.
@@ -3746,7 +3767,8 @@ mod tests {
             }))
             .await,
             Err(EngineError::UpstreamCode {
-                code: "STICKER_PACK_FETCH_FAILED"
+                code: "STICKER_PACK_FETCH_FAILED",
+                data: None,
             })
         );
         assert_eq!(
@@ -3756,7 +3778,8 @@ mod tests {
             }))
             .await,
             Err(EngineError::UpstreamCode {
-                code: "CONVERSATION_NOT_RESOLVED"
+                code: "CONVERSATION_NOT_RESOLVED",
+                data: None,
             })
         );
         // Fallback shape: string `code` carrying the literal directly.
@@ -3767,7 +3790,36 @@ mod tests {
             }))
             .await,
             Err(EngineError::UpstreamCode {
-                code: "STORAGE_WRITE_FAILED"
+                code: "STORAGE_WRITE_FAILED",
+                data: None,
+            })
+        );
+        // Contract 1.50: the engine's error.data object rides along verbatim
+        // on an allowlisted literal (the PROFILE_UPLOAD_FAILED
+        // partial-success facts).
+        assert_eq!(
+            classify(json!({
+                "code": -1,
+                "message": "PROFILE_UPLOAD_FAILED",
+                "data": { "retryable": true, "textSaved": true }
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "PROFILE_UPLOAD_FAILED",
+                data: Some(json!({ "retryable": true, "textSaved": true })),
+            })
+        );
+        // A non-object data member is dropped rather than passed through.
+        assert_eq!(
+            classify(json!({
+                "code": -1,
+                "message": "PROFILE_UPLOAD_FAILED",
+                "data": "garbage"
+            }))
+            .await,
+            Err(EngineError::UpstreamCode {
+                code: "PROFILE_UPLOAD_FAILED",
+                data: None,
             })
         );
         // Unknown literal: degrades to plain Upstream.
