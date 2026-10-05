@@ -3838,6 +3838,10 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "backups.exportFile.readChunk",
         "backups.exportFile.closeHandle",
         "backup-export",
+        "conversations.getAvatar",
+        "avatar-fetch",
+        "conversations.setBlocked",
+        "blocked-write",
     ] {
         assert!(
             capabilities
@@ -5713,6 +5717,407 @@ async fn account_settings_and_blocked_faces_round_trip() {
             .count(),
         1,
         "an unknown timer outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.48: the §4.47 alignment faces — conversations.getAvatar
+/// (round trip with the fixture data URI, the honest UNAVAILABLE face, the
+/// FETCH_FAILED/TOO_LARGE structured codes, the fail-closed local ladder) and
+/// conversations.setBlocked (verbatim forwarding of the resolved reference +
+/// kind + boolean, the post-write blocked list read back, unblock
+/// symmetry, CONVERSATION_NOT_RESOLVED, and the crash-with-in-flight-write
+/// unknown outcome on the mutating face — no retry, exactly-once dispatch).
+#[tokio::test]
+async fn avatar_and_blocked_write_faces_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [44_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Align3a" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // getAvatar round trip: the fixture PNG payload arrives as the sniffed
+    // data URI with the decoded byte count, projected 1:1 from the engine.
+    let sent = request(
+        &mut client,
+        "avatar-setup-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "avatar me",
+            "clientRequestId": "avatar-setup-0"
+        }),
+    )
+    .await;
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let avatar = request(
+        &mut client,
+        "get-avatar",
+        "conversations.getAvatar",
+        json!({ "accountId": account_id, "conversationId": conversation_id }),
+    )
+    .await;
+    let data_uri = avatar["result"]["dataUri"].as_str().unwrap();
+    assert!(data_uri.starts_with("data:image/png;base64,"), "{avatar}");
+    // The fixture payload's exact padded base64 (the connector ships the
+    // engine's URI verbatim) and the decoded byte count beside it.
+    assert_eq!(
+        data_uri,
+        "data:image/png;base64,iVBORw0KGgpmaXh0dXJlLWF2YXRhcg=="
+    );
+    assert_eq!(avatar["result"]["byteSize"], 22);
+
+    // The honest no-avatar face: retryable=false — the state is the answer.
+    // The sentinels travel as the conversation's upstream peer reference
+    // (the pin face's materialize-then-call discipline): each sentinel is
+    // first materialized as a real local conversation by a send to that
+    // peerKey, so the local ladder passes and the fixture sees the sentinel
+    // as the forwarded peer reference.
+    for (request_id, sentinel, expected_code, retryable) in [
+        (
+            "avatar-unavailable",
+            "[fixture-avatar-unavailable]",
+            "AVATAR_UNAVAILABLE",
+            false,
+        ),
+        (
+            "avatar-fetch-failed",
+            "[fixture-avatar-failed]",
+            "AVATAR_FETCH_FAILED",
+            true,
+        ),
+        (
+            "avatar-too-large",
+            "[fixture-avatar-large]",
+            "AVATAR_TOO_LARGE",
+            false,
+        ),
+    ] {
+        let setup = request(
+            &mut client,
+            &format!("{request_id}-setup"),
+            "messages.sendText",
+            json!({
+                "accountId": account_id,
+                "kind": "contact",
+                "peerKey": sentinel,
+                "text": sentinel,
+                "clientRequestId": format!("{request_id}-0")
+            }),
+        )
+        .await;
+        let sentinel_conversation = setup["result"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = request(
+            &mut client,
+            request_id,
+            "conversations.getAvatar",
+            json!({ "accountId": account_id, "conversationId": sentinel_conversation }),
+        )
+        .await;
+        assert_eq!(
+            error["error"]["code"], expected_code,
+            "{request_id}: {error}"
+        );
+        assert_eq!(
+            error["error"]["retryable"], retryable,
+            "{request_id}: {error}"
+        );
+    }
+
+    // Local fail-closed ladder: empty/over-bound conversationId, unknown
+    // account and conversation — all before any upstream call.
+    let oversized = "A".repeat(257);
+    for (request_id, params, expected) in [
+        (
+            "avatar-empty",
+            json!({ "accountId": account_id, "conversationId": "" }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "avatar-over-bound",
+            json!({ "accountId": account_id, "conversationId": oversized }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "avatar-unknown-account",
+            json!({ "accountId": "no-such-account", "conversationId": "conv" }),
+            "ACCOUNT_NOT_FOUND",
+        ),
+        (
+            "avatar-unknown-conversation",
+            json!({ "accountId": account_id, "conversationId": "no-such-conversation" }),
+            "CONVERSATION_NOT_FOUND",
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "conversations.getAvatar", params).await;
+        assert_eq!(
+            rejected["error"]["code"], expected,
+            "{request_id}: {rejected}"
+        );
+    }
+
+    // setBlocked verbatim forwarding: the resolved peer reference, kind, and
+    // boolean land on the wire; the answer is the post-write blocked list.
+    let blocked = request(
+        &mut client,
+        "set-blocked",
+        "conversations.setBlocked",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "blocked": true
+        }),
+    )
+    .await;
+    let entries = blocked["result"]["blocked"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["conversationId"] == "+15555550102" && entry["kind"] == "contact"),
+        "the blocked write must read back in the list: {entries:?}"
+    );
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+    let blocked_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("blocked").is_some())
+        .collect();
+    assert_eq!(blocked_calls.len(), 1, "{blocked_calls:?}");
+    assert_eq!(blocked_calls[0]["account"], "+15555550100");
+    assert_eq!(blocked_calls[0]["conversationId"], "+15555550102");
+    assert_eq!(blocked_calls[0]["kind"], "contact");
+    assert_eq!(blocked_calls[0]["blocked"], true);
+
+    // Unblock: the false form of the same method, symmetric read-back.
+    let unblocked = request(
+        &mut client,
+        "set-unblocked",
+        "conversations.setBlocked",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "blocked": false
+        }),
+    )
+    .await;
+    let entries = unblocked["result"]["blocked"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry["conversationId"] != "+15555550102"),
+        "the unblocked conversation must be gone: {entries:?}"
+    );
+
+    // Fail-closed ladder: illegal kind, missing boolean, unknown
+    // conversation, over-bound id.
+    for (request_id, params, expected) in [
+        (
+            "blocked-bad-kind",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "story",
+                "blocked": true
+            }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "blocked-missing-bool",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact"
+            }),
+            "INVALID_REQUEST",
+        ),
+        (
+            "blocked-unknown-conversation",
+            json!({
+                "accountId": account_id,
+                "conversationId": "no-such-conversation",
+                "kind": "contact",
+                "blocked": true
+            }),
+            "CONVERSATION_NOT_FOUND",
+        ),
+        (
+            "blocked-over-bound",
+            json!({
+                "accountId": account_id,
+                "conversationId": oversized,
+                "kind": "contact",
+                "blocked": true
+            }),
+            "INVALID_REQUEST",
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "conversations.setBlocked", params).await;
+        assert_eq!(
+            rejected["error"]["code"], expected,
+            "{request_id}: {rejected}"
+        );
+    }
+    assert_eq!(
+        send_log()
+            .into_iter()
+            .filter(|params| params.get("blocked").is_some())
+            .count(),
+        2,
+        "refusals never dial upstream"
+    );
+
+    // CONVERSATION_NOT_RESOLVED passes through verbatim (retryable=false)
+    // and STORAGE_UNAVAILABLE verbatim (retryable=true): the sentinels ride
+    // materialized conversations whose peer reference the fixture answers
+    // on, the pin face's discipline.
+    for (request_id, sentinel, expected_code, retryable) in [
+        (
+            "blocked-unresolved",
+            "[fixture-blocked-unresolved]",
+            "CONVERSATION_NOT_RESOLVED",
+            false,
+        ),
+        (
+            "blocked-storage",
+            "[fixture-blocked-unavailable]",
+            "STORAGE_UNAVAILABLE",
+            true,
+        ),
+    ] {
+        let setup = request(
+            &mut client,
+            &format!("{request_id}-setup"),
+            "messages.sendText",
+            json!({
+                "accountId": account_id,
+                "kind": "contact",
+                "peerKey": sentinel,
+                "text": sentinel,
+                "clientRequestId": format!("{request_id}-0")
+            }),
+        )
+        .await;
+        let sentinel_conversation = setup["result"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = request(
+            &mut client,
+            request_id,
+            "conversations.setBlocked",
+            json!({
+                "accountId": account_id,
+                "conversationId": sentinel_conversation,
+                "kind": "contact",
+                "blocked": true
+            }),
+        )
+        .await;
+        assert_eq!(
+            error["error"]["code"], expected_code,
+            "{request_id}: {error}"
+        );
+        assert_eq!(
+            error["error"]["retryable"], retryable,
+            "{request_id}: {error}"
+        );
+    }
+
+    // Crash with the mutating blocked write in flight (fixture sentinel,
+    // os._exit(32)): SEND_OUTCOME_UNKNOWN, never retried. The crash sentinel
+    // is also materialized as a real conversation first so the local ladder
+    // passes and the engine call goes out.
+    let crash_setup = request(
+        &mut client,
+        "blocked-crash-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "[fixture-blocked-crash]",
+            "text": "[fixture-blocked-crash]",
+            "clientRequestId": "blocked-crash-0"
+        }),
+    )
+    .await;
+    let crash_conversation = crash_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let crash = request(
+        &mut client,
+        "blocked-crash",
+        "conversations.setBlocked",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_conversation,
+            "kind": "contact",
+            "blocked": true
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-blocked", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+
+    // No-retry audit: exactly one crashing blocked call across the restart.
+    let crash_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params["conversationId"] == "[fixture-blocked-crash]")
+        .collect();
+    assert_eq!(
+        crash_calls.len(),
+        1,
+        "an unknown blocked outcome is never retried: {crash_calls:?}"
     );
 
     drop(client);

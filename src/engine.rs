@@ -1540,6 +1540,11 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "STICKER_PACK_FETCH_FAILED",
     "STICKER_PACK_MALFORMED",
     "STICKER_IMAGE_TOO_LARGE",
+    // §4.47 avatar download (contract 1.48, engine alignment batch ③a:
+    // honest no-avatar, download/decrypt failure, the 10 MiB decoded cap).
+    "AVATAR_UNAVAILABLE",
+    "AVATAR_FETCH_FAILED",
+    "AVATAR_TOO_LARGE",
     // §4.33 conversation pin sync (engine-owned: cloud reference resolution,
     // storage-service failures surface under the engine's STORAGE_* family).
     "CONVERSATION_NOT_RESOLVED",

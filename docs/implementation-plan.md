@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.47 (2026-10-05)
+- Contract revision: 1.48 (2026-10-06)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2173,6 +2173,87 @@ Implementation batch record (2026-10-06) — deviations and decisions as built:
   tests (identity parsing, timestamp shape, snapshot caretaker, handle-table ladder), the
   handshake capability assertion in `tests/server_integration.rs`, and the
   schema-consistency gates (methods, error codes, bounds inventory).
+
+### 4.47 Conversation avatar read + blocked write: conversations.getAvatar, conversations.setBlocked (contract revision 1.48, 2026-10-06)
+
+The alignment batch ③a connector side (kt-signal-engine `main` @ `1ce131d`,
+`docs/jsonrpc-compat.md` §3/§5 registration + §4.36-anchored error faces): the desktop-facing
+wire methods for the engine's two alignment capabilities — the conversation avatar download
+and the per-conversation blocked-bit write. Both are engine-extension methods (the pinned
+signal-cli JSON-RPC has neither), dispatched by the engine per its compat §3 registration;
+against the stock signal-cli face they answer the upstream's method-not-found as
+`UPSTREAM_ERROR` — the same declared swap boundary the §4.32–§4.34/§4.45 engine-extension
+family records. `conversations.setBlocked` reuses the §4.45 `conversations.getBlocked` result
+face verbatim (`{blocked: [{conversationId, kind}]}`, storage order, the same 256-entry KT
+cap and missing-identity drop); `conversations.getAvatar` projects the engine's result
+1:1 — `dataUri` (a `data:<mime>;base64,` URI, MIME sniffed from the magic bytes engine-side)
+plus `byteSize`, the decoded byte count. The connector forwards the conversation reference
+and projects the result; it never decodes image bytes beyond the result-face bound, never
+logs avatar bytes or blocked-list contents, and persists nothing (the desktop pulls; no push
+event, mirroring the §4.33/§4.45 read faces).
+
+- `conversations.getAvatar`: params `accountId`, `conversationId` (1..256 chars — the shared
+  conversation bound; the engine classifies the shape itself: an ACI/PNI ServiceId UUID goes
+  straight through, a phone-number text reverse-resolves through the account's contacts, and
+  a 32-byte standard-base64 group master key is the `listGroups` id form; any other shape
+  fails closed at the engine as `-32603`, which the connector's existing parameter-face
+  fallback folds into `UPSTREAM_ERROR`). The connector resolves the local conversation row
+  (`CONVERSATION_NOT_FOUND` before any upstream call) and forwards the row's `peer_key` —
+  the resolved upstream reference, never the host's opaque local id (the §4.33 setPinned
+  discipline). Result `{dataUri, byteSize}`. Result-face bound: the engine caps a download
+  at 10 MiB decoded (`AVATAR_TOO_LARGE` beyond), so the data URI stays under the
+  10 MiB + base64-expansion envelope (≤ 13,981,080 chars — the §4.45 upload schema margin,
+  reused as the result face's coarse guard with a description noting the code enforces the
+  precise decoded budget; a `byteSize` that disagrees with the decoded count is a protocol
+  error). Read lane, non-mutating — a download touches no account state; the result rides
+  one bounded host frame (≤ 16 MiB line budget, §4.12).
+- `conversations.setBlocked`: params `accountId`, `conversationId`, `kind` (the §4.33
+  `contact` | `group` | `legacyGroup` enum), `blocked` (required boolean — there is no
+  toggle form). Send lane, account-scoped mutating — the reaction-class write-lane mutex and
+  delete drain barrier verbatim; an indeterminate outcome answers `SEND_OUTCOME_UNKNOWN` and
+  is never retried. The engine writes the official storage record's blocked bit
+  (storageRecordOps semantics: first block stamps the engine time, an already-blocked record
+  is idempotent and never rewrites another device's timestamp, unblock clears it) and
+  returns the post-write blocked list in storage order, which the connector projects through
+  the same cap-and-drop discipline as `conversations.getBlocked` (§4.45). The conversation
+  resolves through the local ladder like every storage write (`CONVERSATION_NOT_FOUND`
+  before any upstream call; the upstream keys are the resolved peer reference and kind,
+  never the host's opaque id). Result `{blocked: [...]}` — the post-write cloud state read
+  back, not a local echo. Unblocking is the `blocked: false` form of the same method; there
+  is no separate unblock face.
+
+Structured engine errors (engine compat §3, `-1` + message literals): the blocked write
+rides the existing `STORAGE_*` family and `CONVERSATION_NOT_RESOLVED` exactly as the §4.33
+pinned write face — all four already declared in the engine.rs allowlist and the schema
+error enum, mapped verbatim (`STORAGE_*` retryable=true; `CONVERSATION_NOT_RESOLVED`
+retryable=false, the deterministic refusal). The avatar face adds three engine codes to the
+allowlist and the schema error enum: `AVATAR_UNAVAILABLE` (the honest "no avatar": the peer
+or group has none, the profile key was never synced, or the server answered 403/404 —
+`retryable=false`: the state is the answer, not a failure, and the desktop renders its
+placeholder immediately), `AVATAR_FETCH_FAILED` (network/download/decrypt failure,
+`retryable=true` — a later attempt may succeed), and `AVATAR_TOO_LARGE` (beyond the engine's
+10 MiB cap, `retryable=false` — deterministic: the same avatar does not shrink between
+attempts). The engine's parameter-face `-32603` (unknown conversation shape, unregistered
+account) folds into the plain `UPSTREAM_ERROR` like every account-domain method; engine-down
+/ method-absent follow the §4.32 mapping (`RUNTIME_NOT_RUNNING` / `CAPABILITY_UNAVAILABLE`).
+
+Capability tags: `avatar-fetch` (the getAvatar face) and `blocked-write` (the setBlocked
+face) join `FEATURE_CAPABILITIES` and the handshake capability assertion; desktops gate the
+two methods on them. `reportSpam` (engine alignment batch ③a's third face) is deliberately
+NOT in this batch: it needs connector-side per-message `serverGuid` persistence to address
+received rows, which lands with the row-level persistence batch — recorded here as the
+§4.47 backlog item.
+
+Local validation ladder: `accountId` through the opaque-id validator and resolved to the
+owning proxy group; `conversationId` 1..256 chars and resolved to the conversation row;
+`kind` against the three-value enum (setBlocked); `blocked` required boolean (setBlocked,
+params-shaped). Engine errors pass through structurally per the mapping above.
+
+Persistence and cross-face boundaries: neither method reads or writes connector state — no
+row, no cache, no event, no store schema change; the avatar bytes exist only inside the
+engine and the response, the blocked state lives in the account's storage records, and the
+connector persists neither. No avatar bytes and no blocked-list contents ever reach a log
+line (the AGENTS.md redaction boundary; neither path logs payload content).
 
 ## 5. signal-cli Boundary
 

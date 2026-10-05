@@ -81,6 +81,13 @@ pub const MAX_STICKER_PACK_SYNCS: usize = 256;
 pub const MAX_PROFILE_NAME_BYTES: usize = 128;
 pub const MAX_PROFILE_ABOUT_BYTES: usize = 512;
 pub const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
+/// Result-face coarse guard for `conversations.getAvatar` (§4.47): the
+/// engine caps a download at [`MAX_AVATAR_BYTES`] decoded, so the data URI
+/// — `data:<mime>;base64,` prefix plus the padded base64 encoding of the
+/// ceiling — stays under this margin (the §4.45 upload schema margin); the
+/// precise decoded budget is enforced in `avatar_from_engine` by decoding
+/// and cross-checking `byteSize`, not by this length.
+pub const MAX_AVATAR_DATA_URI_CHARS: usize = 13_981_080;
 pub const MAX_BLOCKED_CONVERSATIONS: usize = 256;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
@@ -231,6 +238,26 @@ impl ServiceError {
                 "STICKER_IMAGE_TOO_LARGE" => ApiError::new(
                     "STICKER_IMAGE_TOO_LARGE",
                     "sticker image exceeds the size budget",
+                    false,
+                ),
+                // §4.47 avatar face (contract 1.48): UNAVAILABLE is the
+                // honest no-avatar answer (peer/group has none, profile key
+                // never synced, server 403/404) — the state is the answer,
+                // not a failure, so not retryable; FETCH_FAILED is
+                // network/download/decrypt and may succeed on a later
+                // attempt; TOO_LARGE is deterministic (the same avatar does
+                // not shrink between attempts).
+                "AVATAR_UNAVAILABLE" => ApiError::new(
+                    "AVATAR_UNAVAILABLE",
+                    "the conversation has no downloadable avatar",
+                    false,
+                ),
+                "AVATAR_FETCH_FAILED" => {
+                    ApiError::new("AVATAR_FETCH_FAILED", "the avatar download failed", true)
+                }
+                "AVATAR_TOO_LARGE" => ApiError::new(
+                    "AVATAR_TOO_LARGE",
+                    "the avatar exceeds the 10 MiB download budget",
                     false,
                 ),
                 "CONVERSATION_NOT_RESOLVED" => ApiError::new(
@@ -2205,6 +2232,68 @@ impl ConnectorService {
     pub fn prepare_backups_account(&self, account_id: &str) -> Result<String, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         Ok(self.resolve_account(account_id)?.signal_account)
+    }
+
+    /// conversations.getAvatar (contract revision 1.48, §4.47): bounds +
+    /// resolution only — the avatar bytes live entirely inside the engine
+    /// and the response. The local conversation row resolves first
+    /// (CONVERSATION_NOT_FOUND before any upstream call) and the upstream
+    /// key is the row's peer reference, never the host's opaque local id;
+    /// the engine classifies the reference shape itself (ServiceId UUID /
+    /// phone number / 32-byte base64 group master key).
+    pub fn prepare_conversations_get_avatar(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "conversationId": conversation.peer_key,
+        }))
+    }
+
+    /// conversations.setBlocked (contract revision 1.48, §4.47): bounds,
+    /// kind enum, and resolution — the §4.33 pin-write ladder verbatim. No
+    /// local row is written: the cloud record is the whole state and the
+    /// engine answers the post-write blocked list.
+    pub fn prepare_conversations_set_blocked(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+        blocked: bool,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        validate_pinned_kind(kind)?;
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "conversationId": conversation.peer_key,
+            "kind": kind,
+            "blocked": blocked,
+        }))
     }
 
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
@@ -4467,6 +4556,19 @@ pub struct BlockedConversations {
     pub blocked: Vec<BlockedConversation>,
 }
 
+/// The §4.47 result of `conversations.getAvatar` (contract revision 1.48):
+/// the decrypted avatar as a data URI (MIME sniffed engine-side from the
+/// magic bytes, `application/octet-stream` when unrecognized) plus the
+/// decoded byte count. Pass-through of the engine's result — nothing
+/// decoded or re-encoded connector-side beyond the result-face budget check,
+/// nothing persisted, nothing logged.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AvatarDownload {
+    pub data_uri: String,
+    pub byte_size: u64,
+}
+
 /// `accounts.setProfile` avatar tri-state (contract revision 1.46, §4.45):
 /// `Keep` (key absent) forwards no avatar key, `Remove` (explicit null)
 /// forwards `avatar: null`, `Replace` (a data URI) forwards the validated
@@ -4910,6 +5012,30 @@ pub struct AccountsSetExpireTimerParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationsGetBlockedParams {
     pub account_id: String,
+}
+
+/// `conversations.getAvatar` params (contract revision 1.48, §4.47): the
+/// conversation id is the shared 1..256 bound — the engine classifies the
+/// reference shape itself (ServiceId UUID / phone number / 32-byte base64
+/// group master key), so the connector only bounds the string and resolves
+/// the local row.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsGetAvatarParams {
+    pub account_id: String,
+    pub conversation_id: String,
+}
+
+/// `conversations.setBlocked` params (contract revision 1.48, §4.47): the
+/// three-value kind enum mirrors the upstream storage reference taxonomy;
+/// `blocked` is required (absent fails params deserialization).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsSetBlockedParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub kind: String,
+    pub blocked: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6157,6 +6283,10 @@ mod tests {
             "STICKER_PACK_KEY_INVALID",
             "STICKER_IMAGE_TOO_LARGE",
             "CONVERSATION_NOT_RESOLVED",
+            // §4.47: the honest no-avatar answer and the deterministic
+            // over-cap refusal are answers, not failures.
+            "AVATAR_UNAVAILABLE",
+            "AVATAR_TOO_LARGE",
         ];
         for code in deterministic {
             let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
@@ -6169,6 +6299,9 @@ mod tests {
             "STORAGE_UNAVAILABLE",
             "STORAGE_WRITE_FAILED",
             "STORAGE_READ_FAILED",
+            // §4.47: a network/download/decrypt failure may succeed on a
+            // later attempt.
+            "AVATAR_FETCH_FAILED",
         ];
         for code in retryable {
             let api = ServiceError::Engine(EngineError::UpstreamCode { code }).into_api();
@@ -10179,6 +10312,128 @@ mod tests {
         let result = blocked_conversations_result(&mixed);
         assert_eq!(result.blocked.len(), 2);
         assert_eq!(result.blocked[1].kind, "legacyGroup");
+    }
+
+    /// Avatar face (contract revision 1.48, §4.47): the conversation
+    /// resolves through the shared ladder and forwards the row's peer
+    /// reference; the blocked write forwards the resolved reference, the
+    /// kind enum, and the boolean verbatim.
+    #[test]
+    fn prepare_avatar_and_set_blocked_forward_resolved_references() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        // getAvatar: peer reference, never the opaque local id; bounds first.
+        let upstream = service
+            .prepare_conversations_get_avatar(&account.id, &conversation.id)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["conversationId"], conversation.peer_key);
+
+        for (request_id, account_id, conversation_id) in [
+            ("avatar-empty-conversation", account.id.as_str(), ""),
+            (
+                "avatar-over-bound-conversation",
+                account.id.as_str(),
+                &"A".repeat(257),
+            ),
+            ("avatar-unknown-account", "no-such-account", "conv"),
+            (
+                "avatar-unknown-conversation",
+                account.id.as_str(),
+                "no-such-conversation",
+            ),
+        ] {
+            let error = service
+                .prepare_conversations_get_avatar(account_id, conversation_id)
+                .unwrap_err();
+            assert_eq!(
+                error.into_api().code,
+                if request_id == "avatar-unknown-account" {
+                    "ACCOUNT_NOT_FOUND"
+                } else if request_id == "avatar-unknown-conversation" {
+                    "CONVERSATION_NOT_FOUND"
+                } else {
+                    "INVALID_REQUEST"
+                },
+                "{request_id}"
+            );
+        }
+
+        // setBlocked: the resolved reference plus the kind enum and boolean,
+        // the §4.33 pin-write wire shape with `blocked` in `pinned`'s place.
+        let upstream = service
+            .prepare_conversations_set_blocked(&account.id, &conversation.id, "contact", true)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["conversationId"], conversation.peer_key);
+        assert_eq!(upstream["kind"], "contact");
+        assert_eq!(upstream["blocked"], true);
+
+        let upstream = service
+            .prepare_conversations_set_blocked(&account.id, &conversation.id, "group", false)
+            .unwrap();
+        assert_eq!(upstream["blocked"], false);
+        assert_eq!(upstream["kind"], "group");
+
+        // Fail-closed ladder: illegal kind, unknown conversation, empty id.
+        let error = service
+            .prepare_conversations_set_blocked(&account.id, &conversation.id, "story", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_conversations_set_blocked(&account.id, "no-such-conversation", "contact", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+        let error = service
+            .prepare_conversations_set_blocked(&account.id, "", "contact", true)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// The avatar result projection (contract revision 1.48, §4.47):
+    /// dataUri/byteSize pass through, the coarse result-face bound holds,
+    /// and a shape-violating engine answer is a protocol error — nothing
+    /// half-carried ships to the host.
+    #[test]
+    fn avatar_result_projection_holds_the_face_bound() {
+        let payload = "aGVsbG8="; // "hello", 5 bytes
+        let ok = json!({
+            "dataUri": format!("data:image/png;base64,{payload}"),
+            "size": 5,
+        });
+        let download = crate::supervisor::avatar_from_engine_for_tests(&ok).unwrap();
+        assert_eq!(download.byte_size, 5);
+        assert!(download.data_uri.starts_with("data:image/png;base64,"));
+
+        // byteSize disagreeing with the decoded count: protocol error.
+        let mismatch = json!({
+            "dataUri": format!("data:image/png;base64,{payload}"),
+            "size": 4,
+        });
+        assert_eq!(
+            crate::supervisor::avatar_from_engine_for_tests(&mismatch)
+                .unwrap_err()
+                .into_api()
+                .code,
+            "UPSTREAM_PROTOCOL_ERROR"
+        );
+
+        // Missing fields / non-base64 payload: protocol errors.
+        for broken in [
+            json!({"size": 5}),
+            json!({"dataUri": format!("data:image/png;base64,{payload}")}),
+            json!({"dataUri": "data:image/png;base64,!!!", "size": 5}),
+        ] {
+            assert_eq!(
+                crate::supervisor::avatar_from_engine_for_tests(&broken)
+                    .unwrap_err()
+                    .into_api()
+                    .code,
+                "UPSTREAM_PROTOCOL_ERROR",
+                "{broken}"
+            );
+        }
     }
 
     /// The §4.35 sticker-quote face: the quote resolves through the same

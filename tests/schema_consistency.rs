@@ -323,7 +323,14 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 /// - the blocked-list entry cap (contract 1.46, §4.45,
 ///   `MAX_BLOCKED_CONVERSATIONS` = 256): same free-form-result situation,
 ///   enforced in `blocked_conversations_result` and pinned by the §4.45 unit
-///   and integration tests.
+///   and integration tests; the §4.47 setBlocked result face reuses the same
+///   projection verbatim.
+/// - the §4.47 avatar result-face bound (contract 1.48,
+///   `MAX_AVATAR_DATA_URI_CHARS` = 13,981,080): a coarse result-side guard
+///   enforced in `avatar_from_engine` on the engine result (the schema's
+///   `result` is a free-form object, so there is no schema numeric hook);
+///   the precise decoded budget is the decode + `byteSize` cross-check,
+///   pinned by the §4.47 unit and integration tests.
 /// - the §4.45 avatar budget (`MAX_AVATAR_BYTES` = 10 MiB decoded): the code
 ///   bound is on the decoded size, which the schema can only approximate —
 ///   the data-URI `maxLength` 13981080 is the padded-base64 encoding of the
@@ -466,6 +473,19 @@ fn schema_numeric_bounds_match_code_constants() {
         ),
         (
             "/$defs/conversationsSetPinnedParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        // Conversation avatar + blocked write (contract 1.48, §4.47): both
+        // faces share the pinned face's 256-char conversation bound (the
+        // getAvatar reference and the setBlocked reference).
+        (
+            "/$defs/conversationsGetAvatarParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/conversationsSetBlockedParams/properties/conversationId",
             "maxLength",
             MAX_PIN_CONVERSATION_ID_CHARS as u64,
         ),

@@ -50,8 +50,10 @@
             "link.cancel",
             "conversations.list",
             "conversations.getBlocked",
+            "conversations.getAvatar",
             "conversations.getPinned",
             "conversations.setPinned",
+            "conversations.setBlocked",
             "conversations.setExpireTimer",
             "messages.list",
             "messages.search",
@@ -183,6 +185,17 @@
         },
         {
           "if": {
+            "properties": { "method": { "const": "conversations.getAvatar" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsGetAvatarParams" }
+            }
+          }
+        },
+        {
+          "if": {
             "properties": { "method": { "const": "link.start" } },
             "required": ["method"]
           },
@@ -235,6 +248,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/conversationsSetPinnedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.setBlocked" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsSetBlockedParams" }
             }
           }
         },
@@ -1364,6 +1388,45 @@
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "conversationsGetAvatarParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Download one conversation's avatar (contract revision 1.48, \u00a74.47, capability avatar-fetch; engine alignment batch \u2462a): the engine resolves the conversation reference by shape \u2014 an ACI/PNI ServiceId UUID goes straight to the profile face, a phone-number text reverse-resolves through the account's contacts, a 32-byte standard-base64 group master key is the listGroups id form \u2014 downloads the encrypted avatar and decrypts it (presage profile/group faces), sniffs the MIME from the magic bytes, and answers {dataUri, byteSize}. The connector resolves the local conversation row first (CONVERSATION_NOT_FOUND before any upstream call) and forwards the row's peer reference. The result face: dataUri is a data:<mime>;base64, URI (unrecognized magic answers data:application/octet-stream;base64,) whose coarse bound is the engine's 10 MiB decoded cap plus base64 expansion \u2014 \u2264 13,981,080 chars, the \u00a74.45 upload schema margin reused as the result guard; this schema length is the coarse envelope, the code enforces the precise decoded budget (decode + byteSize cross-check) and a violation is a protocol error. Read lane, non-mutating; nothing persists \u2014 the bytes exist only inside the engine and the response, and neither the bytes nor the URI reach a log line. Structured engine errors: AVATAR_UNAVAILABLE (the honest no-avatar: peer/group has none, profile key never synced, server 403/404 \u2014 retryable=false), AVATAR_FETCH_FAILED (network/download/decrypt \u2014 retryable=true), AVATAR_TOO_LARGE (beyond the engine's 10 MiB decoded cap \u2014 retryable=false); a parameter face the local ladder cannot reach (unknown conversation shape, unregistered account) answers the engine -32603, folded into UPSTREAM_ERROR.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to fetch the avatar for; resolved against the account before any upstream call. The engine classifies the reference shape itself (ServiceId UUID / phone number / 32-byte base64 group master key)."
+        }
+      }
+    },
+    "conversationsSetBlockedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "kind", "blocked"],
+      "description": "Block or unblock one conversation (contract revision 1.48, \u00a74.47, capability blocked-write; engine alignment batch \u2462a): the engine writes the official storage record's blocked bit with the official storageRecordOps semantics \u2014 the first block stamps the engine time, an already-blocked record is idempotent and never rewrites another device's timestamp, unblock clears it \u2014 then answers the post-write blocked list {blocked: [{conversationId, kind}]}, the \u00a74.45 conversations.getBlocked result face verbatim (storage order, capped at 256 entries, entries missing identity or kind drop). The connector resolves the local conversation row first (CONVERSATION_NOT_FOUND before any upstream call) and forwards the resolved peer reference and kind. Blocking never deletes the conversation or its messages (the official desktop behaves the same). Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: CONVERSATION_NOT_RESOLVED (the cloud reference does not resolve \u2014 retryable=false) and the STORAGE_* family passed through verbatim (retryable); no new codes on this face.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to block or unblock; resolved against the account before any upstream call."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "group", "legacyGroup"],
+          "description": "The upstream conversation reference taxonomy: direct chat, GroupsV2 group, or GroupsV1 legacy group."
+        },
+        "blocked": {
+          "type": "boolean",
+          "description": "true blocks the conversation, false unblocks it. Required \u2014 there is no toggle form."
+        }
+      }
+    },
     "conversationsGetPinnedParams": {
       "type": "object",
       "additionalProperties": false,
@@ -1927,6 +1990,9 @@
             "STICKER_PACK_FETCH_FAILED",
             "STICKER_PACK_MALFORMED",
             "STICKER_IMAGE_TOO_LARGE",
+            "AVATAR_UNAVAILABLE",
+            "AVATAR_FETCH_FAILED",
+            "AVATAR_TOO_LARGE",
             "STORAGE_UNAVAILABLE",
             "STORAGE_WRITE_FAILED",
             "STORAGE_READ_FAILED",

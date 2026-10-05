@@ -20,13 +20,14 @@ use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsUpdateConfigurationParams,
-    AttachmentSendTarget, BlockedConversations, ConnectorService, ContactsSyncOutcome,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetExpireTimerParams,
+    AttachmentSendTarget, AvatarDownload, BlockedConversations, ConnectorService,
+    ContactsSyncOutcome, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
     ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, GroupDetails,
-    GroupsQuitParams, GroupsUpdateParams, HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
-    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
+    GroupsQuitParams, GroupsUpdateParams, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
+    MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend,
+    SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
     StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
     StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, account_limit_error,
     blocked_conversations_result, pinned_conversations_result, sticker_pack_syncs_result,
@@ -2302,6 +2303,64 @@ impl RuntimeSupervisor {
         ))
     }
 
+    /// conversations.getAvatar (contract revision 1.48, §4.47, capability
+    /// avatar-fetch): resolution under the service lock, then the read-only
+    /// engine call — a download touches no account state. The result
+    /// projects through the avatar face's bound and byte-count cross-check
+    /// (`avatar_from_engine`); nothing is persisted and nothing is logged.
+    pub async fn get_avatar(
+        &self,
+        params: ConversationsGetAvatarParams,
+    ) -> Result<AvatarDownload, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_get_avatar(&params.account_id, &params.conversation_id)?
+        };
+        let result = engine
+            .call("getAvatar", upstream, CallClass::ReadOnly)
+            .await?;
+        avatar_from_engine(&result)
+    }
+
+    /// conversations.setBlocked (contract revision 1.48, §4.47, capability
+    /// blocked-write): bounds + resolution under the service lock, then the
+    /// mutating engine call — reaction-class discipline: an unknown outcome
+    /// answers SEND_OUTCOME_UNKNOWN and is never retried; the success result
+    /// is the post-write cloud blocked list read back, not a local echo.
+    pub async fn set_conversation_blocked(
+        &self,
+        params: ConversationsSetBlockedParams,
+    ) -> Result<BlockedConversations, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_set_blocked(
+                &params.account_id,
+                &params.conversation_id,
+                &params.kind,
+                params.blocked,
+            )?
+        };
+        match engine
+            .call("setConversationBlocked", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => Ok(blocked_conversations_result(
+                result
+                    .get("blocked")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Best-effort "Delete for everyone" for one own sent message
     /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
     /// upstream `remoteDelete` call without it — the same shape as
@@ -3938,6 +3997,47 @@ fn image_from_engine(result: &Value) -> Result<StickerPackImage, ServiceError> {
         content_type,
         size: size as u32,
     })
+}
+
+/// Project the engine's `getAvatar` result (contract 1.48, §4.47): the data
+/// URI passes through with the result-face bound — the engine caps a
+/// download at [`MAX_AVATAR_DATA_URI_CHARS`] chars, the padded encoding of
+/// the engine's 10 MiB decoded ceiling plus the URI prefix margin — and
+/// `byteSize` must equal the decoded byte count, or the mismatching result
+/// is a protocol error instead of shipping a truncated image. The decoded
+/// bytes are never logged and never persisted.
+fn avatar_from_engine(result: &Value) -> Result<AvatarDownload, ServiceError> {
+    let data_uri = result
+        .get("dataUri")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    if data_uri.len() > MAX_AVATAR_DATA_URI_CHARS {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    let byte_size = result
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let payload = data_uri
+        .split_once(";base64,")
+        .map(|(_, payload)| payload)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let mut decoded = Vec::new();
+    let decodes = crate::service::base64_decode_to_vec(payload, &mut decoded);
+    if decodes.is_err() || decoded.len() as u64 != byte_size {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    Ok(AvatarDownload {
+        data_uri: data_uri.to_string(),
+        byte_size,
+    })
+}
+
+/// Test-only re-export so the service-layer projection test can pin the
+/// avatar result face (the same pattern as the engine error allowlist).
+#[cfg(test)]
+pub(crate) fn avatar_from_engine_for_tests(result: &Value) -> Result<AvatarDownload, ServiceError> {
+    avatar_from_engine(result)
 }
 
 #[cfg(test)]

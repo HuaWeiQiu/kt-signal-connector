@@ -67,6 +67,14 @@ BLOCKED_STATE = [
     {"conversationId": "+15555550103", "kind": "contact"},
     {"conversationId": "bGVnYWN5LWdyb3VwLTE=", "kind": "legacyGroup"},
 ]
+# Contract 1.48 §4.47 avatar fixture: a tiny PNG magic payload — the engine
+# sniffs the MIME from the magic bytes and answers a data URI plus the
+# decoded byte count; getAvatar's sentinel conversationId answers the
+# structured avatar error faces.
+AVATAR_PNG_BYTES = b"\x89PNG\r\n\x1a\nfixture-avatar"
+AVATAR_DATA_URI = (
+    "data:image/png;base64," + base64.b64encode(AVATAR_PNG_BYTES).decode()
+)
 
 
 def argument_value(name):
@@ -821,6 +829,78 @@ for line in sys.stdin:
         # sentinel input exists on this face — the STORAGE_* passthrough is
         # integration-proven on the sibling faces (getStickerPackSyncs
         # precedent).
+        result = {"blocked": list(BLOCKED_STATE)}
+    elif method == "getAvatar":
+        # Contract 1.48 §4.47 avatar download: read face, no SEND_LOG
+        # dispatch recording (read-lane discipline, listContacts precedent).
+        # Sentinel conversationIds: "[fixture-avatar-unavailable]" answers
+        # AVATAR_UNAVAILABLE (the honest no-avatar), "[fixture-avatar-failed]"
+        # answers AVATAR_FETCH_FAILED, "[fixture-avatar-large]" answers
+        # AVATAR_TOO_LARGE — all three disjoint from every other face's
+        # magic.
+        conversation_id = params.get("conversationId")
+        if conversation_id == "[fixture-avatar-unavailable]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "AVATAR_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "[fixture-avatar-failed]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "AVATAR_FETCH_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "[fixture-avatar-large]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "AVATAR_TOO_LARGE"},
+            }
+            emit_json(response)
+            continue
+        result = {"dataUri": AVATAR_DATA_URI, "size": len(AVATAR_PNG_BYTES)}
+    elif method == "setConversationBlocked":
+        # Contract 1.48 §4.47 blocked write: record the exact upstream params
+        # (tests assert the resolved conversationId/kind/blocked contract),
+        # apply the write to the fixture blocked state, answer the post-write
+        # full list. ConversationId sentinels: "[fixture-blocked-unavailable]"
+        # answers STORAGE_UNAVAILABLE, "[fixture-blocked-unresolved]" answers
+        # CONVERSATION_NOT_RESOLVED, "[fixture-blocked-crash]" crashes with
+        # the mutating call in flight (os._exit(32); disjoint from
+        # 25/29/30/31).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        conversation_id = params.get("conversationId")
+        if conversation_id == "[fixture-blocked-unavailable]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "[fixture-blocked-unresolved]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "CONVERSATION_NOT_RESOLVED"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "[fixture-blocked-crash]":
+            os._exit(32)
+        conversation_id = params.get("conversationId")
+        kind = params.get("kind")
+        blocked = [entry for entry in BLOCKED_STATE if entry["conversationId"] != conversation_id]
+        if params.get("blocked"):
+            blocked.append({"conversationId": conversation_id, "kind": kind})
+        BLOCKED_STATE[:] = blocked
         result = {"blocked": list(BLOCKED_STATE)}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream

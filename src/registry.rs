@@ -798,6 +798,28 @@ impl ProxyGroupRuntime {
         slot.supervisor.get_blocked_conversations(params).await
     }
 
+    /// conversations.getAvatar (contract 1.48, §4.47): the avatar bytes are
+    /// account-scoped upstream state, so the read routes through the
+    /// account's owning engine like every other account face.
+    pub async fn get_avatar(
+        &self,
+        params: crate::service::ConversationsGetAvatarParams,
+    ) -> Result<crate::service::AvatarDownload, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_avatar(params).await
+    }
+
+    /// conversations.setBlocked (contract 1.48, §4.47): the blocked bit
+    /// lives in the account's storage records, so the write routes through
+    /// the account's owning engine like every other mutating face.
+    pub async fn set_conversation_blocked(
+        &self,
+        params: crate::service::ConversationsSetBlockedParams,
+    ) -> Result<crate::service::BlockedConversations, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_conversation_blocked(params).await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

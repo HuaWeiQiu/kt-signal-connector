@@ -47,6 +47,11 @@ pub const METHODS: &[MethodRow] = &[
     // cloud-backed read of the storage records' blocked bits — read lane, no
     // local persistence; advertised through `blocked-conversations`.
     ("conversations.getBlocked", Lane::Read, false, "read"),
+    // Avatar download (contract 1.48, §4.47): the engine downloads,
+    // decrypts, and sniffs the conversation avatar — one bounded read-only
+    // call, no mutation, no local persistence; advertised through
+    // `avatar-fetch`.
+    ("conversations.getAvatar", Lane::Read, false, "read"),
     ("messages.list", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
     // Account-wide store search (contract 1.30): a bounded read over the
@@ -118,6 +123,12 @@ pub const METHODS: &[MethodRow] = &[
     // barrier, no local persistence on either side.
     ("conversations.getPinned", Lane::Read, false, "read"),
     ("conversations.setPinned", Lane::Send, true, "send"),
+    // Conversation blocked-bit write (contract 1.48, §4.47): mutating,
+    // send-lane upstream traffic — the §4.33 pin-write class verbatim,
+    // same-account mutex and delete barrier included; the result is the
+    // post-write cloud blocked list read back, not a local echo; advertised
+    // through `blocked-write`.
+    ("conversations.setBlocked", Lane::Send, true, "send"),
     // Sticker pack sync (contract 1.37, §4.34): getSyncs is a bounded
     // cloud-backed read of the account's StickerPackRecord set; setSync is
     // the mutating storage-service write — reaction-class write-lane mutex
@@ -211,7 +222,9 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (contract revision 1.46) mark the §4.45 account-record write faces and
 /// the blocked-list read face, and `backup-export` (contract revision 1.47)
 /// marks the §4.46 Android local-backup export face (`backups.export`,
-/// `backups.exportStatus`, the `backups.exportFile` three-chain). They never
+/// `backups.exportStatus`, the `backups.exportFile` three-chain), and
+/// `avatar-fetch` / `blocked-write` (contract revision 1.48) mark the §4.47
+/// avatar download and blocked-bit write faces. They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -227,6 +240,8 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "account-settings",
     "blocked-conversations",
     "backup-export",
+    "avatar-fetch",
+    "blocked-write",
 ];
 
 #[cfg(test)]
@@ -241,6 +256,7 @@ mod tests {
         let read_lane = [
             "conversations.list",
             "conversations.getBlocked",
+            "conversations.getAvatar",
             "messages.list",
             "messages.getText",
             "messages.search",
@@ -281,6 +297,7 @@ mod tests {
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "conversations.setPinned",
+            "conversations.setBlocked",
             "conversations.setExpireTimer",
             "groups.update",
             "groups.quit",
@@ -310,6 +327,7 @@ mod tests {
             "presence.setTypingMessage",
             "accounts.deleteLocalData",
             "conversations.setPinned",
+            "conversations.setBlocked",
             "conversations.setExpireTimer",
             "groups.update",
             "groups.quit",

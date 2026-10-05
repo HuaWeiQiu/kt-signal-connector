@@ -29,18 +29,19 @@ use crate::service::{
     AccountsUpdateConfigurationParams, BackupsExportFileCloseHandleParams,
     BackupsExportFileOpenParams, BackupsExportFileReadChunkParams, BackupsExportParams,
     BackupsExportStatusParams, ContactsListParams, ContactsSetLocalAliasParams, ContactsSyncParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
-    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, GroupsGetParams,
-    GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams, HostSideEvent,
-    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetPinnedParams, GroupsGetParams, GroupsQuitParams, GroupsUpdateParams,
+    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
+    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
+    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1426,6 +1427,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid conversations.getBlocked params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.getAvatar" => {
+            match serde_json::from_value::<ConversationsGetAvatarParams>(request.params) {
+                Ok(params) => match runtime.get_avatar(params).await {
+                    Ok(avatar) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(avatar).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.getAvatar params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.setBlocked" => {
+            match serde_json::from_value::<ConversationsSetBlockedParams>(request.params) {
+                Ok(params) => match runtime.set_conversation_blocked(params).await {
+                    Ok(blocked) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(blocked).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.setBlocked params",
                         false,
                     ),
                 ),
