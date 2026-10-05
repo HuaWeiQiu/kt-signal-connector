@@ -2483,22 +2483,28 @@ impl ConnectorService {
         }))
     }
 
-    /// calls.sendSignal (contract revision 1.50, §4.48): the shape gate
-    /// plus resolution — the signaling envelope (`recipient`, `data`,
-    /// `urgency`, `destinationDeviceId`) is the engine `sendCallMessage`
-    /// face verbatim; the connector forwards it and never inspects the
-    /// signaling content. `type` gates against the five-value frame-family
-    /// enum (the enum value itself does not travel — the RingRTC payload is
-    /// self-describing), `callId` a positive u32, `payload` a non-empty
-    /// bounded string. Group shapes answer INVALID_REQUEST here (the
-    /// upstream 1:1 face is contact-only — its official fail-closed).
+    /// calls.sendSignal (contract revision 1.53, §4.49): the shape gate plus
+    /// resolution — the signaling envelope (`recipient`, `data`/`legacy`,
+    /// `urgency`, `destinationDeviceId`) is the engine `sendCallMessage` face;
+    /// the connector forwards it and never inspects the signaling content.
+    /// `type` gates against the five-value frame-family enum, `callId` a
+    /// positive u32. `payload` is mandatory for the modern faces and must be
+    /// absent-or-present only as the engine face allows: offer/answer/ice/
+    /// opaque carry RingRTC bytes (non-empty, bounded); busy/hangup are the
+    /// official legacy bare-frame family (RingRTC 2.72.1 emits them with no
+    /// opaque material) and may omit the payload — the connector then routes
+    /// the engine's `legacy` face instead of inventing bytes. `urgency` (1.53)
+    /// is the pass-through wake-up bit (`droppable` | `handleImmediately`).
+    /// Group shapes answer INVALID_REQUEST here (the upstream 1:1 face is
+    /// contact-only — its official fail-closed).
     pub fn prepare_calls_send_signal(
         &self,
         account_id: &str,
         conversation_id: &str,
         signal_type: &str,
         call_id: u32,
-        payload: &str,
+        payload: Option<&str>,
+        urgency: Option<&str>,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         if conversation_id.is_empty()
@@ -2524,13 +2530,42 @@ impl ConnectorService {
                 false,
             )));
         }
-        if payload.is_empty() || payload.chars().count() > MAX_CALL_SIGNAL_PAYLOAD_CHARS {
+        // The payload face: mandatory non-empty bounded bytes for the modern
+        // faces; the legacy busy/hangup family may omit it (the engine builds
+        // the official bare frames). A present payload keeps the modern bound
+        // regardless of type (the connector never inspects content, so an
+        // explicit payload on a legacy type forwards verbatim).
+        if payload.is_none() && !matches!(signal_type, "busy" | "hangup") {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "payload must contain between 1 and 3145728 characters",
+                "payload is mandatory for the offer, answer, ice, and opaque faces",
                 false,
             )));
         }
+        let legacy_face = matches!(signal_type, "busy" | "hangup") && payload.is_none();
+        if let Some(payload) = payload {
+            if payload.is_empty() || payload.chars().count() > MAX_CALL_SIGNAL_PAYLOAD_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "payload must contain between 1 and 3145728 characters",
+                    false,
+                )));
+            }
+        }
+        // The urgency face (1.53): absent/null = the engine's droppable
+        // default; otherwise the two-value enum, anything else refuses before
+        // any upstream call.
+        let urgency_value = match urgency {
+            None => Value::Null,
+            Some("droppable") | Some("handleImmediately") => json!(urgency),
+            Some(_) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "urgency must be droppable or handleImmediately",
+                    false,
+                )));
+            }
+        };
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
         if conversation.kind != "direct" {
@@ -2540,11 +2575,25 @@ impl ConnectorService {
                 false,
             )));
         }
-        Ok(json!({
+        let mut upstream = json!({
             "account": account.signal_account,
             "recipient": conversation.peer_key,
-            "data": payload,
-        }))
+        });
+        if legacy_face {
+            // The official legacy bare-frame family: busy/hangup ride the
+            // engine's `legacy` face — `CallMessage{busy{id}}` /
+            // `CallMessage{hangup{id}}` with no opaque field (the callId the
+            // caller addressed is the frames' id face; hangup's type vocabulary
+            // is default-normal here — the desktop layer owns richer
+            // projections and this connector forwards, never invents).
+            upstream["legacy"] = json!({ "kind": signal_type, "id": call_id });
+        } else {
+            upstream["data"] = json!(payload);
+        }
+        if !urgency_value.is_null() {
+            upstream["urgency"] = urgency_value;
+        }
+        Ok(upstream)
     }
 
     /// calls.getState (contract revision 1.50, §4.48): the honest
@@ -5482,12 +5531,18 @@ pub struct PreparedReportSpam {
     pub pairs: Vec<(String, String)>,
 }
 
-/// `calls.sendSignal` params (contract revision 1.51, §4.49): `type` is the
-/// five-value RingRTC frame-family enum, `callId` a positive u32, and
-/// `payload` the non-empty opaque signaling material the connector
-/// shape-gates and forwards verbatim — the engine validates the transport
-/// face and the RingRTC layer parses the content, the connector parses
-/// neither.
+/// `calls.sendSignal` params (contract revision 1.53, §4.49): `type` is the
+/// five-value RingRTC frame-family enum, `callId` a positive u32. `payload`
+/// is the opaque signaling material the connector forwards verbatim —
+/// mandatory for the modern faces (offer/answer/ice/opaque all carry
+/// RingRTC-serialized bytes) and optional for the legacy frames (busy/hangup
+/// ride the official proto bare-frame family `CallMessage{busy{id}}` /
+/// `CallMessage{hangup{...}}` with no opaque field — RingRTC 2.72.1 emits
+/// them opaque-less, verified in the P1 device experiment). `urgency`
+/// (contract 1.53) is the optional urgency pass-through (`droppable` |
+/// `handleImmediately`, absent = the engine's droppable default). The
+/// engine validates the transport face and the RingRTC layer parses the
+/// content; the connector parses neither.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CallsSendSignalParams {
@@ -5496,7 +5551,8 @@ pub struct CallsSendSignalParams {
     #[serde(rename = "type")]
     pub signal_type: String,
     pub call_id: u32,
-    pub payload: String,
+    pub payload: Option<String>,
+    pub urgency: Option<String>,
 }
 
 /// `calls.getState` params (contract revision 1.51, §4.49): account-scoped
@@ -11023,10 +11079,11 @@ mod tests {
         }
     }
 
-    /// Call signaling (contract revision 1.50, §4.48): the sendSignal shape
-    /// gate (type enum / positive callId / non-empty bounded payload), the
-    /// resolved direct peer reference as the upstream `recipient`, the
-    /// group-shape refusal, and the honest empty state registry.
+    /// Call signaling (contract revision 1.53, §4.49): the sendSignal shape
+    /// gate (type enum / positive callId / payload mandatory for the modern
+    /// faces and optional for the legacy family / urgency enum), the resolved
+    /// direct peer reference as the upstream `recipient`, the legacy bare-frame
+    /// routing, and the group-shape refusal.
     #[test]
     fn prepare_call_signal_gates_and_forwards_the_envelope() {
         let (_temp, mut service) = service();
@@ -11034,22 +11091,47 @@ mod tests {
 
         // The happy path: resolved number as recipient, payload verbatim.
         let upstream = service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "offer", 7, "c2RwLW9mZmVy")
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                7,
+                Some("c2RwLW9mZmVy"),
+                None,
+            )
             .unwrap();
         assert_eq!(upstream["account"], "+15555550100");
         assert_eq!(upstream["recipient"], conversation.peer_key);
         assert_eq!(upstream["data"], "c2RwLW9mZmVy");
+        assert!(
+            upstream.get("urgency").is_none(),
+            "urgency absent = key absent"
+        );
 
-        // The type enum: every legal value passes, an unknown one and a
-        // wrong-typed one fail closed.
+        // The type enum: every legal value passes with a payload, an unknown
+        // one and a wrong-typed one fail closed.
         for legal in CALL_SIGNAL_TYPES {
             service
-                .prepare_calls_send_signal(&account.id, &conversation.id, legal, 7, "eA==")
+                .prepare_calls_send_signal(
+                    &account.id,
+                    &conversation.id,
+                    legal,
+                    7,
+                    Some("eA=="),
+                    None,
+                )
                 .unwrap();
         }
         for illegal in ["offerx", "", "OFFER", "sdp"] {
             let error = service
-                .prepare_calls_send_signal(&account.id, &conversation.id, illegal, 7, "eA==")
+                .prepare_calls_send_signal(
+                    &account.id,
+                    &conversation.id,
+                    illegal,
+                    7,
+                    Some("eA=="),
+                    None,
+                )
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{illegal}");
         }
@@ -11057,11 +11139,25 @@ mod tests {
         // The callId face: 0 is the no-call marker and is rejected; the u32
         // ceiling is legal.
         let error = service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "offer", 0, "eA==")
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                0,
+                Some("eA=="),
+                None,
+            )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
         service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "hangup", u32::MAX, "eA==")
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "hangup",
+                u32::MAX,
+                Some("eA=="),
+                None,
+            )
             .unwrap();
 
         // The payload face: empty, wrong type, and over-budget all reject
@@ -11071,19 +11167,111 @@ mod tests {
             ("payload-over-bound", 7u32, &"A".repeat(3 * 1024 * 1024 + 1)),
         ] {
             let error = service
-                .prepare_calls_send_signal(&account.id, &conversation.id, "offer", call_id, payload)
+                .prepare_calls_send_signal(
+                    &account.id,
+                    &conversation.id,
+                    "offer",
+                    call_id,
+                    Some(payload),
+                    None,
+                )
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
         }
 
+        // The legacy face (1.53): busy/hangup without a payload route the
+        // engine's `legacy` bare-frame family — official proto shapes, no
+        // invented bytes, no `data` key. A modern type without a payload
+        // still refuses (offer/answer/ice carry RingRTC bytes by protocol).
+        let legacy_busy = service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "busy", 7, None, None)
+            .unwrap();
+        assert_eq!(legacy_busy["legacy"], json!({"kind": "busy", "id": 7}));
+        assert!(
+            legacy_busy.get("data").is_none(),
+            "legacy face carries no data"
+        );
+        let legacy_hangup = service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "hangup", 9, None, None)
+            .unwrap();
+        assert_eq!(legacy_hangup["legacy"], json!({"kind": "hangup", "id": 9}));
+        let error = service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "offer", 7, None, None)
+            .unwrap_err();
+        assert_eq!(
+            error.into_api().code,
+            "INVALID_REQUEST",
+            "modern type demands payload"
+        );
+        let error = service
+            .prepare_calls_send_signal(&account.id, &conversation.id, "ice", 7, None, None)
+            .unwrap_err();
+        assert_eq!(
+            error.into_api().code,
+            "INVALID_REQUEST",
+            "ice demands payload"
+        );
+
+        // The urgency face (1.53): the two-value enum rides through, absence
+        // stays absent (the engine's droppable default), anything else
+        // refuses before any upstream call.
+        let urgent = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                7,
+                Some("eA=="),
+                Some("handleImmediately"),
+            )
+            .unwrap();
+        assert_eq!(urgent["urgency"], "handleImmediately");
+        let droppable = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "busy",
+                7,
+                None,
+                Some("droppable"),
+            )
+            .unwrap();
+        assert_eq!(droppable["urgency"], "droppable");
+        assert_eq!(droppable["legacy"], json!({"kind": "busy", "id": 7}));
+        let error = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                7,
+                Some("eA=="),
+                Some("urgent"),
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
         // The local ladder: unknown account and conversation refuse before
         // any upstream shape is built.
         let error = service
-            .prepare_calls_send_signal("no-such-account", &conversation.id, "offer", 7, "eA==")
+            .prepare_calls_send_signal(
+                "no-such-account",
+                &conversation.id,
+                "offer",
+                7,
+                Some("eA=="),
+                None,
+            )
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
         let error = service
-            .prepare_calls_send_signal(&account.id, "no-such-conversation", "offer", 7, "eA==")
+            .prepare_calls_send_signal(
+                &account.id,
+                "no-such-conversation",
+                "offer",
+                7,
+                Some("eA=="),
+                None,
+            )
             .unwrap_err();
         assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
 
@@ -11093,7 +11281,7 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let error = service
-            .prepare_calls_send_signal(&account.id, &group.id, "offer", 7, "eA==")
+            .prepare_calls_send_signal(&account.id, &group.id, "offer", 7, Some("eA=="), None)
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
 

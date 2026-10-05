@@ -7872,18 +7872,22 @@ async fn send_request_frame(
         .unwrap();
 }
 
-/// Contract revision 1.50 (§4.48, capability call-signaling): the connector's
+/// Contract revision 1.53 (§4.49, capability call-signaling): the connector's
 /// call-signaling pipe. Outbound: `calls.sendSignal` shape-gates the envelope
-/// (the five-value type enum, the positive-u32 callId, the non-empty bounded
-/// payload) and forwards the resolved direct peer reference plus the payload
-/// verbatim as the engine `sendCallMessage` upstream face — every illegal
-/// shape refuses locally (refusals never dial upstream), a group conversation
-/// fails closed, an engine crash with the mutating call in flight answers
-/// SEND_OUTCOME_UNKNOWN and is never retried across the restart. Inbound: the
-/// engine's `callMessage` envelope face lands as exactly one `call.incoming`
-/// event carrying the projected payload verbatim — no row, nothing persisted.
-/// The state face: the honest empty registry, repeatable, and the crash drill
-/// proves the send face's no-retry discipline.
+/// (the five-value type enum, the positive-u32 callId, the payload mandatory
+/// for the modern faces and optional for the legacy busy/hangup family, the
+/// two-value urgency pass-through) and forwards the resolved direct peer
+/// reference plus the payload verbatim as the engine `sendCallMessage`
+/// upstream face — legacy busy/hangup frames without a payload route the
+/// engine's `legacy` bare-frame face (the official proto shapes, no invented
+/// bytes); every illegal shape refuses locally (refusals never dial
+/// upstream), a group conversation fails closed, an engine crash with the
+/// mutating call in flight answers SEND_OUTCOME_UNKNOWN and is never retried
+/// across the restart. Inbound: the engine's `callMessage` envelope face
+/// lands as exactly one `call.incoming` event carrying the projected payload
+/// verbatim — no row, nothing persisted. The state face: the honest empty
+/// registry, repeatable, and the crash drill proves the send face's no-retry
+/// discipline.
 #[tokio::test]
 async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     let temp = TempDir::new().unwrap();
@@ -8031,7 +8035,7 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|params| params.get("data").is_some())
+            .filter(|params| params.get("data").is_some() || params.get("legacy").is_some())
             .collect()
     };
     assert_eq!(call_lines().len(), 1, "{:?}", call_lines());
@@ -8039,13 +8043,11 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     assert_eq!(call_lines()[0]["recipient"], "+15555550102");
     assert_eq!(call_lines()[0]["data"], "c2RwLW9mZmVy");
 
-    // The rest of the frame family rides the same pipe; ICE, busy, and
-    // hangup keep the u32 ceiling legal and the payload opaque.
+    // The rest of the frame family rides the same pipe; ICE keeps the u32
+    // ceiling legal and the payload opaque.
     for (request_id, signal_type, call_id, payload) in [
         ("call-answer", "answer", 7u64, "c2RwLWFuc3dlcg=="),
         ("call-ice", "ice", 4294967295u64, "aWNlLTE="),
-        ("call-busy", "busy", 7u64, "YnVzeQ=="),
-        ("call-hangup", "hangup", 7u64, "aGFuZ3Vw"),
     ] {
         let signaled = request(
             &mut client,
@@ -8062,11 +8064,69 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
         .await;
         assert_eq!(signaled["result"]["sentAt"], 1727000000000u64, "{signaled}");
     }
-    assert_eq!(call_lines().len(), 5, "{:?}", call_lines());
+    assert_eq!(call_lines().len(), 3, "{:?}", call_lines());
+
+    // The legacy bare-frame family (1.53): busy/hangup without a payload
+    // route the engine's `legacy` face — the official proto shapes, no
+    // invented bytes; the addressed callId is the frames' id. urgency rides
+    // through on both faces.
+    let legacy_busy = request(
+        &mut client,
+        "call-busy-legacy",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "busy",
+            "callId": 7
+        }),
+    )
+    .await;
+    assert_eq!(
+        legacy_busy["result"]["sentAt"], 1727000000000u64,
+        "{legacy_busy}"
+    );
+    let legacy_hangup = request(
+        &mut client,
+        "call-hangup-legacy",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "type": "hangup",
+            "callId": 7,
+            "urgency": "handleImmediately"
+        }),
+    )
+    .await;
+    assert_eq!(
+        legacy_hangup["result"]["sentAt"], 1727000000000u64,
+        "{legacy_hangup}"
+    );
+    let lines = call_lines();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    let busy_row = &lines[3];
+    assert_eq!(busy_row["recipient"], "+15555550102");
+    assert_eq!(busy_row["legacy"], json!({"kind": "busy", "id": 7}));
+    assert!(
+        busy_row.get("data").is_none(),
+        "legacy face carries no data"
+    );
+    assert!(
+        busy_row.get("urgency").is_none(),
+        "absent urgency stays absent"
+    );
+    let hangup_row = &lines[4];
+    assert_eq!(hangup_row["legacy"], json!({"kind": "hangup", "id": 7}));
+    assert_eq!(
+        hangup_row["urgency"], "handleImmediately",
+        "urgency pass-through"
+    );
 
     // The shape gate, locally: unknown type, callId 0, empty payload, an
-    // over-bound payload, an unknown conversation — every refusal precedes
-    // any upstream call, so the log stays at five lines.
+    // over-bound payload, a modern type without a payload, an illegal
+    // urgency, an unknown conversation — every refusal precedes any upstream
+    // call, so the log stays at five lines.
     let oversized = "A".repeat(3 * 1024 * 1024 + 1);
     for (request_id, expected_code, params) in [
         (
@@ -8122,6 +8182,28 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
                 "type": "offer",
                 "callId": 7,
                 "payload": oversized
+            }),
+        ),
+        (
+            "signal-modern-type-payload-less",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7
+            }),
+        ),
+        (
+            "signal-bad-urgency",
+            "INVALID_REQUEST",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "type": "offer",
+                "callId": 7,
+                "payload": "eA==",
+                "urgency": "urgent"
             }),
         ),
         (

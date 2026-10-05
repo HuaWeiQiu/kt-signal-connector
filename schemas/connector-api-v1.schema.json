@@ -1517,8 +1517,8 @@
     "callsSendSignalParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["accountId", "conversationId", "type", "callId", "payload"],
-      "description": "Forward one outbound call-signaling frame (contract revision 1.51, §4.49, capability call-signaling): the connector shape-gates the envelope — type against the RingRTC 1:1 frame-family enum, callId a positive integer (u32 face, the legacy frames' id address space), payload the non-empty opaque signaling material (≤ 3,145,728 chars, the coarse envelope of the same budget the receive face enforces) — resolves the local conversation row (CONVERSATION_NOT_FOUND before any upstream call; direct conversations only, the upstream sendCallMessage face is contact-only and a group shape fails closed) and forwards the signaling payload byte-for-byte as the engine's {account, recipient, data} upstream face. The connector never parses, validates, or logs the signaling content: the engine owns the transport face (Content.callMessage=3, official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) and the desktop + calling sidecar's RingRTC state machine parses the frames. Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. The result {sentAt} is the engine's envelope timestamp — a send ack, not call state.",
+      "required": ["accountId", "conversationId", "type", "callId"],
+      "description": "Forward one outbound call-signaling frame (contract revision 1.55, §4.49, capability call-signaling): the connector shape-gates the envelope — type against the RingRTC 1:1 frame-family enum, callId a positive integer (u32 face, the legacy frames' id address space), payload mandatory (non-empty, ≤ 3,145,728 chars, the coarse envelope of the same budget the receive face enforces) for the modern faces offer/answer/ice and optional (absent) for the legacy busy/hangup family — the official proto bare frames CallMessage{busy{id}} / CallMessage{hangup{...}} carry no opaque field (RingRTC 2.72.1 emits them opaque-less, verified in the P1 device experiment), so a payload-less busy/hangup routes the engine sendCallMessage legacy face instead of inventing bytes — resolves the local conversation row (CONVERSATION_NOT_FOUND before any upstream call; direct conversations only, the upstream sendCallMessage face is contact-only and a group shape fails closed) and forwards the signaling payload byte-for-byte as the engine's {account, recipient, data|legacy} upstream face. urgency (1.55) is the optional pass-through wake-up bit forwarded to the engine's CallMessage{opaque{urgency}} (absent = the engine's droppable default). The connector never parses, validates, or logs the signaling content: the engine owns the transport face (Content.callMessage=3, official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) and the desktop + calling sidecar's RingRTC state machine parses the frames. Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. The result {sentAt} is the engine's envelope timestamp — a send ack, not call state.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": {
@@ -1530,7 +1530,7 @@
         "type": {
           "type": "string",
           "enum": ["offer", "answer", "ice", "busy", "hangup"],
-          "description": "The RingRTC 1:1 frame family the payload carries. Gated but not forwarded — the opaque payload is self-describing; the enum keeps desktop-side logging/routing honest."
+          "description": "The RingRTC 1:1 frame family the frame carries. offer/answer/ice demand payload (the RingRTC-serialized opaque material); busy/hangup may omit it (the legacy bare-frame family, engine-built from the callId). Gated for the route decision and the desktop-side logging/routing honesty; the payload itself is self-describing."
         },
         "callId": {
           "type": "integer",
@@ -1542,7 +1542,12 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 3145728,
-          "description": "The opaque signaling material (RingRTC-serialized), forwarded byte-for-byte. The connector validates the envelope shape only — never the content."
+          "description": "The opaque signaling material (RingRTC-serialized), forwarded byte-for-byte. Mandatory for offer/answer/ice; omit for a legacy busy/hangup bare frame (the engine builds CallMessage{busy{id}} / CallMessage{hangup{id}}). The connector validates the envelope shape only — never the content."
+        },
+        "urgency": {
+          "type": "string",
+          "enum": ["droppable", "handleImmediately"],
+          "description": "The optional wake-up bit (contract 1.55), forwarded to the engine's CallMessage{opaque{urgency}}. Absent = the engine's droppable default (proto: a missing urgency treats as DROPPABLE). Only meaningful with a payload (the legacy bare frames have no opaque envelope)."
         }
       }
     },

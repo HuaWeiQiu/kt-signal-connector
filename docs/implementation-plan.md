@@ -5,12 +5,13 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.54 (2026-10-06; §4.51 link-time import progress + manual retry — the
-  `history.importStatus` `running` face gains the `progress` object and the `history.importRetry`
-  mutating face lands, kt-signal-engine batch contract; rebumped from H1's 1.53 which collided
-  with the same-day §4.50 appendix — the groups.get read face widening with the synced
-  isTerminated flag; 1.52 was the §4.50 group-termination write batch, whose Status-header
-  bump covered the 1.51 call-signaling miss)
+- Contract revision: 1.55 (2026-10-06; §4.49.1 call-signaling legacy bare-frame face +
+  urgency pass-through — `calls.sendSignal` payload becomes optional for the legacy
+  busy/hangup bare frames and the `urgency` parameter rides through to the engine;
+  rebumped from this batch's 1.53 which collided with the same-day 1.54 §4.51
+  (link-time import progress + manual retry) and 1.53 §4.50 appendix (groups.get
+  isTerminated read face); 1.52 was the §4.50 group-termination write batch, whose
+  Status-header bump covered the 1.51 call-signaling miss)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2465,6 +2466,49 @@ group; `conversationId` bounded and resolved; `type` against the five-value enum
 boundaries: no row, no cache, no store schema change; the signaling material exists only
 inside the engine, the response, and the event, and never reaches a log line (the
 AGENTS.md redaction boundary; neither path logs payload content).
+
+#### 4.49.1 Legacy bare frames + urgency pass-through (contract revision 1.53, 2026-10-06)
+
+The P1 real-device experiment closed the open question this connector's §4.49 batch had
+left implicit: **RingRTC 2.72.1 emits outbound hangup/busy frames with no opaque
+material** (the legacy five-value frame family), while the engine's `sendCallMessage`
+face accepted only base64(opaque) — so hangup/busy signaling could not leave through the
+pipe at all. Evidence anchors (all read from pinned upstream trees, behavior alignment
+only, zero source copied): the vendored libsignal-service `SignalService.proto`
+(`CallMessage.Busy{id}` field 5, `CallMessage.Hangup{id,type,deviceId}` field 7, the
+envelope-level `opaque` a separate field 10); Signal-Desktop `callingMessageToProto`
+(busy={id}, hangup={id,type} — no opaque material on either); signal-cli 0.14.7
+`CallManager.sendBusyViaSignal`/`sendHangupViaSignal` (the same bare-frame family). The
+engine batch (kt-signal-engine, `docs/jsonrpc-compat.md` §5 legacy 裸帧族 + the
+`sendCallMessage` row) builds those frames natively; this batch opens the connector's
+send face to them.
+
+- `calls.sendSignal` (1.53): `payload` is now **mandatory for offer/answer/ice** (the
+  modern faces carry RingRTC-serialized opaque bytes — unchanged) and **optional for
+  busy/hangup**: omitting it routes the engine's `legacy` face — upstream
+  `{account, recipient, legacy: {kind: "busy"|"hangup", id: callId}}`, the official
+  bare-frame family built engine-side from the addressed `callId`, no bytes invented.
+  A *present* payload on a busy/hangup keeps the modern `data` route verbatim (the
+  connector never inspects content, so an explicit payload forwards as-is; the
+  engine wraps it in the opaque envelope). A payload-less offer/answer/ice refuses
+  `INVALID_REQUEST` locally before any upstream call. `required` drops `payload`;
+  `urgency` (new, optional, `droppable|handleImmediately`) is the pass-through
+  wake-up bit (the P1-遗留② cross-repo gap this batch also closes): forwarded to the
+  engine's `CallMessage{opaque{urgency}}`; absent = the engine's droppable default;
+  an illegal value refuses locally. Legacy bare frames carry no opaque envelope, so
+  urgency is meaningless there and the connector forwards only what the caller sent.
+- Schema: `callsSendSignalParams.required` = `[accountId, conversationId, type,
+  callId]`; `payload` loses its `required` membership (constraints unchanged);
+  `urgency` joins `properties`. Capability `call-signaling` unchanged (a face
+  extension of the same pipe, not a new capability — the desktop consume batch needs
+  no capability gate change).
+- The inbound face is untouched: legacy busy/hangup frames already projected through
+  `normalized_call_message` (the §4.49 receive ladder) and land as `call.incoming`
+  events with the frame object verbatim.
+- Tests: the round-trip drill now covers a payload-less busy and hangup (the `legacy`
+  upstream shape asserted on the fixture send log, urgency pass-through both faces),
+  a payload-less offer refusal, and an illegal urgency refusal; the unit gate covers
+  the same face split, the `legacy` projection, and the urgency enum.
 
 ### 4.50 Group termination: groups.terminate (contract revision 1.52, 2026-10-06)
 

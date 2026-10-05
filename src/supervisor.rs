@@ -2559,15 +2559,17 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// calls.sendSignal (contract revision 1.50, §4.48, capability
+    /// calls.sendSignal (contract revision 1.53, §4.49, capability
     /// call-signaling): the shape gate + resolution under the service lock,
     /// then the mutating engine `sendCallMessage` call — the reaction-class
     /// discipline verbatim (same-account mutex, delete barrier, an unknown
     /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried). The
     /// signaling envelope travels byte-for-byte: the connector neither
-    /// parses nor logs the payload. The result is the engine's envelope
-    /// timestamp, echoed as `{sentAt}` — the send ack, not call state (the
-    /// connector keeps none).
+    /// parses nor logs the payload. Legacy busy/hangup frames without a
+    /// payload route the engine's `legacy` bare-frame face (contract 1.53);
+    /// `urgency` rides through when present. The result is the engine's
+    /// envelope timestamp, echoed as `{sentAt}` — the send ack, not call
+    /// state (the connector keeps none).
     pub async fn send_call_signal(
         &self,
         params: CallsSendSignalParams,
@@ -2580,7 +2582,8 @@ impl RuntimeSupervisor {
                 &params.conversation_id,
                 &params.signal_type,
                 params.call_id,
-                &params.payload,
+                params.payload.as_deref(),
+                params.urgency.as_deref(),
             )?
         };
         match engine
