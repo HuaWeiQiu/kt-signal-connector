@@ -30,6 +30,12 @@ pub const METHODS: &[MethodRow] = &[
     ("runtime.stop", Lane::Control, false, "control"),
     ("accounts.list", Lane::Control, false, "accounts"),
     ("accounts.deleteLocalData", Lane::Control, true, "accounts"),
+    // Account settings writes (contract 1.46, §4.45): the three storage-record
+    // write faces — reaction-class write-lane mutex and delete barrier, no
+    // local persistence; advertised through `account-settings`.
+    ("accounts.setExpireTimer", Lane::Send, true, "accounts"),
+    ("accounts.setProfile", Lane::Send, true, "accounts"),
+    ("accounts.updateConfiguration", Lane::Send, true, "accounts"),
     ("link.start", Lane::Control, false, "link"),
     // `link.finish` never takes a global lane: `host.rs` routes it to the
     // bounded per-group wait lane (ADR 0001 R3) before the table's lane
@@ -37,6 +43,10 @@ pub const METHODS: &[MethodRow] = &[
     ("link.finish", Lane::Control, false, "link"),
     ("link.cancel", Lane::Control, false, "link"),
     ("conversations.list", Lane::Read, false, "read"),
+    // Blocked-conversations read (contract 1.46, §4.45): a bounded
+    // cloud-backed read of the storage records' blocked bits — read lane, no
+    // local persistence; advertised through `blocked-conversations`.
+    ("conversations.getBlocked", Lane::Read, false, "read"),
     ("messages.list", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
     // Account-wide store search (contract 1.30): a bounded read over the
@@ -187,7 +197,9 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// face (`groups.update` / `groups.quit` / the group route of
 /// `conversations.setExpireTimer`) — desktops gate the new surface on this
 /// tag so an old connector answers a clean capability gap instead of
-/// `METHOD_NOT_ALLOWED`. They never join
+/// `METHOD_NOT_ALLOWED`. `account-settings` and `blocked-conversations`
+/// (contract revision 1.46) mark the §4.45 account-record write faces and
+/// the blocked-list read face. They never join
 /// [`METHOD_NAMES`]: the schema request-frame method enum and the dispatch
 /// table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -200,6 +212,8 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "history-import",
     "disappearing-messages",
     "group-management",
+    "account-settings",
+    "blocked-conversations",
 ];
 
 #[cfg(test)]
@@ -213,6 +227,7 @@ mod tests {
     fn lane_and_mutating_sets_match_the_dispatch_contract() {
         let read_lane = [
             "conversations.list",
+            "conversations.getBlocked",
             "messages.list",
             "messages.getText",
             "messages.search",
@@ -230,6 +245,9 @@ mod tests {
         ];
         let send_lane = [
             "messages.sendText",
+            "accounts.setExpireTimer",
+            "accounts.setProfile",
+            "accounts.updateConfiguration",
             "messages.retryText",
             "messages.attachments.send",
             "messages.sendSticker",
@@ -253,6 +271,9 @@ mod tests {
         ];
         let mutating = [
             "messages.sendText",
+            "accounts.setExpireTimer",
+            "accounts.setProfile",
+            "accounts.updateConfiguration",
             "messages.retryText",
             "messages.attachments.send",
             "messages.sendSticker",

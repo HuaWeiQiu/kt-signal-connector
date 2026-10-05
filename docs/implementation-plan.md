@@ -5,7 +5,7 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.45 (2026-10-05)
+- Contract revision: 1.46 (2026-10-05)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -1931,6 +1931,86 @@ kt-engine gap honestly; the engine batch (separate repository) owns the method p
   `setExpirationTimer` is recipient-shaped only — with the reason updated from "not settable
   through this connector" to the engine-batch debt ("engine face pending"); the desktop batch
   owns the matrix wording fix. Direct conversations are untouched in both modes.
+
+### 4.45 Account settings writes + blocked read: accounts.updateConfiguration, accounts.setProfile, accounts.setExpireTimer, conversations.getBlocked (contract revision 1.46, 2026-10-05)
+
+The account-level settings face of contract 1.46: three host methods that write the official
+account-record settings (read receipts, typing indicators, phone-number sharing mode, unlisted
+number, profile, the universal disappearing-message default) and one read method for the
+blocked-conversations list. Source of truth for all four is the Signal Storage Service record
+family (`AccountRecord` for configuration/profile/universal-timer, the per-conversation
+`blocked` bits for the blocked list) — the engine owns every storage-service read-modify-write,
+the connector forwards, bounds-checks, and resolves the account context. All four are
+engine-extension methods (the pinned signal-cli JSON-RPC has none of them), provided by
+`kt-signal-engine` per its `docs/jsonrpc-compat.md` §3/§5 registration block; against the stock
+signal-cli face they answer the upstream's method-not-found as `UPSTREAM_ERROR` — the same
+declared swap boundary the §4.32–§4.34 engine-extension family records.
+
+- `accounts.updateConfiguration`: params `accountId`, plus at least one of the optional
+  `readReceipts` (boolean), `typingIndicators` (boolean), `phoneNumberSharingMode` (enum
+  `"everybody"` | `"nobody"` — the official `AccountRecord` PhoneNumberSharingMode values;
+  the old `CONTACTS_ONLY` value has been removed from the official proto and is not accepted),
+  `unlistedPhoneNumber` (boolean). Only the provided keys are forwarded upstream — the upstream
+  writes exactly the provided fields, reads the rest back untouched (official
+  updateConfiguration partial-write semantics), and an all-fields-satisfied call is an idempotent
+  no-write success. A call carrying no writable key answers `INVALID_REQUEST` before any
+  upstream call (the engine would fail-closed `-32603`; the connector refuses it locally
+  instead). Result `{"status": "saved"}` on a definite success. Send lane, account-scoped
+  mutating.
+- `accounts.setProfile`: params `accountId`, `givenName` (required, 1..128 bytes — the official
+  desktop ProfileEditor `maxBytes: 128` for both name components, v8.31 ProfileEditor.dom.tsx),
+  optional `familyName` (≤ 128 bytes, same source), `about` (≤ 512
+  bytes — the official bio `maxByteCount: 512`), `emoji` (≤ 32 bytes, one emoji — the repo-wide
+  emoji label bound), and `avatar` with three states: absent = keep the current avatar, data URI
+  (`data:image/*;base64,` + canonical base64, decoded ≤ 10 MiB — the engine's stated avatar
+  budget, AvatarHelper-scale) = replace, explicit `null` = remove. The text face is a full
+  write exactly like the official updateProfile (every upstream write carries the complete
+  encrypted profile): a key the caller omits is cleared upstream, so the desktop always sends
+  the full text face it wants. Result `{"status": "saved"}`. Send lane, account-scoped
+  mutating.
+- `accounts.setExpireTimer`: params `accountId`, `expireSeconds` (0..=u32::MAX — the engine
+  face validates within u32 and `AccountRecord.universalExpireTimer` is a uint32 second count;
+  unlike the per-conversation face there is no signal-cli int counterpart to share a smaller
+  denominator with). 0 turns the account-wide disappearing-message default off; a same-value
+  set is an idempotent no-write upstream. This is the account-level default timer — the
+  official "universal timer" (`AccountRecord.universalExpireTimer`): per-conversation timers
+  stay on `conversations.setExpireTimer` (§4.41/§4.44), and unlike that face the universal
+  timer carries no expiration-update broadcast (other devices converge through storage sync).
+  Result `{"status": "saved"}`. Send lane, account-scoped mutating.
+- `conversations.getBlocked`: params `accountId`. Result `{blocked: [{conversationId, kind}]}`
+  with the same `contact` | `group` | `legacyGroup` enum and entry shape as the §4.33 pinned
+  face, in storage order, capped at 256 entries (KT bound — the official clients apply no
+  explicit cap; the connector truncates beyond 256 to keep one host frame bounded; entries
+  missing identity or kind drop, mirroring the pinned projection). Read lane, non-mutating.
+  Blocked state lives in the per-conversation storage records' `blocked` bit, not in the
+  account record — a read face with no write counterpart in this batch (unblocking rides the
+  engine's storage write face when a desktop needs it; the v1 result carries no
+  `blockedAtTimestamp`, matching the engine's §5 registration).
+
+Local validation is the deterministic ladder before any upstream call: `accountId` through the
+opaque-id validator and resolved to the owning proxy group (the upstream account key is the
+resolved `signal_account`, never the host's opaque id); profile string bounds as above;
+`phoneNumberSharingMode` against the two-value enum; `avatar` data-URI shape (image family,
+canonical base64, ≤ 10 MiB decoded) — everything else fails at params deserialization
+(`deny_unknown_fields`, required keys, boolean/u32 types). Engine errors pass through
+structurally: the `STORAGE_*` family (`STORAGE_UNAVAILABLE` / `STORAGE_READ_FAILED` /
+`STORAGE_WRITE_FAILED` — avatar upload failures fold into `STORAGE_WRITE_FAILED` upstream,
+no new code) maps verbatim with `retryable=true`, and the allowlist already declares these
+codes (§4.33/§4.34); an engine `-32603` for a parameter shape this connector's ladder already
+refused is unreachable, and any other engine error degrades to the plain `UPSTREAM_ERROR`.
+Engine-down and method-absent follow the §4.32 mapping (`RUNTIME_NOT_RUNNING` /
+`CAPABILITY_UNAVAILABLE`). Handshake `capabilities` gains `account-settings` (the three write
+faces) and `blocked-conversations` (the read face).
+
+Persistence and cross-face boundaries: none of the four methods reads or writes connector
+state — no row, no cache, no event, no store schema change; the cloud record is the whole
+state and the desktop pulls with the read faces (poll-on-open; there is no storage-sync
+push subscription on this batch, mirroring the §4.33 pin face). The AccountRecord 52–60
+fidelity fix the engine landed alongside this batch (vendored official proto) needs no
+connector change: the connector's storage-write faces (`conversations.setPinned`,
+`stickerPacks.setSync`, and this batch) forward only semantic parameters — no record bytes
+ever cross the connector boundary — so there is no passthrough surface the fix could regress;
+the existing pin/sync integration tests staying green is the regression check.
 
 ## 5. signal-cli Boundary
 

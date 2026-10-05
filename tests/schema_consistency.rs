@@ -37,9 +37,10 @@ use kt_signal_connector::service::{
     MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
     MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS,
-    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES,
-    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
+    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
+    MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
+    MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    STICKER_PACK_SYNC_KEY_B64_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -319,6 +320,19 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   src/service.rs), pinned by the §4.39 unit and integration tests; the
 ///   §4.44 group-management write face (contract 1.45) mirrors both caps in
 ///   the schema and is pinned by the pairs below.
+/// - the blocked-list entry cap (contract 1.46, §4.45,
+///   `MAX_BLOCKED_CONVERSATIONS` = 256): same free-form-result situation,
+///   enforced in `blocked_conversations_result` and pinned by the §4.45 unit
+///   and integration tests.
+/// - the §4.45 avatar budget (`MAX_AVATAR_BYTES` = 10 MiB decoded): the code
+///   bound is on the decoded size, which the schema can only approximate —
+///   the data-URI `maxLength` 13981080 is the padded-base64 encoding of the
+///   ceiling plus a fixed prefix margin, not the enforcement itself, so
+///   pairing it would be fabricated; pinned by the §4.45 unit tests.
+/// - the §4.45 universal-timer face (contract 1.46): `expireSeconds`
+///   maximum 4294967295 is enforced structurally by the `u32` type at params
+///   deserialization (same situation as `stickerPackSetSyncParams.position`);
+///   the schema `maximum` mirrors the type.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
@@ -492,6 +506,34 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/groupsUpdateParams/properties/addMembers/items",
             "maxLength",
             MAX_GROUP_MEMBER_ID_CHARS as u64,
+        ),
+        // Account settings (contract 1.46, §4.45): the profile text budgets
+        // mirror the official desktop ProfileEditor; the emoji label reuses
+        // the repo-wide bound. The avatar budget (10 MiB decoded) is a
+        // code-side constant without an exact schema length (the data-URI
+        // prefix varies; the schema carries only a coarse maxLength margin) —
+        // inventoried below. The universal-timer u32 face and the blocked-list
+        // entry cap are enforced structurally / on the free-form result and
+        // are inventoried below as well.
+        (
+            "/$defs/accountsSetProfileParams/properties/givenName",
+            "maxLength",
+            MAX_PROFILE_NAME_BYTES as u64,
+        ),
+        (
+            "/$defs/accountsSetProfileParams/properties/familyName",
+            "maxLength",
+            MAX_PROFILE_NAME_BYTES as u64,
+        ),
+        (
+            "/$defs/accountsSetProfileParams/properties/about",
+            "maxLength",
+            MAX_PROFILE_ABOUT_BYTES as u64,
+        ),
+        (
+            "/$defs/accountsSetProfileParams/properties/emoji",
+            "maxLength",
+            MAX_EMOJI_BYTES as u64,
         ),
         (
             "/$defs/groupsUpdateParams/properties/removeMembers/items",

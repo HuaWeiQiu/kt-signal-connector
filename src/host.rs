@@ -25,19 +25,21 @@ use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
-    AccountDeleteLocalDataParams, ContactsListParams, ContactsSetLocalAliasParams,
-    ContactsSyncParams, ConversationsGetPinnedParams, ConversationsListParams,
-    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, GroupsGetParams,
-    GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams, HostSideEvent,
-    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams,
+    AccountDeleteLocalDataParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
+    AccountsUpdateConfigurationParams, ContactsListParams, ContactsSetLocalAliasParams,
+    ContactsSyncParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsListParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    GroupsGetParams, GroupsQuitParams, GroupsUpdateParams, HistoryImportStatusParams,
+    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
+    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -930,6 +932,54 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "accounts.updateConfiguration" => {
+            match serde_json::from_value::<AccountsUpdateConfigurationParams>(request.params) {
+                Ok(params) => match runtime.update_account_configuration(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.updateConfiguration params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "accounts.setProfile" => {
+            match serde_json::from_value::<AccountsSetProfileParams>(request.params) {
+                Ok(params) => match runtime.set_profile(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.setProfile params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "accounts.setExpireTimer" => {
+            match serde_json::from_value::<AccountsSetExpireTimerParams>(request.params) {
+                Ok(params) => match runtime.set_account_expire_timer(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.setExpireTimer params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "link.start" => match serde_json::from_value::<LinkStartParams>(request.params) {
             Ok(params) => {
                 match runtime
@@ -1272,6 +1322,25 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid stickerPacks.getImage params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.getBlocked" => {
+            match serde_json::from_value::<ConversationsGetBlockedParams>(request.params) {
+                Ok(params) => match runtime.get_blocked_conversations(params).await {
+                    Ok(blocked) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(blocked).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.getBlocked params",
                         false,
                     ),
                 ),

@@ -60,6 +60,13 @@ PACK_SYNC_STATE = [
         "deletedAtTimestampMs": 1727000000000,
     },
 ]
+# Contract 1.46 account-settings/blocked fixture state: the blocked list is a
+# read-only storage-order constant (the §4.45 batch has no unblock write
+# face); the three write faces are dispatch-recorded no-ops.
+BLOCKED_STATE = [
+    {"conversationId": "+15555550103", "kind": "contact"},
+    {"conversationId": "bGVnYWN5LWdyb3VwLTE=", "kind": "legacyGroup"},
+]
 
 
 def argument_value(name):
@@ -747,6 +754,74 @@ for line in sys.stdin:
             )
         PACK_SYNC_STATE[:] = packs
         result = {"packs": list(PACK_SYNC_STATE)}
+    elif method == "setAccountConfiguration":
+        # Contract 1.46 §4.45 account settings write: record the exact
+        # upstream params (tests assert only the provided keys appear — the
+        # partial-write contract) and answer the engine's bare success. No
+        # free-text param exists on this face, so the STORAGE_* sentinels ride
+        # the pin/sticker/profile faces; the shared UpstreamCode mapping is
+        # already integration-proven there.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        result = {}
+    elif method == "setProfile":
+        # Contract 1.46 §4.45 profile write: record the exact upstream
+        # params (tests assert the text-face full-write forwarding and the
+        # avatar tri-state). Sentinels: about "[fixture-storage-*]" answers a
+        # structured storage error (disjoint codes), givenName
+        # "[fixture-crash-profile]" crashes with the mutating call in flight
+        # (os._exit(31); disjoint from 25/29/30).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        about = params.get("about")
+        if about == "[fixture-storage-unavailable]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        if about == "[fixture-storage-read-failed]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_READ_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if about == "[fixture-storage-write-failed]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_WRITE_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if params.get("givenName") == "[fixture-crash-profile]":
+            os._exit(31)
+        result = {}
+    elif method == "setUniversalExpireTimer":
+        # Contract 1.46 §4.45 universal timer write: record the exact
+        # upstream params (tests assert the expirationInSeconds key). The max
+        # legal u32 value is the in-flight crash magic (os._exit(31)), the
+        # 1.42 timer-face discipline with a value the per-conversation face
+        # cannot carry (i32 ceiling).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("expirationInSeconds") == 4294967295:
+            os._exit(31)
+        result = {}
+    elif method == "getBlockedConversations":
+        # Contract 1.46 §4.45 blocked read: the storage-order projection as a
+        # fixture constant (one contact + one legacy group). Read face, no
+        # sentinel input exists on this face — the STORAGE_* passthrough is
+        # integration-proven on the sibling faces (getStickerPackSyncs
+        # precedent).
+        result = {"blocked": list(BLOCKED_STATE)}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the single-string recipient contract.

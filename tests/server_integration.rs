@@ -3826,6 +3826,12 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "groups.update",
         "groups.quit",
         "group-management",
+        "accounts.setExpireTimer",
+        "accounts.setProfile",
+        "accounts.updateConfiguration",
+        "account-settings",
+        "conversations.getBlocked",
+        "blocked-conversations",
     ] {
         assert!(
             capabilities
@@ -5323,6 +5329,384 @@ async fn sticker_and_pin_methods_surface_engine_errors() {
             .count(),
         1,
         "an unknown pin outcome is never retried: {crash_calls:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.46: the §4.45 account-settings write faces
+/// (accounts.updateConfiguration partial-write forwarding, accounts.setProfile
+/// text full-write + avatar tri-state + bounds, accounts.setExpireTimer u32
+/// engine face) and the conversations.getBlocked read face — success shapes,
+/// the deterministic fail-closed ladder, the structured STORAGE_* passthrough
+/// riding the profile face's sentinels, and the crash-with-in-flight-write
+/// unknown outcome on both mutating faces (no retry, exactly-once dispatch).
+#[tokio::test]
+async fn account_settings_and_blocked_faces_round_trip() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-AccountSettings" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // Blocked read: the storage-order fixture constant, the pinned-face entry
+    // shape (conversationId + kind), contact and legacyGroup kinds.
+    let blocked = request(
+        &mut client,
+        "get-blocked",
+        "conversations.getBlocked",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let entries = blocked["result"]["blocked"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["conversationId"], "+15555550103");
+    assert_eq!(entries[0]["kind"], "contact");
+    assert_eq!(entries[1]["kind"], "legacyGroup");
+    let missing_account = request(
+        &mut client,
+        "blocked-missing-account",
+        "conversations.getBlocked",
+        json!({}),
+    )
+    .await;
+    assert_eq!(missing_account["error"]["code"], "INVALID_REQUEST");
+
+    // Configuration partial write: only the provided keys reach upstream.
+    let configured = request(
+        &mut client,
+        "config-partial",
+        "accounts.updateConfiguration",
+        json!({
+            "accountId": account_id,
+            "readReceipts": true,
+            "phoneNumberSharingMode": "nobody"
+        }),
+    )
+    .await;
+    assert_eq!(configured["result"]["status"], "saved");
+    let config_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("readReceipts").is_some())
+        .collect();
+    assert_eq!(config_calls.len(), 1, "{config_calls:?}");
+    assert_eq!(config_calls[0]["account"], "+15555550100");
+    assert_eq!(config_calls[0]["readReceipts"], true);
+    assert_eq!(config_calls[0]["phoneNumberSharingMode"], "nobody");
+    assert!(config_calls[0].get("typingIndicators").is_none());
+    assert!(config_calls[0].get("unlistedPhoneNumber").is_none());
+
+    // Fail-closed ladder: zero writable keys, the retired CONTACTS_ONLY enum
+    // value, an unknown key, a non-boolean.
+    for (request_id, params) in [
+        ("config-empty", json!({ "accountId": account_id })),
+        (
+            "config-retired-enum",
+            json!({
+                "accountId": account_id,
+                "phoneNumberSharingMode": "contactsOnly"
+            }),
+        ),
+        (
+            "config-unknown-key",
+            json!({
+                "accountId": account_id,
+                "readReceipts": true,
+                "bogus": 1
+            }),
+        ),
+        (
+            "config-non-bool",
+            json!({
+                "accountId": account_id,
+                "readReceipts": "yes"
+            }),
+        ),
+    ] {
+        let rejected = request(
+            &mut client,
+            request_id,
+            "accounts.updateConfiguration",
+            params,
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected}"
+        );
+    }
+    let config_calls_after: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("readReceipts").is_some())
+        .collect();
+    assert_eq!(config_calls_after.len(), 1, "refusals never dial upstream");
+
+    // Profile full-write: text keys forward verbatim, absent keys stay absent
+    // (the caller's clear instruction), the avatar replace forwards verbatim.
+    let profile = request(
+        &mut client,
+        "profile-set",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "李",
+            "about": "hello",
+            "avatar": "data:image/png;base64,YQ=="
+        }),
+    )
+    .await;
+    assert_eq!(profile["result"]["status"], "saved");
+    let profile_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("givenName").is_some())
+        .collect();
+    assert_eq!(profile_calls.len(), 1, "{profile_calls:?}");
+    assert_eq!(profile_calls[0]["account"], "+15555550100");
+    assert_eq!(profile_calls[0]["givenName"], "李");
+    assert_eq!(profile_calls[0]["about"], "hello");
+    assert_eq!(profile_calls[0]["avatar"], "data:image/png;base64,YQ==");
+    assert!(profile_calls[0].get("familyName").is_none());
+
+    // Clearing face: familyName "" clears upstream; avatar null removes.
+    let cleared = request(
+        &mut client,
+        "profile-clear",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "Li",
+            "familyName": "",
+            "avatar": null
+        }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["status"], "saved");
+    let profile_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("givenName").is_some())
+        .collect();
+    assert_eq!(profile_calls.len(), 2);
+    assert_eq!(profile_calls[1]["familyName"], "");
+    assert!(profile_calls[1]["avatar"].is_null());
+
+    // Profile fail-closed ladder: empty/over-bound text, non-image avatar,
+    // non-canonical payload, over-budget decode, non-string avatar.
+    let oversized_name = "A".repeat(129);
+    let oversized_about = "A".repeat(513);
+    let oversized_avatar = format!(
+        "data:image/png;base64,{}",
+        "QUJD".repeat(10 * 1024 * 1024 / 3 + 1)
+    );
+    for (request_id, params) in [
+        (
+            "profile-empty-name",
+            json!({ "accountId": account_id, "givenName": "" }),
+        ),
+        (
+            "profile-long-name",
+            json!({ "accountId": account_id, "givenName": oversized_name }),
+        ),
+        (
+            "profile-long-about",
+            json!({ "accountId": account_id, "givenName": "Li", "about": oversized_about }),
+        ),
+        (
+            "profile-non-image",
+            json!({
+                "accountId": account_id,
+                "givenName": "Li",
+                "avatar": "data:text/html;base64,YQ=="
+            }),
+        ),
+        (
+            "profile-non-canonical",
+            json!({
+                "accountId": account_id,
+                "givenName": "Li",
+                "avatar": "data:image/png;base64,YQ"
+            }),
+        ),
+        (
+            "profile-over-budget",
+            json!({ "accountId": account_id, "givenName": "Li", "avatar": oversized_avatar }),
+        ),
+        (
+            "profile-non-string-avatar",
+            json!({ "accountId": account_id, "givenName": "Li", "avatar": 7 }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "accounts.setProfile", params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected}"
+        );
+    }
+
+    // STORAGE_* passthrough: the profile face's about sentinels surface the
+    // engine's structured codes verbatim, retryable.
+    for (request_id, sentinel, expected) in [
+        (
+            "profile-storage-unavailable",
+            "[fixture-storage-unavailable]",
+            "STORAGE_UNAVAILABLE",
+        ),
+        (
+            "profile-storage-read-failed",
+            "[fixture-storage-read-failed]",
+            "STORAGE_READ_FAILED",
+        ),
+        (
+            "profile-storage-write-failed",
+            "[fixture-storage-write-failed]",
+            "STORAGE_WRITE_FAILED",
+        ),
+    ] {
+        let error = request(
+            &mut client,
+            request_id,
+            "accounts.setProfile",
+            json!({
+                "accountId": account_id,
+                "givenName": "Li",
+                "about": sentinel
+            }),
+        )
+        .await;
+        assert_eq!(error["error"]["code"], expected, "{request_id}: {error}");
+        assert_eq!(error["error"]["retryable"], true, "{request_id}: {error}");
+    }
+
+    // Universal timer: the engine-face key forwards; 0 is the legal off value.
+    for (request_id, seconds) in [("timer-set", 86400), ("timer-off", 0)] {
+        let timer = request(
+            &mut client,
+            request_id,
+            "accounts.setExpireTimer",
+            json!({ "accountId": account_id, "expireSeconds": seconds }),
+        )
+        .await;
+        assert_eq!(timer["result"]["status"], "saved", "{request_id}");
+    }
+    let timer_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("expirationInSeconds").is_some())
+        .collect();
+    assert_eq!(timer_calls.len(), 2, "{timer_calls:?}");
+    assert_eq!(timer_calls[0]["account"], "+15555550100");
+    assert_eq!(timer_calls[0]["expirationInSeconds"], 86400);
+    assert_eq!(timer_calls[1]["expirationInSeconds"], 0);
+
+    // Timer fail-closed ladder: negative, fractional, beyond the u32 face.
+    for (request_id, params) in [
+        (
+            "timer-negative",
+            json!({ "accountId": account_id, "expireSeconds": -1 }),
+        ),
+        (
+            "timer-fractional",
+            json!({ "accountId": account_id, "expireSeconds": 1.5 }),
+        ),
+        (
+            "timer-over-u32",
+            json!({ "accountId": account_id, "expireSeconds": 4294967296u64 }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, "accounts.setExpireTimer", params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected}"
+        );
+    }
+
+    // Crash with the mutating profile write in flight (givenName sentinel,
+    // os._exit(31)): SEND_OUTCOME_UNKNOWN, never retried.
+    let crash = request(
+        &mut client,
+        "profile-crash",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "[fixture-crash-profile]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-profile", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let profile_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(profile_pid, engine_pid, "the engine actually restarted");
+    engine_pid = profile_pid;
+
+    // Same discipline on the timer face: the max legal u32 value is the
+    // crash magic (os._exit(31), a value the per-conversation int face
+    // cannot carry).
+    let timer_crash = request(
+        &mut client,
+        "timer-crash",
+        "accounts.setExpireTimer",
+        json!({ "accountId": account_id, "expireSeconds": 4294967295u32 }),
+    )
+    .await;
+    assert_eq!(timer_crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-timer", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+
+    // No-retry audit: exactly one crashing profile call and one crashing
+    // timer call across both restarts.
+    let log = send_log();
+    assert_eq!(
+        log.iter()
+            .filter(|params| params["givenName"] == "[fixture-crash-profile]")
+            .count(),
+        1,
+        "an unknown profile outcome is never retried"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|params| params["expirationInSeconds"] == 4294967295u64)
+            .count(),
+        1,
+        "an unknown timer outcome is never retried"
     );
 
     drop(client);

@@ -42,10 +42,14 @@
             "runtime.stop",
             "accounts.list",
             "accounts.deleteLocalData",
+            "accounts.setExpireTimer",
+            "accounts.setProfile",
+            "accounts.updateConfiguration",
             "link.start",
             "link.finish",
             "link.cancel",
             "conversations.list",
+            "conversations.getBlocked",
             "conversations.getPinned",
             "conversations.setPinned",
             "conversations.setExpireTimer",
@@ -125,6 +129,50 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/accountDeleteLocalDataParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.setExpireTimer" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsSetExpireTimerParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.setProfile" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsSetProfileParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.updateConfiguration" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsUpdateConfigurationParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.getBlocked" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsGetBlockedParams" }
             }
           }
         },
@@ -588,6 +636,85 @@
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "accountsUpdateConfigurationParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Update the account's official settings (contract revision 1.46, \u00a74.45, capability account-settings): at least one of readReceipts / typingIndicators / phoneNumberSharingMode / unlistedPhoneNumber must be present; only the provided keys are forwarded upstream and written (official updateConfiguration partial-write semantics \u2014 the upstream writes exactly the provided fields, reads the rest back untouched), and an all-fields-satisfied call is an idempotent no-write success. A call with no writable key answers INVALID_REQUEST before any upstream call. phoneNumberSharingMode takes \"everybody\" | \"nobody\" (the official AccountRecord PhoneNumberSharingMode values; the old CONTACTS_ONLY has been removed from the official proto and is not accepted). The result is {status: 'saved'} on a definite success. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: the STORAGE_* family passed through verbatim (retryable).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "readReceipts": {
+          "type": "boolean",
+          "description": "Whether the account sends read receipts. Optional; omitted means no change upstream."
+        },
+        "typingIndicators": {
+          "type": "boolean",
+          "description": "Whether the account sends typing indicators. Optional; omitted means no change upstream."
+        },
+        "phoneNumberSharingMode": {
+          "type": "string",
+          "enum": ["everybody", "nobody"],
+          "description": "Who may discover the account by phone number: \"everybody\" or \"nobody\" (official AccountRecord values; CONTACTS_ONLY is gone from the official proto). Optional; omitted means no change upstream."
+        },
+        "unlistedPhoneNumber": {
+          "type": "boolean",
+          "description": "Whether the phone number is unlisted from discovery. Optional; omitted means no change upstream."
+        }
+      }
+    },
+    "accountsSetProfileParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "givenName"],
+      "description": "Write the account's profile (contract revision 1.46, \u00a74.45, capability account-settings): the text face is a full write exactly like the official updateProfile \u2014 every upstream write carries the complete profile, so a text key the caller omits is cleared upstream (the desktop always sends the full text face it wants). givenName is required, 1..128 bytes (the official desktop ProfileEditor maxBytes for both name components); familyName \u2264 128 bytes; about \u2264 512 bytes (the official bio byte budget); emoji \u2264 32 bytes, one emoji. avatar has three states: absent = keep the current avatar, a data:image/*;base64, URI with \u2264 10 MiB decoded = replace, explicit null = remove. The result is {status: 'saved'} on a definite success. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: avatar upload failures fold into STORAGE_WRITE_FAILED and the STORAGE_* family passes through verbatim (retryable).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "givenName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Required profile first name; the full-write anchor (an empty string is INVALID_REQUEST)."
+        },
+        "familyName": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128,
+          "description": "Optional profile last name; omitted (or null) clears it upstream \u2014 official full-write semantics."
+        },
+        "about": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 512,
+          "description": "Optional profile bio; omitted (or null) clears it upstream \u2014 official full-write semantics."
+        },
+        "emoji": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 32,
+          "description": "Optional single bio emoji; omitted (or null) clears it upstream \u2014 official full-write semantics."
+        },
+        "avatar": {
+          "type": "string",
+          "maxLength": 13981080,
+          "description": "Three states: absent = keep the current avatar; a data:image/*;base64, data URI whose decoded size is 1..10485760 bytes (10 MiB, the engine's stated avatar budget, AvatarHelper-scale) = replace; explicit null = remove. The maxLength is the padded-base64 encoding of the ceiling plus a fixed prefix margin — the connector enforces the decoded budget itself and answers INVALID_REQUEST before any upstream call."
+        }
+      }
+    },
+    "accountsSetExpireTimerParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "expireSeconds"],
+      "description": "Set or clear the account's disappearing-message default timer (contract revision 1.46, \u00a74.45, capability account-settings) \u2014 the official universal timer (AccountRecord.universalExpireTimer). 0 turns it off; a same-value set is an idempotent no-write upstream. Unlike conversations.setExpireTimer this is the account-level default: new conversations inherit it, per-conversation timers stay on conversations.setExpireTimer, and the universal timer carries no expiration-update broadcast (other devices converge through storage sync). expireSeconds is 0..4294967295 (the engine face validates within u32 and the official field is uint32; unlike the per-conversation face there is no signal-cli int counterpart to share a smaller denominator with). The result is {status: 'saved'} on a definite success. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: the STORAGE_* family passed through verbatim (retryable).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "expireSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The account-wide default timer in seconds; 0 turns it off."
+        }
       }
     },
     "linkSessionParams": {
@@ -1162,6 +1289,15 @@
           "maximum": 4294967295,
           "description": "Pack-local sticker id."
         }
+      }
+    },
+    "conversationsGetBlockedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's blocked conversations (contract revision 1.46, \u00a74.45, capability blocked-conversations): the engine reads the official Storage Service records' blocked bits (per-conversation Contact/GroupV1/GroupV2 records, not the account record) and the result projects {blocked: [{conversationId, kind}]} in storage order \u2014 the same entry shape and kind enum as the \u00a74.33 pinned face, capped at 256 entries (KT bound, overflow truncated, entries missing identity or kind drop). Read lane; the connector persists nothing \u2014 the cloud record plus the desktop's own cache is the whole story. There is deliberately no blockedAtTimestamp in v1 (matching the engine's registration) and no write counterpart in this batch.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
     "conversationsGetPinnedParams": {

@@ -18,17 +18,19 @@ use crate::engine::{
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AttachmentSendTarget, ConnectorService, ContactsSyncOutcome, ConversationsGetPinnedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsUpdateParams,
-    HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView,
-    MediaIngest, MediaOpenView, MessagesSendStickerParams, PeerTarget, PinnedConversations,
-    PreparedSend, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    account_limit_error, pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsUpdateConfigurationParams,
+    AttachmentSendTarget, BlockedConversations, ConnectorService, ContactsSyncOutcome,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, GroupDetails,
+    GroupsQuitParams, GroupsUpdateParams, HostSideEvent, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
+    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedSend, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
+    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
+    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, account_limit_error,
+    blocked_conversations_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_get_group, store_get_message_text, store_list_contacts, store_list_conversations,
+    store_list_messages, store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2154,6 +2156,114 @@ impl RuntimeSupervisor {
             ))),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// accounts.updateConfiguration (contract revision 1.46, §4.45,
+    /// capability account-settings): bounds under the service lock, then the
+    /// mutating engine call — reaction-class discipline: an unknown outcome
+    /// answers SEND_OUTCOME_UNKNOWN and is never retried. The result is the
+    /// definite-success ack, not state: the settings live upstream and the
+    /// desktop re-reads them through its own channel.
+    pub async fn update_account_configuration(
+        &self,
+        params: AccountsUpdateConfigurationParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_update_configuration(&params)?
+        };
+        match engine
+            .call("setAccountConfiguration", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("saved"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// accounts.setProfile (contract revision 1.46, §4.45, capability
+    /// account-settings): bounds + the avatar tri-state under the service
+    /// lock, then the mutating engine call — the reaction-class discipline
+    /// verbatim. Zero local writes: the profile lives upstream.
+    pub async fn set_profile(
+        &self,
+        params: AccountsSetProfileParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_set_profile(&params)?
+        };
+        match engine
+            .call("setProfile", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("saved"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// accounts.setExpireTimer (contract revision 1.46, §4.45, capability
+    /// account-settings): account resolution under the service lock, then the
+    /// mutating engine call — the reaction-class discipline verbatim. Zero
+    /// local writes: the universal timer lives upstream, other devices
+    /// converge through storage sync.
+    pub async fn set_account_expire_timer(
+        &self,
+        params: AccountsSetExpireTimerParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_set_expire_timer(&params.account_id, params.expire_seconds)?
+        };
+        match engine
+            .call("setUniversalExpireTimer", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("saved"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// conversations.getBlocked (contract revision 1.46, §4.45, capability
+    /// blocked-conversations): account resolution then the read-only engine
+    /// call; the blocked list projects straight from the engine result with
+    /// the KT entry cap (§4.45).
+    pub async fn get_blocked_conversations(
+        &self,
+        params: ConversationsGetBlockedParams,
+    ) -> Result<BlockedConversations, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_get_blocked(&params.account_id)?
+        };
+        let result = engine
+            .call("getBlockedConversations", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(blocked_conversations_result(
+            result
+                .get("blocked")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
     }
 
     /// Best-effort "Delete for everyone" for one own sent message

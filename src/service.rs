@@ -71,6 +71,17 @@ pub const MAX_PINNED_CONVERSATIONS: usize = 128;
 /// one response frame stays bounded.
 pub const STICKER_PACK_SYNC_KEY_B64_CHARS: usize = 44;
 pub const MAX_STICKER_PACK_SYNCS: usize = 256;
+/// Account settings bounds (contract revision 1.46, §4.45): the profile text
+/// budgets mirror the official desktop ProfileEditor (v8.31
+/// `ts/components/ProfileEditor.dom.tsx`) — both name components maxBytes 128,
+/// the bio maxByteCount 512 — and the emoji label reuses the repo-wide emoji
+/// bound. The avatar budget is the engine's stated 10 MiB decoded ceiling
+/// (AvatarHelper-scale); the blocked list cap is a KT bound (the official
+/// clients declare no explicit cap) so one response frame stays bounded.
+pub const MAX_PROFILE_NAME_BYTES: usize = 128;
+pub const MAX_PROFILE_ABOUT_BYTES: usize = 512;
+pub const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_BLOCKED_CONVERSATIONS: usize = 256;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
@@ -1991,6 +2002,170 @@ impl ConnectorService {
             "installed": installed,
             "position": if installed { position } else { None },
         }))
+    }
+
+    /// accounts.updateConfiguration (contract revision 1.46, §4.45):
+    /// at-least-one-writable-key fail-closed, the sharing-mode enum, and
+    /// account resolution under the service lock; only the provided keys are
+    /// forwarded so the upstream partial-write semantics (official
+    /// updateConfiguration: write exactly the provided fields, read the rest
+    /// back untouched) survive the hop. No local row is written.
+    pub fn prepare_accounts_update_configuration(
+        &self,
+        params: &AccountsUpdateConfigurationParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        let provided = [
+            params.read_receipts.is_some(),
+            params.typing_indicators.is_some(),
+            params.phone_number_sharing_mode.is_some(),
+            params.unlisted_phone_number.is_some(),
+        ];
+        if !provided.iter().any(|present| *present) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "at least one of readReceipts, typingIndicators, phoneNumberSharingMode, unlistedPhoneNumber is required",
+                false,
+            )));
+        }
+        if let Some(mode) = params.phone_number_sharing_mode.as_deref() {
+            if !matches!(mode, "everybody" | "nobody") {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "phoneNumberSharingMode must be 'everybody' or 'nobody'",
+                    false,
+                )));
+            }
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let mut upstream = json!({ "account": account.signal_account });
+        if let Some(read_receipts) = params.read_receipts {
+            upstream["readReceipts"] = json!(read_receipts);
+        }
+        if let Some(typing_indicators) = params.typing_indicators {
+            upstream["typingIndicators"] = json!(typing_indicators);
+        }
+        if let Some(mode) = params.phone_number_sharing_mode.as_deref() {
+            upstream["phoneNumberSharingMode"] = json!(mode);
+        }
+        if let Some(unlisted_phone_number) = params.unlisted_phone_number {
+            upstream["unlistedPhoneNumber"] = json!(unlisted_phone_number);
+        }
+        Ok(upstream)
+    }
+
+    /// accounts.setProfile (contract revision 1.46, §4.45): the text-face
+    /// bounds (official desktop ProfileEditor budgets, §4.45) and the avatar
+    /// tri-state resolve under the service lock; the optional text keys pass
+    /// through as-is because the upstream text face is a full write — a key
+    /// the caller omits is cleared upstream, exactly the official
+    /// updateProfile semantics. No local row is written.
+    pub fn prepare_accounts_set_profile(
+        &self,
+        params: &AccountsSetProfileParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.given_name.is_empty() || params.given_name.len() > MAX_PROFILE_NAME_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "givenName must contain between 1 and 128 bytes",
+                false,
+            )));
+        }
+        if let Some(family_name) = params.family_name.as_deref() {
+            if family_name.len() > MAX_PROFILE_NAME_BYTES {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "familyName must contain at most 128 bytes",
+                    false,
+                )));
+            }
+        }
+        if let Some(about) = params.about.as_deref() {
+            if about.len() > MAX_PROFILE_ABOUT_BYTES {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "about must contain at most 512 bytes",
+                    false,
+                )));
+            }
+        }
+        if let Some(emoji) = params.emoji.as_deref() {
+            if emoji.len() > MAX_EMOJI_BYTES {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "emoji must contain at most 32 bytes",
+                    false,
+                )));
+            }
+        }
+        let avatar = match &params.avatar {
+            None => AvatarUpdate::Keep,
+            Some(Value::Null) => AvatarUpdate::Remove,
+            Some(Value::String(data_uri)) => {
+                AvatarUpdate::Replace(validate_avatar_data_uri(data_uri)?)
+            }
+            Some(_) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "avatar must be a data:image/*;base64, data URI, null, or absent",
+                    false,
+                )));
+            }
+        };
+        let account = self.resolve_account(&params.account_id)?;
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "givenName": params.given_name,
+        });
+        if let Some(family_name) = params.family_name.as_deref() {
+            upstream["familyName"] = json!(family_name);
+        }
+        if let Some(about) = params.about.as_deref() {
+            upstream["about"] = json!(about);
+        }
+        if let Some(emoji) = params.emoji.as_deref() {
+            upstream["emoji"] = json!(emoji);
+        }
+        match avatar {
+            AvatarUpdate::Keep => {}
+            AvatarUpdate::Remove => upstream["avatar"] = Value::Null,
+            AvatarUpdate::Replace(data_uri) => upstream["avatar"] = json!(data_uri),
+        }
+        Ok(upstream)
+    }
+
+    /// accounts.setExpireTimer (contract revision 1.46, §4.45): account
+    /// resolution under the service lock; the u32 face is params-shaped (the
+    /// engine face and the official AccountRecord field are both uint32).
+    /// Same-value sets are upstream idempotent no-writes — no pre-check, the
+    /// passthrough never guesses. No local row is written: the universal
+    /// timer carries no broadcast, other devices converge through storage
+    /// sync.
+    pub fn prepare_accounts_set_expire_timer(
+        &self,
+        account_id: &str,
+        expire_seconds: u32,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "expirationInSeconds": expire_seconds,
+        }))
+    }
+
+    /// conversations.getBlocked (contract revision 1.46, §4.45): account
+    /// bounds and existence — the blocked list lives in the account's
+    /// storage records, the service reads nothing locally (no persistence on
+    /// this face).
+    pub fn prepare_conversations_get_blocked(
+        &self,
+        account_id: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
     }
 
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
@@ -4235,6 +4410,37 @@ pub struct StickerPackSyncs {
     pub packs: Vec<StickerPackSync>,
 }
 
+/// One blocked-conversation entry of the §4.45 result: the storage record's
+/// blocked-bit projection, the same shape and kind taxonomy as the §4.33
+/// pinned entry.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedConversation {
+    pub conversation_id: String,
+    pub kind: String,
+}
+
+/// The §4.45 result of `conversations.getBlocked`: the blocked list in
+/// storage order, capped at [`MAX_BLOCKED_CONVERSATIONS`].
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedConversations {
+    pub blocked: Vec<BlockedConversation>,
+}
+
+/// `accounts.setProfile` avatar tri-state (contract revision 1.46, §4.45):
+/// `Keep` (key absent) forwards no avatar key, `Remove` (explicit null)
+/// forwards `avatar: null`, `Replace` (a data URI) forwards the validated
+/// string. The distinction survives params deserialization via
+/// `Option<Value>` — a plain `Option<String>` would erase the absent/null
+/// line the engine's avatar semantics are built on.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AvatarUpdate {
+    Keep,
+    Remove,
+    Replace(String),
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -4580,6 +4786,55 @@ pub struct StickerPackSetSyncParams {
     pub pack_key: Option<String>,
     pub installed: bool,
     pub position: Option<u32>,
+}
+
+/// `accounts.updateConfiguration` params (contract revision 1.46, §4.45):
+/// every settings key is optional — at least one must be present, which the
+/// service enforces (the schema cannot express "at least one of"); only the
+/// provided keys are forwarded upstream.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsUpdateConfigurationParams {
+    pub account_id: String,
+    pub read_receipts: Option<bool>,
+    pub typing_indicators: Option<bool>,
+    pub phone_number_sharing_mode: Option<String>,
+    pub unlisted_phone_number: Option<bool>,
+}
+
+/// `accounts.setProfile` params (contract revision 1.46, §4.45): the text
+/// face is a full write upstream (an omitted key clears the field), so only
+/// `givenName` is meaningful to omit-guard — the optional text keys pass
+/// through as-is. `avatar` is the tri-state [`AvatarUpdate`]: captured as
+/// `Option<Value>` because absent and explicit null must stay distinct.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsSetProfileParams {
+    pub account_id: String,
+    pub given_name: String,
+    pub family_name: Option<String>,
+    pub about: Option<String>,
+    pub emoji: Option<String>,
+    pub avatar: Option<Value>,
+}
+
+/// `accounts.setExpireTimer` params (contract revision 1.46, §4.45):
+/// `expireSeconds` is required — `0` turns the account-wide default off. The
+/// u32 type fails negative, fractional and over-range values at params
+/// deserialization; the engine face and the official `AccountRecord` field
+/// are both uint32.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsSetExpireTimerParams {
+    pub account_id: String,
+    pub expire_seconds: u32,
+}
+
+/// `conversations.getBlocked` params (contract revision 1.46, §4.45).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsGetBlockedParams {
+    pub account_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5464,6 +5719,59 @@ pub(crate) fn sticker_pack_syncs_result(entries: &[Value]) -> StickerPackSyncs {
         })
         .collect();
     StickerPackSyncs { packs }
+}
+
+/// Project the engine's blocked list onto the wire shape with the KT entry
+/// cap (§4.45): order is storage order, entries beyond 256 are truncated —
+/// the connector adds no ordering of its own. Entries missing identity or
+/// kind drop, mirroring the pinned projection (§4.33).
+pub(crate) fn blocked_conversations_result(entries: &[Value]) -> BlockedConversations {
+    let blocked = entries
+        .iter()
+        .take(MAX_BLOCKED_CONVERSATIONS)
+        .filter_map(|entry| {
+            let conversation_id = entry.get("conversationId").and_then(Value::as_str)?;
+            let kind = entry.get("kind").and_then(Value::as_str)?;
+            Some(BlockedConversation {
+                conversation_id: conversation_id.to_string(),
+                kind: kind.to_string(),
+            })
+        })
+        .collect();
+    BlockedConversations { blocked }
+}
+
+/// `accounts.setProfile` avatar gate (contract revision 1.46, §4.45): the
+/// data URI must be the image family, canonical padded base64, non-empty and
+/// within [`MAX_AVATAR_BYTES`] decoded — the engine's stated avatar budget
+/// (AvatarHelper-scale), checked here so the host gets the deterministic
+/// `INVALID_REQUEST` before any upstream call instead of the engine's
+/// post-dial `-32603`. The validated URI forwards verbatim; the connector
+/// never decodes image bytes beyond the budget check and never persists them.
+fn validate_avatar_data_uri(data_uri: &str) -> Result<String, ServiceError> {
+    let invalid = || {
+        ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "avatar must be a data:image/*;base64, data URI within 10485760 decoded bytes",
+            false,
+        ))
+    };
+    let rest = data_uri.strip_prefix("data:image/").ok_or_else(invalid)?;
+    let (subtype, payload) = rest.split_once(";base64,").ok_or_else(invalid)?;
+    if subtype.is_empty() || subtype.contains(',') {
+        return Err(invalid());
+    }
+    if payload.is_empty() || payload.len() % 4 != 0 {
+        return Err(invalid());
+    }
+    let mut decoded = Vec::with_capacity(payload.len() / 4 * 3);
+    if base64_decode_to_vec(payload, &mut decoded).is_err()
+        || decoded.is_empty()
+        || decoded.len() > MAX_AVATAR_BYTES
+    {
+        return Err(invalid());
+    }
+    Ok(data_uri.to_string())
 }
 
 /// Build the RFC 2397 data URI the pinned upstream accepts
@@ -9544,6 +9852,250 @@ mod tests {
         assert_eq!(result.packs[0].position, None);
         assert_eq!(result.packs[1].pack_id, "b".repeat(32));
         assert_eq!(result.packs[1].deleted_at_timestamp_ms, Some(1727000000000));
+    }
+
+    /// Account configuration bounds (contract revision 1.46, §4.45): at
+    /// least one writable key is required (zero keys fail closed locally —
+    /// the engine would answer -32603), the sharing-mode enum is the official
+    /// two-value proto set, and only the provided keys forward upstream so
+    /// the partial-write semantics survive the hop.
+    #[test]
+    fn prepare_account_configuration_validates_and_forwards_only_provided_keys() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let params =
+            |read_receipts: Option<bool>, sharing: Option<&str>, unlisted: Option<bool>| {
+                AccountsUpdateConfigurationParams {
+                    account_id: account.id.clone(),
+                    read_receipts,
+                    typing_indicators: None,
+                    phone_number_sharing_mode: sharing.map(str::to_string),
+                    unlisted_phone_number: unlisted,
+                }
+            };
+
+        // Happy partial write: exactly the provided keys ride the upstream
+        // payload beside the resolved account.
+        let upstream = service
+            .prepare_accounts_update_configuration(&params(Some(true), Some("nobody"), None))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["readReceipts"], true);
+        assert_eq!(upstream["phoneNumberSharingMode"], "nobody");
+        assert!(upstream.get("typingIndicators").is_none());
+        assert!(upstream.get("unlistedPhoneNumber").is_none());
+
+        // Zero writable keys: deterministic local refusal, not a silent no-op.
+        let error = service
+            .prepare_accounts_update_configuration(&params(None, None, None))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The old CONTACTS_ONLY value is gone from the official proto.
+        let error = service
+            .prepare_accounts_update_configuration(&params(None, Some("contactsOnly"), None))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // Unknown account answers ACCOUNT_NOT_FOUND before any upstream call.
+        let mut unknown = params(Some(true), None, None);
+        unknown.account_id = "no-such-account".to_string();
+        let error = service
+            .prepare_accounts_update_configuration(&unknown)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// Profile bounds (contract revision 1.46, §4.45): the official desktop
+    /// editor budgets (name components 128 bytes, bio 512, emoji 32), the
+    /// avatar tri-state keeps absent/null/string distinct on the wire, and
+    /// the data-URI gate refuses non-image families, non-canonical base64 and
+    /// over-budget payloads before any upstream call.
+    #[test]
+    fn prepare_account_profile_validates_bounds_and_avatar_tri_state() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let params = |given_name: &str,
+                      family_name: Option<&str>,
+                      about: Option<&str>,
+                      emoji: Option<&str>,
+                      avatar: Option<Value>| AccountsSetProfileParams {
+            account_id: account.id.clone(),
+            given_name: given_name.to_string(),
+            family_name: family_name.map(str::to_string),
+            about: about.map(str::to_string),
+            emoji: emoji.map(str::to_string),
+            avatar,
+        };
+
+        // Minimal write: only givenName forwards (the upstream text face is a
+        // full write — absent keys are the caller's clear instruction, the
+        // connector adds nothing).
+        let upstream = service
+            .prepare_accounts_set_profile(&params("Li", None, None, None, None))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["givenName"], "Li");
+        assert!(upstream.get("familyName").is_none());
+        assert!(upstream.get("avatar").is_none());
+
+        // Full write: text keys forward verbatim; an empty optional clears
+        // upstream (official full-write semantics — empty is a legal value).
+        let upstream = service
+            .prepare_accounts_set_profile(&params(
+                "Li",
+                Some(""),
+                Some("hello"),
+                Some("🎉"),
+                Some(Value::Null),
+            ))
+            .unwrap();
+        assert_eq!(upstream["familyName"], "");
+        assert_eq!(upstream["about"], "hello");
+        assert_eq!(upstream["emoji"], "🎉");
+        assert!(upstream["avatar"].is_null());
+
+        // Replace: a legal data URI forwards verbatim.
+        let upstream = service
+            .prepare_accounts_set_profile(&params(
+                "Li",
+                None,
+                None,
+                None,
+                Some(json!("data:image/png;base64,YQ==")),
+            ))
+            .unwrap();
+        assert_eq!(upstream["avatar"], "data:image/png;base64,YQ==");
+
+        // Text bounds: the official editor budgets, enforced deterministically.
+        for (request_id, profile) in [
+            ("empty-given-name", params("", None, None, None, None)),
+            (
+                "given-name-over-128-bytes",
+                params(&"A".repeat(129), None, None, None, None),
+            ),
+            (
+                "family-name-over-128-bytes",
+                params("Li", Some(&"A".repeat(129)), None, None, None),
+            ),
+            (
+                "about-over-512-bytes",
+                params("Li", None, Some(&"A".repeat(513)), None, None),
+            ),
+            (
+                "emoji-over-32-bytes",
+                params("Li", None, None, Some(&"A".repeat(33)), None),
+            ),
+        ] {
+            let error = service.prepare_accounts_set_profile(&profile).unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{request_id}");
+        }
+
+        // Avatar gate: non-string, non-image family, missing base64 marker,
+        // empty payload, non-canonical payload, over-budget decode.
+        for avatar in [
+            json!(7),
+            json!("data:text/html;base64,YQ=="),
+            json!("data:image/png,YQ=="),
+            json!("data:image/png;base64,"),
+            json!("data:image/png;base64,YQ"),
+            json!(format!(
+                "data:image/png;base64,{}",
+                "QUJD".repeat(MAX_AVATAR_BYTES / 3 + 1)
+            )),
+        ] {
+            let error = service
+                .prepare_accounts_set_profile(&params("Li", None, None, None, Some(avatar)))
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        }
+
+        // The exact 10 MiB decoded budget passes; unknown account errors first-class.
+        let at_bound = format!(
+            "data:image/png;base64,{}",
+            "QUJD".repeat(MAX_AVATAR_BYTES / 3)
+        );
+        assert_eq!(
+            (MAX_AVATAR_BYTES / 3) * 3,
+            MAX_AVATAR_BYTES - MAX_AVATAR_BYTES % 3
+        );
+        let upstream = service
+            .prepare_accounts_set_profile(&params("Li", None, None, None, Some(json!(at_bound))))
+            .unwrap();
+        assert!(
+            upstream["avatar"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+
+        let error = service
+            .prepare_conversations_get_blocked("no-such-account")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// Universal-timer forward (contract revision 1.46, §4.45): the resolved
+    /// account plus the engine-face `expirationInSeconds` key; 0 forwards as
+    /// the legal off value, the u32 face is params-shaped so no extra ladder
+    /// exists beyond opaque-id/account checks.
+    #[test]
+    fn prepare_account_expire_timer_forwards_the_engine_face() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let upstream = service
+            .prepare_accounts_set_expire_timer(&account.id, 0)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["expirationInSeconds"], 0);
+
+        let upstream = service
+            .prepare_accounts_set_expire_timer(&account.id, 86400)
+            .unwrap();
+        assert_eq!(upstream["expirationInSeconds"], 86400);
+
+        let error = service
+            .prepare_accounts_set_expire_timer("no-such-account", 86400)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+
+        let blocked_params = service
+            .prepare_conversations_get_blocked(&account.id)
+            .unwrap();
+        assert_eq!(blocked_params["account"], "+15555550100");
+    }
+
+    /// The blocked-list projection (contract revision 1.46, §4.45): storage
+    /// order preserved, the 256-entry KT cap truncates, and entries missing
+    /// identity or kind drop rather than half-carried — the §4.33 pinned
+    /// projection discipline with the wider cap.
+    #[test]
+    fn blocked_conversations_result_caps_and_projects() {
+        let entries: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({
+                    "conversationId": format!("conv-{index}"),
+                    "kind": if index % 3 == 0 { "contact" } else if index % 3 == 1 { "group" } else { "legacyGroup" },
+                })
+            })
+            .collect();
+        let result = blocked_conversations_result(&entries);
+        assert_eq!(result.blocked.len(), MAX_BLOCKED_CONVERSATIONS);
+        assert_eq!(result.blocked[0].conversation_id, "conv-0");
+        assert_eq!(result.blocked[255].conversation_id, "conv-255");
+        assert_eq!(result.blocked[0].kind, "contact");
+
+        // Malformed entries drop instead of failing the whole read.
+        let mixed = vec![
+            json!({"conversationId": "conv-a", "kind": "contact"}),
+            json!({"kind": "group"}),
+            json!({"conversationId": "conv-b"}),
+            json!({"conversationId": "conv-c", "kind": "legacyGroup"}),
+        ];
+        let result = blocked_conversations_result(&mixed);
+        assert_eq!(result.blocked.len(), 2);
+        assert_eq!(result.blocked[1].kind, "legacyGroup");
     }
 
     /// The §4.35 sticker-quote face: the quote resolves through the same

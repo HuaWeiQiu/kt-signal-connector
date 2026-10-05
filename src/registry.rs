@@ -760,6 +760,44 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_sticker_pack_sync(params).await
     }
 
+    /// Account settings writes (contract 1.46, §4.45): account-record state —
+    /// the writes live in the account's storage session, so all three route
+    /// through the account's owning engine like every other mutating face.
+    pub async fn update_account_configuration(
+        &self,
+        params: crate::service::AccountsUpdateConfigurationParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.update_account_configuration(params).await
+    }
+
+    pub async fn set_profile(
+        &self,
+        params: crate::service::AccountsSetProfileParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_profile(params).await
+    }
+
+    pub async fn set_account_expire_timer(
+        &self,
+        params: crate::service::AccountsSetExpireTimerParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_account_expire_timer(params).await
+    }
+
+    /// conversations.getBlocked (contract 1.46, §4.45): blocked state lives
+    /// in the account's storage records, so the read routes through the
+    /// account's owning engine.
+    pub async fn get_blocked_conversations(
+        &self,
+        params: crate::service::ConversationsGetBlockedParams,
+    ) -> Result<crate::service::BlockedConversations, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_blocked_conversations(params).await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,
