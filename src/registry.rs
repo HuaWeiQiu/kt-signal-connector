@@ -719,6 +719,30 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Multi-attachment send (contract revision 1.66, §4.59): routed through
+    /// the account's own proxy-group slot exactly like the singular send.
+    pub async fn send_attachments_multi(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        entries: Vec<crate::service::MessagesSendAttachmentEntry>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .send_attachments_multi(
+                account_id,
+                target,
+                client_request_id,
+                entries,
+                text,
+                quote_message_id,
+            )
+            .await
+    }
+
     pub async fn send_sticker(
         &self,
         params: crate::service::MessagesSendStickerParams,

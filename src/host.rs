@@ -875,6 +875,25 @@ fn log_dispatch(
     }
 }
 
+/// §4.59 (contract revision 1.66): the two mutually exclusive payload forms
+/// of `messages.attachments.send` — the §4.12 singular attachment (the
+/// historical wire shape, unchanged) and the §4.59 plural `attachments`
+/// array (the official forward face). `dataBase64`/`sizeBytes` stay optional
+/// keys at the serde layer only because the form selection happens here;
+/// each form's requirements are enforced deterministically at this boundary,
+/// before any pending row exists.
+enum AttachmentSendForm {
+    Singular {
+        data_base64: String,
+        size_bytes: u64,
+        filename: Option<String>,
+        content_type: Option<String>,
+    },
+    Plural {
+        entries: Vec<crate::service::MessagesSendAttachmentEntry>,
+    },
+}
+
 async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResponse {
     let request_id = request.request_id;
     match request.method.as_str() {
@@ -1439,30 +1458,102 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                             false,
                         )),
                     };
-                    match target {
-                        Ok(target) => match runtime
-                            .send_attachment(
-                                params.account_id,
-                                target,
-                                params.client_request_id,
-                                params.data_base64,
-                                params.size_bytes,
-                                params.filename,
-                                params.content_type,
-                                params.text,
-                                params.quote_message_id,
-                                params.voice_note,
-                                params.view_once,
-                            )
-                            .await
-                        {
-                            Ok(message) => HostResponse::success(
-                                request_id,
-                                serde_json::to_value(message).unwrap_or(Value::Null),
+                    // §4.59 (contract revision 1.66): the singular and plural
+                    // payload forms are mutually exclusive. The plural form
+                    // rejects any singular key outright (and the singular-only
+                    // voiceNote/viewOnce markers, neither official multi-
+                    // attachment face); the singular form requires exactly the
+                    // §4.12 pair (dataBase64+sizeBytes). Both rejections are
+                    // deterministic and happen before any pending row exists.
+                    if params.attachments.is_some() && (params.voice_note || params.view_once) {
+                        return HostResponse::failure(
+                            request_id,
+                            ApiError::new(
+                                "INVALID_REQUEST",
+                                "voiceNote and viewOnce apply to the singular attachment form only",
+                                false,
                             ),
-                            Err(error) => HostResponse::failure(request_id, error.into_api()),
-                        },
-                        Err(error) => HostResponse::failure(request_id, error),
+                        );
+                    }
+                    let form = match (
+                        params.data_base64,
+                        params.size_bytes,
+                        params.filename,
+                        params.content_type,
+                        params.attachments,
+                    ) {
+                        (Some(data_base64), Some(size_bytes), filename, content_type, None) => {
+                            Ok(AttachmentSendForm::Singular {
+                                data_base64,
+                                size_bytes,
+                                filename,
+                                content_type,
+                            })
+                        }
+                        (None, None, None, None, Some(entries)) => {
+                            Ok(AttachmentSendForm::Plural { entries })
+                        }
+                        _ => Err(ApiError::new(
+                            "INVALID_REQUEST",
+                            "either dataBase64+sizeBytes or the attachments array must be provided, never both",
+                            false,
+                        )),
+                    };
+                    match (target, form) {
+                        (
+                            Ok(target),
+                            Ok(AttachmentSendForm::Singular {
+                                data_base64,
+                                size_bytes,
+                                filename,
+                                content_type,
+                            }),
+                        ) => {
+                            match runtime
+                                .send_attachment(
+                                    params.account_id,
+                                    target,
+                                    params.client_request_id,
+                                    data_base64,
+                                    size_bytes,
+                                    filename,
+                                    content_type,
+                                    params.text,
+                                    params.quote_message_id,
+                                    params.voice_note,
+                                    params.view_once,
+                                )
+                                .await
+                            {
+                                Ok(message) => HostResponse::success(
+                                    request_id,
+                                    serde_json::to_value(message).unwrap_or(Value::Null),
+                                ),
+                                Err(error) => HostResponse::failure(request_id, error.into_api()),
+                            }
+                        }
+                        (Ok(target), Ok(AttachmentSendForm::Plural { entries })) => {
+                            match runtime
+                                .send_attachments_multi(
+                                    params.account_id,
+                                    target,
+                                    params.client_request_id,
+                                    entries,
+                                    params.text,
+                                    params.quote_message_id,
+                                )
+                                .await
+                            {
+                                Ok(message) => HostResponse::success(
+                                    request_id,
+                                    serde_json::to_value(message).unwrap_or(Value::Null),
+                                ),
+                                Err(error) => HostResponse::failure(request_id, error.into_api()),
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            HostResponse::failure(request_id, error)
+                        }
                     }
                 }
                 Err(_) => HostResponse::failure(

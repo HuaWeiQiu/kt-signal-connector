@@ -2024,6 +2024,49 @@ impl RuntimeSupervisor {
         self.dispatch_prepared(&engine, prepared).await
     }
 
+    /// Send one message carrying several attachments (contract revision
+    /// 1.66, §4.59). Identical settlement path to `send_attachment`: local
+    /// prepare under the service lock, one upstream mutating `send` call
+    /// whose array-typed `attachments` carries every entry, pending row
+    /// settled with the same no-auto-retry discipline.
+    pub async fn send_attachments_multi(
+        &self,
+        account_id: String,
+        target: SendTarget,
+        client_request_id: String,
+        entries: Vec<crate::service::MessagesSendAttachmentEntry>,
+        text: Option<String>,
+        quote_message_id: Option<String>,
+    ) -> Result<MessageRecord, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let attachment_target = match &target {
+                SendTarget::Conversation(conversation_id) => {
+                    AttachmentSendTarget::Conversation(conversation_id)
+                }
+                SendTarget::Peer {
+                    kind,
+                    peer_key,
+                    peer_title,
+                } => AttachmentSendTarget::Peer(PeerTarget {
+                    kind,
+                    peer_key,
+                    peer_title: peer_title.as_deref(),
+                }),
+            };
+            service.prepare_send_attachment_multi(
+                &account_id,
+                &attachment_target,
+                &client_request_id,
+                &entries,
+                text.as_deref(),
+                quote_message_id.as_deref(),
+            )?
+        };
+        self.dispatch_prepared(&engine, prepared).await
+    }
+
     /// messages.sendViewOnceOpen (contract revision 1.38, §4.36): the bare
     /// engine `sendViewOnceOpen` passthrough under receipt-class discipline —
     /// account resolution still fails deterministically, but every upstream

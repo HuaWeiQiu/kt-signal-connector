@@ -161,6 +161,13 @@ pub const MARK_RECEIPT_MESSAGE_IDS_LIMIT: usize = 512;
 /// projection cap mirrored — entries beyond 64 are dropped, mirroring the
 /// official bounded BodyRange list.
 pub const MAX_SEND_MENTIONS: usize = 64;
+/// The multi-attachment send cap (contract revision 1.66, §4.59): the
+/// upstream engine's own per-message attachment ceiling (pinned signal-cli /
+/// kt-engine `ATTACHMENT_MAX_COUNT` = 32) mirrored — a `messages.attachments.
+/// send` plural `attachments` array answers INVALID_REQUEST past 32 entries
+/// before any pending row exists, instead of the engine's late internal
+/// error. A forwarded multi-attachment message never exceeds this shape.
+pub const MAX_SEND_ATTACHMENTS: usize = 32;
 /// The group roster cap (contract revision 1.40, §4.39): the official
 /// GroupsV2 group-size ceiling. The contacts sync projects at most this many
 /// members into the cached group row; entries past the cap drop.
@@ -1378,6 +1385,123 @@ impl ConnectorService {
             Some(vec![json!(data_uri)]),
             vec![descriptor],
             view_once,
+        )
+    }
+
+    /// Send one message carrying several attachments (contract revision
+    /// 1.66, §4.59) — the official forward face: a forwarded multi-
+    /// attachment message is one upstream message whose array-typed
+    /// `attachments` parameter carries every entry's data URI (the engine
+    /// has always accepted the array; the singular §4.12 entry point was the
+    /// only one-element gate). Validation runs entirely before the pending
+    /// row exists. Shape rules, all deterministic INVALID_REQUEST: 1..=32
+    /// entries (the engine's own per-message ceiling, `MAX_SEND_ATTACHMENTS`);
+    /// the entries' combined raw size stays within the §4.12 100 MiB budget
+    /// so the whole request still fits one host frame; voiceNote/viewOnce are
+    /// rejected on this form (a voice note is always a single-attachment
+    /// message and view-once media is a single unadorned medium — neither
+    /// official face produces a multi-attachment message). Per-entry
+    /// validation reuses the §4.12 family verbatim (payload, filename,
+    /// content type); the caption and quote are message-level and shared.
+    /// Settlement is the §4.12 chain unchanged: one pending row carrying one
+    /// descriptor per entry, then the shared `dispatch_send` completion, so
+    /// the desktop renders every outgoing attachment from the first tick.
+    pub fn prepare_send_attachment_multi(
+        &self,
+        account_id: &str,
+        target: &AttachmentSendTarget<'_>,
+        client_request_id: &str,
+        entries: &[MessagesSendAttachmentEntry],
+        text: Option<&str>,
+        quote_message_id: Option<&str>,
+    ) -> Result<PreparedSend, ServiceError> {
+        if entries.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachments must contain at least one entry",
+                false,
+            )));
+        }
+        if entries.len() > MAX_SEND_ATTACHMENTS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachments must contain at most 32 entries",
+                false,
+            )));
+        }
+        // The combined raw budget equals the singular §4.12 ceiling: one
+        // multi-attachment request is still one host frame (base64 expansion
+        // plus JSON envelope under the 160 MiB frame limit), and no entry can
+        // exceed the budget the singular form already proves fits.
+        let mut total_bytes = 0usize;
+        for entry in entries {
+            total_bytes =
+                total_bytes.saturating_add(usize::try_from(entry.size_bytes).unwrap_or(usize::MAX));
+            if total_bytes > MAX_ATTACHMENT_BYTES {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "combined attachment payload exceeds the 100 MiB message budget",
+                    false,
+                )));
+            }
+            validate_attachment_send_payload(&entry.data_base64, entry.size_bytes)?;
+            validate_attachment_descriptor(entry.filename.as_deref(), "filename")?;
+            validate_attachment_content_type(entry.content_type.as_deref())?;
+        }
+        if let Some(caption) = text {
+            if !caption.is_empty() {
+                validate_text(caption)?;
+            }
+        }
+        validate_opaque_id(client_request_id, "clientRequestId")?;
+        if let Some(quote) = quote_message_id {
+            validate_opaque_id(quote, "quoteMessageId")?;
+        }
+        if let Some(existing) = self
+            .store
+            .message_by_client_request(account_id, client_request_id)?
+        {
+            return Ok(PreparedSend::Existing(Box::new(existing)));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_send_conversation(account_id, target)?;
+        let mut data_uris = Vec::with_capacity(entries.len());
+        let mut descriptors = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let data_uri = build_attachment_data_uri(
+                &entry.data_base64,
+                entry.filename.as_deref(),
+                entry.content_type.as_deref(),
+                false,
+            )?;
+            data_uris.push(json!(data_uri));
+            descriptors.push(NormalizedAttachment {
+                locator: None,
+                id: stable_hash_id(&[
+                    account_id,
+                    client_request_id,
+                    "attachment",
+                    &index.to_string(),
+                ]),
+                content_type: entry.content_type.clone(),
+                filename: entry.filename.clone(),
+                size: Some(entry.size_bytes),
+                width: None,
+                height: None,
+                is_voice_note: false,
+            });
+        }
+        self.dispatch_send(
+            &account,
+            &conversation,
+            text.unwrap_or_default(),
+            client_request_id,
+            quote_message_id,
+            None,
+            None,
+            Some(data_uris),
+            descriptors,
+            false,
         )
     }
 
@@ -5983,23 +6107,61 @@ pub struct MessagesSendAttachmentParams {
     pub peer_key: Option<String>,
     pub peer_title: Option<String>,
     pub client_request_id: String,
-    pub data_base64: String,
-    pub size_bytes: u64,
+    /// §4.12 singular attachment payload. Mutually exclusive with the §4.59
+    /// plural `attachments` array: either form, never both (INVALID_REQUEST).
+    /// Required on the singular form.
+    pub data_base64: Option<String>,
+    /// §4.12 singular declared raw size. Mutually exclusive with the §4.59
+    /// plural `attachments` array. Required on the singular form.
+    pub size_bytes: Option<u64>,
+    /// §4.12 singular display filename. Only legal on the singular form.
     pub filename: Option<String>,
+    /// §4.12 singular media type. Only legal on the singular form.
     pub content_type: Option<String>,
     pub text: Option<String>,
     pub quote_message_id: Option<String>,
     /// §4.30 voice note marker: true maps the attachment to the official
     /// VOICE_MESSAGE flag via the `;voice=true` data-URI parameter. Requires
     /// `audio/*` contentType, validated before the pending row exists.
+    /// Singular-form only: a plural §4.59 send with voiceNote is
+    /// INVALID_REQUEST (a voice note is always a single-attachment message —
+    /// the official sender never produces a multi-attachment voice message).
     #[serde(default)]
     pub voice_note: bool,
     /// §4.36 view-once marker: true sends the attachment as an official
     /// view-once message (upstream `send` carries `viewOnce`). Requires
     /// `image/*` or `video/*` contentType, an empty caption, no quote, and no
-    /// voiceNote — validated before the pending row exists.
+    /// voiceNote — validated before the pending row exists. Singular-form
+    /// only: a plural §4.59 send with viewOnce is INVALID_REQUEST (official
+    /// view-once media is a single unadorned medium).
     #[serde(default)]
     pub view_once: bool,
+    /// §4.59 plural attachment payloads (contract revision 1.66): one
+    /// upstream `send` carries every entry's data URI in its array-typed
+    /// `attachments` parameter — the official forward face merges a multi-
+    /// attachment message into one upstream message. Mutually exclusive with
+    /// the singular `dataBase64`/`sizeBytes`/`filename`/`contentType` keys;
+    /// 1..=32 entries (the engine's per-message ceiling); the entries'
+    /// combined raw budget equals the singular 100 MiB ceiling so the whole
+    /// request still fits one host frame. voiceNote/viewOnce are rejected on
+    /// this form.
+    #[serde(default)]
+    pub attachments: Option<Vec<MessagesSendAttachmentEntry>>,
+}
+
+/// One §4.59 plural attachment entry (contract revision 1.66): the §4.12
+/// singular budget family per entry — standard padded base64 whose decoded
+/// size must equal `sizeBytes`, optional display filename (same path-
+/// separator/control-character rejection) and optional `type/subtype` media
+/// type. No per-entry voice flag: the `;voice=true` data-URI parameter is a
+/// singular-form face only.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendAttachmentEntry {
+    pub data_base64: String,
+    pub size_bytes: u64,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
 }
 
 /// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
@@ -10734,6 +10896,274 @@ mod tests {
                 .message_by_client_request(&account.id, "req-voice-2")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Contract 1.66 (§4.59): the plural form sends ONE upstream message
+    /// whose array-typed `attachments` carries every entry in order — the
+    /// official forward face. The pending row carries one descriptor per
+    /// entry, in array order; the caption is message-level; settlement is
+    /// the §4.12 chain. Rejections (empty array, past the 32-entry upstream
+    /// ceiling, combined budget over the §4.12 100 MiB message budget,
+    /// per-entry payload/filename violations) all answer INVALID_REQUEST
+    /// before the pending row exists, so the same clientRequestId stays a
+    /// fresh request. A single-element array is the singular form's twin:
+    /// same upstream wire shape, same idempotency chain.
+    #[test]
+    fn prepare_send_attachment_multi_merges_entries_into_one_upstream_message() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64_16 = "YXR0YWNobWVudCBieXRlcw=="; // "attachment bytes", 16 raw
+        let b64_5 = "aGVsbG8="; // "hello", 5 raw
+        let entries = |items: &[(&str, u64, Option<&str>, Option<&str>)]| {
+            items
+                .iter()
+                .map(
+                    |(data, size, filename, content_type)| MessagesSendAttachmentEntry {
+                        data_base64: (*data).to_string(),
+                        size_bytes: *size,
+                        filename: filename.map(str::to_string),
+                        content_type: content_type.map(str::to_string),
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+
+        // The plural send: one dispatch, two ordered entries, one caption.
+        let prepared = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-1",
+                &entries(&[
+                    (b64_16, 16, Some("notes.txt"), Some("text/plain")),
+                    (b64_5, 5, Some("clip.ogg"), Some("audio/ogg")),
+                ]),
+                Some("two files"),
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(params["message"], "two files");
+        let attachments = params["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(
+            attachments[0].as_str().unwrap(),
+            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        assert_eq!(
+            attachments[1].as_str().unwrap(),
+            "data:audio/ogg;filename=clip.ogg;base64,aGVsbG8="
+        );
+        assert!(params.get("viewOnce").is_none());
+        // The pending row carries one descriptor per entry, in array order.
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-multi-1")
+            .unwrap()
+            .expect("the pending multi row exists");
+        assert_eq!(row.attachments.len(), 2);
+        assert_eq!(row.attachments[0].filename.as_deref(), Some("notes.txt"));
+        assert_eq!(row.attachments[1].filename.as_deref(), Some("clip.ogg"));
+        assert_eq!(row.attachments[1].size, Some(5));
+        assert!(row.attachments.iter().all(|entry| !entry.is_voice_note));
+
+        // Idempotency: replaying the clientRequestId returns the existing
+        // row instead of a second dispatch.
+        let replay = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-1",
+                &entries(&[(b64_16, 16, Some("notes.txt"), Some("text/plain"))]),
+                Some("two files"),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(replay, PreparedSend::Existing(_)));
+
+        // A single-element array is the singular form's twin: the same data
+        // URI the §4.12 singular send composes for the same payload.
+        let single = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-single",
+                &entries(&[(b64_16, 16, Some("notes.txt"), Some("text/plain"))]),
+                Some("see attachment"),
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &single else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(params["message"], "see attachment");
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+
+        // Empty array: INVALID_REQUEST, nothing behind.
+        let error = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-empty",
+                &entries(&[]),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-multi-empty")
+                .unwrap()
+                .is_none()
+        );
+
+        // Past the 32-entry upstream ceiling: INVALID_REQUEST (mirrored
+        // locally instead of the engine's late internal error), nothing
+        // behind.
+        let oversized: Vec<MessagesSendAttachmentEntry> = (0..33)
+            .map(|_| MessagesSendAttachmentEntry {
+                data_base64: b64_5.to_string(),
+                size_bytes: 5,
+                filename: Some("a.txt".into()),
+                content_type: Some("text/plain".into()),
+            })
+            .collect();
+        let error = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-cap",
+                &oversized,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-multi-cap")
+                .unwrap()
+                .is_none()
+        );
+
+        // Combined budget: the entries' declared sizes together exceed the
+        // §4.12 100 MiB message budget even though each entry is within it.
+        // The total check runs before per-entry payload validation, so the
+        // rejection needs no megabyte payloads.
+        let heavy: Vec<MessagesSendAttachmentEntry> = (0..2)
+            .map(|_| MessagesSendAttachmentEntry {
+                data_base64: b64_5.to_string(),
+                size_bytes: 60_000_000,
+                filename: Some("big.bin".into()),
+                content_type: Some("application/octet-stream".into()),
+            })
+            .collect();
+        let error = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-budget",
+                &heavy,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-multi-budget")
+                .unwrap()
+                .is_none()
+        );
+
+        // Per-entry filename discipline: a path separator rejects the whole
+        // request before the pending row exists.
+        let bad_name = entries(&[(b64_16, 16, Some("../escape.txt"), Some("text/plain"))]);
+        let error = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-path",
+                &bad_name,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert!(
+            service
+                .store
+                .message_by_client_request(&account.id, "req-multi-path")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// §4.59 host-side form discipline: the plural and singular payload forms
+    /// are mutually exclusive and voiceNote/viewOnce stay singular-form
+    /// faces. The host answers INVALID_REQUEST deterministically before any
+    /// prepare work; a plural request whose entries violate the §4.12 family
+    /// rejects inside prepare with the row-absent guarantee.
+    #[test]
+    fn messages_send_attachment_params_reject_mixed_forms_at_deserialization_time() {
+        let base = json!({
+            "accountId": "acc-1",
+            "conversationId": "conv-1",
+            "clientRequestId": "req-form-1",
+        });
+        // A plural form alone deserializes (the host then enforces the
+        // singular-key absence deterministically).
+        let plural_only = serde_json::from_value::<MessagesSendAttachmentParams>(json!({
+            "accountId": "acc-1",
+            "conversationId": "conv-1",
+            "clientRequestId": "req-form-2",
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(plural_only.attachments.as_ref().unwrap().len(), 1);
+        assert!(plural_only.data_base64.is_none());
+        assert!(!plural_only.voice_note);
+        let _ = base;
+
+        // Any singular key beside the array fails the host's deterministic
+        // form match (simulated at the deserialization boundary: the shape
+        // deserializes — both key sets are declared — so the mutual
+        // exclusion lives in the host, exactly like the addressing rule).
+        let mixed = serde_json::from_value::<MessagesSendAttachmentParams>(json!({
+            "accountId": "acc-1",
+            "conversationId": "conv-1",
+            "clientRequestId": "req-form-3",
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5 }
+            ]
+        }))
+        .unwrap();
+        assert!(mixed.data_base64.is_some() && mixed.attachments.is_some());
+
+        // An unknown key still fails closed at deserialization.
+        assert!(
+            serde_json::from_value::<MessagesSendAttachmentParams>(json!({
+                "accountId": "acc-1",
+                "conversationId": "conv-1",
+                "clientRequestId": "req-form-4",
+                "attachments": [],
+                "bogus": true
+            }))
+            .is_err()
         );
     }
 

@@ -1385,11 +1385,45 @@
         "mediaHandle": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "messagesSendAttachmentEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataBase64", "sizeBytes"],
+      "description": "One plural-form attachment (contract revision 1.66): the §4.12 singular budget family per entry — standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes), optional filename (1..128 bytes, no path separators or control characters) and optional contentType (type/subtype). No per-entry voice flag: the ;voice=true data-URI parameter is a singular-form face only.",
+      "properties": {
+        "dataBase64": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 139810136,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "description": "Standard padded base64 of the attachment bytes; decoded size must equal sizeBytes."
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 104857600,
+          "description": "Declared raw size of this entry; verified against the decoded payload before anything is sent. The entries' combined total stays within the 100 MiB message budget."
+        },
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional display filename for the data URI; path separators and control characters are rejected."
+        },
+        "contentType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$",
+          "description": "Optional RFC 2045 media type 'type/subtype'; defaults to application/octet-stream."
+        }
+      }
+    },
     "messagesSendAttachmentParams": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["accountId", "clientRequestId", "dataBase64", "sizeBytes"],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Sends one attachment (contract revision 1.13, budget raised to the official 100 MiB ceiling in 1.16): dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling). The connector re-encodes the payload as an RFC 2397 data URI for the upstream send call and never persists attachment bytes. Optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; text is an optional caption subject to the sendText byte bound. voiceNote (contract revision 1.35) marks the attachment as a voice note: the data URI gains the ;voice=true parameter the engine maps to the official VOICE_MESSAGE flag, and the sent row's descriptor carries isVoiceNote — voiceNote requires contentType audio/* and is rejected INVALID_REQUEST before the pending row exists. Settlement follows messages.sendText: the response is the sent MessageRecord, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "required": ["accountId", "clientRequestId"],
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Two mutually exclusive payload forms (contract revision 1.66): the singular §4.12 form — dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling), optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; or the plural §4.59 form — attachments is an array of 1..32 entries (the upstream per-message ceiling), each carrying its own dataBase64/sizeBytes/filename/contentType, and the combined raw payload stays within the same 100 MiB message budget so one request still fits one host frame (the official forward face: one forwarded multi-attachment message is one upstream message). Both forms re-encode payloads as RFC 2397 data URIs for the upstream send call and never persist attachment bytes. The forms are never mixed: any singular key beside the attachments array (or a singular send missing dataBase64/sizeBytes) is INVALID_REQUEST before the pending row exists; voiceNote and viewOnce are singular-form faces and are INVALID_REQUEST on the plural form (a voice note is always a single-attachment message; view-once media is a single unadorned medium). text is an optional caption subject to the sendText byte bound and quoteMessageId quotes one message in the same conversation — shared by both forms. Settlement follows messages.sendText: the response is the sent MessageRecord whose descriptor list carries one entry per attachment in order, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -1416,45 +1450,76 @@
           "minLength": 4,
           "maxLength": 139810136,
           "pattern": "^[A-Za-z0-9+/]+={0,2}$",
-          "description": "Standard padded base64 of the attachment bytes; decoded size must equal sizeBytes. The bound is 4 * ceil(104857600 / 3) — the exact padded-base64 length for the 100 MiB ceiling."
+          "description": "Singular form. Standard padded base64 of the attachment bytes; decoded size must equal sizeBytes. The bound is 4 * ceil(104857600 / 3) — the exact padded-base64 length for the 100 MiB ceiling. Mutually exclusive with the attachments array."
         },
         "sizeBytes": {
           "type": "integer",
           "minimum": 1,
           "maximum": 104857600,
-          "description": "Declared raw attachment size; verified against the decoded payload before anything is sent."
+          "description": "Singular form. Declared raw attachment size; verified against the decoded payload before anything is sent. Mutually exclusive with the attachments array."
         },
         "filename": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "description": "Optional display filename for the data URI; path separators and control characters are rejected."
+          "description": "Singular form. Optional display filename for the data URI; path separators and control characters are rejected. Mutually exclusive with the attachments array."
         },
         "contentType": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
           "pattern": "^[!#$%&'*+\\-.^_`|~0-9A-Za-z]+/[!#$%&'*+\\-.^_`|~0-9A-Za-z]+$",
-          "description": "Optional RFC 2045 media type 'type/subtype'; defaults to application/octet-stream."
+          "description": "Singular form. Optional RFC 2045 media type 'type/subtype'; defaults to application/octet-stream. Mutually exclusive with the attachments array."
+        },
+        "attachments": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/messagesSendAttachmentEntry" },
+          "description": "Plural form (contract revision 1.66): one upstream message carries every entry, the official multi-attachment forward shape. 1..32 entries; the entries' combined sizeBytes stays within the 100 MiB message budget. Mutually exclusive with the singular dataBase64/sizeBytes/filename/contentType keys, and with voiceNote/viewOnce."
         },
         "text": {
           "type": "string",
           "minLength": 1,
           "maxLength": 65536,
-          "description": "Optional caption; the service authoritatively enforces at most 65536 UTF-8 bytes."
+          "description": "Optional caption; the service authoritatively enforces at most 65536 UTF-8 bytes. Message-level: one caption for the whole send, both forms."
         },
         "quoteMessageId": { "$ref": "#/$defs/opaqueId" },
         "voiceNote": {
           "type": "boolean",
           "default": false,
-          "description": "Send the attachment as a voice note (contract revision 1.35): the data URI gains ;voice=true (engine maps it to the official VOICE_MESSAGE flag — the exact wire shape the official desktop recorder emits) and the sent descriptor records isVoiceNote. Requires contentType audio/*; anything else is INVALID_REQUEST before the pending row exists."
+          "description": "Send the attachment as a voice note (contract revision 1.35): the data URI gains ;voice=true (engine maps it to the official VOICE_MESSAGE flag — the exact wire shape the official desktop recorder emits) and the sent descriptor records isVoiceNote. Requires contentType audio/*; anything else is INVALID_REQUEST before the pending row exists. Singular form only: INVALID_REQUEST on the plural attachments array."
         },
         "viewOnce": {
           "type": "boolean",
           "default": false,
-          "description": "Send the attachment as a view-once message (contract revision 1.38): the upstream send carries viewOnce=true and the sent row's rich record carries viewOnce so the sender's bubble renders the burn UI across restarts. Requires contentType image/* or video/*, an empty caption, no quoteMessageId, and no voiceNote; any violation is INVALID_REQUEST before the pending row exists."
+          "description": "Send the attachment as a view-once message (contract revision 1.38): the upstream send carries viewOnce=true and the sent row's rich record carries viewOnce so the sender's bubble renders the burn UI across restarts. Requires contentType image/* or video/*, an empty caption, no quoteMessageId, and no voiceNote; any violation is INVALID_REQUEST before the pending row exists. Singular form only: INVALID_REQUEST on the plural attachments array."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "required": ["dataBase64"] },
+          "then": {
+            "required": ["sizeBytes"],
+            "not": { "required": ["attachments"] }
+          }
+        },
+        {
+          "if": { "required": ["attachments"] },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["dataBase64"] },
+                { "required": ["sizeBytes"] },
+                { "required": ["filename"] },
+                { "required": ["contentType"] },
+                { "required": ["voiceNote"] },
+                { "required": ["viewOnce"] }
+              ]
+            }
+          }
+        }
+      ]
     },
     "messagesSendStickerParams": {
       "type": "object",

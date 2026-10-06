@@ -9438,3 +9438,199 @@ async fn groups_approve_join_requests_round_trip_and_guards() {
     wait_for_process_exit(recovered_pid).await;
     assert_clean_exit(&mut connector).await;
 }
+
+/// Contract 1.66 (§4.59): the plural `attachments` form merges a forwarded
+/// multi-attachment message into ONE upstream message — the fake engine's
+/// send log carries the whole array on one line and the sent MessageRecord
+/// one descriptor per entry. The singular/plural forms are mutually
+/// exclusive (mixed keys and plural-with-voiceNote both answer
+/// INVALID_REQUEST before any pending row exists), and an unknown plural
+/// entry payload rejects the whole request with nothing left behind.
+#[tokio::test]
+async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [77_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-FwdAttach" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let listed = request(
+        &mut client,
+        "conversations-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 10 }),
+    )
+    .await;
+    let conversation_id = listed["result"]["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let attachment_lines = || {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("attachments").is_some())
+            .collect::<Vec<_>>()
+    };
+
+    // The plural send: one upstream line, both data URIs on the array, the
+    // caption as the message body.
+    let sent = request(
+        &mut client,
+        "multi-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-send-1",
+            "attachments": [
+                {
+                    "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
+                    "sizeBytes": 16,
+                    "filename": "notes.txt",
+                    "contentType": "text/plain"
+                },
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 5,
+                    "filename": "clip.ogg",
+                    "contentType": "audio/ogg"
+                }
+            ],
+            "text": "two files"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["text"], "two files", "{sent}");
+    let descriptors = sent["result"]["attachments"].as_array().unwrap();
+    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors[0]["filename"], "notes.txt");
+    assert_eq!(descriptors[1]["filename"], "clip.ogg");
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 1, "one upstream send: {lines:?}");
+    let upstream = lines[0]["attachments"].as_array().unwrap();
+    assert_eq!(upstream.len(), 2);
+    assert_eq!(
+        upstream[0].as_str().unwrap(),
+        "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+    );
+    assert_eq!(
+        upstream[1].as_str().unwrap(),
+        "data:audio/ogg;filename=clip.ogg;base64,aGVsbG8="
+    );
+
+    // Mixed forms: any singular key beside the array is INVALID_REQUEST —
+    // no upstream line, no pending row.
+    let mixed = request(
+        &mut client,
+        "multi-mixed",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-mixed-1",
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(mixed["error"]["code"], "INVALID_REQUEST", "{mixed}");
+    assert_eq!(mixed["error"]["retryable"], false);
+
+    // Plural with voiceNote: the voice flag is a singular-form face.
+    let voiced = request(
+        &mut client,
+        "multi-voice",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-voice-1",
+            "attachments": [
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 5,
+                    "contentType": "audio/ogg"
+                }
+            ],
+            "voiceNote": true
+        }),
+    )
+    .await;
+    assert_eq!(voiced["error"]["code"], "INVALID_REQUEST", "{voiced}");
+
+    // A per-entry payload violation (size mismatch) rejects the whole
+    // request with no pending row left behind.
+    let bad_entry = request(
+        &mut client,
+        "multi-bad-entry",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "multi-bad-1",
+            "attachments": [
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 4,
+                    "contentType": "text/plain"
+                }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(bad_entry["error"]["code"], "INVALID_REQUEST", "{bad_entry}");
+
+    // Exactly one upstream line landed (the successful plural send) and none
+    // of the rejected requests left a row behind.
+    assert_eq!(attachment_lines().len(), 1);
+    let listed = request(
+        &mut client,
+        "list-final",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    for rejected_id in ["multi-mixed-1", "multi-voice-1", "multi-bad-1"] {
+        assert!(
+            rows.iter().all(|row| row["clientRequestId"] != rejected_id),
+            "a rejected request leaves no row: {rejected_id}"
+        );
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}

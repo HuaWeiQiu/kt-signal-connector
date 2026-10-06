@@ -5,7 +5,24 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.63 (2026-10-06; §4.56 — message-request response faces
+- Contract revision: 1.66 (2026-10-06; §4.59 — the multi-attachment send face
+  opens: `messages.attachments.send` gains an optional plural
+  `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]` form
+  beside the §4.12 singular payload, mutually exclusive with it — the
+  official forward face where one forwarded multi-attachment message is one
+  upstream message. 1..32 entries (the upstream per-message ceiling
+  mirrored), combined raw size within the §4.12 100 MiB message budget so
+  one request still fits one host frame, per-entry validation the §4.12
+  family verbatim, voiceNote/viewOnce stay singular-form faces, caption and
+  quote are message-level. The upstream `send` has always accepted the
+  array-typed `attachments` parameter — the singular §4.12 entry point was
+  the only one-element gate; `dispatch_send` downstream wire shapes are
+  byte-identical. Same-capability in-place evolution on the §4.30/§4.36
+  precedent; the schema-19 store is untouched, zero capture-path change.
+  1.63 is the landed message-request response face (the §4.56 entry, in the
+  chain below — it landed first and its entry therefore sits in the chain,
+  newest wins); 1.64–1.65 remain reserved by parallel batches) —
+  previously 1.63 (2026-10-06; §4.56 — message-request response faces
   `conversations.acceptRequest` / `conversations.declineRequest`: the pinned upstream's native
   `sendMessageRequestResponse` sync face (accept/delete — the official CLI carries only this
   pair; the block/block-and-delete twins stay the desktop's explicit `conversations.setBlocked`
@@ -3206,6 +3223,69 @@ additionally flips the contact's profile-sharing bit upstream
   §4.56 desktop projection below. The connector itself persists nothing.
 - Desktop gating: capability `message-requests` (new tag). A desktop without the tag keeps
   its current rendering (zero calls); contract 1.61 wire consumers are unaffected.
+
+### 4.59 Multi-attachment send: messages.attachments.send `attachments` array (contract revision 1.66, 2026-10-06)
+
+The official forward face (v8.31 `maybeForwardMessages`): a forwarded multi-
+attachment message is **one** upstream message — `enqueueMessageForSend`
+carries every attachment of the source message in one `enqueuedMessage`
+(attachments array), not one message per attachment. The connector's §4.12
+entry point was the only bottleneck: the upstream `send` has always accepted
+an array-typed `attachments` parameter (data URIs; the pinned engine
+`methods.rs` parses `attachments` as a string array and its
+`upload_attachments_for_send` uploads the batch against a per-message ceiling
+of 32, fail-closed past it), and `dispatch_send`/`upstream_text_send_params`
+already thread `Option<Vec<Value>>` — the wire shape downstream of the
+service layer never changed.
+
+`messages.attachments.send` (§4.12) therefore gains an optional **plural
+form**, evolving in place on the §4.30/§4.36 precedent (optional params on
+the same method, same capability — no new capability tag, the method stays
+listed under the same handshake entry):
+
+- Params gain `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]`.
+  Each entry is the §4.12 budget family verbatim (padded base64 whose decoded
+  size must equal `sizeBytes`, ≤ 104857600 bytes; filename 1–128 bytes with
+  the same path-separator/control-character rejection; contentType `type/
+  subtype`). 1..=32 entries (`MAX_SEND_ATTACHMENTS`, the upstream per-message
+  ceiling mirrored — entries past 32 are rejected INVALID_REQUEST here, not
+  as a late engine internal error); the entries' **combined** raw size stays
+  within the §4.12 100 MiB message budget, so a plural request still fits one
+  host frame and no entry can exceed the size the singular form already
+  proves fits.
+- **Mutually exclusive with the singular form.** Any singular key
+  (`dataBase64`/`sizeBytes`/`filename`/`contentType`) beside the
+  `attachments` array — or a singular send missing `dataBase64`/`sizeBytes` —
+  is `INVALID_REQUEST` before the pending row exists. A single-element
+  `attachments` array is semantically equivalent to the singular form (same
+  upstream wire shape, same idempotency chain, same projection): old callers
+  and new callers converge on the same row shapes. The schema expresses the
+  exclusivity with if/then guards; the host enforces it deterministically.
+- **voiceNote and viewOnce stay singular-form faces**: either marker set on
+  the plural form is `INVALID_REQUEST`. A voice note is always a single-
+  attachment message and official view-once media is a single unadorned
+  medium — neither face produces a multi-attachment message, so the plural
+  form carries no per-entry voice flag and no view-once semantics (the
+  descriptor `isVoiceNote` is false for every plural entry).
+- `text` (caption) and `quoteMessageId` are message-level and shared by both
+  forms. The pending row carries one metadata-only descriptor per entry, in
+  array order (descriptor ids derive from the entry index), so the desktop
+  renders every outgoing attachment from the first pending tick and the
+  conversation preview falls back to the first filename when the caption is
+  empty. Settlement is the §4.12 chain unchanged: one upstream mutating
+  `send`, the sent `MessageRecord` on confirmation, `SEND_OUTCOME_UNKNOWN`
+  on an indeterminate outcome, no auto-retry. Idempotency: the
+  `clientRequestId` short-circuit runs before addressing resolution exactly
+  like the singular form.
+- Caller migration (the desktop consume batch): the forward path picks the
+  plural form when the draft carries ≥ 2 attachments and no voice entry, and
+  falls back to the singular per-attachment chain when the connector answers
+  a deterministic rejection (an older connector's `deny_unknown_fields`
+  params deserialization fails closed on the unknown `attachments` key
+  before anything is sent) — never on `SEND_OUTCOME_UNKNOWN`, where a
+  fallback send could double-deliver. The backward-compat story is
+  byte-identical to every optional-param revision: a pre-1.66 caller sends
+  no new key and reads the old shapes unchanged.
 
 ## 5. signal-cli Boundary
 
