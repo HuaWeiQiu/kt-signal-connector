@@ -1068,6 +1068,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "limit"],
+      "description": "Contract 1.72 (2026-10-07, the §4.64 bodyRanges pass-through; the receive half of §4.62): every projected message row carries the peer's text-formatting ranges as an optional `textStyles: [{style, start, length}]` array on the flattened MessageRecord — the §4.20 vocabulary (BOLD / ITALIC / STRIKETHROUGH / MONOSPACE / SPOILER) over UTF-16 code-unit offsets, persisted in the row's rich payload since 1.25 and now a guaranteed contract face on every read shape (`message.upserted` and `messages.search` share it). The same per-entry gate the §4.20 receive face has practiced holds end to end: only the five renderable styles pass, NONE and unknown values drop individually (a hostile payload can never fail the message), start/length are u32-bounded, the list caps at 64 entries, and an all-invalid list collapses to the key-absent plain row — absence means unstyled; rows without styles (and every pre-1.25 row) read byte-identical without the key. No body-bounds gate runs on either face (the official parseTextStyles posture).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -1079,7 +1080,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "query", "limit"],
-      "description": "Contract 1.30: account-wide substring search over stored message bodies. Empty or whitespace-only queries answer an empty page; queries over 128 characters are rejected (INVALID_REQUEST).",
+      "description": "Contract 1.30: account-wide substring search over stored message bodies. Empty or whitespace-only queries answer an empty page; queries over 128 characters are rejected (INVALID_REQUEST). Contract 1.72 (§4.64): hit rows carry the same optional `textStyles` ranges as messages.list — one stored shape, every read face agrees.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "query": { "type": "string", "maxLength": 4096 },

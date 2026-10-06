@@ -5,7 +5,28 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.71 (2026-10-07; §4.63 — the desktop evidence-gate
+- Contract revision: 1.72 (2026-10-07; the §4.62 receive half — the bodyRanges
+  pass-through batch: the pinned `JsonTextStyle` projection a peer's
+  dataMessage carries (`textStyles: [{style, start, length}]`, the §4.20
+  vocabulary over UTF-16 code-unit offsets) reaches every wire face that
+  reads the row — the receive pipeline has consumed it since 1.25 (the
+  per-entry shape gate: the five renderable styles pass, `NONE` and unknown
+  values drop individually, start/length are u32-bounded, 64 entries cap,
+  malformed entries never fail the message) and the store has persisted it
+  in the row's `rich_json` since the same revision, but this batch records
+  the full-stack pass-through contract and pins it with the dedicated
+  round-trip tests: `message.upserted`, `messages.list`, and
+  `messages.search` all carry the ranges verbatim on the flattened
+  MessageRecord; an all-invalid list collapses to the key-absent plain row
+  (the §4.20 all-default collapse — absence means unstyled, pre-1.25 hosts
+  read byte-identical rows); a plain body never grows the key. No new
+  method, no wire shape change beyond the key's now-guaranteed presence on
+  every read face, no capability tag, no schema store version bump (schema
+  20 unchanged; the kt-engine receive projection is the parallel
+  engine-repo batch's to land, the same recorded-gap family the 1.70
+  consume batch practiced — the connector consume side is ready either
+  way) —
+  previously 1.71 (2026-10-07; §4.63 — the desktop evidence-gate
   data-plane gap closes on the connector side: every `conversations.list`
   summary row and the single `conversation.changed` summary now carry
   `hasUserInitiatedOutbound`, a bare always-serialized boolean (the
@@ -59,7 +80,9 @@
   modes: the pinned signal-cli and the kt-engine receive faces still drop the
   sync on the wire today (the recorded §4.58 engine gap for the projection
   half); the consume path activates automatically the moment an engine ships
-  the projection — engine-repo work out of this batch's boundary) —
+  the projection — engine-repo work out of this batch's boundary; 1.72
+  has since landed above (the §4.62 receive half, the bodyRanges
+  pass-through batch — its entry tops the chain)) —
   previously 1.69 (2026-10-06; §4.62 — the send-side text-formatting
   face opens: `messages.sendText` gains an optional `textStyle:
   [{style, start, length}]` array beside the §4.29 `mentions` face — the
@@ -3841,7 +3864,7 @@ the read side is this batch: `listGroups` member entries carry `labelEmoji` / `l
   store column (the pair rides the existing §4.39 `group_extra_json` roster). Metrics
   classify as contacts like the rest of `groups.get`.
 
-### 4.62 Send-side text formatting: messages.sendText `textStyle` ranges (contract revision 1.69, 2026-10-06)
+### 4.62 Send-side text formatting: messages.sendText `textStyle` ranges (contract revision 1.69, 2026-10-06; the receive half landed as §4.64 with 1.72)
 
 The outbound half of the §4.20 rich-body receive face: the caller can style
 its own outgoing text. `messages.sendText` gains an optional `textStyle:
@@ -3909,7 +3932,7 @@ The composer has no inline rich preview (a plain textarea renders no
 ranges); the official inline preview is a documented projection difference.
 A pre-1.69 caller sends no new key and reads the old shapes unchanged.
 
-### 4.63 Outbound evidence bit: `hasUserInitiatedOutbound` on the conversation summaries (contract revision 1.71, 2026-10-07)
+### 4.63 Outbound evidence bit: `hasUserInitiatedOutbound` on the conversation summaries (contract revision 1.71, 2026-10-07; 1.72 has since landed — the §4.62 receive half, its entry sits directly above this section)
 
 The desktop evidence-gate data-plane gap (its official parity matrix §18.4,
 2026-10-06 record, read from the desktop repo `signal/default-timer-persist`
@@ -3986,6 +4009,62 @@ the linked fixture peer starts incoming-only with
 creates the outgoing row and the bit flips true on the refreshed summary,
 a second conversation that never sends stays false, and a fresh never-
 touched conversation projects false — the factor-absent degradation).
+
+### 4.64 Receive-side text formatting: the bodyRanges pass-through contract (contract revision 1.72, 2026-10-07)
+
+The receive half of the §4.62 send face: a peer's styled message reaches
+every wire face this connector serves. The upstream projection is the
+pinned signal-cli `JsonTextStyle` record — `textStyles:
+[{style, start, length}]` on the dataMessage (and its
+`syncMessage.sentMessage` multi-device mirror), the §4.20 vocabulary
+(BOLD / ITALIC / STRIKETHROUGH / MONOSPACE / SPOILER) over UTF-16
+code-unit offsets. The receive pipeline has consumed it since 1.25
+(§4.20): the per-entry shape gate passes only the five renderable styles,
+`NONE` and unknown values drop individually (a hostile payload can never
+fail the message), start/length are u32-bounded, the list caps at 64
+entries past which extras drop, and an all-default result collapses to no
+rich payload at all. This batch records the pass-through contract
+explicitly and pins it end to end:
+
+- **Wire**: every read face that projects a row carries `textStyles`
+  verbatim on the flattened MessageRecord — `message.upserted`,
+  `messages.list`, and `messages.search` (§4.30) share the stored shape,
+  so no face can disagree. Absence semantics: a row without styles carries
+  no key (the §4.20 all-default collapse) — absence means unstyled, and
+  pre-1.25 hosts read byte-identical rows. The key's presence is now a
+  guaranteed contract face, not an incidental projection: any wire face
+  added later reads the same stored shape.
+- **Persistence**: the row's existing additive `messages.rich_json`
+  column (schema 8 → 9, §4.20) — no new table, no schema store version
+  change (schema 20 unchanged). Rich fields never change after receive
+  (the §4.20 edit rule: a body edit keeps the original ranges until a new
+  body arrives with fresh ones).
+- **Gate placement**: the connector consumes and forwards; it neither
+  invents nor validates against the body (no body-bounds gate, the
+  official `parseTextStyles` posture both faces share). The sender-side
+  strictness (fail-closed INVALID_REQUEST) and the receiver-side leniency
+  (drop the entry, keep the message) are deliberate mirrors of the
+  official client's two faces — a caller's own ranges are authored, a
+  peer's are not.
+- **Engine modes**: stock signal-cli carries `textStyles` natively on
+  receives. The kt-engine receive projection keeps its recorded "Style arm
+  not projected" boundary (engine `docs/jsonrpc-compat.md` §5) until the
+  parallel engine batch lands its projection; the connector consume side
+  is engine-mode-agnostic — the moment an engine projects the key, every
+  face above carries it with no connector edit (the same recorded-gap
+  family the 1.70 consume batch practiced).
+
+Tests: the 1.25-era unit faces stand (the five-style pass set, NONE and
+unknown drop individually, malformed entries and u32 overflow drop, the
+64-entry cap, the all-default collapse, the sentMessage mirror); the
+store round trip pins the persisted shape (previews/mentions/textStyles/
+viewOnce flatten onto the wire row, plain rows stay key-absent); the
+full-stack round trip over the fake engine is new and standalone
+(`tests/body_ranges_integration.rs`): one styled receive rides
+`message.upserted` with its ranges verbatim, the read faces (`messages.list`,
+`messages.search`) project the same arrays, a hostile mix keeps only its
+well-formed entries, an all-invalid list collapses to the key-absent
+plain shape, and a plain body never grows the key.
 
 ## 5. signal-cli Boundary
 
