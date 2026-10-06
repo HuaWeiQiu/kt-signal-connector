@@ -1137,6 +1137,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.terminate_group(params).await
     }
 
+    /// groups.approveJoinRequests (contract revision 1.58, §4.53, capability
+    /// group-join-approve): the requested members' join state lives with the
+    /// account's engine, so the write routes through the account's owning
+    /// supervisor like every other mutating face.
+    pub async fn approve_join_requests(
+        &self,
+        params: crate::service::GroupsApproveJoinRequestsParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.approve_join_requests(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

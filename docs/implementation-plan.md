@@ -15,7 +15,11 @@
   `selectors/conversations.dom.ts` `!conversation.terminated` behavior;
   1.57/1.58/1.59 were reserved by parallel batches — 1.58/1.59 never landed
   on this tree, 1.57 landed as the §4.38 attachv2 step-3 download batch below;
-  this revision rebumps from 1.57) — previously 1.57 (2026-10-06; §4.38
+  this revision rebumps from 1.57) — previously 1.58 (2026-10-06; group
+  join-request approval — `groups.approveJoinRequests`: the safe managed write over
+  the pinned upstream's approval-woven updateGroup member semantics; capability
+  `group-join-approve`; §4.52→§4.53 renumbered on landing, the batch drafted before
+  1.59/1.60 claimed §4.52 first) — previously 1.57 (2026-10-06; §4.38
   attachv2 step 3 — history attachment download: `history.attachmentDownload`
   walks one stored pointer face end to end (transit-CDN stream → ciphertext
   HMAC/digest gates → AES-256-CBC decrypt → log-pad trim → plaintextHash gate
@@ -2851,6 +2855,91 @@ the flag moves to where the desktop already reads every conversation.
   direct rows never marked), the `contacts.list` row face (group true / group false /
   direct absent), and the existing 1.53 sync-capture + `groups.get` faces stay green
   (no capture-path change, zero retirement).
+
+### 4.53 Group join-request approval: groups.approveJoinRequests (contract revision 1.58, 2026-10-06; §4.52→§4.53 renumbered on landing — 1.60 §4.52 claimed the section number first)
+
+The group-management matrix item 「群加入审批（approve/joinRequest）」 closes as a **safe
+managed write over an upstream face the pinned engine already carries natively** — no
+upstream source copied, no protocol invention.
+
+Verification record (2026-10-06, all line anchors read from the pinned upstream trees):
+
+- Upstream face (signal-cli `v0.14.7-4-g472784e6` checkout, the 0.14.8 line — semantics
+  verified in the pinned tree): approval is **woven into the updateGroup member semantics**.
+  `GroupHelper.updateGroupV2` (lib/.../helper/GroupHelper.java:730-733, 769): `members`
+  entries that are requesting members ride `GroupV2Helper.approveJoinRequestMembers`
+  (GroupV2Helper.java:297), `removeMembers` entries that are requesting members ride
+  `refuseJoinRequestMembers` (:309) — every other entry is an ordinary add/remove member
+  change. The read source is `listGroups`: `ListGroupsCommand` projects
+  `requestingMembers` as `JsonGroupMemberAddress {number?, uuid?}` records
+  (ListGroupsCommand.java:127, the NON_NULL omissions a single-identity candidate
+  carries). The underlying protocol actions are the GroupsV2
+  promote/delete `pending_admin_approval` pair — server-adjudicated (admin-only, 403),
+  revision-Conflict retried inside the engine (`GroupHelper.updateGroup` ConflictException
+  → refresh + one retry, upstream-owned semantics the connector neither sees nor repeats).
+- The hazard this batch exists for: the shared `members`/`removeMembers` arrays mean a
+  naive "approve these people" call **adds non-requesting names to the group** (and a
+  naive refuse **removes existing members**). The official client avoids it by comparing
+  against `requestingMembers` first; the connector does the same, server-side of the API
+  boundary.
+- `groups.approveJoinRequests` (host method, capability `group-join-approve`, send lane,
+  account-scoped mutating): params `{accountId, conversationId, members, approve,
+  operationId?}` — `members` is the candidate set (1-1001 entries of 1-128 characters,
+  the §4.39 roster bounds; an empty array is refused, the §4.44 no-delta discipline),
+  `approve: true` approves / `false` refuses. conversationId must resolve to a
+  `kind='group'` row before any engine call (direct answers `INVALID_REQUEST`, unknown
+  answers `CONVERSATION_NOT_FOUND`); duplicated candidates collapse.
+- The fold (supervisor-side, the safety core): before anything goes upstream the
+  connector reads the engine's own `listGroups {account, groupId}` (single-group read,
+  ReadOnly class) and intersects the candidates with the projected requesting
+  identities (number and uuid both ride one identity set). Only requesting survivors
+  can ever ride the upstream `members` (approve) / `removeMembers` (refuse) array —
+  every other change key stays absent (§4.44: absence = no change). A fold that
+  empties the candidate set answers `JOIN_REQUEST_NO_LONGER_PENDING` (retryable —
+  the request was resolved elsewhere: another admin acted, the candidate withdrew)
+  and **no write is dispatched**. A read face that cannot answer fails closed with
+  its own engine error. Mis-targets therefore fail at the connector, never at the
+  group's member list.
+- Result semantics (the groups.terminate discipline verbatim): a definite success
+  answers `{"status": "sent"}` (the engine's SendGroupMessageResults body is not
+  interpreted); an indeterminate upstream outcome (engine exit or timeout with the
+  write in flight) answers `SEND_OUTCOME_UNKNOWN`, never retried. Zero local writes:
+  the roster converges through `contacts.sync` (the requesting set is as fresh as the
+  sync the fold's own read refreshes upstream-side; the cached row keeps its own
+  §4.50-appendix-era staleness boundary).
+- Error ladder: shape/resolution errors `INVALID_REQUEST` / `CONVERSATION_NOT_FOUND`
+  (retryable=false, before any engine call); upstream non-admin (GroupsV2 UNAUTHORIZED)
+  forwards verbatim as `UPSTREAM_ERROR` (retryable=true, the §4.50 family); the
+  stale-fold `JOIN_REQUEST_NO_LONGER_PENDING` (retryable=true); unknown outcome
+  `SEND_OUTCOME_UNKNOWN` (retryable=false, never retried). The kt-engine face has no
+  updateGroup member-family method (the engine's updateGroup takes the expiration family
+  only — its compat §5 batch boundary) and answers `CAPABILITY_UNAVAILABLE`
+  (retryable=false) after local validation — the groups.update/groups.quit engine-batch
+  debt precedent, honest by design: answering the fold instead would disguise "the
+  engine cannot approve" as "nobody is requesting".
+- Capability tag: `group-join-approve` joins `FEATURE_CAPABILITIES`; the desktop
+  consume batch gates the method on it (a pre-1.58 connector answers a clean
+  capability gap instead of `METHOD_NOT_ALLOWED`). Desktop UI rendering (approve /
+  refuse actions on the requesting-members list) is the follow-up consume batch; this
+  batch ships the connector face + handshake declaration only. Schema: the method
+  enum entry, the `groupsApproveJoinRequestsParams` def, the allOf dispatch branch,
+  the `JOIN_REQUEST_NO_LONGER_PENDING` error-code entry, and the roster-bounds mirror
+  rows in the schema-consistency test land together with the code.
+- Tests: the prepare unit face (happy path both directions + duplicate collapse; the
+  ladder — empty members, oversized array, per-entry shape, unknown conversation,
+  direct addressing, over-bound audit id; the engine-mode CAPABILITY_UNAVAILABLE after
+  validation, and INVALID_REQUEST precedence on the engine face), the fold unit face
+  (dual-identity capture, malformed entry drops, foreign-shape fail-closed, survivor
+  order), and the server integration (handshake advertises the method + tag; the fold
+  keeps only the requesting survivor in the recorded upstream payload; the refuse
+  direction rides `removeMembers`; the stale fold answers
+  JOIN_REQUEST_NO_LONGER_PENDING with zero writes; unknown conversation / direct /
+  unknown-params-key / empty-members answer before any write; the upstream refusal
+  forwards UPSTREAM_ERROR; the in-flight crash answers SEND_OUTCOME_UNKNOWN and is
+  never retried across the restart). Fixture: `KT_FAKE_REQUESTING_GROUPS`
+  (`<groupId>=<addr,addr>;<groupId>=…`) rides the listGroups JsonGroup with the
+  `requestingMembers` array; the updateGroup route grows the `[fixture-approve-forbidden]`
+  user-error sentinel and the `[fixture-approve-crash]` `os._exit(36)` sentinel.
 
 ## 5. signal-cli Boundary
 

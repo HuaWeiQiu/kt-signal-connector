@@ -24,18 +24,18 @@ use crate::service::{
     ConnectorService, ContactsSyncOutcome, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
-    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget,
-    PinnedConversations, PreparedHistoryDownload, PreparedSend, ReportSpamFailure,
-    ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    account_limit_error, blocked_conversations_result, pinned_conversations_result,
-    sticker_pack_syncs_result, store_get_group, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    ConversationsSetPinnedParams, GroupDetails, GroupsApproveJoinRequestsParams, GroupsQuitParams,
+    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent,
+    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView,
+    MediaCloseView, MediaIngest, MediaOpenView, MessagesReportSpamParams,
+    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
+    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
+    SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, account_limit_error, blocked_conversations_result,
+    pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2395,6 +2395,96 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// groups.approveJoinRequests (contract revision 1.58, §4.53, capability
+    /// group-join-approve): the safety fold, then the mutating upstream
+    /// write. The pinned upstream weaves approval into the updateGroup
+    /// member semantics (`GroupHelper.updateGroupV2`: `members` entries
+    /// that are requesting members ride `approveJoinRequestMembers`,
+    /// `removeMembers` entries that are requesting members ride
+    /// `refuseJoinRequestMembers` — every other entry is an add/remove
+    /// member change), so the connector folds the caller's candidates
+    /// against the engine's own requesting-members read
+    /// (`listGroups {account, groupId}` → JsonGroup.requestingMembers)
+    /// before anything goes upstream: only candidates the engine itself
+    /// reports as requesting can ever ride the member arrays, so the
+    /// "add a stranger" / "remove a member" mis-target faces of the shared
+    /// arrays fail closed here instead of upstream. A fully-stale candidate
+    /// set (the fold empties it) answers
+    /// `JOIN_REQUEST_NO_LONGER_PENDING` (retryable) — the request was
+    /// resolved elsewhere (another admin acted, the candidate withdrew); a
+    /// read face that cannot answer (engine refuses the group read) fails
+    /// closed with that refusal. The write is the groups.terminate
+    /// discipline verbatim: one mutating `updateGroup` call, a definite
+    /// success answers `{"status": "sent"}`, an indeterminate outcome
+    /// answers SEND_OUTCOME_UNKNOWN and is never retried. Zero local
+    /// writes: the roster converges through contacts.sync.
+    pub async fn approve_join_requests(
+        &self,
+        params: GroupsApproveJoinRequestsParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let (group_id, members, approve) = {
+            let service = self.service.lock().await;
+            service.prepare_groups_approve_join_requests(&params, self.config.mode)?
+        };
+        let number = self
+            .service
+            .lock()
+            .await
+            .account_signal_number(&params.account_id)?;
+        // The engine's own read of who is still requesting membership (the
+        // §4.50-verified listGroups read source; a single-group read keeps
+        // the fold O(requesting) and the traffic bounded).
+        let listed = engine
+            .call(
+                "listGroups",
+                json!({ "account": number, "groupId": [group_id.clone()] }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        let requesting: std::collections::HashSet<String> = requesting_member_identities(&listed);
+        // The fold: the caller's candidates survive only while the engine
+        // still reports them requesting. A requesting entry carries either
+        // or both of its number/uuid identities (the JsonGroupMemberAddress
+        // NON_NULL omissions), so both ride the same identity set and the
+        // caller may name the candidate by either (the connector-wide
+        // first-wins address ladder). Nothing else can ride the arrays.
+        let folded: Vec<String> = fold_join_request_candidates(members, &requesting);
+        if folded.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "JOIN_REQUEST_NO_LONGER_PENDING",
+                "no candidate is still requesting membership (already approved, refused, or withdrawn)",
+                true,
+            )));
+        }
+        // The upstream write: the requesting-survivor set rides exactly the
+        // one member family its approve bit names, every other change key
+        // absent — the upstream reads absence as "no change" (§4.44).
+        let mut upstream = json!({
+            "account": number,
+            "groupId": group_id,
+        });
+        if let Some(object) = upstream.as_object_mut() {
+            object.insert(
+                if approve { "members" } else { "removeMembers" }.to_string(),
+                json!(folded),
+            );
+        }
+        match engine
+            .call("updateGroup", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolution and row reads under the service lock, then
     /// the mutating `reportSpam` call — the groups face's unknown-outcome
@@ -3549,6 +3639,51 @@ async fn sync_contacts_with(
         group_count,
         synced_at: now_ms,
     })
+}
+
+/// The requesting-members identity set the §4.53 fold reads: the first group
+/// entry's `requestingMembers` array (the pinned JsonGroupMemberAddress
+/// shape — each entry carries `number` and/or `uuid`, the NON_NULL
+/// omissions a real single-identity candidate has), flattened into the
+/// set of address strings. Anything else (an engine without the face, a
+/// foreign shape) reads as an empty set — the fold then empties and the
+/// write never happens, the honest fail-closed direction.
+fn requesting_member_identities(listed: &Value) -> std::collections::HashSet<String> {
+    listed
+        .as_array()
+        .and_then(|groups| groups.first())
+        .and_then(|group| group.get("requestingMembers"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_object())
+                .flat_map(|object| {
+                    ["number", "uuid"].iter().filter_map(|field| {
+                        object
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The §4.53 fold: the caller's candidates survive only while the engine
+/// still reports them requesting (either identity the set carries). The
+/// return keeps the caller's order; empty means no candidate is still
+/// requesting — the write never goes upstream.
+fn fold_join_request_candidates(
+    members: Vec<String>,
+    requesting: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    members
+        .into_iter()
+        .filter(|member| requesting.contains(member))
+        .collect()
 }
 
 /// The cached group row's `extra` JSON (contract revision 1.40, §4.39; the
@@ -4894,6 +5029,70 @@ mod tests {
         );
     }
 
+    /// The §4.53 requesting-members identity read: both identities of a
+    /// candidate (number and uuid) land in the set, an address-less or
+    /// malformed entry drops, a missing/foreign listGroups answer reads as
+    /// empty (the fold's fail-closed direction), and the fold keeps only
+    /// candidates the engine still reports requesting, in caller order.
+    #[test]
+    fn join_request_fold_keeps_only_requesting_candidates() {
+        use super::{fold_join_request_candidates, requesting_member_identities};
+
+        let listed = json!([
+            {
+                "id": "ZmFrZS1ncm91cC0x",
+                "name": "Fixture Group",
+                "isMember": true,
+                "requestingMembers": [
+                    {"number": "+15555550101"},
+                    {
+                        "number": "+15555550102",
+                        "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"
+                    },
+                    {"uuid": "0b7fca57-abcd-4d0e-9b0f-4f6c1f8a2e10"},
+                    {},
+                    {"number": 12345},
+                    "not-an-object"
+                ]
+            }
+        ]);
+        let requesting = requesting_member_identities(&listed);
+        assert!(requesting.contains("+15555550101"));
+        assert!(requesting.contains("+15555550102"));
+        assert!(requesting.contains("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"));
+        assert!(requesting.contains("0b7fca57-abcd-4d0e-9b0f-4f6c1f8a2e10"));
+        assert_eq!(requesting.len(), 4, "address-less/malformed entries drop");
+
+        // The fold: requesting candidates survive in caller order; a stale
+        // or mistaken candidate (an existing member, a stranger) drops.
+        let folded = fold_join_request_candidates(
+            vec![
+                "+15555550102".into(),
+                "+15555550999".into(),
+                "+15555550101".into(),
+            ],
+            &requesting,
+        );
+        assert_eq!(
+            folded,
+            vec!["+15555550102".to_string(), "+15555550101".to_string()]
+        );
+
+        // The fail-closed direction: an engine answer without the face (or
+        // a foreign shape) reads as empty and the fold empties — nothing
+        // rides the member arrays.
+        assert!(requesting_member_identities(&json!([])).is_empty());
+        assert!(requesting_member_identities(&json!({"error": 1})).is_empty());
+        assert!(requesting_member_identities(&json!([{"members": []}])).is_empty());
+        assert!(
+            fold_join_request_candidates(
+                vec!["+15555550101".into()],
+                &requesting_member_identities(&json!([]))
+            )
+            .is_empty()
+        );
+    }
+
     /// The §4.39 roster capture (contract revision 1.40): the pinned
     /// signal-cli member/admin shapes mark admins through both faces, the
     /// engine-mode shape marks none, address-less entries drop individually,
@@ -4901,7 +5100,6 @@ mod tests {
     #[test]
     fn group_extra_json_captures_the_bounded_roster() {
         use super::group_extra_json;
-
         // Pinned 0.14.8 shape: `members` carry {number, uuid, isAdmin}, the
         // group carries a separate `admins` address set. Alice is marked by
         // her per-member flag, Bob only through the admins set (his uuid),

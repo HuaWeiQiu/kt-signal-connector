@@ -8695,3 +8695,386 @@ async fn groups_terminate_round_trip_and_guards() {
     wait_for_process_exit(recovered_pid).await;
     assert_clean_exit(&mut connector).await;
 }
+
+/// Contract 1.58 (§4.53): the groups.approveJoinRequests round trip. The
+/// handshake advertises the method plus the `group-join-approve` capability;
+/// the fold narrows the caller's candidates to the engine's own
+/// requesting-members read before the write, so the exact upstream
+/// `updateGroup` member-family payload carries only requesting survivors;
+/// the fail-closed ladder (unknown conversation, direct addressing, shape
+/// violations, the fully-stale fold) answers before any upstream write; the
+/// upstream non-admin refusal forwards verbatim (UPSTREAM_ERROR); the
+/// crash-with-in-flight-write path pins the SEND_OUTCOME_UNKNOWN answer and
+/// the no-retry discipline across the engine restart.
+#[tokio::test]
+async fn groups_approve_join_requests_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [53_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // The stub answers one requesting member for the fixture group and for
+    // each sentinel group (the §4.53 verified listGroups read source) —
+    // Alice's number everywhere, so the fold passes the survivors upstream.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[(
+            "KT_FAKE_REQUESTING_GROUPS",
+            "ZmFrZS1ncm91cC0x=+15555550101;[fixture-approve-forbidden]=+15555550101;[fixture-approve-crash]=+15555550101",
+        )],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["groups.approveJoinRequests", "group-join-approve"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupApprove" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Sync so the fixture group row exists, then read its conversation id.
+    request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let listed = request(
+        &mut client,
+        "conversations-list",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture group row must exist");
+
+    // Stage the sentinel groups (the upstream-refusal group and the crash
+    // group) through the runtime injection marker, each also carrying a
+    // requesting member in the stub read so the fold passes them upstream.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 80,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-approve-forbidden]",
+                        "type": "UPDATE",
+                        "groupName": "forbidden group",
+                        "revision": 3
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 81,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-approve-crash]",
+                        "type": "UPDATE",
+                        "groupName": "crash group",
+                        "revision": 3
+                    }
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut groups: Vec<(String, String)> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("approve-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("approve-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        groups = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["type"] == "group")
+            .filter_map(|row| {
+                Some((
+                    row["id"].as_str()?.to_string(),
+                    row["title"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let titles: Vec<&str> = groups.iter().map(|(_, name)| name.as_str()).collect();
+        if titles.contains(&"forbidden group") && titles.contains(&"crash group") {
+            break;
+        }
+    }
+    let by_title = |title: &str| {
+        groups
+            .iter()
+            .find(|(_, name)| name == title)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| panic!("the staged {title} row must materialize: {groups:?}"))
+    };
+    let forbidden = by_title("forbidden group");
+    let crash_group = by_title("crash group");
+
+    // The refusal ladder, each before any upstream write.
+    let unknown = request(
+        &mut client,
+        "approve-unknown",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "members": ["+15555550101"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+    let bad_params = request(
+        &mut client,
+        "approve-bad-params",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "approve": true,
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_params["error"]["code"], "INVALID_REQUEST");
+    let empty_members = request(
+        &mut client,
+        "approve-empty",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": [],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(empty_members["error"]["code"], "INVALID_REQUEST");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-approve-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "approve-direct",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "members": ["+15555550102"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let approval_writes = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| {
+                params.get("members").is_some() || params.get("removeMembers").is_some()
+            })
+            .collect()
+    };
+
+    // The fully-stale fold: the candidates are not requesting (Bob is no
+    // candidate at all, the stranger nobody ever requested) — nothing rides
+    // the arrays and the connector answers before any write.
+    let stale = request(
+        &mut client,
+        "approve-stale",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550102", "+15555550999"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        stale["error"]["code"], "JOIN_REQUEST_NO_LONGER_PENDING",
+        "{stale}"
+    );
+    assert_eq!(stale["error"]["retryable"], true);
+    assert!(approval_writes().is_empty(), "{:?}", approval_writes());
+
+    // The definite success: only the requesting survivor (Alice) rides the
+    // members array — the stale candidates are gone before the write.
+    let approved = request(
+        &mut client,
+        "approve-group",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101", "+15555550999"],
+            "approve": true,
+            "operationId": "approve-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(approved["result"]["status"], "sent", "{approved}");
+    let writes = approval_writes();
+    assert_eq!(writes.len(), 1, "{:?}", approval_writes());
+    assert_eq!(writes[0]["account"], "+15555550100");
+    assert_eq!(writes[0]["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(
+        writes[0]["members"],
+        json!(["+15555550101"]),
+        "the fold keeps only the requesting survivor: {writes:?}"
+    );
+    assert!(writes[0].get("removeMembers").is_none());
+
+    // The refuse direction rides the removeMembers family.
+    let refused_fold = request(
+        &mut client,
+        "refuse-group",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "approve": false
+        }),
+    )
+    .await;
+    assert_eq!(refused_fold["result"]["status"], "sent", "{refused_fold}");
+    let writes = approval_writes();
+    assert_eq!(writes.len(), 2, "{:?}", approval_writes());
+    assert_eq!(
+        writes[1]["removeMembers"],
+        json!(["+15555550101"]),
+        "the refuse direction rides the removeMembers family: {writes:?}"
+    );
+
+    // The upstream non-admin refusal forwards verbatim: the engine's user
+    // error lands as the UPSTREAM_ERROR family (retryable, like every
+    // upstream protocol refusal the connector forwards). The requesting
+    // hook lists Alice for the sentinel group too, so the fold passes her
+    // upstream and the write itself is what the stub refuses.
+    let refused = request(
+        &mut client,
+        "approve-forbidden",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": forbidden,
+            "members": ["+15555550101"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "UPSTREAM_ERROR", "{refused}");
+
+    // Crash with the mutating write in flight (fixture sentinel,
+    // os._exit(36)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
+    // write in the recovered log across the restart.
+    let crash = request(
+        &mut client,
+        "approve-crash",
+        "groups.approveJoinRequests",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_group,
+            "members": ["+15555550101"],
+            "approve": true
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    assert_eq!(crash["error"]["retryable"], false);
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-approve", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+    let crash_writes: Vec<Value> = approval_writes()
+        .into_iter()
+        .filter(|params| params["groupId"] == "[fixture-approve-crash]")
+        .collect();
+    assert_eq!(
+        crash_writes.len(),
+        1,
+        "an unknown approval outcome is never retried: {crash_writes:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}

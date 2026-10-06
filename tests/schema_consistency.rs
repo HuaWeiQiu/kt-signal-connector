@@ -539,6 +539,19 @@ fn schema_numeric_bounds_match_code_constants() {
             "maxLength",
             MAX_GROUP_MEMBER_ID_CHARS as u64,
         ),
+        // Join-request approval (contract 1.58, §4.53): the candidate set
+        // rides the §4.39 roster bounds verbatim (the schema mirrors every
+        // bound the prepare checks enforce).
+        (
+            "/$defs/groupsApproveJoinRequestsParams/properties/members",
+            "maxItems",
+            MAX_GROUP_MEMBERS as u64,
+        ),
+        (
+            "/$defs/groupsApproveJoinRequestsParams/properties/members/items",
+            "maxLength",
+            MAX_GROUP_MEMBER_ID_CHARS as u64,
+        ),
         // Account settings (contract 1.46, §4.45): the profile text budgets
         // mirror the official desktop ProfileEditor; the emoji label reuses
         // the repo-wide bound. The avatar budget (10 MiB decoded) is a

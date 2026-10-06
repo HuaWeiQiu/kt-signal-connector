@@ -179,6 +179,18 @@ pub const METHODS: &[MethodRow] = &[
     // local writes: the terminated state converges through the group-update
     // receive projection.
     ("groups.terminate", Lane::Send, true, "send"),
+    // Group join-request approval (contract revision 1.58, §4.53): mutating,
+    // send-lane upstream traffic — the groups class verbatim, same-account
+    // mutex and delete barrier included; advertised through
+    // `group-join-approve`. The write itself is the pinned upstream's
+    // `updateGroup` faces (approve = the `members` family, refuse = the
+    // `removeMembers` family), with the candidate set the caller names
+    // intersected against the engine's own requesting-members read before
+    // anything goes upstream, so the member/remove-member arrays can never
+    // carry a non-requesting address (the "add stranger" / "remove member"
+    // mis-target faces fail closed at the connector). Zero local writes: the
+    // roster converges through contacts.sync like every group row.
+    ("groups.approveJoinRequests", Lane::Send, true, "send"),
     // Android local-backup export (contract revision 1.47, §4.46): the
     // engine's background export task is account-mutating state, so the
     // start face rides the send lane behind the reaction-class write-lane
@@ -275,7 +287,8 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// revision 1.51) marks the §4.49 call signaling faces
 /// (`calls.sendSignal` plus the `call.incoming` event); `group-terminate`
 /// (contract revision 1.52) marks the §4.50 termination face
-/// (`groups.terminate`). They never
+/// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
+/// the §4.53 join-request approval face (`groups.approveJoinRequests`). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -296,6 +309,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "report-spam",
     "call-signaling",
     "group-terminate",
+    "group-join-approve",
 ];
 
 #[cfg(test)]
@@ -357,6 +371,7 @@ mod tests {
             "groups.update",
             "groups.quit",
             "groups.terminate",
+            "groups.approveJoinRequests",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
@@ -392,6 +407,7 @@ mod tests {
             "groups.update",
             "groups.quit",
             "groups.terminate",
+            "groups.approveJoinRequests",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",

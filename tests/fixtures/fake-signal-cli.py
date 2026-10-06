@@ -453,17 +453,35 @@ for line in sys.stdin:
         # isTerminated rides the JsonGroup record the same way (the §4.50
         # verified read source); KT_FAKE_TERMINATED_GROUPS lists the group
         # ids that answer it true, so the sync-capture path is exercisable.
+        # requestingMembers rides the JsonGroup too (ListGroupsCommand's
+        # resolveJsonMembers(group.requestingMembers()), the §4.53 verified
+        # read source): KT_FAKE_REQUESTING_GROUPS carries
+        # <groupId>=<comma-separated member addresses> entries, so the
+        # approval fold is exercisable against a real JsonGroupMemberAddress
+        # shape (number-only entries, the NON_NULL omission real single-
+        # device candidates carry).
         terminated_ids = {
             value.strip()
             for value in os.environ.get("KT_FAKE_TERMINATED_GROUPS", "").split(",")
             if value.strip()
         }
+        requesting: dict[str, list[str]] = {}
+        for entry in os.environ.get("KT_FAKE_REQUESTING_GROUPS", "").split(";"):
+            if "=" not in entry:
+                continue
+            group_id, _, addresses = entry.partition("=")
+            requesting[group_id.strip()] = [
+                address.strip() for address in addresses.split(",") if address.strip()
+            ]
         result = [
             {
                 "id": "ZmFrZS1ncm91cC0x",
                 "name": "Fixture Group",
                 "isMember": True,
                 "isTerminated": "ZmFrZS1ncm91cC0x" in terminated_ids,
+                "requestingMembers": [
+                    {"number": address} for address in requesting.get("ZmFrZS1ncm91cC0x", [])
+                ],
                 "members": [
                     {"number": LINKED_ACCOUNT},
                     {
@@ -1000,6 +1018,28 @@ for line in sys.stdin:
                 }
                 emit_json(response)
                 continue
+        # Contract 1.58 §4.53: the join-request approval rides updateGroup's
+        # member family (the fold already emptied everything but requesting
+        # members). The sentinel group id answers the upstream non-admin
+        # refusal (the GroupsV2 user error → UPSTREAM_ERROR family); the
+        # crash sentinel rides the members/removeMembers array and crashes
+        # with the mutating call in flight (os._exit(36); disjoint from
+        # 25/29/30/31/32/33/34/35).
+        if params.get("groupId") == "[fixture-approve-forbidden]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "UserErrorException: Failed to send group update",
+                },
+            }
+            emit_json(response)
+            continue
+        if params.get("groupId") == "[fixture-approve-crash]" and (
+            params.get("members") or params.get("removeMembers")
+        ):
+            os._exit(36)
         result = {"timestamp": 99, "results": []}
     elif method == "quitGroup":
         # Contract 1.45 §4.44: same recording discipline; the magic group id

@@ -2126,6 +2126,88 @@ impl ConnectorService {
         }))
     }
 
+    /// groups.approveJoinRequests (contract revision 1.58, §4.53, capability
+    /// group-join-approve): the local validation + resolution ladder, then
+    /// the candidate payload the supervisor folds against the engine's own
+    /// requesting-members read. `prepare` owns every fail-closed gate that
+    /// needs no engine call: member-array bounds (the §4.44 discipline — an
+    /// empty array carries no change upstream, so it is refused by shape),
+    /// the group-row resolution (direct answers INVALID_REQUEST before any
+    /// upstream call), and the audit id shape. The candidate list is passed
+    /// through to the supervisor verbatim — the intersection with the live
+    /// requesting set is upstream-state work and lives there; duplicates
+    /// collapse so the upstream set semantics (JSON sets) can never be
+    /// surprised by repeated entries. The kt-engine face has no
+    /// updateGroup member-family method (the engine's updateGroup takes the
+    /// expiration family only — its compat §5 batch boundary) and answers
+    /// CAPABILITY_UNAVAILABLE (retryable=false) after the local validation
+    /// completed — the groups.update/groups.quit engine-batch debt
+    /// precedent, honest by design: answering the fold instead would
+    /// disguise "the engine cannot approve" as "nobody is requesting".
+    pub fn prepare_groups_approve_join_requests(
+        &self,
+        params: &GroupsApproveJoinRequestsParams,
+        mode: SignalCliMode,
+    ) -> Result<(String, Vec<String>, bool), ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        if params.members.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "an empty member array carries no change upstream; omit the call instead",
+                false,
+            )));
+        }
+        if params.members.len() > MAX_GROUP_MEMBERS
+            || params.members.iter().any(|member| {
+                member.is_empty() || member.chars().count() > MAX_GROUP_MEMBER_ID_CHARS
+            })
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "members carries at most 1001 entries of 1-128 characters",
+                false,
+            )));
+        }
+        // The account row resolves first (the shared ladder's wire order —
+        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND); the payload
+        // itself needs only the group peer key, the supervisor re-resolves
+        // the account number for the upstream call.
+        let _account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "groups.approveJoinRequests addresses a group conversation",
+                false,
+            )));
+        }
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no updateGroup member-family method yet",
+                false,
+            ))),
+            _ => {
+                let mut members = params.members.clone();
+                members.sort();
+                members.dedup();
+                Ok((conversation.peer_key, members, params.approve))
+            }
+        }
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolve the direct conversation's rows to the engine's
     /// `reportSpam {account, targetAci, serverGuids}` payload. The report is
@@ -5928,6 +6010,22 @@ pub struct GroupsQuitParams {
 pub struct GroupsTerminateParams {
     pub account_id: String,
     pub conversation_id: String,
+    pub operation_id: Option<String>,
+}
+
+/// groups.approveJoinRequests params (contract revision 1.58, §4.53,
+/// capability group-join-approve): the addressing pair, the candidate member
+/// set (1-1001 entries of 1-128 characters, the §4.39 roster bounds — the
+/// §4.44 member-array discipline: an empty array carries no change upstream
+/// and is refused by shape), the approve bit (true = approve the join
+/// requests, false = refuse them), and the optional audit id.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsApproveJoinRequestsParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub members: Vec<String>,
+    pub approve: bool,
     pub operation_id: Option<String>,
 }
 
@@ -14037,6 +14135,152 @@ mod tests {
         assert!(
             matches!(bad_operation, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
             "an over-bound operationId is a shape refusal: {bad_operation:?}"
+        );
+    }
+
+    // ---- Contract 1.58 (§4.53): group join-request approval face ----
+
+    /// prepare_groups_approve_join_requests validates the candidate set and
+    /// resolves the group row: the happy path answers (peerKey, deduped
+    /// members, approve) with duplicates collapsed and order normalized;
+    /// the refusal ladder answers before any engine call — empty members,
+    /// oversized member arrays, per-entry shape violations, bad ids, an
+    /// unknown conversation, direct addressing, and an over-bound audit id.
+    /// The kt-engine face answers CAPABILITY_UNAVAILABLE after the local
+    /// validation completed (the engine debt precedent — the fold must not
+    /// disguise "cannot approve" as "nobody is requesting").
+    #[test]
+    fn groups_approve_join_requests_preparation_folds_shape_and_refuses_gaps() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let params = |conversation_id: String, members: Vec<String>, approve: bool| {
+            GroupsApproveJoinRequestsParams {
+                account_id: account.id.clone(),
+                conversation_id,
+                members,
+                approve,
+                operation_id: None,
+            }
+        };
+
+        // The happy path: both decision directions and duplicate collapse.
+        assert_eq!(
+            service
+                .prepare_groups_approve_join_requests(
+                    &params(group.id.clone(), vec!["+15555550101".into()], true),
+                    SignalCliMode::Jvm,
+                )
+                .unwrap(),
+            (
+                "group-id-1".to_string(),
+                vec!["+15555550101".to_string()],
+                true
+            )
+        );
+        assert_eq!(
+            service
+                .prepare_groups_approve_join_requests(
+                    &params(
+                        group.id.clone(),
+                        vec![
+                            "+15555550102".into(),
+                            "+15555550101".into(),
+                            "+15555550102".into()
+                        ],
+                        false,
+                    ),
+                    SignalCliMode::Jvm,
+                )
+                .unwrap(),
+            (
+                "group-id-1".to_string(),
+                vec!["+15555550101".to_string(), "+15555550102".to_string()],
+                false
+            )
+        );
+
+        // The refusal ladder, each before any engine call.
+        let empty = service
+            .prepare_groups_approve_join_requests(
+                &params(group.id.clone(), vec![], true),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(empty, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let direct_addressed = service
+            .prepare_groups_approve_join_requests(
+                &params(direct.id.clone(), vec!["+15555550102".into()], true),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(direct_addressed, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
+            "a direct conversation is a shape refusal: {direct_addressed:?}"
+        );
+        let missing = service
+            .prepare_groups_approve_join_requests(
+                &params("conv-absent".into(), vec!["+15555550102".into()], true),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+        let bad_shape = service
+            .prepare_groups_approve_join_requests(
+                &params(group.id.clone(), vec![String::new()], true),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(bad_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let oversized = service
+            .prepare_groups_approve_join_requests(
+                &params(
+                    group.id.clone(),
+                    (0..=MAX_GROUP_MEMBERS)
+                        .map(|index| format!("+15555050{index:03}"))
+                        .collect(),
+                    true,
+                ),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(oversized, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // The kt-engine face: the honest capability gap after local
+        // validation (CAPABILITY_UNAVAILABLE, retryable=false).
+        let engine_mode = service
+            .prepare_groups_approve_join_requests(
+                &params(group.id.clone(), vec!["+15555550101".into()], true),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(engine_mode, ServiceError::Api(ref api) if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable),
+            "the engine debt answers the capability gap: {engine_mode:?}"
+        );
+        // The engine gate sits after local validation: a shape violation
+        // still answers INVALID_REQUEST on the engine face.
+        let engine_mode_shape = service
+            .prepare_groups_approve_join_requests(
+                &params(group.id.clone(), vec![], true),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(engine_mode_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST")
         );
     }
 

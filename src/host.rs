@@ -32,10 +32,10 @@ use crate::service::{
     ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
     ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    GroupsGetParams, GroupsQuitParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
-    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
+    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
+    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
     MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
     MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
     MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
@@ -1954,6 +1954,28 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 Err(_) => HostResponse::failure(
                     request_id,
                     ApiError::new("INVALID_REQUEST", "invalid groups.terminate params", false),
+                ),
+            }
+        }
+        // Group join-request approval (contract revision 1.58, §4.53,
+        // capability group-join-approve): the groups.terminate dispatch
+        // shape — params shape errors answer INVALID_REQUEST, the definite
+        // success is {"status": "sent"}, the stale-candidate fold answers
+        // JOIN_REQUEST_NO_LONGER_PENDING (retryable), and an indeterminate
+        // upstream outcome is the SEND_OUTCOME_UNKNOWN error, never retried.
+        "groups.approveJoinRequests" => {
+            match serde_json::from_value::<GroupsApproveJoinRequestsParams>(request.params) {
+                Ok(params) => match runtime.approve_join_requests(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.approveJoinRequests params",
+                        false,
+                    ),
                 ),
             }
         }
