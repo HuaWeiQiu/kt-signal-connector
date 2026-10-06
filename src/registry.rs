@@ -931,6 +931,28 @@ impl ProxyGroupRuntime {
         slot.supervisor.decline_message_request(params).await
     }
 
+    /// identities.get (contract 1.68, §4.61): the safety number lives in the
+    /// account's upstream identity store, so the read routes through the
+    /// account's owning engine like every other account face.
+    pub async fn get_identity(
+        &self,
+        params: crate::service::IdentitiesGetParams,
+    ) -> Result<crate::service::IdentityRead, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_identity(params).await
+    }
+
+    /// identities.verify (contract 1.68, §4.61): the trust write is
+    /// account-scoped upstream traffic, so it routes through the account's
+    /// owning engine like every other mutating face.
+    pub async fn verify_identity(
+        &self,
+        params: crate::service::IdentitiesVerifyParams,
+    ) -> Result<crate::service::IdentityVerifyOutcome, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.verify_identity(params).await
+    }
+
     /// calls.sendSignal (contract 1.50, §4.48): the signaling envelope is
     /// account-scoped upstream traffic, so the send routes through the
     /// account's owning engine like every other send face.

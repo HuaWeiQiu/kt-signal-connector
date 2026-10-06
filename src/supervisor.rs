@@ -27,15 +27,16 @@ use crate::service::{
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
     ConversationsSetPinnedParams, GroupDetails, GroupsApproveJoinRequestsParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadView, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
-    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
+    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
+    MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
     MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
     PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
     SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
     StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
     StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_limit_error, blocked_conversations_result,
+    UsernameLookupResult, account_limit_error, blocked_conversations_result, identity_from_engine,
     pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
@@ -3072,6 +3073,61 @@ impl RuntimeSupervisor {
                 })
                 .collect::<Result<Vec<_>, ServiceError>>()?,
         })
+    }
+
+    /// identities.get (contract revision 1.68, §4.61, capability
+    /// safety-number): resolution under the service lock, then the
+    /// read-only pinned `listIdentities` call narrowed to the resolved peer
+    /// reference. The upstream answer is the JSON array of `JsonIdentity`
+    /// records; the projection is the §4.61 ladder (empty → `identity` null,
+    /// malformed record → protocol defect).
+    pub async fn get_identity(
+        &self,
+        params: IdentitiesGetParams,
+    ) -> Result<IdentityRead, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_identities_get(&params.account_id, &params.conversation_id)?
+        };
+        let result = engine
+            .call("listIdentities", upstream, CallClass::ReadOnly)
+            .await?;
+        identity_from_engine(&result)
+    }
+
+    /// identities.verify (contract revision 1.68, §4.61, capability
+    /// safety-number): resolution under the service lock, then the mutating
+    /// pinned `trust {verifiedSafetyNumber}` call — the reaction-class
+    /// discipline verbatim (an indeterminate outcome answers
+    /// SEND_OUTCOME_UNKNOWN and is never retried: the trust write may
+    /// already have landed). The pinned face answers an empty result object
+    /// on success (the command writes no JSON output), so the result is the
+    /// plain `{status: "verified"}` confirmation; the upstream mismatch
+    /// UserError folds into the plain UPSTREAM_ERROR like every
+    /// account-domain method.
+    pub async fn verify_identity(
+        &self,
+        params: IdentitiesVerifyParams,
+    ) -> Result<IdentityVerifyOutcome, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_identities_verify(
+                &params.account_id,
+                &params.conversation_id,
+                &params.safety_number,
+            )?
+        };
+        match engine.call("trust", upstream, CallClass::Mutating).await {
+            Ok(_) => Ok(IdentityVerifyOutcome { status: "verified" }),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// conversations.setBlocked (contract revision 1.48, §4.47, capability

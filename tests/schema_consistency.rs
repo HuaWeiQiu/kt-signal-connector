@@ -34,10 +34,10 @@ use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
     GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES, GROUP_NAME_MAX_BYTES,
-    MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES,
-    MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
-    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
+    IDENTITY_SAFETY_NUMBER_MAX_CHARS, MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES,
+    MAX_ATTACHMENT_ID_BYTES, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
     MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
     MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT,
     STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
@@ -677,6 +677,26 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/usernameLookupParams/properties/usernames/items",
             "maxLength",
             USERNAME_LOOKUP_ENTRY_MAX_CHARS as u64,
+        ),
+        // Safety-number faces (contract 1.68, §4.61): both faces share the
+        // pinned face's 256-char conversation bound; the caller-echoed
+        // verification string carries the IDENTITY_SAFETY_NUMBER_MAX_CHARS
+        // wire bound (the grammar itself is the upstream's parse, not a
+        // connector-enforced shape).
+        (
+            "/$defs/identitiesGetParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/identitiesVerifyParams/properties/conversationId",
+            "maxLength",
+            MAX_PIN_CONVERSATION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/identitiesVerifyParams/properties/safetyNumber",
+            "maxLength",
+            IDENTITY_SAFETY_NUMBER_MAX_CHARS as u64,
         ),
     ];
     assert!(!pairs.is_empty());

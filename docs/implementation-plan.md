@@ -5,8 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.66 (2026-10-06; §4.59 — the multi-attachment send face
-  opens: `messages.attachments.send` gains an optional plural
+- Contract revision: 1.68 (2026-10-06; §4.61 — safety-number faces `identities.get` /
+  `identities.verify`: the pinned upstream's native identity faces — the read narrows the
+  native `listIdentities` JSON-RPC projection (a `JsonRpcLocalCommand`, so the JSON-RPC read
+  is native; jsonrpc.rs:121-126 + ListIdentitiesCommand.java:23) to the resolved peer
+  reference and projects the pinned `JsonIdentity` record verbatim (empty array = the honest
+  `identity: null`, the official SafetyNumberNotReady face), the write carries only the native
+  `trust` `verifiedSafetyNumber` form (the official "Mark as verified" digits-compare
+  semantic; the testing-only `trustAllKnownKeys` mode is never sent) with the official
+  clear-verification half recorded as having no pinned JSON-RPC projection; Read + Send lanes,
+  capability `safety-number` one bit for both halves. 1.64 is the landed group-invites face
+  (the §4.57 entry, in the chain below) and 1.66 is the landed multi-attachment send face
+  (the §4.59 entry, in the chain below) — both landed first and their entries therefore sit
+  in the chain, newest wins; 1.65/1.67 remain reserved by parallel batches) — previously 1.66
+  (2026-10-06; §4.59 — the multi-attachment send face opens: `messages.attachments.send` gains
+  an optional plural
   `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]` form
   beside the §4.12 singular payload, mutually exclusive with it — the
   official forward face where one forwarded multi-attachment message is one
@@ -78,7 +91,7 @@
   desktop gating on the capability + key presence. Zero local writes, the
   schema-19 store untouched, zero capture-path change. 1.63 (the
   message-request response face) landed ahead of this batch on the rebased
-  stack — its §4.56 entry already sits in the chain and the 1.66 header
+  stack — its §4.56 entry already sits in the chain and the 1.68 header
   above took the top, newest wins; this batch takes §4.57 directly) —
   previously 1.63 (2026-10-06; §4.56 — message-request response faces
   `conversations.acceptRequest` / `conversations.declineRequest`: the pinned upstream's native
@@ -3404,6 +3417,67 @@ additionally flips the contact's profile-sharing bit upstream
 > any write; the upstream refusal forwards UPSTREAM_ERROR; the in-flight
 > crash answers SEND_OUTCOME_UNKNOWN and is never retried across the
 > restart).
+### 4.61 Safety-number faces: identities.get, identities.verify (contract revision 1.68, 2026-10-06; §4.57/§4.59 already landed in the chain above — the 1.64 invites and 1.66 forward-multi-attachment batches; §4.58/§4.60 remain reserved by the parallel 1.65 MRR-projection / 1.67 member-label batches)
+
+The safety-number matrix item (the official safety number convergence flow: the details row +
+the viewer modal + the verify action) closes its data plane as **one thin managed read plus one
+thin managed write over the pinned upstream's native identity faces** — no upstream source
+copied, no protocol invention, no engine change. The read face is `listIdentities` (pinned
+checkout `v0.14.8` checkout 472784e6: Rust JSON-RPC `client/src/jsonrpc.rs:121-126` — a native
+`#[method]` registration taking `account?` and `number?`; the Java command
+`src/main/java/.../ListIdentitiesCommand.java:23` implements `JsonRpcLocalCommand`, so the
+JSON-RPC projection is native, not a Manager-internal-only ladder). The write face is `trust`
+(`jsonrpc.rs:374-381` — `trustAllKnownKeys` XOR `verifiedSafetyNumber`,
+`TrustCommand.java:38-60`); the connector carries **only the `verifiedSafetyNumber` form** —
+the official desktop's "Mark as verified" semantic, the digits the user just compared
+travelling back as the verification confirmation (`TrustCommand.java:37` "only use this option
+if you have verified the safety number") — and never the testing-only `trustAllKnownKeys`
+mode. The official toggle's clear-verification half (`toggleVerified` → `setVerifiedDefault`,
+upstream desktop `ts/models/conversations.preload.ts:3323-3328`) has **no pinned JSON-RPC
+projection** (the pinned jsonrpc surface carries no untrust/set-default method) and stays out
+of this contract — recorded honestly, not papered over.
+
+- `identities.get` (host method, capability `safety-number`, read lane, non-mutating): params
+  `{accountId, conversationId}` — the same addressing pair as the §4.47/§4.56 faces, the way
+  the official details row addresses the feature (`!isGroup && !conversation.isMe`,
+  upstream desktop `ConversationDetails.dom.tsx:654-660`). Resolution: the §4.47/§4.56 ladder
+  verbatim, gated to the 1:1 shape — group/legacyGroup rows fail closed `INVALID_REQUEST`
+  before any upstream call (identity keys are a per-contact concept), and so does the §4.42
+  self row (empty peer reference). The upstream key is the resolved peer reference verbatim:
+  the pinned recipient parameter accepts the phone number / ACI UUID / `PNI:` / `u:` username
+  forms (`RecipientIdentifier.java:26-49`), which is exactly the connector peer_key shape
+  taxonomy, so the connector passes it through and never re-classifies. The upstream call is
+  `listIdentities {account, number}` — narrowed to one recipient, never the account-wide list.
+- `identities.get` result `{identity}`: the pinned `JsonIdentity` fields verbatim
+  (`ListIdentitiesCommand.java:88-96` — `number?`, `uuid?`, hex `fingerprint`, formatted
+  `safetyNumber` (12 spaced 5-digit groups, `Util.java:52-67` — the official desktop's
+  `numberBlocks.join(' ')` rendering, `safetyNumber.preload.ts:21,65-68`), base64
+  `scannableSafetyNumber?` (the scannable-fingerprint bytes the desktop renders as the QR),
+  three-value `trustLevel` (`TrustLevel.java:5-8` — the desktop derives the official
+  `isVerified` presentation as `trustLevel === 'TRUSTED_VERIFIED'`), `addedTimestamp`). An
+  empty upstream array is the honest `identity: null` — the official desktop's
+  SafetyNumberNotReady face ("A safety number will be created with this person after you
+  exchange messages with them", `SafetyNumberModal.dom.tsx:35-54`): a state, never an error.
+  A record missing its non-nullable core is a protocol defect, not a no-identity answer.
+- `identities.verify` (host method, capability `safety-number`, send lane, account-scoped
+  mutating — the reaction-class write-lane mutex and delete drain barrier verbatim): params
+  `{accountId, conversationId, safetyNumber}` — the safety number string exactly as the
+  desktop displayed it. The upstream parses spaced 60-digit groups, 66-char hex fingerprints,
+  or base64 scannable payloads (`IdentityVerificationCode.java:20-32`); the connector
+  enforces only the 256-char wire bound and never invents a second grammar — a malformed or
+  mismatched string is the upstream's definite UserError, folded into the plain
+  `UPSTREAM_ERROR` like every account-domain method (no per-failure ladder exists to
+  honest-map). Result `{status: "verified"}`: the pinned face answers an empty result object
+  on success (the command writes no JSON output, `TrustCommand.handleCommand`), so the
+  outcome verb is the honest whole of what the connector knows. An indeterminate outcome
+  answers `SEND_OUTCOME_UNKNOWN` and is never retried (the trust write may already have
+  landed).
+- Zero local writes on both faces: trust level converges through the next `identities.get`
+  (the desktop refreshes its read after a verify instead of echoing a local flag — the
+  upstream identity store is the whole truth).
+- Desktop gating: capability `safety-number` (new tag, one capability for the read and write
+  halves — the 1.53 appendix discipline). A desktop without the tag keeps its current
+  rendering (zero calls, no details row); contract 1.63 wire consumers are unaffected.
 
 ### 4.58 Message-request receive projection: `messageRequestAccepted` on the conversation summaries (contract revision 1.65, 2026-10-06)
 

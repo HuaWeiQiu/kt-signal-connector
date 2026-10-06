@@ -75,6 +75,12 @@ AVATAR_PNG_BYTES = b"\x89PNG\r\n\x1a\nfixture-avatar"
 AVATAR_DATA_URI = (
     "data:image/png;base64," + base64.b64encode(AVATAR_PNG_BYTES).decode()
 )
+# Contract 1.68 §4.61 safety-number faces: the fixture identity's peer — the
+# contacted number the integration test's conversation row resolves to (the
+# link-time contacts sync materializes the same number into the store), so
+# listIdentities keyed by it answers the identity record and trust keyed by
+# it records the write.
+FIXTURE_PEER_NUMBER = "+15555550103"
 
 
 def argument_value(name):
@@ -925,6 +931,50 @@ for line in sys.stdin:
         # integration-proven on the sibling faces (getStickerPackSyncs
         # precedent).
         result = {"blocked": list(BLOCKED_STATE)}
+    elif method == "listIdentities":
+        # Contract 1.68 §4.61 safety-number read: the pinned face answers a
+        # JSON array of JsonIdentity records. Read face, no SEND_LOG dispatch
+        # recording (read-lane discipline, listContacts precedent). The
+        # number param keys the read; the fixture answers the contacted
+        # peer's identity record (the contacts fixture's number) or an empty
+        # array for any other recipient — the honest no-identity-yet state
+        # (never exchanged messages).
+        number = params.get("number")
+        if number == FIXTURE_PEER_NUMBER:
+            result = [{
+                "number": FIXTURE_PEER_NUMBER,
+                "uuid": "99999999-9999-9999-9999-999999999999",
+                "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "safetyNumber": "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890",
+                "scannableSafetyNumber": "AQIDBAUGBwgJCgsMDQ4PEA==",
+                "trustLevel": "TRUSTED_UNVERIFIED",
+                "addedTimestamp": 1727000000000,
+            }]
+        else:
+            result = []
+    elif method == "trust":
+        # Contract 1.68 §4.61 verify write: record the exact upstream params
+        # (tests assert the resolved recipient + the echoed verification
+        # digits), answer the pinned face's empty success object. The
+        # verifiedSafetyNumber grammar is the upstream's IdentityVerification
+        # Code.parse: the fixture mirrors only the digits-stripped 60-digit
+        # form — anything else is the upstream's definite UserError (-1), the
+        # honest mismatch face. No crash sentinel: the trust outcome is
+        # deterministic upstream (parse-or-apply), the unknown-outcome drill
+        # is carried by the sibling mutating faces (25/29/30/31/32/33).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        digits = (params.get("verifiedSafetyNumber") or "").replace(" ", "")
+        if digits != "123456789012345678901234567890123456789012345678901234567890":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "User input error (UserErrorException)"},
+            }
+            emit_json(response)
+            continue
+        result = {}
     elif method == "getAvatar":
         # Contract 1.48 §4.47 avatar download: read face, no SEND_LOG
         # dispatch recording (read-lane discipline, listContacts precedent).

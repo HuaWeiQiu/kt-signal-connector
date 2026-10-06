@@ -6715,6 +6715,263 @@ async fn account_settings_and_blocked_faces_round_trip() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.68: the §4.61 safety-number faces — identities.get
+/// (the pinned listIdentities read narrowed to the resolved peer reference,
+/// the honest empty-list no-identity face) and identities.verify (the pinned
+/// trust verifiedSafetyNumber write with the exact upstream params on the
+/// dispatch log, the digits-mismatch UserError folding to the plain upstream
+/// family, and the 1:1 fail-closed ladder).
+#[tokio::test]
+async fn safety_number_faces_round_trip_and_gate_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [44_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-SafetyNumber" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // Address a fresh direct conversation (the established sendText ladder);
+    // the fixture identity's peer is the same number the contacts sync
+    // materialized.
+    let sent = request(
+        &mut client,
+        "send-peer",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Safety Peer",
+            "text": "open the safety number face",
+            "clientRequestId": "safety-peer-send"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Read: the pinned JsonIdentity record projects verbatim.
+    let identity = request(
+        &mut client,
+        "identity-get",
+        "identities.get",
+        json!({ "accountId": account_id, "conversationId": conversation_id }),
+    )
+    .await;
+    let row = &identity["result"]["identity"];
+    assert_eq!(row["number"], "+15555550103");
+    assert_eq!(row["uuid"], "99999999-9999-9999-9999-999999999999");
+    assert_eq!(row["trustLevel"], "TRUSTED_UNVERIFIED");
+    assert_eq!(
+        row["safetyNumber"],
+        "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890"
+    );
+    assert_eq!(row["scannableSafetyNumber"], "AQIDBAUGBwgJCgsMDQ4PEA==");
+    assert_eq!(row["addedTimestamp"], 1727000000000_u64);
+
+    // Read dispatch shape: the connector narrowed the pinned read to the
+    // resolved peer reference (read faces are not dispatch-recorded, so the
+    // params shape is integration-proven on the verify write below and the
+    // projection above).
+
+    // Verify write: the echoed digits ride `recipient` + `verifiedSafetyNumber`.
+    let verified = request(
+        &mut client,
+        "identity-verify",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "safetyNumber": "12345 67890 12345 67890 12345 67890 12345 67890 12345 67890 12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(verified["result"]["status"], "verified");
+    let trust_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("verifiedSafetyNumber").is_some())
+        .collect();
+    assert_eq!(trust_calls.len(), 1, "{trust_calls:?}");
+    assert_eq!(trust_calls[0]["account"], "+15555550100");
+    assert_eq!(trust_calls[0]["recipient"], "+15555550103");
+    assert!(trust_calls[0].get("trustAllKnownKeys").is_none());
+
+    // Digits mismatch: the upstream's definite UserError folds into the
+    // plain upstream family (no per-failure ladder to honest-map), and the
+    // failed write is not retried.
+    let mismatch = request(
+        &mut client,
+        "identity-verify-mismatch",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "safetyNumber": "99999 99999"
+        }),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(
+        send_log()
+            .into_iter()
+            .filter(|params| params.get("verifiedSafetyNumber").is_some())
+            .count(),
+        2,
+        "a definite trust failure is never retried"
+    );
+
+    // The 1:1 gate: a group conversation fails closed before any upstream
+    // call, on both faces.
+    let group_sent = request(
+        &mut client,
+        "group-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "group",
+            "peerKey": "ZmFrZS1ncm91cC0x",
+            "peerTitle": "Safety Group",
+            "text": "group face",
+            "clientRequestId": "safety-group-send"
+        }),
+    )
+    .await;
+    let group_conversation_id = group_sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let group_read = request(
+        &mut client,
+        "identity-group-read",
+        "identities.get",
+        json!({ "accountId": account_id, "conversationId": group_conversation_id }),
+    )
+    .await;
+    assert_eq!(group_read["error"]["code"], "INVALID_REQUEST");
+    let group_verify = request(
+        &mut client,
+        "identity-group-verify",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation_id,
+            "safetyNumber": "12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(group_verify["error"]["code"], "INVALID_REQUEST");
+
+    // Params-shape ladder: missing fields, an over-bound safety number, an
+    // unknown key.
+    for (request_id, method, params) in [
+        (
+            "identity-missing-conversation",
+            "identities.get",
+            json!({ "accountId": account_id }),
+        ),
+        (
+            "verify-missing-digits",
+            "identities.verify",
+            json!({ "accountId": account_id, "conversationId": conversation_id }),
+        ),
+        (
+            "verify-over-bound-digits",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "safetyNumber": "1".repeat(257)
+            }),
+        ),
+        (
+            "verify-unknown-key",
+            "identities.verify",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "safetyNumber": "12345 67890",
+                "trustAllKnownKeys": true
+            }),
+        ),
+    ] {
+        let rejected = request(&mut client, request_id, method, params).await;
+        assert_eq!(
+            rejected["error"]["code"], "INVALID_REQUEST",
+            "{request_id}: {rejected:?}"
+        );
+    }
+
+    // Unknown conversation answers CONVERSATION_NOT_FOUND (resolution before
+    // any upstream call) on both faces.
+    let unknown_conversation = request(
+        &mut client,
+        "identity-unknown-conversation",
+        "identities.get",
+        json!({ "accountId": account_id, "conversationId": "no-such-conversation" }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"],
+        "CONVERSATION_NOT_FOUND"
+    );
+    let unknown_conversation = request(
+        &mut client,
+        "verify-unknown-conversation",
+        "identities.verify",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "safetyNumber": "12345 67890"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"],
+        "CONVERSATION_NOT_FOUND"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.59: the §4.55 username faces — accounts.setUsername
 /// (the updateAccount write with the upstream write-back projection, the
 /// InvalidUsernameException face via the -1 sentinel, the crash-with-

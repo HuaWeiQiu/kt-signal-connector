@@ -272,6 +272,24 @@ pub const METHODS: &[MethodRow] = &[
     // sees one method and one outcome.
     ("conversations.acceptRequest", Lane::Send, true, "send"),
     ("conversations.declineRequest", Lane::Send, true, "send"),
+    // Safety-number read (contract revision 1.68, §4.61): the pinned
+    // upstream's native `listIdentities` JSON-RPC read (0.14.8
+    // jsonrpc.rs:121-126; ListIdentitiesCommand.java:23 — a
+    // JsonRpcLocalCommand, so the JSON-RPC projection is native) — one
+    // bounded read keyed by the resolved peer reference, no mutation, no
+    // local persistence; advertised through `safety-number`.
+    ("identities.get", Lane::Read, false, "read"),
+    // Safety-number verify write (contract revision 1.68, §4.61): the
+    // pinned upstream's native `trust` JSON-RPC face (0.14.8
+    // jsonrpc.rs:374-381) in its verifiedSafetyNumber form — the official
+    // desktop's "Mark as verified" semantic (the digits the user just
+    // compared travel back as the confirmation). Mutating, send-lane
+    // upstream traffic — the reaction class verbatim, same-account mutex
+    // and delete barrier included; the testing-only trustAllKnownKeys mode
+    // is never sent. The official toggle's clear-verification half has no
+    // pinned JSON-RPC projection and stays out of the contract. Zero local
+    // writes: trust level converges through the next `identities.get`.
+    ("identities.verify", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -356,10 +374,15 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// group-invites face (`groups.get` `pendingMembers` read half +
 /// `groups.revokeInvites` write half) — one capability for one protocol
 /// action's read and write halves, the 1.53-appendix discipline the 1.62
-/// read face recorded. They never join [`METHOD_NAMES`]: the schema
-/// request-frame method enum and the dispatch table describe real methods
-/// only — desktops gate a new surface on its tag so an old connector answers
-/// a clean capability gap instead of `METHOD_NOT_ALLOWED`.
+/// read face recorded; and `safety-number` (contract revision 1.68) marks
+/// the §4.61 safety-number faces (`identities.get` read over the pinned
+/// upstream's native `listIdentities` projection plus the `identities.verify`
+/// write over its native `trust` verifiedSafetyNumber form — one capability,
+/// read and write halves together, the 1.53 appendix discipline). They never
+/// join [`METHOD_NAMES`]: the schema request-frame method enum and the
+/// dispatch table describe real methods only — desktops gate a new surface on
+/// its tag so an old connector answers a clean capability gap instead of
+/// `METHOD_NOT_ALLOWED`.
 /// `METHOD_NOT_ALLOWED`.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
@@ -384,6 +407,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "attachment-download",
     "username",
     "message-requests",
+    "safety-number",
 ];
 
 #[cfg(test)]
@@ -420,6 +444,7 @@ mod tests {
             "calls.getState",
             "accounts.getUsername",
             "username.lookup",
+            "identities.get",
         ];
         let send_lane = [
             "messages.sendText",
@@ -459,6 +484,7 @@ mod tests {
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",
+            "identities.verify",
         ];
         let mutating = [
             "messages.sendText",
@@ -500,6 +526,7 @@ mod tests {
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",
+            "identities.verify",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

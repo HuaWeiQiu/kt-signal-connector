@@ -64,6 +64,14 @@ pub const MAX_STICKER_IMAGE_BASE64_CHARS: usize = 4 * MAX_STICKER_IMAGE_BYTES.di
 /// explicit cap) so one response frame stays bounded.
 pub const MAX_PIN_CONVERSATION_ID_CHARS: usize = 256;
 pub const MAX_PINNED_CONVERSATIONS: usize = 128;
+/// Safety-number faces (contract revision 1.68, §4.61): the caller-echoed
+/// verification string bound. The pinned upstream parses spaced 60-digit
+/// groups (71 chars), 66-char hex fingerprints, or base64 scannable
+/// payloads (IdentityVerificationCode.java:20-32); 256 keeps one wire frame
+/// bounded while every legitimate pinned form fits with room to spare. The
+/// connector enforces only the bound — the grammar itself is the upstream's
+/// definite UserError, never a local re-derivation.
+pub const IDENTITY_SAFETY_NUMBER_MAX_CHARS: usize = 256;
 /// Sticker pack sync bounds (contract revision 1.37, §4.34): the pack key
 /// when present is the §4.32 browse shape — exactly 32 bytes, whose padded
 /// standard-base64 encoding is exactly 44 characters — and the returned pack
@@ -3005,6 +3013,115 @@ impl ConnectorService {
                 false,
             ))),
         }
+    }
+
+    /// identities.get / identities.verify (contract revision 1.68, §4.61):
+    /// bounds and resolution — the §4.47/§4.56 ladder verbatim, gated to the
+    /// 1:1 shape. Identity keys are a per-contact concept (the official
+    /// desktop gates the details row on `!isGroup`, ConversationDetails.dom
+    /// .tsx:654), so group/legacy rows fail closed before any upstream call;
+    /// the §4.42 self row (empty peer reference) fails closed the same way.
+    /// The upstream key is the resolved peer reference verbatim — the pinned
+    /// `listIdentities`/`trust` recipient parameter accepts a phone number,
+    /// ACI UUID, `PNI:` or `u:` username form (RecipientIdentifier.java:26-49),
+    /// which is exactly the peer_key shape taxonomy, so the connector passes
+    /// it through and never re-classifies.
+    fn prepare_identities_face(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(Value, String), ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        match conversation.kind.as_str() {
+            "direct" => {
+                if conversation.peer_key.is_empty() {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "this conversation has no upstream address",
+                        false,
+                    )));
+                }
+                Ok((
+                    json!({ "account": account.signal_account }),
+                    conversation.peer_key,
+                ))
+            }
+            "group" | "legacyGroup" => Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "safety numbers are a 1:1 conversation face",
+                false,
+            ))),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "unsupported conversation kind",
+                false,
+            ))),
+        }
+    }
+
+    /// identities.get (contract revision 1.68, §4.61, capability
+    /// safety-number): the prepared pinned `listIdentities` call — the
+    /// upstream reads one identity when the recipient parameter is present,
+    /// so the connector narrows the read to the resolved peer reference and
+    /// never requests the account-wide list.
+    pub fn prepare_identities_get(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, ServiceError> {
+        let (mut upstream, peer_key) = self.prepare_identities_face(account_id, conversation_id)?;
+        if let Some(map) = upstream.as_object_mut() {
+            map.insert("number".to_string(), Value::String(peer_key));
+        }
+        Ok(upstream)
+    }
+
+    /// identities.verify (contract revision 1.68, §4.61, capability
+    /// safety-number): the prepared pinned `trust` call in its
+    /// `verifiedSafetyNumber` form — the safety number string is the exact
+    /// digits the desktop just displayed (the official verify semantics:
+    /// only use this option if you have verified the safety number,
+    /// TrustCommand.java:37). The upstream parses spaced 60-digit groups,
+    /// 66-char hex fingerprints, or base64 scannable payloads
+    /// (IdentityVerificationCode.java:20-32); the connector enforces only
+    /// the wire bound and never invents a second grammar — a malformed
+    /// string is the upstream's definite UserError, not a local guess.
+    /// The testing-only `trustAllKnownKeys` mode is never sent.
+    pub fn prepare_identities_verify(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        safety_number: &str,
+    ) -> Result<Value, ServiceError> {
+        if safety_number.is_empty()
+            || safety_number.chars().count() > IDENTITY_SAFETY_NUMBER_MAX_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "safetyNumber must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let (mut upstream, peer_key) = self.prepare_identities_face(account_id, conversation_id)?;
+        if let Some(map) = upstream.as_object_mut() {
+            map.insert("recipient".to_string(), Value::String(peer_key));
+            map.insert(
+                "verifiedSafetyNumber".to_string(),
+                Value::String(safety_number.to_string()),
+            );
+        }
+        Ok(upstream)
     }
 
     /// calls.sendSignal (contract revision 1.53, §4.49): the shape gate plus
@@ -6576,6 +6693,75 @@ pub struct MessageRequestParams {
     pub conversation_id: String,
 }
 
+/// `identities.get` params (contract revision 1.68, §4.61): the same
+/// addressing pair as the §4.47/§4.56 faces — the identity is addressed by
+/// the conversation it belongs to, the way the official details row does.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdentitiesGetParams {
+    pub account_id: String,
+    pub conversation_id: String,
+}
+
+/// `identities.verify` params (contract revision 1.68, §4.61): the
+/// addressing pair plus the safety number string exactly as the desktop
+/// displayed it (spaced 60-digit groups on the modern face) — the digits
+/// travel back as the verification confirmation, the official
+/// "Mark as verified" semantics. The wire bound mirrors
+/// `IDENTITY_SAFETY_NUMBER_MAX_CHARS`; the grammar is the upstream's.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IdentitiesVerifyParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub safety_number: String,
+}
+
+/// One projected identity row (contract revision 1.68, §4.61): the pinned
+/// upstream `JsonIdentity` fields verbatim (ListIdentitiesCommand.java:88-96)
+/// — the formatted safety number string (12 spaced 5-digit groups,
+/// Util.java:52-67), the hex fingerprint, the base64 scannable payload when
+/// the upstream supplied one, the three-value trust level
+/// (UNTRUSTED | TRUSTED_UNVERIFIED | TRUSTED_VERIFIED, TrustLevel.java:5-8),
+/// and the add timestamp. `number`/`uuid` are optional exactly as the pinned
+/// shape declares: a UUID-only identity row carries a null number and the
+/// reverse. The desktop derives the official `isVerified` presentation as
+/// `trustLevel === 'TRUSTED_VERIFIED'`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    pub fingerprint: String,
+    pub safety_number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scannable_safety_number: Option<String>,
+    pub trust_level: String,
+    pub added_timestamp: u64,
+}
+
+/// The `identities.get` result (contract revision 1.68, §4.61): the first
+/// projected identity row, or `identity: null` when the pinned upstream
+/// answered an empty list — the honest no-identity-yet state (the official
+/// desktop's SafetyNumberNotReady face; never folded into an error).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityRead {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityView>,
+}
+
+/// The §4.61 result face of `identities.verify`: `{status}` — the pinned
+/// upstream `trust` answers an empty result object on success (the command
+/// writes no JSON output, TrustCommand.handleCommand), so the outcome verb
+/// is the honest whole of what the connector knows.
+#[derive(Debug, serde::Serialize)]
+pub struct IdentityVerifyOutcome {
+    pub status: &'static str,
+}
+
 /// The §4.56 result face: `{status}` — the pinned upstream's
 /// `sendMessageRequestResponse` answers an empty result object on success,
 /// so the outcome verb is the honest whole of what the connector knows.
@@ -7679,6 +7865,62 @@ pub(crate) fn blocked_conversations_result(entries: &[Value]) -> BlockedConversa
         })
         .collect();
     BlockedConversations { blocked }
+}
+
+/// Project the engine's `listIdentities` answer onto the wire shape (contract
+/// revision 1.68, §4.61): the pinned upstream writes one JSON array of
+/// `JsonIdentity` records (ListIdentitiesCommand.java:68-84); the read is
+/// narrowed to one recipient upstream, so the first record is the whole
+/// answer and an empty array is the honest `identity: null` (the official
+/// SafetyNumberNotReady face — a state, not an error). Fields the pinned
+/// record declares nullable (`number`, `uuid`, `scannableSafetyNumber`)
+/// pass through as absent; a record missing its non-nullable identity core
+/// (fingerprint, safetyNumber, trustLevel, addedTimestamp) is a protocol
+/// defect, not a no-identity answer.
+pub(crate) fn identity_from_engine(result: &Value) -> Result<IdentityRead, ServiceError> {
+    let empty: [Value; 0] = [];
+    let entries = result
+        .as_array()
+        .map_or(&empty[..], |array| array.as_slice());
+    let Some(entry) = entries.first() else {
+        return Ok(IdentityRead { identity: None });
+    };
+    let fingerprint = entry
+        .get("fingerprint")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let safety_number = entry
+        .get("safetyNumber")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let trust_level = entry
+        .get("trustLevel")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let added_timestamp = entry
+        .get("addedTimestamp")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(IdentityRead {
+        identity: Some(IdentityView {
+            number: entry
+                .get("number")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            uuid: entry
+                .get("uuid")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            fingerprint: fingerprint.to_string(),
+            safety_number: safety_number.to_string(),
+            scannable_safety_number: entry
+                .get("scannableSafetyNumber")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            trust_level: trust_level.to_string(),
+            added_timestamp,
+        }),
+    })
 }
 
 /// `accounts.setProfile` avatar gate (contract revision 1.46, §4.45): the
@@ -12562,6 +12804,169 @@ mod tests {
             .unwrap();
         assert_eq!(upstream["groupId"], "abc123GROUP");
         assert!(upstream.get("recipient").is_none());
+    }
+
+    /// The safety-number faces (contract revision 1.68, §4.61): the read
+    /// narrows the pinned listIdentities call to the resolved peer reference
+    /// (`number` key); the verify carries it as `recipient` beside the echoed
+    /// verification digits (`verifiedSafetyNumber` — never the testing-only
+    /// trustAllKnownKeys mode). The 1:1 gate fails group/legacy rows and the
+    /// §4.42 self row (empty peer reference) closed before any upstream call;
+    /// bounds and resolution fail closed in wire order.
+    #[test]
+    fn prepare_identity_faces_gate_one_to_one_and_forward_peer_reference() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        // Read: the peer reference rides the upstream `number` key verbatim.
+        let upstream = service
+            .prepare_identities_get(&account.id, &conversation.id)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["number"], conversation.peer_key);
+
+        // Verify: the same reference as `recipient` plus the echoed digits;
+        // trustAllKnownKeys is never part of the payload.
+        let upstream = service
+            .prepare_identities_verify(&account.id, &conversation.id, "12345 67890")
+            .unwrap();
+        assert_eq!(upstream["recipient"], conversation.peer_key);
+        assert_eq!(upstream["verifiedSafetyNumber"], "12345 67890");
+        assert!(upstream.get("trustAllKnownKeys").is_none());
+
+        // The verification string bound fails closed before any upstream
+        // resolution (empty, and one past the 256-char wire bound).
+        for (request_id, safety_number) in [
+            ("empty-digits", ""),
+            ("over-bound-digits", &"1".repeat(257)[..]),
+        ] {
+            let error = service
+                .prepare_identities_verify(&account.id, &conversation.id, safety_number)
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{request_id}");
+        }
+
+        // Group and legacy rows are the 1:1 gate's fail-closed face (the
+        // official details row gates on !isGroup); the §4.42 self row's empty
+        // peer reference fails closed the same way.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "abc123GROUP", "Group")
+            .unwrap();
+        let error = service
+            .prepare_identities_get(&account.id, &group.id)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let legacy = service
+            .store_ref()
+            .ensure_conversation(&account.id, "legacyGroup", "abc123LEGACY", "Legacy")
+            .unwrap();
+        let error = service
+            .prepare_identities_verify(&account.id, &legacy.id, "12345 67890")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let self_row = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "", "Note to Self")
+            .unwrap();
+        let error = service
+            .prepare_identities_get(&account.id, &self_row.id)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // Bounds and resolution fail closed in wire order (shared ladder).
+        for (request_id, account_id, conversation_id, expected) in [
+            (
+                "empty-conversation",
+                account.id.as_str(),
+                "",
+                "INVALID_REQUEST",
+            ),
+            (
+                "unknown-account",
+                "no-such-account",
+                "conv",
+                "ACCOUNT_NOT_FOUND",
+            ),
+            (
+                "unknown-conversation",
+                account.id.as_str(),
+                "no-such-conversation",
+                "CONVERSATION_NOT_FOUND",
+            ),
+        ] {
+            let error = service
+                .prepare_identities_get(account_id, conversation_id)
+                .unwrap_err();
+            assert_eq!(error.into_api().code, expected, "{request_id}");
+        }
+    }
+
+    /// The safety-number read projection (contract revision 1.68, §4.61):
+    /// the pinned JsonIdentity fields pass through verbatim with the nullable
+    /// trio (number/uuid/scannableSafetyNumber) optional; an empty upstream
+    /// array is the honest `identity: null` (never an error); a record
+    /// missing its non-nullable core is a protocol defect, not a no-identity
+    /// answer.
+    #[test]
+    fn identity_projection_maps_pinned_record_and_empty_list() {
+        // Full record: every field round-trips, camelCase on the wire.
+        let read = identity_from_engine(&json!([{
+            "number": "+15555550103",
+            "uuid": "99999999-9999-9999-9999-999999999999",
+            "fingerprint": "ab".repeat(32),
+            "safetyNumber": "12345 67890",
+            "scannableSafetyNumber": "AQIDBAUGBwgJCgsMDQ4PEA==",
+            "trustLevel": "TRUSTED_VERIFIED",
+            "addedTimestamp": 1727000000000_u64,
+        }]))
+        .unwrap();
+        let identity = read.identity.as_ref().unwrap();
+        assert_eq!(identity.number.as_deref(), Some("+15555550103"));
+        assert_eq!(identity.trust_level, "TRUSTED_VERIFIED");
+        assert_eq!(identity.added_timestamp, 1727000000000);
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(wire["identity"]["safetyNumber"], "12345 67890");
+        assert_eq!(wire["identity"]["trustLevel"], "TRUSTED_VERIFIED");
+        assert_eq!(
+            wire["identity"]["scannableSafetyNumber"],
+            "AQIDBAUGBwgJCgsMDQ4PEA=="
+        );
+
+        // Nullable trio: a UUID-only record carries no number key on the
+        // wire; a record without the scannable payload omits the key.
+        let read = identity_from_engine(&json!([{
+            "number": serde_json::Value::Null,
+            "uuid": "99999999-9999-9999-9999-999999999999",
+            "fingerprint": "ab".repeat(32),
+            "safetyNumber": "12345 67890",
+            "scannableSafetyNumber": serde_json::Value::Null,
+            "trustLevel": "TRUSTED_UNVERIFIED",
+            "addedTimestamp": 1727000000000_u64,
+        }]))
+        .unwrap();
+        let wire = serde_json::to_value(&read).unwrap();
+        assert!(wire["identity"].get("number").is_none());
+        assert!(wire["identity"].get("scannableSafetyNumber").is_none());
+        assert_eq!(
+            wire["identity"]["uuid"],
+            "99999999-9999-9999-9999-999999999999"
+        );
+
+        // Empty list: the honest no-identity-yet state.
+        let read = identity_from_engine(&json!([])).unwrap();
+        assert!(read.identity.is_none());
+        let wire = serde_json::to_value(&read).unwrap();
+        assert!(wire.get("identity").is_none());
+
+        // Malformed record: the non-nullable core missing is a protocol
+        // defect, folded by the caller into the structured upstream family.
+        let error = identity_from_engine(&json!([{
+            "number": "+15555550103",
+            "fingerprint": "ab".repeat(32),
+        }]))
+        .unwrap_err();
+        assert!(matches!(error, ServiceError::Engine(EngineError::Protocol)));
     }
 
     /// The avatar result projection (contract revision 1.48, §4.47):

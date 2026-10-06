@@ -59,6 +59,8 @@
             "conversations.setBlocked",
             "conversations.acceptRequest",
             "conversations.declineRequest",
+            "identities.get",
+            "identities.verify",
             "conversations.setExpireTimer",
             "messages.list",
             "messages.search",
@@ -328,6 +330,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messageRequestParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "identities.get" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/identitiesGetParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "identities.verify" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/identitiesVerifyParams" }
             }
           }
         },
@@ -1826,6 +1850,42 @@
           "minLength": 1,
           "maxLength": 256,
           "description": "The conversation whose request is being answered; resolved against the account before any upstream call."
+        }
+      }
+    },
+    "identitiesGetParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Read one 1:1 conversation's identity safety number (contract revision 1.68, §4.61, capability safety-number): the host method rides the pinned upstream's native listIdentities JSON-RPC read (jsonrpc.rs:121-126 — a JsonRpcLocalCommand, so the JSON-RPC projection is native; ListIdentitiesCommand.java:23) narrowed to the resolved peer reference — the upstream recipient parameter accepts the phone number / ACI UUID / PNI: / u: username forms (RecipientIdentifier.java:26-49), which is the connector peer_key shape taxonomy, so the reference forwards verbatim. The result is {identity} — the pinned JsonIdentity fields verbatim (number?, uuid?, hex fingerprint, formatted safety number = 12 spaced 5-digit groups (Util.java:52-67), base64 scannable payload?, three-value trustLevel UNTRUSTED|TRUSTED_UNVERIFIED|TRUSTED_VERIFIED (TrustLevel.java:5-8), addedTimestamp) — or identity: null when the upstream answered an empty list, the honest no-identity-yet state (the official desktop's SafetyNumberNotReady face; a state, never an error). The desktop derives the official isVerified presentation as trustLevel === 'TRUSTED_VERIFIED'. Read lane, no mutation, zero local persistence.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The 1:1 conversation whose identity is being read; resolved against the account before any upstream call. Group and legacy-group rows fail closed INVALID_REQUEST before any upstream call (identity keys are a per-contact concept — the official details row gates on !isGroup, ConversationDetails.dom.tsx:654), and so does the §4.42 self row (no peer reference)."
+        }
+      }
+    },
+    "identitiesVerifyParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "safetyNumber"],
+      "description": "Mark one 1:1 conversation's identity as verified (contract revision 1.68, §4.61, capability safety-number): the host method rides the pinned upstream's native trust JSON-RPC face (jsonrpc.rs:374-381) in its verifiedSafetyNumber form — the official desktop's 'Mark as verified' semantic, the digits the user just compared travelling back as the verification confirmation (TrustCommand.java:37 'only use this option if you have verified the safety number'). The upstream parses spaced 60-digit groups, 66-char hex fingerprints, or base64 scannable payloads (IdentityVerificationCode.java:20-32); the connector enforces only the wire bound and never invents a second grammar — a malformed string is the upstream's definite UserError, folded into the plain UPSTREAM_ERROR family. The testing-only trustAllKnownKeys mode is never sent. The official toggle's clear-verification half (toggleVerified → setVerifiedDefault, conversations.preload.ts:3323-3328) has no pinned JSON-RPC projection and stays out of the contract — the desktop renders the verified state and no clear action. The pinned face answers an empty result object on success, so the result face is {status: 'verified'}; the refreshed trust level converges through the next identities.get. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried (the trust write may already have landed). Zero local writes.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The 1:1 conversation whose identity is being verified; the same §4.61 resolution ladder as identities.get (group/legacy/self fail closed before any upstream call)."
+        },
+        "safetyNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The safety number string exactly as the desktop displayed it — the spaced 60-digit groups on the modern face. Verified verbatim by the pinned upstream's IdentityVerificationCode.parse; a mismatch answers the upstream UserError (the digits are wrong), never a silent success."
         }
       }
     },

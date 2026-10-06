@@ -35,9 +35,9 @@ use crate::service::{
     ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
     GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams,
     GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
-    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessageGetTextParams, MessageRequestParams,
-    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessageRequestParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
     MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
     MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
     MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
@@ -1715,6 +1715,34 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                         "invalid conversations.declineRequest params",
                         false,
                     ),
+                ),
+            }
+        }
+        "identities.get" => match serde_json::from_value::<IdentitiesGetParams>(request.params) {
+            Ok(params) => match runtime.get_identity(params).await {
+                Ok(identity) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(identity).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid identities.get params", false),
+            ),
+        },
+        "identities.verify" => {
+            match serde_json::from_value::<IdentitiesVerifyParams>(request.params) {
+                Ok(params) => match runtime.verify_identity(params).await {
+                    Ok(outcome) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(outcome).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid identities.verify params", false),
                 ),
             }
         }
