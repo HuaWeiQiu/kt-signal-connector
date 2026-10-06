@@ -13,7 +13,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS messages (
   quote_snapshot TEXT,
   attachments_json TEXT,
   attachment_locators TEXT,
+  live_attachment_locators TEXT,
   rich_json TEXT,
   sticker_json TEXT,
   expire_seconds INTEGER,
@@ -470,7 +471,7 @@ pub struct ConversationSummary {
     /// self. The row's title stays raw contact material (the account's own
     /// profile name); the desktop localizes the presentation from this flag.
     pub is_self: bool,
-    /// Contract 1.60 (§4.52): the group row's termination flag as the last
+    /// Contract 1.60 (§4.54): the group row's termination flag as the last
     /// contacts sync captured it (the §4.50 appendix `group_extra_json`
     /// marker). True only for a `kind='group'` conversation whose contacts
     /// row stores the flag — the flag lives in the cache row, never on the
@@ -531,7 +532,7 @@ fn contact_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> 
     kind == "contact" && peer_key_is_self(peer_key, signal_account)
 }
 
-/// Contract 1.60 (§4.52): the termination flag a contacts-cache row carries —
+/// Contract 1.60 (§4.54): the termination flag a contacts-cache row carries —
 /// read out of the §4.50 appendix `group_extra_json` marker (stored only when
 /// true) at projection time. Direct rows have no group marker and every
 /// pre-1.53 sync row predates the key: both answer false, the same default
@@ -545,7 +546,7 @@ fn extra_is_terminated(extra: Option<&str>) -> bool {
         == Some(true)
 }
 
-/// Contract 1.60 (§4.52): the ids of the contacts-cache group rows whose last
+/// Contract 1.60 (§4.54): the ids of the contacts-cache group rows whose last
 /// sync captured the terminated flag. Read at projection time over the
 /// caller's already-held connection guard (the store mutex is never
 /// re-entrant); the scanned set is the whole group-kind contacts cache of the
@@ -786,7 +787,7 @@ pub struct ContactSummary {
     /// row's title stays raw contact material (the account's own profile
     /// name); the desktop localizes the presentation from this flag.
     pub is_self: bool,
-    /// Contract 1.60 (§4.52): the row's own termination flag for
+    /// Contract 1.60 (§4.54): the row's own termination flag for
     /// `kind='group'` rows — the §4.50 appendix `group_extra_json` marker the
     /// sync captured, projected at read time. Direct contact rows and every
     /// pre-1.53 sync row answer false. Collapsed to an absent key when false
@@ -1627,7 +1628,7 @@ impl Store {
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
                         is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
-                        // Contract 1.60 (§4.52): stamped from the contacts
+                        // Contract 1.60 (§4.54): stamped from the contacts
                         // cache after the row maps (page lookup / single-row
                         // query below).
                         is_terminated: false,
@@ -1655,7 +1656,7 @@ impl Store {
         } else {
             None
         };
-        // Contract 1.60 (§4.52): group termination flags ride the summaries —
+        // Contract 1.60 (§4.54): group termination flags ride the summaries —
         // one bounded lookup against the contacts cache over the already-held
         // connection guard (the flag lives in the `group_extra_json` marker
         // the sync captured; §4.50 appendix). For a group the conversation
@@ -1936,9 +1937,10 @@ impl Store {
                 "INSERT OR IGNORE INTO messages(
                     id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
-                    quote_message_id, quote_snapshot, attachments_json, rich_json, edited_at, sender_name,
+                    quote_message_id, quote_snapshot, attachments_json, live_attachment_locators,
+                    rich_json, edited_at, sender_name,
                     mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?18, ?17, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
                 params![
                     message.id,
                     message.account_id,
@@ -1960,6 +1962,21 @@ impl Store {
                         .map(|quote| serde_json::to_string(quote).expect("quote snapshot json")),
                     (!message.attachments.is_empty()).then(|| {
                         serde_json::to_string(&message.attachments).expect("attachments json")
+                    }),
+                    // The receive envelope's transit pointer faces (contract
+                    // 1.61), index-aligned with `attachments_json`; the
+                    // host-facing descriptor stays byte-identical (v1 shape).
+                    // An engine without the projection stores all-None faces
+                    // (indistinguishable from NULL on the read face).
+                    (!message.attachments.is_empty()).then(|| {
+                        serde_json::to_string(
+                            &message
+                                .attachments
+                                .iter()
+                                .map(|descriptor| descriptor.locator.clone().unwrap_or_default())
+                                .collect::<Vec<_>>(),
+                        )
+                        .expect("live attachment locators json")
                     }),
                     message.edited_at.map(|v| v as i64),
                     message
@@ -2911,14 +2928,36 @@ impl Store {
         account_id: &str,
         message_id: &str,
     ) -> Result<Vec<HistoryAttachmentLocator>, StoreError> {
+        self.message_attachment_locators_column(account_id, message_id, "attachment_locators")
+    }
+
+    /// The live-receive locator faces of one message row (contract revision
+    /// 1.61, §4.54): the schema-19 `live_attachment_locators` column, the
+    /// receive-envelope twin of [`Self::history_attachment_locators`]. Same
+    /// read discipline: NULL / pre-19 row answers empty; a malformed cell is
+    /// `Unavailable` (failing closed beats failing wrong on key material).
+    pub fn live_attachment_locators(
+        &self,
+        account_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<HistoryAttachmentLocator>, StoreError> {
+        self.message_attachment_locators_column(account_id, message_id, "live_attachment_locators")
+    }
+
+    /// Shared single-column reader behind both locator faces.
+    fn message_attachment_locators_column(
+        &self,
+        account_id: &str,
+        message_id: &str,
+        column: &str,
+    ) -> Result<Vec<HistoryAttachmentLocator>, StoreError> {
+        // The column name is a call-site literal, never caller input.
+        let sql = format!("SELECT {column} FROM messages WHERE account_id=?1 AND id=?2");
         let cell: Option<String> = self
             .lock_conn()?
-            .query_row(
-                "SELECT attachment_locators FROM messages
-                 WHERE account_id=?1 AND id=?2",
-                params![account_id, message_id],
-                |row| row.get::<_, Option<String>>(0),
-            )
+            .query_row(&sql, params![account_id, message_id], |row| {
+                row.get::<_, Option<String>>(0)
+            })
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?
             .flatten();
@@ -4033,7 +4072,7 @@ impl Store {
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
                         is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
-                        // Contract 1.60 (§4.52): stamped from the contacts
+                        // Contract 1.60 (§4.54): stamped from the contacts
                         // cache after the row maps (page lookup / single-row
                         // query below).
                         is_terminated: false,
@@ -4053,7 +4092,7 @@ impl Store {
                 summary.last_message_reactions = meta.reactions;
                 summary.pinned_message =
                     pinned_message_for_conversation(&conn, account_id, conversation_id)?;
-                // Contract 1.60 (§4.52): the same read-time terminated
+                // Contract 1.60 (§4.54): the same read-time terminated
                 // projection the list applies — the summary that rides
                 // conversation.changed carries the flag, so an event-driven
                 // window and a full reload cannot disagree. For a group the
@@ -5344,6 +5383,25 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 19 {
+        // Contract revision 1.61 (§4.54): live-receive attachment pointer
+        // faces. One additive nullable JSON column — the same ingest face as
+        // the schema-18 import column, captured from the receive envelope
+        // instead of the archive. Today's pinned engines (signal-cli 0.14.8,
+        // the kt-engine receive projection) ship metadata-only envelopes, so
+        // live rows keep NULL until an engine projects the receive locator —
+        // the column then fills without a further migration. Never
+        // backfilled: a past envelope's pointer face (if any) is gone, and
+        // inventing one is impossible. Same internal-only discipline as
+        // schema 18: key material never crosses the host wire.
+        if !table_has_column(conn, "messages", "live_attachment_locators")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN live_attachment_locators TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -6013,7 +6071,7 @@ mod tests {
         );
     }
 
-    /// Contract 1.60 (§4.52): the terminated flag rides the summary and the
+    /// Contract 1.60 (§4.54): the terminated flag rides the summary and the
     /// contacts-row projections from the §4.50 appendix capture — a group
     /// whose cache row stores the flag answers true on the list, the
     /// single-summary (conversation.changed) face, and the contacts row;
@@ -6889,6 +6947,7 @@ mod tests {
             width: Some(512),
             height: Some(512),
             is_voice_note: false,
+            locator: None,
         }];
         sticker_row.sticker = Some(crate::engine::NormalizedSticker {
             pack_id: "abcdef01".into(),
@@ -7257,6 +7316,7 @@ mod tests {
                 width: None,
                 height: None,
                 is_voice_note,
+                locator: None,
             };
         let kind = || {
             store
@@ -10814,6 +10874,7 @@ mod tests {
                 width: Some(64),
                 height: Some(32),
                 is_voice_note: false,
+                locator: None,
             }],
             rich: Some(NormalizedRich {
                 view_once: true,
@@ -11088,6 +11149,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The live locator column round-trips (contract revision 1.61, §4.54):
+    /// a receive envelope's transit faces land index-aligned beside the
+    /// descriptors, a metadata-only envelope lands the all-None faces, and
+    /// both read back through `live_attachment_locators` — the wire
+    /// descriptor stays byte-identical either way.
+    #[test]
+    fn live_locator_column_round_trips_index_aligned() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550105", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550106", "Peer")
+            .unwrap();
+        let descriptor = |id: &str, locator: Option<crate::store::HistoryAttachmentLocator>| {
+            crate::engine::NormalizedAttachment {
+                id: id.into(),
+                content_type: Some("image/jpeg".into()),
+                filename: None,
+                size: Some(2048),
+                width: None,
+                height: None,
+                is_voice_note: false,
+                locator,
+            }
+        };
+        let full_face = crate::store::HistoryAttachmentLocator {
+            key: Some("a2F0LWtleQ==".into()),
+            cdn_key: Some("live-key".into()),
+            cdn_number: Some(3),
+            upload_timestamp: Some(1700000000000),
+            digest: Some("ZGl-nonsense".into()),
+            plaintext_hash: Some("aabb".into()),
+        };
+        let mut with_face = expire_record("m-loc", &account.id, &conversation.id);
+        with_face.attachments = vec![
+            descriptor("att-a", Some(full_face.clone())),
+            // The hole stays index-aligned: a metadata-only sibling keeps its
+            // own all-None face instead of shifting the row.
+            descriptor("att-b", None),
+        ];
+        store
+            .insert_message(&with_face, None, Some("face"), true)
+            .unwrap();
+        let faces = store
+            .live_attachment_locators(&account.id, "m-loc")
+            .unwrap();
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces[0], full_face);
+        assert_eq!(faces[1], crate::store::HistoryAttachmentLocator::default());
+
+        let plain = expire_record("m-plain", &account.id, &conversation.id);
+        store
+            .insert_message(&plain, None, Some("plain"), true)
+            .unwrap();
+        assert!(
+            store
+                .live_attachment_locators(&account.id, "m-plain")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// serverGuid round-trip (contract revision 1.49, §4.48): a live receive

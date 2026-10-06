@@ -596,6 +596,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.history_attachment_download(params).await
     }
 
+    /// attachments.download (contract revision 1.61, §4.54): the pointer
+    /// face and the destination directory live with the account's group, so
+    /// the chain routes through the owning supervisor like every other
+    /// mutating face.
+    pub async fn attachment_download(
+        &self,
+        params: crate::service::AttachmentDownloadParams,
+    ) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.attachment_download(params).await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,

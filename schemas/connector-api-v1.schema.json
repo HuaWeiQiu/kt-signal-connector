@@ -92,6 +92,7 @@
             "history.importStatus",
             "history.importRetry",
             "history.attachmentDownload",
+            "attachments.download",
             "backups.export",
             "backups.exportStatus",
             "backups.exportFile.open",
@@ -688,6 +689,17 @@
               "params": {
                 "$ref": "#/$defs/historyAttachmentDownloadParams"
               }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "attachments.download" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/attachmentDownloadParams" }
             }
           }
         },
@@ -1951,6 +1963,28 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "The attachment id from the message's received metadata (a bare attachment file name; path separators refused)."
+        }
+      }
+    },
+    "attachmentDownloadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accountId",
+        "conversationId",
+        "messageId",
+        "attachmentIndex"
+      ],
+      "description": "Download one message attachment's bytes from the Signal transit CDN (contract revision 1.61, \u00a74.54, capability attachment-download): the on-demand byte channel for message-attachment pills \u2014 the caller names the message and the descriptor's positional index, the connector resolves the row locally and walks the stored pointer face through the official attachv2 pipeline (the same machine as history.attachmentDownload, \u00a74.38 step 3: cdnNumber \u2192 cdn base map with the CDN-0 fallback, encodeURIComponent'd cdnKey path, streamed GET with connect 10 s / total 120 s / no redirects, trailing-MAC HMAC-SHA256 then whole-body SHA-256 digest gates, AES-256-CBC decrypt with the IV-prefixed body and PKCS7, the official log-pad trim, the plaintextHash face). The pointer face resolves through the locator ladder: the live-receive column first (persisted since this revision in the internal live_attachment_locators column when the engine projects a receive locator \u2014 the pinned 0.14.8 signal-cli and the kt-engine receive face project metadata only today, so live rows answer the hole), then the schema-18 import column (the index-aligned archive faces persisted since 1.56). Fail-closed: an index past the descriptor list, or a hole in both locator columns (a descriptor without any pointer face) answers INVALID_REQUEST before any network traffic \u2014 never a guessed download. Download, integrity, and decryption failures answer UPSTREAM_ERROR retryable=false \u2014 terminal, never auto-retried; local filesystem failures answer UPSTREAM_ERROR retryable=true. Already-present files answer {sizeBytes} without touching the CDN (idempotent dedup: an earlier call, or the engine's own live download of the same id). Result {sizeBytes: N} \u2014 the plaintext byte count messages.attachments.open will report; no handle, no path: the bytes stay behind the chunked media triple. Send lane, account-scoped mutating (it lands a file in the governed media directory; the reaction-class write-lane mutex and delete drain barrier serialize it).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageId": { "$ref": "#/$defs/opaqueId" },
+        "attachmentIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31,
+          "description": "The zero-based position of the attachment in the message's received metadata \u2014 the descriptor list order the wire row already carries."
         }
       }
     },

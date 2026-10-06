@@ -784,19 +784,53 @@ impl RuntimeSupervisor {
         &self,
         params: crate::service::HistoryAttachmentDownloadParams,
     ) -> Result<Value, ServiceError> {
-        // The staged, locally-verified inputs: capability gate, id ladder,
-        // descriptor index, pointer face, destination paths. Everything
-        // deterministic answers here, before any network traffic.
-        let prepared = self
-            .service
-            .lock()
-            .await
-            .prepare_history_attachment_download(
+        self.run_attachment_download_chain(|service| {
+            service.prepare_history_attachment_download(
                 &params.account_id,
                 &params.conversation_id,
                 &params.message_id,
                 &params.attachment_id,
-            )?;
+            )
+        })
+        .await
+    }
+
+    /// attachments.download (contract revision 1.61, §4.54): the §4.54
+    /// addressing face onto the same chain as
+    /// [`Self::history_attachment_download`] — the prepare half resolves the
+    /// descriptor positionally and walks the live/import locator ladder, the
+    /// network and crypto halves are the 1.57 machine unchanged. Mutating,
+    /// send lane behind the reaction-class write-lane mutex and delete
+    /// barrier; every download/verify failure terminal; idempotent on an
+    /// already-present file.
+    pub async fn attachment_download(
+        &self,
+        params: crate::service::AttachmentDownloadParams,
+    ) -> Result<Value, ServiceError> {
+        self.run_attachment_download_chain(|service| {
+            service.prepare_attachment_download(
+                &params.account_id,
+                &params.conversation_id,
+                &params.message_id,
+                params.attachment_index,
+            )
+        })
+        .await
+    }
+
+    /// The shared download chain: the deterministic prepare half runs inside
+    /// the service lock, the streaming network half runs on the supervisor
+    /// (§4.38 step 3 machine verbatim).
+    async fn run_attachment_download_chain(
+        &self,
+        prepare: impl FnOnce(
+            &crate::service::ConnectorService,
+        ) -> Result<crate::service::PreparedHistoryDownload, ServiceError>,
+    ) -> Result<Value, ServiceError> {
+        // The staged, locally-verified inputs: capability gate, id ladder,
+        // descriptor index, pointer face, destination paths. Everything
+        // deterministic answers here, before any network traffic.
+        let prepared = prepare(&*self.service.lock().await)?;
         let (locator, descriptor_size, target, temp_path, plaintext_path) = match prepared {
             // Idempotent dedup: the file already exists (an earlier call or
             // the engine's own live download). The measured size is the

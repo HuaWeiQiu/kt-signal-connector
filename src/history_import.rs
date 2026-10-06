@@ -875,6 +875,7 @@ impl<'a> Importer<'a> {
                 height: None,
                 is_voice_note: raw.get("flag").and_then(Value::as_i64)
                     == Some(ATTACHMENT_FLAG_VOICE_MESSAGE),
+                locator: None,
             });
             locators.push(import_locator(raw.get("locator")));
         }

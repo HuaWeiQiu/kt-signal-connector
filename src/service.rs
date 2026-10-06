@@ -1336,6 +1336,7 @@ impl ConnectorService {
         // descriptor (§4.30), so the sender's own bubble renders the voice UI
         // across restarts.
         let descriptor = NormalizedAttachment {
+            locator: None,
             id: stable_hash_id(&[account_id, client_request_id, "attachment", "0"]),
             content_type: content_type.map(str::to_string),
             filename: filename.map(str::to_string),
@@ -1471,6 +1472,7 @@ impl ConnectorService {
         // and the row itself records the pack identity, so the sender's bubble
         // renders as a sticker across restarts (§4.31).
         let descriptor = NormalizedAttachment {
+            locator: None,
             id: stable_hash_id(&[account_id, client_request_id, "sticker", "0"]),
             content_type: Some(image.content_type.clone()),
             filename: None,
@@ -3730,6 +3732,113 @@ impl ConnectorService {
         })
     }
 
+    /// attachments.download (contract revision 1.61, §4.54) — the local half
+    /// of the live attachment download chain, the
+    /// `prepare_history_attachment_download` shape addressed by
+    /// `attachmentIndex` instead of `attachmentId`. Same capability gate,
+    /// id ladder, and idempotent-dedup staging; the pointer face resolves
+    /// through the live/import locator ladder (see
+    /// [`Self::attachment_locator_for_index`]).
+    pub fn prepare_attachment_download(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_index: usize,
+    ) -> Result<PreparedHistoryDownload, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        if attachment_index >= crate::engine::MAX_INBOUND_ATTACHMENTS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentIndex must name an attachment of this message",
+                false,
+            )));
+        }
+        let (_account, _conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let descriptor = message.attachments.get(attachment_index).ok_or_else(|| {
+            ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentIndex does not name an attachment of this message",
+                false,
+            ))
+        })?;
+        let descriptor_size = descriptor.size;
+        let attachment_id = descriptor.id.clone();
+        let locator = self.attachment_locator_for_index(account_id, &message, attachment_index)?;
+        let sanitized_id = sanitize_attachment_id(&attachment_id)?;
+        let write_dir = media.write_dir()?;
+        let target = write_dir.join(&sanitized_id);
+        if let Ok(metadata) = std::fs::metadata(&target)
+            && metadata.is_file()
+        {
+            // Idempotent dedup, same posture as the history face: the bytes
+            // already landed (an earlier call, or the engine's own live
+            // download of the same id). The measured size is the honest
+            // answer; the CDN is never re-asked.
+            let size_bytes = metadata.len();
+            return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
+        }
+        let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
+        let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
+        Ok(PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            temp_path,
+            plaintext_path,
+        })
+    }
+
+    /// The pointer face behind one descriptor index (contract revision 1.61,
+    /// §4.54): the live-receive column first (schema 19 — an engine that
+    /// projects receive locators fills it), then the schema-18 import column
+    /// (the index-aligned archive faces, already persisted since 1.56). Both
+    /// empty / hole answers the honest no-pointer INVALID_REQUEST — a
+    /// key-less import face stays a hole, never a shifted row (the 1.56
+    /// alignment ruling).
+    fn attachment_locator_for_index(
+        &self,
+        account_id: &str,
+        message: &crate::store::MessageRecord,
+        attachment_index: usize,
+    ) -> Result<crate::store::HistoryAttachmentLocator, ServiceError> {
+        let default = crate::store::HistoryAttachmentLocator::default();
+        let live = self
+            .store
+            .live_attachment_locators(account_id, &message.id)?
+            .get(attachment_index)
+            .cloned()
+            .unwrap_or(default.clone());
+        let face = if live != default {
+            live
+        } else {
+            self.store
+                .history_attachment_locators(account_id, &message.id)?
+                .get(attachment_index)
+                .cloned()
+                .unwrap_or(default)
+        };
+        if face.key.is_none()
+            && face.cdn_key.is_none()
+            && face.cdn_number.is_none()
+            && face.digest.is_none()
+            && face.plaintext_hash.is_none()
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachment has no downloadable pointer face",
+                false,
+            )));
+        }
+        Ok(face)
+    }
+
     /// messages.attachments.readChunk (ADR 0002): deliver exactly one bounded
     /// chunk of one live handle at a strictly sequential offset. The handle
     /// table validates origin, TTL, and offset; this layer base64-encodes the
@@ -5300,6 +5409,21 @@ pub struct HistoryAttachmentDownloadParams {
     pub attachment_id: String,
 }
 
+/// u64-bounded usize parse for `attachmentIndex`: JSON numbers are unsigned
+/// in the schema; anything else is the params-gate INVALID_REQUEST.
+fn parse_attachment_index<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    usize::try_from(value).map_err(|_| {
+        serde::de::Error::invalid_value(
+            serde::de::Unexpected::Unsigned(value),
+            &"an index inside the unsigned platform range",
+        )
+    })
+}
+
 /// history.attachmentDownload result: the plaintext byte count that landed —
 /// the same size `messages.attachments.open` will report for the file. No
 /// path, no handle: the bytes stay behind the chunked media triple.
@@ -5308,6 +5432,24 @@ pub struct HistoryAttachmentDownloadParams {
 pub struct HistoryAttachmentDownloadView {
     pub size_bytes: u64,
 }
+
+/// attachments.download params (contract revision 1.61, §4.54): the message
+/// addressing plus the descriptor's positional index — the wire-free
+/// addressing the byte-identical descriptor ids cannot offer on every engine
+/// face (§4.54).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentDownloadParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    #[serde(deserialize_with = "parse_attachment_index")]
+    pub attachment_index: usize,
+}
+
+/// attachments.download result: the `HistoryAttachmentDownloadView` shape
+/// verbatim — afterwards `messages.attachments.open` resolves the bytes.
+pub type AttachmentDownloadView = HistoryAttachmentDownloadView;
 
 /// The staged download the service hands its supervisor: either the file
 /// already exists (idempotent dedup — the honest measured size comes back),
@@ -10287,6 +10429,7 @@ mod tests {
                 width: Some(64),
                 height: Some(32),
                 is_voice_note: false,
+                locator: None,
             }],
             rich: Some(NormalizedRich {
                 view_once: true,
@@ -13128,6 +13271,7 @@ mod tests {
                 width: Some(64),
                 height: Some(32),
                 is_voice_note: false,
+                locator: None,
             }],
             rich: None,
             sticker: None,

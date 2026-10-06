@@ -712,3 +712,171 @@ async fn cdn_404_is_terminal() {
     assert!(!error.retryable);
     server.verify().await;
 }
+
+/// The §4.54 face: `attachments.download` addresses the same imported pointer
+/// face positionally and walks the identical chain; the hole answers
+/// INVALID_REQUEST before any traffic.
+mod on_demand {
+    use super::*;
+    use kt_signal_connector::service::AttachmentDownloadParams;
+
+    async fn dispatch_index(
+        supervisor: &RuntimeSupervisor,
+        params: Value,
+    ) -> Result<Value, kt_signal_connector::protocol::ApiError> {
+        let parsed: AttachmentDownloadParams = serde_json::from_value(params).unwrap();
+        supervisor
+            .attachment_download(parsed)
+            .await
+            .map_err(|error| error.into_api())
+    }
+
+    async fn seeded_supervisor_with_attachment(
+        temp: &TempDir,
+        server: &MockServer,
+        plaintext: &[u8],
+        digest: Option<String>,
+        plaintext_hash: Option<String>,
+        expected_hits: usize,
+    ) -> (Arc<RuntimeSupervisor>, Arc<Store>, String, String, String) {
+        let body = sealed(plaintext);
+        Mock::given(method("GET"))
+            .and(path("/attachments/test-cdn-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .expect(expected_hits as u64)
+            .mount(server)
+            .await;
+        let signal_data = temp.path().join("signal-data");
+        seed_archive_with_attachment(
+            &signal_data,
+            &json!({
+                "contentType": "application/octet-stream",
+                "fileName": "archived.bin",
+                "size": plaintext.len(),
+            }),
+            &locator_json(digest, plaintext_hash),
+        );
+        let seeded = {
+            let seed = test_store(temp.path());
+            seed.upsert_account_from_signal(
+                SIGNAL_ACCOUNT,
+                Some(1),
+                kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+        };
+        let store = test_store(temp.path());
+        let supervisor = Arc::new(RuntimeSupervisor::with_backup_handles(
+            kt_engine_config(&fixture(), &signal_data, Some(server.uri())),
+            Arc::clone(&store),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
+            Some(Arc::new(MediaHandleTable::new())),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let conversation_id = stable_hash_id(&[&seeded.id, "direct", ALICE_E164]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (message_id, attachment_id) = loop {
+            let messages = store
+                .list_messages(&seeded.id, &conversation_id, 10, None)
+                .unwrap();
+            if let Some(row) = messages.items.first()
+                && !row.attachments.is_empty()
+            {
+                break (row.id.clone(), row.attachments[0].id.clone());
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the import must land the attachment message"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        (
+            supervisor,
+            store,
+            seeded.id,
+            conversation_id,
+            format!("{message_id}\u{1}{attachment_id}"),
+        )
+    }
+
+    fn index_params(
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_index: u64,
+    ) -> Value {
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "messageId": message_id,
+            "attachmentIndex": attachment_index,
+        })
+    }
+
+    #[tokio::test]
+    async fn index_addressing_walks_the_import_face_and_lands_where_media_opens() {
+        let temp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        let plaintext = b"indexed on-demand bytes".to_vec();
+        let (supervisor, _store, account_id, conversation_id, ids) =
+            seeded_supervisor_with_attachment(
+                &temp,
+                &server,
+                &plaintext,
+                Some(whole_body_digest(&sealed(&plaintext))),
+                Some(plaintext_hash_hex(&plaintext)),
+                // one live call + the idempotent dedup is answered locally
+                1,
+            )
+            .await;
+        let (message_id, _attachment_id) = ids.split_once('\u{1}').expect("the seeded id pair");
+
+        let result = dispatch_index(
+            &supervisor,
+            index_params(&account_id, &conversation_id, message_id, 0),
+        )
+        .await
+        .expect("the indexed chain must succeed");
+        assert_eq!(result["sizeBytes"], plaintext.len());
+
+        // Idempotent: a second indexed call never re-asks the CDN.
+        let second = dispatch_index(
+            &supervisor,
+            index_params(&account_id, &conversation_id, message_id, 0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["sizeBytes"], plaintext.len());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_index_past_the_descriptor_list_answers_invalid_request() {
+        let temp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        let plaintext = b"out of range".to_vec();
+        let (supervisor, _store, account_id, conversation_id, ids) =
+            seeded_supervisor_with_attachment(
+                &temp,
+                &server,
+                &plaintext,
+                Some(whole_body_digest(&sealed(&plaintext))),
+                Some(plaintext_hash_hex(&plaintext)),
+                // the refusal answers before any traffic
+                0,
+            )
+            .await;
+        let (message_id, _) = ids.split_once('\u{1}').unwrap();
+
+        let error = dispatch_index(
+            &supervisor,
+            index_params(&account_id, &conversation_id, message_id, 1),
+        )
+        .await
+        .expect_err("an out-of-range index must fail closed");
+        assert_eq!(error.code, "INVALID_REQUEST");
+        assert!(!error.retryable);
+        server.verify().await;
+    }
+}

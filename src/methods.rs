@@ -160,6 +160,15 @@ pub const METHODS: &[MethodRow] = &[
     // importRetry. Advertised through the existing `history-import` tag (no
     // new capability bit, the 1.53 precedent).
     ("history.attachmentDownload", Lane::Send, true, "send"),
+    // Live attachment download (contract revision 1.61, §4.54): the same
+    // transit-CDN chain behind the live-receive/import locator ladder,
+    // addressed by attachmentIndex. Mutating (it lands a file in the
+    // governed media directory), send lane behind the reaction-class
+    // write-lane mutex and delete barrier — the 1.57 class verbatim.
+    // Advertised through the new `attachment-download` tag (the §4.38
+    // faces keep their no-new-bit discipline; this one widens the audience
+    // beyond the history-import desktops).
+    ("attachments.download", Lane::Send, true, "send"),
     // Disappearing-message timer set (contract revision 1.42, §4.41):
     // mutating, send-lane upstream traffic — the reaction class verbatim,
     // same-account mutex and delete barrier included. Direct conversations
@@ -288,7 +297,9 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (`calls.sendSignal` plus the `call.incoming` event); `group-terminate`
 /// (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
-/// the §4.53 join-request approval face (`groups.approveJoinRequests`). They never
+/// the §4.53 join-request approval face (`groups.approveJoinRequests`);
+/// `attachment-download` (contract revision 1.61) marks the §4.54 live
+/// attachment download face (`attachments.download`). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
@@ -310,6 +321,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "call-signaling",
     "group-terminate",
     "group-join-approve",
+    "attachment-download",
 ];
 
 #[cfg(test)]
@@ -377,6 +389,7 @@ mod tests {
             "backups.export",
             "history.importRetry",
             "history.attachmentDownload",
+            "attachments.download",
             "calls.sendSignal",
         ];
         let mutating = [
@@ -413,6 +426,7 @@ mod tests {
             "backups.export",
             "history.importRetry",
             "history.attachmentDownload",
+            "attachments.download",
             "calls.sendSignal",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

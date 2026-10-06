@@ -5,7 +5,17 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.60 (2026-10-06; §4.52 conversation-summary/contact-row
+- Contract revision: 1.61 (2026-10-06; §4.54 — live message-attachment pointer persistence +
+  `attachments.download`: the receive envelope's transit locator face persists into a new internal
+  `messages.live_attachment_locators` column (schema version 19) beside the byte-identical wire
+  descriptors when an engine projects it (the pinned signal-cli 0.14.8 and the kt-engine receive
+  face project metadata only today, so live rows carry the honest hole until an engine ships the
+  projection), and the new `attachments.download` face (Send lane, account-scoped mutating,
+  capability `attachment-download`) walks the stored face positionally — attachmentIndex
+  addressing, live/import locator ladder, the §4.38 step-3 chain unchanged (idempotent dedup,
+  terminal failures, no auto-retry). Same-day rebump past 1.60 — 1.58
+  (group-join-approve) and 1.60 (summary isTerminated projection) landed on main before this
+  batch; 1.59 stays reserved for the parallel username-passthrough batch, unwritten) — previously 1.60 (2026-10-06; §4.52 conversation-summary/contact-row
   terminated projection — the `conversations.list` page, the single
   `conversation.changed` summary, and the `contacts.list` rows now carry the
   group termination flag the 1.53 §4.50 appendix sync capture stores, read out
@@ -2940,6 +2950,50 @@ Verification record (2026-10-06, all line anchors read from the pinned upstream 
   (`<groupId>=<addr,addr>;<groupId>=…`) rides the listGroups JsonGroup with the
   `requestingMembers` array; the updateGroup route grows the `[fixture-approve-forbidden]`
   user-error sentinel and the `[fixture-approve-crash]` `os._exit(36)` sentinel.
+
+### 4.54 Live message-attachment pointer persistence + on-demand download: `attachments.download` (contract revision 1.61, 2026-10-06; §4.52→§4.54 renumbered on landing — 1.60 §4.52 and 1.58 §4.53 claimed the lower numbers first)
+
+The message-attachment on-demand batch: the desktop's attachment pills (image thumbnails,
+voice notes) need a byte channel keyed to **live** message rows, not only the link-time
+import rows §4.38 step 3 serves. Two connector halves land together.
+
+- Receive locator persistence (store schema 18 → 19): the receive envelope's attachment
+  objects may carry the §4.38 pointer face under a `locator` key (the engine-side
+  projection the archive export already ships). The engine normalization captures it under
+  the 1.56 ingest caps verbatim (key/digest/cdnKey base64 ≤512 chars, plaintextHash hex
+  ≤128 chars lowercased, cdnNumber ≤u32::MAX, uploadTimestamp > 0; wrong-shaped keys drop;
+  an all-empty face collapses to the hole) into a new `NormalizedAttachment.locator`
+  field, and `insert_message` serializes the index-aligned faces into the new internal
+  `messages.live_attachment_locators` column. The host wire stays byte-identical (§4.13):
+  key material never crosses it, and the descriptor shape is unchanged. Facts recorded
+  honestly: the pinned signal-cli 0.14.8 receive envelope (`JsonAttachment`) and the
+  kt-engine receive projection (`project_attachment_pointer`) ship metadata only today, so
+  live rows store the all-None faces (indistinguishable from NULL on the read face) until
+  an engine ships the receive projection — the column then fills without a further
+  migration, and `attachments.download` becomes live for new messages automatically.
+  Additive nullable, never backfilled.
+- `attachments.download` (Send lane, account-scoped mutating, capability
+  `attachment-download`): params `{accountId, conversationId, messageId, attachmentIndex}`
+  — positional addressing, because the synthetic descriptor ids an engine face emits are
+  not stable addressing (the §4.54 ruling); the index is capped at the 32-descriptor
+  receive ceiling and must name a descriptor of the message. The pointer face resolves
+  through the locator ladder: the live column first (schema 19), then the schema-18 import
+  column (the index-aligned archive faces, already persisted since 1.56) — a hole in both
+  answers `INVALID_REQUEST` before any network traffic, never a guessed download.
+  Everything after the staging is the §4.38 step-3 machine verbatim: same
+  fail-closed `TransitFace` decode, same CDN stream/gates/decrypt/trim/hash chain, same
+  governed media-directory landing under the descriptor's sanitized id, same idempotent
+  already-present dedup, same error ladder (terminal
+  download/verify failures `UPSTREAM_ERROR retryable=false`; local-IO
+  `retryable=true`). Result `{sizeBytes}` — afterwards
+  `messages.attachments.open/readChunk` deliver the bytes exactly like any
+  engine-downloaded file. Dispatch is the `history.attachmentDownload` class: the reaction
+  write-lane mutex and delete drain barrier; metrics class `send`.
+- Desktop gating: capability `attachment-download` (new tag; the §4.38 faces keep their
+  no-new-bit `history-import` discipline, but this face's audience is every
+  attachment-pill desktop, not only the history-import ones). A desktop without the tag
+  keeps the metadata-only rendering (zero calls); contract 1.61 wire consumers are
+  unaffected.
 
 ## 5. signal-cli Boundary
 

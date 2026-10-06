@@ -453,6 +453,13 @@ pub struct NormalizedQuote {
 }
 
 /// One inbound attachment descriptor: metadata only, never bytes (§4.13).
+/// Since contract revision 1.61 the receive face also captures the
+/// envelope's transit locator when the engine projects one (the §4.38
+/// attachv2 pointer face, the same ingest caps as the 1.56 import parser);
+/// the pinned 0.14.8 signal-cli and the kt-engine receive face project
+/// metadata only today, so the field stays `None` until an engine ships the
+/// receive-side projection — the download face then becomes live without a
+/// further connector change.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedAttachment {
@@ -468,6 +475,12 @@ pub struct NormalizedAttachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     pub is_voice_note: bool,
+    /// Ingest-side transit pointer face, internal only — it rides the store's
+    /// schema-19 live locator column and never the host wire (the §4.13
+    /// metadata-only discipline covers it too). `None` on every engine face
+    /// that does not project a receive locator.
+    #[serde(skip)]
+    pub locator: Option<crate::store::HistoryAttachmentLocator>,
 }
 
 /// One inbound link-preview card (contract 1.25): bounded metadata only — the
@@ -701,7 +714,7 @@ pub enum ControlReceive {
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
-const MAX_INBOUND_ATTACHMENTS: usize = 32;
+pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
 const MAX_ATTACHMENT_ID_CHARS: usize = 128;
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 128;
 const MAX_ATTACHMENT_CONTENT_TYPE_CHARS: usize = 64;
@@ -1770,8 +1783,12 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 }
 
 /// One bounded attachment descriptor off an attachment-shaped object (§4.13,
-/// reused by message attachments and link-preview images alike).
+/// reused by message attachments and link-preview images alike). The transit
+/// locator face (contract revision 1.61) parses with the 1.56 import caps —
+/// wrong-shaped keys drop, never guess (the §4.38 ingest discipline).
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
+    const MAX_LOCATOR_BASE64_CHARS: usize = 512;
+    const MAX_LOCATOR_HEX_CHARS: usize = 128;
     let id = object
         .get("id")
         .and_then(Value::as_str)
@@ -1793,6 +1810,40 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
         .and_then(Value::as_str)
         .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
         .filter(|s| !s.is_empty());
+    let locator = object.get("locator").and_then(|raw| {
+        let raw = raw.as_object()?;
+        let bounded_b64 = |name: &str| {
+            raw.get(name)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty() && text.len() <= MAX_LOCATOR_BASE64_CHARS)
+                .map(str::to_string)
+        };
+        let plaintext_hash = raw
+            .get("plaintextHash")
+            .and_then(Value::as_str)
+            .filter(|text| {
+                !text.is_empty()
+                    && text.len() <= MAX_LOCATOR_HEX_CHARS
+                    && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .map(|text| text.to_ascii_lowercase());
+        let face = crate::store::HistoryAttachmentLocator {
+            key: bounded_b64("key"),
+            cdn_key: bounded_b64("cdnKey"),
+            cdn_number: raw
+                .get("cdnNumber")
+                .and_then(Value::as_u64)
+                .filter(|number| *number <= u32::MAX as u64)
+                .map(|number| number as u32),
+            upload_timestamp: raw
+                .get("uploadTimestamp")
+                .and_then(Value::as_u64)
+                .filter(|timestamp| *timestamp > 0),
+            digest: bounded_b64("digest"),
+            plaintext_hash,
+        };
+        (face != crate::store::HistoryAttachmentLocator::default()).then_some(face)
+    });
     Some(NormalizedAttachment {
         id,
         content_type,
@@ -1810,6 +1861,7 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
             .get("isVoiceNote")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        locator,
     })
 }
 
@@ -3412,6 +3464,62 @@ mod tests {
         assert_eq!(descriptor.width, Some(512));
         assert_eq!(descriptor.height, Some(512));
         assert!(!descriptor.is_voice_note);
+        // The metadata-only engines project no locator: the ingest face stays
+        // the honest hole (contract revision 1.61).
+        assert_eq!(descriptor.locator, None);
+
+        // A receive envelope that does project the transit locator parses it
+        // under the 1.56 ingest caps, index-aligned with its descriptor.
+        let with_locator = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 57,
+                "dataMessage": {
+                    "attachments": [{
+                        "id": "att-loc",
+                        "contentType": "image/jpeg",
+                        "size": 4096,
+                        "locator": {
+                            "key": crate::service::base64_encode(&[0x33_u8; 64]),
+                            "cdnKey": "live-cdn-key",
+                            "cdnNumber": 2,
+                            "digest": crate::service::base64_encode(&[0x44_u8; 32]),
+                            "plaintextHash": "AABBCCDD"
+                        }
+                    }]
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        let face = with_locator.attachments[0]
+            .locator
+            .as_ref()
+            .expect("a projected locator parses");
+        assert_eq!(face.cdn_key.as_deref(), Some("live-cdn-key"));
+        assert_eq!(face.cdn_number, Some(2));
+        assert!(face.key.is_some());
+        assert!(face.digest.is_some());
+        assert_eq!(face.plaintext_hash.as_deref(), Some("aabbccdd"));
+        // A locator whose every field is missing or wrong-shaped collapses to
+        // the hole, never a half-face.
+        let hostile = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 58,
+                "dataMessage": {
+                    "attachments": [{
+                        "id": "att-bad",
+                        "locator": { "key": 7, "cdnNumber": -1, "plaintextHash": "zzz" }
+                    }]
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(hostile.attachments[0].locator, None);
 
         // The pack identity does not ride the engine-side normalization wire
         // shape (the service layer projects it onto MessageRecord, asserted in

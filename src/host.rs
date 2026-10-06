@@ -1108,6 +1108,28 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Live attachment download (contract revision 1.61, §4.54): the
+        // params-gate arm — shape errors answer INVALID_REQUEST before any
+        // staging; the ladder (capability gate, resolve chain, locator-ladder
+        // holes, download/verify failures) rides the runtime call; success is
+        // {"sizeBytes": N}.
+        "attachments.download" => {
+            match serde_json::from_value::<crate::service::AttachmentDownloadParams>(request.params)
+            {
+                Ok(params) => match runtime.attachment_download(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid attachments.download params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "backups.export" => match serde_json::from_value::<BackupsExportParams>(request.params) {
             Ok(params) => match runtime.export_local_backup(&params.account_id).await {
                 Ok(result) => HostResponse::success(request_id, result),
