@@ -5,6 +5,7 @@ pub mod backup_export;
 pub mod datalock;
 pub mod engine;
 pub mod groups;
+pub mod history_attachment;
 pub mod history_import;
 pub mod host;
 pub mod ids;

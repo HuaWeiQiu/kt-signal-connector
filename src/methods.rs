@@ -153,6 +153,13 @@ pub const METHODS: &[MethodRow] = &[
     // no upstream traffic. Advertised through the existing `history-import`
     // tag (no new capability bit).
     ("history.importRetry", Lane::Send, true, "accounts"),
+    // History attachment download (contract revision 1.57, §4.38 step 3):
+    // the transit-CDN byte chain behind an imported pointer face — mutating
+    // (it lands a file in the governed media directory), send lane behind the
+    // reaction-class write-lane mutex and delete barrier, same class as
+    // importRetry. Advertised through the existing `history-import` tag (no
+    // new capability bit, the 1.53 precedent).
+    ("history.attachmentDownload", Lane::Send, true, "send"),
     // Disappearing-message timer set (contract revision 1.42, §4.41):
     // mutating, send-lane upstream traffic — the reaction class verbatim,
     // same-account mutex and delete barrier included. Direct conversations
@@ -247,7 +254,9 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// §4.38 link-time import status face — widened in place by revision 1.53
 /// (the `running` `progress` object plus the `history.importRetry` manual
 /// retry face; no new capability bit, so a 1.39-aware desktop keeps gating
-/// on the same tag) — `disappearing-messages`
+/// on the same tag) and by revision 1.57 (the `history.attachmentDownload`
+/// transit byte chain; the same no-new-bit discipline) —
+/// `disappearing-messages`
 /// (contract revision 1.42) marks the §4.41 receive metadata, timer-notice
 /// and bounded-sweep faces plus `conversations.setExpireTimer`, and
 /// `group-management` (contract revision 1.45) marks the §4.44 group write
@@ -352,6 +361,7 @@ mod tests {
             "stickerPacks.setSync",
             "backups.export",
             "history.importRetry",
+            "history.attachmentDownload",
             "calls.sendSignal",
         ];
         let mutating = [
@@ -386,6 +396,7 @@ mod tests {
             "stickerPacks.setSync",
             "backups.export",
             "history.importRetry",
+            "history.attachmentDownload",
             "calls.sendSignal",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

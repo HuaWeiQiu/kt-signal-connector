@@ -15,7 +15,7 @@ use crate::engine::{
     truncate_utf8_bytes,
 };
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
-use crate::ids::{mask_address, stable_hash_id};
+use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
@@ -162,6 +162,10 @@ pub enum ServiceError {
     Engine(#[from] EngineError),
     #[error("api error: {0}")]
     Api(ApiError),
+    /// Local filesystem work outside the store (download temp dirs, media
+    /// directory creation). Log-safe class only — never the OS error text.
+    #[error("local filesystem io failed")]
+    Io,
 }
 
 impl ServiceError {
@@ -172,6 +176,7 @@ impl ServiceError {
             ServiceError::Store(_) => "store",
             ServiceError::Engine(_) => "engine",
             ServiceError::Api(_) => "api",
+            ServiceError::Io => "io",
         }
     }
 
@@ -365,6 +370,11 @@ impl ServiceError {
                 "signal-cli runtime could not be started",
                 true,
             ),
+            // Local filesystem work outside the store (§4.38 step-3 download
+            // media-directory handling): the established local-world answer.
+            ServiceError::Io => {
+                ApiError::new("UPSTREAM_ERROR", "local attachment storage failed", true)
+            }
         }
     }
 }
@@ -488,6 +498,19 @@ impl MediaIngest {
             }
         }
         None
+    }
+
+    /// The directory a history download writes into: the first existing
+    /// probe candidate — the same directory `locate_attachment` reads — or
+    /// the plain `<data-dir>/attachments` the eager probe would name, so a
+    /// fresh install creates exactly the layout signal-cli itself uses.
+    fn write_dir(&self) -> Result<PathBuf, ServiceError> {
+        if let Some(dir) = self.governor.attachments_dirs().into_iter().next() {
+            return Ok(dir);
+        }
+        let dir = self.governor.data_dir().join("attachments");
+        std::fs::create_dir_all(&dir).map_err(|_| ServiceError::Io)?;
+        Ok(dir)
     }
 }
 
@@ -3545,6 +3568,86 @@ impl ConnectorService {
         })
     }
 
+    /// history.attachmentDownload (contract revision 1.57, §4.38 step 3) —
+    /// the local half of the download chain, run synchronously inside the
+    /// service lock: gate on the media-ingest capability, resolve the
+    /// message-addressing triple, find the attachment descriptor and its
+    /// stored pointer face, and stage the destination. The network and
+    /// crypto halves run in the supervisor (they stream for a while); this
+    /// layer answers every deterministic caller mistake before any of that.
+    pub fn prepare_history_attachment_download(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<PreparedHistoryDownload, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(account_id, "accountId")?;
+        validate_opaque_id(conversation_id, "conversationId")?;
+        validate_opaque_id(message_id, "messageId")?;
+        if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId must contain between 1 and 128 bytes",
+                false,
+            )));
+        }
+        let sanitized_id = sanitize_attachment_id(attachment_id)?;
+        let (_account, _conversation, message) =
+            self.resolve_target(account_id, conversation_id, message_id)?;
+        let index = message
+            .attachments
+            .iter()
+            .position(|descriptor| descriptor.id == attachment_id)
+            .ok_or_else(|| {
+                ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "attachmentId does not name an attachment of this message",
+                    false,
+                ))
+            })?;
+        let descriptor_size = message.attachments[index].size;
+        let locators = self
+            .store
+            .history_attachment_locators(account_id, &message.id)?;
+        let locator = locators.get(index).cloned().unwrap_or_default();
+        if locator.key.is_none()
+            && locator.cdn_key.is_none()
+            && locator.cdn_number.is_none()
+            && locator.digest.is_none()
+            && locator.plaintext_hash.is_none()
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachment has no downloadable pointer face",
+                false,
+            )));
+        }
+        let write_dir = media.write_dir()?;
+        let target = write_dir.join(&sanitized_id);
+        if let Ok(metadata) = std::fs::metadata(&target)
+            && metadata.is_file()
+        {
+            // Idempotent dedup: the bytes already landed (an earlier call, or
+            // the engine downloaded the same attachment live). Answering the
+            // measured size keeps the success honest without re-fetching.
+            let size_bytes = metadata.len();
+            return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
+        }
+        let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
+        let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
+        Ok(PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            temp_path,
+            plaintext_path,
+        })
+    }
+
     /// messages.attachments.readChunk (ADR 0002): deliver exactly one bounded
     /// chunk of one live handle at a strictly sequential offset. The handle
     /// table validates origin, TTL, and offset; this layer base64-encodes the
@@ -5101,6 +5204,45 @@ pub struct HistoryImportStatusParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HistoryImportRetryParams {
     pub account_id: String,
+}
+
+/// history.attachmentDownload params (contract revision 1.57, §4.38 step 3):
+/// the message-addressing triple plus the attachment id from the message's
+/// received metadata — exactly the `messages.attachments.open` shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryAttachmentDownloadParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+}
+
+/// history.attachmentDownload result: the plaintext byte count that landed —
+/// the same size `messages.attachments.open` will report for the file. No
+/// path, no handle: the bytes stay behind the chunked media triple.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryAttachmentDownloadView {
+    pub size_bytes: u64,
+}
+
+/// The staged download the service hands its supervisor: either the file
+/// already exists (idempotent dedup — the honest measured size comes back),
+/// or the full inputs for one network chain. Paths are internal; they never
+/// appear on any wire.
+#[derive(Debug)]
+pub enum PreparedHistoryDownload {
+    AlreadyPresent {
+        size_bytes: u64,
+    },
+    Ready {
+        locator: crate::store::HistoryAttachmentLocator,
+        descriptor_size: Option<u64>,
+        target: PathBuf,
+        temp_path: PathBuf,
+        plaintext_path: PathBuf,
+    },
 }
 
 /// backups.export / backups.exportStatus (contract revision 1.47, §4.46):

@@ -81,6 +81,11 @@ impl MediaGovernor {
         Self { data_dir }
     }
 
+    /// The engine data directory the probe anchors at.
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
     /// The `attachments/` directories this engine may hold media in, probed
     /// per signal-cli's `PathConfig` layout (verified against the v0.14.8
     /// source): attachment files live under an `attachments/` directory next

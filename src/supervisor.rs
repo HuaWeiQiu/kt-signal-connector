@@ -25,16 +25,17 @@ use crate::service::{
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
     ConversationsSetPinnedParams, GroupDetails, GroupsQuitParams, GroupsTerminateParams,
-    GroupsUpdateParams, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
-    MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget, PinnedConversations,
-    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
-    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, account_limit_error, blocked_conversations_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
+    MediaOpenView, MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget,
+    PinnedConversations, PreparedHistoryDownload, PreparedSend, ReportSpamFailure,
+    ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    account_limit_error, blocked_conversations_result, pinned_conversations_result,
+    sticker_pack_syncs_result, store_get_group, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -766,6 +767,142 @@ impl RuntimeSupervisor {
             history_import_retry_projection(&store, &data_dir, capable, &account_id)
         })
         .await
+    }
+
+    /// history.attachmentDownload (contract revision 1.57, §4.38 step 3):
+    /// walk one stored transit pointer face end to end — stream the CDN body
+    /// to a temp file under hard byte bounds, gate the ciphertext layer
+    /// (terminal HMAC + whole-body SHA-256 `digest`), decrypt
+    /// (AES-256-CBC / PKCS7 / log-pad trim), gate the plaintext hash, and
+    /// atomically land the plaintext where `messages.attachments.open`
+    /// resolves it. Mutating, send lane behind the reaction-class write-lane
+    /// mutex and delete barrier (like importRetry). Every download/verify
+    /// failure is terminal — no auto-retry (§4.38 honest degradation; a retry
+    /// is the caller's fresh call). Local-IO failures keep the established
+    /// retryable UPSTREAM_ERROR face.
+    pub async fn history_attachment_download(
+        &self,
+        params: crate::service::HistoryAttachmentDownloadParams,
+    ) -> Result<Value, ServiceError> {
+        // The staged, locally-verified inputs: capability gate, id ladder,
+        // descriptor index, pointer face, destination paths. Everything
+        // deterministic answers here, before any network traffic.
+        let prepared = self
+            .service
+            .lock()
+            .await
+            .prepare_history_attachment_download(
+                &params.account_id,
+                &params.conversation_id,
+                &params.message_id,
+                &params.attachment_id,
+            )?;
+        let (locator, descriptor_size, target, temp_path, plaintext_path) = match prepared {
+            // Idempotent dedup: the file already exists (an earlier call or
+            // the engine's own live download). The measured size is the
+            // honest answer; the CDN is never re-asked.
+            PreparedHistoryDownload::AlreadyPresent { size_bytes } => {
+                return Ok(
+                    serde_json::to_value(HistoryAttachmentDownloadView { size_bytes })
+                        .unwrap_or(Value::Null),
+                );
+            }
+            PreparedHistoryDownload::Ready {
+                locator,
+                descriptor_size,
+                target,
+                temp_path,
+                plaintext_path,
+            } => (locator, descriptor_size, target, temp_path, plaintext_path),
+        };
+        // Fail-closed pointer decode (official gate parity): the face's
+        // key/cdn/integrity/size fields, the URL assembly, and the body
+        // bounds — before the sink opens. Cheap, but the locator strings
+        // (bounded) move into a scoped thread anyway so nothing borrows
+        // across the await below.
+        let cdn_base_override = self.config.history_cdn_base.clone();
+        let face = std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    crate::history_attachment::TransitFace::build(
+                        &locator,
+                        descriptor_size,
+                        cdn_base_override.as_deref(),
+                    )
+                })
+                .join()
+                .unwrap_or(Err(crate::history_attachment::DownloadFailure::Io))
+        })
+        .map_err(map_download_failure)?;
+        let body_max = face.body_max_bytes();
+        let url = face.url.clone();
+
+        // Stream the body. The service lock is released for the network half
+        // (the media chain answers stay serialized at dispatch; the temp
+        // names are unique so two chains cannot collide).
+        let client = reqwest::Client::builder()
+            .connect_timeout(crate::history_attachment::CONNECT_TIMEOUT)
+            .timeout(crate::history_attachment::TOTAL_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| ServiceError::Io)?;
+        let response = client.get(&url).send().await.map_err(|_| {
+            map_download_failure(crate::history_attachment::DownloadFailure::Network)
+        })?;
+        if !response.status().is_success() {
+            return Err(map_download_failure(
+                crate::history_attachment::DownloadFailure::Http(response.status().as_u16()),
+            ));
+        }
+        let mut sink = crate::history_attachment::BodySink::create(&temp_path, body_max)
+            .map_err(map_download_failure)?;
+        sink.set_mac_key(&face.mac_key);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+            let chunk = chunk.map_err(|_| {
+                map_download_failure(crate::history_attachment::DownloadFailure::Network)
+            })?;
+            sink.push(&chunk).map_err(|failure| {
+                cleanup_temp(&temp_path);
+                map_download_failure(failure)
+            })?;
+        }
+        let finished = sink.finish().map_err(|failure| {
+            cleanup_temp(&temp_path);
+            map_download_failure(failure)
+        })?;
+        // Ciphertext gates: terminal HMAC, then the whole-body digest face.
+        finished.verify_ciphertext(&face).map_err(|failure| {
+            cleanup_temp(&temp_path);
+            map_download_failure(failure)
+        })?;
+        // The decrypt pass is blocking file work — off the async workers.
+        let decrypt = {
+            let temp_path = temp_path.clone();
+            let plaintext_path = plaintext_path.clone();
+            let face = face.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::history_attachment::decrypt_to_file(&temp_path, &plaintext_path, &face)
+            })
+            .await
+            .unwrap_or(Err(crate::history_attachment::DownloadFailure::Io))
+        };
+        let size_bytes = decrypt.map_err(|failure| {
+            cleanup_temp(&temp_path);
+            cleanup_temp(&plaintext_path);
+            map_download_failure(failure)
+        })?;
+        // Land the plaintext atomically; the ciphertext temp never outlives
+        // the chain, win or lose.
+        std::fs::remove_file(&temp_path).map_err(|_| ServiceError::Io)?;
+        std::fs::rename(&plaintext_path, &target).map_err(|_| {
+            cleanup_temp(&plaintext_path);
+            ServiceError::Io
+        })?;
+        Ok(
+            serde_json::to_value(HistoryAttachmentDownloadView { size_bytes })
+                .unwrap_or(Value::Null),
+        )
     }
 
     pub fn subscribe_engine(&self) -> broadcast::Receiver<EngineEvent> {
@@ -3542,6 +3679,57 @@ where
         Ok(result) => result,
         Err(_) => Err(ServiceError::Store(StoreError::Unavailable(None))),
     }
+}
+
+/// Map one download-chain failure onto the wire codes. Content failures are
+/// terminal (a corrupt or expired transit object does not improve on a
+/// re-fetch — §4.38 no-auto-retry); only local filesystem work keeps the
+/// advisory retryable flag. Log discipline: the failure variants are
+/// content-free already — nothing here logs a URL, path, id, or key.
+fn map_download_failure(failure: crate::history_attachment::DownloadFailure) -> ServiceError {
+    use crate::history_attachment::DownloadFailure as Failure;
+    let (code, text, retryable) = match failure {
+        Failure::InvalidLocator(reason) => ("INVALID_REQUEST", reason, false),
+        Failure::Http(_) => (
+            "UPSTREAM_ERROR",
+            "the transit CDN refused the attachment request",
+            false,
+        ),
+        Failure::Network => ("UPSTREAM_ERROR", "the transit CDN download failed", false),
+        Failure::BodyTooLarge { .. } => (
+            "UPSTREAM_ERROR",
+            "the attachment body exceeded its declared bounds",
+            false,
+        ),
+        Failure::BadMac => (
+            "UPSTREAM_ERROR",
+            "the attachment ciphertext failed its integrity check",
+            false,
+        ),
+        Failure::DigestMismatch => (
+            "UPSTREAM_ERROR",
+            "the attachment ciphertext failed its integrity check",
+            false,
+        ),
+        Failure::BadPadding | Failure::PlaintextTooShort { .. } => (
+            "UPSTREAM_ERROR",
+            "the attachment could not be decrypted",
+            false,
+        ),
+        Failure::PlaintextHashMismatch => (
+            "UPSTREAM_ERROR",
+            "the attachment failed its plaintext integrity check",
+            false,
+        ),
+        Failure::Io => ("UPSTREAM_ERROR", "local attachment storage failed", true),
+    };
+    ServiceError::Api(ApiError::new(code, text, retryable))
+}
+
+/// Best-effort temp cleanup; the download dir stays governed, so a leftover
+/// temp only wastes its own bytes.
+fn cleanup_temp(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
 }
 
 // ---------------------------------------------------------------------------

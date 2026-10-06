@@ -118,6 +118,13 @@ pub struct SignalCliConfig {
     /// launcher may tighten it (integration tests); production keeps the
     /// default — a disappearing message legitimately outlives this by design.
     pub expire_sweep_interval: Duration,
+    /// Transit-CDN base override for the §4.38 step-3 attachment download
+    /// chain. `None` keeps the official production CDN map
+    /// (`cdn.signal.org`/`cdn2`/`cdn3` per cdnNumber); `Some(base)` aims
+    /// every history-attachment GET at one base instead — the same seam the
+    /// official desktop carries as window config values, used by tests and
+    /// never set by the production launcher.
+    pub history_cdn_base: Option<String>,
 }
 
 impl SignalCliConfig {
@@ -130,6 +137,7 @@ impl SignalCliConfig {
             proxy: None,
             media_ingest: false,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
+            history_cdn_base: None,
             request_timeout: Duration::from_secs(15),
             shutdown_grace: Duration::from_secs(3),
             receive_enqueue_timeout: RECEIVE_ENQUEUE_TIMEOUT,

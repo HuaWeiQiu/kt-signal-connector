@@ -5,7 +5,15 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.56 (2026-10-06; §4.38 attachv2 — link-time import
+- Contract revision: 1.57 (2026-10-06; §4.38 attachv2 step 3 — history
+  attachment download: `history.attachmentDownload` walks one stored
+  pointer face end to end (transit-CDN stream → ciphertext HMAC/digest
+  gates → AES-256-CBC decrypt → log-pad trim → plaintextHash gate →
+  governed media directory landing where `messages.attachments.open`
+  reads), consuming the schema-18 locator column; same-day rebump from
+  1.56, which collided with 1.54 §4.51 and 1.53 §4.50 the same way — one
+  contract revision per batch, newest wins the header, history kept in the
+  bullets) — previously 1.56 (2026-10-06; §4.38 attachv2 — link-time import
   attachment pointer faces: the engine's NDJSON export stops discarding
   `FilePointer.LocatorInfo` (transfer archives carry no media bytes; the
   pointer three-piece key/transit-CDN/integrity is what makes media
@@ -1624,6 +1632,62 @@ documented data-directory artifact instead of an RPC surface.
   proceed but a hash mismatch is terminal (no digest re-check possible). Failure degrades
   honestly: verification failure or transit 404 keeps the message and answers the attachment
   placeholder (the official tap-to-retry face); nothing auto-retries.
+- Step-3 wired (contract 1.57, 2026-10-06): `history.attachmentDownload`
+  (send lane, account-scoped mutating, capability `history-import` — no new
+  bit, the 1.53 precedent) walks one pointer face end to end. Official
+  pipeline anchors, verified against the local Signal-Desktop checkout and
+  its GitHub main (AGPL, read-only reference, zero code copied):
+  `ts/util/Attachment.std.ts` `isDownloadableFromTransitTier` (integrity +
+  key + cdnKey + cdnNumber), `ts/textsecure/WebAPI.preload.ts`
+  (`getAttachment` cdnPath `/attachments/<encodeURIComponent(cdnKey)>`,
+  `getCheckedCdnUrl` cdn map with the unknown-number `?? cdnUrlObject['0']`
+  fallback; production bases `cdn.signal.org`/`cdn2`/`cdn3` per
+  `config/production.json`), `ts/AttachmentCrypto.node.ts`
+  `decryptAttachmentV2ToSink` (raw body → digest hash → trailing-MAC split →
+  AES-256-CBC with the 16-byte IV prefixed → `trimPadding(size)` →
+  plaintextHash), `ts/util/appendMacStream.node.ts` (32-byte HMAC key and
+  MAC), `ts/util/decipherWithAesKey.node.ts`, `ts/util/trimPadding.node.ts`.
+  **Digest-face semantic refinement of the pre-ruling above**: the official
+  `digest` is the SHA-256 of the complete body INCLUDING the trailing MAC
+  (the pipeline feeds the raw stream into the digest hash before the MAC is
+  split off — `checkIntegrity` type 'encrypted' compares that value), while
+  the HMAC-SHA256(macKey, IV‖ciphertext) is the transit transport's terminal
+  MAC checked against the body's last 32 bytes. The pre-ruling's "streaming
+  HMAC-SHA256 vs digest" wording conflated the two; the implementation
+  follows the official primitives — both the terminal-HMAC gate and the
+  whole-body SHA-256 digest gate verify streaming at the ciphertext layer,
+  then the plaintextHash gate verifies over the trimmed plaintext. The
+  pre-ruling's other clauses stand as written: a plaintextHash-only row is
+  downloadable (the official gate allows it), its mismatch is terminal,
+  and no failure auto-retries. Wire shape: params are the
+  `messages.attachments.open` addressing quartet; result `{sizeBytes}` —
+  the plaintext byte count `messages.attachments.open` reports afterwards;
+  there is deliberately no separate status/handle face (the chain is
+  synchronous within the request, bytes stay behind the chunked media
+  triple). Error mapping: pointer-face holes (missing/malformed
+  key/cdnKey/cdnNumber/integrity, missing or out-of-range descriptor size)
+  answer INVALID_REQUEST before any network traffic; download, integrity,
+  and decryption failures answer UPSTREAM_ERROR retryable=false (terminal —
+  a corrupt or expired transit object does not improve on a re-fetch);
+  local filesystem failures keep the retryable UPSTREAM_ERROR face.
+  Idempotent dedup: an already-present file answers its measured size
+  without touching the CDN (an earlier call, or the engine's own live
+  download of the same id). Landing: the plaintext writes to a unique temp
+  name and renames into the governor-probed `attachments/` directory under
+  the descriptor's stable id — the exact file `messages.attachments.open`
+  resolves — so the landed bytes ride the existing media governance (TTL +
+  quota) unchanged. Network bounds: connect 10 s, total 120 s, redirects
+  refused; the ciphertext streams to disk in 64 KiB chunks (resident memory
+  one chunk plus the 32-byte MAC holdback), and the decrypt pass re-reads
+  the temp file bounded to the ciphertext region. New crates: `aes` 0.8 +
+  `cbc` 0.1 (cipher 0.4 line — `cbc` 0.2 pulls cipher 0.5 and does not
+  compose with `aes` 0.8), `reqwest` 0.12 (rustls-tls-webpki-roots +
+  stream, default features off — rustls keeps the TLS story pure-Rust and
+  matches the repo's no-openssl posture); `sha2`/`hmac` were already in
+  the tree. Test seam: `history_cdn_base` (launcher-input-only config,
+  never set by the production launcher) aims the chain at a local mock CDN
+  — the same seam the official desktop carries as its window config cdn
+  values.
 - Bounded discipline (ADR 0002): the archive is read as a line stream with a hard per-line cap;
   pass 1 stages recipient/chat identity maps into bounded SQLite temp tables (dropped at the
   end), pass 2 streams messages in fixed-size batches (256 rows per transaction, store lock

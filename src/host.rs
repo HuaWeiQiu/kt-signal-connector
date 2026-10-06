@@ -33,17 +33,17 @@ use crate::service::{
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
     ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
     GroupsGetParams, GroupsQuitParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, LinkSessionParams,
-    LinkStartParams, MessageGetTextParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
-    MessagesSendStickerParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams,
+    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
+    HostSideEvent, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1082,6 +1082,27 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid history.importRetry params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // History attachment download (contract revision 1.57, §4.38 step
+        // 3): the params-gate arm — shape errors answer INVALID_REQUEST
+        // before any staging; the ladder (capability gate, resolve chain,
+        // pointer-face holes, download/verify failures) rides the runtime
+        // call; success is {"sizeBytes": N}.
+        "history.attachmentDownload" => {
+            match serde_json::from_value::<HistoryAttachmentDownloadParams>(request.params) {
+                Ok(params) => match runtime.history_attachment_download(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid history.attachmentDownload params",
                         false,
                     ),
                 ),
