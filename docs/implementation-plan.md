@@ -5,7 +5,32 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.69 (2026-10-06; §4.62 — the send-side text-formatting
+- Contract revision: 1.70 (2026-10-07; §4.58 consume batch — the connector now
+  consumes the official `syncMessage.messageRequestResponse` sync face on the
+  receive path when its engine projects it: a well-formed mirror (known
+  non-UNKNOWN enum member 1..=6, exactly one thread leg, the ServiceId UUID
+  shape, the 32-byte standard-base64 group leg — everything else fails closed
+  into the plain syncMessage skip) resolves its thread across conversations
+  (the §4.37 view-once ladder for the direct leg, the group master key for the
+  group leg, then refused — the request family is 1:1 only), stamps the
+  authoritative `acceptResponseType` factor into the row's existing
+  `mrr_factors_json` (a read-modify-write merge: the receive writer owns the
+  accept pair, the listContacts enrich owns the trio, neither clobbers the
+  other), and the refreshed summary rides `conversation.changed` — no message
+  row, no system row (the groupUpdated-projection posture). Derivation
+  priority: a stamped ACCEPT accepts ahead of every window weight (the
+  official factor's first weight, `isConversationAccepted.preload.ts:33-39`);
+  any other member keeps the window answer; no stamp keeps the 1.65 local
+  fallback verbatim. The wire shape never changed — the desktop consumes the
+  new authority with zero desktop-side edits. No new method, no schema shape
+  change, no capability tag (the 1.65 key is already on every summary; the
+  group-timer dated-note precedent: same-face consume closes without a wire
+  revision of its own — the chain entry exists to date the consume). Engine
+  modes: the pinned signal-cli and the kt-engine receive faces still drop the
+  sync on the wire today (the recorded §4.58 engine gap for the projection
+  half); the consume path activates automatically the moment an engine ships
+  the projection — engine-repo work out of this batch's boundary) —
+  previously 1.69 (2026-10-06; §4.62 — the send-side text-formatting
   face opens: `messages.sendText` gains an optional `textStyle:
   [{style, start, length}]` array beside the §4.29 `mentions` face — the
   official bodyRanges write face over the §4.20 vocabulary (BOLD / ITALIC /
@@ -3518,7 +3543,7 @@ of this contract — recorded honestly, not papered over.
   halves — the 1.53 appendix discipline). A desktop without the tag keeps its current
   rendering (zero calls, no details row); contract 1.63 wire consumers are unaffected.
 
-### 4.58 Message-request receive projection: `messageRequestAccepted` on the conversation summaries (contract revision 1.65, 2026-10-06)
+### 4.58 Message-request receive projection: `messageRequestAccepted` on the conversation summaries (contract revision 1.65, 2026-10-06; consume half closed by revision 1.70, 2026-10-07 — see the dated note below)
 
 The message-request data plane closes its read half as a **read-time projection
 with the official `isConversationAccepted` factor weights** (upstream
@@ -3571,6 +3596,73 @@ Reachability record (2026-10-06, all anchors read from the pinned trees):
   face on the JSON-RPC receive, or expose a conversation-level accepted
   query) is the recorded follow-up, engine-repo work out of this batch's
   boundary.
+
+> **Dated note (2026-10-07, message-request consume batch, contract revision
+> 1.70):** the ACCEPT-stamp engine gap above is closed from the connector
+> side of an already-delivering wire. The protocol face
+> (`SignalService.proto:865` — the SyncMessage.content oneof member 14;
+> `:666-678` — the `MessageRequestResponse` record: `threadAci` ServiceId
+> UUID string, `groupId` 32-byte standard-base64 group master key, `type`
+> numbered enum UNKNOWN=0/ACCEPT=1/DELETE=2/BLOCK=3/BLOCK_AND_DELETE=4/SPAM=5/
+> BLOCK_AND_SPAM=6) reaches this connector whenever its engine projects the
+> sync (the official desktop consumes the same face at
+> `MessageReceiver.preload.ts:3104` dispatch / `:3274` handler, with
+> `GROUPV2_ID_LENGTH = 32`, the UUID shape gate, and `isKnownProtoEnumMember`
+> forcing an out-of-enum `type` to UNKNOWN at `:3304-3309`; the conversation
+> attr write at `background.preload.ts:3774`; the first factor weight at
+> `isConversationAccepted.preload.ts:38`... :33-39). The connector consumes
+> it on the receive path as a control receive (the `groupUpdated`
+> projection precedent):
+>
+> - **Normalize + shape gates (engine.rs, fail-closed)**:
+>   `normalized_message_request_response` accepts the face only when `type`
+>   is a known non-UNKNOWN member (1..=6 — UNKNOWN carries no
+>   session-actionable state and drops as skip, the same posture the
+>   desktop's UNKNOWN default produces), exactly one thread leg is present
+>   (the proto oneof), the ACI leg is the 8-4-4-4-12 hex ServiceId shape,
+>   and the group leg standard-base64-decodes to exactly
+>   `GROUPV2_ID_LENGTH = 32` bytes. Any hostile or foreign shape falls
+>   through to the plain syncMessage skip arm — zero factor material, zero
+>   row (宁缺勿错).
+> - **Consume (service.rs, `apply_message_request_response`)**: the mirror
+>   is intercepted before the generic conversation ladder (the §4.37
+>   view-once precedent) and resolves its thread across conversations — the
+>   direct leg through the raw ACI, the recorded ACI→peer-key mappings, then
+>   the contacts digit-suffix matches; the group leg through the raw group
+>   master key (then refused: the request family is 1:1 only, groups carry
+>   no request). A thread nothing local resolves drops warn-only. No message
+>   row, no system row: the face is state convergence, and the refreshed
+>   summary rides `conversation.changed` so every linked device converges.
+> - **Factor landing (store.rs)**: the authoritative stamp merges into the
+>   row's `mrr_factors_json` as the new `acceptResponseType` (bool: exactly
+>   the ACCEPT presence the official factor reads) plus
+>   `acceptResponseTypeMember` (the raw enum value) keys — a read-modify-
+>   -write so the receive writer and the throttled listContacts enrich
+>   writer each own their key family and never clobber each other. The
+>   derivation (schema unchanged, wire key unchanged: the same bare
+>   always-serialized `messageRequestAccepted` bool) reads the stamped
+>   ACCEPT first, ahead of the window weights, exactly the official factor
+>   order (:33-39); every other member keeps the row's window-derived
+>   answer. No stamp — every pre-1.70 row — reads inactive there and keeps
+>   the 1.65 local fallback verbatim (zero regression). The stamped row no
+>   longer owes the factor probe (the same `mrr_factors_json IS NOT NULL`
+>   marker the enrich stamps set).
+> - **Priority, stated once**: authoritative factor present → it decides
+>   (ACCEPT ⇒ accepted; any other member ⇒ the window weights, unchanged);
+>   factor absent → the 1.65 derivation verbatim. The wire shape never
+>   changed, so the desktop batch consumes the new authority with zero
+>   desktop-side edits.
+> - Tests: the engine gates (well-formed direct ACCEPT/DELETE/BLOCK, the
+>   group leg, the seven hostile shapes), the store merge discipline
+>   (ACCEPT flips an incoming-only row, DELETE keeps it pending, the
+>   enrich re-stamp preserves the accept pair, non-direct refusal, probe
+>   silence), the service ladder (mapping resolution, unknown-thread drop,
+>   group refusal, no-row discipline, idempotent re-push), and the
+>   full-stack round trip over the fake engine
+>   (`tests/message_request_response_integration.rs`, standalone file: the
+>   ACCEPT ride on `conversation.changed`, the no-row discipline, the
+>   DELETE/BLOCK terminal stamps, the four hostile shapes changing nothing,
+>   and the unresolvable group mirror inventing nothing).
 - **Other collapsed factors, same discipline**: `messageCountBeforeMessageRequests`
   (:60, :75) is official-desktop migration state no engine projects;
   `removalStage` (:33-35) fires only when defined and is never stored here;
@@ -3594,8 +3686,9 @@ an event-driven window cannot disagree):
 - `profileSharing` / `isInSystemContacts` → the stamped
   `profileSharing == true` / `hidden == false` bits, direct rows only
   (upstream :90-96).
-- everything else (ACCEPT stamp, `messageCountBeforeMessageRequests`,
-  group factors) → inactive, as recorded above.
+- everything else after the authoritative stamp (`messageCountBeforeMessageRequests`,
+  group factors) → inactive, as recorded above; the stamped ACCEPT (the
+  1.70 dated note) reads ahead of this line by design.
 
 Bounds and failure posture: the factor stamp is a stored engine projection —
 no message bodies, no raw envelopes, nothing the §1 boundaries exclude; the

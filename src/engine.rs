@@ -723,6 +723,23 @@ pub enum ControlReceive {
         signal_type: &'static str,
         payload: Value,
     },
+    /// The official `syncMessage.messageRequestResponse` mirror (contract
+    /// 1.70, §4.58 consume batch): one of our own linked devices answered the
+    /// conversation's message request. `response_type` is the protocol enum
+    /// member 0..=6 (UNKNOWN/ACCEPT/DELETE/BLOCK/BLOCK_AND_DELETE/SPAM/
+    /// BLOCK_AND_SPAM — the desktop's `isKnownProtoEnumMember` gate forces an
+    /// out-of-enum value back to UNKNOWN before this connector ever sees it,
+    /// and the shapes that survive the engine-side gates carry only 1..=6),
+    /// `thread_aci` names the 1:1 thread (the ServiceId UUID string), and
+    /// `group_id` the 32-byte group master key's standard base64 — exactly
+    /// one of the two is present (the proto oneof). No message row exists for
+    /// the notification; the service layer stamps the authoritative factor
+    /// and the summary rides `conversation.changed`.
+    MessageRequestResponse {
+        response_type: u8,
+        thread_aci: Option<String>,
+        group_id: Option<String>,
+    },
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -764,6 +781,14 @@ const GROUP_UPDATE_TITLE_MIRROR_CHARS: usize = 64;
 const MAX_CALL_ID: u64 = u32::MAX as u64;
 const MAX_CALL_OPAQUE_CHARS: usize = 3 * 1024 * 1024;
 const MAX_CALL_ICE_FRAMES: usize = 64;
+/// The official desktop's `GROUPV2_ID_LENGTH` (MessageReceiver.preload.ts
+/// :3274-3309, contract 1.70 §4.58 consume batch): the group master key is a
+/// 32-byte value carried on the wire as standard base64; any other decoded
+/// length is not the protocol's face.
+const GROUPV2_ID_LENGTH: usize = 32;
+/// The highest `messageRequestResponseType` enum member this connector
+/// consumes (UNKNOWN=0 … BLOCK_AND_SPAM=6; `SignalService.proto:666-678`).
+const MRR_RESPONSE_TYPE_MAX: u8 = 6;
 
 pub struct QueuedReceive {
     receive: NormalizedReceive,
@@ -1831,6 +1856,73 @@ fn data_message_group_id(message: &serde_json::Map<String, Value>) -> Option<Str
         .map(str::to_string)
 }
 
+/// The `syncMessage.messageRequestResponse` face (contract 1.70, §4.58
+/// consume batch). The official desktop anchors: `SignalService.proto:865`
+/// (SyncMessage.content oneof member 14), `:666-678` (the MessageRequestResponse
+/// record: `threadAci` = the thread's ServiceId UUID string, `groupId` = the
+/// 32-byte group master key's standard base64, `type` = the numbered enum
+/// UNKNOWN=0 / ACCEPT=1 / DELETE=2 / BLOCK=3 / BLOCK_AND_DELETE=4 / SPAM=5 /
+/// BLOCK_AND_SPAM=6), and the consumer's shape gates (`MessageReceiver
+/// .preload.ts:3274-3309` — `GROUPV2_ID_LENGTH = 32`, the UUID shape, and
+/// `isKnownProtoEnumMember` forcing an out-of-enum `type` to UNKNOWN).
+///
+/// The projection returns the parsed face only when the envelope carries a
+/// well-formed one — a hostile or foreign shape (bad UUID / bad base64 /
+/// wrong byte length / a `type` outside 1..=6 / neither or both thread legs)
+/// fails closed here and the envelope falls through to the plain skip arm,
+/// exactly like every other gateless drop (宁缺勿错). A `type` of UNKNOWN
+/// (0, the enum default) carries no session-actionable information, so it is
+/// dropped as skip rather than stamped: the desktop consumes the same face
+/// only for the known member values.
+fn normalized_message_request_response(
+    face: &serde_json::Map<String, Value>,
+) -> Option<ControlReceive> {
+    let response_type = face
+        .get("messageRequestResponseType")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| (1..=MRR_RESPONSE_TYPE_MAX).contains(value))?;
+    let thread_aci = face.get("threadAci").and_then(Value::as_str);
+    let group_id = face.get("groupId").and_then(Value::as_str);
+    // The proto oneof: exactly one of the two thread legs. A shape carrying
+    // neither, both, or a malformed leg is not the protocol's — dropped.
+    let resolved = match (thread_aci, group_id) {
+        (Some(aci), None) => {
+            let aci = aci.trim();
+            if !is_service_id_uuid(aci) {
+                return None;
+            }
+            (Some(aci.to_string()), None)
+        }
+        (None, Some(group)) => {
+            let group = group.trim();
+            let mut decoded = Vec::new();
+            crate::service::base64_decode_to_vec(group, &mut decoded).ok()?;
+            if decoded.len() != GROUPV2_ID_LENGTH {
+                return None;
+            }
+            (None, Some(group.to_string()))
+        }
+        _ => return None,
+    };
+    Some(ControlReceive::MessageRequestResponse {
+        response_type,
+        thread_aci: resolved.0,
+        group_id: resolved.1,
+    })
+}
+
+/// The ServiceId UUID shape gate (the desktop's UUID regex,
+/// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
+fn is_service_id_uuid(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(part, len)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 #[derive(Clone, Debug)]
 struct NormalizedText {
     value: String,
@@ -2471,6 +2563,31 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             control: ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds,
             },
+        });
+    }
+    // The official `syncMessage.messageRequestResponse` mirror (contract
+    // 1.70, §4.58 consume batch): our own linked device answered a
+    // conversation's message request — the ACCEPT stamp the §4.58 read
+    // derivation previously recorded as having no honest source. It routes as
+    // a control receive (the groupUpdated projection precedent) addressed by
+    // the thread leg; a malformed or UNKNOWN-shaped face returns None and the
+    // envelope falls through to the plain syncMessage skip.
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(face) = sync
+            .get("messageRequestResponse")
+            .and_then(Value::as_object)
+        && let Some(control) = normalized_message_request_response(face)
+    {
+        // The ControlReceive carries the thread leg twice by design (the
+        // routing group id and the stamped payload); one clone keeps both.
+        let ControlReceive::MessageRequestResponse { group_id, .. } = &control else {
+            unreachable!("the projection only answers this variant");
+        };
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: group_id.clone(),
+            control,
         });
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
@@ -5286,5 +5403,178 @@ mod tests {
             read_bounded_line(&mut reader, 1024),
             Err(BoundedLineError::InvalidUtf8)
         ));
+    }
+
+    /// The `syncMessage.messageRequestResponse` face (contract 1.70, §4.58
+    /// consume batch): a well-formed direct-thread ACCEPT mirror routes as a
+    /// control receive carrying the thread ACI, and every hostile or foreign
+    /// shape falls through to the plain syncMessage skip — the fail-closed
+    /// discipline. The enum family (DELETE/BLOCK/…), the group thread leg,
+    /// and the shape gates all ride the same normalize face.
+    #[test]
+    fn message_request_response_normalize_routes_and_gates_the_face() {
+        const THREAD_ACI: &str = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        // 32 raw bytes = the group master key; standard base64 (44 chars).
+        const GROUP_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+        let normalize = |sync: Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                },
+            }))
+            .unwrap()
+        };
+
+        // ACCEPT on a direct thread: the authoritative stamp material.
+        let direct = normalize(json!({
+            "messageRequestResponse": {
+                "threadAci": THREAD_ACI,
+                "messageRequestResponseType": 1,
+            }
+        }));
+        assert_eq!(direct.content_kind, "control");
+        assert_eq!(direct.direction, "incoming");
+        assert!(direct.source.is_none());
+        match direct.control.expect("direct face") {
+            ControlReceive::MessageRequestResponse {
+                response_type,
+                thread_aci,
+                group_id,
+            } => {
+                assert_eq!(response_type, 1);
+                assert_eq!(thread_aci.as_deref(), Some(THREAD_ACI));
+                assert!(group_id.is_none());
+            }
+            other => panic!("unexpected control: {other:?}"),
+        }
+
+        // DELETE and BLOCK ride the same face with the enum's numeric value.
+        for response_type in [2u8, 3] {
+            let face = normalize(json!({
+                "messageRequestResponse": {
+                    "threadAci": THREAD_ACI,
+                    "messageRequestResponseType": response_type,
+                }
+            }));
+            assert_eq!(face.content_kind, "control");
+            assert!(
+                matches!(
+                    face.control,
+                    Some(ControlReceive::MessageRequestResponse {
+                        response_type: got,
+                        ..
+                    }) if got == response_type
+                ),
+                "member {response_type} must keep its numeric value"
+            );
+        }
+
+        // The group thread leg: the 32-byte standard-base64 group id, no ACI.
+        let group = normalize(json!({
+            "messageRequestResponse": {
+                "groupId": GROUP_B64,
+                "messageRequestResponseType": 1,
+            }
+        }));
+        match group.control.expect("group face") {
+            ControlReceive::MessageRequestResponse {
+                thread_aci,
+                group_id,
+                ..
+            } => {
+                assert!(thread_aci.is_none());
+                assert_eq!(group_id.as_deref(), Some(GROUP_B64));
+            }
+            other => panic!("unexpected control: {other:?}"),
+        }
+
+        // Upper-case hex UUID is the same ServiceId shape.
+        let upper = normalize(json!({
+            "messageRequestResponse": {
+                "threadAci": THREAD_ACI.to_uppercase(),
+                "messageRequestResponseType": 1,
+            }
+        }));
+        assert!(matches!(
+            upper.control,
+            Some(ControlReceive::MessageRequestResponse { .. })
+        ));
+
+        // The gates, every one falling through to the plain skip arm:
+        // UNKNOWN (0) and past-enum values, a bad UUID, a wrong-byte-length
+        // group id, non-base64 group material, neither thread leg, and both
+        // legs at once.
+        for (why, sync) in [
+            (
+                "UNKNOWN (0) carries no actionable state",
+                json!({
+                    "messageRequestResponse": {
+                        "threadAci": THREAD_ACI,
+                        "messageRequestResponseType": 0,
+                    }
+                }),
+            ),
+            (
+                "past-enum value",
+                json!({
+                    "messageRequestResponse": {
+                        "threadAci": THREAD_ACI,
+                        "messageRequestResponseType": 7,
+                    }
+                }),
+            ),
+            (
+                "bad UUID shape",
+                json!({
+                    "messageRequestResponse": {
+                        "threadAci": "not-a-service-id",
+                        "messageRequestResponseType": 1,
+                    }
+                }),
+            ),
+            (
+                "wrong decoded group length",
+                json!({
+                    "messageRequestResponse": {
+                        "groupId": "ZmFrZS1ncm91cC0x",
+                        "messageRequestResponseType": 1,
+                    }
+                }),
+            ),
+            (
+                "non-base64 group material",
+                json!({
+                    "messageRequestResponse": {
+                        "groupId": "not base64!!",
+                        "messageRequestResponseType": 1,
+                    }
+                }),
+            ),
+            (
+                "neither thread leg",
+                json!({
+                    "messageRequestResponse": {
+                        "messageRequestResponseType": 1,
+                    }
+                }),
+            ),
+            (
+                "both thread legs",
+                json!({
+                    "messageRequestResponse": {
+                        "threadAci": THREAD_ACI,
+                        "groupId": GROUP_B64,
+                        "messageRequestResponseType": 1,
+                    }
+                }),
+            ),
+        ] {
+            let face = normalize(sync);
+            assert_eq!(face.content_kind, "syncMessage", "{why}");
+            assert_eq!(face.direction, "skip", "{why}");
+            assert!(face.control.is_none(), "{why}");
+        }
     }
 }

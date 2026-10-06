@@ -14,6 +14,9 @@ use crate::engine::{
     ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, SignalCliMode,
     truncate_utf8_bytes,
 };
+/// The official ACCEPT member of the `messageRequestResponseType` enum
+/// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
+const MRR_RESPONSE_TYPE_ACCEPT: u8 = 1;
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
@@ -4927,6 +4930,24 @@ impl ConnectorService {
         {
             return self.apply_view_once_open_sync(&account, sender_aci, *timestamp);
         }
+        // Contract 1.70 (§4.58 consume batch): the message-request response
+        // sync also addresses its thread across conversations — by the peer
+        // ACI or the group master key, never by an envelope source (the
+        // envelope is our own account). Intercepted before the generic
+        // ladder with the same ACI→peer-key resolution family.
+        if let ControlReceive::MessageRequestResponse {
+            response_type,
+            thread_aci,
+            group_id,
+        } = &control
+        {
+            return self.apply_message_request_response(
+                &account,
+                *response_type,
+                thread_aci.as_deref(),
+                group_id.as_deref(),
+            );
+        }
         // Resolve the conversation: group id, or peer (incoming source /
         // outgoing destination). Control receives address existing
         // conversations only — they never create one.
@@ -5259,6 +5280,10 @@ impl ConnectorService {
             // ladder (it addresses rows across conversations by author +
             // timestamp), so this arm is the unreachable fall-through.
             ControlReceive::ViewOnceOpen { .. } => Ok(Vec::new()),
+            // The message-request response sync is intercepted the same way
+            // (it addresses its thread by ACI / group key), so this arm is
+            // the unreachable fall-through too.
+            ControlReceive::MessageRequestResponse { .. } => Ok(Vec::new()),
             // Call signaling (contract 1.51, §4.49): no row, no local state
             // — the signaling payload forwards as the transient
             // `call.incoming` event addressed by the conversation it routed
@@ -5354,6 +5379,110 @@ impl ConnectorService {
             message_id: record.id,
             opened_at,
         }])
+    }
+
+    /// Contract 1.70 (§4.58 consume batch): consume one
+    /// `syncMessage.messageRequestResponse` mirror — our own linked device
+    /// answered a conversation's message request. The face carries no message
+    /// row: it stamps the authoritative
+    /// `acceptResponseType` factor (the official factor's first weight, the
+    /// read derivation previously collapsed to inactive) on the resolved
+    /// conversation, sets the terminal flag for the §4.56
+    /// acceptRequest/declineRequest faces' vocabulary (ACCEPT true, every
+    /// other known member false — DELETE/BLOCK/BLOCK_AND_DELETE/BLOCK_AND_SPAM
+    /// close the request, SPAM closes it), and the refreshed summary rides
+    /// `conversation.changed` so the desktop's request bar converges on every
+    /// linked device.
+    ///
+    /// Resolution is the §4.37 candidate ladder gated to the thread leg: a
+    /// direct thread resolves by the ACI itself, the recorded ACI→peer-key
+    /// mappings, then the contacts digit-suffix matches; a group thread is the
+    /// raw group master key exactly as the §4.44/§4.50 faces address it. A
+    /// thread nothing local resolves drops warn-only (宁缺勿错 — better to
+    /// converge late than to invent a row), and the 1:1 vocabulary never
+    /// stamps a group row (groups carry no request to accept).
+    fn apply_message_request_response(
+        &mut self,
+        account: &AccountRow,
+        response_type: u8,
+        thread_aci: Option<&str>,
+        group_id: Option<&str>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // Resolution: the group leg keys a group row directly; the ACI leg
+        // walks the same ladder the view-once open sync runs.
+        let (kind, peer_key) = if let Some(group_id) = group_id {
+            ("group", group_id.to_string())
+        } else if let Some(aci) = thread_aci {
+            let mut peer_keys = vec![aci.to_string()];
+            peer_keys.extend(self.store.peer_keys_for_aci(&account.id, aci)?);
+            let digits = address_digits(aci);
+            if !digits.is_empty() {
+                for key in self.store.contact_peer_keys(&account.id)? {
+                    let candidate = address_digits(&key);
+                    if !candidate.is_empty() && candidate.ends_with(&digits) {
+                        peer_keys.push(key);
+                    }
+                }
+            }
+            peer_keys.sort();
+            peer_keys.dedup();
+            let Some(peer_key) = peer_keys.into_iter().find_map(|peer_key| {
+                self.store
+                    .conversation_by_peer(&account.id, "direct", &peer_key)
+                    .ok()
+                    .flatten()
+                    .map(|_| peer_key)
+            }) else {
+                tracing::warn!(
+                    kind = "message_request_response",
+                    "response sync matched no local conversation; dropped"
+                );
+                return Ok(Vec::new());
+            };
+            ("direct", peer_key)
+        } else {
+            return Ok(Vec::new());
+        };
+        // The 1:1 vocabulary: only direct rows carry the request family.
+        let Some(conversation) = self
+            .store
+            .conversation_by_peer(&account.id, kind, &peer_key)?
+        else {
+            tracing::warn!(
+                kind = "message_request_response",
+                "response sync matched no local conversation; dropped"
+            );
+            return Ok(Vec::new());
+        };
+        if conversation.kind != "direct" {
+            tracing::warn!(
+                kind = "message_request_response",
+                "response sync addressed a non-direct conversation; dropped"
+            );
+            return Ok(Vec::new());
+        }
+        // The authoritative stamp: exactly the ACCEPT presence the official
+        // factor weight reads (`messageRequestResponseType === ACCEPT`,
+        // isConversationAccepted.preload.ts:33-39), plus the raw member so a
+        // later consumer can see the terminal verb.
+        let accepted = response_type == MRR_RESPONSE_TYPE_ACCEPT;
+        self.store.set_conversation_accept_response_factor(
+            &account.id,
+            &conversation.id,
+            accepted,
+            response_type,
+        )?;
+        // The summary always re-pushes (idempotent convergence, the
+        // GroupTimerUpdate discipline) even when the stamp did not change —
+        // a lagging window must still converge.
+        let mut events = Vec::new();
+        if let Some(summary) = self
+            .store
+            .conversation_summary(&account.id, &conversation.id)?
+        {
+            events.push(HostSideEvent::ConversationChanged(summary));
+        }
+        Ok(events)
     }
 }
 
@@ -17394,5 +17523,203 @@ mod tests {
             )
             .unwrap();
         assert!(events.is_empty(), "an unknown group converges nothing");
+    }
+
+    /// Contract 1.70 (§4.58 consume batch): the message-request response sync
+    /// consumption. An ACCEPT mirror stamps the authoritative factor on the
+    /// resolved direct conversation (the ACI ladder: raw ACI → the recorded
+    /// ACI→peer-key mapping) and rides `conversation.changed` with the
+    /// accepted state; a non-ACCEPT member (DELETE) stamps the terminal
+    /// not-accepted; a mirror naming nothing local converges nothing; a
+    /// group-threaded mirror is refused (groups carry no request); no message
+    /// row is ever created.
+    #[test]
+    fn ingest_message_request_response_stamps_the_authoritative_factor() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut incoming = expire_record_fixture(&account.id, &direct.id, "mrr-in");
+        incoming.sent_at = 10;
+        service
+            .store_ref()
+            .insert_message(&incoming, None, None, false)
+            .unwrap();
+        let base = NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "control",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: None,
+            source_uuid: None,
+            server_guid: None,
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 1,
+                thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                group_id: None,
+            }),
+        };
+
+        // Before the mirror: the incoming-only row is pending (the honest
+        // no-stamp derivation). The mirror keys its thread by the peer's ACI,
+        // so the §4.37 mapping that resolution walks is recorded up front —
+        // the same shape a real receive chain leaves behind.
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "+15555550101",
+            )
+            .unwrap();
+        let before = service
+            .store_ref()
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!before.message_request_accepted);
+
+        // The ACCEPT mirror flips it through conversation.changed and the
+        // store state both.
+        let events = service
+            .ingest_receive(base.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
+            "a response mirror is not a message row"
+        );
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("the stamp rides conversation.changed");
+        assert_eq!(changed.id, direct.id);
+        assert!(changed.message_request_accepted);
+        let after = service
+            .store_ref()
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(after.message_request_accepted);
+
+        // The DELETE twin (member 2) stamps the terminal not-accepted back.
+        let delete = NormalizedReceive {
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 2,
+                thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                group_id: None,
+            }),
+            ..base.clone()
+        };
+        let events = service
+            .ingest_receive(delete, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("the delete stamp rides conversation.changed too");
+        assert!(!changed.message_request_accepted);
+
+        // The idempotent re-stamp: a same-value ACCEPT re-pushes the summary
+        // (the GroupTimerUpdate convergence discipline).
+        assert!(
+            service
+                .ingest_receive(base, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::ConversationChanged(_)))
+        );
+        let stamped = service
+            .store_ref()
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(stamped.message_request_accepted);
+
+        // Nothing local (an unknown ACI) converges nothing.
+        let unknown = NormalizedReceive {
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 1,
+                thread_aci: Some("99999999-9999-9999-9999-999999999999".into()),
+                group_id: None,
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        assert!(
+            service
+                .ingest_receive(unknown, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A group-threaded mirror is refused: the request family is 1:1 only.
+        let group_mirror = NormalizedReceive {
+            group_id: None,
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 1,
+                thread_aci: None,
+                group_id: Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into()),
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        assert!(
+            service
+                .ingest_receive(group_mirror, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "groups carry no request to accept"
+        );
+    }
+
+    /// The receive fixture the message-request tests clone from — the same
+    /// shape [`control_receive`] builds, kept separate so the 1.70 block is
+    /// independent of the shared helper's defaults.
+    fn base_shape_for_unknown_test() -> NormalizedReceive {
+        NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "control",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: None,
+            source_uuid: None,
+            server_guid: None,
+            peer_name: None,
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+        }
     }
 }

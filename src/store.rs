@@ -487,18 +487,18 @@ pub struct ConversationSummary {
     /// `isConversationAccepted` factor weights over the material this chain
     /// can honestly see: the row's stored engine factors
     /// (`mrr_factors_json` — the {hidden, profileSharing, blocked} trio the
-    /// throttled listContacts enrich stamps, or the probed-absent `{}`), the
-    /// message window (any data row / any outgoing row), and the row's own
-    /// is_self. Always serialized (bare bool, the muted/pinned/isSelf
-    /// discipline): both values are meaningful — the desktop consumes the key
-    /// as authoritative and keeps its local window derivation only for
-    /// pre-1.65 connectors where the key is absent. Honest per-factor holes,
-    /// each collapsed to inactive (documented in §4.58): the ACCEPT response
-    /// stamp (no engine projects the syncMessage face on the JSON-RPC wire),
-    /// `messageCountBeforeMessageRequests` (upstream never projects it), and
-    /// for groups `profileSharing`/`addedBy`/`pendingAdminApprovalV2` (no
-    /// engine read face) — a group row therefore derives accepted from its
-    /// own outgoing window alone.
+    /// throttled listContacts enrich stamps, the authoritative
+    /// `acceptResponseType` bit the §4.58 receive face writes on ingest
+    /// (contract 1.70), or the probed-absent `{}`), the message window, and
+    /// the row's own is_self. Always serialized (bare bool, the
+    /// muted/pinned/isSelf discipline): both values are meaningful — the
+    /// desktop consumes the key as authoritative and keeps its local window
+    /// derivation only for pre-1.65 connectors where the key is absent.
+    /// Honest per-factor holes, each collapsed to inactive (documented in
+    /// §4.58): `messageCountBeforeMessageRequests` (upstream never projects
+    /// it), and for groups `profileSharing`/`addedBy`/`pendingAdminApprovalV2`
+    /// (no engine read face) — a group row therefore derives accepted from
+    /// its own outgoing window alone.
     pub message_request_accepted: bool,
 }
 
@@ -587,6 +587,19 @@ struct MrrFactors {
     /// `isConversationAccepted` does not read it (blocked state rides the
     /// §4.45/§4.47 blocked faces), so it never factors the derivation here.
     blocked: Option<bool>,
+    /// The authoritative `messageRequestResponseType` stamp (contract 1.70,
+    /// §4.58 consume batch): true exactly when a linked device's
+    /// `syncMessage.messageRequestResponse` named this conversation ACCEPT —
+    /// the official factor's first weight, previously recorded as having no
+    /// honest engine source. Absent = never received (the collapsed default);
+    /// every other known member (DELETE / BLOCK / BLOCK_AND_DELETE / SPAM /
+    /// BLOCK_AND_SPAM) stamps false.
+    accept_response: Option<bool>,
+    /// The raw member value behind [`MrrFactors::accept_response`]
+    /// (UNKNOWN=0 … BLOCK_AND_SPAM=6), absent on the never-received default.
+    /// Carried for diagnostics and future consumers; the derivation reads
+    /// only the ACCEPT presence bit.
+    accept_response_type: Option<u8>,
 }
 
 /// Parse a row's stored factor stamp. NULL (never probed) and any malformed
@@ -603,6 +616,11 @@ fn mrr_factors_of(extra: Option<&str>) -> MrrFactors {
         hidden: object.get("hidden").and_then(Value::as_bool),
         profile_sharing: object.get("profileSharing").and_then(Value::as_bool),
         blocked: object.get("blocked").and_then(Value::as_bool),
+        accept_response: object.get("acceptResponseType").and_then(Value::as_bool),
+        accept_response_type: object
+            .get("acceptResponseTypeMember")
+            .and_then(Value::as_u64)
+            .and_then(|value| u8::try_from(value).ok()),
     }
 }
 
@@ -628,12 +646,18 @@ fn mrr_factors_of(extra: Option<&str>) -> MrrFactors {
 /// - `profileSharing` / `isInSystemContacts` → the engine-supplied
 ///   `profileSharing` / inverted `hidden` bits (direct rows only; groups
 ///   are not contacts, no engine read face exists for either).
-/// - `messageRequestResponseType == ACCEPT` → inactive everywhere today: no
-///   pinned engine projects the `syncMessage.messageRequestResponse` face on
-///   the JSON-RPC wire (signal-cli 0.14.8 projects it only on its plain-text
-///   path; the kt-engine receive projection drops it), so an ACCEPT stamp
-///   has no honest source — recorded as the §4.58 engine gap, never
-///   invented.
+/// - `messageRequestResponseType == ACCEPT` → the stamped
+///   `acceptResponseType` bit (contract 1.70, §4.58 consume batch): the
+///   authoritative face a linked device's
+///   `syncMessage.messageRequestResponse` mirror writes on ingest. The
+///   official factor reads the ACCEPT presence first (:33-39), so this
+///   weight short-circuits ahead of the window weights: a stamped ACCEPT is
+///   accepted even while the local window is incoming-only, and a stamped
+///   non-ACCEPT terminal member keeps the row's window-derived answer (the
+///   official factor treats every non-ACCEPT member as not-accepted — the
+///   request stays pending for the desktop's banner, the §4.56 faces'
+///   vocabulary). No stamp (the pre-1.70 shape) reads inactive here and the
+///   derivation keeps its local fallback.
 /// - `messageCountBeforeMessageRequests > 0` → inactive: upstream never
 ///   projects the attr (it is official-desktop migration state).
 /// - `removalStage` → inactive by construction: the official factor only
@@ -648,6 +672,16 @@ fn derive_message_request_accepted(
     factors: MrrFactors,
 ) -> bool {
     if is_self {
+        return true;
+    }
+    // The authoritative response stamp outranks every derived weight: the
+    // user's own answer is the truth the desktop consumes (upstream :33-39).
+    // Direct rows only — the sync face never names a group (groups carry no
+    // request).
+    if kind == "direct"
+        && let Some(accept) = factors.accept_response
+        && accept
+    {
         return true;
     }
     if kind == "direct" && !has_data {
@@ -1631,7 +1665,13 @@ impl Store {
     /// three booleans; an engine without the flags stamps the honest
     /// probed-absent `{}` marker so the probe never re-fires for the row.
     /// Direct rows only: groups are not contacts and carry no trio. Unstamped
-    /// rows stay NULL and are never backfilled.
+    /// rows stay NULL and are never backfilled. The trio keys are this
+    /// setter's truth (a re-stamp replaces them verbatim); the authoritative
+    /// `acceptResponseType` pair the §4.58 receive face
+    /// ([`Store::set_conversation_accept_response_factor`]) wrote survives a
+    /// re-stamp — each key family has exactly one writer, so the throttled
+    /// enrich can never clobber the response state and the response face can
+    /// never clobber the trio.
     pub fn set_conversation_mrr_factors_for_peer(
         &self,
         account_id: &str,
@@ -1639,11 +1679,94 @@ impl Store {
         factors_json: &str,
     ) -> Result<bool, StoreError> {
         let conn = self.lock_conn()?;
+        // The accept pair is not the enrich's to write: carry it over from
+        // the row's current stamp so a re-stamp of the trio (every enrich
+        // window re-stamps every direct row the engine answer names) keeps
+        // the response state.
+        let accept = conn
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                params![account_id, peer_key],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten()
+            .and_then(|current| serde_json::from_str::<Value>(&current).ok())
+            .and_then(|value| value.as_object().cloned());
+        let mut object = serde_json::from_str::<Value>(factors_json)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(current) = accept {
+            for key in ["acceptResponseType", "acceptResponseTypeMember"] {
+                if let Some(value) = current.get(key)
+                    && !object.contains_key(key)
+                {
+                    object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        let merged = Value::Object(object).to_string();
         let updated = conn
             .execute(
                 "UPDATE conversations SET mrr_factors_json=?1
                  WHERE account_id=?2 AND kind='direct' AND peer_key=?3",
-                params![factors_json, account_id, peer_key],
+                params![merged, account_id, peer_key],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
+    /// Contract 1.70 (§4.58 consume batch): merge the authoritative
+    /// `messageRequestResponseType` face into one direct conversation's
+    /// factor stamp. The stamp is read-modify-written so the sync face never
+    /// clobbers the enrich trio (and vice versa): the accept keys land on
+    /// top of whatever the row already stores, and a row with no stamp at
+    /// all gets exactly the accept pair. Direct rows only, matching the
+    /// sync-face grammar (the response never names a group thread with
+    /// request semantics).
+    pub fn set_conversation_accept_response_factor(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        accepted: bool,
+        response_type: u8,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        // Outer None = no such direct row (or the wrong kind); inner None =
+        // the row exists but was never enriched (a NULL stamp) — both inner
+        // shapes merge to an accept-only stamp.
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations
+                 WHERE id=?1 AND account_id=?2 AND kind='direct'",
+                params![conversation_id, account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(current) = current else {
+            // No such direct row (or the wrong kind): nothing to stamp.
+            return Ok(false);
+        };
+        let mut object = current
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        object.insert("acceptResponseType".to_string(), Value::Bool(accepted));
+        object.insert(
+            "acceptResponseTypeMember".to_string(),
+            Value::from(response_type),
+        );
+        let merged = Value::Object(object).to_string();
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET mrr_factors_json=?1
+                 WHERE id=?2 AND account_id=?3 AND kind='direct'",
+                params![merged, conversation_id, account_id],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(updated > 0)
@@ -1657,9 +1780,10 @@ impl Store {
     /// `sentMessageCount`, regardless of the factors). The throttled enrich
     /// widens its trigger with this count so a derivability-critical fresh
     /// row is probed on the next window even when every title is already
-    /// resolved; once every such row carries a stamp (values or the
-    /// probed-absent `{}` marker) the probe goes quiet and the enrich keeps
-    /// its no-engine-call fast path.
+    /// resolved; once every such row carries a stamp (values, the
+    /// probed-absent `{}` marker, or the §4.58 receive face's authoritative
+    /// accept stamp) the probe goes quiet and the enrich keeps its
+    /// no-engine-call fast path.
     pub fn count_direct_conversations_without_mrr_factors(
         &self,
         account_id: &str,
@@ -12255,6 +12379,126 @@ mod tests {
         assert!(
             rows.iter()
                 .all(|row| row["messageRequestAccepted"].is_boolean())
+        );
+    }
+
+    /// Contract 1.70 (§4.58 consume batch): the authoritative
+    /// `acceptResponseType` face. The ACCEPT stamp accepts an
+    /// incoming-only row the window weights alone leave pending (the
+    /// official factor's first weight, isConversationAccepted.preload.ts
+    /// :33-39); every other known member keeps the window-derived answer;
+    /// the stamp merges with the enrich trio instead of clobbering it (and
+    /// survives a re-stamp); non-direct rows are never stamped; and the
+    /// stamped row stops owing the probe.
+    #[test]
+    fn message_request_accept_response_stamp_is_authoritative_and_merges() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-in", &account.id, &direct.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        // Base state: the incoming-only row is pending (no stamp at all).
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+
+        // DELETE (member 2) stamps not-accepted: the row stays pending —
+        // the window weights are untouched by a non-ACCEPT member.
+        assert!(
+            store
+                .set_conversation_accept_response_factor(&account.id, &direct.id, false, 2,)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+
+        // ACCEPT (member 1) is the authoritative weight: the row accepts
+        // even though the window is still incoming-only (no outgoing row,
+        // no trio factors).
+        assert!(
+            store
+                .set_conversation_accept_response_factor(&account.id, &direct.id, true, 1,)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+
+        // The merge discipline: a re-stamp of the enrich trio keeps the
+        // accept pair, and the trio itself is the enrich's truth verbatim.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"hidden":true,"profileSharing":false,"blocked":false}"#,
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            summary.message_request_accepted,
+            "the accept stamp survives the enrich re-stamp"
+        );
+        // The reverse order also merges: an accept face fired after the trio
+        // keeps the trio keys.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(&account.id, "+15555550101", r#"{}"#,)
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_conversation_accept_response_factor(&account.id, &direct.id, false, 4,)
+                .unwrap()
+        );
+        // BLOCK_AND_DELETE (member 4) keeps the row pending (the window has
+        // no outgoing row and the trio is empty).
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+
+        // Non-direct rows are never stamped by the response face.
+        let group = store
+            .ensure_conversation(&account.id, "group", "group-key-1", "group")
+            .unwrap();
+        assert!(
+            !store
+                .set_conversation_accept_response_factor(&account.id, &group.id, true, 1,)
+                .unwrap()
+        );
+
+        // The stamped row no longer owes the probe (the derivation is
+        // settled by the authoritative stamp's mere presence within the
+        // window weights).
+        assert_eq!(
+            store
+                .count_direct_conversations_without_mrr_factors(&account.id)
+                .unwrap(),
+            0
         );
     }
 }
