@@ -5377,6 +5377,23 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
 
+    // Contract 1.65 (§4.58): the factor probe rides the first
+    // conversations.list — the link sync already resolved every title, so
+    // the probe is the enrich's only trigger, and the fixture's listContacts
+    // flush hook would deliver the staged envelopes on that round trip. Burn
+    // the probe here, before the staged envelopes are written: this list
+    // pays the one listContacts round trip (stamping the default-burst rows,
+    // the flush hook finding an empty marker), so the list below stays a
+    // store-only read and the choreography keeps controlling the burst via
+    // the typing flush as before.
+    request(
+        &mut client,
+        "probe-burn",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+
     // The link sync materialized the fixture group; a staged envelope also
     // creates the quit-fail group so the UPSTREAM_ERROR drill has a real
     // local row to address.

@@ -22,8 +22,38 @@
   1.63 is the landed message-request response face (the §4.56 entry, in the
   chain below — it landed first and its entry therefore sits in the chain,
   newest wins); 1.64 is the landed group-invites face (the §4.57 entry, in
-  the chain below — newest wins), 1.65 remains reserved by parallel
-  batches) — previously 1.64 (2026-10-06; §4.57 — the group invites face opens:
+  the chain below — newest wins), 1.65 is the landed message-request receive
+  projection (the §4.58 entry, in the chain below — newest wins)) — previously
+  1.65 (2026-10-06; §4.58 — the message-request receive projection: the
+  conversation summaries (`conversations.list` page and the single
+  `conversation.changed` summary) now carry `messageRequestAccepted`, the
+  official `isConversationAccepted` multi-factor (upstream
+  `ts/util/isConversationAccepted.preload.ts:21-82`, AGPL read-only anchor)
+  derived at read time over the material this chain can honestly see. New
+  store column `conversations.mrr_factors_json` (schema version 20, additive
+  nullable): the throttled listContacts enrich stamps the engine-supplied
+  {hidden, profileSharing, blocked} trio per direct row on the SAME one
+  round trip it already spends on titles — signal-cli's `JsonContact` carries
+  all three natively (`isHidden`/`profileSharing`/`isBlocked`), an engine
+  without them (the kt-engine read face today) stamps the probed-absent `{}`.
+  Honest per-factor holes, never invented: the ACCEPT response stamp has no
+  source on either engine (the pinned signal-cli projects
+  `syncMessage.messageRequestResponse` only on its plain-text path —
+  `ReceiveMessageHandler.java:413-424` — never on the JSON-RPC wire
+  `JsonSyncMessage.from`, and the kt-engine receive projection drops it), so
+  the receive-side stamp the desktop §4.56 consume batch assumed is recorded
+  as the engine gap; `messageCountBeforeMessageRequests` is official-desktop
+  migration state no engine projects; groups carry no whitelisted/addedBy/
+  pendingAdminApprovalV2 read face, so a group row derives accepted from its
+  own outgoing window alone. The key is a bare always-serialized bool (the
+  muted/pinned/isSelf discipline — both values are meaningful); pre-1.65
+  hosts read one added key, and a desktop consumes the key as authoritative,
+  keeping its local window derivation only for the key-absent pre-1.65
+  connectors. The parallel batches landed while this entry was in flight —
+  1.63 is the landed message-request response write face (the §4.56 entry, in
+  the chain below — drafted as §4.55, renumbered on landing) and 1.64 the
+  landed group-invites face (the §4.57 entry, in the chain below — newest
+  wins)) — previously 1.64 (2026-10-06; §4.57 — the group invites face opens:
   `groups.get` now carries `pendingMembers` — the invited-but-not-yet-joined
   set — projected live at read time as bounded `{id, uuid?, name?}` entries
   from the same single-group upstream `listGroups` read the new
@@ -3252,69 +3282,6 @@ additionally flips the contact's profile-sharing bit upstream
 - Desktop gating: capability `message-requests` (new tag). A desktop without the tag keeps
   its current rendering (zero calls); contract 1.61 wire consumers are unaffected.
 
-### 4.59 Multi-attachment send: messages.attachments.send `attachments` array (contract revision 1.66, 2026-10-06)
-
-The official forward face (v8.31 `maybeForwardMessages`): a forwarded multi-
-attachment message is **one** upstream message — `enqueueMessageForSend`
-carries every attachment of the source message in one `enqueuedMessage`
-(attachments array), not one message per attachment. The connector's §4.12
-entry point was the only bottleneck: the upstream `send` has always accepted
-an array-typed `attachments` parameter (data URIs; the pinned engine
-`methods.rs` parses `attachments` as a string array and its
-`upload_attachments_for_send` uploads the batch against a per-message ceiling
-of 32, fail-closed past it), and `dispatch_send`/`upstream_text_send_params`
-already thread `Option<Vec<Value>>` — the wire shape downstream of the
-service layer never changed.
-
-`messages.attachments.send` (§4.12) therefore gains an optional **plural
-form**, evolving in place on the §4.30/§4.36 precedent (optional params on
-the same method, same capability — no new capability tag, the method stays
-listed under the same handshake entry):
-
-- Params gain `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]`.
-  Each entry is the §4.12 budget family verbatim (padded base64 whose decoded
-  size must equal `sizeBytes`, ≤ 104857600 bytes; filename 1–128 bytes with
-  the same path-separator/control-character rejection; contentType `type/
-  subtype`). 1..=32 entries (`MAX_SEND_ATTACHMENTS`, the upstream per-message
-  ceiling mirrored — entries past 32 are rejected INVALID_REQUEST here, not
-  as a late engine internal error); the entries' **combined** raw size stays
-  within the §4.12 100 MiB message budget, so a plural request still fits one
-  host frame and no entry can exceed the size the singular form already
-  proves fits.
-- **Mutually exclusive with the singular form.** Any singular key
-  (`dataBase64`/`sizeBytes`/`filename`/`contentType`) beside the
-  `attachments` array — or a singular send missing `dataBase64`/`sizeBytes` —
-  is `INVALID_REQUEST` before the pending row exists. A single-element
-  `attachments` array is semantically equivalent to the singular form (same
-  upstream wire shape, same idempotency chain, same projection): old callers
-  and new callers converge on the same row shapes. The schema expresses the
-  exclusivity with if/then guards; the host enforces it deterministically.
-- **voiceNote and viewOnce stay singular-form faces**: either marker set on
-  the plural form is `INVALID_REQUEST`. A voice note is always a single-
-  attachment message and official view-once media is a single unadorned
-  medium — neither face produces a multi-attachment message, so the plural
-  form carries no per-entry voice flag and no view-once semantics (the
-  descriptor `isVoiceNote` is false for every plural entry).
-- `text` (caption) and `quoteMessageId` are message-level and shared by both
-  forms. The pending row carries one metadata-only descriptor per entry, in
-  array order (descriptor ids derive from the entry index), so the desktop
-  renders every outgoing attachment from the first pending tick and the
-  conversation preview falls back to the first filename when the caption is
-  empty. Settlement is the §4.12 chain unchanged: one upstream mutating
-  `send`, the sent `MessageRecord` on confirmation, `SEND_OUTCOME_UNKNOWN`
-  on an indeterminate outcome, no auto-retry. Idempotency: the
-  `clientRequestId` short-circuit runs before addressing resolution exactly
-  like the singular form.
-- Caller migration (the desktop consume batch): the forward path picks the
-  plural form when the draft carries ≥ 2 attachments and no voice entry, and
-  falls back to the singular per-attachment chain when the connector answers
-  a deterministic rejection (an older connector's `deny_unknown_fields`
-  params deserialization fails closed on the unknown `attachments` key
-  before anything is sent) — never on `SEND_OUTCOME_UNKNOWN`, where a
-  fallback send could double-deliver. The backward-compat story is
-  byte-identical to every optional-param revision: a pre-1.66 caller sends
-  no new key and reads the old shapes unchanged.
-
 ### 4.57 Group invites: the `pendingMembers` read face + `groups.revokeInvites` (contract revision 1.64, 2026-10-06; landed after §4.56 on the rebased stack)
 
 > **Upstream evidence (pinned signal-cli `v0.14.7-4-g472784e6`, the 0.14.8
@@ -3437,6 +3404,166 @@ listed under the same handshake entry):
 > any write; the upstream refusal forwards UPSTREAM_ERROR; the in-flight
 > crash answers SEND_OUTCOME_UNKNOWN and is never retried across the
 > restart).
+
+### 4.58 Message-request receive projection: `messageRequestAccepted` on the conversation summaries (contract revision 1.65, 2026-10-06)
+
+The message-request data plane closes its read half as a **read-time projection
+with the official `isConversationAccepted` factor weights** (upstream
+`Signal-Desktop` v8.31.0-alpha.1 `ts/util/isConversationAccepted.preload.ts:21-82`,
+AGPL read-only anchor, zero copy): `conversations.list` rows and the single
+`conversation.changed` summary carry `messageRequestAccepted` — a bare
+always-serialized bool (the muted/pinned/isSelf discipline, both values
+meaningful). A desktop consumes the key as authoritative the moment it is
+present and keeps its local window derivation only for pre-1.65 connectors
+where the key is absent.
+
+Reachability record (2026-10-06, all anchors read from the pinned trees):
+
+- **Path A confirmed for the factor trio on signal-cli**: the pinned
+  `v0.14.7-4-g472784e6` `listContacts` row (`JsonContact.java:13-35`) carries
+  `isBlocked`, `isHidden`, and `profileSharing` natively — the exact
+  official-factor raw material. The connector stamps it through the
+  **existing throttled title enrich**: `conversations.list` already spends one
+  `listContacts {account, allRecipients: true}` round trip per 60s window
+  (`enrich_conversation_faces_throttled`, the renamed
+  `enrich_conversation_titles_throttled`); the stamp rides the same answer
+  into the new additive nullable `conversations.mrr_factors_json` column
+  (schema version 20). Per-row stamps: exactly the flags the engine item
+  exposed (`hidden` / `profileSharing` / `blocked`, upstream names minus the
+  `is` prefix to match the official factor vocabulary); an item without any
+  of the three stamps the honest probed-absent `{}` so the probe never
+  re-fires for that row. NULL rows (fresh, never probed) are never
+  backfilled — the probe widens the enrich trigger only when every title is
+  resolved and a direct row still owes its stamp (a data window without an
+  outgoing row: empty windows are already accepted by the official
+  empty-private-conversation weight and outgoing-bearing windows by
+  `sentMessageCount`, so the probe never wakes for them), so a fully-probed
+  account costs zero extra engine traffic.
+- **Engine gap, recorded and never invented — the ACCEPT stamp**: the
+  official factor's first weight (`messageRequestResponseType === ACCEPT`,
+  :33-39) has no honest source on either engine's JSON-RPC receive face. The
+  pinned signal-cli projects `syncMessage.messageRequestResponse` only on its
+  plain-text path (`ReceiveMessageHandler.java:413-424`); the JSON-RPC wire
+  face (`JsonSyncMessage.from`, `JsonSyncMessage.java:41-64`) omits it
+  entirely (the wire syncMessage carries sentMessage/blocked/readMessages/
+  type only), and the kt-engine receive projection
+  (`kt-signal-engine/src/service/mod.rs` `project_content`
+  SynchronizeMessage arm) drops it in its `_ =>` fall-through. The §4.56
+  write face (`conversations.acceptRequest`/`declineRequest`, upstream
+  `sendMessageRequestResponse`) therefore cannot be observed back on today's
+  engines — the multi-device echo arrives as a `messageRequestResponse` sync
+  the connector's `normalize_receive_fields` files under its syncMessage skip
+  arm. The factor collapses to inactive exactly as the official
+  `(attr || default)`-style defaults do; engine-side extension (project the
+  face on the JSON-RPC receive, or expose a conversation-level accepted
+  query) is the recorded follow-up, engine-repo work out of this batch's
+  boundary.
+- **Other collapsed factors, same discipline**: `messageCountBeforeMessageRequests`
+  (:60, :75) is official-desktop migration state no engine projects;
+  `removalStage` (:33-35) fires only when defined and is never stored here;
+  the group factors `addedBy`/`pendingAdminApprovalV2`/group
+  `profileSharing` (:45-53, :70-72, :90-103) have no engine read face —
+  groups are not contacts and `listGroups` carries none of them. A group row
+  therefore derives accepted from its own outgoing window alone.
+
+Derivation (one guarded lookup per row, the 1.27/1.60 post-map loop family —
+list page and single-row summary share the same helper so a reloaded page and
+an event-driven window cannot disagree):
+
+- `isMe` → the row's `is_self` (always accepted, upstream :25-28).
+- empty direct data window → accepted (upstream :63-69
+  `isEmptyPrivateConvo`: an empty conversation never shows the request UI;
+  the empty-group `isEmptyWhitelistedGroup` twin needs the unseen
+  whitelisted bit, so an empty group stays pending — the honest hole).
+- `sentMessageCount > 0` → the row has any outgoing data row (upstream
+  :58, :75; system rows excluded by the same wall the wire
+  `lastMessageDirection` draws).
+- `profileSharing` / `isInSystemContacts` → the stamped
+  `profileSharing == true` / `hidden == false` bits, direct rows only
+  (upstream :90-96).
+- everything else (ACCEPT stamp, `messageCountBeforeMessageRequests`,
+  group factors) → inactive, as recorded above.
+
+Bounds and failure posture: the factor stamp is a stored engine projection —
+no message bodies, no raw envelopes, nothing the §1 boundaries exclude; the
+stamp's stored keys are three booleans capped by construction; a malformed or
+absent stamp degrades to the all-absent default (a hostile stamp can never
+fail a summary read); the derivation is a single indexed EXISTS pair plus one
+row column, the same per-row cost family as the 1.27 meta lookups. Pre-1.65
+hosts read one added always-present key per row (wire addition only, no
+renames, no removals); the store migrates 19→20 additively and never
+rewrites a row's past. Tests: the unit faces (self row accepted; empty
+direct accepted; direct with only-incoming window pending, flipped accepted
+by each stamped factor; group with only-outgoing accepted, group
+only-incoming pending; stamp degraded default absent; system-only rows
+excluded), the enrich faces (trio stamped from one listContacts answer;
+item without flags stamps `{}`; probe trigger stays quiet on a fully
+probed account), the wire byte faces (pre-1.65 host compatibility is
+informational — the key is additive), and the server integration (the key
+rides a real store page through the full list → projection ladder).
+
+### 4.59 Multi-attachment send: messages.attachments.send `attachments` array (contract revision 1.66, 2026-10-06)
+
+The official forward face (v8.31 `maybeForwardMessages`): a forwarded multi-
+attachment message is **one** upstream message — `enqueueMessageForSend`
+carries every attachment of the source message in one `enqueuedMessage`
+(attachments array), not one message per attachment. The connector's §4.12
+entry point was the only bottleneck: the upstream `send` has always accepted
+an array-typed `attachments` parameter (data URIs; the pinned engine
+`methods.rs` parses `attachments` as a string array and its
+`upload_attachments_for_send` uploads the batch against a per-message ceiling
+of 32, fail-closed past it), and `dispatch_send`/`upstream_text_send_params`
+already thread `Option<Vec<Value>>` — the wire shape downstream of the
+service layer never changed.
+
+`messages.attachments.send` (§4.12) therefore gains an optional **plural
+form**, evolving in place on the §4.30/§4.36 precedent (optional params on
+the same method, same capability — no new capability tag, the method stays
+listed under the same handshake entry):
+
+- Params gain `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]`.
+  Each entry is the §4.12 budget family verbatim (padded base64 whose decoded
+  size must equal `sizeBytes`, ≤ 104857600 bytes; filename 1–128 bytes with
+  the same path-separator/control-character rejection; contentType `type/
+  subtype`). 1..=32 entries (`MAX_SEND_ATTACHMENTS`, the upstream per-message
+  ceiling mirrored — entries past 32 are rejected INVALID_REQUEST here, not
+  as a late engine internal error); the entries' **combined** raw size stays
+  within the §4.12 100 MiB message budget, so a plural request still fits one
+  host frame and no entry can exceed the size the singular form already
+  proves fits.
+- **Mutually exclusive with the singular form.** Any singular key
+  (`dataBase64`/`sizeBytes`/`filename`/`contentType`) beside the
+  `attachments` array — or a singular send missing `dataBase64`/`sizeBytes` —
+  is `INVALID_REQUEST` before the pending row exists. A single-element
+  `attachments` array is semantically equivalent to the singular form (same
+  upstream wire shape, same idempotency chain, same projection): old callers
+  and new callers converge on the same row shapes. The schema expresses the
+  exclusivity with if/then guards; the host enforces it deterministically.
+- **voiceNote and viewOnce stay singular-form faces**: either marker set on
+  the plural form is `INVALID_REQUEST`. A voice note is always a single-
+  attachment message and official view-once media is a single unadorned
+  medium — neither face produces a multi-attachment message, so the plural
+  form carries no per-entry voice flag and no view-once semantics (the
+  descriptor `isVoiceNote` is false for every plural entry).
+- `text` (caption) and `quoteMessageId` are message-level and shared by both
+  forms. The pending row carries one metadata-only descriptor per entry, in
+  array order (descriptor ids derive from the entry index), so the desktop
+  renders every outgoing attachment from the first pending tick and the
+  conversation preview falls back to the first filename when the caption is
+  empty. Settlement is the §4.12 chain unchanged: one upstream mutating
+  `send`, the sent `MessageRecord` on confirmation, `SEND_OUTCOME_UNKNOWN`
+  on an indeterminate outcome, no auto-retry. Idempotency: the
+  `clientRequestId` short-circuit runs before addressing resolution exactly
+  like the singular form.
+- Caller migration (the desktop consume batch): the forward path picks the
+  plural form when the draft carries ≥ 2 attachments and no voice entry, and
+  falls back to the singular per-attachment chain when the connector answers
+  a deterministic rejection (an older connector's `deny_unknown_fields`
+  params deserialization fails closed on the unknown `attachments` key
+  before anything is sent) — never on `SEND_OUTCOME_UNKNOWN`, where a
+  fallback send could double-deliver. The backward-compat story is
+  byte-identical to every optional-param revision: a pre-1.66 caller sends
+  no new key and reads the old shapes unchanged.
 
 ## 5. signal-cli Boundary
 

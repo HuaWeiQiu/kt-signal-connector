@@ -1715,9 +1715,11 @@ impl RuntimeSupervisor {
         limit: u32,
         cursor: Option<String>,
     ) -> Result<Page<ConversationSummary>, ServiceError> {
-        // Best-effort title enrich only when masks remain — and at most every 60s
-        // so poll/UI refresh does not hammer listContacts on the single JVM queue.
-        let _ = self.enrich_conversation_titles_throttled(&account_id).await;
+        // Best-effort title enrich only when masks remain or a fresh direct
+        // row still owes its §4.58 factor probe — and at most every 60s so
+        // poll/UI refresh does not hammer listContacts on the single JVM
+        // queue.
+        let _ = self.enrich_conversation_faces_throttled(&account_id).await;
         // Store-only read: the service lock guards in-memory state only.
         let store = Arc::clone(&self.store);
         blocking_service(move || {
@@ -1726,19 +1728,37 @@ impl RuntimeSupervisor {
         .await
     }
 
-    /// Resolve human titles for direct chats still showing mask_address(peer).
-    async fn enrich_conversation_titles_throttled(
+    /// Resolve human titles for direct chats still showing mask_address(peer)
+    /// and, on the same one listContacts round trip, stamp the §4.58
+    /// message-request factor trio. Throttled to at most one engine call per
+    /// 60s; the call fires only when a mask remains or a fresh direct row has
+    /// never been probed, so a fully-enriched account costs no engine traffic.
+    async fn enrich_conversation_faces_throttled(
         &self,
         account_id: &str,
     ) -> Result<(), ServiceError> {
-        let peers = tokio::task::spawn_blocking({
+        let (peers, mrr_missing) = tokio::task::spawn_blocking({
             let store = Arc::clone(&self.store);
             let account_id = account_id.to_string();
-            move || store.list_direct_peers_needing_title(&account_id)
+            move || {
+                let peers = store.list_direct_peers_needing_title(&account_id)?;
+                // The §4.58 probe only widens the trigger: a page with masks
+                // to resolve fires anyway, so the count is read only when the
+                // title fast path would otherwise skip the engine call. The
+                // counter itself only owes rows whose derivation can flip on
+                // a stamp (data window without outgoing rows), so the probe
+                // never wakes for rows the window weight already settles.
+                let mrr_missing = if peers.is_empty() {
+                    store.count_direct_conversations_without_mrr_factors(&account_id)?
+                } else {
+                    0
+                };
+                Ok((peers, mrr_missing))
+            }
         })
         .await
         .unwrap_or(Err(StoreError::Unavailable(None)))?;
-        if peers.is_empty() {
+        if peers.is_empty() && mrr_missing == 0 {
             return Ok(());
         }
         let now_ms = SystemTime::now()
@@ -1788,6 +1808,25 @@ impl RuntimeSupervisor {
                             &name,
                         );
                     }
+                }
+                // Contract 1.65 (§4.58): the factor stamp rides the same
+                // answer. Every engine contact with a direct conversation row
+                // gets exactly the flags the engine exposed; an item without
+                // any of the three (the kt-engine read face today) stamps the
+                // probed-absent `{}` so the probe never re-fires for that
+                // row. Per-item failures are warn-silent by the same
+                // discipline as the title pass — one bad stamp never fails
+                // the list that triggered the enrich.
+                for item in &items {
+                    let Some(peer_key) = contact_item_peer_key(item) else {
+                        continue;
+                    };
+                    let factors = mrr_factors_stamp(item);
+                    let _ = store.set_conversation_mrr_factors_for_peer(
+                        &account_id,
+                        peer_key,
+                        &factors,
+                    );
                 }
             }
         })
@@ -5065,6 +5104,42 @@ fn find_contact_display_name(items: &[Value], peer_key: &str) -> Option<String> 
     compose_contact_display_name(item)
 }
 
+/// The connector-wide contact address ladder (number before uuid, the
+/// `numberUuid` projection tail included) — the same match
+/// [`find_contact_display_name`] runs, exposed for the §4.58 factor stamp so
+/// both consumers of one listContacts answer can never disagree about which
+/// identity a row is addressed by. First present non-empty identity wins.
+fn contact_item_peer_key(item: &Value) -> Option<&str> {
+    ["number", "uuid", "numberUuid"].iter().find_map(|key| {
+        item.get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Contract 1.65 (§4.58): serialize exactly the factor flags one engine
+/// contact item exposed. The upstream names are the pinned signal-cli
+/// `JsonContact` fields (`isHidden` / `profileSharing` / `isBlocked`); the
+/// stored keys drop the `is` prefix for hidden/blocked to match the official
+/// desktop's factor vocabulary (`hidden` / `profileSharing`). An item without
+/// any of the three stamps the empty object — the probed-absent marker an
+/// engine without the trio (the kt-engine read face today) legitimately
+/// leaves, so the probe never re-fires for that row.
+fn mrr_factors_stamp(item: &Value) -> String {
+    let mut object = serde_json::Map::new();
+    for (stored, upstream) in [
+        ("hidden", "isHidden"),
+        ("profileSharing", "profileSharing"),
+        ("blocked", "isBlocked"),
+    ] {
+        if let Some(flag) = item.get(upstream).and_then(Value::as_bool) {
+            object.insert(stored.to_string(), Value::Bool(flag));
+        }
+    }
+    Value::Object(object).to_string()
+}
+
 fn display_name_from_contacts(result: &Value, number: &str) -> Option<String> {
     let items = result.as_array()?;
     let item = items
@@ -5349,6 +5424,42 @@ mod tests {
             compose_contact_display_name(&item).as_deref(),
             Some("Ada Lovelace")
         );
+    }
+
+    /// Contract 1.65 (§4.58): the factor stamp serializes exactly the flags
+    /// the engine item exposed — upstream `JsonContact` names minus the `is`
+    /// prefix — and an item without any of the three stamps the honest
+    /// probed-absent `{}` so the probe never re-fires for the row.
+    #[test]
+    fn mrr_factor_stamp_carries_exactly_the_exposed_flags() {
+        use super::{contact_item_peer_key, mrr_factors_stamp};
+        let signal_cli = json!({
+            "number": "+15555550101",
+            "isBlocked": false,
+            "isHidden": true,
+            "profileSharing": false
+        });
+        assert_eq!(
+            mrr_factors_stamp(&signal_cli),
+            r#"{"blocked":false,"hidden":true,"profileSharing":false}"#
+        );
+        assert_eq!(contact_item_peer_key(&signal_cli), Some("+15555550101"));
+
+        let kt_engine = json!({ "number": "+15555550102", "name": "Peer" });
+        assert_eq!(mrr_factors_stamp(&kt_engine), "{}");
+        assert_eq!(contact_item_peer_key(&kt_engine), Some("+15555550102"));
+
+        // The address ladder: number wins before uuid, the numberUuid tail
+        // included; an identity-less item contributes nothing.
+        let uuid_only = json!({
+            "uuid": "abcd1234-0000-0000-0000-000000000000",
+            "numberUuid": "abcd1234-0000-0000-0000-000000000001"
+        });
+        assert_eq!(
+            contact_item_peer_key(&uuid_only),
+            Some("abcd1234-0000-0000-0000-000000000000")
+        );
+        assert_eq!(contact_item_peer_key(&json!({"name": "x"})), None);
     }
 
     #[tokio::test]

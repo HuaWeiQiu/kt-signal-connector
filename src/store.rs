@@ -13,7 +13,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   muted INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   expire_timer_seconds INTEGER,
+  mrr_factors_json TEXT,
   UNIQUE(account_id, kind, peer_key),
   FOREIGN KEY(account_id) REFERENCES accounts(id)
 );
@@ -481,6 +482,24 @@ pub struct ConversationSummary {
     /// hosts read byte-identical summaries.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_terminated: bool,
+    /// Contract 1.65 (§4.58): the conversation's message-request accepted
+    /// state, derived at read time with the official
+    /// `isConversationAccepted` factor weights over the material this chain
+    /// can honestly see: the row's stored engine factors
+    /// (`mrr_factors_json` — the {hidden, profileSharing, blocked} trio the
+    /// throttled listContacts enrich stamps, or the probed-absent `{}`), the
+    /// message window (any data row / any outgoing row), and the row's own
+    /// is_self. Always serialized (bare bool, the muted/pinned/isSelf
+    /// discipline): both values are meaningful — the desktop consumes the key
+    /// as authoritative and keeps its local window derivation only for
+    /// pre-1.65 connectors where the key is absent. Honest per-factor holes,
+    /// each collapsed to inactive (documented in §4.58): the ACCEPT response
+    /// stamp (no engine projects the syncMessage face on the JSON-RPC wire),
+    /// `messageCountBeforeMessageRequests` (upstream never projects it), and
+    /// for groups `profileSharing`/`addedBy`/`pendingAdminApprovalV2` (no
+    /// engine read face) — a group row therefore derives accepted from its
+    /// own outgoing window alone.
+    pub message_request_accepted: bool,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -544,6 +563,140 @@ fn extra_is_terminated(extra: Option<&str>) -> bool {
         .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
         .and_then(|extra| extra.get("isTerminated").and_then(Value::as_bool))
         == Some(true)
+}
+
+/// Contract 1.65 (§4.58): the engine-supplied message-request factor trio a
+/// conversation row's `mrr_factors_json` stores. Every member is optional:
+/// the stamp carries exactly what the engine answer exposed (the pinned
+/// signal-cli `listContacts` row always carries all three as booleans; an
+/// engine without the flags — the kt-engine read face today — stamps the
+/// empty object, every member absent).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MrrFactors {
+    /// The upstream contact's hidden bit (`JsonContact.isHidden`): true =
+    /// discovered but not in the phone's system contacts. Inverted it is the
+    /// official `isInSystemContacts` trusted-contact factor (direct rows
+    /// only).
+    hidden: Option<bool>,
+    /// The upstream contact's profile-sharing bit (`JsonContact.profileSharing`):
+    /// the official `profileSharing` whitelisted factor, the same bit the
+    /// official accept write flips upstream.
+    profile_sharing: Option<bool>,
+    /// The upstream contact's blocked bit (`JsonContact.isBlocked`). Carried
+    /// for the request-row family faces; the official
+    /// `isConversationAccepted` does not read it (blocked state rides the
+    /// §4.45/§4.47 blocked faces), so it never factors the derivation here.
+    blocked: Option<bool>,
+}
+
+/// Parse a row's stored factor stamp. NULL (never probed) and any malformed
+/// payload degrade to the all-absent default — a hostile or partial stamp can
+/// never fail a summary read, the §4.50 appendix discipline.
+fn mrr_factors_of(extra: Option<&str>) -> MrrFactors {
+    let Some(object) = extra
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return MrrFactors::default();
+    };
+    MrrFactors {
+        hidden: object.get("hidden").and_then(Value::as_bool),
+        profile_sharing: object.get("profileSharing").and_then(Value::as_bool),
+        blocked: object.get("blocked").and_then(Value::as_bool),
+    }
+}
+
+/// Contract 1.65 (§4.58): the message window a summary row derives its
+/// accepted state from — read over the caller's already-held connection
+/// guard. `has_data` mirrors the official `messageCount` factor (data rows
+/// only: system rows are not conversation content the request flow gates on,
+/// the same exclusion the wire `lastMessageDirection` makes); `has_outgoing`
+/// mirrors `sentMessageCount`. Both read as EXISTS so a bounded row scan
+/// answers, the same per-row lookup family the 1.27/1.60 projections run.
+/// Contract 1.65 (§4.58): the official `isConversationAccepted` factor
+/// weights (upstream `ts/util/isConversationAccepted.preload.ts:21-82`,
+/// AGPL read-only anchor) collapsed onto the material this chain can see.
+/// Weights kept 1:1 where a factor exists; absent factors collapse to
+/// inactive exactly as the official `(attr || 0)`-style defaults do:
+///
+/// - `isMe` → the row's is_self (always accepted).
+/// - `isEmptyPrivateConvo` → a direct row with an empty data window
+///   (official: an empty conversation never shows the request UI; groups
+///   need the whitelisted bit we cannot see, so an empty group stays
+///   pending — the honest factor hole).
+/// - `sentMessageCount > 0` → `has_outgoing`.
+/// - `profileSharing` / `isInSystemContacts` → the engine-supplied
+///   `profileSharing` / inverted `hidden` bits (direct rows only; groups
+///   are not contacts, no engine read face exists for either).
+/// - `messageRequestResponseType == ACCEPT` → inactive everywhere today: no
+///   pinned engine projects the `syncMessage.messageRequestResponse` face on
+///   the JSON-RPC wire (signal-cli 0.14.8 projects it only on its plain-text
+///   path; the kt-engine receive projection drops it), so an ACCEPT stamp
+///   has no honest source — recorded as the §4.58 engine gap, never
+///   invented.
+/// - `messageCountBeforeMessageRequests > 0` → inactive: upstream never
+///   projects the attr (it is official-desktop migration state).
+/// - `removalStage` → inactive by construction: the official factor only
+///   fires when the attr is DEFINED, and ours is never stored.
+/// - `addedBy` / `pendingAdminApprovalV2` (group trusted-contact factors) →
+///   inactive: no engine read face.
+fn derive_message_request_accepted(
+    kind: &str,
+    is_self: bool,
+    has_data: bool,
+    has_outgoing: bool,
+    factors: MrrFactors,
+) -> bool {
+    if is_self {
+        return true;
+    }
+    if kind == "direct" && !has_data {
+        return true;
+    }
+    has_outgoing
+        || factors.profile_sharing == Some(true)
+        || (kind == "direct" && factors.hidden == Some(false))
+}
+
+/// Contract 1.65 (§4.58): the accepted state for one conversation row — the
+/// stored factor stamp plus the message window in one guarded lookup, called
+/// from the post-map loops the 1.27/1.60 projections run (the row closures
+/// answer rusqlite, so the fallible derivation rides the already-held guard
+/// after the rows collect). Shared by the list page and the single-row
+/// summary so a reloaded window and an event-driven refresh can never
+/// disagree (the 1.60 discipline).
+fn conversation_message_request_accepted(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+    kind: &str,
+    is_self: bool,
+) -> Result<bool, StoreError> {
+    let (factors_json, has_data, has_outgoing): (Option<String>, i64, i64) = conn
+        .query_row(
+            "SELECT mrr_factors_json,
+               EXISTS(SELECT 1 FROM messages
+                      WHERE account_id=?2 AND conversation_id=?1
+                        AND direction IN ('incoming','outgoing')),
+               EXISTS(SELECT 1 FROM messages
+                      WHERE account_id=?2 AND conversation_id=?1 AND direction='outgoing')
+             FROM conversations WHERE id=?1 AND account_id=?2",
+            params![conversation_id, account_id],
+            |row| {
+                let factors_json: Option<String> = row.get(0)?;
+                let has_data: i64 = row.get(1)?;
+                let has_outgoing: i64 = row.get(2)?;
+                Ok((factors_json, has_data, has_outgoing))
+            },
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(derive_message_request_accepted(
+        kind,
+        is_self,
+        has_data != 0,
+        has_outgoing != 0,
+        mrr_factors_of(factors_json.as_deref()),
+    ))
 }
 
 /// Contract 1.60 (§4.54): the ids of the contacts-cache group rows whose last
@@ -1472,6 +1625,63 @@ impl Store {
         Ok(true)
     }
 
+    /// Contract 1.65 (§4.58): stamp one direct conversation's engine factor
+    /// trio (`mrr_factors_json`). The caller serializes exactly the flags the
+    /// engine answer exposed — the pinned signal-cli row always carries all
+    /// three booleans; an engine without the flags stamps the honest
+    /// probed-absent `{}` marker so the probe never re-fires for the row.
+    /// Direct rows only: groups are not contacts and carry no trio. Unstamped
+    /// rows stay NULL and are never backfilled.
+    pub fn set_conversation_mrr_factors_for_peer(
+        &self,
+        account_id: &str,
+        peer_key: &str,
+        factors_json: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET mrr_factors_json=?1
+                 WHERE account_id=?2 AND kind='direct' AND peer_key=?3",
+                params![factors_json, account_id, peer_key],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
+    /// Contract 1.65 (§4.58): how many direct conversation rows owe their
+    /// factor probe — never stamped (`mrr_factors_json IS NULL`) **and** the
+    /// only rows whose derivation can still flip on a stamp (a data window
+    /// with no outgoing row: empty windows are accepted by the official
+    /// empty-private-conversation weight and outgoing-bearing windows by
+    /// `sentMessageCount`, regardless of the factors). The throttled enrich
+    /// widens its trigger with this count so a derivability-critical fresh
+    /// row is probed on the next window even when every title is already
+    /// resolved; once every such row carries a stamp (values or the
+    /// probed-absent `{}` marker) the probe goes quiet and the enrich keeps
+    /// its no-engine-call fast path.
+    pub fn count_direct_conversations_without_mrr_factors(
+        &self,
+        account_id: &str,
+    ) -> Result<i64, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT count(*) FROM conversations c
+             WHERE c.account_id=?1 AND c.kind='direct' AND c.mrr_factors_json IS NULL
+               AND EXISTS(SELECT 1 FROM messages m
+                          WHERE m.account_id=c.account_id
+                            AND m.conversation_id=c.id
+                            AND m.direction IN ('incoming','outgoing'))
+               AND NOT EXISTS(SELECT 1 FROM messages m
+                              WHERE m.account_id=c.account_id
+                                AND m.conversation_id=c.id
+                                AND m.direction='outgoing')",
+            params![account_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     pub fn conversation_by_id(
         &self,
         account_id: &str,
@@ -1576,7 +1786,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key
+                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
+                        mrr_factors_json
                  FROM conversations
                  WHERE account_id=?1
                    AND (
@@ -1632,6 +1843,9 @@ impl Store {
                         // cache after the row maps (page lookup / single-row
                         // query below).
                         is_terminated: false,
+                        // Contract 1.65 (§4.58): derived after the row maps
+                        // (page lookup below), the same post-map loop.
+                        message_request_accepted: false,
                     })
                 },
             )
@@ -1647,6 +1861,16 @@ impl Store {
             item.last_message_author_name = meta.author_name;
             item.last_message_reactions = meta.reactions;
             item.pinned_message = pinned_message_for_conversation(&conn, account_id, &item.id)?;
+            // Contract 1.65 (§4.58): the same read-time accepted derivation
+            // the single-row summary applies, over the same held guard — a
+            // reloaded page and an event-driven window cannot disagree.
+            item.message_request_accepted = conversation_message_request_accepted(
+                &conn,
+                account_id,
+                &item.id,
+                item.kind,
+                item.is_self,
+            )?;
         }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
@@ -4076,6 +4300,9 @@ impl Store {
                         // cache after the row maps (page lookup / single-row
                         // query below).
                         is_terminated: false,
+                        // Contract 1.65 (§4.58): derived after the row maps
+                        // (single-row match below), the same post-map loop.
+                        message_request_accepted: false,
                     })
                 },
             )
@@ -4112,6 +4339,17 @@ impl Store {
                         .map(|extra| extra_is_terminated(Some(&extra)))
                         .unwrap_or(false);
                 }
+                // Contract 1.65 (§4.58): the same read-time accepted
+                // derivation the list applies — the summary that rides
+                // conversation.changed carries the key, so an event-driven
+                // window and a full reload cannot disagree.
+                summary.message_request_accepted = conversation_message_request_accepted(
+                    &conn,
+                    account_id,
+                    conversation_id,
+                    summary.kind,
+                    summary.is_self,
+                )?;
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -5397,6 +5635,27 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         if !table_has_column(conn, "messages", "live_attachment_locators")? {
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN live_attachment_locators TEXT",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
+    if current < 20 {
+        // Contract revision 1.65 (§4.58): message-request factor faces. One
+        // additive nullable JSON column on the conversation row — the
+        // engine-supplied {hidden, profileSharing, blocked} trio the
+        // throttled listContacts enrich stamps for direct conversations, or
+        // `{}` when the engine answered without any of the three flags (the
+        // honest probed-absent marker an engine without the trio leaves).
+        // NULL = never probed (fresh rows; the next enrich window
+        // stamps them). Never backfilled: the factor state a past engine
+        // answer carried is only known from that answer. The accepted value
+        // itself is never stored — it stays a read-time derivation over this
+        // column plus the message window (§4.58), so a factor refresh never
+        // needs a second migration.
+        if !table_has_column(conn, "conversations", "mrr_factors_json")? {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN mrr_factors_json TEXT",
                 [],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -11501,6 +11760,501 @@ mod tests {
             !store
                 .set_conversation_expire_timer(&account.id, "conv-absent", 60)
                 .unwrap()
+        );
+    }
+
+    // ---- Contract 1.65 (§4.58): message-request receive projection ----
+
+    fn mrr_record(
+        id: &str,
+        account_id: &str,
+        conversation_id: &str,
+        direction: &'static str,
+        sent_at: u64,
+    ) -> MessageRecord {
+        MessageRecord {
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction,
+            sender_id: if direction == "outgoing" {
+                "self".into()
+            } else {
+                "peer".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        }
+    }
+
+    /// A v19 store upgrades in place: the additive `mrr_factors_json` column
+    /// lands on `conversations`, existing rows stay NULL (never backfilled —
+    /// the factor state a past engine answer carried is only known from that
+    /// answer) and the version stamp moves to 20.
+    #[test]
+    fn schema_v20_upgrade_adds_mrr_factors_column() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '19');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               last_message_preview TEXT,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               unread_mentions INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               expire_timer_seconds INTEGER,
+               UNIQUE(account_id, kind, peer_key)
+             );
+             INSERT INTO conversations(id, account_id, kind, peer_key, title)
+               VALUES('conv-1', 'acc-1', 'direct', '+15555550101', 'peer');
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               attachment_locators TEXT,
+               live_attachment_locators TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "conversations", "mrr_factors_json").unwrap());
+        let stamped: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations WHERE id='conv-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stamped.is_none(), "history rows are never backfilled");
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The official `isConversationAccepted` factor weights on the material
+    /// this chain can see: self and empty direct rows are accepted; a
+    /// direct row with only incoming rows is pending until a stamped factor
+    /// (profileSharing, or the inverted hidden system-contact bit) or an
+    /// outgoing row accepts it; a group row derives from its outgoing window
+    /// alone (no engine read face for the group factors — the §4.58 holes).
+    #[test]
+    fn message_request_accepted_derives_official_factor_weights() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // An empty direct conversation is accepted (the official
+        // isEmptyPrivateConvo weight).
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+
+        // Only-incoming window, no stamp: the honest pending.
+        store
+            .insert_message(
+                &mrr_record("m-in", &account.id, &direct.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+
+        // profileSharing (the whitelisted bit) accepts it.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"profileSharing":true,"hidden":true,"blocked":false}"#,
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+
+        // hidden=false (a system contact) alone accepts it.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"hidden":false}"#,
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+
+        // hidden=true with no other factor flips back to pending.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"hidden":true}"#,
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+
+        // An outgoing row accepts it regardless of the factors
+        // (sentMessageCount > 0).
+        store
+            .insert_message(
+                &mrr_record("m-out", &account.id, &direct.id, "outgoing", 20),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+
+        // System-only additions change nothing (the window is data rows).
+        store
+            .insert_message(
+                &mrr_record("m-sys", &account.id, &direct.id, "system", 30),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+
+        // Self row: always accepted.
+        let self_row = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "self")
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-self", &account.id, &self_row.id, "incoming", 5),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &self_row.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.is_self);
+        assert!(summary.message_request_accepted);
+
+        // Groups: only the outgoing window (no engine read face for the
+        // group factors).
+        let group = store
+            .ensure_conversation(&account.id, "group", "group-key-1", "group")
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+        store
+            .insert_message(
+                &mrr_record("m-g-in", &account.id, &group.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+        store
+            .insert_message(
+                &mrr_record("m-g-out", &account.id, &group.id, "outgoing", 20),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.message_request_accepted);
+    }
+
+    /// The stamp degrades honestly: a malformed payload parses as the
+    /// all-absent default (never fails the read), and the blocked bit —
+    /// carried for the request-row family — never factors the derivation
+    /// (the official isConversationAccepted does not read it).
+    #[test]
+    fn message_request_stamp_degrades_and_blocked_never_factors() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-in", &account.id, &direct.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        // Blocked alone is not a factor.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"blocked":true}"#,
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+
+        // Malformed stamp degrades to absent.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(&account.id, "+15555550101", "not-json",)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.message_request_accepted);
+    }
+
+    /// The stamp targets direct rows only (groups carry no trio) and the
+    /// probe counter tracks exactly the derivability-critical rows — a
+    /// window with data and no outgoing row, never stamped. Empty windows
+    /// (accepted by the official empty-private-conversation weight) and
+    /// outgoing-bearing windows (accepted by `sentMessageCount`) are already
+    /// settled by the window weights alone, so they never owe a probe and a
+    /// fully probed account reads zero — the enrich keeps its engine-call
+    /// fast path.
+    #[test]
+    fn message_request_stamp_targets_direct_rows_and_probe_counter_tracks() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        // The group row exists so the kind='direct' guard on the stamp has a
+        // peer_key it could wrongly match if the guard were missing.
+        let _group = store
+            .ensure_conversation(&account.id, "group", "group-key-1", "group")
+            .unwrap();
+
+        // An empty window never owes a probe: the empty-private weight
+        // already answers accepted regardless of the factors.
+        assert_eq!(
+            store
+                .count_direct_conversations_without_mrr_factors(&account.id)
+                .unwrap(),
+            0
+        );
+        // An incoming-only data window is the derivability-critical shape.
+        store
+            .insert_message(
+                &mrr_record("m-probe", &account.id, &direct.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .count_direct_conversations_without_mrr_factors(&account.id)
+                .unwrap(),
+            1
+        );
+        // Group peers never take the stamp.
+        assert!(
+            !store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "group-key-1",
+                    r#"{"hidden":false}"#,
+                )
+                .unwrap()
+        );
+        // The self row also stamps (its derivation short-circuits, but the
+        // probe should go quiet).
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(&account.id, "+15555550101", r#"{}"#,)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .count_direct_conversations_without_mrr_factors(&account.id)
+                .unwrap(),
+            0
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        // The probed-absent `{}` marker: the factors stay inactive, so the
+        // incoming-only window keeps its pending answer (the honest
+        // derivation with the kt-engine read face).
+        assert!(!summary.message_request_accepted);
+    }
+
+    /// The wire key is a bare always-serialized bool (the muted/pinned/isSelf
+    /// discipline): both values ride every summary, so a desktop can treat
+    /// key-present as authoritative and key-absent (pre-1.65 connector) as
+    /// its local-derivation fallback.
+    #[test]
+    fn message_request_accepted_wire_key_always_serialized() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let pending = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-in", &account.id, &pending.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let accepted = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
+            .unwrap();
+
+        for (conversation, expected) in [(&pending, false), (&accepted, true)] {
+            let summary = store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap();
+            let wire = serde_json::to_value(&summary).unwrap();
+            assert_eq!(wire["messageRequestAccepted"], expected);
+        }
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let wire = serde_json::to_value(&page.items).unwrap();
+        let rows = wire.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row["messageRequestAccepted"].is_boolean())
         );
     }
 }
