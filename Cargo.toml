@@ -2,7 +2,7 @@
 name = "kt-signal-connector"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "AGPL-3.0-only"
 description = "Local, isolated Signal connector for KT Desktop"
 repository = "https://github.com/KTAIorg/kt-signal-connector"

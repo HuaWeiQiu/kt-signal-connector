@@ -33,6 +33,19 @@ const COMMAND_QUEUE_CAPACITY: usize = 128;
 /// queue answers Backpressure, the same admission failure as the pending map
 /// cap; the queue can only fill when the pipe itself is already full.
 pub const STDIN_WRITE_QUEUE_CAPACITY: usize = 16;
+/// Bounded queue of lines pumped from the child's stdout to the actor. The
+/// pump is the pipe's only reader (A7, symmetric with the stdin writer), so a
+/// burst of engine output parks the pump alone until the actor drains it;
+/// capacity bounds the buffered lines (each capped at `line_limit`).
+const STDOUT_LINE_QUEUE_CAPACITY: usize = 64;
+/// A line pumped off the child's stdout. `FramingError` marks a codec failure
+/// (oversized or malformed line); end-of-stream arrives as the channel
+/// closing, the same EOF signal the inline arm used to observe.
+#[derive(Debug, PartialEq)]
+enum PumpedLine {
+    Line(String),
+    FramingError,
+}
 const EVENT_QUEUE_CAPACITY: usize = 1024;
 const RECEIVE_QUEUE_CAPACITY: usize = 256;
 const RECEIVE_QUEUE_BYTE_CAPACITY: usize = 2 * 1024 * 1024;
@@ -929,6 +942,14 @@ impl EngineHandle {
         }
 
         let mut command = Command::new(&config.executable);
+        // The engine's stdout is an owned blocking pipe, not tokio's piped
+        // stdio: the read end is consumed by the dedicated blocking pump
+        // thread below, whose plain `read` cannot miss a readiness wakeup —
+        // engine output drains no matter what the async side is doing.
+        // Command holds the parent-side write end until dropped (end of this
+        // function), so the reader sees EOF when the child exits.
+        let (stdout_reader, stdout_writer) =
+            std::io::pipe().map_err(|_| EngineError::StartFailed)?;
         command
             .args(signal_cli_args(
                 config.mode,
@@ -937,7 +958,7 @@ impl EngineHandle {
                 config.media_ingest,
             ))
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .stdout(stdout_writer)
             .stderr(Stdio::piped())
             // The dev/test store-key override must never leak into the child's
             // environment (Phase 3: keys travel the bootstrap channel only).
@@ -961,7 +982,6 @@ impl EngineHandle {
 
         let pid = child.id().ok_or(EngineError::StartFailed)?;
         let stdin = child.stdin.take().ok_or(EngineError::StartFailed)?;
-        let stdout = child.stdout.take().ok_or(EngineError::StartFailed)?;
         let stderr = child.stderr.take().ok_or(EngineError::StartFailed)?;
         let child = Arc::new(Mutex::new(child));
         // The configured enqueue timeout is authoritative for every engine
@@ -985,6 +1005,17 @@ impl EngineHandle {
         let actor_events = events.clone();
         let stderr_lines = stderr_tx.clone();
         let actor_child = Arc::clone(&child);
+        // The stdout pump is a blocking OS thread: a blocking `read` cannot
+        // miss a readiness wakeup, and the engine's output must keep draining
+        // no matter what the async consumers of this pipe are doing. Lines
+        // are handed to the actor through a bounded queue; end-of-stream
+        // closes it, the same EOF signal the actor would observe inline.
+        let (stdout_tx, stdout_rx) = mpsc::channel::<PumpedLine>(STDOUT_LINE_QUEUE_CAPACITY);
+        let stdout_limit = config.line_limit;
+        std::thread::Builder::new()
+            .name(format!("engine-stdout-{pid}"))
+            .spawn(move || run_stdout_pump(stdout_reader, stdout_limit, stdout_tx))
+            .map_err(|_| EngineError::StartFailed)?;
         tokio::spawn(async move {
             let stderr_drain = tokio::spawn(async move {
                 // Forward signal-cli stderr line by line (bounded) so the watchdog can
@@ -1010,7 +1041,7 @@ impl EngineHandle {
             run_actor(
                 actor_child,
                 stdin,
-                stdout,
+                stdout_rx,
                 ActorChannels {
                     commands: command_rx,
                     status: status_tx,
@@ -1018,7 +1049,6 @@ impl EngineHandle {
                     receive_ingress,
                 },
                 ActorLimits {
-                    line_limit: config.line_limit,
                     shutdown_grace: config.shutdown_grace,
                 },
             )
@@ -1243,7 +1273,6 @@ struct PendingRequest {
 }
 
 struct ActorLimits {
-    line_limit: usize,
     shutdown_grace: Duration,
 }
 
@@ -1257,7 +1286,7 @@ struct ActorChannels {
 async fn run_actor(
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
-    stdout: tokio::process::ChildStdout,
+    mut lines: mpsc::Receiver<PumpedLine>,
     channels: ActorChannels,
     limits: ActorLimits,
 ) {
@@ -1277,7 +1306,6 @@ async fn run_actor(
     let (write_tx, write_rx) = mpsc::channel::<Vec<u8>>(STDIN_WRITE_QUEUE_CAPACITY);
     let (writer_failed_tx, mut writer_failed_rx) = mpsc::channel::<()>(1);
     let writer = tokio::spawn(run_stdin_writer(stdin, write_rx, writer_failed_tx));
-    let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(limits.line_limit));
     let mut pending = HashMap::<String, PendingRequest>::new();
     // Whether dropped receives have been reported as degraded storage; reset
     // when admission succeeds again so a `recovered` state is emitted once.
@@ -1359,9 +1387,9 @@ async fn run_actor(
                 terminal_state = EngineState::Exited;
                 break;
             }
-            line = lines.next() => {
+            line = lines.recv() => {
                 match line {
-                    Some(Ok(line)) => {
+                    Some(PumpedLine::Line(line)) => {
                         if handle_upstream_line(
                             &line,
                             &mut pending,
@@ -1373,10 +1401,13 @@ async fn run_actor(
                             break;
                         }
                     }
-                    Some(Err(_)) => {
+                    Some(PumpedLine::FramingError) => {
                         terminal_state = EngineState::Faulted;
                         break;
                     }
+                    // The pump returned: the child's stdout hit EOF, so the
+                    // child is gone or closed its output — same as the old
+                    // inline `None` arm.
                     None => {
                         terminal_state = EngineState::Exited;
                         break;
@@ -1456,6 +1487,99 @@ async fn run_stdin_writer(
             let _ = failed.try_send(());
             break;
         }
+    }
+}
+
+/// The engine's only stdout reader: a blocking OS thread. A blocking `read`
+/// delivers bytes regardless of any readiness-event machinery, so engine
+/// output drains even when the async side never observes a wakeup; the
+/// actor's queue arm (`PumpedLine`) is the only coupling. A full queue parks
+/// this thread alone (the same backpressure an inline reader had), a codec
+/// failure reports `FramingError` once, and end-of-stream closes the queue —
+/// the actor's EOF signal.
+fn run_stdout_pump(stdout: std::io::PipeReader, line_limit: usize, tx: mpsc::Sender<PumpedLine>) {
+    let mut reader = std::io::BufReader::new(stdout);
+    loop {
+        match read_bounded_line(&mut reader, line_limit) {
+            Ok(Some(line)) => {
+                if tx.blocking_send(line).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(BoundedLineError::Io(error)) => {
+                tracing::warn!(error = %error, "engine stdout pump read failed");
+                let _ = tx.blocking_send(PumpedLine::FramingError);
+                return;
+            }
+            Err(_) => {
+                let _ = tx.blocking_send(PumpedLine::FramingError);
+                return;
+            }
+        }
+    }
+}
+
+/// One newline-terminated line from a blocking reader, capped at `limit`
+/// bytes with the same observable behavior as the line codec it replaces: a
+/// partial final line at EOF is delivered, a trailing `\r` before the
+/// newline is stripped, a longer line or invalid UTF-8 is `FramingError`,
+/// and a clean EOF with nothing buffered is `None`.
+fn read_bounded_line(
+    reader: &mut impl std::io::BufRead,
+    limit: usize,
+) -> Result<Option<PumpedLine>, BoundedLineError> {
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(BoundedLineError::Io(error)),
+        };
+        if available.is_empty() {
+            // End of stream: an empty buffer ends the stream, a partial
+            // final line is delivered the way the codec's EOF decode did.
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line_from_buffer(line)?))
+            };
+        }
+        match available.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                if line.len() + newline > limit {
+                    return Err(BoundedLineError::TooLong);
+                }
+                line.extend_from_slice(&available[..newline]);
+                reader.consume(newline + 1);
+                return Ok(Some(line_from_buffer(line)?));
+            }
+            None => {
+                if line.len() + available.len() > limit {
+                    return Err(BoundedLineError::TooLong);
+                }
+                line.extend_from_slice(available);
+                let buffered = available.len();
+                reader.consume(buffered);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BoundedLineError {
+    TooLong,
+    InvalidUtf8,
+    Io(std::io::Error),
+}
+
+fn line_from_buffer(mut line: Vec<u8>) -> Result<PumpedLine, BoundedLineError> {
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    match String::from_utf8(line) {
+        Ok(text) => Ok(PumpedLine::Line(text)),
+        Err(_) => Err(BoundedLineError::InvalidUtf8),
     }
 }
 
@@ -3039,6 +3163,7 @@ pub fn event_channel() -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     #[test]
     fn socks_proxy_parse_accepts_host_port() {
@@ -5101,5 +5226,62 @@ mod tests {
         let rich = normalize.rich.expect("timer row carries rich");
         assert!(rich.is_expiration_update);
         assert!(!rich.is_group_update);
+    }
+
+    #[test]
+    fn stdout_pump_reader_frames_lines_strips_cr_and_delivers_eof_partial() {
+        let (pipe_reader, writer) = std::io::pipe().unwrap();
+        let mut reader = std::io::BufReader::new(pipe_reader);
+        {
+            let mut writer = writer;
+            writer.write_all(b"alpha\nbeta\r\ngamma-partial").unwrap();
+        }
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024).unwrap(),
+            Some(PumpedLine::Line("alpha".into()))
+        );
+        // A `\r` before the newline is transport padding, not content.
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024).unwrap(),
+            Some(PumpedLine::Line("beta".into()))
+        );
+        // A partial final line at EOF is delivered, then the stream ends.
+        assert_eq!(
+            read_bounded_line(&mut reader, 1024).unwrap(),
+            Some(PumpedLine::Line("gamma-partial".into()))
+        );
+        assert_eq!(read_bounded_line(&mut reader, 1024).unwrap(), None);
+    }
+
+    #[test]
+    fn stdout_pump_reader_allows_line_up_to_the_cap_and_rejects_longer() {
+        let (pipe_reader, writer) = std::io::pipe().unwrap();
+        let mut reader = std::io::BufReader::new(pipe_reader);
+        {
+            let mut writer = writer;
+            writer.write_all(b"12345678\n12345678901234\n").unwrap();
+        }
+        assert_eq!(
+            read_bounded_line(&mut reader, 8).unwrap(),
+            Some(PumpedLine::Line("12345678".into()))
+        );
+        assert!(matches!(
+            read_bounded_line(&mut reader, 8),
+            Err(BoundedLineError::TooLong)
+        ));
+    }
+
+    #[test]
+    fn stdout_pump_reader_rejects_invalid_utf8_as_framing_error() {
+        let (pipe_reader, writer) = std::io::pipe().unwrap();
+        let mut reader = std::io::BufReader::new(pipe_reader);
+        {
+            let mut writer = writer;
+            writer.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        }
+        assert!(matches!(
+            read_bounded_line(&mut reader, 1024),
+            Err(BoundedLineError::InvalidUtf8)
+        ));
     }
 }

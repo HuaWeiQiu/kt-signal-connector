@@ -463,7 +463,8 @@ pub fn decrypt_to_file(
 ) -> Result<u64, DownloadFailure> {
     let mut reader = File::open(ciphertext_path).map_err(|_| DownloadFailure::Io)?;
     let total = reader.metadata().map_err(|_| DownloadFailure::Io)?.len();
-    if total < MIN_BODY_BYTES || (total - IV_LENGTH as u64 - MAC_LENGTH as u64) % 16 != 0 {
+    if total < MIN_BODY_BYTES || !(total - IV_LENGTH as u64 - MAC_LENGTH as u64).is_multiple_of(16)
+    {
         return Err(DownloadFailure::BadPadding);
     }
     let ciphertext_len = total - IV_LENGTH as u64 - MAC_LENGTH as u64;

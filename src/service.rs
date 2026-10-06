@@ -7338,7 +7338,7 @@ fn validate_attachment_send_payload(
     expected_size_bytes: u64,
 ) -> Result<(), ServiceError> {
     validate_attachment_payload(base64_data, expected_size_bytes)?;
-    if base64_data.len() % 4 != 0 {
+    if !base64_data.len().is_multiple_of(4) {
         return Err(ServiceError::Api(ApiError::new(
             "INVALID_REQUEST",
             "attachment payload is not canonical base64",
@@ -7404,7 +7404,7 @@ pub(crate) fn base64_decode_to_vec(input: &str, out: &mut Vec<u8>) -> Result<(),
         }
     }
     let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(());
     }
     let padding = bytes.iter().rev().take_while(|&&b| b == b'=').count();
@@ -7524,7 +7524,7 @@ fn validate_sticker_pack_id(pack_id: &str) -> Result<(), ServiceError> {
     let count = pack_id.chars().count();
     if count == 0
         || count > MAX_STICKER_PACK_ID_CHARS
-        || count % 2 != 0
+        || !count.is_multiple_of(2)
         || !pack_id.chars().all(|c| c.is_ascii_hexdigit())
     {
         return Err(ServiceError::Api(ApiError::new(

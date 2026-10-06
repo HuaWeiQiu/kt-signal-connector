@@ -242,8 +242,20 @@ threading.Thread(target=watch_load_marker, daemon=True).start()
 # later write injects again.
 EMIT_MARKER = SIGNAL_DATA_DIR / ".fixture-emit-envelopes.json"
 
+# --- flake instrumentation (temporary) ---
+_flake_log_path = Path(f"/tmp/kt-fixture-debug-{os.getpid()}.log")
+
+
+def flake_log(msg):
+    try:
+        with _flake_log_path.open("a") as handle:
+            handle.write(f"{time.time():.6f} pid={os.getpid()} {msg}\n")
+    except OSError:
+        pass
+
 
 def watch_emit_marker():
+    flake_log("emit-marker watcher started")
     while True:
         try:
             spec = json.loads(EMIT_MARKER.read_text())
@@ -253,7 +265,9 @@ def watch_emit_marker():
         envelopes = spec.get("envelopes") if isinstance(spec, dict) else None
         if isinstance(envelopes, list) and envelopes:
             account = spec.get("account") or receiving_account()
-            for envelope in envelopes:
+            flake_log(f"marker consumed: {len(envelopes)} envelopes -> {account}")
+            for index, envelope in enumerate(envelopes):
+                flake_log(f"emit begin {index} ts={envelope.get('timestamp')}")
                 emit_json(
                     {
                         "jsonrpc": "2.0",
@@ -261,6 +275,8 @@ def watch_emit_marker():
                         "params": {"account": account, "envelope": envelope},
                     }
                 )
+                flake_log(f"emit done {index} ts={envelope.get('timestamp')}")
+            flake_log("marker envelopes emitted")
         try:
             EMIT_MARKER.unlink()
         except OSError:

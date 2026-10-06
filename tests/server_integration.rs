@@ -8807,7 +8807,11 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     assert_eq!(
         incoming.len(),
         2,
-        "both signaling frames must arrive: {incoming:?}"
+        "both signaling frames must arrive: {incoming:?} (marker still present: {})",
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json")
+            .exists()
     );
     assert_eq!(incoming[0]["accountId"], account_id);
     assert_eq!(incoming[0]["conversationId"], conversation_id);
