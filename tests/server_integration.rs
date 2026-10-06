@@ -345,13 +345,13 @@ async fn phase2_link_receive_send_and_idempotent_text() {
     let mut response_order = Vec::new();
     while response_order.len() < 3 {
         let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if let Some(request_id) = response.get("requestId").and_then(Value::as_str) {
-            if matches!(
+        if let Some(request_id) = response.get("requestId").and_then(Value::as_str)
+            && matches!(
                 request_id,
                 "send-slow" | "send-after-slow" | "msg-concurrent"
-            ) {
-                response_order.push(request_id.to_string());
-            }
+            )
+        {
+            response_order.push(request_id.to_string());
         }
     }
     assert_eq!(
@@ -4120,10 +4120,10 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
     let send_log_path = signal_data.join(".fixture-send-log.jsonl");
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(contents) = fs::read_to_string(&send_log_path) {
-                if receipt_log_lines(&contents).len() >= 3 {
-                    break;
-                }
+            if let Ok(contents) = fs::read_to_string(&send_log_path)
+                && receipt_log_lines(&contents).len() >= 3
+            {
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -8254,15 +8254,15 @@ async fn view_once_send_mark_open_and_sync_burn_reach_the_upstream() {
     let sent_row_id = sent["result"]["id"].as_str().unwrap().to_string();
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(log) = read_send_log(&signal_data).await {
-                if !log.view_once_send_lines().is_empty() {
-                    assert_eq!(log.view_once_send_lines()[0]["viewOnce"], true);
-                    assert_eq!(
-                        log.view_once_send_lines()[0]["recipient"],
-                        json!(["+15555550101"])
-                    );
-                    break;
-                }
+            if let Some(log) = read_send_log(&signal_data).await
+                && !log.view_once_send_lines().is_empty()
+            {
+                assert_eq!(log.view_once_send_lines()[0]["viewOnce"], true);
+                assert_eq!(
+                    log.view_once_send_lines()[0]["recipient"],
+                    json!(["+15555550101"])
+                );
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -8273,10 +8273,10 @@ async fn view_once_send_mark_open_and_sync_burn_reach_the_upstream() {
     // The finish burst's auto delivery receipts: one per incoming dataMessage.
     timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(log) = read_send_log(&signal_data).await {
-                if log.receipt_lines().len() >= 2 {
-                    break;
-                }
+            if let Some(log) = read_send_log(&signal_data).await
+                && log.receipt_lines().len() >= 2
+            {
+                break;
             }
             sleep(Duration::from_millis(20)).await;
         }

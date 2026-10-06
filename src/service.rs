@@ -292,14 +292,14 @@ impl ServiceError {
                 // payload. Every other allowlisted code keeps the fixed
                 // content-free face below; their data (if any) is dropped
                 // here rather than leaking engine internals unpromised.
-                if code == "PROFILE_UPLOAD_FAILED" {
-                    if let Some(data) = data {
-                        return ApiError::with_data(
-                            "PROFILE_UPLOAD_FAILED",
-                            "the profile avatar upload failed after the text face was saved",
-                            data,
-                        );
-                    }
+                if code == "PROFILE_UPLOAD_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "PROFILE_UPLOAD_FAILED",
+                        "the profile avatar upload failed after the text face was saved",
+                        data,
+                    );
                 }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
@@ -1536,10 +1536,10 @@ impl ConnectorService {
             validate_attachment_descriptor(entry.filename.as_deref(), "filename")?;
             validate_attachment_content_type(entry.content_type.as_deref())?;
         }
-        if let Some(caption) = text {
-            if !caption.is_empty() {
-                validate_text(caption)?;
-            }
+        if let Some(caption) = text
+            && !caption.is_empty()
+        {
+            validate_text(caption)?;
         }
         validate_opaque_id(client_request_id, "clientRequestId")?;
         if let Some(quote) = quote_message_id {
@@ -1762,13 +1762,12 @@ impl ConnectorService {
         let inserted = self
             .store
             .insert_message(&pending, Some(client_request_id), None, false)?;
-        if !inserted {
-            if let Some(existing) = self
+        if !inserted
+            && let Some(existing) = self
                 .store
                 .message_by_client_request(account_id, client_request_id)?
-            {
-                return Ok(PreparedSend::Existing(Box::new(existing)));
-            }
+        {
+            return Ok(PreparedSend::Existing(Box::new(existing)));
         }
         // Upstream shape (official `sendStickerMessage`): the sticker object
         // with the image re-encoded as a data URI, plus the shared upstream
@@ -1902,13 +1901,12 @@ impl ConnectorService {
             preview.as_deref(),
             false,
         )?;
-        if !inserted {
-            if let Some(existing) = self
+        if !inserted
+            && let Some(existing) = self
                 .store
                 .message_by_client_request(account_id, client_request_id)?
-            {
-                return Ok(PreparedSend::Existing(Box::new(existing)));
-            }
+        {
+            return Ok(PreparedSend::Existing(Box::new(existing)));
         }
 
         let params = Self::upstream_text_send_params(
@@ -2706,14 +2704,14 @@ impl ConnectorService {
                 false,
             )));
         }
-        if let Some(mode) = params.phone_number_sharing_mode.as_deref() {
-            if !matches!(mode, "everybody" | "nobody") {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "phoneNumberSharingMode must be 'everybody' or 'nobody'",
-                    false,
-                )));
-            }
+        if let Some(mode) = params.phone_number_sharing_mode.as_deref()
+            && !matches!(mode, "everybody" | "nobody")
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "phoneNumberSharingMode must be 'everybody' or 'nobody'",
+                false,
+            )));
         }
         let account = self.resolve_account(&params.account_id)?;
         let mut upstream = json!({ "account": account.signal_account });
@@ -2750,32 +2748,32 @@ impl ConnectorService {
                 false,
             )));
         }
-        if let Some(family_name) = params.family_name.as_deref() {
-            if family_name.len() > MAX_PROFILE_NAME_BYTES {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "familyName must contain at most 128 bytes",
-                    false,
-                )));
-            }
+        if let Some(family_name) = params.family_name.as_deref()
+            && family_name.len() > MAX_PROFILE_NAME_BYTES
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "familyName must contain at most 128 bytes",
+                false,
+            )));
         }
-        if let Some(about) = params.about.as_deref() {
-            if about.len() > MAX_PROFILE_ABOUT_BYTES {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "about must contain at most 512 bytes",
-                    false,
-                )));
-            }
+        if let Some(about) = params.about.as_deref()
+            && about.len() > MAX_PROFILE_ABOUT_BYTES
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "about must contain at most 512 bytes",
+                false,
+            )));
         }
-        if let Some(emoji) = params.emoji.as_deref() {
-            if emoji.len() > MAX_EMOJI_BYTES {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "emoji must contain at most 32 bytes",
-                    false,
-                )));
-            }
+        if let Some(emoji) = params.emoji.as_deref()
+            && emoji.len() > MAX_EMOJI_BYTES
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "emoji must contain at most 32 bytes",
+                false,
+            )));
         }
         let avatar = match &params.avatar {
             None => AvatarUpdate::Keep,
@@ -3282,14 +3280,14 @@ impl ConnectorService {
             )));
         }
         let legacy_face = matches!(signal_type, "busy" | "hangup") && payload.is_none();
-        if let Some(payload) = payload {
-            if payload.is_empty() || payload.chars().count() > MAX_CALL_SIGNAL_PAYLOAD_CHARS {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "payload must contain between 1 and 3145728 characters",
-                    false,
-                )));
-            }
+        if let Some(payload) = payload
+            && (payload.is_empty() || payload.chars().count() > MAX_CALL_SIGNAL_PAYLOAD_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "payload must contain between 1 and 3145728 characters",
+                false,
+            )));
         }
         // The urgency face (1.53): absent/null = the engine's droppable
         // default; otherwise the two-value enum, anything else refuses before
@@ -5221,13 +5219,11 @@ impl ConnectorService {
                     &conversation.id,
                     &target_author,
                     target_timestamp,
-                )? {
-                    if let Some(summary) = self
-                        .store
-                        .conversation_summary(&account.id, &conversation.id)?
-                    {
-                        events.push(HostSideEvent::ConversationChanged(summary));
-                    }
+                )? && let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
                 }
                 Ok(events)
             }
@@ -7475,10 +7471,10 @@ fn normalize_send_preview(
         .description
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
-    if let Some(description) = &description {
-        if description.len() > MAX_PREVIEW_DESCRIPTION_BYTES {
-            return invalid("preview description must contain at most 4096 bytes");
-        }
+    if let Some(description) = &description
+        && description.len() > MAX_PREVIEW_DESCRIPTION_BYTES
+    {
+        return invalid("preview description must contain at most 4096 bytes");
     }
     if let Some(image) = &preview.image_data_uri {
         if !image.starts_with("data:image/") {
@@ -7565,16 +7561,15 @@ fn validate_username_shape(username: &str) -> Result<(), ServiceError> {
             ));
         }
     }
-    if let Some(discriminator) = discriminator {
-        if discriminator.is_empty()
+    if let Some(discriminator) = discriminator
+        && (discriminator.is_empty()
             || !discriminator.bytes().all(|byte| byte.is_ascii_digit())
             || discriminator.starts_with("00")
-            || (discriminator.starts_with('0') && discriminator.len() != 2)
-        {
-            return Err(invalid(
-                "username discriminator must be all digits without leading zeros (a single leading zero is allowed only as exactly two digits)",
-            ));
-        }
+            || (discriminator.starts_with('0') && discriminator.len() != 2))
+    {
+        return Err(invalid(
+            "username discriminator must be all digits without leading zeros (a single leading zero is allowed only as exactly two digits)",
+        ));
     }
     Ok(())
 }

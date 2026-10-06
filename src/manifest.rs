@@ -165,10 +165,10 @@ impl RuntimeManifest {
                 return Err(ManifestError::Invalid);
             }
         }
-        if let Some(source) = &self.source_archive {
-            if !declared.contains(&source.path.as_str()) {
-                return Err(ManifestError::Invalid);
-            }
+        if let Some(source) = &self.source_archive
+            && !declared.contains(&source.path.as_str())
+        {
+            return Err(ManifestError::Invalid);
         }
         Ok(())
     }

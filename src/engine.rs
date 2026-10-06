@@ -2611,12 +2611,12 @@ fn group_update_rich(group_name: Option<String>) -> NormalizedRich {
 /// Our own multi-device control echo inside `syncMessage.sentMessage`: edit /
 /// remote delete / reaction of an earlier message we sent from the phone.
 fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
-    if let Some(edit) = sent.get("editMessage").and_then(Value::as_object) {
-        if let Some(target) = edit.get("targetSentTimestamp").and_then(Value::as_u64) {
-            return Some(ControlReceive::Edit {
-                target_timestamp: target,
-            });
-        }
+    if let Some(edit) = sent.get("editMessage").and_then(Value::as_object)
+        && let Some(target) = edit.get("targetSentTimestamp").and_then(Value::as_u64)
+    {
+        return Some(ControlReceive::Edit {
+            target_timestamp: target,
+        });
     }
     if let Some(target) = sent
         .get("remoteDelete")
@@ -2792,21 +2792,24 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 });
             // Our own multi-device edit / delete / reaction of an earlier
             // message mirrors as a control receive keyed by its target.
-            if text.is_none() && quote.is_none() && attachments.is_empty() && rich.is_none() {
-                if let Some(control) = sync_sent_control(sent) {
-                    return Ok(make(
-                        sent.get("timestamp").and_then(Value::as_u64).or(timestamp),
-                        "control",
-                        "outgoing",
-                        destination,
-                        group_id,
-                        None,
-                        None,
-                        Vec::new(),
-                        None,
-                        Some(control),
-                    ));
-                }
+            if text.is_none()
+                && quote.is_none()
+                && attachments.is_empty()
+                && rich.is_none()
+                && let Some(control) = sync_sent_control(sent)
+            {
+                return Ok(make(
+                    sent.get("timestamp").and_then(Value::as_u64).or(timestamp),
+                    "control",
+                    "outgoing",
+                    destination,
+                    group_id,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    Some(control),
+                ));
             }
             let sent_ts = sent.get("timestamp").and_then(Value::as_u64).or(timestamp);
             // Our own device set the conversation's disappearing timer (the

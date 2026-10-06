@@ -309,10 +309,10 @@ async fn proxy_groups_launch_route_and_fail_closed_end_to_end() {
     let mut responses = HashMap::new();
     while responses.len() < 2 {
         let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if let Some(id) = frame.get("requestId").and_then(Value::as_str) {
-            if id == "link-a" || id == "link-b" {
-                responses.insert(id.to_string(), frame.clone());
-            }
+        if let Some(id) = frame.get("requestId").and_then(Value::as_str)
+            && (id == "link-a" || id == "link-b")
+        {
+            responses.insert(id.to_string(), frame.clone());
         }
     }
     let start_a = &responses["link-a"];

@@ -508,7 +508,7 @@ pub fn decrypt_to_file(
         if decryptable > 0 {
             let byte_count = decryptable * 16;
             let (blocks, _) = carry.split_at_mut(byte_count);
-            for block in blocks.chunks_exact_mut(16) {
+            for block in blocks.as_chunks_mut::<16>().0 {
                 decipher.decrypt_block_mut(GenericArray::from_mut_slice(block));
             }
             emit(&mut writer, &mut hasher, &mut kept, size, blocks)?;

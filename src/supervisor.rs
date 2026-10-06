@@ -968,10 +968,10 @@ impl RuntimeSupervisor {
 
     pub async fn start(&self) -> Result<EngineStatus, EngineError> {
         let mut slot = self.engine.lock().await;
-        if let Some(engine) = slot.as_ref() {
-            if !engine.is_terminal() {
-                return Err(EngineError::Backpressure);
-            }
+        if let Some(engine) = slot.as_ref()
+            && !engine.is_terminal()
+        {
+            return Err(EngineError::Backpressure);
         }
         let engine = EngineHandle::start(
             self.config.clone(),
@@ -1099,10 +1099,9 @@ impl RuntimeSupervisor {
                 CallClass::ReadOnly,
             )
             .await
+            && let Some(name) = display_name_from_contacts(&result, number)
         {
-            if let Some(name) = display_name_from_contacts(&result, number) {
-                return Some(name);
-            }
+            return Some(name);
         }
         if let Ok(result) = engine
             .call(
@@ -1114,10 +1113,9 @@ impl RuntimeSupervisor {
                 CallClass::ReadOnly,
             )
             .await
+            && let Some(name) = display_name_from_contacts(&result, number)
         {
-            if let Some(name) = display_name_from_contacts(&result, number) {
-                return Some(name);
-            }
+            return Some(name);
         }
         None
     }
@@ -1276,17 +1274,15 @@ impl RuntimeSupervisor {
             service.complete_link_session(&link_session_id, number, &self.group_id)?
         };
         // Refresh profile display name right after link (best-effort).
-        if let Ok(engine) = self.running_engine().await {
-            if let Some(name) = self.fetch_self_display_name(&engine, number).await {
-                if let Ok(updated) = self
-                    .service
-                    .lock()
-                    .await
-                    .set_account_display_name(&account.id, Some(name.as_str()))
-                {
-                    account = updated;
-                }
-            }
+        if let Ok(engine) = self.running_engine().await
+            && let Some(name) = self.fetch_self_display_name(&engine, number).await
+            && let Ok(updated) = self
+                .service
+                .lock()
+                .await
+                .set_account_display_name(&account.id, Some(name.as_str()))
+        {
+            account = updated;
         }
         // Best-effort initial contacts/groups sync right after link: signal-cli
         // has already pulled them from the primary device, so this only reads
@@ -4094,15 +4090,15 @@ impl RuntimeSupervisor {
         let now_ms = crate::link::now_ms();
         {
             let service = self.service.lock().await;
-            if let Some(synced_at) = service.contacts_synced_at(account_id)? {
-                if now_ms.saturating_sub(synced_at) < 60_000 {
-                    let (contact_count, group_count) = service.count_contacts(account_id)?;
-                    return Ok(ContactsSyncOutcome {
-                        contact_count,
-                        group_count,
-                        synced_at,
-                    });
-                }
+            if let Some(synced_at) = service.contacts_synced_at(account_id)?
+                && now_ms.saturating_sub(synced_at) < 60_000
+            {
+                let (contact_count, group_count) = service.count_contacts(account_id)?;
+                return Ok(ContactsSyncOutcome {
+                    contact_count,
+                    group_count,
+                    synced_at,
+                });
             }
         }
         let engine = self.running_engine().await?;
@@ -4936,13 +4932,13 @@ fn export_status_idle_projection(
         "artifactPresent": false,
         "snapshots": snapshots,
     });
-    if let Some(dir) = &account_dir {
-        if let Some(entry) = crate::backup_export::latest_snapshot(dir) {
-            result["snapshot"] = json!({
-                "name": entry.name,
-                "mainBytes": entry.main_bytes,
-            });
-        }
+    if let Some(dir) = &account_dir
+        && let Some(entry) = crate::backup_export::latest_snapshot(dir)
+    {
+        result["snapshot"] = json!({
+            "name": entry.name,
+            "mainBytes": entry.main_bytes,
+        });
     }
     Ok(result)
 }

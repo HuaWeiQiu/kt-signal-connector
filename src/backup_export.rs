@@ -362,15 +362,15 @@ fn record_roster_members(
             continue;
         }
         let mut identity = peer_identity(base, aci_by_peer);
-        if identity.aci.is_none() {
-            if let Some(form) = raw_forms.iter().find(|form| parse_aci(form).is_some()) {
-                identity.aci = parse_aci(form);
-            }
+        if identity.aci.is_none()
+            && let Some(form) = raw_forms.iter().find(|form| parse_aci(form).is_some())
+        {
+            identity.aci = parse_aci(form);
         }
-        if identity.e164.is_none() {
-            if let Some(form) = raw_forms.iter().find(|form| parse_e164(form).is_some()) {
-                identity.e164 = parse_e164(form);
-            }
+        if identity.e164.is_none()
+            && let Some(form) = raw_forms.iter().find(|form| parse_e164(form).is_some())
+        {
+            identity.e164 = parse_e164(form);
         }
         record_contact(contacts, identity, None, &raw_forms);
     }

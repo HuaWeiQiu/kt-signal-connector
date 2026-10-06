@@ -1555,10 +1555,10 @@ impl Store {
     ) -> Result<ConversationRow, StoreError> {
         if let Some(existing) = self.conversation_by_peer(account_id, kind, peer_key)? {
             // Upgrade masked/placeholder titles when we learn a real display name.
-            if let Some(current) = self.conversation_title(&existing.id)? {
-                if title_should_upgrade(&current, title) {
-                    let _ = self.set_conversation_title(&existing.id, title);
-                }
+            if let Some(current) = self.conversation_title(&existing.id)?
+                && title_should_upgrade(&current, title)
+            {
+                let _ = self.set_conversation_title(&existing.id, title);
             }
             return Ok(existing);
         }
@@ -4440,15 +4440,15 @@ impl Store {
                         )
                         .optional()
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                    if let Some(current) = existing {
-                        if title_should_upgrade(&current, entry.title) {
-                            transaction
-                                .execute(
-                                    "UPDATE conversations SET title=?2 WHERE id=?1",
-                                    params![id, entry.title],
-                                )
-                                .map_err(|error| StoreError::Unavailable(Some(error)))?;
-                        }
+                    if let Some(current) = existing
+                        && title_should_upgrade(&current, entry.title)
+                    {
+                        transaction
+                            .execute(
+                                "UPDATE conversations SET title=?2 WHERE id=?1",
+                                params![id, entry.title],
+                            )
+                            .map_err(|error| StoreError::Unavailable(Some(error)))?;
                     }
                 }
             }

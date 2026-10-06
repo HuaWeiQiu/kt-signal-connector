@@ -2497,10 +2497,10 @@ impl RecentRequestIds {
         if self.set.contains(&id) {
             return false;
         }
-        if self.order.len() == RECENT_REQUEST_IDS {
-            if let Some(expired) = self.order.pop_front() {
-                self.set.remove(&expired);
-            }
+        if self.order.len() == RECENT_REQUEST_IDS
+            && let Some(expired) = self.order.pop_front()
+        {
+            self.set.remove(&expired);
         }
         self.set.insert(id.clone());
         self.order.push_back(id);

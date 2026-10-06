@@ -251,10 +251,10 @@ async fn download_chain_lands_the_plaintext_where_media_open_reads_it() {
         let messages = store
             .list_messages(&seeded.id, &conversation_id, 10, None)
             .unwrap();
-        if let Some(row) = messages.items.first() {
-            if !row.attachments.is_empty() {
-                break (row.id.clone(), row.attachments[0].id.clone());
-            }
+        if let Some(row) = messages.items.first()
+            && !row.attachments.is_empty()
+        {
+            break (row.id.clone(), row.attachments[0].id.clone());
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -358,10 +358,10 @@ async fn a_digest_mismatch_is_terminal_with_no_file_left_behind() {
         let messages = store
             .list_messages(&seeded.id, &conversation_id, 10, None)
             .unwrap();
-        if let Some(row) = messages.items.first() {
-            if !row.attachments.is_empty() {
-                break (row.id.clone(), row.attachments[0].id.clone());
-            }
+        if let Some(row) = messages.items.first()
+            && !row.attachments.is_empty()
+        {
+            break (row.id.clone(), row.attachments[0].id.clone());
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -444,10 +444,10 @@ async fn plaintext_hash_only_rows_download_and_mismatch_is_terminal() {
         let messages = store
             .list_messages(&seeded.id, &conversation_id, 10, None)
             .unwrap();
-        if let Some(row) = messages.items.first() {
-            if !row.attachments.is_empty() {
-                break (row.id.clone(), row.attachments[0].id.clone());
-            }
+        if let Some(row) = messages.items.first()
+            && !row.attachments.is_empty()
+        {
+            break (row.id.clone(), row.attachments[0].id.clone());
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -549,10 +549,10 @@ async fn locator_holes_answer_invalid_request_before_any_network() {
             let messages = store
                 .list_messages(&seeded.id, &conversation_id, 10, None)
                 .unwrap();
-            if let Some(row) = messages.items.first() {
-                if !row.attachments.is_empty() {
-                    break (row.id.clone(), row.attachments[0].id.clone());
-                }
+            if let Some(row) = messages.items.first()
+                && !row.attachments.is_empty()
+            {
+                break (row.id.clone(), row.attachments[0].id.clone());
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -623,10 +623,10 @@ async fn a_hmac_mismatch_is_terminal() {
         let messages = store
             .list_messages(&seeded.id, &conversation_id, 10, None)
             .unwrap();
-        if let Some(row) = messages.items.first() {
-            if !row.attachments.is_empty() {
-                break (row.id.clone(), row.attachments[0].id.clone());
-            }
+        if let Some(row) = messages.items.first()
+            && !row.attachments.is_empty()
+        {
+            break (row.id.clone(), row.attachments[0].id.clone());
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -691,10 +691,10 @@ async fn cdn_404_is_terminal() {
         let messages = store
             .list_messages(&seeded.id, &conversation_id, 10, None)
             .unwrap();
-        if let Some(row) = messages.items.first() {
-            if !row.attachments.is_empty() {
-                break (row.id.clone(), row.attachments[0].id.clone());
-            }
+        if let Some(row) = messages.items.first()
+            && !row.attachments.is_empty()
+        {
+            break (row.id.clone(), row.attachments[0].id.clone());
         }
         assert!(
             std::time::Instant::now() < deadline,
