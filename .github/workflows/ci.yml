@@ -3,6 +3,13 @@
 # -- -D warnings, cargo test. The server_integration test binary drives a
 # python fixture; ubuntu-latest ships python3, no extra setup step needed.
 #
+# Gate 3/3 runs through scripts/run-cargo-gates.sh: cargo (and everything it
+# spawns — test binaries, the connector, the python fixture) is placed in a
+# fresh process group (POSIX::setsid via perl; ubuntu-latest has no
+# util-linux setsid(1) either), and the group is reaped on timeout so a stuck
+# test cannot orphan into init and burn the 30-minute job ceiling. fmt/clippy
+# spawn no long-lived test processes, so they stay unwrapped.
+#
 # Toolchain: rust-toolchain.toml pins channel = "1.99.0" for local rustup and
 # CI alike. Note: Cargo.toml says rust-version = "1.87", but that MSRV claim is
 # stale — verified 2026-10-06 the tree does not build on 1.87.0 (E0658
@@ -50,5 +57,5 @@ jobs:
       - name: Gate 2/3 — cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Gate 3/3 — cargo test
-        run: cargo test
+      - name: Gate 3/3 — cargo test (process-group wrapped, orphans reaped on timeout)
+        run: scripts/run-cargo-gates.sh test

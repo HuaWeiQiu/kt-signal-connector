@@ -109,6 +109,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
 
+`scripts/run-cargo-gates.sh` [fmt|clippy|test|build|all] runs the same gates inside a
+throwaway process group and reaps the whole group on timeout (default 1800s, override with
+`GATE_TIMEOUT_SECS`), so a hung test binary, connector, or fixture process cannot orphan into
+launchd/init and outlive the run. CI uses it for the `cargo test` gate
+(`.github/workflows/ci.yml`).
+
 Real Signal account tests are intentionally separate from mocked tests and must never use production
 customer accounts or commit account data.
 
