@@ -500,6 +500,23 @@ pub struct ConversationSummary {
     /// (no engine read face) — a group row therefore derives accepted from
     /// its own outgoing window alone.
     pub message_request_accepted: bool,
+    /// Contract 1.71 (§4.63): the desktop evidence-gate field the official
+    /// `hasUserInitiatedMessages` faces need and no existing read face
+    /// decomposes (the desktop matrix §18.4 data-plane gap, 2026-10-06
+    /// record): true exactly when the conversation's **whole history**
+    /// contains at least one outgoing data row — the official
+    /// `sentMessageCount > 0` factor
+    /// (`ts/util/isConversationAccepted.preload.ts:58,75`, AGPL read-only
+    /// anchor) read as a standalone bit, window- and newest-row-independent.
+    /// Derived at read time over the same indexed EXISTS the §4.58
+    /// derivation runs (one source, no second truth); the factor row itself
+    /// is read, never written — no counting logic changes. Always serialized
+    /// (bare bool, the muted/pinned/isSelf discipline): both values are
+    /// meaningful — true is the suppression signal, false the decisive
+    /// negative the banner gate hangs on. A row with no store evidence at
+    /// all (fresh row, link-time import gap, any history the connector does
+    /// not hold) projects false — honest absence, never invented.
+    pub has_user_initiated_outbound: bool,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -731,6 +748,30 @@ fn conversation_message_request_accepted(
         has_outgoing != 0,
         mrr_factors_of(factors_json.as_deref()),
     ))
+}
+
+/// Contract 1.71 (§4.63): the whole-history outbound row presence for one
+/// conversation — the official `hasUserInitiatedMessages` evidence bit
+/// (desktop matrix §18.4 data-plane gap) the summary wire now carries. Reads
+/// the same indexed EXISTS the §4.58 accepted derivation runs, shares the
+/// same held-connection-guard discipline, and answers false when the row is
+/// gone mid-page (retention deleted between the page query and the post-map
+/// loop — the same tolerance the meta lookups next door practice). No
+/// counting logic is touched: the EXISTS reads the rows, it writes nothing.
+fn conversation_has_user_initiated_outbound(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages
+             WHERE account_id=?2 AND conversation_id=?1 AND direction='outgoing')
+         FROM conversations WHERE id=?1 AND account_id=?2",
+        params![conversation_id, account_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|present| present != 0)
+    .unwrap_or(false)
 }
 
 /// Contract 1.60 (§4.54): the ids of the contacts-cache group rows whose last
@@ -1970,6 +2011,9 @@ impl Store {
                         // Contract 1.65 (§4.58): derived after the row maps
                         // (page lookup below), the same post-map loop.
                         message_request_accepted: false,
+                        // Contract 1.71 (§4.63): derived in the same post-map
+                        // loop (below), the same read-time family.
+                        has_user_initiated_outbound: false,
                     })
                 },
             )
@@ -1995,6 +2039,10 @@ impl Store {
                 item.kind,
                 item.is_self,
             )?;
+            // Contract 1.71 (§4.63): the whole-history outbound bit, the same
+            // post-map loop, the same guard.
+            item.has_user_initiated_outbound =
+                conversation_has_user_initiated_outbound(&conn, account_id, &item.id);
         }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
@@ -4427,6 +4475,9 @@ impl Store {
                         // Contract 1.65 (§4.58): derived after the row maps
                         // (single-row match below), the same post-map loop.
                         message_request_accepted: false,
+                        // Contract 1.71 (§4.63): derived in the same post-map
+                        // match (below), the same read-time family.
+                        has_user_initiated_outbound: false,
                     })
                 },
             )
@@ -4474,6 +4525,11 @@ impl Store {
                     summary.kind,
                     summary.is_self,
                 )?;
+                // Contract 1.71 (§4.63): the whole-history outbound bit —
+                // the summary that rides conversation.changed carries it so
+                // an event-driven window and a full reload cannot disagree.
+                summary.has_user_initiated_outbound =
+                    conversation_has_user_initiated_outbound(&conn, account_id, conversation_id);
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -12499,6 +12555,170 @@ mod tests {
                 .count_direct_conversations_without_mrr_factors(&account.id)
                 .unwrap(),
             0
+        );
+    }
+
+    /// Contract 1.71 (§4.63): the whole-history outbound evidence bit the
+    /// desktop matrix §18.4 data-plane gap names. True exactly when the row's
+    /// whole history holds at least one outgoing data row — window- and
+    /// newest-row-independent — and false on every honest absence (empty
+    /// window, incoming-only window, system-only additions, unknown row).
+    /// Read-time derivation only: the EXISTS reads, it never writes the
+    /// counts.
+    #[test]
+    fn has_user_initiated_outbound_projects_whole_history_outgoing() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+
+        // Empty window: no store evidence at all — false.
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.has_user_initiated_outbound);
+
+        // Incoming-only history: false (the newest row says nothing about
+        // the whole history).
+        store
+            .insert_message(
+                &mrr_record("m-in", &account.id, &direct.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.has_user_initiated_outbound);
+
+        // One outgoing row anywhere in history: true — even with a newer
+        // incoming row as the newest row.
+        store
+            .insert_message(
+                &mrr_record("m-out", &account.id, &direct.id, "outgoing", 20),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-in-2", &account.id, &direct.id, "incoming", 30),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.has_user_initiated_outbound);
+
+        // System-only additions stay invisible (the data-row wall the wire
+        // lastMessageDirection draws).
+        store
+            .insert_message(
+                &mrr_record("m-sys", &account.id, &direct.id, "system", 40),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.has_user_initiated_outbound);
+
+        // A group row answers from the same whole-history rule.
+        let group = store
+            .ensure_conversation(&account.id, "group", "group-key-1", "group")
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.has_user_initiated_outbound);
+        store
+            .insert_message(
+                &mrr_record("m-g-out", &account.id, &group.id, "outgoing", 20),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let summary = store
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.has_user_initiated_outbound);
+
+        // An unknown conversation id (row deleted mid-page, the tolerance the
+        // meta lookups practice) answers false, never errors.
+        assert!(!conversation_has_user_initiated_outbound(
+            &store.conn(),
+            &account.id,
+            "conv-does-not-exist"
+        ));
+    }
+
+    /// The wire key is a bare always-serialized bool on both projections (the
+    /// muted/pinned/isSelf discipline), and the list page and the single-row
+    /// summary cannot disagree about the same row.
+    #[test]
+    fn has_user_initiated_outbound_wire_key_always_serialized() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let incoming = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-in", &account.id, &incoming.id, "incoming", 10),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let outgoing = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "contact")
+            .unwrap();
+        store
+            .insert_message(
+                &mrr_record("m-out", &account.id, &outgoing.id, "outgoing", 11),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        for (conversation, expected) in [(&incoming, false), (&outgoing, true)] {
+            let summary = store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap();
+            let wire = serde_json::to_value(&summary).unwrap();
+            assert_eq!(wire["hasUserInitiatedOutbound"], expected);
+        }
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let wire = serde_json::to_value(&page.items).unwrap();
+        let rows = wire.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row["hasUserInitiatedOutbound"].is_boolean())
         );
     }
 }

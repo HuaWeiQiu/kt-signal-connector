@@ -5,7 +5,37 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.70 (2026-10-07; §4.58 consume batch — the connector now
+- Contract revision: 1.71 (2026-10-07; §4.63 — the desktop evidence-gate
+  data-plane gap closes on the connector side: every `conversations.list`
+  summary row and the single `conversation.changed` summary now carry
+  `hasUserInitiatedOutbound`, a bare always-serialized boolean (the
+  muted/pinned/isSelf discipline): true exactly when the conversation's
+  whole history contains at least one outgoing data row — the official
+  `sentMessageCount > 0` factor weight
+  (`ts/util/isConversationAccepted.preload.ts:58,75`, AGPL read-only anchor)
+  surfaced as a standalone bit, aligned with the official
+  `hasUserInitiatedMessages` whole-history EXISTS semantics
+  (`Server.node.ts:2389-2410`, `Interface.std.ts:486`,
+  `conversations.preload.ts:4621` / `:3752-3755`,
+  `maybeForwardMessages.preload.ts:192-201`), independent of any message
+  window or the newest row. The desktop evidence gate (§18.4 of its official
+  parity matrix, 2026-10-06 data-plane gap record) exhausted its three local
+  read faces (`lastMessageDirection`, the paged outgoing rows, the
+  `messageRequestAccepted` fold — whose true is three-ways overloaded) and
+  recorded the missing decomposition; this batch ships exactly the missing
+  bit, named per that record (`hasUserInitiatedOutbound` or a
+  `sentMessageCount` passthrough were the recorded options). Derived at read
+  time over the store's existing data — the same indexed EXISTS family the
+  §4.58 derivation runs, reading the row's `sentMessageCount > 0` material
+  directly (the messages table, not the stored `mrr_factors_json` stamp,
+  which never carries a count); every counting logic stays read-only
+  untouched. Absent store evidence (a fresh row, or any history
+  the connector does not hold — link-time import gaps included) projects
+  false, the honest-absent degradation. Pure wire addition: no rename, no
+  removal, no shape change elsewhere — pre-1.71 hosts read byte-identical
+  summaries without the key; no new method, no capability tag, no schema
+  store version bump (schema 20 unchanged) —
+  previously 1.70 (2026-10-07; §4.58 consume batch — the connector now
   consumes the official `syncMessage.messageRequestResponse` sync face on the
   receive path when its engine projects it: a well-formed mirror (known
   non-UNKNOWN enum member 1..=6, exactly one thread leg, the ServiceId UUID
@@ -3878,6 +3908,84 @@ payload so the sender's own bubble echoes the styles with no extra wire.
 The composer has no inline rich preview (a plain textarea renders no
 ranges); the official inline preview is a documented projection difference.
 A pre-1.69 caller sends no new key and reads the old shapes unchanged.
+
+### 4.63 Outbound evidence bit: `hasUserInitiatedOutbound` on the conversation summaries (contract revision 1.71, 2026-10-07)
+
+The desktop evidence-gate data-plane gap (its official parity matrix §18.4,
+2026-10-06 record, read from the desktop repo `signal/default-timer-persist`
+branch) closes on the connector side. The official desktop's
+`hasUserInitiatedMessages` gate is a **whole-history** truth:
+`EXISTS(… isUserInitiatedMessage IS 1)` over the full history index
+(`Server.node.ts:2389-2410` definition, `Interface.std.ts:486` stats shape,
+`conversations.preload.ts:4621` updateLastMessage trigger / `:3752-3755`
+consume, `maybeForwardMessages.preload.ts:192-201` forward trigger) —
+independent of any message window or the newest row. The desktop's three
+existing read faces cannot reconstruct it:
+
+- `lastMessageDirection` (1.27, §4.22) — a newest-row projection; a
+  non-outgoing last row says nothing about the history before it.
+- the paged message window's outgoing rows — bounded by the pagination
+  window; history outside it is invisible.
+- `messageRequestAccepted` (1.65, §4.58) — a multi-factor fold whose true is
+  three-ways overloaded (`isSelf`, the empty-direct-window weight, the
+  `profileSharing`/`isInSystemContacts` bits, and since 1.70 the
+  authoritative ACCEPT stamp all flip it); the underlying `sentMessageCount`
+  factor row (`mrr_factors_json`, schema v20) never rides the wire, so the
+  desktop cannot decompose it. Using its true as suppression evidence would
+  wrongly suppress the reachable main path ("contact-added empty
+  conversation" / "incoming-only conversation" — official
+  `hasUserInitiatedMessages=false`, the banner should hang); only the fold's
+  false is decisive negative evidence, and negative evidence never changes
+  the hang decision.
+
+This batch ships exactly the missing bit, named per the desktop record
+(the recorded options were `hasUserInitiatedOutbound` or a
+`sentMessageCount` passthrough):
+
+- **Wire**: every `conversations.list` summary row and the single
+  `conversation.changed` summary carry `hasUserInitiatedOutbound` — a bare
+  always-serialized boolean (the muted/pinned/isSelf discipline), true
+  exactly when the conversation's whole history contains at least one
+  outgoing data row. Semantics align with the official
+  `hasUserInitiatedMessages`: the same whole-history EXISTS the official
+  stats shape answers, with the §4.58 data-row wall (system rows are not
+  conversation content — the same exclusion the wire `lastMessageDirection`
+  draws) standing in for the official `isUserInitiatedMessage` filter, the
+  closest honest material this chain holds. Pure wire addition: no rename,
+  no removal, no other shape change — pre-1.71 hosts read byte-identical
+  summaries without the key.
+- **Derivation path (store → projection)**: read-time, the same family the
+  §4.58 accepted derivation runs — the list post-map loop and the
+  single-row summary share one helper (a conversation list and an
+  event-driven refresh cannot disagree, the 1.60 discipline), each answered
+  by one indexed EXISTS over the `messages` table
+  (`direction='outgoing'`). The store's factor rows and every counting
+  logic are read, never written: `mrr_factors_json` is not consulted (the
+  bit does not ride the §4.58 fold), the schema stays at version 20, and no
+  capture path changes.
+- **Absence degradation**: a row with no store evidence at all — a fresh
+  row, or any history the connector does not hold (link-time import gaps
+  included) — projects false. Honest absence, never invented: the desktop
+  treats false as "no positive evidence" (its gate hangs), which is the
+  safe direction for both readers. A conversation row deleted mid-page
+  (retention between the page query and the post-map loop) also answers
+  false, never errors — the same tolerance the §4.58 derivation and the
+  1.27 meta lookups practice.
+- **Cost**: one indexed EXISTS per row over the already-held connection
+  guard, the same per-row cost family as the 1.27/§4.58 lookups; no new
+  table, no new column, no schema migration.
+
+Tests: the unit faces (whole-history semantics — empty window false,
+incoming-only false, outgoing-anywhere true even under a newer incoming
+newest row, system-only additions invisible, group rows under the same
+rule, unknown-row tolerance, the always-serialized wire key on both
+projections, list/single-row agreement) and the full-stack round trip over
+the fake engine (standalone file, `tests/outbound_evidence_integration.rs`:
+the linked fixture peer starts incoming-only with
+`hasUserInitiatedOutbound=false`, a real `messages.sendText` round trip
+creates the outgoing row and the bit flips true on the refreshed summary,
+a second conversation that never sends stays false, and a fresh never-
+touched conversation projects false — the factor-absent degradation).
 
 ## 5. signal-cli Boundary
 
