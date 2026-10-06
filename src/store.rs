@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -469,6 +470,16 @@ pub struct ConversationSummary {
     /// self. The row's title stays raw contact material (the account's own
     /// profile name); the desktop localizes the presentation from this flag.
     pub is_self: bool,
+    /// Contract 1.60 (§4.52): the group row's termination flag as the last
+    /// contacts sync captured it (the §4.50 appendix `group_extra_json`
+    /// marker). True only for a `kind='group'` conversation whose contacts
+    /// row stores the flag — the flag lives in the cache row, never on the
+    /// conversation itself, so a direct conversation and every pre-1.53 sync
+    /// row answer false. Collapsed to an absent key when false (the same
+    /// informative-keys discipline as the roster `admin` mark), so pre-1.60
+    /// hosts read byte-identical summaries.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_terminated: bool,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -518,6 +529,47 @@ fn summary_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> 
 /// keeps a group row unmarked no matter what its group id collides with.
 fn contact_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> bool {
     kind == "contact" && peer_key_is_self(peer_key, signal_account)
+}
+
+/// Contract 1.60 (§4.52): the termination flag a contacts-cache row carries —
+/// read out of the §4.50 appendix `group_extra_json` marker (stored only when
+/// true) at projection time. Direct rows have no group marker and every
+/// pre-1.53 sync row predates the key: both answer false, the same default
+/// the §4.50 appendix `groups.get` projection already answers. No local
+/// invention — the flag exists only because the upstream `JsonGroup` exposed
+/// it to the sync.
+fn extra_is_terminated(extra: Option<&str>) -> bool {
+    extra
+        .and_then(|extra| serde_json::from_str::<Value>(extra).ok())
+        .and_then(|extra| extra.get("isTerminated").and_then(Value::as_bool))
+        == Some(true)
+}
+
+/// Contract 1.60 (§4.52): the ids of the contacts-cache group rows whose last
+/// sync captured the terminated flag. Read at projection time over the
+/// caller's already-held connection guard (the store mutex is never
+/// re-entrant); the scanned set is the whole group-kind contacts cache of the
+/// account — one row per group, the scale the §6.5 sync already maintains.
+fn group_terminated_ids(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<std::collections::HashSet<String>, StoreError> {
+    let mut stmt = conn
+        .prepare("SELECT id, extra FROM contacts WHERE account_id=?1 AND kind='group'")
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let rows = stmt
+        .query_map(params![account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    let mut terminated = std::collections::HashSet::new();
+    for row in rows {
+        let (id, extra) = row.map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if extra_is_terminated(extra.as_deref()) {
+            terminated.insert(id);
+        }
+    }
+    Ok(terminated)
 }
 
 /// One aggregated reaction pill projected onto a message row (contract
@@ -734,6 +786,14 @@ pub struct ContactSummary {
     /// row's title stays raw contact material (the account's own profile
     /// name); the desktop localizes the presentation from this flag.
     pub is_self: bool,
+    /// Contract 1.60 (§4.52): the row's own termination flag for
+    /// `kind='group'` rows — the §4.50 appendix `group_extra_json` marker the
+    /// sync captured, projected at read time. Direct contact rows and every
+    /// pre-1.53 sync row answer false. Collapsed to an absent key when false
+    /// (the same informative-keys discipline as the roster `admin` mark), so
+    /// pre-1.60 hosts read byte-identical rows.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_terminated: bool,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -1567,6 +1627,10 @@ impl Store {
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
                         is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
+                        // Contract 1.60 (§4.52): stamped from the contacts
+                        // cache after the row maps (page lookup / single-row
+                        // query below).
+                        is_terminated: false,
                     })
                 },
             )
@@ -1591,6 +1655,20 @@ impl Store {
         } else {
             None
         };
+        // Contract 1.60 (§4.52): group termination flags ride the summaries —
+        // one bounded lookup against the contacts cache over the already-held
+        // connection guard (the flag lives in the `group_extra_json` marker
+        // the sync captured; §4.50 appendix). For a group the conversation
+        // row and the contacts row share the same
+        // `stable_hash_id([account, 'group', peer])` id, so the summary is
+        // stamped through its own id; direct conversations and groups without
+        // a cache row stay false.
+        let terminated = group_terminated_ids(&conn, account_id)?;
+        for item in &mut items {
+            if item.kind == "group" {
+                item.is_terminated = terminated.contains(&item.id);
+            }
+        }
         Ok(Page { items, next_cursor })
     }
 
@@ -3955,6 +4033,10 @@ impl Store {
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
                         is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
+                        // Contract 1.60 (§4.52): stamped from the contacts
+                        // cache after the row maps (page lookup / single-row
+                        // query below).
+                        is_terminated: false,
                     })
                 },
             )
@@ -3971,6 +4053,26 @@ impl Store {
                 summary.last_message_reactions = meta.reactions;
                 summary.pinned_message =
                     pinned_message_for_conversation(&conn, account_id, conversation_id)?;
+                // Contract 1.60 (§4.52): the same read-time terminated
+                // projection the list applies — the summary that rides
+                // conversation.changed carries the flag, so an event-driven
+                // window and a full reload cannot disagree. For a group the
+                // conversation row and the contacts row share the same stable
+                // id; a group without a cache row stays false.
+                if summary.kind == "group" {
+                    summary.is_terminated = conn
+                        .query_row(
+                            "SELECT c.extra FROM contacts c
+                             WHERE c.id = ?1 AND c.account_id = ?2 AND c.kind = 'group'",
+                            params![conversation_id, account_id],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .optional()
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?
+                        .flatten()
+                        .map(|extra| extra_is_terminated(Some(&extra)))
+                        .unwrap_or(false);
+                }
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -4217,7 +4319,7 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, kind, peer_key, title
+                "SELECT id, kind, peer_key, title, extra
                  FROM contacts
                  WHERE account_id=?1
                    AND (
@@ -4247,8 +4349,10 @@ impl Store {
                 |row| {
                     let kind = static_contact_kind(row.get::<_, String>(1)?);
                     let peer_key: String = row.get(2)?;
+                    let extra: Option<String> = row.get(4)?;
                     Ok(ContactSummary {
                         id: row.get(0)?,
+                        is_terminated: kind == "group" && extra_is_terminated(extra.as_deref()),
                         kind,
                         is_self: contact_is_self(kind, &peer_key, signal_account.as_deref()),
                         peer_key,
@@ -5906,6 +6010,155 @@ mod tests {
                 .map(|row| row.peer_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["+15555550100"]
+        );
+    }
+
+    /// Contract 1.60 (§4.52): the terminated flag rides the summary and the
+    /// contacts-row projections from the §4.50 appendix capture — a group
+    /// whose cache row stores the flag answers true on the list, the
+    /// single-summary (conversation.changed) face, and the contacts row;
+    /// a non-terminated group, a direct conversation, and a group with no
+    /// cache row (pre-1.53 sync) all answer false, and false collapses to the
+    /// absent wire key (pre-1.60 hosts read byte-identical rows).
+    #[test]
+    fn terminated_projection_marks_only_sync_captured_groups() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        // Conversation skeletons through the normal ensure path (the same
+        // stable_hash_id([account, kind, peer]) key the sync materializes).
+        let ended = store
+            .ensure_conversation(&account.id, "group", "ZW5kZWQ=", "Ended Group")
+            .unwrap();
+        let alive = store
+            .ensure_conversation(&account.id, "group", "YWxpdmU=", "Alive Group")
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Alice")
+            .unwrap();
+
+        // The §4.50 appendix capture discipline verbatim: terminated stored
+        // only when true, the marker JSON mirrors group_extra_json's shape.
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "ZW5kZWQ=",
+                "Ended Group",
+                Some(r#"{"memberCount":3,"isTerminated":true}"#),
+                20,
+            )
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "group",
+                "YWxpdmU=",
+                "Alive Group",
+                Some(r#"{"memberCount":4}"#),
+                20,
+            )
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "+15555550101", "Alice", None, 20)
+            .unwrap();
+
+        // List face: exactly the flagged group marked, direct never.
+        let listed = store.list_conversations(&account.id, 10, None).unwrap();
+        let ended_row = listed.items.iter().find(|row| row.id == ended.id).unwrap();
+        let alive_row = listed.items.iter().find(|row| row.id == alive.id).unwrap();
+        let direct_row = listed.items.iter().find(|row| row.id == direct.id).unwrap();
+        assert!(ended_row.is_terminated);
+        assert!(!alive_row.is_terminated);
+        assert!(!direct_row.is_terminated);
+
+        // Single-summary face (the conversation.changed payload).
+        assert!(
+            store
+                .conversation_summary(&account.id, &ended.id)
+                .unwrap()
+                .unwrap()
+                .is_terminated
+        );
+        assert!(
+            !store
+                .conversation_summary(&account.id, &alive.id)
+                .unwrap()
+                .unwrap()
+                .is_terminated
+        );
+        assert!(
+            !store
+                .conversation_summary(&account.id, &direct.id)
+                .unwrap()
+                .unwrap()
+                .is_terminated
+        );
+
+        // Contacts-row face: the group carries its own marker, the direct
+        // row never marks.
+        let contacts = store.list_contacts(&account.id, None, 10, None).unwrap();
+        let ended_contact = contacts
+            .items
+            .iter()
+            .find(|row| row.kind == "group" && row.peer_key == "ZW5kZWQ=")
+            .unwrap();
+        let alive_contact = contacts
+            .items
+            .iter()
+            .find(|row| row.kind == "group" && row.peer_key == "YWxpdmU=")
+            .unwrap();
+        assert!(ended_contact.is_terminated);
+        assert!(!alive_contact.is_terminated);
+        assert!(
+            contacts
+                .items
+                .iter()
+                .filter(|row| row.kind == "contact")
+                .all(|row| !row.is_terminated)
+        );
+
+        // Wire shape: true serializes, false collapses to the absent key —
+        // pre-1.60 hosts read byte-identical rows.
+        use serde_json::json;
+        let wire = serde_json::to_value(&*listed.items).unwrap();
+        let rows = wire.as_array().unwrap();
+        for row in rows {
+            let flag = row.get("isTerminated");
+            let expected = row["id"] == json!(ended.id);
+            assert_eq!(flag.is_some(), expected, "row {}", row["id"]);
+            if expected {
+                assert_eq!(flag, Some(&json!(true)));
+            }
+        }
+        let contact_wire = serde_json::to_value(&*contacts.items).unwrap();
+        for row in contact_wire.as_array().unwrap() {
+            let expected = row["peerKey"] == json!("ZW5kZWQ=");
+            assert_eq!(row.get("isTerminated").is_some(), expected);
+        }
+
+        // A group with no contacts-cache row at all (never synced) stays
+        // false on both faces.
+        let orphan = store
+            .ensure_conversation(&account.id, "group", "b3JwaGFu", "Orphan")
+            .unwrap();
+        assert!(
+            !store
+                .conversation_summary(&account.id, &orphan.id)
+                .unwrap()
+                .unwrap()
+                .is_terminated
+        );
+        let orphan_listed = store.list_conversations(&account.id, 10, None).unwrap();
+        assert!(
+            !orphan_listed
+                .items
+                .iter()
+                .find(|row| row.id == orphan.id)
+                .unwrap()
+                .is_terminated
         );
     }
 

@@ -5,11 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.57 (2026-10-06; §4.38 attachv2 step 3 — history
-  attachment download: `history.attachmentDownload` walks one stored
-  pointer face end to end (transit-CDN stream → ciphertext HMAC/digest
-  gates → AES-256-CBC decrypt → log-pad trim → plaintextHash gate →
-  governed media directory landing where `messages.attachments.open`
+- Contract revision: 1.60 (2026-10-06; §4.52 conversation-summary/contact-row
+  terminated projection — the `conversations.list` page, the single
+  `conversation.changed` summary, and the `contacts.list` rows now carry the
+  group termination flag the 1.53 §4.50 appendix sync capture stores, read out
+  of `group_extra_json` at projection time as a plain bool collapsed to an
+  absent key when false; the desktop forward-target filter consumes it to keep
+  terminated groups out of the forward candidates, the official
+  `selectors/conversations.dom.ts` `!conversation.terminated` behavior;
+  1.57/1.58/1.59 were reserved by parallel batches — 1.58/1.59 never landed
+  on this tree, 1.57 landed as the §4.38 attachv2 step-3 download batch below;
+  this revision rebumps from 1.57) — previously 1.57 (2026-10-06; §4.38
+  attachv2 step 3 — history attachment download: `history.attachmentDownload`
+  walks one stored pointer face end to end (transit-CDN stream → ciphertext
+  HMAC/digest gates → AES-256-CBC decrypt → log-pad trim → plaintextHash gate
+  → governed media directory landing where `messages.attachments.open`
   reads), consuming the schema-18 locator column; same-day rebump from
   1.56, which collided with 1.54 §4.51 and 1.53 §4.50 the same way — one
   contract revision per batch, newest wins the header, history kept in the
@@ -18,16 +28,16 @@
   `FilePointer.LocatorInfo` (transfer archives carry no media bytes; the
   pointer three-piece key/transit-CDN/integrity is what makes media
   recoverable after import, per the official import pipeline), the connector
-  parses it into a new internal `messages.attachment_locators` column
-  (schema version 18) beside the byte-identical wire descriptors — ingest
-  only this batch, the download wiring (step 3) is registered as follow-up;
-  1.55 was §4.49.1 call-signaling legacy bare-frame face + urgency
-  pass-through (`calls.sendSignal` payload becomes optional for the legacy
-  busy/hangup bare frames and the `urgency` parameter rides through to the
-  engine), itself rebumped from 1.53 which collided with the same-day 1.54
-  §4.51 (link-time import progress + manual retry) and 1.53 §4.50 appendix
-  (groups.get isTerminated read face); 1.52 was the §4.50 group-termination
-  write batch, whose Status-header bump covered the 1.51 call-signaling miss)
+  parses it into a new internal `messages.attachment_locators` column (schema
+  version 18) beside the byte-identical wire descriptors — ingest only that
+  batch, the download wiring (step 3) is registered as follow-up; 1.55 was
+  §4.49.1 call-signaling legacy bare-frame face + urgency pass-through
+  (`calls.sendSignal` payload becomes optional for the legacy busy/hangup bare
+  frames and the `urgency` parameter rides through to the engine), itself
+  rebumped from 1.53 which collided with the same-day 1.54 §4.51 (link-time
+  import progress + manual retry) and 1.53 §4.50 appendix (groups.get
+  isTerminated read face); 1.52 was the §4.50 group-termination write batch,
+  whose Status-header bump covered the 1.51 call-signaling miss)
 - Connector source baseline: `main` @ `6656f70`
 - Target engine baseline: unmodified `signal-cli v0.14.8` (upgraded from 0.14.7 on 2026-09-23
   per `docs/signal-cli-upgrade.md`: smoke 4/4 on JRE 25; 0.14.8 adds voice-note metadata and
@@ -2797,6 +2807,50 @@ zero copy).
   in the engine's own compat doc (`docs/jsonrpc-compat.md` §3) — the connector treats it
   as an untrusted projection source and keeps working when the engine predates it (the
   call fails or answers a foreign shape → no `progress`, the pre-1.53 answer byte-for-byte).
+
+### 4.52 Conversation-summary / contact-row terminated projection (contract revision 1.60, 2026-10-06)
+
+The desktop's remaining §14.2.1 gap (projection difference ④) closes with data: the
+official forward-target list excludes terminated groups (`selectors/conversations.dom.ts`
+L709 `canComposeConversation` / L725 `getAllComposableConversations`, both gated on
+`!conversation.terminated`; the forward modal consumes the latter through
+`ForwardMessagesModal.preload.tsx:66`). The 1.53 §4.50 appendix already gave the sync the
+capture (`group_extra_json` stores the upstream `JsonGroup.isTerminated` when true) and
+`groups.get` the single-group read — but the forward dialog renders the whole conversation
+list, and no batch group-state read face exists (an N× `groups.get` storm, or filtering
+only the LRU-cached subset, would be dishonest projections; recorded 2026-10-06). This
+revision widens the existing summary projection faces instead of inventing a new one —
+the flag moves to where the desktop already reads every conversation.
+
+- Capture stays exactly the §4.50 appendix facts: only the contacts sync writes the flag
+  (when the upstream `listGroups` JsonGroup carries `isTerminated: true`), stored in the
+  `kind='group'` row's `group_extra_json`, rewritten wholesale at each sync, refreshable
+  only at a sync boundary (`syncedAt` remains the only staleness signal). Nothing in this
+  batch writes or locally derives the flag — no receive-chain source exists (the
+  `JsonGroupInfo` envelope exposes no terminated field), the same honest boundary 1.53
+  recorded.
+- Projection faces (read time, zero new storage, no schema change — schema stays 18):
+  - `conversations.list` items carry `isTerminated` as a plain bool — present only when
+    true (collapsed to an absent key when false, the same informative-keys discipline as
+    the roster `admin`/`self` marks), so pre-1.60 hosts read byte-identical summaries.
+    The flags are stamped after the page query through one contacts-cache lookup (the
+    group-kind rows; for a group the conversation row and the contacts row share the same
+    `stable_hash_id([account, 'group', peer])` id, so the stamp joins on id; a group with
+    no cache row yet stays false).
+  - The single-row summary that rides `conversation.changed` carries the same flag (the
+    same id-keyed read through the already-held connection guard), so an event-driven
+    window and a full reload cannot disagree about one conversation.
+  - `contacts.list` rows carry the same `isTerminated` (their own row's marker for
+    `kind='group'`; direct rows and pre-1.53 sync rows always false/absent) — the compose
+    face and the conversation face cannot disagree about the same group.
+- Consumers: the desktop forward-target filter (matrix §14.2.1 ④, closes ✅ with data =
+  contract 1.60). The `groups.get` shape is untouched — it already answered the plain
+  bool `isTerminated` since 1.53.
+- Tests: the store projection faces (terminated group true on both the list and the
+  single-summary path, non-terminated/pre-1.53 rows absent-key false byte-identical,
+  direct rows never marked), the `contacts.list` row face (group true / group false /
+  direct absent), and the existing 1.53 sync-capture + `groups.get` faces stay green
+  (no capture-path change, zero retirement).
 
 ## 5. signal-cli Boundary
 
