@@ -4891,6 +4891,19 @@ pub(crate) fn store_get_group(
     account_id: &str,
     group_key: &str,
 ) -> Result<GroupDetails, ServiceError> {
+    store_get_group_with_requesting(store, account_id, group_key, None)
+}
+
+/// The store read with an injected live requesting-members list (contract
+/// revision 1.62, §4.53 appendix): the supervisor passes the engine's own
+/// `listGroups` answer for this group; `None` keeps the pre-1.62 face
+/// (the key stays absent — store-only callers, tests).
+pub(crate) fn store_get_group_with_requesting(
+    store: &Store,
+    account_id: &str,
+    group_key: &str,
+    requesting: Option<&[Value]>,
+) -> Result<GroupDetails, ServiceError> {
     validate_opaque_id(account_id, "accountId")?;
     validate_opaque_id(group_key, "groupKey")?;
     let account = store
@@ -4927,14 +4940,78 @@ pub(crate) fn store_get_group(
         .as_ref()
         .and_then(|extra| extra.get("isTerminated").and_then(Value::as_bool))
         == Some(true);
+    // Contract 1.62 (§4.53 appendix): the live requesting-members projection —
+    // resolved against the same read-time contacts-cache name map the roster
+    // uses, bounded to the roster cap. `None` (store-only callers, pre-1.62
+    // face) and an engine without the face (empty slice) both collapse to an
+    // absent key.
+    let requesting_members = requesting
+        .map(|entries| project_requesting_members(store, account_id, entries))
+        .transpose()?
+        .filter(|roster| !roster.is_empty());
     Ok(GroupDetails {
         peer_key: group_key.to_string(),
         title,
         member_count,
         members: members?,
         is_terminated,
+        requesting_members,
         synced_at,
     })
+}
+
+/// One live requesting-member projection (contract revision 1.62, §4.53
+/// appendix): the connector-wide first-wins address ladder picks the id the
+/// desktop addresses the approval write with (the fold accepts either
+/// identity, so the ladder id always folds), the uuid rides only when it
+/// differs from the id, and the name resolves from the same read-time
+/// contacts-cache map the roster uses. Malformed entries and entries past
+/// [`MAX_GROUP_MEMBERS`] drop individually — a hostile answer can never fail
+/// the read.
+fn project_requesting_members(
+    store: &Store,
+    account_id: &str,
+    entries: &[Value],
+) -> Result<Vec<GroupRequestingMemberView>, ServiceError> {
+    let titles = store.contact_title_map(account_id)?;
+    Ok(entries
+        .iter()
+        .take(MAX_GROUP_MEMBERS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            // The first-wins address ladder (number before uuid), the same
+            // [`member_address_id`] shape the sync capture and the §4.39
+            // roster projection run — kept local: the supervisor twin is a
+            // private fn of its module.
+            let id = ["number", "uuid"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                })?;
+            let uuid = ["uuid"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != id)
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                });
+            let name = titles
+                .get(&id)
+                .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
+                .cloned();
+            Some(GroupRequestingMemberView { id, uuid, name })
+        })
+        .collect())
 }
 
 /// One projected roster entry (§4.39): the stored identity, the read-time
@@ -5269,7 +5346,9 @@ pub struct MediaCloseView {
 /// last sync — false for every pre-1.53 row and every engine without the
 /// flag, and the receive chain cannot refresh it (the `JsonGroupInfo`
 /// envelope exposes no terminated field), so `synced_at` remains the only
-/// staleness signal for it too.
+/// staleness signal for it too. `requesting_members` (contract revision
+/// 1.62, §4.53 appendix) is the live read, not the cached row — see the
+/// supervisor projection.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDetails {
@@ -5279,6 +5358,8 @@ pub struct GroupDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<GroupMemberView>>,
     pub is_terminated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requesting_members: Option<Vec<GroupRequestingMemberView>>,
     pub synced_at: u64,
 }
 
@@ -5306,9 +5387,22 @@ pub struct GroupMemberView {
     pub admin: bool,
 }
 
-/// One sticker entry of the `stickerPacks.getManifest` result (contract
-/// revision 1.36, §4.32): pack-local id plus optional emoji/contentType —
-/// the official `StickerPackRecord` projection fields the desktop renders
+/// One projected requesting-member row (contract revision 1.62, §4.53
+/// appendix): the same minimal face as the roster [`GroupMemberView`] — the
+/// address the desktop addresses the approval write with rides the
+/// connector-wide first-wins ladder, the name resolves from the contacts
+/// cache at read time, the admin/self marks never ride (a requesting
+/// candidate is by definition not yet a member). `uuid` is present only when
+/// the upstream supplied one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRequestingMemberView {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
 /// with. `emoji`/`contentType` are absent when the pack did not declare
 /// them (the official proto treats both as optional).
 #[derive(Debug, Serialize)]
@@ -12295,6 +12389,85 @@ mod tests {
         assert_eq!(wire["isTerminated"], json!(true));
         let plain = serde_json::to_value(&group).unwrap();
         assert_eq!(plain["isTerminated"], json!(false));
+
+        // Contract 1.62 (§4.53 appendix): the live requesting-members
+        // projection. None (the pre-1.62 face, engine stopped / refused)
+        // keeps the key absent — byte-identical to the cached row face.
+        let quiet = service.get_group(&account.id, "ZmFrZS1ncm91cC0x").unwrap();
+        assert_eq!(quiet.requesting_members, None);
+        let quiet_wire = serde_json::to_value(&quiet).unwrap();
+        assert!(quiet_wire.get("requestingMembers").is_none());
+
+        // The live face: the engine's raw JsonGroupMemberAddress entries
+        // project with the first-wins ladder id, the upstream uuid (only
+        // when it differs from the id), and the read-time contacts-cache
+        // name. Malformed entries drop individually; the cap holds.
+        let with_requesting = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            Some(&[
+                json!({"number": "+15555550101", "uuid": "9f0fd6a2-1111-4000-8000-000000000001"}),
+                json!({"uuid": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"}),
+                json!({"number": "+15555550102", "uuid": "+15555550102"}),
+                json!("not-an-object"),
+                json!({}),
+            ]),
+        )
+        .unwrap();
+        let requesting = with_requesting.requesting_members.unwrap();
+        let requesting_wire = serde_json::to_value(&requesting).unwrap();
+        assert_eq!(
+            requesting.len(),
+            3,
+            "malformed entries drop: {requesting_wire}"
+        );
+        assert_eq!(
+            requesting_wire[0],
+            json!({
+                "id": "+15555550101",
+                "uuid": "9f0fd6a2-1111-4000-8000-000000000001",
+                "name": "Alice Contact",
+            }),
+            "ladder id + upstream uuid + read-time contacts-cache name"
+        );
+        assert_eq!(
+            requesting_wire[1],
+            json!({"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"}),
+            "an unknown ACI-keyed candidate keeps the bare identity, uuid never equals id"
+        );
+        assert_eq!(
+            requesting_wire[2],
+            json!({"id": "+15555550102"}),
+            "the ladder collapses a uuid that repeats the number"
+        );
+
+        // An empty live answer (nobody requesting / upstream face missing)
+        // collapses to the absent key, not an empty array.
+        let empty = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            Some(&[]),
+        )
+        .unwrap();
+        assert_eq!(empty.requesting_members, None);
+
+        // The cap holds for a hostile oversized live answer.
+        let flood: Vec<Value> = (0..MAX_GROUP_MEMBERS + 50)
+            .map(|index| json!({"number": format!("+1555555{index:04}")}))
+            .collect();
+        let flooded = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            Some(&flood),
+        )
+        .unwrap();
+        assert_eq!(
+            flooded.requesting_members.as_ref().map(Vec::len),
+            Some(MAX_GROUP_MEMBERS)
+        );
 
         // A contact peer key is not a group row: deterministic GROUP_NOT_FOUND.
         let contact = service.get_group(&account.id, "+15555550101").unwrap_err();

@@ -35,7 +35,7 @@ use crate::service::{
     StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
     StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry, UsernameLookupParams,
     UsernameLookupResult, account_limit_error, blocked_conversations_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
+    pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
 };
@@ -3652,17 +3652,83 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// Read-only projection of one cached group row (§4.8); served from the
-    /// contacts cache with no upstream call, so it answers even while the
-    /// engine is stopped.
+    /// Read-only projection of one group (§4.8): the cached contacts row plus
+    /// — contract revision 1.62, §4.53 appendix — the group's live
+    /// requesting-members list. The requesting list is deliberately NOT a
+    /// sync-captured cache field: the §4.53 fold treats the engine's own
+    /// single-group `listGroups` read as the approval truth source (the
+    /// candidate set is intersected against it at write time), and the read
+    /// face consumes the same source so the list the desktop renders and the
+    /// set the approval write folds against can never disagree — a sync
+    /// snapshot would be a second, older truth that the write's own
+    /// `JOIN_REQUEST_NO_LONGER_PENDING` stale-ladder exists to paper over.
+    /// Freshness follows the read call itself (as fresh as opening the group
+    /// info page, the official render rhythm), which also lets the desktop's
+    /// post-action refresh observe the converged list without waiting for a
+    /// contacts.sync (the sync path cannot carry this face: its 60s
+    /// short-circuit would keep answering the pre-approval roster). The read
+    /// degrades honestly: an engine that is not running, or a `listGroups`
+    /// face without the requesting array, answers the cached row without the
+    /// key (the desktop renders no approval section) — the cache face the
+    /// method has always promised stays intact.
     pub async fn get_group(
         &self,
         account_id: String,
         group_key: String,
     ) -> Result<GroupDetails, ServiceError> {
+        // The live half first (ReadOnly, the §4.53 fold's own read): failure
+        // degrades to no requesting key instead of failing the cached read.
+        let requesting = self
+            .requesting_members_for_group(&account_id, &group_key)
+            .await
+            .unwrap_or_default();
         // Store-only read: the service lock guards in-memory state only.
         let store = Arc::clone(&self.store);
-        blocking_service(move || store_get_group(&store, &account_id, &group_key)).await
+        blocking_service(move || {
+            store_get_group_with_requesting(&store, &account_id, &group_key, requesting.as_deref())
+        })
+        .await
+    }
+
+    /// The engine's live requesting-members array for one group (contract
+    /// revision 1.62, §4.53 appendix): the same single-group `listGroups`
+    /// read the §4.53 fold runs, projected to the raw
+    /// `JsonGroup.requestingMembers` entries. `Ok(None)` = the engine
+    /// answered without the face (every entry drops, the key stays absent);
+    /// `Err` = the engine is not running or refused the read (the caller
+    /// degrades the same way). The read does not widen the §4.8 addressing:
+    /// the caller still gates on the cached kind='group' row before this
+    /// face is worth anything, and `store_get_group_with_requesting` keeps
+    /// answering `GROUP_NOT_FOUND` for an unsynced group even when the live
+    /// read succeeded.
+    async fn requesting_members_for_group(
+        &self,
+        account_id: &str,
+        group_key: &str,
+    ) -> Result<Option<Vec<Value>>, ServiceError> {
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(_) => return Ok(None),
+        };
+        let number = self
+            .service
+            .lock()
+            .await
+            .account_signal_number(account_id)?;
+        let listed = engine
+            .call(
+                "listGroups",
+                json!({ "account": number, "groupId": [group_key] }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        Ok(listed
+            .as_array()
+            .and_then(|groups| groups.first())
+            .and_then(|group| group.get("requestingMembers"))
+            .and_then(Value::as_array)
+            .cloned())
     }
 
     /// Pull the contacts/groups signal-cli already synced from the primary

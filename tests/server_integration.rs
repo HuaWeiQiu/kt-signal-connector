@@ -3011,6 +3011,116 @@ async fn groups_get_carries_the_sync_terminated_flag() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// groups.get carries the live requesting-members projection (contract
+/// 1.62, §4.53 appendix): the stub answers one requesting member for the
+/// fixture group, so the full ladder — single-group listGroups live read →
+/// address-ladder projection → read-time contacts-cache name — lands in the
+/// response beside the cached face; the sync's requesting-less cached row
+/// proves the key is the live read, not the capture; and a group with an
+/// empty requesting set answers without the key.
+#[tokio::test]
+async fn groups_get_carries_the_live_requesting_members() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [55_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // One requesting member on the fixture group only; the former-member
+    // group stays requesting-less so the absent-key face is exercisable on
+    // the same engine answer.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_REQUESTING_GROUPS", "ZmFrZS1ncm91cC0x=+15555550101")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupApproveRead" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    // Sync first so the cached row exists — the assertion below that the
+    // requesting key rides a requesting-less cache row is the whole point
+    // (the face is the live read, not the capture).
+    request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    // The cached face stays intact beside the live key.
+    assert_eq!(group["result"]["memberCount"], 2);
+    let requesting = group["result"]["requestingMembers"]
+        .as_array()
+        .expect("the live requesting set must ride the response");
+    assert_eq!(requesting.len(), 1, "{group}");
+    assert_eq!(requesting[0]["id"], "+15555550101");
+    assert_eq!(requesting[0]["name"], "Alice Example");
+    assert!(
+        requesting[0].get("self").is_none(),
+        "a requesting candidate is never a member row"
+    );
+    assert!(requesting[0].get("admin").is_none());
+
+    // A requesting-less group answers without the key (empty live set
+    // collapses to absent, never an empty array).
+    let empty = request(
+        &mut client,
+        "groups-get-empty",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "bm90LWEtbWVtYmVy"
+        }),
+    )
+    .await;
+    // The former-member group is not a cached row (the sync filters
+    // isMember=false) — it answers GROUP_NOT_FOUND, which is itself the
+    // §4.8 gate staying intact over the live read. The absent-key face on
+    // a cached row needs the same engine's fixture group after its set
+    // drains; the stub cannot drain mid-run, so the empty-set face is
+    // pinned by the unit test instead. Read the former-member group to
+    // prove the gate.
+    assert_eq!(empty["error"]["code"], "GROUP_NOT_FOUND", "{empty}");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn contacts_set_local_alias_renames_a_locally_known_peer() {
     let temp = TempDir::new().unwrap();

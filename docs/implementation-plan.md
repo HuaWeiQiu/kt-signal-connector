@@ -5,7 +5,26 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.61 (2026-10-06; §4.54 — live message-attachment pointer persistence +
+- Contract revision: 1.62 (2026-10-06; §4.53 appendix — the group join-request
+  read face opens: `groups.get` now carries `requestingMembers`, the same
+  single-group upstream `listGroups` read the 1.58 approval fold runs against,
+  projected live at read time as bounded `{id, uuid?, name?}` entries — present
+  only when the engine answers a non-empty requesting set, absent otherwise.
+  The key is deliberately a live read, not a sync-captured cache field: the
+  1.58 record fixed the approval truth source as the fold's own in-call
+  `listGroups` read, and this face consumes the same source so the list the
+  desktop renders and the set the write folds against can never disagree — a
+  `group_extra_json` snapshot would be a second, older truth the write's own
+  `JOIN_REQUEST_NO_LONGER_PENDING` stale ladder exists to paper over, and the
+  sync path cannot carry this face anyway (its 60s short-circuit would keep
+  answering the pre-approval roster after an action). This is the desktop
+  consume batch's data face for the 1.58 write (`groups.approveJoinRequests`,
+  capability `group-join-approve` unchanged — one capability, read and write
+  halves together, the 1.53 appendix discipline); the schema-18 store is
+  untouched, zero capture-path change. 1.61 was reserved by the parallel
+  on-demand-attachment-bytes batch and had not landed on this tree when this
+  revision was written; if it lands first, its entry takes the header and this
+  becomes "previously 1.62" in the chain, newest wins) — previously 1.61 (2026-10-06; §4.54 — live message-attachment pointer persistence +
   `attachments.download`: the receive envelope's transit locator face persists into a new internal
   `messages.live_attachment_locators` column (schema version 19) beside the byte-identical wire
   descriptors when an engine projects it (the pinned signal-cli 0.14.8 and the kt-engine receive
@@ -3063,6 +3082,78 @@ exactly two digits).
   `CAPABILITY_UNAVAILABLE` (mode/getter) → upstream errors degrade to plain
   `UPSTREAM_ERROR`. Zero local persistence: no username state is written to the store —
   the desktop's signalProfileMirror is the only local copy, fed from the write-back.
+
+> **Dated appendix (2026-10-06, group-approval consume batch, contract revision
+> 1.62): the read face opens.** The desktop consume batch named its one missing
+> data face against the official approval surface
+> (`PendingInvites.dom.tsx` `MembersPendingAdminApproval` L314-393: requesting
+> rows with accept/deny actions; the areWeAdmin gate L351; the
+> `getGroupMemberships.dom.ts` L54-63 `pendingApprovalMemberships` join): the
+> 1.58 write face folds candidates against the engine's own single-group
+> `listGroups` read, but nothing projected that read, so the desktop had no
+> list to render. This appendix widens `groups.get` with `requestingMembers` —
+> **a live read, deliberately not a `group_extra_json` sync capture**, and the
+> reasoning is recorded because the §4.50-appendix precedent cuts the other
+> way there:
+>
+> - **One truth source.** The 1.58 record fixed the approval truth source as
+>   the fold's own in-call `listGroups` read ("the requesting set is as fresh
+>   as the sync the fold's own read refreshes upstream-side" was the honest
+>   note about the *roster*, not about the fold). The read face consumes the
+>   same single-group read, so the rendered list and the folded write set are
+>   the same bytes moments apart. A sync snapshot would be a second, older
+>   truth: the fold would still refuse a candidate the UI swore was
+>   requesting (`JOIN_REQUEST_NO_LONGER_PENDING` is exactly that lie made
+>   into an error code).
+> - **The sync path cannot carry this face.** `contacts.sync` short-circuits
+>   at 60s; an approval action writes nothing locally (the 1.58 zero-local-
+>   writes discipline), so the "refresh the read after the action" step would
+>   answer the pre-action snapshot for up to a minute — the official UI's
+>   post-action row disappearance (the requester leaves the list when the
+>   change lands) could not converge through it.
+> - **The §4.50-appendix precedent is a state bit, not a set.**
+>   `isTerminated` is low-frequency and monotone (false→true only), the
+>   receive envelope carries no terminated field, and the desktop renders a
+>   banner from it — sync freshness is honest there. The requesting set is
+>   high-frequency and changes from *any* admin on *any* device, without an
+>   envelope the connector can project; the freshness contract that is
+>   honest for the flag is stale-by-construction for the set.
+>
+> Shape: `requestingMembers` rides the `groups.get` result as an optional
+> array of `{id, uuid?, name?}` — `id` is the connector-wide number-before-
+> uuid address ladder (the 1.58 fold accepts either identity, so the ladder
+> id always folds), `uuid` only when the upstream supplied one and it differs
+> from the id, `name` resolved at read time from the same account's contacts
+> cache the §4.39 roster resolves against (absent when unknown — the desktop
+> renders its avatar fallback). Bounded to the §4.39 roster cap (1001
+> entries), malformed entries drop individually. **Present only when the
+> engine answered a non-empty requesting set**; absent otherwise — engine
+> stopped, upstream face missing, or nobody requesting. Pre-1.62 hosts read
+> byte-identical responses (the key is absent on every face they knew). The
+> capability story is the 1.53-appendix discipline verbatim: no new tag —
+> the read rides the `group-join-approve` capability the write face already
+> carries, one capability for one protocol action's read and write halves
+> (the method itself stays ungated like every §4.8 cache read; the desktop
+> consume batch gates the UI on the capability and on this key's presence —
+> an old connector answers without the key and the section renders nothing).
+> Failure posture: the live read is best-effort by design — an engine that
+> is not running or a refused read degrades to the cached row without the
+> key (the §4.8 promise "the cached face never fails because of the engine"
+> stays intact; the approval section is a privilege, not a load-bearing
+> face). Tests: the projection unit faces (requesting entries project with
+> ladder id + uuid + read-time name; malformed drop; cap holds; absent on
+> None/empty; name resolution joins the contacts cache), the degradation
+> unit face (store-only call answers without the key), and the server
+> integration (the live key rides a real engine answer through the full
+> listGroups → projection ladder; the fold keeps the same survivor set the
+> read rendered).
+> Consequence recorded honestly: `groups.get` is no longer a pure
+> store-only read — it now makes one bounded engine round-trip when an
+> engine is running (single-group `listGroups`, ReadOnly class, the same
+> traffic the 1.58 fold already spends per approval). A desktop that wants
+> the engine-free face can keep reading it while the engine is stopped and
+> simply not see the approval section; `syncedAt` remains the freshness
+> signal for every other field in the response.
 
 ## 5. signal-cli Boundary
 
