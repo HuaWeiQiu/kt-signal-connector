@@ -19,7 +19,21 @@ use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 use tokio_util::codec::{Framed, LinesCodec};
 
+#[path = "common/harness_scene.rs"]
+mod harness_scene;
+use harness_scene::dump_connector_crash_scene;
+
 const API_VERSION: &str = "1.0";
+
+/// Upper bound for one harness request round trip (write + response wait).
+/// The investigation found the harness blocked forever inside deadline-less
+/// `client.next().await` calls (no pending timer — an unbounded await), so any
+/// transient upstream anomaly became an indefinite hang that the gate's
+/// runner kill fixed into an orphan. Every harness read face now carries this
+/// deadline and converts the hang into an evidence-dumping failure.
+const HARNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound for the handshake faces (challenge read + proof response read).
+const HARNESS_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Phase 3 contract: every spawned connector gets its store key as bootstrap
 /// payload line 2. One fixed test key keeps respawns against the same state
@@ -344,7 +358,18 @@ async fn phase2_link_receive_send_and_idempotent_text() {
 
     let mut response_order = Vec::new();
     while response_order.len() < 3 {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let response: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!(
+                "the send/response ordering drain stalled over \
+                 {HARNESS_REQUEST_TIMEOUT:?} with {response_order:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if let Some(request_id) = response.get("requestId").and_then(Value::as_str)
             && matches!(
                 request_id,
@@ -375,7 +400,18 @@ async fn phase2_link_receive_send_and_idempotent_text() {
         .await;
     }
     loop {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let response: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!(
+                "the capacity drain never saw capacity-32 within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if response.get("requestId").and_then(Value::as_str) == Some("capacity-32") {
             assert_eq!(response["error"]["code"], "INTERNAL_ERROR");
             assert_eq!(
@@ -2194,7 +2230,18 @@ async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
     // groupUpdated assertion below can only pass through its own path.
     let mut saw_send_mirror = false;
     for _ in 0..16 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "conversation.changed send mirror never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == group_conversation.as_str()
             && frame["data"]["expireTimerSeconds"] == 3600
@@ -2244,7 +2291,7 @@ async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
         .to_string(),
     )
     .unwrap();
-    request(
+    let _ = request(
         &mut client,
         "typing-flush",
         "presence.setTypingMessage",
@@ -2256,7 +2303,18 @@ async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
     .await;
     let mut saw_timer_change = false;
     for _ in 0..16 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "group conversation.changed timer mirror (86400) never arrived \
+                 within {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == group_conversation.as_str()
             && frame["data"]["expireTimerSeconds"] == 86400
@@ -2535,7 +2593,18 @@ async fn account_delete_drains_in_flight_send_and_rejects_new_sends() {
     let mut delete = None;
     let mut during = None;
     while slow.is_none() || delete.is_none() || during.is_none() {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let response: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!(
+                "the delete-race drain stalled over {HARNESS_REQUEST_TIMEOUT:?} \
+                 with order {order:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         match response.get("requestId").and_then(Value::as_str) {
             Some("race-send-slow") => {
                 order.push("race-send-slow");
@@ -2980,7 +3049,7 @@ async fn groups_get_carries_the_sync_terminated_flag() {
     )
     .await;
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
-    request(
+    let _ = request(
         &mut client,
         "contacts-sync",
         "contacts.sync",
@@ -3056,7 +3125,7 @@ async fn groups_get_carries_the_member_label_projection() {
     )
     .await;
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
-    request(
+    let _ = request(
         &mut client,
         "contacts-sync",
         "contacts.sync",
@@ -3155,7 +3224,7 @@ async fn groups_get_carries_the_live_requesting_members() {
     // Sync first so the cached row exists — the assertion below that the
     // requesting key rides a requesting-less cache row is the whole point
     // (the face is the live read, not the capture).
-    request(
+    let _ = request(
         &mut client,
         "contacts-sync",
         "contacts.sync",
@@ -3265,7 +3334,7 @@ async fn groups_get_carries_the_live_pending_members() {
     // Sync first so the cached row exists — the assertion below that the
     // pending key rides the cached row is the whole point (the face is the
     // live read, not the capture).
-    request(
+    let _ = request(
         &mut client,
         "contacts-sync",
         "contacts.sync",
@@ -4377,7 +4446,17 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
 
     // Handshake with an inline capability assertion (the shared helper only
     // checks the api version).
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
     let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
@@ -4402,7 +4481,17 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         )
         .await
         .unwrap();
-    let handshake: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let handshake: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(handshake) => handshake,
+        Err(_) => panic!(
+            "handshake response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
     for advertised in [
         "messages.markRead",
@@ -4477,7 +4566,7 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
 
     // Refresh the contacts cache outside the link debounce so the digit
     // suffix resolution has +15555550101 to match against.
-    request(
+    let _ = request(
         &mut client,
         "sync-1",
         "contacts.sync",
@@ -5273,7 +5362,18 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     // The refreshed summary arrived on conversation.changed with the timer.
     let mut saw_timer_change = false;
     for _ in 0..8 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "conversation.changed timer mirror (86400) never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == conversation_id
             && frame["data"]["expireTimerSeconds"] == 86400
@@ -5355,7 +5455,18 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     assert_eq!(group_timer["result"]["expireTimerSeconds"], 3600);
     let mut saw_group_timer_change = false;
     for _ in 0..8 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "group conversation.changed timer mirror (3600) never arrived \
+                 within {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == group_conversation
             && frame["data"]["expireTimerSeconds"] == 3600
@@ -5479,7 +5590,7 @@ async fn groups_update_quit_round_trip_and_guards() {
     // the flush hook finding an empty marker), so the list below stays a
     // store-only read and the choreography keeps controlling the burst via
     // the typing flush as before.
-    request(
+    let _ = request(
         &mut client,
         "probe-burn",
         "conversations.list",
@@ -5685,7 +5796,7 @@ async fn groups_update_quit_round_trip_and_guards() {
     // Flush the staged envelopes through the typing hook (the receive burst
     // rides the request): the UPDATE envelope lands as a system row and the
     // conversation.changed summary already carries the mirrored title.
-    request(
+    let _ = request(
         &mut client,
         "flush-update",
         "presence.setTypingMessage",
@@ -5698,7 +5809,18 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     let mut saw_title_change = false;
     for _ in 0..16 {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "conversation.changed title mirror never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame["event"] == "conversation.changed"
             && frame["data"]["id"] == group_conversation
             && frame["data"]["title"] == "Renamed Fixture"
@@ -5913,7 +6035,7 @@ async fn report_spam_round_trip_persists_server_guids_and_guards() {
         .as_str()
         .unwrap()
         .to_string();
-    request(
+    let _ = request(
         &mut client,
         "flush-receives",
         "presence.setTypingMessage",
@@ -6105,7 +6227,7 @@ async fn report_spam_round_trip_persists_server_guids_and_guards() {
         .to_string(),
     )
     .unwrap();
-    request(
+    let _ = request(
         &mut client,
         "flush-partial",
         "presence.setTypingMessage",
@@ -6218,7 +6340,7 @@ async fn report_spam_round_trip_persists_server_guids_and_guards() {
         .to_string(),
     )
     .unwrap();
-    request(
+    let _ = request(
         &mut client,
         "flush-crash",
         "presence.setTypingMessage",
@@ -8111,7 +8233,18 @@ async fn drain_until_response_collecting_opened(
 ) -> (Value, Vec<Value>) {
     let mut opened: Vec<Value> = Vec::new();
     loop {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "drain_until_response_collecting_opened stalled over \
+                 {HARNESS_REQUEST_TIMEOUT:?} waiting for {request_id} (collected {opened:?}):\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame.get("event").and_then(Value::as_str) == Some("message.viewOnceOpened") {
             opened.push(frame["data"].clone());
             continue;
@@ -8127,7 +8260,18 @@ async fn drain_until_response_collecting_opened(
 /// exactly one event (the "exactly once" side is the barrier drain).
 async fn drain_until_opened_event(client: &mut Framed<UnixStream, LinesCodec>) -> Value {
     loop {
-        let frame: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "drain_until_opened_event stalled over {HARNESS_REQUEST_TIMEOUT:?} \
+                 without a message.viewOnceOpened frame:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
         if frame.get("event").and_then(Value::as_str) == Some("message.viewOnceOpened") {
             return frame["data"].clone();
         }
@@ -8609,7 +8753,17 @@ async fn authenticate_capture(
     client: &mut Framed<UnixStream, LinesCodec>,
     secret: &[u8; 32],
 ) -> (Value, Value) {
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
@@ -8632,12 +8786,32 @@ async fn authenticate_capture(
         )
         .await
         .unwrap();
-    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let response: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "handshake response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     (challenge, response)
 }
 
 async fn reject_authentication(client: &mut Framed<UnixStream, LinesCodec>) {
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     assert_eq!(challenge["event"], "runtime.challenge");
     client
         .send(
@@ -8654,7 +8828,17 @@ async fn reject_authentication(client: &mut Framed<UnixStream, LinesCodec>) {
         )
         .await
         .unwrap();
-    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let response: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "handshake rejection response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     assert_eq!(response["error"]["code"], "AUTHENTICATION_FAILED");
 }
 
@@ -8664,12 +8848,25 @@ async fn request(
     method: &str,
     params: Value,
 ) -> Value {
-    send_request_frame(client, request_id, method, params).await;
-    loop {
-        let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
-        if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
-            return response;
+    let round = timeout(HARNESS_REQUEST_TIMEOUT, async {
+        send_request_frame(client, request_id, method, params).await;
+        loop {
+            let response: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if response.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return response;
+            }
         }
+    })
+    .await;
+    match round {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "harness request {request_id} ({method}) exceeded {HARNESS_REQUEST_TIMEOUT:?}; \
+             the deadline-less await family turned transient upstream anomalies into \
+             indefinite hangs:\n{}",
+            dump_connector_crash_scene()
+        ),
     }
 }
 
@@ -8679,18 +8876,33 @@ async fn send_request_frame(
     method: &str,
     params: Value,
 ) {
-    client
-        .send(
-            json!({
-                "apiVersion": API_VERSION,
-                "requestId": request_id,
-                "method": method,
-                "params": params
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
+    // The deliberate fire-and-forget face: responses are consumed by the
+    // caller's own drain loops, so nothing is read here. Only the write is
+    // bounded — a connector that stopped reading would otherwise block this
+    // write forever once the socket buffers filled.
+    if timeout(
+        HARNESS_REQUEST_TIMEOUT,
+        client.send(request_frame(request_id, method, params)),
+    )
+    .await
+    .is_err()
+    {
+        panic!(
+            "harness frame write {request_id} ({method}) stalled over \
+             {HARNESS_REQUEST_TIMEOUT:?} (the connector likely stopped reading):\n{}",
+            dump_connector_crash_scene()
+        );
+    }
+}
+
+fn request_frame(request_id: &str, method: &str, params: Value) -> String {
+    json!({
+        "apiVersion": API_VERSION,
+        "requestId": request_id,
+        "method": method,
+        "params": params
+    })
+    .to_string()
 }
 
 /// Contract revision 1.53 (§4.49, capability call-signaling): the connector's
@@ -9155,8 +9367,18 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
         )
         .await;
         loop {
-            let frame: Value =
-                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+                serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+            })
+            .await
+            {
+                Ok(frame) => frame,
+                Err(_) => panic!(
+                    "the call.incoming poll drain stalled over \
+                     {HARNESS_REQUEST_TIMEOUT:?} with {incoming:?}:\n{}",
+                    dump_connector_crash_scene()
+                ),
+            };
             if frame.get("event").and_then(Value::as_str) == Some("call.incoming") {
                 incoming.push(frame["data"].clone());
                 continue;
@@ -9587,7 +9809,7 @@ async fn groups_approve_join_requests_round_trip_and_guards() {
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
 
     // Sync so the fixture group row exists, then read its conversation id.
-    request(
+    let _ = request(
         &mut client,
         "contacts-sync",
         "contacts.sync",
@@ -10163,7 +10385,7 @@ async fn groups_revoke_invites_round_trip_and_guards() {
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
 
     // Sync so the fixture group row exists, then read its conversation id.
-    request(
+    let _ = request(
         &mut client,
         "contacts-sync",
         "contacts.sync",

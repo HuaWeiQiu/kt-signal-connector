@@ -30,6 +30,17 @@ const API_VERSION: &str = "1.0";
 const TEST_STORE_KEY: [u8; 32] = [0x5A; 32];
 const CEILING: usize = 8;
 
+/// Upper bound for one harness request round trip (write + response wait) —
+/// the harness-timeout discipline from server_integration.rs: a deadline-less
+/// read turned any transient upstream anomaly into an indefinite hang.
+const HARNESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound for the handshake faces (challenge read + proof response read).
+const HARNESS_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[path = "common/harness_scene.rs"]
+mod harness_scene;
+use harness_scene::dump_connector_crash_scene;
+
 fn bootstrap_payload(secret: &[u8; 32]) -> String {
     format!("{}\n{}", hex::encode(secret), hex::encode(TEST_STORE_KEY))
 }
@@ -89,7 +100,17 @@ async fn ninth_link_start_is_refused_with_the_group_named() {
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
 
-    let challenge: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let challenge: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(challenge) => challenge,
+        Err(_) => panic!(
+            "authentication challenge never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
     let client_nonce = hex::encode([9_u8; 32]);
     let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
@@ -112,7 +133,17 @@ async fn ninth_link_start_is_refused_with_the_group_named() {
         )
         .await
         .unwrap();
-    let response: Value = serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+    let response: Value = match timeout(HARNESS_AUTH_TIMEOUT, async {
+        serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => panic!(
+            "handshake response never arrived within {HARNESS_AUTH_TIMEOUT:?}:\n{}",
+            dump_connector_crash_scene()
+        ),
+    };
     assert_eq!(response["result"]["apiVersion"], API_VERSION);
 
     let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
@@ -186,23 +217,35 @@ async fn request(
     method: &str,
     params: Value,
 ) -> Value {
-    client
-        .send(
-            json!({
-                "apiVersion": API_VERSION,
-                "requestId": request_id,
-                "method": method,
-                "params": params,
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-    loop {
-        let line = client.next().await.unwrap().unwrap();
-        let value: Value = serde_json::from_str(&line).unwrap();
-        if value.get("requestId").and_then(Value::as_str) == Some(request_id) {
-            return value;
+    let round = timeout(HARNESS_REQUEST_TIMEOUT, async {
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": request_id,
+                    "method": method,
+                    "params": params,
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        loop {
+            let line = client.next().await.unwrap().unwrap();
+            let value: Value = serde_json::from_str(&line).unwrap();
+            if value.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return value;
+            }
         }
+    })
+    .await;
+    match round {
+        Ok(value) => value,
+        Err(_) => panic!(
+            "harness request {request_id} ({method}) exceeded {HARNESS_REQUEST_TIMEOUT:?}; \
+             the deadline-less await family turned transient upstream anomalies into \
+             indefinite hangs:\n{}",
+            dump_connector_crash_scene()
+        ),
     }
 }
