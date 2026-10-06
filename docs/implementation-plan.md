@@ -5,7 +5,20 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.68 (2026-10-06; §4.61 — safety-number faces `identities.get` /
+- Contract revision: 1.67 (2026-10-06; §4.60 — the group member-label read
+  face: `groups.get` roster entries now carry the upstream member's own
+  `labelEmoji` / `label` pair, the pinned `listGroups` `JsonGroupMember`
+  `@JsonInclude(NON_NULL)` fields captured verbatim at sync under the pinned
+  server budgets (emoji ≤64B / string ≤512B, over-budget drops the key) and
+  projected at read time as absent-when-none keys; same-day rebump —
+  1.66 is the landed multi-attachment send face (the §4.59 entry, in the
+  chain below — it landed first and its entry therefore sits in the chain,
+  newest wins); 1.64 and 1.65 have since landed (the group-invites face
+  §4.57 and the message-request receive projection §4.58, both in the
+  chain below) and the safety-number faces have landed in this same stack
+  (1.68, the §4.61 entry, also in the chain below), so this batch takes
+  the next chain entry) —
+  previously 1.68 (2026-10-06; §4.61 — safety-number faces `identities.get` /
   `identities.verify`: the pinned upstream's native identity faces — the read narrows the
   native `listIdentities` JSON-RPC projection (a `JsonRpcLocalCommand`, so the JSON-RPC read
   is native; jsonrpc.rs:121-126 + ListIdentitiesCommand.java:23) to the resolved peer
@@ -17,8 +30,10 @@
   capability `safety-number` one bit for both halves. 1.64 is the landed group-invites face
   (the §4.57 entry, in the chain below) and 1.66 is the landed multi-attachment send face
   (the §4.59 entry, in the chain below) — both landed first and their entries therefore sit
-  in the chain, newest wins; 1.65/1.67 remain reserved by parallel batches) — previously 1.66
-  (2026-10-06; §4.59 — the multi-attachment send face opens: `messages.attachments.send` gains
+  in the chain, newest wins; 1.65 has since landed (the message-request receive projection,
+  the §4.58 entry in the chain below) and 1.67 lands in this same stack (the member-label
+  read face, the §4.60 entry in the chain), so this batch takes §4.61 directly) —
+  previously 1.66 (2026-10-06; §4.59 — the multi-attachment send face opens: `messages.attachments.send` gains
   an optional plural
   `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]` form
   beside the §4.12 singular payload, mutually exclusive with it — the
@@ -3417,7 +3432,7 @@ additionally flips the contact's profile-sharing bit upstream
 > any write; the upstream refusal forwards UPSTREAM_ERROR; the in-flight
 > crash answers SEND_OUTCOME_UNKNOWN and is never retried across the
 > restart).
-### 4.61 Safety-number faces: identities.get, identities.verify (contract revision 1.68, 2026-10-06; §4.57/§4.59 already landed in the chain above — the 1.64 invites and 1.66 forward-multi-attachment batches; §4.58/§4.60 remain reserved by the parallel 1.65 MRR-projection / 1.67 member-label batches)
+### 4.61 Safety-number faces: identities.get, identities.verify (contract revision 1.68, 2026-10-06; §4.57/§4.58/§4.59 already landed in the chain above — the 1.64 invites, 1.65 MRR-projection, and 1.66 forward-multi-attachment batches; §4.60 lands in this same stack — the 1.67 member-label batch's entry sits below)
 
 The safety-number matrix item (the official safety number convergence flow: the details row +
 the viewer modal + the verify action) closes its data plane as **one thin managed read plus one
@@ -3638,6 +3653,46 @@ listed under the same handshake entry):
   fallback send could double-deliver. The backward-compat story is
   byte-identical to every optional-param revision: a pre-1.66 caller sends
   no new key and reads the old shapes unchanged.
+
+### 4.60 Group member-label read face: `groups.get` roster label projection (contract revision 1.67, 2026-10-06; §4.56→§4.60 renumbered on landing — §4.57 landed as the group-invites face, §4.58 landed as the message-request receive projection, §4.59 landed as the multi-attachment send face)
+
+The official member-labels feature (Signal-Desktop v8.31.0-alpha.1:
+`ts/components/conversation/conversation-details/GroupMemberLabelEditor.dom.tsx`,
+`ConversationDetails.dom.tsx:704-720` list row, `ConversationDetailsMembershipList.dom.tsx:
+203-237` roster rows) closes its connector data face. The pinned signal-cli v0.14.8 carries
+both halves natively: the write side landed with §4.44 (`groups.update` forwards
+`memberLabel` / `memberLabelEmoji`; Java `GroupHelper.updateGroupV2` sets **the linked
+account's own** label — `labelEmoji` falls back to the self member's current value when
+absent, `GroupV2Helper.setMemberLabels` → `createChangeMemberLabel(getSelfAci(), ...)`; there
+is no admin-over-other-member path in the upstream command, and clearing is impossible
+because the connector's 1..256-byte bound refuses the empty string that would clear), and
+the read side is this batch: `listGroups` member entries carry `labelEmoji` / `label`
+(`ListGroupsCommand$JsonGroupMember`, both `@JsonInclude(NON_NULL)`, fed from
+`GroupMemberInfoV2.labelEmoji()/labelString()` over the decrypted member).
+
+- Sync capture (`group_extra_json`): each bounded roster entry now stores `labelEmoji` /
+  `label` verbatim under the upstream's own server budgets — emoji ≤64 bytes, string ≤512
+  bytes (`ts/types/GroupMemberLabels.std.ts` `SERVER_EMOJI_BYTE_LIMIT` /
+  `SERVER_STRING_BYTE_LIMIT`); a value past its budget (or an empty/whitespace one) drops
+  the key instead of truncating — a clipped label would render a lie. Engines without a
+  label face (and every pre-1.67 row) never set the keys; entries keep dropping
+  individually on any malformation.
+- Read projection (`project_group_roster`): `members[].labelEmoji` / `members[].label` are
+  absent-when-none keys — absent for label-less members, for engine-mode rosters, and for
+  pre-1.67 rows (byte-identical wire). The read re-checks the same budgets (cheap defense
+  in depth). The §4.44 write converges through the next sync; this face projects, it never
+  composes.
+- Capability: none new — the write half shipped under `group-management` (§4.44) and this
+  is a read projection of the same family (the §4.50 appendix / §4.53 appendix discipline).
+  The official client's own gate is a remote-config flag
+  (`desktop.groupMemberLabels.edit.beta` / `.prod`), a desktop rollout control, not a
+  protocol capability; desktops gate the editor on `group-management` plus the roster admin
+  mark (the official `getCanAddLabel` admin arm — the group's `accessControl.memberLabel`
+  permission is not projected by the pinned upstream, so the knowable arm is the only one
+  rendered).
+- Schema: `groupsGetParams` description extended; no new method, error code, event, or
+  store column (the pair rides the existing §4.39 `group_extra_json` roster). Metrics
+  classify as contacts like the rest of `groups.get`.
 
 ## 5. signal-cli Boundary
 

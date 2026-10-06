@@ -3011,6 +3011,99 @@ async fn groups_get_carries_the_sync_terminated_flag() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// groups.get carries the sync-captured member label projection (contract
+/// 1.67, §4.60): the stub answers the fixture label pair for the fixture
+/// group's members, so the full ladder — listGroups JsonGroupMember
+/// labelEmoji/label → group_extra_json capture (server budgets) → the
+/// groups.get roster projection — lands in the response as absent-when-none
+/// keys; the unlabeled default fixture row (groups_get_projects_the_synced_
+/// group_cache's exact-shape assertion) proves the absent face.
+#[tokio::test]
+async fn groups_get_carries_the_member_label_projection() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [56_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_LABELED_GROUPS", "ZmFrZS1ncm91cC0x")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-MemberLabels" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    let members = group["result"]["members"].as_array().unwrap();
+    // Self member: label string only — the fixture carries no labelEmoji for
+    // it, so the emoji key stays absent (the NON_NULL omission shape).
+    assert_eq!(
+        members[0],
+        json!({
+            "id": "+15555550100",
+            "name": "Test User",
+            "self": true,
+            "label": "Ops",
+        })
+    );
+    // Alice: the full pair, captured verbatim.
+    assert_eq!(
+        members[1],
+        json!({
+            "id": "+15555550101",
+            "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+            "name": "Alice Example",
+            "admin": true,
+            "labelEmoji": "🛠️",
+            "label": "Builders",
+        })
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// groups.get carries the live requesting-members projection (contract
 /// 1.62, §4.53 appendix): the stub answers one requesting member for the
 /// fixture group, so the full ladder — single-group listGroups live read →

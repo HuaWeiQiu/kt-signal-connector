@@ -25,8 +25,9 @@ use crate::service::{
     ConnectorService, ContactsSyncOutcome, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, GroupDetails, GroupsApproveJoinRequestsParams, GroupsQuitParams,
-    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    ConversationsSetPinnedParams, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
+    GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails, GroupsApproveJoinRequestsParams,
+    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
     MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
@@ -4299,16 +4300,26 @@ fn fold_invite_candidates(
 }
 
 /// The cached group row's `extra` JSON (contract revision 1.40, §4.39; the
-/// terminated flag added in 1.53, §4.50 appendix): the member count the 1.9
-/// sync already recorded, now beside the bounded roster the §4.39 projection
-/// reads. Member entries keep the connector-wide first-wins address ladder
-/// (`number` before `uuid`); a separate `uuid` key
+/// terminated flag added in 1.53, §4.50 appendix; the member label pair added
+/// in 1.67, §4.60): the member count the 1.9 sync already recorded, now beside
+/// the bounded roster the §4.39 projection reads. Member entries keep the
+/// connector-wide first-wins address ladder (`number` before `uuid`); a
+/// separate `uuid` key
 /// is stored only when the upstream supplied one that differs from `id`.
 /// `admin: true` is recorded when the pinned upstream marks the member — its
 /// per-member `isAdmin` flag or the group-level `admins` address set
 /// (`ListGroupsCommand$JsonGroupMember` / `$JsonGroup`, verified in the
 /// 0.14.8 distribution jar); engines without an admin face simply never set
-/// it. Entries without any address and entries past [`MAX_GROUP_MEMBERS`]
+/// it. `labelEmoji` / `label` (contract 1.67, §4.60) are the pinned upstream's
+/// per-member label fields (`JsonGroupMember.labelEmoji` / `.label`, both
+/// `@JsonInclude(NON_NULL)` — absent keys when the member carries none) passed
+/// through verbatim under the upstream's own server budgets: an emoji over 64
+/// bytes or a string over 512 bytes (the pinned
+/// `GroupsV2Operations` server-side caps; the write face budgets them at
+/// `SERVER_EMOJI_BYTE_LIMIT` / `SERVER_STRING_BYTE_LIMIT`) drops the key
+/// instead of truncating — a clipped label would render a lie. Engines
+/// without a label face simply never set either key. Entries without any
+/// address and entries past [`MAX_GROUP_MEMBERS`]
 /// drop — a hostile roster can never fail the sync. `isTerminated: true` is
 /// recorded when the upstream `JsonGroup` carries it (the §4.50 verified read
 /// source; false and absent collapse to absent, the same informative-keys
@@ -4344,13 +4355,27 @@ fn group_extra_json(members: &[Value], group: &Value) -> String {
                 });
             let admin = object.get("isAdmin").and_then(Value::as_bool) == Some(true)
                 || admin_ids.contains(&id);
-            let mut projected = serde_json::Map::with_capacity(3);
+            let label_emoji = bounded_upstream_label(
+                object.get("labelEmoji").and_then(Value::as_str),
+                GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
+            );
+            let label = bounded_upstream_label(
+                object.get("label").and_then(Value::as_str),
+                GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
+            );
+            let mut projected = serde_json::Map::with_capacity(5);
             projected.insert("id".to_string(), json!(id));
             if let Some(uuid) = uuid {
                 projected.insert("uuid".to_string(), json!(uuid));
             }
             if admin {
                 projected.insert("admin".to_string(), json!(true));
+            }
+            if let Some(label_emoji) = label_emoji {
+                projected.insert("labelEmoji".to_string(), json!(label_emoji));
+            }
+            if let Some(label) = label {
+                projected.insert("label".to_string(), json!(label));
             }
             Some(Value::Object(projected))
         })
@@ -4378,6 +4403,18 @@ fn member_address_id(object: &serde_json::Map<String, Value>) -> Option<String> 
                 .take(MAX_GROUP_MEMBER_ID_CHARS)
                 .collect::<String>()
         })
+}
+
+/// One upstream label field under its server budget (contract 1.67, §4.60):
+/// trimmed, non-empty, and only when it fits the budget whole — the key drops
+/// otherwise (a truncated label would render a lie, so over-budget values are
+/// treated as malformed and dropped individually, the §4.39 hostile-roster
+/// discipline).
+fn bounded_upstream_label(value: Option<&str>, max_bytes: usize) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
+        .map(str::to_owned)
 }
 
 impl Drop for RuntimeSupervisor {
@@ -5418,7 +5455,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RuntimeSupervisor, compose_contact_display_name, compose_import_progress,
+        RuntimeSupervisor, compose_contact_display_name, compose_import_progress, group_extra_json,
         is_receive_fatal_stderr,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
@@ -5930,6 +5967,49 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(terminated["isTerminated"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn group_extra_json_captures_member_labels_within_server_budgets() {
+        // Contract 1.67 (§4.60): the pinned listGroups member label pair is
+        // captured verbatim; label-less members, engines without the face,
+        // and over-budget values (dropped, never truncated) follow the
+        // informative-keys discipline.
+        let group = json!({"id": "aWQ", "isMember": true});
+        let members = json!([
+            {
+                "number": "+15555550100",
+                "labelEmoji": "🛠️",
+                "label": "Builders",
+            },
+            {"number": "+15555550101", "label": "  Design  "},
+            {"number": "+15555550102", "labelEmoji": "", "label": "   "},
+            {"number": "+15555550103", "label": "x".repeat(512)},
+            {"number": "+15555550104", "label": "x".repeat(513)},
+            {"number": "+15555550105", "labelEmoji": "x".repeat(64)},
+            {"number": "+15555550106", "labelEmoji": "x".repeat(65)},
+        ]);
+        let extra: serde_json::Value =
+            serde_json::from_str(&group_extra_json(members.as_array().unwrap(), &group)).unwrap();
+        let roster = extra["members"].as_array().unwrap();
+        assert_eq!(
+            roster[0],
+            json!({"id": "+15555550100", "labelEmoji": "🛠️", "label": "Builders"})
+        );
+        // Trimmed but otherwise verbatim.
+        assert_eq!(roster[1]["label"], json!("Design"));
+        assert!(roster[1].get("labelEmoji").is_none());
+        // Empty/whitespace-only values drop (the upstream emits NON_NULL but
+        // an empty string is not a label).
+        assert_eq!(roster[2], json!({"id": "+15555550102"}));
+        // Exactly at the 512-byte server string budget passes whole.
+        assert_eq!(roster[3]["label"], json!("x".repeat(512)));
+        // One byte over drops the key instead of truncating.
+        assert_eq!(roster[4], json!({"id": "+15555550104"}));
+        // The 64-byte emoji budget: a 64-byte value passes whole, 65 drops.
+        // The budget is bytes, not graphemes.
+        assert_eq!(roster[5]["labelEmoji"], json!("x".repeat(64)));
+        assert_eq!(roster[6], json!({"id": "+15555550106"}));
     }
 
     #[test]

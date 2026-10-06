@@ -489,6 +489,11 @@ for line in sys.stdin:
         # are exercisable against the same shape. The upstream projects no
         # inviter metadata on a pending entry (no addedByUserId — the
         # recorded §4.57 projection difference), so none is faked.
+        # Member labels ride the JsonGroupMember record the same way
+        # (labelEmoji/label, both @JsonInclude(NON_NULL), the §4.60 verified
+        # read source): KT_FAKE_LABELED_GROUPS lists the group ids whose
+        # members answer with the fixture label pair, so the sync-capture
+        # path is exercisable; unlisted groups keep the label-less shape.
         terminated_ids = {
             value.strip()
             for value in os.environ.get("KT_FAKE_TERMINATED_GROUPS", "").split(",")
@@ -510,6 +515,23 @@ for line in sys.stdin:
             pending[group_id.strip()] = [
                 address.strip() for address in addresses.split(",") if address.strip()
             ]
+        labeled_ids = {
+            value.strip()
+            for value in os.environ.get("KT_FAKE_LABELED_GROUPS", "").split(",")
+            if value.strip()
+        }
+        fixture_members = [
+            {"number": LINKED_ACCOUNT},
+            {
+                "number": "+15555550101",
+                "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "isAdmin": True,
+            },
+        ]
+        if "ZmFrZS1ncm91cC0x" in labeled_ids:
+            fixture_members[0]["label"] = "Ops"
+            fixture_members[1]["labelEmoji"] = "🛠️"
+            fixture_members[1]["label"] = "Builders"
         result = [
             {
                 "id": "ZmFrZS1ncm91cC0x",
@@ -522,14 +544,7 @@ for line in sys.stdin:
                 "pendingMembers": [
                     {"number": address} for address in pending.get("ZmFrZS1ncm91cC0x", [])
                 ],
-                "members": [
-                    {"number": LINKED_ACCOUNT},
-                    {
-                        "number": "+15555550101",
-                        "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
-                        "isAdmin": True,
-                    },
-                ],
+                "members": fixture_members,
             },
             {
                 "id": "bm90LWEtbWVtYmVy",

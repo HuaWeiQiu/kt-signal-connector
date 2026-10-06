@@ -190,6 +190,14 @@ pub const MAX_GROUP_MEMBER_ID_CHARS: usize = 128;
 pub const GROUP_NAME_MAX_BYTES: usize = 256;
 pub const GROUP_DESCRIPTION_MAX_BYTES: usize = 4096;
 pub const GROUP_MEMBER_LABEL_MAX_BYTES: usize = 256;
+/// The upstream member-label read budgets (contract 1.67, §4.60): the pinned
+/// server-side caps the official client applies to labels it stores for the
+/// group (`ts/types/GroupMemberLabels.std.ts` `SERVER_STRING_BYTE_LIMIT` /
+/// `SERVER_EMOJI_BYTE_LIMIT`). The §4.60 sync capture passes label fields
+/// through under these budgets — a value past its budget drops the key rather
+/// than truncating, so the read projection never renders a clipped label.
+pub const GROUP_MEMBER_LABEL_SERVER_MAX_BYTES: usize = 512;
+pub const GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -5464,7 +5472,11 @@ fn project_pending_members(
 /// One projected roster entry (§4.39): the stored identity, the read-time
 /// contacts-cache name, the number-based self marker, and the admin flag the
 /// sync captured from the upstream (absent when the engine exposes none).
-/// Stored entries without an address drop individually.
+/// Stored entries without an address drop individually. The stored label pair
+/// (contract 1.67, §4.60) passes through under the same server budgets the
+/// capture enforced — the stored roster is connector-written, so this second
+/// bound is cheap defense in depth against any older row that predates the
+/// capture budgets.
 fn project_group_roster(
     store: &Store,
     account_id: &str,
@@ -5503,15 +5515,35 @@ fn project_group_roster(
                 .get(&id)
                 .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
                 .cloned();
+            let label_emoji = super_supervisor_label_bound(
+                object.get("labelEmoji").and_then(Value::as_str),
+                GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
+            );
+            let label = super_supervisor_label_bound(
+                object.get("label").and_then(Value::as_str),
+                GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
+            );
             Some(GroupMemberView {
                 is_self: id == account.signal_account,
                 id,
                 uuid,
                 name,
                 admin: object.get("admin").and_then(Value::as_bool) == Some(true),
+                label_emoji,
+                label,
             })
         })
         .collect())
+}
+
+/// The read-side twin of the capture budget (contract 1.67, §4.60): trimmed,
+/// non-empty, whole-value-only. Local copy — the capture helper is a private
+/// fn of the supervisor module, and the projection must not truncate either.
+fn super_supervisor_label_bound(value: Option<&str>, max_bytes: usize) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= max_bytes)
+        .map(str::to_owned)
 }
 
 pub(crate) fn store_list_messages(
@@ -5788,7 +5820,9 @@ pub struct MediaCloseView {
 /// timestamp — the response is exactly as fresh as that sync, nothing more.
 /// `members` (contract revision 1.40, §4.39) is the bounded roster the sync
 /// captured; absent on pre-1.40 rows, where the response stays byte-identical
-/// to the §4.8 shape. `is_terminated` (contract revision 1.53, §4.50
+/// to the §4.8 shape; its entries carry the upstream member label pair since
+/// contract 1.67 (§4.60), absent keys when the member (or the whole engine
+/// face) has none. `is_terminated` (contract revision 1.53, §4.50
 /// appendix) is the upstream `JsonGroup.isTerminated` flag as of the row's
 /// last sync — false for every pre-1.53 row and every engine without the
 /// flag, and the receive chain cannot refresh it (the `JsonGroupInfo`
@@ -5823,7 +5857,14 @@ pub struct GroupDetails {
 /// boundary (the own ACI is not queryable upstream); `admin` is the upstream
 /// admin mark the sync captured, collapsed to an absent key when false or
 /// never provided (engine-mode rosters carry none — §4.39 records the
-/// projection difference).
+/// projection difference). `labelEmoji` / `label` (contract 1.67, §4.60) are
+/// the upstream member's own label the sync captured verbatim, collapsed to
+/// absent keys when the member carries none (the pinned upstream emits both
+/// `@JsonInclude(NON_NULL)`; engine-mode rosters carry neither — same
+/// projection difference as `admin`). The write face (§4.44
+/// `groups.update memberLabel`/`memberLabelEmoji`, self only per the pinned
+/// `GroupHelper.updateGroupV2`) converges the values through the next sync —
+/// this read projects, it never composes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupMemberView {
@@ -5836,6 +5877,10 @@ pub struct GroupMemberView {
     pub is_self: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub admin: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label_emoji: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// One projected requesting-member row (contract revision 1.62, §4.53
@@ -13515,6 +13560,47 @@ mod tests {
             Some(MAX_GROUP_MEMBERS)
         );
         assert_eq!(flooded.member_count, Some((MAX_GROUP_MEMBERS + 50) as u64));
+
+        // Contract 1.67 (§4.60): the captured label pair projects as
+        // absent-when-none keys — present verbatim for labelled members,
+        // absent for label-less members, and dropped (not truncated) for
+        // values past the server budgets the capture enforced.
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "bGFiZWwtZ3JvdXA",
+                "Label Group",
+                Some(
+                    json!({
+                        "memberCount": 4,
+                        "members": [
+                            {"id": "+15555550100", "labelEmoji": "🛠️", "label": "Builders"},
+                            {"id": "+15555550101"},
+                            {"id": "+15555550102", "label": "x".repeat(512)},
+                            {"id": "+15555550103", "label": "x".repeat(513)},
+                        ],
+                    })
+                    .to_string()
+                    .as_str(),
+                ),
+                1725300003,
+            )
+            .unwrap();
+        let labelled = service.get_group(&account.id, "bGFiZWwtZ3JvdXA").unwrap();
+        let labelled_wire = serde_json::to_value(labelled.members.unwrap()).unwrap();
+        assert_eq!(
+            labelled_wire[0],
+            json!({"id": "+15555550100", "self": true, "labelEmoji": "🛠️", "label": "Builders"}),
+        );
+        assert_eq!(
+            labelled_wire[1],
+            json!({"id": "+15555550101", "name": "Alice Contact"})
+        );
+        assert_eq!(labelled_wire[2]["label"], json!("x".repeat(512)));
+        assert!(labelled_wire[2].get("labelEmoji").is_none());
+        assert_eq!(labelled_wire[3], json!({"id": "+15555550103"}));
 
         // A group row without a captured member list omits memberCount.
         service
