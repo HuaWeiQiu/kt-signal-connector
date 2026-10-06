@@ -15,7 +15,14 @@
   addressing, live/import locator ladder, the §4.38 step-3 chain unchanged (idempotent dedup,
   terminal failures, no auto-retry). Same-day rebump past 1.60 — 1.58
   (group-join-approve) and 1.60 (summary isTerminated projection) landed on main before this
-  batch; 1.59 stays reserved for the parallel username-passthrough batch, unwritten) — previously 1.60 (2026-10-06; §4.52 conversation-summary/contact-row
+  batch; 1.59 stays reserved for the parallel username-passthrough batch, unwritten) — previously 1.59 (2026-10-06; §4.55 — the Signal username faces:
+  `accounts.setUsername` / `accounts.getUsername` / `username.lookup`, capability
+  `username`; the write rides the pinned `updateAccount` mutually exclusive
+  group with the official desktop username grammar mirrored fail-closed
+  locally, the read honestly answers CAPABILITY_UNAVAILABLE because the
+  pinned signal-cli has no local-account username getter, and the lookup
+  resolves usernames/username links through `getUserStatus --username` with
+  a 20-entry KT batch bound; previously 1.60 (2026-10-06; §4.52 conversation-summary/contact-row
   terminated projection — the `conversations.list` page, the single
   `conversation.changed` summary, and the `contacts.list` rows now carry the
   group termination flag the 1.53 §4.50 appendix sync capture stores, read out
@@ -2994,6 +3001,68 @@ import rows §4.38 step 3 serves. Two connector halves land together.
   attachment-pill desktop, not only the history-import ones). A desktop without the tag
   keeps the metadata-only rendering (zero calls); contract 1.61 wire consumers are
   unaffected.
+
+### 4.55 Signal username: `accounts.setUsername`, `accounts.getUsername`, `username.lookup` (contract revision 1.59, 2026-10-06; §4.52→§4.55 renumbered on landing — §4.52-§4.54 claimed by the 1.60/1.58/1.61 batches)
+
+The Signal username capability for the KT chain: an account can set a contactable username
+(what other people reach it by without a phone number), delete it, and resolve other
+people's usernames/username links to registration status. The upstream anchors in the
+pinned signal-cli 0.14.8 are `UpdateAccountCommand` (the `updateAccount` jsonRpc method,
+`username` XOR `delete-username` mutually exclusive group at UpdateAccountCommand.java:41-46,
+`InvalidUsernameException` → UserErrorException → JSON-RPC error "Invalid username: ..."),
+`ManagerImpl.setUsername` (a value containing `.` routes to `reserveExactUsername`, a bare
+nickname to `reserveUsernameFromNickname` which lets the server pick the discriminator),
+`AccountHelper` (USERNAME_MIN_LENGTH 3 / USERNAME_MAX_LENGTH 32, the libsignal
+`Username.candidatesFrom` denominators), and `GetUserStatusCommand` (`--username` nargs=*,
+the `[{recipient, number?, username?, uuid?, isRegistered}]` array). Official desktop
+source is read for the grammar anchors only (AGPL, zero copy): `ts/util/Username.dom.ts`
+pins nickname `[a-zA-Z_][a-zA-Z0-9_]*` plus an optional all-digits discriminator with
+libsignal's 0..65535 range and no-leading-zero forms (a `0`-leading discriminator is
+exactly two digits).
+
+- `accounts.setUsername` params `{accountId, username?, deleteUsername}` — XOR enforced in
+  the service ladder (both present or both absent → `INVALID_REQUEST`, retryable=false;
+  the schema cannot express XOR so both stay optional). The username shape gate is the
+  desktop grammar mirrored fail-closed (3..32 chars total; nickname charset; `.N`
+  discriminator all digits, no `00` prefix, `0`-leading only as exactly two digits,
+  0..65535); a bare nickname is allowed (server picks the discriminator). The server
+  reserve/confirm stays the authority — a shape-valid but taken username is the upstream
+  "Invalid username: ..." user error, surfaced as `UPSTREAM_ERROR` (no new structured
+  code; the `-1` upstream code never crosses the host boundary verbatim).
+  Send lane, class `accounts`, account-scoped mutating (`CallClass::Mutating`): an
+  indeterminate outcome answers `SEND_OUTCOME_UNKNOWN` and is never retried. Result on
+  the set path: `{username, usernameLink?}` straight from the upstream write-back
+  (`m.getUsername()` / `m.getUsernameLink()`, NON_NULL); on the delete path the upstream
+  writes no result body, so the projection is `{}`. A same-value set is upstream-idempotent
+  (`reserveExactUsername` refreshes the current username in place).
+- `accounts.getUsername` deliberately answers `CAPABILITY_UNAVAILABLE` (retryable=false)
+  in every mode, after the standard account ladder: the pinned signal-cli has **no JSON-RPC
+  reader** for the local account's username — `JsonAccountResponse` is a private record
+  inside `UpdateAccountCommand` fed by the write-back only, and no list/get account face
+  carries the field (verified across the pinned checkout). The method exists as wire
+  surface so the desktop can gate and call it once an upstream getter lands; display is
+  fed by the `setUsername` write-back mirror instead (the desktop persists the projection
+  in its own signalProfileMirror).
+- `username.lookup` params `{accountId, usernames[1..20]}` — the upstream takes an open
+  array; 20 entries is the KT bound for one host frame (`USERNAME_LOOKUP_MAX_ENTRIES`),
+  each entry 1..64 characters (a full username is ≤32; the 64 is a frame bound, not the
+  grammar). Entries are usernames or username-link URLs (`resolveRecipientByUsernameOrLink`
+  resolves both); bare nicknames are not entries. Read lane (`CallClass::ReadOnly`),
+  class `read`. Result: `{results: [{recipient, number?, username?, uuid?, isRegistered}]}`
+  projected entry-for-entry from the upstream array — `uuid != null` means the entry
+  resolved to a registered account. The upstream CDSI face can rate-limit
+  (`RateLimitException`) — surfaced as `UPSTREAM_ERROR` like every upstream user error.
+- All three faces carry capability tag `username` (rides the handshake capabilities array;
+  desktops gate the new surface on it). JVM/native modes dispatch `updateAccount` /
+  `getUserStatus` directly; **the kt-engine face has no username method at all** (verified
+  against the engine's method table in `docs/jsonrpc-compat.md` §3) and all three answer
+  `CAPABILITY_UNAVAILABLE` (retryable=false) after local validation — the groups.update/
+  quit engine-batch debt shape, honest by design.
+- Zero new structured error codes (`ENGINE_STRUCTURED_ERROR_CODES` unchanged); the local
+  ladder is `INVALID_REQUEST` (shape) → `ACCOUNT_NOT_FOUND` (resolution) →
+  `CAPABILITY_UNAVAILABLE` (mode/getter) → upstream errors degrade to plain
+  `UPSTREAM_ERROR`. Zero local persistence: no username state is written to the store —
+  the desktop's signalProfileMirror is the only local copy, fed from the write-back.
 
 ## 5. signal-cli Boundary
 

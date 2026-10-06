@@ -4146,6 +4146,10 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "calls.sendSignal",
         "calls.getState",
         "call-signaling",
+        "accounts.setUsername",
+        "accounts.getUsername",
+        "username.lookup",
+        "username",
     ] {
         assert!(
             capabilities
@@ -6487,6 +6491,252 @@ async fn account_settings_and_blocked_faces_round_trip() {
 
     drop(client);
     wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract revision 1.59: the §4.55 username faces — accounts.setUsername
+/// (the updateAccount write with the upstream write-back projection, the
+/// InvalidUsernameException face via the -1 sentinel, the crash-with-
+/// in-flight-write unknown outcome with no retry), accounts.getUsername
+/// (the honest CAPABILITY_UNAVAILABLE read in every mode), and
+/// username.lookup (the getUserStatus array projection entry-for-entry,
+/// including the unregistered face and the CDSI rate-limit sentinel).
+#[tokio::test]
+async fn username_faces_round_trip_and_gate_the_mode() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let mut engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Username" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let send_log = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // setUsername round trip: the updateAccount payload rides the resolved
+    // signal account + username; the result projects the upstream write-back
+    // verbatim (username + the generated username link).
+    let set = request(
+        &mut client,
+        "username-set",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "kt_test_agent.07" }),
+    )
+    .await;
+    assert_eq!(set["result"]["username"], "kt_test_agent.07");
+    assert_eq!(
+        set["result"]["usernameLink"],
+        "https://signal.me/username/fixture-link"
+    );
+    let set_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("username").is_some())
+        .collect();
+    assert_eq!(set_calls.len(), 1, "{set_calls:?}");
+    assert_eq!(set_calls[0]["account"], "+15555550100");
+    assert_eq!(set_calls[0]["username"], "kt_test_agent.07");
+
+    // The XOR ladder: both present and both absent answer INVALID_REQUEST
+    // before any upstream call.
+    let both = request(
+        &mut client,
+        "username-both",
+        "accounts.setUsername",
+        json!({
+            "accountId": account_id,
+            "username": "kt_test_agent.07",
+            "deleteUsername": true
+        }),
+    )
+    .await;
+    assert_eq!(both["error"]["code"], "INVALID_REQUEST");
+    let neither = request(
+        &mut client,
+        "username-neither",
+        "accounts.setUsername",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(neither["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(
+        send_log()
+            .iter()
+            .filter(
+                |params| params.get("username").is_some() || params.get("deleteUsername").is_some()
+            )
+            .count(),
+        1,
+        "XOR refusals never dial upstream"
+    );
+
+    // The taken-username sentinel rides the upstream -1 user error and
+    // degrades to plain UPSTREAM_ERROR (no new structured code); the
+    // sentinel value itself is grammar-legal so it reaches the upstream.
+    let taken = request(
+        &mut client,
+        "username-taken",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "fixture_username_taken.01" }),
+    )
+    .await;
+    assert_eq!(taken["error"]["code"], "UPSTREAM_ERROR");
+
+    // Local grammar: a malformed username answers INVALID_REQUEST without
+    // dialing upstream.
+    let malformed = request(
+        &mut client,
+        "username-malformed",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "kt_test.00" }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(
+        send_log()
+            .iter()
+            .filter(|params| params.get("username").is_some())
+            .count(),
+        2,
+        "the grammar refusal stays local"
+    );
+
+    // getUsername: the honest capability debt in every mode.
+    let get = request(
+        &mut client,
+        "username-get",
+        "accounts.getUsername",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(get["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    let missing = request(
+        &mut client,
+        "username-get-missing",
+        "accounts.getUsername",
+        json!({ "accountId": "acct-absent" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // username.lookup: the getUserStatus array projects entry-for-entry —
+    // first entry registered (number/username/uuid), the rest the
+    // unregistered face.
+    let lookup = request(
+        &mut client,
+        "username-lookup",
+        "username.lookup",
+        json!({
+            "accountId": account_id,
+            "usernames": ["kt_registered.01", "kt_unregistered.02"]
+        }),
+    )
+    .await;
+    let results = lookup["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["recipient"], "kt_registered.01");
+    assert_eq!(results[0]["isRegistered"], true);
+    assert!(results[0]["uuid"].is_string());
+    assert_eq!(results[1]["recipient"], "kt_unregistered.02");
+    assert_eq!(results[1]["isRegistered"], false);
+    assert!(results[1]["uuid"].is_null());
+
+    // The lookup batch cap: 21 entries refuse locally.
+    let oversized: Vec<&str> = std::iter::repeat_n("kt_lookup.entry", 21).collect();
+    let too_many = request(
+        &mut client,
+        "username-lookup-oversized",
+        "username.lookup",
+        json!({ "accountId": account_id, "usernames": oversized }),
+    )
+    .await;
+    assert_eq!(too_many["error"]["code"], "INVALID_REQUEST");
+
+    // The CDSI rate-limit sentinel degrades to UPSTREAM_ERROR.
+    let ratelimited = request(
+        &mut client,
+        "username-lookup-ratelimited",
+        "username.lookup",
+        json!({
+            "accountId": account_id,
+            "usernames": ["[fixture-username-ratelimited]"]
+        }),
+    )
+    .await;
+    assert_eq!(ratelimited["error"]["code"], "UPSTREAM_ERROR");
+
+    // Crash with the mutating username write in flight (os._exit(31)):
+    // SEND_OUTCOME_UNKNOWN, never retried.
+    let crash = request(
+        &mut client,
+        "username-crash",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "username": "fixture_crash_username.31" }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-username", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    engine_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        send_log()
+            .iter()
+            .filter(|params| params["username"] == "fixture_crash_username.31")
+            .count(),
+        1,
+        "an unknown username outcome is never retried"
+    );
+
+    // The delete face: the bare upstream payload, an empty result body.
+    let delete = request(
+        &mut client,
+        "username-delete",
+        "accounts.setUsername",
+        json!({ "accountId": account_id, "deleteUsername": true }),
+    )
+    .await;
+    assert_eq!(delete["result"], json!({}));
+    let delete_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("deleteUsername").is_some())
+        .collect();
+    assert_eq!(delete_calls.len(), 1, "{delete_calls:?}");
+    assert_eq!(delete_calls[0]["account"], "+15555550100");
+    assert_eq!(delete_calls[0]["deleteUsername"], true);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
 

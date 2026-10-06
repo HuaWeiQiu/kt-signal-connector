@@ -45,6 +45,9 @@
             "accounts.setExpireTimer",
             "accounts.setProfile",
             "accounts.updateConfiguration",
+            "accounts.setUsername",
+            "accounts.getUsername",
+            "username.lookup",
             "link.start",
             "link.finish",
             "link.cancel",
@@ -177,6 +180,39 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/accountsUpdateConfigurationParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.setUsername" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsSetUsernameParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.getUsername" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsGetUsernameParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "username.lookup" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/usernameLookupParams" }
             }
           }
         },
@@ -902,6 +938,50 @@
           "minimum": 0,
           "maximum": 4294967295,
           "description": "The account-wide default timer in seconds; 0 turns it off."
+        }
+      }
+    },
+    "accountsSetUsernameParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Set or delete the account's Signal username (contract revision 1.59, \u00a74.55, capability username) \u2014 the pinned signal-cli updateAccount mutually exclusive group (username XOR deleteUsername; the schema cannot express XOR so both stay optional and the service ladder enforces exactly-one, answering INVALID_REQUEST when both are present or both absent). username grammar is the official desktop shape mirrored fail-closed: nickname [a-zA-Z_][a-zA-Z0-9_]*, optional discriminator .N all-digits 0-65535 with no 00-leading and a 0-leading form only as exactly two digits, 3..32 characters total (the pinned libsignal bounds, AccountHelper.java:363-364); a bare nickname (no dot) is allowed and lets the server pick the discriminator. The server reserve/confirm remains the authority \u2014 a shape-valid but taken username answers UPSTREAM_ERROR (the upstream 'Invalid username: ...' user error, not a structured code). JVM/native modes dispatch updateAccount directly; the kt-engine face has no username method and answers CAPABILITY_UNAVAILABLE (retryable=false) after local validation \u2014 engine-batch debt. Send lane, account-scoped mutating: the result projects the upstream write-back {username, usernameLink?} on the set path (the connector's only username read face \u2014 there is no local-account username getter in the pinned signal-cli) and {} on the delete path; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Nothing is persisted connector-side; the desktop mirrors from the write-back.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 38,
+          "description": "The full username (nickname plus optional .discriminator) or a bare nickname. The whole-string wire bound is 38 (the 3..32 nickname window plus the separator and the widest discriminator digit run); the grammar below the wire bound — nickname charset, discriminator forms — is enforced connector-side and answers INVALID_REQUEST."
+        },
+        "deleteUsername": {
+          "type": "boolean",
+          "description": "Delete the account's username; mutually exclusive with username."
+        }
+      }
+    },
+    "accountsGetUsernameParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's own username (contract revision 1.59, \u00a74.55, capability username). Deliberately answers CAPABILITY_UNAVAILABLE (retryable=false) after account resolution in every mode: the pinned signal-cli has no JSON-RPC reader for the local account's username (JsonAccountResponse is a private write-back record inside UpdateAccountCommand; no listAccounts/getAccount face carries the field) \u2014 honest engine-surface debt. Display is fed by the accounts.setUsername write-back mirror instead of a live read.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "usernameLookupParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "usernames"],
+      "description": "Resolve usernames or username-link URLs against the account's own engine session (contract revision 1.59, \u00a74.55, capability username) \u2014 the pinned getUserStatus --username face (resolveRecipientByUsernameOrLink, so bare nicknames are not entries). usernames carries 1..20 entries (KT bound for one host frame; the upstream takes an open array), each 1..64 characters, forwarded verbatim. The result projects the upstream array entry-for-entry: {results: [{recipient, number?, username?, uuid?, isRegistered}]} \u2014 uuid != null means the entry resolved to a registered account (uuid == null with isRegistered=false is the unregistered face). The upstream CDSI face can rate-limit (RateLimitException) which surfaces as UPSTREAM_ERROR. Read lane. JVM/native modes dispatch getUserStatus directly; the kt-engine face has no username method and answers CAPABILITY_UNAVAILABLE (retryable=false) after local validation \u2014 engine-batch debt. The desktop has no lookup UI in this batch: the face is wire-complete for a later batch.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "usernames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "Usernames or username-link URLs to resolve, 1..20 entries."
         }
       }
     },

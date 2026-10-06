@@ -831,6 +831,40 @@ impl ProxyGroupRuntime {
         slot.supervisor.get_blocked_conversations(params).await
     }
 
+    /// accounts.setUsername (contract 1.59, §4.55): the username is
+    /// account-record upstream state, so the write routes through the
+    /// account's owning engine like every other mutating face.
+    pub async fn set_username(
+        &self,
+        params: crate::service::AccountsSetUsernameParams,
+    ) -> Result<crate::service::AccountUsername, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_username(params).await
+    }
+
+    /// accounts.getUsername (contract 1.59, §4.55): the read answers
+    /// CAPABILITY_UNAVAILABLE (no upstream username reader in the pinned
+    /// signal-cli), but the ladder still resolves the account's owning slot
+    /// first so ACCOUNT_NOT_FOUND keeps its precedence.
+    pub async fn get_username(
+        &self,
+        params: crate::service::AccountsGetUsernameParams,
+    ) -> Result<crate::service::AccountUsername, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_username(params).await
+    }
+
+    /// username.lookup (contract 1.59, §4.55): registration status is queried
+    /// against the account's own engine session (its CDSI face), so the read
+    /// routes through the account's owning engine.
+    pub async fn lookup_usernames(
+        &self,
+        params: crate::service::UsernameLookupParams,
+    ) -> Result<crate::service::UsernameLookupResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.lookup_usernames(params).await
+    }
+
     /// conversations.getAvatar (contract 1.48, §4.47): the avatar bytes are
     /// account-scoped upstream state, so the read routes through the
     /// account's owning engine like every other account face.

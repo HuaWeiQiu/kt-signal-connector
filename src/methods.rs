@@ -225,6 +225,25 @@ pub const METHODS: &[MethodRow] = &[
     // registry). Advertised through `call-signaling`.
     ("calls.sendSignal", Lane::Send, true, "send"),
     ("calls.getState", Lane::Read, false, "read"),
+    // Username write (contract revision 1.59, §4.55): mutating, send-lane
+    // upstream traffic — the account-settings class verbatim, same-account
+    // mutex and delete barrier included. The upstream face is the pinned
+    // signal-cli `updateAccount` JSON-RPC command (0.14.8
+    // UpdateAccountCommand.java:42-71): `username` and `deleteUsername` are
+    // mutually exclusive keys (at least one required — fail-closed locally),
+    // the reserve→confirm sequence is upstream-internal, and the result is
+    // the `{username, usernameLink}` projection (read back after the write).
+    // Zero local persistence; advertised through `username`.
+    ("accounts.setUsername", Lane::Send, true, "accounts"),
+    // Username read (contract revision 1.59, §4.55): a bounded read of the
+    // account's own username/link straight from the upstream `updateAccount`
+    // result shape — read lane, no mutation, no local persistence.
+    ("accounts.getUsername", Lane::Read, false, "read"),
+    // Username lookup (contract revision 1.59, §4.55): upstream `getUserStatus
+    // --username` passthrough (0.14.8 GetUserStatusCommand.java:41,69) — one
+    // bounded cloud read, no mutation, no local state; the candidate bounds
+    // mirror the username shape rules.
+    ("username.lookup", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -301,7 +320,11 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `attachment-download` (contract revision 1.61) marks the §4.54 live
 /// attachment download face (`attachments.download`). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
-/// dispatch table describe real methods only.
+/// dispatch table describe real methods only. `username` (contract revision
+/// 1.59) marks the §4.55 username faces (`accounts.setUsername`,
+/// `accounts.getUsername`, `username.lookup`) — desktops gate the surface on
+/// this tag so an old connector answers a clean capability gap instead of
+/// `METHOD_NOT_ALLOWED`.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
     "send-sticker",
@@ -322,6 +345,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-terminate",
     "group-join-approve",
     "attachment-download",
+    "username",
 ];
 
 #[cfg(test)]
@@ -356,6 +380,8 @@ mod tests {
             "backups.exportFile.readChunk",
             "backups.exportFile.closeHandle",
             "calls.getState",
+            "accounts.getUsername",
+            "username.lookup",
         ];
         let send_lane = [
             "messages.sendText",
@@ -391,6 +417,7 @@ mod tests {
             "history.attachmentDownload",
             "attachments.download",
             "calls.sendSignal",
+            "accounts.setUsername",
         ];
         let mutating = [
             "messages.sendText",
@@ -428,6 +455,7 @@ mod tests {
             "history.attachmentDownload",
             "attachments.download",
             "calls.sendSignal",
+            "accounts.setUsername",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

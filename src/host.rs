@@ -25,13 +25,14 @@ use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
-    AccountDeleteLocalDataParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
-    AccountsUpdateConfigurationParams, BackupsExportFileCloseHandleParams,
-    BackupsExportFileOpenParams, BackupsExportFileReadChunkParams, BackupsExportParams,
-    BackupsExportStatusParams, CallsGetStateParams, CallsSendSignalParams, ContactsListParams,
-    ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    AccountDeleteLocalDataParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
+    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
+    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
+    BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
+    CallsGetStateParams, CallsSendSignalParams, ContactsListParams, ContactsSetLocalAliasParams,
+    ContactsSyncParams, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsListParams, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
     GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsTerminateParams,
     GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
@@ -43,7 +44,7 @@ use crate::service::{
     MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
     MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
     PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams,
+    StickerPackManifestParams, StickerPackSetSyncParams, UsernameLookupParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -984,6 +985,57 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "accounts.setUsername" => {
+            match serde_json::from_value::<AccountsSetUsernameParams>(request.params) {
+                Ok(params) => match runtime.set_username(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.setUsername params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "accounts.getUsername" => {
+            match serde_json::from_value::<AccountsGetUsernameParams>(request.params) {
+                Ok(params) => match runtime.get_username(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.getUsername params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "username.lookup" => match serde_json::from_value::<UsernameLookupParams>(request.params) {
+            Ok(params) => match runtime.lookup_usernames(params).await {
+                Ok(result) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(result).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid username.lookup params", false),
+            ),
+        },
         "link.start" => match serde_json::from_value::<LinkStartParams>(request.params) {
             Ok(params) => {
                 match runtime

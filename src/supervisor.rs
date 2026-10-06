@@ -19,7 +19,8 @@ use crate::engine::{
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsUpdateConfigurationParams,
+    AccountUsername, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
+    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
     AttachmentSendTarget, AvatarDownload, BlockedConversations, CallsSendSignalParams,
     ConnectorService, ContactsSyncOutcome, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
@@ -32,7 +33,8 @@ use crate::service::{
     PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
     SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
     StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, account_limit_error, blocked_conversations_result,
+    StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_limit_error, blocked_conversations_result,
     pinned_conversations_result, sticker_pack_syncs_result, store_get_group,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
@@ -2780,6 +2782,124 @@ impl RuntimeSupervisor {
             .call("getAvatar", upstream, CallClass::ReadOnly)
             .await?;
         avatar_from_engine(&result)
+    }
+
+    /// accounts.setUsername (contract revision 1.59, §4.55, capability
+    /// username): resolution under the service lock, then the mutating
+    /// `updateAccount` call — the groups face's unknown-outcome discipline
+    /// (an indeterminate answer is SEND_OUTCOME_UNKNOWN and is never
+    /// retried). The confirmed result projects the upstream write-back
+    /// `{username, usernameLink}` on the set path — the connector's only
+    /// username read face, persisted nowhere locally — and `{username: null}`
+    /// on the delete path (the upstream writes no result body there).
+    pub async fn set_username(
+        &self,
+        params: AccountsSetUsernameParams,
+    ) -> Result<AccountUsername, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_set_username(&params, self.config.mode)?
+        };
+        match engine
+            .call("updateAccount", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => {
+                if params.delete_username {
+                    return Ok(AccountUsername {
+                        username: None,
+                        username_link: None,
+                    });
+                }
+                let username = result
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                    .to_string();
+                Ok(AccountUsername {
+                    username: Some(username),
+                    username_link: result
+                        .get("usernameLink")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// accounts.getUsername (contract revision 1.59, §4.55, capability
+    /// username): the ladder answers CAPABILITY_UNAVAILABLE — the pinned
+    /// signal-cli has no local-account username reader on either engine face
+    /// (see `prepare_accounts_get_username`). No engine call is attempted.
+    pub async fn get_username(
+        &self,
+        params: AccountsGetUsernameParams,
+    ) -> Result<AccountUsername, ServiceError> {
+        let service = self.service.lock().await;
+        match service.prepare_accounts_get_username(&params.account_id) {
+            Err(error) => Err(error),
+            Ok(_) => Err(ServiceError::Engine(EngineError::Protocol)),
+        }
+    }
+
+    /// username.lookup (contract revision 1.59, §4.55, capability username):
+    /// resolution under the service lock, then the read-only `getUserStatus`
+    /// call (entries are usernames or username links). The upstream answer is
+    /// a top-level array (`JsonUserStatus` records); the connector projects
+    /// it entry-for-entry — a missing field is a protocol face, not a
+    /// silently-dropped item.
+    pub async fn lookup_usernames(
+        &self,
+        params: UsernameLookupParams,
+    ) -> Result<UsernameLookupResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_username_lookup(&params, self.config.mode)?
+        };
+        let result = engine
+            .call("getUserStatus", upstream, CallClass::ReadOnly)
+            .await?;
+        let entries = result
+            .as_array()
+            .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+        Ok(UsernameLookupResult {
+            results: entries
+                .iter()
+                .map(|entry| {
+                    Ok(UsernameLookupEntry {
+                        recipient: entry
+                            .get("recipient")
+                            .and_then(Value::as_str)
+                            .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                            .to_string(),
+                        number: entry
+                            .get("number")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        username: entry
+                            .get("username")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        uuid: entry
+                            .get("uuid")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        is_registered: entry
+                            .get("isRegistered")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, ServiceError>>()?,
+        })
     }
 
     /// conversations.setBlocked (contract revision 1.48, §4.47, capability

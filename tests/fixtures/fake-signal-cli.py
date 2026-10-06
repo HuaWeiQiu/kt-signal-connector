@@ -850,6 +850,40 @@ for line in sys.stdin:
         if params.get("expirationInSeconds") == 4294967295:
             os._exit(31)
         result = {}
+    elif method == "updateAccount":
+        # Contract 1.59 §4.55 username write: record the exact upstream
+        # params (tests assert the username / deleteUsername key). Sentinels
+        # (grammar-legal so they pass the connector's local shape gate):
+        # username "fixture_username_taken.01" answers the upstream
+        # InvalidUsernameException face (-1 "Invalid username: ...");
+        # "fixture_crash_username.31" crashes with the mutating call in
+        # flight (os._exit(31); disjoint from 25/29/30). The set path answers
+        # the upstream write-back shape {username, usernameLink}; the delete
+        # path answers {} (no result body upstream).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        username = params.get("username")
+        if username == "fixture_username_taken.01":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "Invalid username: Username is malformed or already taken",
+                },
+            }
+            emit_json(response)
+            continue
+        if username == "fixture_crash_username.31":
+            os._exit(31)
+        if "deleteUsername" in params:
+            result = {}
+        else:
+            result = {
+                "username": username,
+                "usernameLink": "https://signal.me/username/fixture-link",
+            }
     elif method == "getBlockedConversations":
         # Contract 1.46 §4.45 blocked read: the storage-order projection as a
         # fixture constant (one contact + one legacy group). Read face, no
@@ -1387,7 +1421,41 @@ for line in sys.stdin:
                 }
                 emit_json(response)
                 continue
-        result = {"isRegistered": True}
+        if params.get("usernames") is not None:
+            # Contract 1.59 §4.55 username lookup: the --username face answers
+            # a top-level array of JsonUserStatus records. First entry
+            # resolves registered (with number+username+uuid), the rest are
+            # the unregistered face; a rate-limit sentinel entry answers the
+            # upstream CDSI RateLimitException mapping (-1, retryAfter
+            # message).
+            if "[fixture-username-ratelimited]" in params["usernames"]:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -1,
+                        "message": "Rate limit exceeded; try again after 30 seconds (RateLimitException)",
+                    },
+                }
+                emit_json(response)
+                continue
+            entries = []
+            for index, name in enumerate(params["usernames"]):
+                if index == 0:
+                    entries.append(
+                        {
+                            "recipient": name,
+                            "number": "+15551230001",
+                            "username": name,
+                            "uuid": "00000000-0000-0000-0000-00000000000" + str(index % 10),
+                            "isRegistered": True,
+                        }
+                    )
+                else:
+                    entries.append({"recipient": name, "isRegistered": False})
+            result = entries
+        else:
+            result = {"isRegistered": True}
     else:
         result = {"method": method}
 

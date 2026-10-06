@@ -81,6 +81,28 @@ pub const MAX_STICKER_PACK_SYNCS: usize = 256;
 pub const MAX_PROFILE_NAME_BYTES: usize = 128;
 pub const MAX_PROFILE_ABOUT_BYTES: usize = 512;
 pub const MAX_AVATAR_BYTES: usize = 10 * 1024 * 1024;
+/// Username bounds (contract revision 1.59, §4.55): the fail-closed mirror of
+/// the pinned signal-cli username rules — `AccountHelper.java:363-364` pins
+/// USERNAME_MIN_LENGTH 3 / USERNAME_MAX_LENGTH 32 and passes them to
+/// `Username.candidatesFrom(nickname, ...)`, so the window binds the
+/// *nickname* (the libsignal denominators); the official desktop
+/// `ts/util/Username.dom.ts` grammar is: nickname `[a-zA-Z_][a-zA-Z0-9_]*`,
+/// optional discriminator `.N` with N all-digits, no leading-zero forms
+/// (`0…` beyond exactly-two-digits). The connector enforces this shape
+/// locally before any upstream call; the server-side reserve/confirm remains
+/// the authority (a shape-valid but taken username answers UPSTREAM_ERROR).
+pub const USERNAME_MIN_CHARS: usize = 3;
+pub const USERNAME_MAX_CHARS: usize = 32;
+/// Whole-string wire bound for `accounts.setUsername` (contract revision
+/// 1.59, §4.55): the nickname window plus the separator and the widest
+/// legal discriminator digit run (5 digits for the 0..65535 range; the
+/// two-digit `0N` forms are shorter) — a KT frame bound, enforced before
+/// the grammar walk.
+pub const USERNAME_MAX_WIRE_CHARS: usize = 38;
+/// username.lookup batch cap (contract revision 1.59, §4.55): a KT bound for
+/// one host frame — the official getUserStatus takes an open array, the
+/// connector refuses anything wider.
+pub const USERNAME_LOOKUP_MAX_ENTRIES: usize = 20;
 /// Result-face coarse guard for `conversations.getAvatar` (§4.47): the
 /// engine caps a download at [`MAX_AVATAR_BYTES`] decoded, so the data URI
 /// — `data:<mime>;base64,` prefix plus the padded base64 encoding of the
@@ -2517,6 +2539,137 @@ impl ConnectorService {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
         Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// accounts.setUsername (contract revision 1.59, §4.55, capability
+    /// username): the resolution ladder ends at the pinned signal-cli
+    /// `updateAccount` mutually exclusive group — `username` XOR
+    /// `deleteUsername` (UpdateAccountCommand.java:41-46), both absent being
+    /// a legitimate attributes-only call the connector does not expose (the
+    /// desktop face is username-shaped). The local shape gate mirrors the
+    /// official desktop grammar (`ts/util/Username.dom.ts`): nickname
+    /// `[a-zA-Z_][a-zA-Z0-9_]*`, optional all-digits discriminator `.N` with
+    /// no `0…` forms beyond exactly-one-zero, 3..32 characters total — the
+    /// pinned libsignal bounds (AccountHelper.java:363-364). A bare nickname
+    /// (no dot) is allowed: `ManagerImpl.setUsername` routes it to
+    /// `reserveUsernameFromNickname`, which lets the server pick the
+    /// discriminator. The kt-engine face has no username method and answers
+    /// CAPABILITY_UNAVAILABLE after local validation (groups.update/quit
+    /// debt shape). Nothing is persisted locally — the write result
+    /// projection is the desktop's mirror source.
+    pub fn prepare_accounts_set_username(
+        &self,
+        params: &AccountsSetUsernameParams,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        let setting = match (params.username.as_deref(), params.delete_username) {
+            (Some(_), true) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "username and deleteUsername are mutually exclusive",
+                    false,
+                )));
+            }
+            (Some(username), false) => Some(username),
+            (None, false) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "one of username or deleteUsername is required",
+                    false,
+                )));
+            }
+            (None, true) => None,
+        };
+        if let Some(username) = setting {
+            if username.is_empty() || username.chars().count() > USERNAME_MAX_WIRE_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "username must contain between 1 and 38 characters",
+                    false,
+                )));
+            }
+            validate_username_shape(username)?;
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no username method yet",
+                false,
+            ))),
+            _ => Ok(match setting {
+                Some(username) => json!({
+                    "account": account.signal_account,
+                    "username": username,
+                }),
+                None => json!({
+                    "account": account.signal_account,
+                    "deleteUsername": true,
+                }),
+            }),
+        }
+    }
+
+    /// accounts.getUsername (contract revision 1.59, §4.55, capability
+    /// username): the pinned signal-cli has no JSON-RPC reader for the local
+    /// account's username — `JsonAccountResponse` is a private record inside
+    /// UpdateAccountCommand fed by the write-back only, and no listAccounts/
+    /// getAccount face carries the field. The read face therefore answers
+    /// CAPABILITY_UNAVAILABLE after the standard ladder: honest engine-surface
+    /// debt (same shape as the kt-engine arms), with display fed by the
+    /// setUsername write-back mirror instead of a live read. Mode-independent:
+    /// neither engine face has the reader.
+    pub fn prepare_accounts_get_username(&self, account_id: &str) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        self.resolve_account(account_id)?;
+        Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "the pinned signal-cli has no username read face; the connector mirrors the setUsername write-back instead",
+            false,
+        )))
+    }
+
+    /// username.lookup (contract revision 1.59, §4.55, capability username):
+    /// entries resolve through the pinned `getUserStatus --username` face
+    /// (`resolveRecipientByUsernameOrLink`, so entries are full usernames or
+    /// username-link URLs, not bare nicknames). The batch cap bounds one host
+    /// frame (the upstream takes an open array); entries stay 1..64 chars —
+    /// a bound, not the upstream grammar, which the link resolution owns.
+    pub fn prepare_username_lookup(
+        &self,
+        params: &UsernameLookupParams,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.usernames.is_empty() || params.usernames.len() > USERNAME_LOOKUP_MAX_ENTRIES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "usernames must contain between 1 and 20 entries",
+                false,
+            )));
+        }
+        for entry in &params.usernames {
+            if entry.is_empty() || entry.chars().count() > USERNAME_LOOKUP_ENTRY_MAX_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "each username entry must contain between 1 and 64 characters",
+                    false,
+                )));
+            }
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no username method yet",
+                false,
+            ))),
+            _ => Ok(json!({
+                "account": account.signal_account,
+                "usernames": params.usernames,
+            })),
+        }
     }
 
     /// backups.export / backups.exportStatus (contract revision 1.47, §4.46):
@@ -5265,6 +5418,48 @@ pub struct AvatarDownload {
     pub byte_size: u64,
 }
 
+/// The §4.55 result of `accounts.setUsername`: on the set path the username
+/// as confirmed by the upstream write-back (`updateAccount` →
+/// `m.getUsername()`) plus the username link URL when the server generated
+/// one (NON_NULL upstream, so the field is skipped when absent); on the
+/// delete path both are `null`/absent (the upstream writes no result body).
+/// This write-back is the connector's only username read face — there is no
+/// local-account getter in the pinned signal-cli (see
+/// `prepare_accounts_get_username`).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsername {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username_link: Option<String>,
+}
+
+/// One §4.55 `username.lookup` entry: the caller's entry echoed verbatim,
+/// plus the upstream status. `number`/`username`/`uuid` are the upstream
+/// NON_NULL projections (`JsonUserStatus`): `uuid != null` means the entry
+/// resolved to a registered account.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsernameLookupEntry {
+    pub recipient: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    pub is_registered: bool,
+}
+
+/// The §4.55 result of `username.lookup`: entries in upstream order, capped
+/// at [`USERNAME_LOOKUP_MAX_ENTRIES`] by the params gate.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsernameLookupResult {
+    pub results: Vec<UsernameLookupEntry>,
+}
+
 /// The §4.48 result of `calls.getState` (contract revision 1.50): the
 /// connector's call-state registry, honestly empty — the connector is a
 /// signaling pipe; the RingRTC state machine lives in the desktop + calling
@@ -5825,6 +6020,38 @@ pub struct ConversationsGetBlockedParams {
     pub account_id: String,
 }
 
+/// `accounts.setUsername` params (contract revision 1.59, §4.55): `username`
+/// and `deleteUsername` are mutually exclusive — the schema keeps both
+/// optional (it cannot express XOR), the service ladder enforces
+/// exactly-one before any upstream call. This mirrors the pinned signal-cli
+/// `updateAccount` mutually exclusive group (UpdateAccountCommand.java:41-46).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsSetUsernameParams {
+    pub account_id: String,
+    pub username: Option<String>,
+    #[serde(default)]
+    pub delete_username: bool,
+}
+
+/// `accounts.getUsername` params (contract revision 1.59, §4.55).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsGetUsernameParams {
+    pub account_id: String,
+}
+
+/// `username.lookup` params (contract revision 1.59, §4.55): usernames or
+/// username-link URLs — the upstream resolves both (`getUserStatus --username`
+/// accepts "the recipient username or username link"). The entries are
+/// caller-provided labels echoed verbatim in the result projection.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UsernameLookupParams {
+    pub account_id: String,
+    pub usernames: Vec<String>,
+}
+
 /// `conversations.getAvatar` params (contract revision 1.48, §4.47): the
 /// conversation id is the shared 1..256 bound — the engine classifies the
 /// reference shape itself (ServiceId UUID / phone number / 32-byte base64
@@ -6383,6 +6610,66 @@ fn validate_emoji(emoji: &str) -> Result<(), ServiceError> {
             "emoji must be a single unicode grapheme cluster",
             false,
         )));
+    }
+    Ok(())
+}
+
+/// username.lookup single-entry cap (contract revision 1.59, §4.55): a bound
+/// against fat frames — a full username is ≤32 chars and a username link is
+/// far below 64.
+pub const USERNAME_LOOKUP_ENTRY_MAX_CHARS: usize = 64;
+
+/// The local shape gate for `accounts.setUsername` (contract revision 1.59,
+/// §4.55): the official desktop username grammar (`ts/util/Username.dom.ts`
+/// `isUsernameValid`) mirrored fail-closed — nickname
+/// `[a-zA-Z_][a-zA-Z0-9_]*` 3..32 characters, an optional discriminator
+/// `.N` that is all digits, never empty, never `00`-leading, and a
+/// `0`-leading form only as exactly two digits. The numeric range above the
+/// shape (the libsignal discriminator bounds) stays upstream authority on
+/// purpose: the desktop's own validator checks exactly this shape and lets
+/// the server answer the rest. The server reserve/confirm is the authority:
+/// a shape-valid username can still be taken, which surfaces as
+/// UPSTREAM_ERROR.
+fn validate_username_shape(username: &str) -> Result<(), ServiceError> {
+    let invalid = |reason: &str| ServiceError::Api(ApiError::new("INVALID_REQUEST", reason, false));
+    let (nickname, discriminator) = match username.split_once('.') {
+        Some((nickname, discriminator)) => (nickname, Some(discriminator)),
+        None => (username, None),
+    };
+    // The desktop grammar's 3..32 window applies to the nickname itself; the
+    // whole string is bounded by the schema wire bound (maxLength 32).
+    let nickname_length = nickname.chars().count();
+    if !(USERNAME_MIN_CHARS..=USERNAME_MAX_CHARS).contains(&nickname_length) {
+        return Err(invalid(
+            "username nickname must contain between 3 and 32 characters",
+        ));
+    }
+    let mut nickname_chars = nickname.chars();
+    match nickname_chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => {
+            return Err(invalid(
+                "username nickname must start with a letter or underscore",
+            ));
+        }
+    }
+    for ch in nickname_chars {
+        if !(ch.is_ascii_alphanumeric() || ch == '_') {
+            return Err(invalid(
+                "username nickname must contain only letters, digits, and underscores",
+            ));
+        }
+    }
+    if let Some(discriminator) = discriminator {
+        if discriminator.is_empty()
+            || !discriminator.bytes().all(|byte| byte.is_ascii_digit())
+            || discriminator.starts_with("00")
+            || (discriminator.starts_with('0') && discriminator.len() != 2)
+        {
+            return Err(invalid(
+                "username discriminator must be all digits without leading zeros (a single leading zero is allowed only as exactly two digits)",
+            ));
+        }
     }
     Ok(())
 }
@@ -14207,6 +14494,259 @@ mod tests {
             missing,
             ServiceError::Store(StoreError::ConversationNotFound)
         ));
+    }
+
+    // ---- Contract 1.59 (§4.55): username faces ----
+
+    /// accounts.setUsername enforces the XOR ladder before the capability
+    /// gate, mirrors the desktop grammar fail-closed, and builds the
+    /// `updateAccount` payload per mode.
+    #[test]
+    fn set_username_preparation_enforces_xor_shape_and_mode() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let params = |username: Option<String>, delete: bool| AccountsSetUsernameParams {
+            account_id: account.id.clone(),
+            username,
+            delete_username: delete,
+        };
+
+        // XOR: both present, both absent.
+        let error = service
+            .prepare_accounts_set_username(
+                &params(Some("kt_test.01".into()), true),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let error = service
+            .prepare_accounts_set_username(&params(None, false), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // Shape gate: grammar violations answered locally.
+        for bad in [
+            "ab",          // nickname below the 3-char window
+            "1kt.test",    // nickname starts with a digit
+            "kt test",     // space in nickname
+            "kt.test.x",   // second dot breaks the discriminator grammar
+            "kt_test.00",  // 00-leading discriminator
+            "kt_test.0",   // 0-leading single digit
+            "kt_test.012", // 0-leading three digits
+            "kt_test.",    // empty discriminator
+        ] {
+            let error = service
+                .prepare_accounts_set_username(&params(Some(bad.into()), false), SignalCliMode::Jvm)
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
+                "expected INVALID_REQUEST for {bad}"
+            );
+        }
+        // Whole-string wire bound (38): the grammar walk never sees it.
+        let error = service
+            .prepare_accounts_set_username(&params(Some("a".repeat(39)), false), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        // Two dots: the split keeps the second dot inside the discriminator —
+        // also a grammar face.
+        let error = service
+            .prepare_accounts_set_username(
+                &params(Some("kt.te.st.1".into()), false),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // Shape-valid names pass: full username, bare nickname, boundary
+        // discriminators (a single leading zero as exactly two digits; the
+        // digit range above the shape stays upstream authority).
+        for good in [
+            "kt_test.01".to_string(),
+            "KtAgentUser".to_string(),
+            "a".repeat(32), // maximal nickname, no discriminator
+            "kt_test.10".to_string(),
+            "kt_test.99".to_string(),
+            "kt_test.65536".to_string(),
+        ] {
+            service
+                .prepare_accounts_set_username(
+                    &params(Some(good.clone()), false),
+                    SignalCliMode::Jvm,
+                )
+                .unwrap_or_else(|error| panic!("expected {good} to pass: {error:?}"));
+        }
+
+        // KtEngine debt: validation outranks the capability gate.
+        let error = service
+            .prepare_accounts_set_username(
+                &params(Some("kt_test.01".into()), false),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        let error = service
+            .prepare_accounts_set_username(&params(None, true), SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+
+        // JVM payloads.
+        assert_eq!(
+            service
+                .prepare_accounts_set_username(
+                    &params(Some("kt_test.01".into()), false),
+                    SignalCliMode::Jvm
+                )
+                .unwrap(),
+            json!({"account": "+15555550100", "username": "kt_test.01"})
+        );
+        assert_eq!(
+            service
+                .prepare_accounts_set_username(&params(None, true), SignalCliMode::Jvm)
+                .unwrap(),
+            json!({"account": "+15555550100", "deleteUsername": true})
+        );
+
+        // Unknown account answers before everything else.
+        let error = service
+            .prepare_accounts_set_username(
+                &AccountsSetUsernameParams {
+                    account_id: "acct-absent".into(),
+                    username: Some("kt_test.01".into()),
+                    delete_username: false,
+                },
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+    }
+
+    /// accounts.getUsername answers CAPABILITY_UNAVAILABLE in both modes
+    /// after account resolution; unknown accounts answer first.
+    #[test]
+    fn get_username_preparation_answers_honest_capability_debt() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        for mode in [SignalCliMode::Jvm, SignalCliMode::KtEngine] {
+            let error = service
+                .prepare_accounts_get_username(&account.id)
+                .unwrap_err();
+            assert!(matches!(error, ServiceError::Api(ref api)
+                    if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+            let _ = mode;
+        }
+        let error = service
+            .prepare_accounts_get_username("acct-absent")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+    }
+
+    /// username.lookup bounds the batch, forwards entries verbatim, and
+    /// answers the kt-engine debt after validation.
+    #[test]
+    fn username_lookup_preparation_bounds_batch_and_gates_mode() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let params = |usernames: Vec<String>| UsernameLookupParams {
+            account_id: account.id.clone(),
+            usernames,
+        };
+
+        // Empty and over-cap batches.
+        let error = service
+            .prepare_username_lookup(&params(vec![]), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let over = vec!["kt.user".to_string(); USERNAME_LOOKUP_MAX_ENTRIES + 1];
+        let error = service
+            .prepare_username_lookup(&params(over), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        // Entry bound: 65 chars.
+        let error = service
+            .prepare_username_lookup(&params(vec!["k".repeat(65)]), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // KtEngine debt after validation.
+        let error = service
+            .prepare_username_lookup(&params(vec!["kt_test.01".into()]), SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+
+        // JVM payload: entries forwarded verbatim.
+        assert_eq!(
+            service
+                .prepare_username_lookup(
+                    &params(vec!["kt_test.01".into(), "https://signal.me/#eu".into()]),
+                    SignalCliMode::Jvm
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "usernames": ["kt_test.01", "https://signal.me/#eu"],
+            })
+        );
+    }
+
+    /// The username shape gate is exactly the desktop grammar: a focused
+    /// rule-by-rule pass.
+    #[test]
+    fn validate_username_shape_mirrors_the_desktop_grammar() {
+        for good in [
+            "abc",           // minimal nickname
+            &"a".repeat(32), // maximal nickname
+            "kt_test",       // underscore nickname, bare (no discriminator)
+            "_leading",      // underscore first
+            "kt_test.01",    // discriminator, two-digit 0-leading form
+            "kt_test.10",
+            "kt_test.65536", // full digit run (range stays upstream authority)
+            "a_b.99",
+        ] {
+            validate_username_shape(good)
+                .unwrap_or_else(|error| panic!("expected {good} to pass: {error:?}"));
+        }
+        for bad in [
+            "ab",             // below the 3-char nickname window
+            &"a".repeat(33),  // above the 32-char nickname window
+            "kt test",        // space
+            "kt-Test",        // dash
+            "1kt",            // leading digit
+            "kt.",            // nickname 2 chars AND empty discriminator
+            "kt..1",          // nickname 2 chars AND empty first discriminator
+            "kt_test.01.2",   // dot inside the discriminator
+            "kt_test.00",     // double zero
+            "kt_test.000",    // triple zero
+            "kt_test.0",      // 0-leading single digit (only exactly two digits allowed)
+            "kt_test.012",    // 0-leading three digits
+            "kt_test.65536x", // trailing letter inside the discriminator
+        ] {
+            assert!(
+                validate_username_shape(bad).is_err(),
+                "expected {bad} to fail"
+            );
+        }
     }
 
     // ---- Contract 1.52 (§4.50): group termination face ----
