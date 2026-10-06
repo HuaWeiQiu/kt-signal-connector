@@ -57,6 +57,8 @@
             "conversations.getPinned",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.acceptRequest",
+            "conversations.declineRequest",
             "conversations.setExpireTimer",
             "messages.list",
             "messages.search",
@@ -303,6 +305,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/conversationsSetBlockedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.acceptRequest" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messageRequestParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.declineRequest" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messageRequestParams" }
             }
           }
         },
@@ -1710,6 +1734,21 @@
         "pinned": {
           "type": "boolean",
           "description": "true pins the conversation, false unpins it. Required — there is no toggle form."
+        }
+      }
+    },
+    "messageRequestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Accept or decline one conversation's message request (contract revision 1.63, §4.56, capability message-requests): the two methods ride the pinned upstream's native sendMessageRequestResponse sync face — accept = type accept, decline = type delete (the official CLI carries only the accept/delete pair; the block and block-and-delete twins are the desktop's explicit conversations.setBlocked compositions). Direct conversations forward the resolved peer reference (recipient), groups the raw group master key (groupId). The pinned face answers an empty result object on success and folds per-recipient failures into an unstructured USER_ERROR, so the result face is {status} only. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Zero local writes: the request state converges through the §4.56 receive projection.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation whose request is being answered; resolved against the account before any upstream call."
         }
       }
     },

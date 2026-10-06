@@ -5,7 +5,16 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.62 (2026-10-06; §4.53 appendix — the group join-request
+- Contract revision: 1.63 (2026-10-06; §4.56 — message-request response faces
+  `conversations.acceptRequest` / `conversations.declineRequest`: the pinned upstream's native
+  `sendMessageRequestResponse` sync face (accept/delete — the official CLI carries only this
+  pair; the block/block-and-delete twins stay the desktop's explicit `conversations.setBlocked`
+  compositions), Send lane account-scoped mutating, capability `message-requests`; direct
+  conversations forward the resolved peer reference, groups the raw group master key; the
+  pinned face answers an empty result on success so the result face is `{status}` — zero local
+  writes, the request state converges through the §4.56 receive projection; same-day rebump
+  past 1.62 — 1.62 is the landed group-approval read face (the §4.53 appendix, in the chain
+  below)) — previously 1.62 (2026-10-06; §4.53 appendix — the group join-request
   read face opens: `groups.get` now carries `requestingMembers`, the same
   single-group upstream `listGroups` read the 1.58 approval fold runs against,
   projected live at read time as bounded `{id, uuid?, name?}` entries — present
@@ -21,10 +30,7 @@
   consume batch's data face for the 1.58 write (`groups.approveJoinRequests`,
   capability `group-join-approve` unchanged — one capability, read and write
   halves together, the 1.53 appendix discipline); the schema-18 store is
-  untouched, zero capture-path change. 1.61 was reserved by the parallel
-  on-demand-attachment-bytes batch and had not landed on this tree when this
-  revision was written; if it lands first, its entry takes the header and this
-  becomes "previously 1.62" in the chain, newest wins) — previously 1.61 (2026-10-06; §4.54 — live message-attachment pointer persistence +
+  untouched, zero capture-path change) — previously 1.61 (2026-10-06; §4.54 — live message-attachment pointer persistence +
   `attachments.download`: the receive envelope's transit locator face persists into a new internal
   `messages.live_attachment_locators` column (schema version 19) beside the byte-identical wire
   descriptors when an engine projects it (the pinned signal-cli 0.14.8 and the kt-engine receive
@@ -34,7 +40,8 @@
   addressing, live/import locator ladder, the §4.38 step-3 chain unchanged (idempotent dedup,
   terminal failures, no auto-retry). Same-day rebump past 1.60 — 1.58
   (group-join-approve) and 1.60 (summary isTerminated projection) landed on main before this
-  batch; 1.59 stays reserved for the parallel username-passthrough batch, unwritten) — previously 1.59 (2026-10-06; §4.55 — the Signal username faces:
+  batch; 1.59 belongs to the parallel username-passthrough batch and has since
+  landed — it takes the next chain entry) — previously 1.59 (2026-10-06; §4.55 — the Signal username faces:
   `accounts.setUsername` / `accounts.getUsername` / `username.lookup`, capability
   `username`; the write rides the pinned `updateAccount` mutually exclusive
   group with the official desktop username grammar mirrored fail-closed
@@ -3154,6 +3161,51 @@ exactly two digits).
 > the engine-free face can keep reading it while the engine is stopped and
 > simply not see the approval section; `syncedAt` remains the freshness
 > signal for every other field in the response.
+
+### 4.56 Message-request response faces: conversations.acceptRequest, conversations.declineRequest (contract revision 1.63, 2026-10-06; §4.55→§4.56 renumbered on landing — 1.59 claimed §4.55 first)
+
+The message-requests matrix item (the official Message Requests convergence flow) closes its
+data plane as **two thin managed writes over the pinned upstream's native sync face** — no
+upstream source copied, no protocol invention, no engine change. The upstream face is
+`sendMessageRequestResponse` (pinned checkout `v0.14.7-4-g472784e6`): Rust JSON-RPC
+`client/src/jsonrpc.rs:342` (params `account?`, `recipients[]`, `groupIds[]`, `type`) and the
+Java local command `src/main/java/.../SendMessageRequestResponseCommand.java:17,51` — the
+official CLI type enum carries **only accept and delete** (`client/src/cli.rs:664-669`; the
+Java command folds everything else to DELETE), so the official block / block-and-delete /
+unblock-and-accept twins (`ManagerImpl.java:1373-1375,1406-1408`, over the internal Manager
+API — not JSON-RPC) stay OUT of this contract: they are the desktop's explicit
+`conversations.setBlocked` (§4.47) compositions, unchanged. The underlying write is the
+multi-device `MessageRequestResponse` sync message (`SyncHelper.java:399-419`), and an accept
+additionally flips the contact's profile-sharing bit upstream
+(`SyncHelper.java:412-415` — the official acceptConversation semantics).
+
+- `conversations.acceptRequest` / `conversations.declineRequest` (host methods, capability
+  `message-requests`, send lane, account-scoped mutating — the reaction-class write-lane
+  mutex and delete drain barrier verbatim): params `{accountId, conversationId}` — the same
+  addressing pair as the §4.47 faces, the request kind carried by the method choice
+  (one button per action, the official desktop's message-request row). Resolution: a direct
+  conversation forwards the row's resolved peer reference as `recipient`; a group/legacy
+  conversation forwards the row's peer key — the raw group master key, the same `listGroups`
+  id the sync materialized — as `groupId` (the upstream takes `groupIds` for groups, never a
+  recipient); the §4.42 self row (empty peer reference) and a pre-sync group row fail closed
+  before any upstream call (`INVALID_REQUEST`). The connector stamps the upstream `type`
+  (`accept` / `delete`) and never composes a second upstream write onto one host method.
+- Result `{status}` (`"accepted"` / `"declined"`): the pinned JSON-RPC face answers an empty
+  result object on success (the command writes no JSON output,
+  `SendMessageRequestResponseCommand.handleCommand`) and folds every per-recipient failure —
+  including the unregistered-failure result type (`JsonSendMessageResult.java:33-34,45`) —
+  into an unstructured USER_ERROR `-1`, so no per-failure ladder exists to honest-map: a
+  USER_ERROR folds into the plain `UPSTREAM_ERROR` like every account-domain method. An
+  indeterminate outcome answers `SEND_OUTCOME_UNKNOWN` and is never retried (unknown send
+  results are terminal, the AGENTS.md discipline).
+- Zero local writes: the request state converges through the receive side — a synced
+  `messageRequestResponse` envelope on the account (`ReceiveMessageHandler.java:413-424`
+  projects type/groupId/person; the official desktop consumes the same event and stamps
+  `messageRequestResponseType` locally, deriving the accepted state with
+  `isConversationAccepted.preload.ts:21-82`) stamps the contact row's accepted flag in the
+  §4.56 desktop projection below. The connector itself persists nothing.
+- Desktop gating: capability `message-requests` (new tag). A desktop without the tag keeps
+  its current rendering (zero calls); contract 1.61 wire consumers are unaffected.
 
 ## 5. signal-cli Boundary
 

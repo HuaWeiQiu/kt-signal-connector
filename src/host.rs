@@ -36,15 +36,16 @@ use crate::service::{
     GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsTerminateParams,
     GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
-    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams, UsernameLookupParams,
+    MessageGetTextParams, MessageRequestParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
+    MessagesSendStickerParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams, UsernameLookupParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1583,6 +1584,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid conversations.setBlocked params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.acceptRequest" => {
+            match serde_json::from_value::<MessageRequestParams>(request.params) {
+                Ok(params) => match runtime.accept_message_request(params).await {
+                    Ok(outcome) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(outcome).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.acceptRequest params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.declineRequest" => {
+            match serde_json::from_value::<MessageRequestParams>(request.params) {
+                Ok(params) => match runtime.decline_message_request(params).await {
+                    Ok(outcome) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(outcome).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.declineRequest params",
                         false,
                     ),
                 ),

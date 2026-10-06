@@ -244,6 +244,21 @@ pub const METHODS: &[MethodRow] = &[
     // bounded cloud read, no mutation, no local state; the candidate bounds
     // mirror the username shape rules.
     ("username.lookup", Lane::Read, false, "read"),
+    // Message-request response faces (contract revision 1.63, §4.56): the
+    // pinned upstream's native `sendMessageRequestResponse` sync face —
+    // accept/decline over the multi-device MessageRequestResponse sync
+    // message. Mutating, send-lane upstream traffic — the reaction class
+    // verbatim, same-account mutex and delete barrier included; advertised
+    // through `message-requests`. Zero local writes: the request state
+    // converges through the §4.56 receive projection (an MRR envelope on the
+    // account stamps the contact row's accepted flag; the official desktop
+    // derives request state locally the same way). An upstream decline for a
+    // single contact rides the two-step ladder when the account cannot share
+    // its profile with the peer (the share-off write fails with the upstream
+    // UNREGISTERED_FAILURE user error); the ladder is internal — the host
+    // sees one method and one outcome.
+    ("conversations.acceptRequest", Lane::Send, true, "send"),
+    ("conversations.declineRequest", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -318,12 +333,15 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
 /// `attachment-download` (contract revision 1.61) marks the §4.54 live
-/// attachment download face (`attachments.download`). They never
-/// join [`METHOD_NAMES`]: the schema request-frame method enum and the
-/// dispatch table describe real methods only. `username` (contract revision
-/// 1.59) marks the §4.55 username faces (`accounts.setUsername`,
-/// `accounts.getUsername`, `username.lookup`) — desktops gate the surface on
-/// this tag so an old connector answers a clean capability gap instead of
+/// attachment download face (`attachments.download`); `username` (contract
+/// revision 1.59) marks the §4.55 username faces (`accounts.setUsername`,
+/// `accounts.getUsername`, `username.lookup`); `message-requests`
+/// (contract revision 1.63) marks the §4.56 message-request response faces
+/// (`conversations.acceptRequest` / `conversations.declineRequest` over the
+/// pinned upstream's native `sendMessageRequestResponse` sync face). They
+/// never join [`METHOD_NAMES`]: the schema request-frame method enum and the
+/// dispatch table describe real methods only — desktops gate a new surface on
+/// its tag so an old connector answers a clean capability gap instead of
 /// `METHOD_NOT_ALLOWED`.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
@@ -346,6 +364,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-join-approve",
     "attachment-download",
     "username",
+    "message-requests",
 ];
 
 #[cfg(test)]
@@ -418,6 +437,8 @@ mod tests {
             "attachments.download",
             "calls.sendSignal",
             "accounts.setUsername",
+            "conversations.acceptRequest",
+            "conversations.declineRequest",
         ];
         let mutating = [
             "messages.sendText",
@@ -456,6 +477,8 @@ mod tests {
             "attachments.download",
             "calls.sendSignal",
             "accounts.setUsername",
+            "conversations.acceptRequest",
+            "conversations.declineRequest",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

@@ -2743,6 +2743,71 @@ impl ConnectorService {
         }))
     }
 
+    /// conversations.acceptRequest / conversations.declineRequest (contract
+    /// revision 1.63, §4.56): bounds, kind classification, and resolution —
+    /// the §4.47 blocked-write ladder verbatim. No local row is written: the
+    /// request state lives in the upstream sync channel and converges through
+    /// the §4.56 receive projection. The upstream keys are the resolved peer
+    /// reference (direct conversation) or the raw group master key (group —
+    /// the contact extra carries it, not the local opaque id). An empty peer
+    /// reference (the §4.42 self row) fails closed here: the upstream face
+    /// takes real recipients only.
+    pub fn prepare_conversations_message_request(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        match conversation.kind.as_str() {
+            "direct" => {
+                if conversation.peer_key.is_empty() {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "this conversation has no upstream address",
+                        false,
+                    )));
+                }
+                Ok(json!({
+                    "account": account.signal_account,
+                    "recipient": conversation.peer_key,
+                }))
+            }
+            "group" | "legacyGroup" => {
+                // The group conversations row's peer_key is the upstream
+                // group master key verbatim — the sync materializes both the
+                // contact-cache row and the conversation skeleton from the
+                // same `listGroups` id, so no extra read is needed.
+                if conversation.peer_key.is_empty() {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "conversation has no upstream group reference",
+                        false,
+                    )));
+                }
+                Ok(json!({
+                    "account": account.signal_account,
+                    "groupId": conversation.peer_key,
+                }))
+            }
+            _ => Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "unsupported conversation kind",
+                false,
+            ))),
+        }
+    }
+
     /// calls.sendSignal (contract revision 1.53, §4.49): the shape gate plus
     /// resolution — the signaling envelope (`recipient`, `data`/`legacy`,
     /// `urgency`, `destinationDeviceId`) is the engine `sendCallMessage` face;
@@ -6168,6 +6233,25 @@ pub struct ConversationsSetBlockedParams {
     pub conversation_id: String,
     pub kind: String,
     pub blocked: bool,
+}
+
+/// `conversations.acceptRequest` / `conversations.declineRequest` params
+/// (contract revision 1.63, §4.56): the addressing pair only — the request
+/// kind (accept/decline) is carried by the method choice, mirroring the
+/// official desktop's one-button-per-action message-request row.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageRequestParams {
+    pub account_id: String,
+    pub conversation_id: String,
+}
+
+/// The §4.56 result face: `{status}` — the pinned upstream's
+/// `sendMessageRequestResponse` answers an empty result object on success,
+/// so the outcome verb is the honest whole of what the connector knows.
+#[derive(Debug, serde::Serialize)]
+pub struct MessageRequestOutcome {
+    pub status: &'static str,
 }
 
 /// `messages.reportSpam` params (contract revision 1.49, §4.48, capability
@@ -11796,6 +11880,73 @@ mod tests {
             .prepare_conversations_set_blocked(&account.id, "", "contact", true)
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// The message-request faces (contract revision 1.63, §4.56): the direct
+    /// ladder forwards the resolved peer reference as `recipient`; a group
+    /// conversation forwards the raw group master key as `groupId`; bounds
+    /// and resolution fail closed in wire order. The `type` stamp is the
+    /// supervisor's (accept/delete), never the prepare's.
+    #[test]
+    fn prepare_message_request_faces_route_direct_and_group() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        // Direct: peer reference, never the opaque local id; the same ladder
+        // as the §4.47 faces.
+        let upstream = service
+            .prepare_conversations_message_request(&account.id, &conversation.id)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["recipient"], conversation.peer_key);
+        assert!(upstream.get("groupId").is_none());
+        assert!(upstream.get("type").is_none());
+
+        // Bounds and resolution fail closed in wire order.
+        for (request_id, account_id, conversation_id, expected) in [
+            (
+                "empty-conversation",
+                account.id.as_str(),
+                "",
+                "INVALID_REQUEST",
+            ),
+            (
+                "over-bound-conversation",
+                account.id.as_str(),
+                &"A".repeat(257),
+                "INVALID_REQUEST",
+            ),
+            (
+                "unknown-account",
+                "no-such-account",
+                "conv",
+                "ACCOUNT_NOT_FOUND",
+            ),
+            (
+                "unknown-conversation",
+                account.id.as_str(),
+                "no-such-conversation",
+                "CONVERSATION_NOT_FOUND",
+            ),
+        ] {
+            let error = service
+                .prepare_conversations_message_request(account_id, conversation_id)
+                .unwrap_err();
+            assert_eq!(error.into_api().code, expected, "{request_id}");
+        }
+
+        // Group: the raw group master key rides as `groupId` (the
+        // conversations row's peer_key — the sync materializes it from the
+        // same `listGroups` id), never a `recipient`.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "abc123GROUP", "Group")
+            .unwrap();
+        let upstream = service
+            .prepare_conversations_message_request(&account.id, &group.id)
+            .unwrap();
+        assert_eq!(upstream["groupId"], "abc123GROUP");
+        assert!(upstream.get("recipient").is_none());
     }
 
     /// The avatar result projection (contract revision 1.48, §4.47):

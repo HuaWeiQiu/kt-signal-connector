@@ -887,6 +887,26 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_conversation_blocked(params).await
     }
 
+    /// conversations.acceptRequest / conversations.declineRequest (contract
+    /// 1.63, §4.56): the MRR sync write is account-scoped upstream traffic,
+    /// so it routes through the account's owning engine like every other
+    /// mutating face.
+    pub async fn accept_message_request(
+        &self,
+        params: crate::service::MessageRequestParams,
+    ) -> Result<crate::service::MessageRequestOutcome, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.accept_message_request(params).await
+    }
+
+    pub async fn decline_message_request(
+        &self,
+        params: crate::service::MessageRequestParams,
+    ) -> Result<crate::service::MessageRequestOutcome, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.decline_message_request(params).await
+    }
+
     /// calls.sendSignal (contract 1.50, §4.48): the signaling envelope is
     /// account-scoped upstream traffic, so the send routes through the
     /// account's owning engine like every other send face.

@@ -28,13 +28,13 @@ use crate::service::{
     ConversationsSetPinnedParams, GroupDetails, GroupsApproveJoinRequestsParams, GroupsQuitParams,
     GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent,
     MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView,
-    MediaCloseView, MediaIngest, MediaOpenView, MessagesReportSpamParams,
-    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
-    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
-    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_limit_error, blocked_conversations_result,
+    MediaCloseView, MediaIngest, MediaOpenView, MessageRequestOutcome, MessageRequestParams,
+    MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
+    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
+    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
     pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
@@ -2931,6 +2931,73 @@ impl RuntimeSupervisor {
                     .and_then(Value::as_array)
                     .ok_or(ServiceError::Engine(EngineError::Protocol))?,
             )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// conversations.acceptRequest (contract revision 1.63, §4.56, capability
+    /// message-requests): bounds + resolution under the service lock, then
+    /// the mutating upstream `sendMessageRequestResponse {type: accept}` —
+    /// the pinned native face. Reaction-class discipline: an unknown outcome
+    /// answers SEND_OUTCOME_UNKNOWN and is never retried. Zero local writes:
+    /// the request state converges through the §4.56 receive projection.
+    pub async fn accept_message_request(
+        &self,
+        params: MessageRequestParams,
+    ) -> Result<MessageRequestOutcome, ServiceError> {
+        self.message_request_request(params, "accept", "accepted")
+            .await
+    }
+
+    /// conversations.declineRequest (contract revision 1.63, §4.56,
+    /// capability message-requests): the delete variant — the same bare
+    /// upstream face with `type: delete`, the official decline (delete-the-
+    /// conversation) sync semantics. The pinned JSON-RPC face answers an
+    /// empty result object on success and folds every per-recipient failure
+    /// (ResolveHelper/SyncHelper, incl. the profile-sharing-off write's
+    /// UnregisteredRecipientException path) into a USER_ERROR -1 with no
+    /// structured marker, so no per-failure ladder is attempted here — the
+    /// connector maps the error class honestly (UPSTREAM_ERROR) and never
+    /// composes a second upstream write onto one host method (the official
+    /// block-and-delete twin stays the desktop's explicit
+    /// conversations.setBlocked composition). Unknown outcomes are terminal.
+    pub async fn decline_message_request(
+        &self,
+        params: MessageRequestParams,
+    ) -> Result<MessageRequestOutcome, ServiceError> {
+        self.message_request_request(params, "delete", "declined")
+            .await
+    }
+
+    /// The shared §4.56 body: prepare under the service lock, stamp the
+    /// upstream `type`, one mutating engine call, unknown-outcome mapping.
+    async fn message_request_request(
+        &self,
+        params: MessageRequestParams,
+        request_type: &str,
+        status: &'static str,
+    ) -> Result<MessageRequestOutcome, ServiceError> {
+        let engine = self.running_engine().await?;
+        let mut upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_message_request(
+                &params.account_id,
+                &params.conversation_id,
+            )?
+        };
+        if let Some(object) = upstream.as_object_mut() {
+            object.insert("type".to_string(), json!(request_type));
+        }
+        match engine
+            .call("sendMessageRequestResponse", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok(MessageRequestOutcome { status }),
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",
