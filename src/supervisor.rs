@@ -26,15 +26,16 @@ use crate::service::{
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
     ConversationsSetPinnedParams, GroupDetails, GroupsApproveJoinRequestsParams, GroupsQuitParams,
-    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent,
-    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView,
-    MediaCloseView, MediaIngest, MediaOpenView, MessageRequestOutcome, MessageRequestParams,
-    MessagesReportSpamParams, MessagesSendStickerParams, PeerTarget, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry,
-    UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadView, HostSideEvent, MAX_AVATAR_DATA_URI_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest,
+    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
+    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
+    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
+    SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_limit_error, blocked_conversations_result,
     pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
     store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
     store_search_messages, validate_account_delete_operation_id,
@@ -2564,6 +2565,95 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// groups.revokeInvites (contract revision 1.64, §4.57, capability
+    /// group-invite-revoke): the safety fold, then the mutating upstream
+    /// write. The pinned upstream weaves invite revocation into the
+    /// updateGroup removeMembers semantics (`GroupHelper.updateGroupV2`:
+    /// `removeMembers` entries that are pending members ride
+    /// `revokeInvitedMembers` — :760-764 — while entries that are full
+    /// members ride the member removal and entries that are requesting
+    /// members ride `refuseJoinRequestMembers`; the three-way discrimination
+    /// is upstream's), so the connector folds the caller's candidates
+    /// against the engine's own pending-members read
+    /// (`listGroups {account, groupId}` → JsonGroup.pendingMembers) before
+    /// anything goes upstream: only candidates the engine itself reports as
+    /// pending invitees can ever ride the `removeMembers` array, so the
+    /// "remove a member" / "refuse a request" mis-target faces of the
+    /// shared array fail closed here instead of upstream. A fully-stale
+    /// candidate set (the fold empties it) answers
+    /// `INVITE_NO_LONGER_PENDING` (retryable) — the invite was resolved
+    /// elsewhere (another admin revoked it, the invitee joined); a read
+    /// face that cannot answer (engine refuses the group read) fails closed
+    /// with that refusal. The write is the groups.terminate discipline
+    /// verbatim: one mutating `updateGroup` call, a definite success
+    /// answers `{"status": "sent"}`, an indeterminate outcome answers
+    /// SEND_OUTCOME_UNKNOWN and is never retried. Zero local writes: the
+    /// roster converges through contacts.sync.
+    pub async fn revoke_invites(
+        &self,
+        params: GroupsRevokeInvitesParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let (group_id, members) = {
+            let service = self.service.lock().await;
+            service.prepare_groups_revoke_invites(&params, self.config.mode)?
+        };
+        let number = self
+            .service
+            .lock()
+            .await
+            .account_signal_number(&params.account_id)?;
+        // The engine's own read of who is still a pending invitee (the same
+        // listGroups read source the groups.get pendingMembers face
+        // projects; a single-group read keeps the fold O(pending) and the
+        // traffic bounded).
+        let listed = engine
+            .call(
+                "listGroups",
+                json!({ "account": number, "groupId": [group_id.clone()] }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        let pending: std::collections::HashSet<String> = pending_member_identities(&listed);
+        // The fold: the caller's candidates survive only while the engine
+        // still reports them pending invitees. A pending entry carries
+        // either or both of its number/uuid identities (the
+        // JsonGroupMemberAddress NON_NULL omissions), so both ride the same
+        // identity set and the caller may name the candidate by either (the
+        // connector-wide first-wins address ladder). Nothing else can ride
+        // the array — a full member or a requesting candidate in the
+        // candidate set drops here, never into the upstream write.
+        let folded: Vec<String> = fold_invite_candidates(members, &pending);
+        if folded.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVITE_NO_LONGER_PENDING",
+                "no candidate is still a pending invitee (already revoked, joined, or withdrawn)",
+                true,
+            )));
+        }
+        // The upstream write: the pending-survivor set rides exactly the
+        // `removeMembers` family, every other change key absent — the
+        // upstream reads absence as "no change" (§4.44).
+        let upstream = json!({
+            "account": number,
+            "groupId": group_id,
+            "removeMembers": folded,
+        });
+        match engine
+            .call("updateGroup", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolution and row reads under the service lock, then
     /// the mutating `reportSpam` call — the groups face's unknown-outcome
@@ -3786,16 +3876,27 @@ impl RuntimeSupervisor {
         account_id: String,
         group_key: String,
     ) -> Result<GroupDetails, ServiceError> {
-        // The live half first (ReadOnly, the §4.53 fold's own read): failure
-        // degrades to no requesting key instead of failing the cached read.
+        // The live halves first (ReadOnly, the §4.53/§4.57 folds' own read):
+        // failure degrades to no live keys instead of failing the cached
+        // read.
         let requesting = self
             .requesting_members_for_group(&account_id, &group_key)
+            .await
+            .unwrap_or_default();
+        let pending = self
+            .pending_members_for_group(&account_id, &group_key)
             .await
             .unwrap_or_default();
         // Store-only read: the service lock guards in-memory state only.
         let store = Arc::clone(&self.store);
         blocking_service(move || {
-            store_get_group_with_requesting(&store, &account_id, &group_key, requesting.as_deref())
+            store_get_group_with_requesting(
+                &store,
+                &account_id,
+                &group_key,
+                requesting.as_deref(),
+                pending.as_deref(),
+            )
         })
         .await
     }
@@ -3837,6 +3938,47 @@ impl RuntimeSupervisor {
             .as_array()
             .and_then(|groups| groups.first())
             .and_then(|group| group.get("requestingMembers"))
+            .and_then(Value::as_array)
+            .cloned())
+    }
+
+    /// The engine's live pending-members array for one group (contract
+    /// revision 1.64, §4.57): the same single-group `listGroups` read the
+    /// §4.57 revoke fold runs, projected to the raw
+    /// `JsonGroup.pendingMembers` entries. `Ok(None)` = the engine answered
+    /// without the face (every entry drops, the key stays absent); `Err` =
+    /// the engine is not running or refused the read (the caller degrades
+    /// the same way). The read does not widen the §4.8 addressing: the
+    /// caller still gates on the cached kind='group' row before this face is
+    /// worth anything, and `store_get_group_with_requesting` keeps answering
+    /// `GROUP_NOT_FOUND` for an unsynced group even when the live read
+    /// succeeded.
+    async fn pending_members_for_group(
+        &self,
+        account_id: &str,
+        group_key: &str,
+    ) -> Result<Option<Vec<Value>>, ServiceError> {
+        let engine = match self.running_engine().await {
+            Ok(engine) => engine,
+            Err(_) => return Ok(None),
+        };
+        let number = self
+            .service
+            .lock()
+            .await
+            .account_signal_number(account_id)?;
+        let listed = engine
+            .call(
+                "listGroups",
+                json!({ "account": number, "groupId": [group_key] }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        Ok(listed
+            .as_array()
+            .and_then(|groups| groups.first())
+            .and_then(|group| group.get("pendingMembers"))
             .and_then(Value::as_array)
             .cloned())
     }
@@ -4013,6 +4155,51 @@ fn fold_join_request_candidates(
     members
         .into_iter()
         .filter(|member| requesting.contains(member))
+        .collect()
+}
+
+/// The pending-invitees identity set the §4.57 fold reads: the first group
+/// entry's `pendingMembers` array (the pinned JsonGroupMemberAddress shape —
+/// each entry carries `number` and/or `uuid`, the NON_NULL omissions a real
+/// single-identity invitee has), flattened into the set of address strings.
+/// Anything else (an engine without the face, a foreign shape) reads as an
+/// empty set — the fold then empties and the write never happens, the
+/// honest fail-closed direction.
+fn pending_member_identities(listed: &Value) -> std::collections::HashSet<String> {
+    listed
+        .as_array()
+        .and_then(|groups| groups.first())
+        .and_then(|group| group.get("pendingMembers"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.as_object())
+                .flat_map(|object| {
+                    ["number", "uuid"].iter().filter_map(|field| {
+                        object
+                            .get(*field)
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The §4.57 fold: the caller's candidates survive only while the engine
+/// still reports them pending invitees (either identity the set carries).
+/// The return keeps the caller's order; empty means no candidate is still
+/// pending — the write never goes upstream.
+fn fold_invite_candidates(
+    members: Vec<String>,
+    pending: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    members
+        .into_iter()
+        .filter(|member| pending.contains(member))
         .collect()
 }
 
@@ -5418,6 +5605,71 @@ mod tests {
             fold_join_request_candidates(
                 vec!["+15555550101".into()],
                 &requesting_member_identities(&json!([]))
+            )
+            .is_empty()
+        );
+    }
+
+    /// The §4.57 pending-invitees identity read: both identities of an
+    /// invitee (number and uuid) land in the set, an address-less or
+    /// malformed entry drops, a missing/foreign listGroups answer reads as
+    /// empty (the fold's fail-closed direction), and the fold keeps only
+    /// candidates the engine still reports pending, in caller order.
+    #[test]
+    fn invite_fold_keeps_only_pending_candidates() {
+        use super::{fold_invite_candidates, pending_member_identities};
+
+        let listed = json!([
+            {
+                "id": "ZmFrZS1ncm91cC0x",
+                "name": "Fixture Group",
+                "isMember": true,
+                "pendingMembers": [
+                    {"number": "+15555550101"},
+                    {
+                        "number": "+15555550102",
+                        "uuid": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"
+                    },
+                    {"uuid": "0b7fca57-abcd-4d0e-9b0f-4f6c1f8a2e10"},
+                    {},
+                    {"number": 12345},
+                    "not-an-object"
+                ]
+            }
+        ]);
+        let pending = pending_member_identities(&listed);
+        assert!(pending.contains("+15555550101"));
+        assert!(pending.contains("+15555550102"));
+        assert!(pending.contains("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"));
+        assert!(pending.contains("0b7fca57-abcd-4d0e-9b0f-4f6c1f8a2e10"));
+        assert_eq!(pending.len(), 4, "address-less/malformed entries drop");
+
+        // The fold: pending invitees survive in caller order; a stale or
+        // mistaken candidate (an existing member, a stranger) drops — never
+        // rides the removeMembers array.
+        let folded = fold_invite_candidates(
+            vec![
+                "+15555550102".into(),
+                "+15555550999".into(),
+                "+15555550101".into(),
+            ],
+            &pending,
+        );
+        assert_eq!(
+            folded,
+            vec!["+15555550102".to_string(), "+15555550101".to_string()]
+        );
+
+        // The fail-closed direction: an engine answer without the face (or
+        // a foreign shape) reads as empty and the fold empties — nothing
+        // rides the removeMembers array.
+        assert!(pending_member_identities(&json!([])).is_empty());
+        assert!(pending_member_identities(&json!({"error": 1})).is_empty());
+        assert!(pending_member_identities(&json!([{"members": []}])).is_empty());
+        assert!(
+            fold_invite_candidates(
+                vec!["+15555550101".into()],
+                &pending_member_identities(&json!([]))
             )
             .is_empty()
         );

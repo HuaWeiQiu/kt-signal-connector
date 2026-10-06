@@ -2356,6 +2356,81 @@ impl ConnectorService {
         }
     }
 
+    /// groups.revokeInvites (contract revision 1.64, §4.57, capability
+    /// group-invite-revoke): the local validation + resolution ladder, then
+    /// the candidate payload the supervisor folds against the engine's own
+    /// pending-members read. The `prepare_groups_approve_join_requests`
+    /// ladder verbatim — bounds, resolution, audit id, duplicate collapse —
+    /// minus the approve bit. The kt-engine face has no updateGroup
+    /// member-family method (the same compat §5 batch boundary the §4.53
+    /// approval recorded) and answers CAPABILITY_UNAVAILABLE
+    /// (retryable=false) after the local validation completed — honest by
+    /// design: answering the fold instead would disguise "the engine cannot
+    /// revoke" as "nobody is pending".
+    pub fn prepare_groups_revoke_invites(
+        &self,
+        params: &GroupsRevokeInvitesParams,
+        mode: SignalCliMode,
+    ) -> Result<(String, Vec<String>), ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        validate_opaque_id(&params.conversation_id, "conversationId")?;
+        if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        if params.members.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "an empty member array carries no change upstream; omit the call instead",
+                false,
+            )));
+        }
+        if params.members.len() > MAX_GROUP_MEMBERS
+            || params.members.iter().any(|member| {
+                member.is_empty() || member.chars().count() > MAX_GROUP_MEMBER_ID_CHARS
+            })
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "members carries at most 1001 entries of 1-128 characters",
+                false,
+            )));
+        }
+        // The account row resolves first (the shared ladder's wire order —
+        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND); the payload
+        // itself needs only the group peer key, the supervisor re-resolves
+        // the account number for the upstream call.
+        let _account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "groups.revokeInvites addresses a group conversation",
+                false,
+            )));
+        }
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no updateGroup member-family method yet",
+                false,
+            ))),
+            _ => {
+                let mut members = params.members.clone();
+                members.sort();
+                members.dedup();
+                Ok((conversation.peer_key, members))
+            }
+        }
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolve the direct conversation's rows to the engine's
     /// `reportSpam {account, targetAci, serverGuids}` payload. The report is
@@ -5080,18 +5155,19 @@ pub(crate) fn store_get_group(
     account_id: &str,
     group_key: &str,
 ) -> Result<GroupDetails, ServiceError> {
-    store_get_group_with_requesting(store, account_id, group_key, None)
+    store_get_group_with_requesting(store, account_id, group_key, None, None)
 }
 
-/// The store read with an injected live requesting-members list (contract
-/// revision 1.62, §4.53 appendix): the supervisor passes the engine's own
-/// `listGroups` answer for this group; `None` keeps the pre-1.62 face
-/// (the key stays absent — store-only callers, tests).
+/// The store read with injected live requesting-members and pending-invite
+/// lists (contract revisions 1.62 and 1.64, §4.53/§4.57): the supervisor
+/// passes the engine's own `listGroups` answer for this group; `None` keeps
+/// the pre-1.62 face (the keys stay absent — store-only callers, tests).
 pub(crate) fn store_get_group_with_requesting(
     store: &Store,
     account_id: &str,
     group_key: &str,
     requesting: Option<&[Value]>,
+    pending: Option<&[Value]>,
 ) -> Result<GroupDetails, ServiceError> {
     validate_opaque_id(account_id, "accountId")?;
     validate_opaque_id(group_key, "groupKey")?;
@@ -5138,6 +5214,14 @@ pub(crate) fn store_get_group_with_requesting(
         .map(|entries| project_requesting_members(store, account_id, entries))
         .transpose()?
         .filter(|roster| !roster.is_empty());
+    // Contract 1.64 (§4.57): the live pending-invite projection — the same
+    // read-time name map and the same bounds as the requesting face.
+    // `None` (store-only callers, pre-1.64 face) and an engine without the
+    // face (empty slice) both collapse to an absent key.
+    let pending_members = pending
+        .map(|entries| project_pending_members(store, account_id, entries))
+        .transpose()?
+        .filter(|roster| !roster.is_empty());
     Ok(GroupDetails {
         peer_key: group_key.to_string(),
         title,
@@ -5145,6 +5229,7 @@ pub(crate) fn store_get_group_with_requesting(
         members: members?,
         is_terminated,
         requesting_members,
+        pending_members,
         synced_at,
     })
 }
@@ -5199,6 +5284,62 @@ fn project_requesting_members(
                 .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
                 .cloned();
             Some(GroupRequestingMemberView { id, uuid, name })
+        })
+        .collect())
+}
+
+/// One live pending-invite projection (contract revision 1.64, §4.57): the
+/// [`project_requesting_members`] shape verbatim — the connector-wide
+/// first-wins address ladder picks the id the desktop addresses the revoke
+/// write with (the fold accepts either identity, so the ladder id always
+/// folds), the uuid rides only when it differs from the id, and the name
+/// resolves from the same read-time contacts-cache map the roster uses.
+/// Malformed entries and entries past [`MAX_GROUP_MEMBERS`] drop
+/// individually — a hostile answer can never fail the read. The upstream
+/// face carries no inviter metadata (the recorded §4.57 projection
+/// difference), so every row is a bare invitee.
+fn project_pending_members(
+    store: &Store,
+    account_id: &str,
+    entries: &[Value],
+) -> Result<Vec<GroupPendingMemberView>, ServiceError> {
+    let titles = store.contact_title_map(account_id)?;
+    Ok(entries
+        .iter()
+        .take(MAX_GROUP_MEMBERS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            // The first-wins address ladder (number before uuid), the same
+            // [`member_address_id`] shape the sync capture and the §4.39
+            // roster projection run — kept local: the supervisor twin is a
+            // private fn of its module.
+            let id = ["number", "uuid"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                })?;
+            let uuid = ["uuid"]
+                .iter()
+                .find_map(|key| object.get(*key).and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && *value != id)
+                .map(|value| {
+                    value
+                        .chars()
+                        .take(MAX_GROUP_MEMBER_ID_CHARS)
+                        .collect::<String>()
+                });
+            let name = titles
+                .get(&id)
+                .or_else(|| uuid.as_deref().and_then(|uuid| titles.get(uuid)))
+                .cloned();
+            Some(GroupPendingMemberView { id, uuid, name })
         })
         .collect())
 }
@@ -5537,7 +5678,9 @@ pub struct MediaCloseView {
 /// envelope exposes no terminated field), so `synced_at` remains the only
 /// staleness signal for it too. `requesting_members` (contract revision
 /// 1.62, §4.53 appendix) is the live read, not the cached row — see the
-/// supervisor projection.
+/// supervisor projection. `pending_members` (contract revision 1.64, §4.57)
+/// is the same-shaped live read of the invited-but-not-yet-joined set — see
+/// the supervisor projection.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupDetails {
@@ -5549,6 +5692,8 @@ pub struct GroupDetails {
     pub is_terminated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requesting_members: Option<Vec<GroupRequestingMemberView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_members: Option<Vec<GroupPendingMemberView>>,
     pub synced_at: u64,
 }
 
@@ -5586,6 +5731,29 @@ pub struct GroupMemberView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupRequestingMemberView {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One projected pending-invite row (contract revision 1.64, §4.57): the
+/// same minimal face as [`GroupRequestingMemberView`] — the address the
+/// desktop addresses the revoke write with rides the connector-wide
+/// first-wins ladder (the §4.57 fold accepts either identity), the name
+/// resolves from the contacts cache at read time, the admin/self marks
+/// never ride (a pending invitee is by definition not yet a member).
+/// `uuid` is present only when the upstream supplied one. The official
+/// row's inviter metadata (`metadata.addedByUserId`) has no upstream face —
+/// the pinned signal-cli projects `pendingMembers` as bare
+/// `JsonGroupMemberAddress` records (`ListGroupsCommand.resolveJsonMembers`
+/// at :125-133; `GroupInfoV2.getPendingMembers` :144-151 resolves the
+/// member's own address only) — so no invited-by grouping rides this face
+/// (the recorded projection difference).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupPendingMemberView {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuid: Option<String>,
@@ -6735,6 +6903,23 @@ pub struct GroupsApproveJoinRequestsParams {
     pub conversation_id: String,
     pub members: Vec<String>,
     pub approve: bool,
+    pub operation_id: Option<String>,
+}
+
+/// groups.revokeInvites (contract revision 1.64, §4.57, capability
+/// group-invite-revoke): the addressing pair, the candidate member set
+/// (1-1001 entries of 1-128 characters, the §4.39 roster bounds — the
+/// §4.44 member-array discipline: an empty array carries no change upstream
+/// and is refused by shape), and the optional audit id. No approve bit: the
+/// method's only direction is revocation (the official surface's
+/// REVOKE_INVITE stage — `PendingInvites.dom.tsx` L57-61), and a
+/// re-invite belongs to the add-member face, not to this one.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsRevokeInvitesParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub members: Vec<String>,
     pub operation_id: Option<String>,
 }
 
@@ -12994,6 +13179,7 @@ mod tests {
                 json!("not-an-object"),
                 json!({}),
             ]),
+            None,
         )
         .unwrap();
         let requesting = with_requesting.requesting_members.unwrap();
@@ -13030,6 +13216,7 @@ mod tests {
             &account.id,
             "ZmFrZS1ncm91cC0x",
             Some(&[]),
+            None,
         )
         .unwrap();
         assert_eq!(empty.requesting_members, None);
@@ -13043,6 +13230,7 @@ mod tests {
             &account.id,
             "ZmFrZS1ncm91cC0x",
             Some(&flood),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -13067,6 +13255,120 @@ mod tests {
 
         let malformed = service.get_group(&account.id, "").unwrap_err();
         assert_eq!(malformed.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// The live pending-invite projection (contract revision 1.64, §4.57):
+    /// the engine's raw JsonGroupMemberAddress entries project with the
+    /// first-wins ladder id, the upstream uuid (only when it differs from
+    /// the id), and the read-time contacts-cache name; malformed entries
+    /// drop individually; the cap holds; absent on None/empty; no inviter
+    /// metadata ever rides a row (the recorded upstream projection
+    /// difference).
+    #[test]
+    fn get_group_projects_the_live_pending_members() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "group",
+                "ZmFrZS1ncm91cC0x",
+                "Fixture Group",
+                Some("{\"memberCount\":2}"),
+                1725300000,
+            )
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "+15555550101",
+                "Alice Contact",
+                None,
+                1725300000,
+            )
+            .unwrap();
+
+        // The live face: the same projection ladder the requesting face
+        // runs, over the pending array.
+        let with_pending = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            None,
+            Some(&[
+                json!({"number": "+15555550101", "uuid": "9f0fd6a2-1111-4000-8000-000000000001"}),
+                json!({"uuid": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"}),
+                json!({"number": "+15555550102", "uuid": "+15555550102"}),
+                json!("not-an-object"),
+                json!({}),
+            ]),
+        )
+        .unwrap();
+        let pending = with_pending.pending_members.unwrap();
+        let pending_wire = serde_json::to_value(&pending).unwrap();
+        assert_eq!(pending.len(), 3, "malformed entries drop: {pending_wire}");
+        assert_eq!(
+            pending_wire[0],
+            json!({
+                "id": "+15555550101",
+                "uuid": "9f0fd6a2-1111-4000-8000-000000000001",
+                "name": "Alice Contact",
+            }),
+            "ladder id + upstream uuid + read-time contacts-cache name"
+        );
+        assert_eq!(
+            pending_wire[1],
+            json!({"id": "d43e8ea0-3f6c-4a57-8a5c-51f83f8e5df1"}),
+            "an unknown ACI-keyed invitee keeps the bare identity, uuid never equals id"
+        );
+        assert_eq!(
+            pending_wire[2],
+            json!({"id": "+15555550102"}),
+            "the ladder collapses a uuid that repeats the number"
+        );
+        assert!(
+            pending_wire
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row.get("addedByUserId").is_none()),
+            "no inviter metadata rides the projection (upstream has none)"
+        );
+
+        // An empty live answer (nobody pending / upstream face missing)
+        // collapses to the absent key, not an empty array.
+        let empty = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            None,
+            Some(&[]),
+        )
+        .unwrap();
+        assert_eq!(empty.pending_members, None);
+
+        // The cap holds for a hostile oversized live answer.
+        let flood: Vec<Value> = (0..MAX_GROUP_MEMBERS + 50)
+            .map(|index| json!({"number": format!("+1555555{index:04}")}))
+            .collect();
+        let flooded = store_get_group_with_requesting(
+            service.store_ref(),
+            &account.id,
+            "ZmFrZS1ncm91cC0x",
+            None,
+            Some(&flood),
+        )
+        .unwrap();
+        assert_eq!(
+            flooded.pending_members.as_ref().map(Vec::len),
+            Some(MAX_GROUP_MEMBERS)
+        );
     }
 
     /// contacts.setLocalAlias prepare (contract revision 1.10, §4.9): the
@@ -15714,6 +16016,128 @@ mod tests {
         let engine_mode_shape = service
             .prepare_groups_approve_join_requests(
                 &params(group.id.clone(), vec![], true),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(engine_mode_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST")
+        );
+    }
+
+    /// prepare_groups_revoke_invites validates the candidate set and
+    /// resolves the group row: the happy path answers (peerKey, deduped
+    /// members) with duplicates collapsed and order normalized; the refusal
+    /// ladder answers before any engine call — empty members, oversized
+    /// member arrays, per-entry shape violations, bad ids, an unknown
+    /// conversation, and direct addressing. The kt-engine face answers
+    /// CAPABILITY_UNAVAILABLE after the local validation completed (the
+    /// engine debt precedent — the fold must not disguise "cannot revoke"
+    /// as "nobody is pending").
+    #[test]
+    fn groups_revoke_invites_preparation_folds_shape_and_refuses_gaps() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let params = |conversation_id: String, members: Vec<String>| GroupsRevokeInvitesParams {
+            account_id: account.id.clone(),
+            conversation_id,
+            members,
+            operation_id: None,
+        };
+
+        // The happy path: duplicate collapse and order normalization.
+        assert_eq!(
+            service
+                .prepare_groups_revoke_invites(
+                    &params(
+                        group.id.clone(),
+                        vec![
+                            "+15555550102".into(),
+                            "+15555550101".into(),
+                            "+15555550102".into()
+                        ],
+                    ),
+                    SignalCliMode::Jvm,
+                )
+                .unwrap(),
+            (
+                "group-id-1".to_string(),
+                vec!["+15555550101".to_string(), "+15555550102".to_string()]
+            )
+        );
+
+        // The refusal ladder, each before any engine call.
+        let empty = service
+            .prepare_groups_revoke_invites(&params(group.id.clone(), vec![]), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(empty, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let direct_addressed = service
+            .prepare_groups_revoke_invites(
+                &params(direct.id.clone(), vec!["+15555550102".into()]),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(direct_addressed, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
+            "a direct conversation is a shape refusal: {direct_addressed:?}"
+        );
+        let missing = service
+            .prepare_groups_revoke_invites(
+                &params("conv-absent".into(), vec!["+15555550102".into()]),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            missing,
+            ServiceError::Store(StoreError::ConversationNotFound)
+        ));
+        let bad_shape = service
+            .prepare_groups_revoke_invites(
+                &params(group.id.clone(), vec![String::new()]),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(bad_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let oversized = service
+            .prepare_groups_revoke_invites(
+                &params(
+                    group.id.clone(),
+                    (0..=MAX_GROUP_MEMBERS)
+                        .map(|index| format!("+15555050{index:03}"))
+                        .collect(),
+                ),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(oversized, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // The kt-engine face: the honest capability gap after local
+        // validation (CAPABILITY_UNAVAILABLE, retryable=false).
+        let engine_mode = service
+            .prepare_groups_revoke_invites(
+                &params(group.id.clone(), vec!["+15555550101".into()]),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(engine_mode, ServiceError::Api(ref api) if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable),
+            "the engine debt answers the capability gap: {engine_mode:?}"
+        );
+        // The engine gate sits after local validation: a shape violation
+        // still answers INVALID_REQUEST on the engine face.
+        let engine_mode_shape = service
+            .prepare_groups_revoke_invites(
+                &params(group.id.clone(), vec![]),
                 SignalCliMode::KtEngine,
             )
             .unwrap_err();

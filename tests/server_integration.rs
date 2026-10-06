@@ -3121,6 +3121,100 @@ async fn groups_get_carries_the_live_requesting_members() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// groups.get carries the live pending-invite projection (contract revision
+/// 1.64, §4.57): a real engine answer projects bounded {id, uuid?, name?}
+/// entries through the full listGroups → projection ladder, the cached face
+/// stays intact beside it, and a pending-less answer degrades without the
+/// key.
+#[tokio::test]
+async fn groups_get_carries_the_live_pending_members() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [56_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // Two pending invitees on the fixture group (the §4.57 verified
+    // listGroups read source); the projection must carry both.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[(
+            "KT_FAKE_PENDING_GROUPS",
+            "ZmFrZS1ncm91cC0x=+15555550101,+15555550102",
+        )],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupInvitesRead" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    // Sync first so the cached row exists — the assertion below that the
+    // pending key rides the cached row is the whole point (the face is the
+    // live read, not the capture).
+    request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+
+    let group = request(
+        &mut client,
+        "groups-get",
+        "groups.get",
+        json!({
+            "accountId": account_id,
+            "groupKey": "ZmFrZS1ncm91cC0x"
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["peerKey"], "ZmFrZS1ncm91cC0x");
+    // The cached face stays intact beside the live key.
+    assert_eq!(group["result"]["memberCount"], 2);
+    let pending = group["result"]["pendingMembers"]
+        .as_array()
+        .expect("the live pending set must ride the response");
+    assert_eq!(pending.len(), 2, "{group}");
+    assert_eq!(pending[0]["id"], "+15555550101");
+    assert_eq!(pending[0]["name"], "Alice Example");
+    assert!(
+        pending[0].get("self").is_none(),
+        "a pending invitee is never a member row"
+    );
+    assert!(pending[0].get("admin").is_none());
+    assert_eq!(pending[1]["id"], "+15555550102");
+    assert!(
+        pending[0].get("addedByUserId").is_none() && pending[1].get("addedByUserId").is_none(),
+        "the upstream face carries no inviter metadata (the §4.57 projection difference)"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn contacts_set_local_alias_renames_a_locally_known_peer() {
     let temp = TempDir::new().unwrap();
@@ -9632,5 +9726,354 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// groups.revokeInvites round trip and guards (contract revision 1.64,
+/// §4.57, capability group-invite-revoke): the fold keeps only pending
+/// survivors in the recorded upstream removeMembers payload, the stale fold
+/// answers INVITE_NO_LONGER_PENDING with zero writes, the refusal ladder
+/// answers before any write, the upstream refusal forwards UPSTREAM_ERROR,
+/// and the in-flight crash answers SEND_OUTCOME_UNKNOWN and is never
+/// retried across the restart.
+#[tokio::test]
+async fn groups_revoke_invites_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [57_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    // The stub answers two pending invitees for the fixture group and one
+    // for each sentinel group (the §4.57 verified listGroups read source) —
+    // Alice's number on the sentinels, so the fold passes her upstream.
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[(
+            "KT_FAKE_PENDING_GROUPS",
+            "ZmFrZS1ncm91cC0x=+15555550101,+15555550102;[fixture-revoke-forbidden]=+15555550101;[fixture-revoke-crash]=+15555550101",
+        )],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new face before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["groups.revokeInvites", "group-invite-revoke"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupRevoke" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Sync so the fixture group row exists, then read its conversation id.
+    request(
+        &mut client,
+        "contacts-sync",
+        "contacts.sync",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let listed = request(
+        &mut client,
+        "conversations-list",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture group row must exist");
+
+    // Stage the sentinel groups (the upstream-refusal group and the crash
+    // group) through the runtime injection marker, each also carrying a
+    // pending member in the stub read so the fold passes them upstream.
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 80,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-revoke-forbidden]",
+                        "type": "UPDATE",
+                        "groupName": "revoke forbidden group",
+                        "revision": 3
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 81,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-revoke-crash]",
+                        "type": "UPDATE",
+                        "groupName": "revoke crash group",
+                        "revision": 3
+                    }
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut groups: Vec<(String, String)> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("revoke-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("revoke-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        groups = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["type"] == "group")
+            .filter_map(|row| {
+                Some((
+                    row["id"].as_str()?.to_string(),
+                    row["title"].as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let titles: Vec<&str> = groups.iter().map(|(_, name)| name.as_str()).collect();
+        if titles.contains(&"revoke forbidden group") && titles.contains(&"revoke crash group") {
+            break;
+        }
+    }
+    let by_title = |title: &str| {
+        groups
+            .iter()
+            .find(|(_, name)| name == title)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| panic!("the staged {title} row must materialize: {groups:?}"))
+    };
+    let forbidden = by_title("revoke forbidden group");
+    let crash_group = by_title("revoke crash group");
+
+    // The refusal ladder, each before any upstream write.
+    let unknown = request(
+        &mut client,
+        "revoke-unknown",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
+    assert_eq!(unknown["error"]["retryable"], false);
+    let bad_params = request(
+        &mut client,
+        "revoke-bad-params",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101"],
+            "unexpected": true
+        }),
+    )
+    .await;
+    assert_eq!(bad_params["error"]["code"], "INVALID_REQUEST");
+    let empty_members = request(
+        &mut client,
+        "revoke-empty",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": []
+        }),
+    )
+    .await;
+    assert_eq!(empty_members["error"]["code"], "INVALID_REQUEST");
+    let direct_setup = request(
+        &mut client,
+        "revoke-direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "direct guard",
+            "clientRequestId": "group-revoke-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "revoke-direct",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "members": ["+15555550102"]
+        }),
+    )
+    .await;
+    assert_eq!(direct["error"]["code"], "INVALID_REQUEST");
+
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let revoke_writes = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("removeMembers").is_some())
+            .collect()
+    };
+
+    // The fully-stale fold: the candidates are not pending invitees (Alice
+    // rides the fixture read, but this call names Bob — no candidate at all
+    // — and a stranger) — nothing rides the array and the connector answers
+    // before any write.
+    let stale = request(
+        &mut client,
+        "revoke-stale",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550999", "+15555550103"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        stale["error"]["code"], "INVITE_NO_LONGER_PENDING",
+        "{stale}"
+    );
+    assert_eq!(stale["error"]["retryable"], true);
+    assert!(revoke_writes().is_empty(), "{:?}", revoke_writes());
+
+    // The definite success: only the pending survivors ride the
+    // removeMembers array — the stale candidates are gone before the write.
+    let revoked = request(
+        &mut client,
+        "revoke-group",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "members": ["+15555550101", "+15555550999"],
+            "operationId": "revoke-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(revoked["result"]["status"], "sent", "{revoked}");
+    let writes = revoke_writes();
+    assert_eq!(writes.len(), 1, "{:?}", revoke_writes());
+    assert_eq!(writes[0]["account"], "+15555550100");
+    assert_eq!(writes[0]["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(
+        writes[0]["removeMembers"],
+        json!(["+15555550101"]),
+        "the fold keeps only the pending survivor: {writes:?}"
+    );
+    assert!(writes[0].get("members").is_none());
+
+    // The upstream non-admin refusal forwards verbatim: the engine's user
+    // error lands as the UPSTREAM_ERROR family (retryable, like every
+    // upstream protocol refusal the connector forwards). The pending hook
+    // lists Alice for the sentinel group too, so the fold passes her
+    // upstream and the write itself is what the stub refuses.
+    let refused = request(
+        &mut client,
+        "revoke-forbidden",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": forbidden,
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "UPSTREAM_ERROR", "{refused}");
+
+    // Crash with the mutating write in flight (fixture sentinel,
+    // os._exit(37)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
+    // write in the recovered log across the restart.
+    let crash = request(
+        &mut client,
+        "revoke-crash",
+        "groups.revokeInvites",
+        json!({
+            "accountId": account_id,
+            "conversationId": crash_group,
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    assert_eq!(crash["error"]["retryable"], false);
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-revoke", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
+    let crash_writes: Vec<Value> = revoke_writes()
+        .into_iter()
+        .filter(|params| params["groupId"] == "[fixture-revoke-crash]")
+        .collect();
+    assert_eq!(
+        crash_writes.len(),
+        1,
+        "an unknown revoke outcome is never retried: {crash_writes:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
     assert_clean_exit(&mut connector).await;
 }

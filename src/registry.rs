@@ -1239,6 +1239,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.approve_join_requests(params).await
     }
 
+    /// groups.revokeInvites (contract revision 1.64, §4.57, capability
+    /// group-invite-revoke): the pending invitees' state lives with the
+    /// account's engine, so the write routes through the account's owning
+    /// supervisor like every other mutating face.
+    pub async fn revoke_invites(
+        &self,
+        params: crate::service::GroupsRevokeInvitesParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.revoke_invites(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

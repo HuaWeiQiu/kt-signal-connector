@@ -21,7 +21,35 @@
   precedent; the schema-19 store is untouched, zero capture-path change.
   1.63 is the landed message-request response face (the §4.56 entry, in the
   chain below — it landed first and its entry therefore sits in the chain,
-  newest wins); 1.64–1.65 remain reserved by parallel batches) —
+  newest wins); 1.64 is the landed group-invites face (the §4.57 entry, in
+  the chain below — newest wins), 1.65 remains reserved by parallel
+  batches) — previously 1.64 (2026-10-06; §4.57 — the group invites face opens:
+  `groups.get` now carries `pendingMembers` — the invited-but-not-yet-joined
+  set — projected live at read time as bounded `{id, uuid?, name?}` entries
+  from the same single-group upstream `listGroups` read the new
+  `groups.revokeInvites` write folds against (capability
+  `group-invite-revoke`, one capability for the read and write halves, the
+  1.62 read-face discipline), and the write face itself: the safe managed
+  revoke over the pinned upstream's revocation-woven updateGroup
+  removeMembers semantics (`GroupHelper.updateGroupV2` discriminates three
+  ways — pending members ride `revokeInvitedMembers`, full members ride the
+  member removal, requesting members ride `refuseJoinRequestMembers` — so
+  the connector folds the candidates against the engine's own
+  `pendingMembers` read and only pending invitees can ever ride the array;
+  a fully-stale fold answers `INVITE_NO_LONGER_PENDING` retryable with zero
+  writes, an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is
+  never retried, the kt-engine face answers CAPABILITY_UNAVAILABLE after
+  local validation on the §4.53 engine-debt precedent). The read face
+  mirrors the 1.62 requestingMembers reasoning point for point: live read,
+  not a sync capture (the revoke fold's own read is the truth source, the
+  rendered list and the folded write set are the same bytes moments apart;
+  the sync path cannot carry this face), best-effort degradation without
+  the key, the method itself ungated like every §4.8 cache read with the
+  desktop gating on the capability + key presence. Zero local writes, the
+  schema-19 store untouched, zero capture-path change. 1.63 (the
+  message-request response face) landed ahead of this batch on the rebased
+  stack — its §4.56 entry already sits in the chain and the 1.66 header
+  above took the top, newest wins; this batch takes §4.57 directly) —
   previously 1.63 (2026-10-06; §4.56 — message-request response faces
   `conversations.acceptRequest` / `conversations.declineRequest`: the pinned upstream's native
   `sendMessageRequestResponse` sync face (accept/delete — the official CLI carries only this
@@ -3286,6 +3314,129 @@ listed under the same handshake entry):
   fallback send could double-deliver. The backward-compat story is
   byte-identical to every optional-param revision: a pre-1.66 caller sends
   no new key and reads the old shapes unchanged.
+
+### 4.57 Group invites: the `pendingMembers` read face + `groups.revokeInvites` (contract revision 1.64, 2026-10-06; landed after §4.56 on the rebased stack)
+
+> **Upstream evidence (pinned signal-cli `v0.14.7-4-g472784e6`, the 0.14.8
+> line — line anchors in the pinned tree):** the read source is
+> `ListGroupsCommand`'s JSON projection: `pendingMembers` rides the
+> `JsonGroup` record through the same `resolveJsonMembers(group.pendingMembers())`
+> call that projects `requestingMembers` (ListGroupsCommand.java:125-133;
+> the `GroupInfoV2.getPendingMembers` storage read at GroupInfoV2.java:144-151
+> resolves each pending entry's own ServiceId — **no inviter metadata
+> survives**: a `JsonGroupMemberAddress` carries `number`/`uuid` only, the
+> official `GroupV2PendingMember.metadata.addedByUserId` has no upstream
+> face here). The write source is `GroupHelper.updateGroupV2`'s three-way
+> removeMembers discrimination (GroupHelper.java:759-770): entries that are
+> pending members ride `GroupV2Helper.revokeInvitedMembers`
+> (GroupV2Helper.java:320-332, the GroupsV2 delete-pending-member change),
+> entries that are full members ride `removeMembers`, entries that are
+> requesting members ride `refuseJoinRequestMembers` — the shared array
+> means a naive "revoke these invites" call would remove ordinary members
+> or refuse join requests, exactly the mis-target family the §4.53
+> approval fold exists for on the other half.
+>
+> **Official desktop surface being aligned (Signal-Desktop,
+> PendingInvites.dom.tsx, line anchors from the AGPL tree — behavior
+> reference only, zero code reuse):** the conversation-details page shows
+> an always-present "Requests & Invites" row for every live group
+> (ConversationDetails.dom.tsx:721-730 — `invitesCount` =
+> pendingMemberships + pendingApprovalMemberships, **no admin gate on the
+> row itself**), pushing a GroupInvites panel with two tabs: Requests (the
+> §4.53 approval face) and Invites (this face — `PendingInvites.dom.tsx`
+> tab split :92-101, default tab Requests :83). The Invites tab groups
+> pending rows by inviter — "Invited by you" with a per-row trash action,
+> "Invited by others" with a per-inviter row and a count
+> (:401-518) — and gates the trash actions on `areWeAdmin`
+> (:446, :494). Revocation is a staged confirm (REVOKE_INVITE :57-61,
+> the confirm copy :274-304), fan-out by invitee ids
+> (:175-183). The projection differences KT records: (1) no inviter
+> metadata upstream → the desktop cannot group by inviter; KT renders one
+> flat invitee list (official "invited-by" grouping degraded — the
+> invitee set, the count, and the revoke write are all exact); (2) the
+> official row appears for everyone while the actions are admin-only —
+> the GroupsV2 server adjudicates admin-ness on the write (non-admin
+> answers the UNAUTHORIZED face, forwarded verbatim as UPSTREAM_ERROR),
+> so the connector does not gate the read either and lets the desktop
+> mirror the official visibility.
+>
+> **Read face (`groups.get` → `pendingMembers`):** the 1.62
+> requestingMembers appendix verbatim with the array swapped — the same
+> single-group `listGroups` read (one extra engine round-trip the §4.57
+> fold itself spends per revoke), projected at read time to bounded
+> `{id, uuid?, name?}` entries (the connector-wide first-wins address
+> ladder, the uuid only when it differs, the name from the read-time
+> contacts cache; bounded to the §4.39 roster cap, malformed entries drop
+> individually), **present only when the engine answered a non-empty
+> pending set**, absent otherwise; pre-1.64 hosts read byte-identical
+> responses; best-effort degradation (engine stopped / refused read → the
+> cached row without the key; the §4.8 promise intact). The method stays
+> ungated like every §4.8 cache read; the desktop consume batch gates the
+> UI on the `group-invite-revoke` capability + this key's presence.
+>
+> **Write face (`groups.revokeInvites`):** the `groups.approveJoinRequests`
+> §4.53 discipline verbatim minus the approve bit — params
+> `{accountId, conversationId, members, operationId?}` (members = the
+> candidate set, 1-1001 entries of 1-128 characters, the §4.39 roster
+> bounds; an empty array is refused, the §4.44 no-delta discipline;
+> duplicates collapse; conversationId must resolve to a kind='group' row
+> before any engine call — direct answers INVALID_REQUEST, unknown answers
+> CONVERSATION_NOT_FOUND). The fold: before anything goes upstream the
+> connector reads the engine's own `listGroups {account, groupId}` and
+> intersects the candidates with the projected pending identities (number
+> and uuid both ride one identity set). Only pending survivors can ever
+> ride the upstream `removeMembers` array — every other change key stays
+> absent. A fold that empties the candidate set answers
+> `INVITE_NO_LONGER_PENDING` (retryable) and **no write is dispatched**; a
+> read face that cannot answer fails closed with its own engine error.
+> Result semantics (the groups.terminate discipline verbatim): a definite
+> success answers `{"status": "sent"}`; an indeterminate upstream outcome
+> answers SEND_OUTCOME_UNKNOWN and is never retried. Zero local writes:
+> the roster converges through contacts.sync. Error ladder:
+> shape/resolution errors `INVALID_REQUEST` / `CONVERSATION_NOT_FOUND`
+> (retryable=false, before any engine call); upstream non-admin forwards
+> verbatim as `UPSTREAM_ERROR` (retryable=true, the §4.50 family); the
+> stale-fold `INVITE_NO_LONGER_PENDING` (retryable=true); unknown outcome
+> `SEND_OUTCOME_UNKNOWN` (retryable=false, never retried). The kt-engine
+> face has no updateGroup member-family method (the §4.53 engine-debt
+> precedent verbatim) and answers `CAPABILITY_UNAVAILABLE`
+> (retryable=false) after local validation.
+>
+> **Capability tag: `group-invite-revoke`** joins `FEATURE_CAPABILITIES` —
+> a new tag, not a reuse of `group-join-approve`: the two tags mark two
+> protocol actions with separate desktop surfaces (the approval consume
+> batch already ships gating on its tag; rebinding its meaning to also
+> cover revocation would make an approval-aware desktop's capability check
+> silently claim a face its connector may not carry), and the 1.53-appendix
+> "one capability for one protocol action's read and write halves"
+> discipline applies to this action's halves instead. The desktop consume
+> batch gates the invites surface on the tag (a pre-1.64 connector answers
+> a clean capability gap instead of METHOD_NOT_ALLOWED). Schema: the
+> method enum entry, the `groupsRevokeInvitesParams` def, the allOf
+> dispatch branch, the `INVITE_NO_LONGER_PENDING` error-code entry, the
+> `groupsGetParams` description widening, and the roster-bounds mirror
+> rows in the schema-consistency test land together with the code.
+> Fixture: `KT_FAKE_PENDING_GROUPS` (`<groupId>=<addr,addr>;…`) rides the
+> listGroups JsonGroup with the `pendingMembers` array; the updateGroup
+> route grows the `[fixture-revoke-forbidden]` user-error sentinel and the
+> `[fixture-revoke-crash]` `os._exit(37)` sentinel (disjoint from the
+> §4.53 crash 36). Tests: the prepare unit face (happy path + duplicate
+> collapse; the ladder — empty members, oversized array, per-entry shape,
+> unknown conversation, direct addressing, over-bound audit id; the
+> engine-mode CAPABILITY_UNAVAILABLE after validation, and
+> INVALID_REQUEST precedence on the engine face), the pending-projection
+> unit face (ladder id + uuid + read-time name; malformed drop; cap holds;
+> absent on None/empty; no inviter metadata ever rides a row), the fold
+> unit face (dual-identity capture, malformed entry drops, foreign-shape
+> fail-closed, survivor order), and the server integration (handshake
+> advertises the method + tag; the live `pendingMembers` key rides a real
+> engine answer through the full listGroups → projection ladder; the fold
+> keeps only the pending survivor in the recorded upstream payload; the
+> stale fold answers INVITE_NO_LONGER_PENDING with zero writes; unknown
+> conversation / direct / unknown-params-key / empty-members answer before
+> any write; the upstream refusal forwards UPSTREAM_ERROR; the in-flight
+> crash answers SEND_OUTCOME_UNKNOWN and is never retried across the
+> restart).
 
 ## 5. signal-cli Boundary
 

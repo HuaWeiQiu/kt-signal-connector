@@ -553,6 +553,18 @@ fn schema_numeric_bounds_match_code_constants() {
             "maxLength",
             MAX_GROUP_MEMBER_ID_CHARS as u64,
         ),
+        // Invite revocation (contract 1.64, §4.57): the same §4.39 roster
+        // bounds verbatim.
+        (
+            "/$defs/groupsRevokeInvitesParams/properties/members",
+            "maxItems",
+            MAX_GROUP_MEMBERS as u64,
+        ),
+        (
+            "/$defs/groupsRevokeInvitesParams/properties/members/items",
+            "maxLength",
+            MAX_GROUP_MEMBER_ID_CHARS as u64,
+        ),
         // Account settings (contract 1.46, §4.45): the profile text budgets
         // mirror the official desktop ProfileEditor; the emoji label reuses
         // the repo-wide bound. The avatar budget (10 MiB decoded) is a

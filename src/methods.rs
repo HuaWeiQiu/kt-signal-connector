@@ -200,6 +200,19 @@ pub const METHODS: &[MethodRow] = &[
     // mis-target faces fail closed at the connector). Zero local writes: the
     // roster converges through contacts.sync like every group row.
     ("groups.approveJoinRequests", Lane::Send, true, "send"),
+    // Group invite revocation (contract revision 1.64, §4.57): mutating,
+    // send-lane upstream traffic — the groups class verbatim, same-account
+    // mutex and delete barrier included; advertised through
+    // `group-invite-revoke`. The write is the pinned upstream's updateGroup
+    // `removeMembers` family — entries that are pending members ride
+    // `revokeInvitedMembers` (GroupHelper.updateGroupV2:763-764) — with the
+    // candidate set the caller names intersected against the engine's own
+    // pending-members read before anything goes upstream, so the array can
+    // never carry a non-pending address (a full member or a requesting
+    // candidate never rides the revoke write; the mis-target faces fail
+    // closed at the connector). Zero local writes: the roster converges
+    // through contacts.sync like every group row.
+    ("groups.revokeInvites", Lane::Send, true, "send"),
     // Android local-backup export (contract revision 1.47, §4.46): the
     // engine's background export task is account-mutating state, so the
     // start face rides the send lane behind the reaction-class write-lane
@@ -338,10 +351,15 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `accounts.getUsername`, `username.lookup`); `message-requests`
 /// (contract revision 1.63) marks the §4.56 message-request response faces
 /// (`conversations.acceptRequest` / `conversations.declineRequest` over the
-/// pinned upstream's native `sendMessageRequestResponse` sync face). They
-/// never join [`METHOD_NAMES`]: the schema request-frame method enum and the
-/// dispatch table describe real methods only — desktops gate a new surface on
-/// its tag so an old connector answers a clean capability gap instead of
+/// pinned upstream's native `sendMessageRequestResponse` sync face);
+/// `group-invite-revoke` (contract revision 1.64) marks the §4.57
+/// group-invites face (`groups.get` `pendingMembers` read half +
+/// `groups.revokeInvites` write half) — one capability for one protocol
+/// action's read and write halves, the 1.53-appendix discipline the 1.62
+/// read face recorded. They never join [`METHOD_NAMES`]: the schema
+/// request-frame method enum and the dispatch table describe real methods
+/// only — desktops gate a new surface on its tag so an old connector answers
+/// a clean capability gap instead of `METHOD_NOT_ALLOWED`.
 /// `METHOD_NOT_ALLOWED`.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
@@ -362,6 +380,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "call-signaling",
     "group-terminate",
     "group-join-approve",
+    "group-invite-revoke",
     "attachment-download",
     "username",
     "message-requests",
@@ -429,6 +448,7 @@ mod tests {
             "groups.quit",
             "groups.terminate",
             "groups.approveJoinRequests",
+            "groups.revokeInvites",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
@@ -469,6 +489,7 @@ mod tests {
             "groups.quit",
             "groups.terminate",
             "groups.approveJoinRequests",
+            "groups.revokeInvites",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",

@@ -33,19 +33,19 @@ use crate::service::{
     ContactsSyncParams, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
     ConversationsGetPinnedParams, ConversationsListParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
-    HistoryImportStatusParams, HostSideEvent, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessageRequestParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
-    MessagesSendStickerParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams, UsernameLookupParams,
+    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams,
+    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, LinkSessionParams,
+    LinkStartParams, MessageGetTextParams, MessageRequestParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams, UsernameLookupParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -2178,6 +2178,29 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid groups.approveJoinRequests params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Group invite revocation (contract revision 1.64, §4.57,
+        // capability group-invite-revoke): the groups.approveJoinRequests
+        // dispatch shape — params shape errors answer INVALID_REQUEST, the
+        // definite success is {"status": "sent"}, the stale-candidate fold
+        // answers INVITE_NO_LONGER_PENDING (retryable), and an
+        // indeterminate upstream outcome is the SEND_OUTCOME_UNKNOWN error,
+        // never retried.
+        "groups.revokeInvites" => {
+            match serde_json::from_value::<GroupsRevokeInvitesParams>(request.params) {
+                Ok(params) => match runtime.revoke_invites(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.revokeInvites params",
                         false,
                     ),
                 ),

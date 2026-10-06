@@ -459,7 +459,14 @@ for line in sys.stdin:
         # <groupId>=<comma-separated member addresses> entries, so the
         # approval fold is exercisable against a real JsonGroupMemberAddress
         # shape (number-only entries, the NON_NULL omission real single-
-        # device candidates carry).
+        # device candidates carry). pendingMembers rides the same record the
+        # same way (resolveJsonMembers(group.pendingMembers()), the §4.57
+        # verified read source): KT_FAKE_PENDING_GROUPS carries
+        # <groupId>=<comma-separated member addresses> entries, so the
+        # invite-revoke fold and the groups.get pendingMembers projection
+        # are exercisable against the same shape. The upstream projects no
+        # inviter metadata on a pending entry (no addedByUserId — the
+        # recorded §4.57 projection difference), so none is faked.
         terminated_ids = {
             value.strip()
             for value in os.environ.get("KT_FAKE_TERMINATED_GROUPS", "").split(",")
@@ -473,6 +480,14 @@ for line in sys.stdin:
             requesting[group_id.strip()] = [
                 address.strip() for address in addresses.split(",") if address.strip()
             ]
+        pending: dict[str, list[str]] = {}
+        for entry in os.environ.get("KT_FAKE_PENDING_GROUPS", "").split(";"):
+            if "=" not in entry:
+                continue
+            group_id, _, addresses = entry.partition("=")
+            pending[group_id.strip()] = [
+                address.strip() for address in addresses.split(",") if address.strip()
+            ]
         result = [
             {
                 "id": "ZmFrZS1ncm91cC0x",
@@ -481,6 +496,9 @@ for line in sys.stdin:
                 "isTerminated": "ZmFrZS1ncm91cC0x" in terminated_ids,
                 "requestingMembers": [
                     {"number": address} for address in requesting.get("ZmFrZS1ncm91cC0x", [])
+                ],
+                "pendingMembers": [
+                    {"number": address} for address in pending.get("ZmFrZS1ncm91cC0x", [])
                 ],
                 "members": [
                     {"number": LINKED_ACCOUNT},
@@ -1054,11 +1072,14 @@ for line in sys.stdin:
                 continue
         # Contract 1.58 §4.53: the join-request approval rides updateGroup's
         # member family (the fold already emptied everything but requesting
-        # members). The sentinel group id answers the upstream non-admin
-        # refusal (the GroupsV2 user error → UPSTREAM_ERROR family); the
-        # crash sentinel rides the members/removeMembers array and crashes
-        # with the mutating call in flight (os._exit(36); disjoint from
-        # 25/29/30/31/32/33/34/35).
+        # members). Contract 1.64 §4.57: the invite revocation rides the
+        # same updateGroup route's removeMembers family (the fold already
+        # emptied everything but pending invitees). The sentinel group ids
+        # answer the upstream non-admin refusal (the GroupsV2 user error →
+        # UPSTREAM_ERROR family); the crash sentinels ride the
+        # members/removeMembers array and crash with the mutating call in
+        # flight (os._exit(36)/os._exit(37); disjoint from
+        # 25/29/30/31/32/33/34/35 and from each other).
         if params.get("groupId") == "[fixture-approve-forbidden]":
             response = {
                 "jsonrpc": "2.0",
@@ -1074,6 +1095,21 @@ for line in sys.stdin:
             params.get("members") or params.get("removeMembers")
         ):
             os._exit(36)
+        if params.get("groupId") == "[fixture-revoke-forbidden]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "UserErrorException: Failed to send group update",
+                },
+            }
+            emit_json(response)
+            continue
+        if params.get("groupId") == "[fixture-revoke-crash]" and (
+            params.get("members") or params.get("removeMembers")
+        ):
+            os._exit(37)
         result = {"timestamp": 99, "results": []}
     elif method == "quitGroup":
         # Contract 1.45 §4.44: same recording discipline; the magic group id
