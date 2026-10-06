@@ -176,6 +176,10 @@ pub const MAX_SEND_MENTIONS: usize = 64;
 /// before any pending row exists, instead of the engine's late internal
 /// error. A forwarded multi-attachment message never exceeds this shape.
 pub const MAX_SEND_ATTACHMENTS: usize = 32;
+/// The outbound text-style cap (contract revision 1.69, §4.62): the §4.20
+/// receive projection cap mirrored — a `messages.sendText` `textStyle` array
+/// answers INVALID_REQUEST past 64 entries before any pending row exists.
+pub const MAX_SEND_TEXT_STYLES: usize = 64;
 /// The group roster cap (contract revision 1.40, §4.39): the official
 /// GroupsV2 group-size ceiling. The contacts sync projects at most this many
 /// members into the cached group row; entries past the cap drop.
@@ -1116,6 +1120,7 @@ impl ConnectorService {
         quote_message_id: Option<&str>,
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
+        text_styles: Option<Vec<SendTextStyleParams>>,
     ) -> Result<PreparedSend, ServiceError> {
         let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
@@ -1131,6 +1136,7 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let mentions = self.mentions_to_upstream(&account, mentions)?;
+        let text_styles = self.text_styles_to_upstream(text_styles)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
         self.dispatch_send(
             &account,
@@ -1140,6 +1146,7 @@ impl ConnectorService {
             quote_message_id,
             preview,
             mentions,
+            text_styles,
             None,
             Vec::new(),
             false,
@@ -1163,6 +1170,7 @@ impl ConnectorService {
         quote_message_id: Option<&str>,
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
+        text_styles: Option<Vec<SendTextStyleParams>>,
     ) -> Result<PreparedSend, ServiceError> {
         let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
@@ -1197,6 +1205,7 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let mentions = self.mentions_to_upstream(&account, mentions)?;
+        let text_styles = self.text_styles_to_upstream(text_styles)?;
         let title = peer_title.unwrap_or_else(|| {
             if kind == "group" {
                 "group".to_string()
@@ -1215,6 +1224,7 @@ impl ConnectorService {
             quote_message_id,
             preview,
             mentions,
+            text_styles,
             None,
             Vec::new(),
             false,
@@ -1278,6 +1288,67 @@ impl ConnectorService {
                     length: entry.length,
                 });
             }
+        }
+        Ok((!upstream.is_empty()).then_some(upstream))
+    }
+
+    /// Validate and normalize the caller-supplied text-style ranges (contract
+    /// revision 1.69, §4.62) into the exact shape the upstream `send`
+    /// expects. Enforced here — not at the engine — for the same reason the
+    /// §4.29 mentions are: the engine answers a malformed entry with a late
+    /// upstream internal error, which would surface as an
+    /// unknown-outcome-shaped send failure instead of deterministic local
+    /// behavior.
+    ///
+    /// Rules: more than 64 entries are rejected INVALID_REQUEST (the §4.20
+    /// receive cap mirrored; the mentions family drops extras, but a style
+    /// list is caller-authored formatting, not protocol-received data, so the
+    /// deterministic rejection is the honest shape); the style value is one
+    /// of the five protocol-renderable upstream enum values (BOLD / ITALIC /
+    /// SPOILER / STRIKETHROUGH / MONOSPACE — the pinned `TextStyle.java`
+    /// enum minus the no-op `NONE`, which the official composer never emits
+    /// and which would silently strip the range); start/length are validated
+    /// non-negative by the u32 param types (UTF-16 code-unit offsets, the
+    /// official BodyRange semantics). There is deliberately **no
+    /// body-length bounds gate**: the pinned upstream carries no such check
+    /// (`SendCommand.parseTextStyles` accepts any `\d+:\d+:STYLE` triple) and
+    /// the official desktop sender clips ranges to the trimmed body at
+    /// composition time (`quill/util.dom.ts getTextAndRangesFromOps`) — a
+    /// connector-side rejection would fail sends the pinned face delivers,
+    /// and connector-side clipping would hide a caller bug the official face
+    /// leaves visible upstream.
+    fn text_styles_to_upstream(
+        &self,
+        text_styles: Option<Vec<SendTextStyleParams>>,
+    ) -> Result<Option<Vec<UpstreamSendTextStyle>>, ServiceError> {
+        let Some(text_styles) = text_styles else {
+            return Ok(None);
+        };
+        if text_styles.len() > MAX_SEND_TEXT_STYLES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "textStyle must contain at most 64 entries",
+                false,
+            )));
+        }
+        let mut upstream = Vec::with_capacity(text_styles.len());
+        for entry in text_styles {
+            let style = match entry.style.as_str() {
+                "BOLD" | "ITALIC" | "SPOILER" | "STRIKETHROUGH" | "MONOSPACE" => entry.style,
+                _ => {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "textStyle entry style must be one of BOLD, ITALIC, SPOILER, \
+                         STRIKETHROUGH, MONOSPACE",
+                        false,
+                    )));
+                }
+            };
+            upstream.push(UpstreamSendTextStyle {
+                style,
+                start: entry.start,
+                length: entry.length,
+            });
         }
         Ok((!upstream.is_empty()).then_some(upstream))
     }
@@ -1398,6 +1469,7 @@ impl ConnectorService {
             quote_message_id,
             None,
             None,
+            None,
             Some(vec![json!(data_uri)]),
             vec![descriptor],
             view_once,
@@ -1513,6 +1585,7 @@ impl ConnectorService {
             text.unwrap_or_default(),
             client_request_id,
             quote_message_id,
+            None,
             None,
             None,
             Some(data_uris),
@@ -1747,6 +1820,7 @@ impl ConnectorService {
         quote_message_id: Option<&str>,
         link_preview: Option<UpstreamSendPreview>,
         mentions: Option<Vec<UpstreamSendMention>>,
+        text_styles: Option<Vec<UpstreamSendTextStyle>>,
         attachments: Option<Vec<Value>>,
         attachment_descriptors: Vec<NormalizedAttachment>,
         view_once: bool,
@@ -1784,8 +1858,23 @@ impl ConnectorService {
             // §4.36: a view-once send persists the marker on its own pending
             // row, so the sender's bubble renders the view-once UI across
             // restarts; every other send stays a plain row (None).
-            rich: view_once.then_some(crate::engine::NormalizedRich {
-                view_once: true,
+            // §4.62: a styled text send persists its ranges the same way —
+            // the sender's bubble keeps its own formatting across restarts
+            // (the official sender echo renders bodyRanges). Mentions stay
+            // unpersisted (the 1.34 shape): a styled send carries both, the
+            // retry rebuilds neither (documented deviation, §4.29 precedent).
+            rich: (view_once || text_styles.is_some()).then(|| crate::engine::NormalizedRich {
+                view_once,
+                text_styles: text_styles
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|style| crate::engine::NormalizedTextStyle {
+                        style: style.style.clone(),
+                        start: style.start,
+                        length: style.length,
+                    })
+                    .collect(),
                 ..crate::engine::NormalizedRich::default()
             }),
             reactions: Vec::new(),
@@ -1827,6 +1916,7 @@ impl ConnectorService {
             text,
             link_preview.as_ref(),
             mentions.as_deref(),
+            text_styles.as_deref(),
             attachments,
             quote,
             conversation,
@@ -3282,12 +3372,21 @@ impl ConnectorService {
     /// signal-cli JSON-RPC send quote parameters (verified against the pinned
     /// 0.14.7 distribution): quoteTimestamp is the quoted message's Signal
     /// timestamp, quoteAuthor its author's number — both required.
+    ///
+    /// Outbound text styles (contract revision 1.69, §4.62) project onto the
+    /// engine `send` `textStyle` entry keys verbatim — `style`/`start`/
+    /// `length` (the camelCase of signal-cli's `--text-style`
+    /// `start:length:STYLE` triples, JsonRpcNamespace getList); validation
+    /// and bounds happened in `text_styles_to_upstream`, so every entry that
+    /// gets here is upstream-safe. The key is absent when no styles are
+    /// given, so every existing wire shape stays byte-identical.
     #[allow(clippy::too_many_arguments)]
     fn upstream_text_send_params(
         signal_account: &str,
         text: &str,
         preview: Option<&UpstreamSendPreview>,
         mentions: Option<&[UpstreamSendMention]>,
+        text_styles: Option<&[UpstreamSendTextStyle]>,
         attachments: Option<Vec<Value>>,
         quote: Option<(u64, String)>,
         conversation: &ConversationRow,
@@ -3319,6 +3418,24 @@ impl ConnectorService {
                             "number": mention.number,
                             "start": mention.start,
                             "length": mention.length,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+        if let Some(text_styles) = text_styles {
+            // The engine `send` textStyle entry keys, verbatim (style/start/
+            // length); style is the pinned TextStyle enum vocabulary and the
+            // offsets are UTF-16 code units passed through — the caller
+            // indexes its own body.
+            params["textStyle"] = json!(
+                text_styles
+                    .iter()
+                    .map(|style| {
+                        json!({
+                            "style": style.style,
+                            "start": style.start,
+                            "length": style.length,
                         })
                     })
                     .collect::<Vec<_>>()
@@ -3417,12 +3534,14 @@ impl ConnectorService {
             .as_deref()
             .map(|quote_id| self.resolve_quote(&account, &conversation, quote_id))
             .transpose()?;
-        // Mentions are not persisted on the row, so a retry rebuilds the send
-        // without them (documented deviation: a retried mention send goes out
-        // un-highlighted; the text arrives unchanged).
+        // Mentions and text styles are not persisted for retry rebuilds: the
+        // row carries only the plain text, so a retried send goes out
+        // un-highlighted and un-styled (documented deviation: the text
+        // arrives unchanged).
         let params = Self::upstream_text_send_params(
             &account.signal_account,
             &text,
+            None,
             None,
             None,
             None,
@@ -6360,6 +6479,9 @@ pub struct MessagesSendTextParams {
     pub quote_message_id: Option<String>,
     pub previews: Option<Vec<SendTextPreviewParams>>,
     pub mentions: Option<Vec<SendTextMentionParams>>,
+    /// §4.62: optional outbound text-style ranges; entry shape validated by
+    /// `SendTextStyleParams` (unknown keys fail deserialization).
+    pub text_style: Option<Vec<SendTextStyleParams>>,
 }
 
 /// One outbound @mention entry (contract revision 1.34, §4.29): the shape
@@ -6372,6 +6494,22 @@ pub struct MessagesSendTextParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SendTextMentionParams {
     pub number: String,
+    pub start: u32,
+    pub length: u32,
+}
+
+/// One outbound text-style range (contract revision 1.69, §4.62): the shape
+/// mirrors the §4.20 receive projection — `style` must be one of the five
+/// protocol-renderable upstream enum values (enforced against the
+/// deserialized string in `text_styles_to_upstream`, which owns the error
+/// body), and `start`/`length` are UTF-16 code-unit offsets the upstream
+/// indexes against the caller's own body (the official BodyRange semantics —
+/// identical to the §4.29 mention offsets). A malformed entry fails params
+/// deserialization with INVALID_REQUEST before anything else runs.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendTextStyleParams {
+    pub style: String,
     pub start: u32,
     pub length: u32,
 }
@@ -6424,6 +6562,17 @@ pub struct UpstreamSendPreview {
 #[derive(Debug, Clone)]
 pub struct UpstreamSendMention {
     pub number: String,
+    pub start: u32,
+    pub length: u32,
+}
+
+/// A validated text-style range passed down to `dispatch_send` and projected
+/// 1:1 onto the upstream `textStyle` entry keys (`style`/`start`/`length`,
+/// contract revision 1.69, §4.62 — the pinned `TextStyle.java` enum names).
+/// Every entry here passed the style whitelist.
+#[derive(Debug, Clone)]
+pub struct UpstreamSendTextStyle {
+    pub style: String,
     pub start: u32,
     pub length: u32,
 }
@@ -8603,6 +8752,7 @@ mod tests {
                     },
                 ]),
                 None,
+                None,
             )
             .unwrap()
         {
@@ -8647,6 +8797,7 @@ mod tests {
                 None,
                 Some(vec![preview("https://example.com/a", "Example")]),
                 None,
+                None,
             )
             .unwrap_err();
         assert!(matches!(url_absent, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -8665,6 +8816,7 @@ mod tests {
                     image_data_uri: Some("/etc/passwd".into()),
                 }]),
                 None,
+                None,
             )
             .unwrap_err();
         assert!(matches!(path_image, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -8677,6 +8829,7 @@ mod tests {
                 "req-preview-title",
                 None,
                 Some(vec![preview("https://example.com/a", "   ")]),
+                None,
                 None,
             )
             .unwrap_err();
@@ -8710,6 +8863,7 @@ mod tests {
                 &conversation.id,
                 "to retry",
                 "retry-req-1",
+                None,
                 None,
                 None,
                 None,
@@ -8776,6 +8930,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -8821,6 +8976,148 @@ mod tests {
         assert!(matches!(cross, ServiceError::Api(ref error) if error.code == "INVALID_REQUEST"));
     }
 
+    /// Contract 1.69 outbound text styles (§4.62): more than 64 entries fail
+    /// closed INVALID_REQUEST (non-retryable, no silent truncation — a caller
+    /// bug must surface, not vanish), an unknown style vocabulary fails the
+    /// whole request, a valid list projects 1:1 onto the engine `send`
+    /// `textStyle` entry keys (style/start/length), an empty list leaves the
+    /// upstream params without a `textStyle` key at all (byte-identical
+    /// legacy wire), a styled pending row persists its ranges so the sender's
+    /// bubble keeps its formatting across restarts, and a retry rebuilds the
+    /// send without a `textStyle` key (documented deviation, §4.29 mentions
+    /// precedent — the ranges are not persisted for retry rebuilds).
+    #[test]
+    fn send_text_styles_validate_project_persist_and_retry_bare() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let style = |style: &str, start: u32, length: u32| SendTextStyleParams {
+            style: style.to_string(),
+            start,
+            length,
+        };
+        let dispatch = |prepared: PreparedSend| match prepared {
+            PreparedSend::Dispatch { params, .. } => params,
+            PreparedSend::Existing(_) => panic!("a fresh client request must dispatch"),
+        };
+
+        // Over-cap: deterministic INVALID_REQUEST, never a silent truncation.
+        let over_cap = service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "styled",
+                "req-style-cap",
+                None,
+                None,
+                None,
+                Some((0..65).map(|index| style("BOLD", index, 1)).collect()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&over_cap, ServiceError::Api(error) if error.code == "INVALID_REQUEST" && !error.retryable)
+        );
+        // A rejected style list leaves no pending row behind.
+        assert!(
+            service
+                .store_ref()
+                .message_by_client_request(&account.id, "req-style-cap")
+                .unwrap()
+                .is_none()
+        );
+
+        // Unknown style vocabulary: fail closed, no row.
+        let unknown_style = service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "styled",
+                "req-style-unknown",
+                None,
+                None,
+                None,
+                Some(vec![style("BLINK", 0, 2)]),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&unknown_style, ServiceError::Api(error) if error.code == "INVALID_REQUEST" && !error.retryable)
+        );
+        assert!(
+            service
+                .store_ref()
+                .message_by_client_request(&account.id, "req-style-unknown")
+                .unwrap()
+                .is_none()
+        );
+
+        // Valid list projects 1:1 onto the engine textStyle entry keys.
+        let projected = dispatch(
+            service
+                .prepare_send_text(
+                    &account.id,
+                    &conversation.id,
+                    "styled body",
+                    "req-style-ok",
+                    None,
+                    None,
+                    None,
+                    Some(vec![
+                        style("BOLD", 0, 6),
+                        style("SPOILER", 7, 4),
+                        style("MONOSPACE", 7, 4),
+                    ]),
+                )
+                .unwrap(),
+        );
+        let entries = projected["textStyle"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["style"], "BOLD");
+        assert_eq!(entries[0]["start"], 0);
+        assert_eq!(entries[0]["length"], 6);
+        assert_eq!(entries[1]["style"], "SPOILER");
+        assert_eq!(entries[2]["style"], "MONOSPACE");
+
+        // The styled pending row persists its ranges (sender echo across
+        // restarts), and an empty list leaves no textStyle key at all.
+        let stored = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-style-ok")
+            .unwrap()
+            .unwrap();
+        let rich = stored.rich.as_ref().expect("styled row carries rich");
+        assert_eq!(rich.text_styles.len(), 3);
+        assert_eq!(rich.text_styles[0].style, "BOLD");
+        assert!(!rich.view_once, "no view-once marker on a styled send");
+
+        let bare = dispatch(
+            service
+                .prepare_send_text(
+                    &account.id,
+                    &conversation.id,
+                    "plain body",
+                    "req-style-empty",
+                    None,
+                    None,
+                    None,
+                    Some(Vec::new()),
+                )
+                .unwrap(),
+        );
+        assert!(bare.get("textStyle").is_none());
+
+        // Retry rebuilds the send without a textStyle key (documented
+        // deviation): the failed styled row rearms and re-dispatches plain.
+        service.complete_send_failed(&stored.id).unwrap();
+        let retry_params = match service
+            .prepare_retry_text(&account.id, &conversation.id, "req-style-ok")
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            PreparedSend::Existing(_) => panic!("retry must re-dispatch the same row"),
+        };
+        assert_eq!(retry_params["message"], "styled body");
+        assert!(retry_params.get("textStyle").is_none());
+    }
+
     #[test]
     fn outgoing_sync_reconciles_by_signal_timestamp_and_client_request_id() {
         let (_temp, mut service) = service();
@@ -8838,6 +9135,7 @@ mod tests {
                 &conversation.id,
                 "same text is not identity",
                 "client-request-exact",
+                None,
                 None,
                 None,
                 None,
@@ -8932,6 +9230,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-race",
+                None,
                 None,
                 None,
                 None,
@@ -9187,6 +9486,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -9217,6 +9517,7 @@ mod tests {
                 },
                 "hello again",
                 "peer-req-2",
+                None,
                 None,
                 None,
                 None,
@@ -9252,6 +9553,7 @@ mod tests {
                     "peer-req-1",
                     None,
                     None,
+                    None,
                     None
                 )
                 .unwrap(),
@@ -9264,6 +9566,7 @@ mod tests {
                     &first,
                     "hello peer",
                     "peer-req-1",
+                    None,
                     None,
                     None,
                     None
@@ -9291,7 +9594,7 @@ mod tests {
                 },
                 "text",
                 "req-bad-kind",
-                None,
+                None, None,
              None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
@@ -9305,7 +9608,7 @@ mod tests {
                 },
                 "text",
                 "req-empty-peer",
-                None,
+                None, None,
              None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
@@ -9319,6 +9622,7 @@ mod tests {
                 },
                 "text",
                 "req-absent",
+                None,
                 None,
                 None,
                 None
@@ -9336,6 +9640,7 @@ mod tests {
                 },
                 "group hello",
                 "req-group",
+                None,
                 None,
                 None,
                 None,
@@ -9367,6 +9672,7 @@ mod tests {
                 },
                 "masked hello",
                 "req-masked",
+                None,
                 None,
                 None,
                 None,
@@ -9443,6 +9749,7 @@ mod tests {
                 Some(&quoted.id),
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -9486,6 +9793,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -9503,6 +9811,7 @@ mod tests {
                 "quote own",
                 "req-quote-own",
                 Some(&pending_id),
+                None,
                 None,
                 None,
             )
@@ -9542,6 +9851,7 @@ mod tests {
                 Some("no-such-message"),
                 None,
                 None,
+                None,
             )
             .unwrap_err()
             .into_api();
@@ -9557,6 +9867,7 @@ mod tests {
                     &conversation.id,
                     "reply",
                     "req-quote-missing",
+                    None,
                     None,
                     None,
                     None
@@ -9576,6 +9887,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -9588,7 +9900,7 @@ mod tests {
                 &conversation.id,
                 "quote pending",
                 "req-quote-pending",
-                Some(&pending_id),
+                Some(&pending_id), None,
              None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
@@ -9635,7 +9947,7 @@ mod tests {
                 &group_message.conversation_id,
                 "quote group",
                 "req-quote-group",
-                Some(&group_message.id),
+                Some(&group_message.id), None,
              None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
@@ -9648,6 +9960,7 @@ mod tests {
                 "cross quote",
                 "req-quote-cross",
                 Some(&group_message.id),
+                None,
                 None,
                 None
             ),
@@ -9679,6 +9992,7 @@ mod tests {
                 &direct.id,
                 "delete me",
                 "req-rd-1",
+                None,
                 None,
                 None,
                 None,
@@ -9716,6 +10030,7 @@ mod tests {
                 &group.id,
                 "group delete",
                 "req-rd-2",
+                None,
                 None,
                 None,
                 None,
@@ -9757,6 +10072,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-rd-p",
+                None,
                 None,
                 None,
                 None,
@@ -9875,6 +10191,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -9955,6 +10272,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -9995,6 +10313,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-sr-p",
+                None,
                 None,
                 None,
                 None,
@@ -10130,6 +10449,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -10172,6 +10492,7 @@ mod tests {
                 &conversation.id,
                 "reaction target",
                 "req-sr-complete",
+                None,
                 None,
                 None,
                 None,
@@ -10259,6 +10580,7 @@ mod tests {
                 &direct.id,
                 "pin me",
                 "req-pin-1",
+                None,
                 None,
                 None,
                 None,
@@ -10360,6 +10682,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -10406,6 +10729,7 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-pin-pending",
+                None,
                 None,
                 None,
                 None,
@@ -10509,6 +10833,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -10576,6 +10901,7 @@ mod tests {
                 &conversation.id,
                 "pin target one",
                 "req-pin-c1",
+                None,
                 None,
                 None,
                 None,
@@ -10912,6 +11238,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -10943,6 +11270,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -10962,6 +11290,7 @@ mod tests {
                 &conversation.id,
                 "will vanish",
                 "req-unknown",
+                None,
                 None,
                 None,
                 None,
@@ -14065,6 +14394,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -14241,6 +14571,7 @@ mod tests {
                 None,
                 None,
                 Some(mentions),
+                None,
             )
         };
 
@@ -15178,6 +15509,7 @@ mod tests {
                 &direct.id,
                 "has attachment",
                 request_id,
+                None,
                 None,
                 None,
                 None,

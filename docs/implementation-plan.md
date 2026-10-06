@@ -5,7 +5,30 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.67 (2026-10-06; §4.60 — the group member-label read
+- Contract revision: 1.69 (2026-10-06; §4.62 — the send-side text-formatting
+  face opens: `messages.sendText` gains an optional `textStyle:
+  [{style, start, length}]` array beside the §4.29 `mentions` face — the
+  official bodyRanges write face over the §4.20 vocabulary (BOLD / ITALIC /
+  STRIKETHROUGH / MONOSPACE / SPOILER; signal-cli `--text-style`
+  `start:length:STYLE` triples over UTF-16 code units, the JSON-RPC camelCase
+  `textStyle` key). The style vocabulary fails closed INVALID_REQUEST — the
+  sender's own ranges are caller-authored, so a hostile or buggy list is
+  rejected, not silently rewritten like the §4.20 receive cap; past 64
+  entries (the §4.20 receive cap mirrored) INVALID_REQUEST, never truncation;
+  no body-bounds gate (the official `parseTextStyles` validates none and the
+  desktop clips its own ranges — the connector neither checks nor clips).
+  A styled send persists its ranges on the pending row's rich payload (the
+  §4.36 view-once marker precedent — the sender's bubble keeps its formatting
+  across restarts); retries rebuild the send without them (the §4.29 mentions
+  deviation). Same-capability in-place evolution, no new capability tag.
+  Engine modes: stock signal-cli carries `textStyle` natively; the kt-engine
+  send face does not parse it yet, so an engine-mode styled send delivers
+  unstyled to the peer while the sender row keeps its persisted formatting
+  (recorded engine-batch debt family; the §4.20 receive face is unaffected
+  since 1.25). 1.67 and 1.68 have since landed (the member-label read face,
+  the §4.60 entry, and the safety-number faces, the §4.61 entry — both in
+  the chain below), so this batch takes the next chain entry) —
+  previously 1.67 (2026-10-06; §4.60 — the group member-label read
   face: `groups.get` roster entries now carry the upstream member's own
   `labelEmoji` / `label` pair, the pinned `listGroups` `JsonGroupMember`
   `@JsonInclude(NON_NULL)` fields captured verbatim at sync under the pinned
@@ -31,8 +54,9 @@
   (the §4.57 entry, in the chain below) and 1.66 is the landed multi-attachment send face
   (the §4.59 entry, in the chain below) — both landed first and their entries therefore sit
   in the chain, newest wins; 1.65 has since landed (the message-request receive projection,
-  the §4.58 entry in the chain below) and 1.67 lands in this same stack (the member-label
-  read face, the §4.60 entry in the chain), so this batch takes §4.61 directly) —
+  the §4.58 entry in the chain below) and 1.67 has since landed in this same stack (the
+  member-label read face, the §4.60 entry in the chain below), so this batch takes §4.61
+  directly; 1.69 tops the stack (the text-formatting send face, the §4.62 entry)) —
   previously 1.66 (2026-10-06; §4.59 — the multi-attachment send face opens: `messages.attachments.send` gains
   an optional plural
   `attachments: [{dataBase64, sizeBytes, filename?, contentType?}]` form
@@ -3693,6 +3717,74 @@ the read side is this batch: `listGroups` member entries carry `labelEmoji` / `l
 - Schema: `groupsGetParams` description extended; no new method, error code, event, or
   store column (the pair rides the existing §4.39 `group_extra_json` roster). Metrics
   classify as contacts like the rest of `groups.get`.
+
+### 4.62 Send-side text formatting: messages.sendText `textStyle` ranges (contract revision 1.69, 2026-10-06)
+
+The outbound half of the §4.20 rich-body receive face: the caller can style
+its own outgoing text. `messages.sendText` gains an optional `textStyle:
+[{style, start, length}]` array beside the §4.29 `mentions` face — the
+official bodyRanges write face. Upstream anchors, verified against the
+pinned distribution: Signal-Android's `TextStyle` vocabulary — BOLD / ITALIC
+/ STRIKETHROUGH / MONOSPACE / SPOILER (`NONE` is the internal unstyled
+marker, never a valid range value); signal-cli's `SendCommand --text-style`
+accepts `start:length:STYLE` triples over UTF-16 code units (the BodyRange
+semantics the §4.29 mentions face already rides — the caller indexes its own
+body), and the JSON-RPC face carries the camelCase `textStyle` array. The
+official desktop composer (format menu + keyboard shortcuts, i18n keys
+`FormatMenu--guide--*` / `Keyboard--composer--*`) is the reference producer,
+and the §4.20 receive projection already renders every one of these styles —
+this revision changes only the send lane.
+
+Validation, all deterministic INVALID_REQUEST before the pending row exists:
+
+- The style vocabulary fails closed: an unknown or `NONE` style rejects the
+  whole request. This is deliberately stricter than the §4.20 receive cap
+  (drop the entry, keep the message — a hostile payload must not fail a
+  peer's message): the sender's own ranges are caller-authored, so a buggy
+  or hostile list surfaces at the caller instead of silently rewriting what
+  the caller asked to send.
+- At most 64 entries (`MAX_SEND_TEXT_STYLES`, the §4.20 receive cap
+  mirrored) — past it INVALID_REQUEST, never silent truncation.
+- No body-bounds gate: the official `parseTextStyles` validates no range
+  against the body and the official desktop clips its own ranges before
+  send; the connector neither checks nor clips and passes the offsets
+  through verbatim.
+
+Projection and persistence:
+
+- `upstream_text_send_params` (the §4.26 send/retry shared param owner)
+  projects each entry verbatim as `{style, start, length}` under the
+  upstream `textStyle` key. An absent or empty list leaves the key absent —
+  every existing wire shape stays byte-identical (the §4.36 `viewOnce` key
+  discipline).
+- A styled send persists its ranges on the pending row's rich payload (the
+  §4.36 view-once marker precedent): the sender's bubble keeps its own
+  formatting across restarts, mirroring the official sender echo. Mentions
+  stay unpersisted (the 1.34 shape unchanged).
+- Retry (§4.26) rebuilds the send without the ranges (documented deviation,
+  the §4.29 mentions precedent): the retried text arrives unstyled upstream,
+  and the row's persisted echo remains the sender's record of the original
+  attempt.
+
+Engine modes: stock signal-cli carries the `textStyle` param natively. The
+kt-engine send face does not parse it yet (engine `methods.rs` send audit:
+quote/preview/attachments/mentions/sticker only), so in kt-engine mode a
+styled send rides upstream without the ranges — the peer receives the body
+unstyled while the sender row keeps its persisted formatting (the recorded
+engine-batch debt family of `groups.quit`/`groups.terminate`; the §4.20
+receive face is unaffected since 1.25). The connector does not gate or
+reject on engine mode: the param is part of the contract face and the debt
+is the engine's to retire.
+
+Caller migration (the desktop consume batch): the composer writes
+`{style, start, length}` ranges over the draft body and the send carries
+them only while the text leaves unchanged — a translation rewrite drops the
+ranges (the offsets would not survive a body change), retries ride the bare
+deviation above, and the optimistic row merge re-reads the persisted rich
+payload so the sender's own bubble echoes the styles with no extra wire.
+The composer has no inline rich preview (a plain textarea renders no
+ranges); the official inline preview is a documented projection difference.
+A pre-1.69 caller sends no new key and reads the old shapes unchanged.
 
 ## 5. signal-cli Boundary
 

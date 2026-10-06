@@ -34,13 +34,14 @@ use crate::service::{
     MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
     MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
     PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
-    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
-    StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_limit_error, blocked_conversations_result, identity_from_engine,
-    pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
+    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
+    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
+    identity_from_engine, pinned_conversations_result, sticker_pack_syncs_result,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -1897,6 +1898,7 @@ impl RuntimeSupervisor {
         quote_message_id: Option<String>,
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
+        text_styles: Option<Vec<SendTextStyleParams>>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -1910,6 +1912,7 @@ impl RuntimeSupervisor {
                     quote_message_id.as_deref(),
                     previews,
                     mentions,
+                    text_styles,
                 )?,
                 SendTarget::Peer {
                     kind,
@@ -1927,6 +1930,7 @@ impl RuntimeSupervisor {
                     quote_message_id.as_deref(),
                     previews,
                     mentions,
+                    text_styles,
                 )?,
             }
         };
@@ -6100,6 +6104,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -6191,6 +6196,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -6279,6 +6285,7 @@ mod tests {
                 &conversation.id,
                 "react confirmed",
                 "req-sr-ok",
+                None,
                 None,
                 None,
                 None,
@@ -6379,6 +6386,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap()
         {
@@ -6467,6 +6475,7 @@ mod tests {
                 &conversation.id,
                 "pin confirmed",
                 "req-pin-ok",
+                None,
                 None,
                 None,
                 None,

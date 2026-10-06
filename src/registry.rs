@@ -41,7 +41,7 @@ use crate::groups::{MAX_PROXY_GROUPS, ProxyGroupPlan};
 use crate::protocol::ApiError;
 use crate::service::{
     ContactsSyncOutcome, HostSideEvent, MessageText, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, ServiceError,
+    SendTextPreviewParams, SendTextStyleParams, ServiceError,
 };
 use crate::store::{
     AccountSummary, ContactSummary, ConversationSummary, MessageRecord, Page, Store, StoreError,
@@ -656,6 +656,7 @@ impl ProxyGroupRuntime {
         quote_message_id: Option<String>,
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
+        text_styles: Option<Vec<SendTextStyleParams>>,
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
@@ -667,6 +668,7 @@ impl ProxyGroupRuntime {
                 quote_message_id,
                 previews,
                 mentions,
+                text_styles,
             )
             .await
     }
