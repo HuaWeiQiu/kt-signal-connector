@@ -1821,6 +1821,16 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "BACKUP_ARTIFACT_INVALID",
     "BACKUP_SNAPSHOT_EXISTS",
     "BACKUP_IO_FAILED",
+    // §4.68 official-desktop snapshot import (engine backup contract): the
+    // import-task faces. MISSING/METADATA_INVALID/KEY_MISMATCH and
+    // ALREADY_RUNNING are deterministic answers (fix the path, check the
+    // account, poll the status face); IO_FAILED is a transient disk
+    // condition the caller may retry after the filesystem recovers.
+    "BACKUP_IMPORT_ALREADY_RUNNING",
+    "BACKUP_SNAPSHOT_MISSING",
+    "BACKUP_SNAPSHOT_METADATA_INVALID",
+    "BACKUP_SNAPSHOT_KEY_MISMATCH",
+    "BACKUP_SNAPSHOT_IO_FAILED",
     // §4.66 username write face (contract 1.75, engine username write-face
     // batch): the reserve/confirm/delete server-state ladder. TAKEN and
     // RESERVATION_GONE are deterministic refusals (a new name / a fresh
