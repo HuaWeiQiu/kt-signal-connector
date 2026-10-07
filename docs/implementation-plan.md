@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.78 (2026-10-08; the history-import contact card
+- Contract revision: 1.79 (2026-10-08; the history-import group-update
+  notice opening (§4.38): the engine NDJSON archive's per-message
+  `groupUpdate` face now lands as the same system row a live group
+  update does — 「群聊信息已更新」 with the `is_group_update` rich flag
+  and the first `title` detail's new title mirrored into `group_name`
+  under the live bound, through the existing rich channel (no schema,
+  capability, or store-version change). The row identity is the live
+  receive form over the updater: outgoing = the account, anything else
+  resolves the archive author as an incoming author resolves
+  (unresolvable = skip-counted, never invented); the conversation
+  title is deliberately not mirrored from the notice (the chat frame
+  owns the current title). Whatever the archive direction says, the
+  face lands as a system row; a row that also carries the timer face
+  splits into the §4.41 timer row and the group row — official
+  `additionalMessages` semantics. `details` missing/empty is no face:
+  plain skip routing behind it. Re-runs converge through the identity
+  discipline) — previously 1.78 (2026-10-08; the history-import contact card
   opening (§4.38): the engine NDJSON archive's per-message `contact`
   face now lands — the card parses into a bounded
   `NormalizedContact` (name parts with empty-stays-absent semantics,
@@ -2135,6 +2151,24 @@ documented data-directory artifact instead of an RPC surface.
   answers no card and the bodyless row behind it keeps plain skip routing — never a
   placeholder contact row; entry-level malformation (an empty value) drops the entry, never
   the row. Additive: pre-1.78 rows deserialize without the key and stay byte-identical.
+- Group updates land as the live system notice (contract 1.79, 2026-10-08; engine counterpart
+  recorded in kt-signal-engine `docs/jsonrpc-compat.md` §5): the archive's per-message
+  `groupUpdate` face — the engine's full official `#fromGroupUpdateMessage` detail vocabulary —
+  now lands as the same system row a live group update does: 「群聊信息已更新」 with the
+  `is_group_update` rich flag and the first `title` detail's new title mirrored into
+  `group_name` under the live `GROUP_NAME_MAX_BYTES` bound, persisted through the existing
+  rich channel with no schema, capability, or store-version change. The row identity is the
+  live receive form over the updater: an outgoing update is the account, anything else
+  resolves the archive author exactly as an incoming author does (an unresolvable updater is
+  skip-counted, never invented); the conversation title is deliberately not mirrored from the
+  update row — the archive's chat frame carries the current title, and a historical notice
+  must not regress it mid-import. Whatever the archive row's direction says, the face lands
+  as a system row; when the same archive row also carries the timer face (a batched group
+  change that moved the timer — the shape §4.41's direction-less export never covered for
+  group chats), it splits into the §4.41 timer row and the group row, the official
+  `additionalMessages` semantics. Presence without material (`details` missing or empty)
+  is no face: the row behind it keeps plain skip routing. A re-run converges through the
+  identity discipline, as every import row does.
 
 ### 4.39 Group member roster: groups.get `members` (contract revision 1.40, 2026-10-05)
 

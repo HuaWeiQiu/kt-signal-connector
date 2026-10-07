@@ -40,7 +40,7 @@ use thiserror::Error;
 
 use crate::engine::{NormalizedAttachment, NormalizedQuote, truncate_utf8_bytes};
 use crate::ids::{mask_address, stable_hash_id};
-use crate::service::{MAX_HOST_TEXT_PREVIEW_BYTES, MAX_INBOUND_TEXT_BYTES};
+use crate::service::{GROUP_NAME_MAX_BYTES, MAX_HOST_TEXT_PREVIEW_BYTES, MAX_INBOUND_TEXT_BYTES};
 use crate::store::{
     HistoryAttachmentLocator, HistoryImportInsert, HistoryStageChat, HistoryStageRecipient,
     ImportCounters, MessageRecord, Store,
@@ -421,16 +421,18 @@ impl<'a> Importer<'a> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         // Direction-less backup items have no place in the two-sided model —
-        // except the timer-change notice (contract 1.42, §4.41): a
-        // conversation-scoped state update the engine exports exactly so the
-        // connector can mirror the timer state.
+        // except the timer-change notice (contract 1.42, §4.41) and the
+        // group-update notice (contract 1.79, §4.38): conversation-scoped
+        // state updates the engine exports exactly so the connector can land
+        // the same system rows live traffic lands.
         let timer_change = value
             .get("expirationTimerChange")
             .and_then(Value::as_object);
+        let group_update = import_group_update(value.get("groupUpdate"));
         let direction = match value.get("direction").and_then(Value::as_str) {
             Some("incoming") => "incoming",
             Some("outgoing") => "outgoing",
-            _ if timer_change.is_some() => "system",
+            _ if timer_change.is_some() || group_update.is_some() => "system",
             _ => {
                 self.counters.skipped_messages += 1;
                 return Ok(());
@@ -440,8 +442,20 @@ impl<'a> Importer<'a> {
             // The unresolvable chat was skip-counted once at resolution time.
             return Ok(());
         };
-        if direction == "system" {
-            return self.handle_timer_change(timer_change.expect("checked above"), &chat, sent_at);
+        // The notice faces land as system rows whatever the archive row's
+        // direction says (contract 1.79, §4.38): the timer face keeps its
+        // §4.41 row identity; the group face lands the live group-update
+        // notice row. Both riding one archive row (a batched group change
+        // that also moved the timer) is the official
+        // `additionalMessages` shape — two system rows.
+        if direction == "system" || group_update.is_some() {
+            if let Some(change) = timer_change {
+                self.handle_timer_change(change, &chat, sent_at)?;
+            }
+            if let Some(group) = group_update {
+                self.handle_group_update(group, value, &chat, sent_at, direction)?;
+            }
+            return Ok(());
         }
         let (sender_id, alt_sender_id, sender_name, author_source) = if direction == "outgoing" {
             (self.account_id.to_string(), None, None, None)
@@ -720,6 +734,107 @@ impl<'a> Importer<'a> {
             record,
             preview,
             alt_sender_id: None,
+            locators: Vec::new(),
+        });
+        if self.batch.len() >= BATCH_MESSAGES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// One group-update archive face (contract 1.79, §4.38): the engine's
+    /// export of a group change — the detail vocabulary rides the row's rich
+    /// JSON for the desktop renderer; the row itself is the same
+    /// live-receive system notice a group update lands as (「群聊信息已更新」，
+    /// `is_group_update` rich, the first `title` detail's new title mirrored
+    /// under the live `GROUP_NAME_MAX_BYTES` bound). The identity is the live
+    /// receive form over the updater: an outgoing update is the account,
+    /// anything else resolves the archive author exactly as an incoming
+    /// author resolves — an unresolvable updater has no live-shaped identity,
+    /// so the row is skip-counted rather than invented (never a placeholder).
+    /// The updater identity rides the row like live traffic does; the
+    /// conversation title is deliberately not mirrored here — the archive's
+    /// chat frame carries the current title, and a historical update row must
+    /// not regress it mid-import.
+    fn handle_group_update(
+        &mut self,
+        group: ImportedGroupUpdate,
+        value: &Value,
+        chat: &ResolvedChat,
+        sent_at: u64,
+        archive_direction: &str,
+    ) -> Result<(), ImportFailure> {
+        let (sender_id, alt_sender_id) = if archive_direction == "outgoing" {
+            (self.account_id.to_string(), None)
+        } else {
+            let author_id = value.get("authorId").and_then(Value::as_u64);
+            let Some(author_id) = author_id else {
+                self.counters.skipped_messages += 1;
+                return Ok(());
+            };
+            let Some(author) = self.store.history_recipient(self.account_id, author_id)? else {
+                self.counters.skipped_messages += 1;
+                return Ok(());
+            };
+            let Some(source) = recipient_source(&author, self.signal_account) else {
+                self.counters.skipped_messages += 1;
+                return Ok(());
+            };
+            let alt = recipient_alt_source(&author)
+                .map(|alt| stable_hash_id(&[self.account_id, chat.kind, &alt]));
+            (stable_hash_id(&[self.account_id, chat.kind, &source]), alt)
+        };
+        let message_id = stable_hash_id(&[
+            "signal-message-v2",
+            self.account_id,
+            &chat.conversation_id,
+            "system",
+            &sent_at.to_string(),
+            &sender_id,
+        ]);
+        let text = "群聊信息已更新".to_string();
+        let record = MessageRecord {
+            id: message_id,
+            account_id: self.account_id.to_string(),
+            conversation_id: chat.conversation_id.clone(),
+            direction: "system",
+            sender_id,
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: Some(crate::link::now_ms()),
+            text: Some(text.clone()),
+            text_bytes: Some(text.len().min(u32::MAX as usize) as u32),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "system",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                is_group_update: true,
+                group_name: group.group_name,
+                ..Default::default()
+            }),
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+            sticker: None,
+            // The notice row never sweeps (§4.41 parity): the columns stay
+            // NULL — a group notice carries no deadline of its own.
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+        };
+        let preview = Some(text.chars().take(120).collect::<String>());
+        self.batch.push(HistoryImportInsert {
+            record,
+            preview,
+            alt_sender_id,
             locators: Vec::new(),
         });
         if self.batch.len() >= BATCH_MESSAGES {
@@ -1336,6 +1451,40 @@ fn import_contact(
         },
         avatar.cloned(),
     ))
+}
+
+/// The archive's groupUpdate face (contract 1.79, §4.38): the official
+/// `#fromGroupUpdateMessage` detail vocabulary the engine projected — the
+/// connector consumes presence (the notice identity) and mirrors the first
+/// `title` detail's new title under the live `GROUP_NAME_MAX_BYTES` bound,
+/// exactly what a live group-update envelope carries in its rich payload.
+/// Presence without material (`details` missing/empty — the engine skips
+/// such items upstream) answers no face: the row behind it keeps its plain
+/// routing. The detail entries themselves are never re-validated here — the
+/// engine owns the vocabulary — and ride verbatim in the persisted rich JSON.
+struct ImportedGroupUpdate {
+    group_name: Option<String>,
+}
+
+fn import_group_update(raw: Option<&Value>) -> Option<ImportedGroupUpdate> {
+    let details = raw?.as_object()?.get("details")?.as_array()?;
+    if details.is_empty() {
+        return None;
+    }
+    let group_name = details
+        .iter()
+        .find_map(|detail| {
+            if detail.get("type").and_then(Value::as_str) != Some("title") {
+                return None;
+            }
+            detail
+                .get("newTitle")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+        })
+        .map(|title| truncate_utf8_bytes(title, GROUP_NAME_MAX_BYTES));
+    Some(ImportedGroupUpdate { group_name })
 }
 
 #[cfg(test)]
@@ -2727,5 +2876,148 @@ mod tests {
         let row = store.history_import_row(&account.id).unwrap().unwrap();
         assert_eq!(row.state, "completed");
         assert_eq!(row.imported_messages, 0);
+    }
+
+    /// Contract 1.79 (§4.38): a groupUpdate face lands the live group-update
+    /// system notice row — 「群聊信息已更新」 with `is_group_update` rich and
+    /// the first `title` detail mirrored into `group_name` — under the live
+    /// updater identity (outgoing = the account, otherwise the archive author
+    /// resolved exactly as an incoming author). A batched change that also
+    /// moved the timer splits into the §4.41 timer row and the group row
+    /// (official `additionalMessages` semantics); an empty `details` face is
+    /// no face at all; a re-run converges.
+    #[test]
+    fn imported_group_update_rows_land_as_the_live_system_notice() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                group().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({"type": "chat", "id": 11, "recipientId": 2}).to_string(),
+                // A title change: the notice row carries the mirrored name.
+                serde_json::json!({
+                    "type": "message", "chatId": 11, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "groupUpdate": {"details": [
+                        {"type": "title", "newTitle": "New Name"},
+                        {"type": "avatar", "removed": false}
+                    ]}
+                })
+                .to_string(),
+                // A batched change that also moved the timer: two system rows
+                // from one archive row.
+                serde_json::json!({
+                    "type": "message", "chatId": 11, "authorId": 1, "dateSent": 1100,
+                    "direction": "incoming",
+                    "expirationTimerChange": {"expiresInMs": 60_000},
+                    "groupUpdate": {"details": [{"type": "title", "newTitle": "Second Name"}]}
+                })
+                .to_string(),
+                // The account itself renamed the group: the live outgoing form.
+                serde_json::json!({
+                    "type": "message", "chatId": 11, "authorId": 1, "dateSent": 1200,
+                    "direction": "outgoing",
+                    "groupUpdate": {"details": [{"type": "summary"}]}
+                })
+                .to_string(),
+                // Presence without material: plain skip routing.
+                serde_json::json!({
+                    "type": "message", "chatId": 11, "authorId": 1, "dateSent": 1300,
+                    "groupUpdate": {"details": []}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(
+            counters.imported, 4,
+            "three group rows and the split timer row"
+        );
+        assert_eq!(counters.skipped_messages, 1, "empty details are no face");
+
+        let conversation = group_conversation_id(&account.id);
+        let group_row = |sent_at: u64| {
+            store
+                .message_by_signal_identity(
+                    &account.id,
+                    &conversation,
+                    "system",
+                    sent_at,
+                    &stable_hash_id(&[&account.id, "group", ALICE_E164]),
+                    &stable_hash_id(&[&account.id, "group", ALICE_ACI]),
+                )
+                .unwrap()
+                .expect("group notice row")
+        };
+
+        let renamed = group_row(1000);
+        assert_eq!(renamed.text.as_deref(), Some("群聊信息已更新"));
+        assert_eq!(renamed.status, "system");
+        let rich = renamed.rich.as_ref().expect("rich");
+        assert!(rich.is_group_update);
+        assert_eq!(rich.group_name.as_deref(), Some("New Name"));
+        let wire = serde_json::to_value(&renamed).expect("wire row");
+        assert_eq!(wire["isGroupUpdate"], true);
+        assert_eq!(wire["groupName"], "New Name");
+        assert_eq!(renamed.expire_seconds, None, "notice rows never sweep");
+
+        // The batched row split: the timer face keeps its §4.41 identity, the
+        // group face its live updater identity — two rows, one archive line.
+        let timer_sender = stable_hash_id(&[&account.id, "group", GROUP_MASTER_KEY]);
+        let timer = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "system",
+                1100,
+                &timer_sender,
+                &timer_sender,
+            )
+            .unwrap()
+            .expect("timer row of the split");
+        assert_eq!(timer.text.as_deref(), Some("已更新消息定时消失：60 秒"));
+        assert!(
+            timer
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.is_expiration_update)
+        );
+        let split_group = group_row(1100);
+        assert_eq!(split_group.text.as_deref(), Some("群聊信息已更新"));
+        assert_ne!(
+            split_group.id, timer.id,
+            "distinct senders give the two faces distinct rows"
+        );
+
+        // Outgoing: the account itself is the sender, no name material in a
+        // summary-only update.
+        let own = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "system",
+                1200,
+                &account.id,
+                &account.id,
+            )
+            .unwrap()
+            .expect("outgoing group notice row");
+        assert_eq!(own.sender_id, account.id);
+        assert_eq!(
+            own.rich.as_ref().and_then(|rich| rich.group_name.clone()),
+            None
+        );
+
+        // A re-run converges (identity discipline covers group rows too).
+        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(second.imported, 0);
     }
 }
