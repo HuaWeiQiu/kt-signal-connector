@@ -593,6 +593,11 @@ pub struct NormalizedRich {
     /// missing timestamp) drops the key, never the row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub story_reply: Option<NormalizedStoryReply>,
+    /// Backfill contact card (contract 1.78, §4.38): the archive's
+    /// per-message `contact` face, bounded. The avatar byte pointer rides the
+    /// descriptor list, never this shape. Absent on plain and pre-1.78 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<NormalizedContact>,
 }
 
 /// One story-reply context (contract 1.76, §4.67): the addressed story's
@@ -618,6 +623,7 @@ impl NormalizedRich {
             && !self.is_group_update
             && self.group_name.is_none()
             && self.story_reply.is_none()
+            && self.contact.is_none()
     }
 }
 
@@ -639,6 +645,60 @@ pub struct NormalizedSticker {
     pub sticker_id: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emoji: Option<String>,
+}
+
+/// Backfill contact card (contract revision 1.78, §4.38): the bounded summary
+/// of the engine archive's per-message `contact` face — the name parts, phone
+/// numbers, emails and organization the official import maps onto its
+/// ContactForm shape (`import.preload.ts:2620-2705`). The avatar byte pointer
+/// is not part of this shape: it rides the row's metadata-only descriptor
+/// list exactly like a sticker's `data`, so fetches go through the existing
+/// media channel. Rides [`NormalizedRich`] (the §4.37/§4.40 additive
+/// channel), so no store schema bump; absent on plain and pre-1.78 rows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedContact {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<NormalizedContactName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub number: Vec<NormalizedContactField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub email: Vec<NormalizedContactField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+}
+
+/// One contact card's name parts (contract 1.78, §4.38): only the parts the
+/// archive actually states ride the wire — an absent part stays absent (the
+/// official `name.given || undefined` semantics).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedContactName {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub given_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub middle_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+}
+
+/// One phone/email entry of a contact card (contract 1.78, §4.38): the value
+/// plus the official ContactFormType vocabulary (HOME/MOBILE/WORK/CUSTOM —
+/// unknown/absent coerce to HOME, the official `phoneToContactFormType`
+/// parse face) and the optional free-form label.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct NormalizedContactField {
+    pub value: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Delivery tier of an inbound receipt (`envelope.receiptMessage`). Order is
@@ -800,6 +860,16 @@ const MAX_MENTION_NAME_BYTES: usize = 128;
 pub(crate) const MAX_STICKER_PACK_ID_CHARS: usize = 64;
 pub(crate) const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
 pub(crate) const MAX_STICKER_EMOJI_CHARS: usize = 32;
+/// Backfill contact card bounds (contract 1.78, §4.38): every string field is
+/// char-truncated at parse and the number/email lists are capped — a hostile
+/// line can never fail the import (the §4.13 discipline). The engine's export
+/// face projects the official item shape verbatim, so these bounds only bind
+/// hostile-line territory.
+pub(crate) const MAX_CONTACT_NAME_CHARS: usize = 128;
+pub(crate) const MAX_CONTACT_VALUE_CHARS: usize = 256;
+pub(crate) const MAX_CONTACT_LABEL_CHARS: usize = 64;
+pub(crate) const MAX_CONTACT_ORGANIZATION_CHARS: usize = 128;
+pub(crate) const MAX_CONTACT_ENTRIES: usize = 8;
 /// Group-update title mirror cap (contract 1.45, §4.44): the update's
 /// resulting `groupName` truncates to the same 64-char budget the envelope's
 /// `sourceName` peer-name material uses before it rides the rich payload.

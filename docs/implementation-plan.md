@@ -5,7 +5,27 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.77 (2026-10-08; the history-import sticker row
+- Contract revision: 1.78 (2026-10-08; the history-import contact card
+  opening (§4.38): the engine NDJSON archive's per-message `contact`
+  face now lands — the card parses into a bounded
+  `NormalizedContact` (name parts with empty-stays-absent semantics,
+  ≤8 phone/email entries each with a value ≤256 chars, the official
+  HOME/MOBILE/WORK/CUSTOM type vocabulary with unknown/absent
+  coercing to HOME per the official parse face, an optional label
+  and organization), rides the row's `contact` wire field through the
+  rich channel (the §4.37/§4.40 additive route — persisted in
+  `rich_json`, no store schema bump), and the avatar byte pointer
+  joins the descriptor list exactly as a live attachment does —
+  metadata-only, its locator face lands in the internal
+  `attachment_locators` column, nothing downloads. The card rides
+  only whole: a non-object face, or one with no usable field (no
+  name part, no entries, no organization, no avatar), answers no
+  card and the bodyless row behind it keeps plain skip routing —
+  never a placeholder contact row; entry-level malformation (an
+  empty value) drops the entry, never the row. No host wire shape
+  change beyond the additive `contact` row field; no capability
+  change, no schema change, no schema store version change) —
+  previously 1.77 (2026-10-08; the history-import sticker row
   opening (§4.38): the engine NDJSON archive's per-message `sticker`
   face now lands — the 1.35 pack identity parses with the live-receive
   bounds as one source of truth (`MAX_STICKER_*`: packId ≤64 chars,
@@ -2099,6 +2119,22 @@ documented data-directory artifact instead of an RPC surface.
   Host wire unchanged: the `sticker` field has ridden the message wire face since 1.35, so
   this batch is wire-shape-zero — no schema JSON change, no capability change, no schema
   store version change.
+- Contact cards land whole (contract 1.78, 2026-10-08; engine counterpart recorded in
+  kt-signal-engine `docs/jsonrpc-compat.md` §5): the archive's per-message `contact` face —
+  unprojected since 1.39's tolerant frame list — now parses into a bounded `NormalizedContact`
+  card (name parts with the official empty-stays-absent semantics, ≤8 phone/email entries
+  each with a value ≤256 chars and the official HOME/MOBILE/WORK/CUSTOM type vocabulary —
+  unknown/absent coercing to HOME, the official `phoneToContactFormType` parse face — plus
+  an optional label ≤64 chars and organization ≤128 chars; the archive's `address` face is
+  not consumed, a recorded v1 gap). The card rides the row's `contact` wire field through
+  the rich channel (the §4.37/§4.40 additive route: `NormalizedRich.contact`, persisted in
+  `rich_json`, no store schema bump) and the avatar byte pointer joins the descriptor list
+  exactly as a live attachment does — metadata-only, its locator face lands in the internal
+  `attachment_locators` column, nothing downloads. The card rides only whole: a non-object
+  face, or one with no usable field (no name part, no entries, no organization, no avatar),
+  answers no card and the bodyless row behind it keeps plain skip routing — never a
+  placeholder contact row; entry-level malformation (an empty value) drops the entry, never
+  the row. Additive: pre-1.78 rows deserialize without the key and stay byte-identical.
 
 ### 4.39 Group member roster: groups.get `members` (contract revision 1.40, 2026-10-05)
 

@@ -470,9 +470,9 @@ impl<'a> Importer<'a> {
             )
         };
         // Body presence: a tombstone carries none by definition; anything else
-        // without text, a long-text pointer, an attachment, or a sticker face
-        // stores nothing (contract 1.76 §4.38: the sticker identity is the
-        // body of a sticker row).
+        // without text, a long-text pointer, an attachment, a sticker face, or
+        // a contact card stores nothing (contract 1.78 §4.38: the contact
+        // identity is the body of a contact row).
         let text = value
             .get("text")
             .and_then(Value::as_str)
@@ -485,11 +485,16 @@ impl<'a> Importer<'a> {
         // with the live-receive bounds; the data pointer rides the descriptor
         // list below, exactly as a live envelope's sticker image does.
         let sticker = import_sticker(value.get("sticker"));
+        // The contact card (contract 1.78, §4.38) parses with char bounds;
+        // the avatar pointer rides the descriptor list below, live-receive
+        // attachment parity.
+        let contact = import_contact(value.get("contact"));
         if !remote_deleted
             && text.is_none()
             && !has_long_text
             && raw_attachments.is_none_or(Vec::is_empty)
             && sticker.is_none()
+            && contact.is_none()
         {
             self.counters.skipped_messages += 1;
             return Ok(());
@@ -530,6 +535,12 @@ impl<'a> Importer<'a> {
         let mut attachment_raws: Vec<Value> = raw_attachments.cloned().unwrap_or_default();
         if let Some((_, data)) = &sticker {
             attachment_raws.push(data.clone());
+        }
+        // The contact card's avatar byte pointer joins the descriptor list
+        // (contract 1.78, §4.38) — metadata-only, exactly like a sticker's
+        // `data`; the card itself never carries bytes.
+        if let Some((_, Some(avatar))) = &contact {
+            attachment_raws.push(Value::Object(avatar.clone()));
         }
         let (attachments, locators) = self.import_attachments(&attachment_raws, &message_id);
         // The archive's disappearing-message metadata (contract 1.42,
@@ -577,7 +588,15 @@ impl<'a> Importer<'a> {
             quote_message_id,
             quote_snapshot: quote,
             attachments,
-            rich: None,
+            // The contact card rides the rich channel (contract 1.78, §4.38):
+            // the additive §4.37/§4.40 route — persisted in `rich_json`
+            // without a store schema bump.
+            rich: contact
+                .as_ref()
+                .map(|(card, _)| crate::engine::NormalizedRich {
+                    contact: Some(card.clone()),
+                    ..Default::default()
+                }),
             edited_at: None,
             reactions: Vec::new(),
             edits: Vec::new(),
@@ -1188,6 +1207,134 @@ fn import_sticker(raw: Option<&Value>) -> Option<(crate::engine::NormalizedStick
             emoji,
         },
         Value::Object(data.clone()),
+    ))
+}
+
+/// Parse one engine NDJSON message's `contact` object into the bounded card
+/// face (contract 1.78, §4.38): name parts, phone/email entries and the
+/// organization, with the avatar byte pointer returned beside the card for
+/// the caller's descriptor list — the same split a live attachment face
+/// makes. Every string is char-truncated and the lists are capped
+/// (`MAX_CONTACT_*`), the type vocabulary coerces unknown/absent to HOME (the
+/// official `phoneToContactFormType` parse face), and a card with no usable
+/// content answers None so the row keeps plain routing instead of storing a
+/// placeholder card (never a half/empty contact — the sticker whole-face
+/// discipline). A malformed entry drops individually; the avatar pointer must
+/// be an object to ride.
+fn import_contact(
+    raw: Option<&Value>,
+) -> Option<(
+    crate::engine::NormalizedContact,
+    Option<serde_json::Map<String, Value>>,
+)> {
+    let object = raw?.as_object()?;
+    let name = object.get("name").and_then(Value::as_object).map(|name| {
+        let part = |key: &str| {
+            name.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.chars()
+                        .take(crate::engine::MAX_CONTACT_NAME_CHARS)
+                        .collect::<String>()
+                })
+        };
+        crate::engine::NormalizedContactName {
+            given_name: part("givenName"),
+            family_name: part("familyName"),
+            prefix: part("prefix"),
+            suffix: part("suffix"),
+            middle_name: part("middleName"),
+            nickname: part("nickname"),
+        }
+    });
+    let entry_value = |object: &serde_json::Map<String, Value>| {
+        object
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.chars()
+                    .take(crate::engine::MAX_CONTACT_VALUE_CHARS)
+                    .collect::<String>()
+            })
+    };
+    let entry_label = |object: &serde_json::Map<String, Value>| {
+        object
+            .get("label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.chars()
+                    .take(crate::engine::MAX_CONTACT_LABEL_CHARS)
+                    .collect::<String>()
+            })
+    };
+    let entry_kind = |object: &serde_json::Map<String, Value>| {
+        object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_uppercase)
+            .filter(|s| matches!(s.as_str(), "HOME" | "MOBILE" | "WORK" | "CUSTOM"))
+            .unwrap_or_else(|| "HOME".to_string())
+    };
+    let field_entries = |raw: Option<&Value>| -> Vec<crate::engine::NormalizedContactField> {
+        raw.and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .filter_map(|entry| {
+                Some(crate::engine::NormalizedContactField {
+                    value: entry_value(entry)?,
+                    kind: entry_kind(entry),
+                    label: entry_label(entry),
+                })
+            })
+            .take(crate::engine::MAX_CONTACT_ENTRIES)
+            .collect()
+    };
+    let organization = object
+        .get("organization")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(crate::engine::MAX_CONTACT_ORGANIZATION_CHARS)
+                .collect::<String>()
+        });
+    let avatar = object.get("avatar").and_then(Value::as_object);
+    let name = name.filter(|name| {
+        name.given_name.is_some()
+            || name.family_name.is_some()
+            || name.prefix.is_some()
+            || name.suffix.is_some()
+            || name.middle_name.is_some()
+            || name.nickname.is_some()
+    });
+    let number = field_entries(object.get("number"));
+    let email = field_entries(object.get("email"));
+    let empty = name.is_none()
+        && number.is_empty()
+        && email.is_empty()
+        && organization.is_none()
+        && avatar.is_none();
+    if empty {
+        return None;
+    }
+    Some((
+        crate::engine::NormalizedContact {
+            name,
+            number,
+            email,
+            organization,
+        },
+        avatar.cloned(),
     ))
 }
 
@@ -2380,5 +2527,205 @@ mod tests {
         let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
         assert_eq!(counters.imported, 0);
         assert_eq!(counters.skipped_messages, 3);
+    }
+
+    /// Contract 1.78 (§4.38): the archive's contact rows land whole — the
+    /// bounded card rides the row's `contact` wire field (rich channel, no
+    /// schema bump) and the avatar byte pointer joins the descriptor list
+    /// exactly like a live attachment, its locator face in the internal
+    /// column only (no key material on the wire). An avatar-less card keeps
+    /// the card-only face; entry-level malformation (empty value) drops the
+    /// entry, never the row.
+    #[test]
+    fn imported_contact_rows_carry_the_card_and_ride_the_descriptor_list() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let key_b64 = "q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=";
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // Full face: name parts + phone + email + organization + an
+                // avatar byte pointer with a transit locator.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "contact": {
+                        "name": {"givenName": "Ada", "familyName": "Lovelace", "prefix": "", "middleName": "Byron"},
+                        "number": [
+                            {"value": "+15550000003", "type": "HOME"},
+                            {"value": "+15550000004", "type": "MOBILE", "label": "cell"},
+                            {"value": "", "type": "WORK"}
+                        ],
+                        "email": [{"value": "ada@example.org", "type": "WORK"}],
+                        "organization": "Analytical Engines Ltd",
+                        "avatar": {
+                            "contentType": "image/jpeg", "fileName": "a.jpg", "size": 55,
+                            "locator": {"key": key_b64, "cdnKey": "ac1", "cdnNumber": 0,
+                                "plaintextHash": "a".repeat(64)}
+                        }
+                    }
+                })
+                .to_string(),
+                // Card-only face: no avatar, unknown type coerces to HOME,
+                // missing label stays absent.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming",
+                    "contact": {
+                        "name": {"givenName": "Grace"},
+                        "number": [{"value": "+15550000005", "type": "SATELLITE"}]
+                    }
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 2);
+        assert_eq!(counters.skipped_messages, 0);
+        let conversation = alice_conversation_id(&account.id);
+        let message_at = |sent_at: u64| {
+            store
+                .message_by_signal_identity(
+                    &account.id,
+                    &conversation,
+                    "incoming",
+                    sent_at,
+                    &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+                )
+                .unwrap()
+                .expect("imported contact row")
+        };
+
+        let full = message_at(1000);
+        let contact = full
+            .rich
+            .as_ref()
+            .expect("rich")
+            .contact
+            .as_ref()
+            .expect("card");
+        let name = contact.name.as_ref().expect("name parts");
+        assert_eq!(name.given_name.as_deref(), Some("Ada"));
+        assert_eq!(name.family_name.as_deref(), Some("Lovelace"));
+        assert_eq!(name.middle_name.as_deref(), Some("Byron"));
+        assert!(name.prefix.is_none(), "empty parts stay absent");
+        assert_eq!(contact.number.len(), 2, "empty-value entry dropped");
+        assert_eq!(contact.number[0].kind, "HOME");
+        assert_eq!(contact.number[1].kind, "MOBILE");
+        assert_eq!(contact.number[1].label.as_deref(), Some("cell"));
+        assert_eq!(contact.email[0].value, "ada@example.org");
+        assert_eq!(
+            contact.organization.as_deref(),
+            Some("Analytical Engines Ltd")
+        );
+        assert_eq!(
+            full.attachments.len(),
+            1,
+            "avatar joined the descriptor list"
+        );
+        assert_eq!(
+            full.attachments[0].content_type.as_deref(),
+            Some("image/jpeg")
+        );
+        let faces = store
+            .history_attachment_locators(&account.id, &full.id)
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].key.as_deref(), Some(key_b64));
+        let wire = serde_json::to_value(&full).expect("wire row");
+        assert_eq!(wire["contact"]["name"]["givenName"], "Ada");
+        assert_eq!(wire["contact"]["number"][0]["value"], "+15550000003");
+        assert!(
+            !wire.to_string().contains(key_b64),
+            "locator key material never rides the wire"
+        );
+
+        // Card-only face: unknown type coerces to HOME, no avatar → no
+        // descriptor, no faces row.
+        let bare = message_at(2000);
+        let contact = bare
+            .rich
+            .as_ref()
+            .expect("rich")
+            .contact
+            .as_ref()
+            .expect("card");
+        assert_eq!(
+            contact.name.as_ref().unwrap().given_name.as_deref(),
+            Some("Grace")
+        );
+        assert_eq!(
+            contact.number[0].kind, "HOME",
+            "unknown type coerces to HOME"
+        );
+        assert_eq!(bare.attachments.len(), 0);
+        assert_eq!(
+            store
+                .history_attachment_locators(&account.id, &bare.id)
+                .unwrap(),
+            Vec::new()
+        );
+
+        // A re-run converges (identity discipline covers contact rows too).
+        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(second.imported, 0);
+    }
+
+    /// Contract 1.78 (§4.38): a contact face with no usable content — a
+    /// non-object, an empty object, or a shape whose every field is absent —
+    /// answers no card, and the bodyless message behind it keeps plain skip
+    /// routing (never a placeholder contact row).
+    #[test]
+    fn contact_rows_without_a_usable_card_skip() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // Not an object.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "contact": "gone"
+                })
+                .to_string(),
+                // Empty object: no renderable field.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming", "contact": {}
+                })
+                .to_string(),
+                // All-empty name parts and empty lists.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 3000,
+                    "direction": "incoming",
+                    "contact": {"name": {"givenName": ""}, "number": [], "email": []}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 0);
+        assert_eq!(
+            counters.skipped_messages, 3,
+            "the face carried nothing usable"
+        );
+        let row = store.history_import_row(&account.id).unwrap().unwrap();
+        assert_eq!(row.state, "completed");
+        assert_eq!(row.imported_messages, 0);
     }
 }
