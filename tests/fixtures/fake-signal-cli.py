@@ -1584,6 +1584,17 @@ for line in sys.stdin:
             daemon=True,
         ).start()
         continue
+    if method == "slowRead":
+        # Slow read answer (same 0.35s cadence as the mutating slow family):
+        # the result lands after a short connector request timeout, so the
+        # read-only outcome is a deadline Timeout and the late answer must be
+        # dropped as an unknown id, never misattributed to a later request.
+        threading.Thread(
+            target=emit_json_after,
+            args=(response, 0.35),
+            daemon=True,
+        ).start()
+        continue
     emit_json(response)
 
     if method == "duplicate":

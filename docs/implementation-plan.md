@@ -5,7 +5,39 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.72 (2026-10-07; the §4.62 receive half — the bodyRanges
+- Contract revision: 1.73 (2026-10-07; the read-only post-deadline
+  convergence batch — the P1 follow-up in the 758 hang-reconnaissance
+  lineage (P0 deadline-ization `40e2248`, gate process-group hygiene
+  `632fb39`): the engine-side lifecycle of a late response after a
+  caller deadline was audited end to end and found already safe, so
+  this batch ships zero production change and pins the convergence on
+  the test side instead. The lifecycle, with anchors: request ids are
+  per-generation monotonic (`kt-N`, engine.rs:1191, counter at :1137 —
+  handle clones share the counter, ids are never reused), the actor
+  registers a pending entry only after the frame is queued to the
+  stdin writer (engine.rs:1363-1369), a fired deadline drops the
+  caller's receiver and spawns a Cancel that retires the entry
+  (engine.rs:1205-1217 → :1390-1392), and every inbound response
+  dispatches by exact id against that map — a miss (late, duplicate,
+  or engine-invented) drops the line with an
+  `unknownOrDuplicateResponseId` protocol warning
+  (engine.rs:1672-1676), so a late read-only answer can never be
+  consumed by a later unrelated request. Both select! orderings of
+  Cancel-vs-response are safe (a response processed first fails its
+  oneshot send silently — the receiver is already gone), a terminal
+  actor drains every pending entry with the class-correct failure
+  (engine.rs:1488-1494), and a watchdog restart is a fresh generation
+  with fresh pipes and a fresh counter, so no late answer crosses
+  generations. Test-side pins: the fixture grows a `slowRead` hook (a
+  read answer 0.35 s late, the same cadence as the mutating
+  350/351/352 slow family), a new engine-integration test drives
+  deadline → `Timeout` → late answer dropped as an unknown id → a
+  subsequent `version` resolving with its own response, and the two
+  mutating slow-answer tests trade their blunt 400 ms sleep for the
+  same deterministic `unknownOrDuplicateResponseId` poll (one shared
+  helper). No wire change, no new method, no capability tag, no
+  schema store version bump (schema 20 unchanged)) —
+  previously 1.72 (2026-10-07; the §4.62 receive half — the bodyRanges
   pass-through batch: the pinned `JsonTextStyle` projection a peer's
   dataMessage carries (`textStyles: [{style, start, length}]`, the §4.20
   vocabulary over UTF-16 code-unit offsets) reaches every wire face that

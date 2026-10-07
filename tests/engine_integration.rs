@@ -99,6 +99,67 @@ async fn read_timeout_and_send_timeout_have_distinct_outcomes() {
     engine.shutdown().await.unwrap();
 }
 
+/// Polls the engine event stream until the actor reports a response whose id
+/// no pending entry claims (`pending.remove` miss in `handle_upstream_line`)
+/// — the deterministic barrier proving a late answer landed and was dropped
+/// instead of resolving or being misattributed to another request.
+async fn assert_late_answer_dropped(events: &mut tokio::sync::broadcast::Receiver<EngineEvent>) {
+    let warning = timeout(Duration::from_secs(2), async {
+        loop {
+            if let EngineEvent::ProtocolWarning { kind } = events.recv().await.unwrap() {
+                break kind;
+            }
+        }
+    })
+    .await
+    .expect("the late answer must surface as a dropped unknown id");
+    assert_eq!(warning, "unknownOrDuplicateResponseId");
+}
+
+/// Read-only deadline convergence: a read-only call whose answer lands after
+/// the request deadline resolves to `Timeout`, the late answer then surfaces
+/// as a dropped unknown id (the deadline's Cancel already retired the pending
+/// entry), and a later unrelated request resolves with its own response —
+/// never the late payload (the pending map dispatches by exact id).
+#[tokio::test]
+async fn read_only_late_response_is_dropped_not_misattributed() {
+    let (_temp, engine, _receives) = engine(Duration::from_millis(100)).await;
+    let mut events = engine.subscribe();
+
+    // Warm the engine past the child's startup latency (a generous budget)
+    // so the 100 ms deadline below measures the fixture's deliberate slow
+    // answer, never the child's first-read time.
+    let warmup = engine
+        .call_with_timeout(
+            "version",
+            json!({}),
+            CallClass::ReadOnly,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warmup, json!({ "method": "version" }));
+
+    assert_eq!(
+        engine
+            .call("slowRead", json!({}), CallClass::ReadOnly)
+            .await,
+        Err(EngineError::Timeout)
+    );
+
+    // The late answer (~350 ms in the fixture) arrives after the deadline's
+    // Cancel (~100 ms): it must be dropped as an unknown id.
+    assert_late_answer_dropped(&mut events).await;
+
+    // A subsequent unrelated request resolves with its own response.
+    let result = engine
+        .call("version", json!({}), CallClass::ReadOnly)
+        .await
+        .unwrap();
+    assert_eq!(result, json!({ "method": "version" }));
+    engine.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn duplicate_response_is_reported_without_resolving_twice() {
     let (_temp, engine, _receives) = engine(Duration::from_secs(1)).await;
@@ -207,6 +268,7 @@ async fn mutating_request_crash_is_an_unknown_outcome() {
 #[tokio::test]
 async fn remote_delete_slow_answer_and_crash_are_unknown_outcomes() {
     let (_temp, slow_engine, _receives) = engine(Duration::from_millis(100)).await;
+    let mut events = slow_engine.subscribe();
     assert_eq!(
         slow_engine
             .call(
@@ -217,8 +279,9 @@ async fn remote_delete_slow_answer_and_crash_are_unknown_outcomes() {
             .await,
         Err(EngineError::UnknownOutcome)
     );
-    // The late fixture answer must not resolve anything afterwards.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The late fixture answer converges deterministically: it surfaces as a
+    // dropped unknown id instead of resolving anything afterwards.
+    assert_late_answer_dropped(&mut events).await;
     slow_engine.shutdown().await.unwrap();
 
     let (_temp, crashed_engine, _receives) = engine(Duration::from_secs(3)).await;
@@ -243,6 +306,7 @@ async fn remote_delete_slow_answer_and_crash_are_unknown_outcomes() {
 #[tokio::test]
 async fn send_reaction_slow_answer_and_crash_are_unknown_outcomes() {
     let (_temp, slow_engine, _receives) = engine(Duration::from_millis(100)).await;
+    let mut events = slow_engine.subscribe();
     assert_eq!(
         slow_engine
             .call(
@@ -253,8 +317,9 @@ async fn send_reaction_slow_answer_and_crash_are_unknown_outcomes() {
             .await,
         Err(EngineError::UnknownOutcome)
     );
-    // The late fixture answer must not resolve anything afterwards.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The late fixture answer converges deterministically: it surfaces as a
+    // dropped unknown id instead of resolving anything afterwards.
+    assert_late_answer_dropped(&mut events).await;
     slow_engine.shutdown().await.unwrap();
 
     let (_temp, crashed_engine, _receives) = engine(Duration::from_secs(3)).await;
