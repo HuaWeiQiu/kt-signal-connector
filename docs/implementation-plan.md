@@ -5,7 +5,21 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.74 (2026-10-08; the username read-face opening —
+- Contract revision: 1.75 (2026-10-08; the username write-face opening —
+  `accounts.setUsername`'s kt-engine arm comes alive as the engine's
+  two-hop `usernameReserve`→`usernameConfirm` orchestration, with
+  `deleteUsername` riding `usernameDelete` (§4.66; the engine's username
+  write-face batch: proof/link cryptography, AccountRecord 33/35
+  storage persistence). Four structured codes join the host contract —
+  USERNAME_TAKEN / USERNAME_RESERVATION_GONE (deterministic,
+  retryable=false) and USERNAME_RATE_LIMITED / USERNAME_SERVER_FAILED
+  (retryable=true); the honest partial-success face (the server
+  confirmed but the engine's storage write failed) rides the existing
+  STORAGE_* family. The JVM/native `updateAccount` face is unchanged.
+  Schema gains the four codes in the error enum and the mode seam in the
+  method descriptions; no wire shape change, no capability change, no
+  schema store version change) —
+  previously 1.74 (2026-10-08; the username read-face opening —
   the kt-engine arms of `accounts.getUsername` and `username.lookup`
   (§4.65) come alive against the engine's `getUsername`/`usernameLookup`
   readers (the engine's username read-face batch, engine compat §3:
@@ -4171,6 +4185,67 @@ without inventing a `number` key, and the dispatch log pins the engine
 method names and the resolved signal account. The real-sidecar smoke
 (engine_integration `kt_engine_sidecar`) extends to the two engine
 method names under the same gate as before.
+
+### 4.66 Username write face, kt-engine opening: `accounts.setUsername` two-hop orchestration (contract revision 1.75, 2026-10-08)
+
+The §4.55 username write face stops being honest debt on the kt-engine
+face: the engine lands its username write-face batch (engine
+`docs/jsonrpc-compat.md` §3 — the KT extension methods `usernameReserve` /
+`usernameConfirm` / `usernameDelete` with the official
+proof/link cryptography and the AccountRecord 33/35 storage
+persistence), and this batch opens the connector arm against it. The
+JVM/native faces keep the pinned `updateAccount` route verbatim.
+
+- **Two-hop orchestration**: the kt-engine set path is
+  `usernameReserve` (`{account, username}` — bare nicknames allowed, the
+  adopted candidate wins: a bare nickname's discriminator is the
+  server's pick, the JVM face's `reserveUsernameFromNickname` twin)
+  followed by `usernameConfirm` (`{account, username, usernameHash}` —
+  the reserve answer feeds the confirm frame verbatim). Each hop is a
+  separate mutating call under the groups face's unknown-outcome
+  discipline: an indeterminate hop answers SEND_OUTCOME_UNKNOWN, nothing
+  retries, and the chain stops (the reservation itself carries no
+  user-visible server effect — the official reserve semantics — so a
+  torn two-hop converges through `accounts.getUsername` / the engine's
+  storage sync). The delete path is one `usernameDelete` `{account}`
+  hop; the host answer is `{}` on both faces (the §4.55 shape).
+- **Structured codes (new in the host error enum)**:
+  `USERNAME_TAKEN` (reserve 409 / confirm 410) and
+  `USERNAME_RESERVATION_GONE` (confirm 409 — the reservation expired or
+  lost its race; the caller reserves again) answer retryable=false —
+  deterministic refusals; `USERNAME_RATE_LIMITED` (413/429) and
+  `USERNAME_SERVER_FAILED` (anything else) answer retryable=true. The
+  connector's engine allowlist and the `into_api` mapping grow the four
+  literals in lockstep (the totality test covers them by construction;
+  the retryability faces have their own pins).
+- **Honest partial success**: the engine confirms server-side first and
+  persists the storage record second — a storage write failure after the
+  server's 200 surfaces as the STORAGE_* family (the username is live
+  server-side; `accounts.getUsername` / multi-device storage sync
+  converge). The connector adds no second truth and no reconciliation
+  loop.
+- **Boundaries (unchanged from the §4.55 recording)**: no case-change
+  shortcut — every set rides the full two-hop (the server is the hash
+  truth; the desktop's local case-change rewrite has no connector-side
+  mirror); no usernameChangeSyncMessage — multi-device convergence is the
+  engine's storage sync, not a second signal; nothing persists
+  connector-side (the write-back projection stays the mirror source).
+- **Lane/capability**: unchanged — send lane, account-scoped mutating,
+  capability `username`; no wire shape change, no schema store version
+  change.
+
+Tests: the prepare face pins the kt-engine frames (the same set frame the
+JVM face builds; the bare-account delete frame; validation outranks the
+mode seam); a supervisor-level engine-mode test rides the §4.55 fixture's
+new `usernameReserve`/`usernameConfirm`/`usernameDelete` arms — the
+two-hop happy path with the adopted candidate, the bare-nickname pick,
+the delete hop, the three structured refusals surfacing as engine
+UpstreamCode literals, the torn two-hop (reserve succeeds, confirm
+refuses RESERVATION_GONE), the in-flight crash answering
+SEND_OUTCOME_UNKNOWN with exactly one reserve dispatch and no confirm
+hop (never retried; the explicit restart lands a fresh engine and the
+next set works), and the dispatch log pinning the hop order/payloads
+with the raw account id never riding the frame.
 
 ## 5. signal-cli Boundary
 

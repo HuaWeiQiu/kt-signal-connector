@@ -545,6 +545,50 @@ async fn kt_engine_sidecar_round_trips_over_the_engine_actor() {
         json!([{ "recipient": "kt_smoke.01", "isRegistered": false }])
     );
 
+    // Contract 1.75 (§4.66): the write faces round-trip over the engine
+    // actor — reserve adopts the bare nickname's candidate and carries a
+    // hash, confirm lands the full link, delete answers {}.
+    let reserved = engine
+        .call(
+            "usernameReserve",
+            json!({ "account": "+15559990000", "username": "kt_smoke" }),
+            CallClass::Mutating,
+        )
+        .await
+        .expect("usernameReserve round-trips");
+    let adopted = reserved["username"].as_str().expect("candidate");
+    assert!(adopted.starts_with("kt_smoke."), "candidate: {adopted}");
+    assert!(reserved["usernameHash"].is_string());
+    let confirmed = engine
+        .call(
+            "usernameConfirm",
+            json!({
+                "account": "+15559990000",
+                "username": adopted,
+                "usernameHash": reserved["usernameHash"],
+            }),
+            CallClass::Mutating,
+        )
+        .await
+        .expect("usernameConfirm round-trips");
+    assert_eq!(confirmed["username"], json!(adopted));
+    assert!(
+        confirmed["usernameLink"]
+            .as_str()
+            .expect("link")
+            .starts_with("https://signal.me/#eu/"),
+        "link shape: {confirmed}"
+    );
+    let deleted = engine
+        .call(
+            "usernameDelete",
+            json!({ "account": "+15559990000" }),
+            CallClass::Mutating,
+        )
+        .await
+        .expect("usernameDelete round-trips");
+    assert_eq!(deleted, json!({}));
+
     let sent = engine
         .call(
             "send",

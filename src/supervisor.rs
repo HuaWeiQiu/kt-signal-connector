@@ -2958,53 +2958,143 @@ impl RuntimeSupervisor {
         avatar_from_engine(&result)
     }
 
-    /// accounts.setUsername (contract revision 1.59, §4.55, capability
-    /// username): resolution under the service lock, then the mutating
-    /// `updateAccount` call — the groups face's unknown-outcome discipline
-    /// (an indeterminate answer is SEND_OUTCOME_UNKNOWN and is never
-    /// retried). The confirmed result projects the upstream write-back
-    /// `{username, usernameLink}` on the set path — the connector's only
-    /// username read face, persisted nowhere locally — and `{username: null}`
-    /// on the delete path (the upstream writes no result body there).
+    /// accounts.setUsername (contract revision 1.59, §4.55; the kt-engine
+    /// write face opens with contract 1.75, §4.66): on the JVM/native faces
+    /// the mutating `updateAccount` call with the groups face's
+    /// unknown-outcome discipline (an indeterminate answer is
+    /// SEND_OUTCOME_UNKNOWN and is never retried); on the kt-engine face the
+    /// two-hop orchestration — `usernameReserve` then `usernameConfirm`,
+    /// each a separate mutating call under the same discipline (an
+    /// indeterminate hop stops the chain: the reservation itself carries no
+    /// user-visible effect server-side, and a torn two-hop converges through
+    /// getUsername / the engine's storage sync). The confirmed result
+    /// projects the write-back `{username, usernameLink}` on the set path —
+    /// the adopted candidate wins (a bare nickname's discriminator is the
+    /// server's pick) — and `{username: null}` on the delete path (the
+    /// upstream writes no result body there). Structured engine codes
+    /// (USERNAME_TAKEN / USERNAME_RESERVATION_GONE / USERNAME_RATE_LIMITED /
+    /// USERNAME_SERVER_FAILED, and the STORAGE_* honest partial-success
+    /// family when the server confirmed but the storage write failed) map
+    /// through the connector's allowlist (`into_api`).
     pub async fn set_username(
         &self,
         params: AccountsSetUsernameParams,
     ) -> Result<AccountUsername, ServiceError> {
         let engine = self.running_engine().await?;
-        let upstream = {
+        let (upstream, account_key, kt_engine) = {
             let service = self.service.lock().await;
-            service.prepare_accounts_set_username(&params, self.config.mode)?
+            let upstream = service.prepare_accounts_set_username(&params, self.config.mode)?;
+            let account_key = upstream["account"].clone();
+            (
+                upstream,
+                account_key,
+                self.config.mode == crate::engine::SignalCliMode::KtEngine,
+            )
         };
-        match engine
-            .call("updateAccount", upstream, CallClass::Mutating)
-            .await
-        {
-            Ok(result) => {
-                if params.delete_username {
-                    return Ok(AccountUsername {
-                        username: None,
-                        username_link: None,
-                    });
-                }
-                let username = result
-                    .get("username")
-                    .and_then(Value::as_str)
-                    .ok_or(ServiceError::Engine(EngineError::Protocol))?
-                    .to_string();
-                Ok(AccountUsername {
-                    username: Some(username),
-                    username_link: result
-                        .get("usernameLink")
+        match kt_engine {
+            // Delete hop: usernameDelete {account} → {} (idempotent — the
+            // engine deletes server-side and clears the storage record).
+            true if params.delete_username => match engine
+                .call("usernameDelete", upstream, CallClass::Mutating)
+                .await
+            {
+                Ok(_) => Ok(AccountUsername {
+                    username: None,
+                    username_link: None,
+                }),
+                Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                    "SEND_OUTCOME_UNKNOWN",
+                    "mutating request has an unknown outcome",
+                    false,
+                ))),
+                Err(error) => Err(error.into()),
+            },
+            // Set path, two hops under the same unknown-outcome discipline:
+            // reserve (candidate + hash, no user-visible server effect)
+            // adopts the candidate, confirm (proof + link) lands it.
+            true => {
+                let reserved = match engine
+                    .call("usernameReserve", upstream, CallClass::Mutating)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(EngineError::UnknownOutcome) => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "SEND_OUTCOME_UNKNOWN",
+                            "mutating request has an unknown outcome",
+                            false,
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let confirm = json!({
+                    "account": account_key,
+                    "username": reserved
+                        .get("username")
                         .and_then(Value::as_str)
-                        .map(str::to_string),
-                })
+                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+                    "usernameHash": reserved
+                        .get("usernameHash")
+                        .and_then(Value::as_str)
+                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+                });
+                match engine
+                    .call("usernameConfirm", confirm, CallClass::Mutating)
+                    .await
+                {
+                    Ok(result) => {
+                        let username = result
+                            .get("username")
+                            .and_then(Value::as_str)
+                            .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                            .to_string();
+                        Ok(AccountUsername {
+                            username: Some(username),
+                            username_link: result
+                                .get("usernameLink")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                    }
+                    Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                        "SEND_OUTCOME_UNKNOWN",
+                        "mutating request has an unknown outcome",
+                        false,
+                    ))),
+                    Err(error) => Err(error.into()),
+                }
             }
-            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
-                "SEND_OUTCOME_UNKNOWN",
-                "mutating request has an unknown outcome",
-                false,
-            ))),
-            Err(error) => Err(error.into()),
+            false => match engine
+                .call("updateAccount", upstream, CallClass::Mutating)
+                .await
+            {
+                Ok(result) => {
+                    if params.delete_username {
+                        return Ok(AccountUsername {
+                            username: None,
+                            username_link: None,
+                        });
+                    }
+                    let username = result
+                        .get("username")
+                        .and_then(Value::as_str)
+                        .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                        .to_string();
+                    Ok(AccountUsername {
+                        username: Some(username),
+                        username_link: result
+                            .get("usernameLink")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                }
+                Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                    "SEND_OUTCOME_UNKNOWN",
+                    "mutating request has an unknown outcome",
+                    false,
+                ))),
+                Err(error) => Err(error.into()),
+            },
         }
     }
 
@@ -5487,6 +5577,7 @@ mod tests {
     use crate::engine::{NormalizedReceive, SignalCliConfig};
     use crate::service::HostSideEvent;
     use crate::store::{MessageRecord, Store, StoreKey};
+    use crate::supervisor::EngineError;
 
     /// Contract 1.53: the running-state progress composition — download
     /// wins, else THIS account's active import pass renders stage
@@ -7086,6 +7177,206 @@ mod tests {
             .find(|params| params.get("usernames").is_some())
             .expect("a usernameLookup dispatch must land");
         assert_eq!(lookup_dispatch["account"], "+15555550100");
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// Contract 1.75 (§4.66): the kt-engine write face orchestrates the two
+    /// hops — reserve adopts the candidate (a bare nickname's discriminator
+    /// is the engine's pick), confirm lands the link; the delete hop rides
+    /// usernameDelete. The structured server codes map through the allowlist
+    /// (TAKEN/RESERVATION_GONE deterministic, RATE_LIMITED retryable); the
+    /// torn two-hop (confirm refuses on a gone reservation) surfaces the
+    /// code verbatim; a crash with reserve in flight answers
+    /// SEND_OUTCOME_UNKNOWN, is never retried (exactly one reserve dispatch,
+    /// no confirm hop), and the next call lands on a fresh engine.
+    #[tokio::test]
+    async fn username_write_face_two_hop_delete_and_structured_codes_in_engine_mode() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.mode = crate::engine::SignalCliMode::KtEngine;
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let set_params =
+            |username: Option<String>, delete: bool| crate::service::AccountsSetUsernameParams {
+                account_id: account.id.clone(),
+                username,
+                delete_username: delete,
+            };
+
+        // Set path: the full username echoes through both hops and the
+        // write-back projects {username, usernameLink}.
+        let set = supervisor
+            .set_username(set_params(Some("kt_test_agent.07".into()), false))
+            .await
+            .unwrap();
+        assert_eq!(set.username.as_deref(), Some("kt_test_agent.07"));
+        assert_eq!(
+            set.username_link.as_deref(),
+            Some("https://signal.me/username/fixture-link")
+        );
+
+        // Bare nickname: the adopted candidate wins (the engine picks the
+        // discriminator; the JVM face's reserveUsernameFromNickname twin).
+        let bare = supervisor
+            .set_username(set_params(Some("kt_agent_bare".into()), false))
+            .await
+            .unwrap();
+        assert_eq!(bare.username.as_deref(), Some("kt_agent_bare.07"));
+
+        // Delete hop: usernameDelete → the null face.
+        let deleted = supervisor
+            .set_username(set_params(None, true))
+            .await
+            .unwrap();
+        assert_eq!(deleted.username, None);
+        assert_eq!(deleted.username_link, None);
+
+        // Structured codes through the allowlist.
+        let taken = supervisor
+            .set_username(set_params(Some("fixture_username_taken.01".into()), false))
+            .await
+            .unwrap_err();
+        // The structured codes surface as engine UpstreamCode literals (the
+        // allowlist classification); the host-face mapping (code + retryable)
+        // is pinned by the service-layer totality/mapping tests.
+        assert!(matches!(
+            taken,
+            crate::service::ServiceError::Engine(EngineError::UpstreamCode {
+                code: "USERNAME_TAKEN",
+                ..
+            })
+        ));
+        let rate = supervisor
+            .set_username(set_params(
+                Some("fixture_username_ratelimited.01".into()),
+                false,
+            ))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rate,
+            crate::service::ServiceError::Engine(EngineError::UpstreamCode {
+                code: "USERNAME_RATE_LIMITED",
+                ..
+            })
+        ));
+        // The torn two-hop: reserve succeeds, confirm refuses.
+        let gone = supervisor
+            .set_username(set_params(Some("fixture_username_gone.01".into()), false))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            gone,
+            crate::service::ServiceError::Engine(EngineError::UpstreamCode {
+                code: "USERNAME_RESERVATION_GONE",
+                ..
+            })
+        ));
+
+        // Crash with reserve in flight: SEND_OUTCOME_UNKNOWN, never retried;
+        // an explicit restart lands a fresh engine and the next set works.
+        let crash = supervisor
+            .set_username(set_params(Some("fixture_crash_username.31".into()), false))
+            .await
+            .unwrap_err();
+        assert!(matches!(crash, crate::service::ServiceError::Api(ref api)
+                if api.code == "SEND_OUTCOME_UNKNOWN" && !api.retryable));
+        supervisor.start().await.unwrap();
+        let after = supervisor
+            .set_username(set_params(Some("kt_after_crash.01".into()), false))
+            .await
+            .unwrap();
+        assert_eq!(after.username.as_deref(), Some("kt_after_crash.01"));
+
+        // The dispatch log pins the hop order and payloads: every set rode
+        // reserve→confirm (the crash username has exactly one reserve, no
+        // confirm), the delete rode usernameDelete, and the raw account id
+        // never rides the frame.
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatches");
+        let dispatches: Vec<serde_json::Value> = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let reserves: Vec<&serde_json::Value> = dispatches
+            .iter()
+            .filter(|params| {
+                params.get("usernameHash").is_none() && params.get("username").is_some()
+            })
+            .collect();
+        let confirms: Vec<&serde_json::Value> = dispatches
+            .iter()
+            .filter(|params| params.get("usernameHash").is_some())
+            .collect();
+        // Every reserve that succeeded rode a confirm hop; the refusals
+        // (taken/rate/crash) legitimately stop at reserve.
+        assert_eq!(reserves.len(), confirms.len() + 3);
+        for name in [
+            "kt_test_agent.07",
+            "kt_agent_bare.07",
+            "fixture_username_gone.01",
+            "kt_after_crash.01",
+        ] {
+            assert_eq!(
+                confirms
+                    .iter()
+                    .filter(|params| params["username"] == name)
+                    .count(),
+                1,
+                "exactly one confirm hop for {name}"
+            );
+        }
+        let crash_reserves = reserves
+            .iter()
+            .filter(|params| params["username"] == "fixture_crash_username.31")
+            .count();
+        let crash_confirms = confirms
+            .iter()
+            .filter(|params| params["username"] == "fixture_crash_username.31")
+            .count();
+        assert_eq!(
+            crash_reserves, 1,
+            "an unknown reserve outcome is never retried"
+        );
+        assert_eq!(crash_confirms, 0, "a lost reserve never reaches confirm");
+        assert!(
+            dispatches
+                .iter()
+                .any(|params| params.get("deleteUsername").is_none()
+                    && params.get("username").is_none()
+                    && params.get("usernameHash").is_none()
+                    && params.get("account").and_then(serde_json::Value::as_str)
+                        == Some("+15555550100")),
+            "the delete hop rides usernameDelete with the bare account"
+        );
+        assert!(
+            dispatches
+                .iter()
+                .all(|params| params.get("accountId").is_none())
+        );
         supervisor.shutdown().await.unwrap();
     }
 

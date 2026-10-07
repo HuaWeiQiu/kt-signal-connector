@@ -1789,6 +1789,17 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "BACKUP_ARTIFACT_INVALID",
     "BACKUP_SNAPSHOT_EXISTS",
     "BACKUP_IO_FAILED",
+    // §4.66 username write face (contract 1.75, engine username write-face
+    // batch): the reserve/confirm/delete server-state ladder. TAKEN and
+    // RESERVATION_GONE are deterministic refusals (a new name / a fresh
+    // reserve is the only way forward); RATE_LIMITED and SERVER_FAILED may
+    // succeed on a later attempt. The honest partial-success family rides
+    // the STORAGE_* codes already above (the server confirmed but the
+    // storage write failed).
+    "USERNAME_TAKEN",
+    "USERNAME_RESERVATION_GONE",
+    "USERNAME_RATE_LIMITED",
+    "USERNAME_SERVER_FAILED",
     // §4.48 report spam (engine-owned: the upstream report API refused the
     // batch — every id's serverGuid was rejected).
     "REPORT_SPAM_FAILED",

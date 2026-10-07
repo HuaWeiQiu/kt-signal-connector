@@ -988,6 +988,72 @@ for line in sys.stdin:
             else:
                 entries.append({"recipient": name, "isRegistered": False})
         result = entries
+    elif method == "usernameReserve":
+        # Contract 1.75 §4.66: the kt-engine username write face, hop one.
+        # Record the exact upstream params (tests assert the resolved account
+        # + username keys). Sentinels mirror the engine's structured server
+        # codes (code -1 + the literal in the message):
+        # "fixture_username_taken.01" answers USERNAME_TAKEN;
+        # "fixture_username_ratelimited.01" answers USERNAME_RATE_LIMITED;
+        # "fixture_crash_username.31" crashes with the mutating call in
+        # flight (os._exit(31); the JVM updateAccount twin never fires in
+        # kt-engine mode). Bare nicknames adopt the .07 discriminator (the
+        # engine's fake first-candidate discipline); full names echo.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        username = params.get("username") or ""
+        if username == "fixture_username_taken.01":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "USERNAME_TAKEN"},
+            }
+            emit_json(response)
+            continue
+        if username == "fixture_username_ratelimited.01":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "USERNAME_RATE_LIMITED"},
+            }
+            emit_json(response)
+            continue
+        if username == "fixture_crash_username.31":
+            os._exit(31)
+        adopted = username if "." in username else username + ".07"
+        result = {
+            "username": adopted,
+            "usernameHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        }
+    elif method == "usernameConfirm":
+        # Contract 1.75 §4.66: hop two — proof + link land the reservation.
+        # "fixture_username_gone.01" answers USERNAME_RESERVATION_GONE (the
+        # torn two-hop face). Success answers the write-back shape
+        # {username, usernameLink}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        username = params.get("username") or ""
+        if username == "fixture_username_gone.01":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "USERNAME_RESERVATION_GONE"},
+            }
+            emit_json(response)
+            continue
+        result = {
+            "username": username,
+            "usernameLink": "https://signal.me/username/fixture-link",
+        }
+    elif method == "usernameDelete":
+        # Contract 1.75 §4.66: the delete hop — server DELETE + storage clear,
+        # idempotent. No result body (the JVM delete path's shape).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        result = {}
     elif method == "getBlockedConversations":
         # Contract 1.46 §4.45 blocked read: the storage-order projection as a
         # fixture constant (one contact + one legacy group). Read face, no

@@ -395,6 +395,34 @@ impl ServiceError {
                         "the backup export hit a filesystem failure",
                         true,
                     ),
+                    // §4.66 username write face (contract 1.75, engine
+                    // username write-face batch): the reserve/confirm/delete
+                    // server-state ladder. TAKEN (reserve 409 / confirm 410)
+                    // and RESERVATION_GONE (confirm 409 — the reservation
+                    // expired or lost its race) are deterministic: a new name
+                    // / a fresh reserve is the only way forward. RATE_LIMITED
+                    // (413/429) and SERVER_FAILED (anything else) may succeed
+                    // on a later attempt. The honest partial-success family
+                    // (the server confirmed but the storage write failed)
+                    // rides the STORAGE_* arms above.
+                    "USERNAME_TAKEN" => {
+                        ApiError::new("USERNAME_TAKEN", "the username is already taken", false)
+                    }
+                    "USERNAME_RESERVATION_GONE" => ApiError::new(
+                        "USERNAME_RESERVATION_GONE",
+                        "the username reservation expired or was taken; reserve again",
+                        false,
+                    ),
+                    "USERNAME_RATE_LIMITED" => ApiError::new(
+                        "USERNAME_RATE_LIMITED",
+                        "the username server rate-limited the request",
+                        true,
+                    ),
+                    "USERNAME_SERVER_FAILED" => ApiError::new(
+                        "USERNAME_SERVER_FAILED",
+                        "the username server request failed",
+                        true,
+                    ),
                     "REPORT_SPAM_FAILED" => {
                         ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
                     }
@@ -2847,22 +2875,23 @@ impl ConnectorService {
         Ok(json!({ "account": account.signal_account }))
     }
 
-    /// accounts.setUsername (contract revision 1.59, §4.55, capability
-    /// username): the resolution ladder ends at the pinned signal-cli
-    /// `updateAccount` mutually exclusive group — `username` XOR
-    /// `deleteUsername` (UpdateAccountCommand.java:41-46), both absent being
-    /// a legitimate attributes-only call the connector does not expose (the
-    /// desktop face is username-shaped). The local shape gate mirrors the
-    /// official desktop grammar (`ts/util/Username.dom.ts`): nickname
-    /// `[a-zA-Z_][a-zA-Z0-9_]*`, optional all-digits discriminator `.N` with
-    /// no `0…` forms beyond exactly-one-zero, 3..32 characters total — the
-    /// pinned libsignal bounds (AccountHelper.java:363-364). A bare nickname
-    /// (no dot) is allowed: `ManagerImpl.setUsername` routes it to
-    /// `reserveUsernameFromNickname`, which lets the server pick the
-    /// discriminator. The kt-engine face has no username method and answers
-    /// CAPABILITY_UNAVAILABLE after local validation (groups.update/quit
-    /// debt shape). Nothing is persisted locally — the write result
-    /// projection is the desktop's mirror source.
+    /// accounts.setUsername (contract revision 1.59, §4.55; the kt-engine
+    /// write face opens with contract 1.75, §4.66): the resolution ladder
+    /// ends at the pinned signal-cli `updateAccount` mutually exclusive
+    /// group — `username` XOR `deleteUsername` (UpdateAccountCommand.java:
+    /// 41-46), both absent being a legitimate attributes-only call the
+    /// connector does not expose (the desktop face is username-shaped). The
+    /// local shape gate mirrors the official desktop grammar
+    /// (`ts/util/Username.dom.ts`): nickname `[a-zA-Z_][a-zA-Z0-9_]*`,
+    /// optional all-digits discriminator `.N` with no `0…` forms beyond
+    /// exactly-one-zero, 3..32 characters total — the pinned libsignal
+    /// bounds (AccountHelper.java:363-364). A bare nickname (no dot) is
+    /// allowed on both faces: the JVM face routes it to
+    /// `reserveUsernameFromNickname` (the server picks the discriminator);
+    /// the kt-engine face's two-hop orchestration (supervisor side)
+    /// reserves from the bare nickname the same way and the adopted
+    /// candidate wins. Nothing is persisted locally — the write result
+    /// projection is the mirror source.
     pub fn prepare_accounts_set_username(
         &self,
         params: &AccountsSetUsernameParams,
@@ -2899,11 +2928,19 @@ impl ConnectorService {
         }
         let account = self.resolve_account(&params.account_id)?;
         match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no username method yet",
-                false,
-            ))),
+            // kt-engine face (contract 1.75, §4.66): the frame feeds the
+            // supervisor's two-hop orchestration — usernameReserve takes the
+            // same {account, username} frame the JVM updateAccount takes;
+            // the delete hop is usernameDelete {account}.
+            SignalCliMode::KtEngine => Ok(match setting {
+                Some(username) => json!({
+                    "account": account.signal_account,
+                    "username": username,
+                }),
+                None => json!({
+                    "account": account.signal_account,
+                }),
+            }),
             _ => Ok(match setting {
                 Some(username) => json!({
                     "account": account.signal_account,
@@ -8653,6 +8690,22 @@ mod tests {
             let api =
                 ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
             assert_eq!(api.code, *code, "unmapped engine code {code}");
+        }
+        // The username write face (contract 1.75, §4.66): the retryability
+        // faces are part of the contract — taken/reservation-gone are
+        // deterministic (a new name / a fresh reserve is the only way
+        // forward), rate-limited/server-failed may succeed on a later
+        // attempt.
+        for (code, retryable) in [
+            ("USERNAME_TAKEN", false),
+            ("USERNAME_RESERVATION_GONE", false),
+            ("USERNAME_RATE_LIMITED", true),
+            ("USERNAME_SERVER_FAILED", true),
+        ] {
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
+            assert_eq!(api.code, code);
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
         }
     }
 
@@ -16594,20 +16647,32 @@ mod tests {
                 .unwrap_or_else(|error| panic!("expected {good} to pass: {error:?}"));
         }
 
-        // KtEngine debt: validation outranks the capability gate.
+        // KtEngine frames (contract 1.75, §4.66): the two-hop orchestration
+        // takes the same set frame the JVM face builds; the delete frame
+        // carries the bare account (usernameDelete's shape). Validation
+        // outranks the mode seam.
+        assert_eq!(
+            service
+                .prepare_accounts_set_username(
+                    &params(Some("kt_test.01".into()), false),
+                    SignalCliMode::KtEngine,
+                )
+                .unwrap(),
+            json!({"account": "+15555550100", "username": "kt_test.01"})
+        );
+        assert_eq!(
+            service
+                .prepare_accounts_set_username(&params(None, true), SignalCliMode::KtEngine)
+                .unwrap(),
+            json!({"account": "+15555550100"})
+        );
         let error = service
             .prepare_accounts_set_username(
-                &params(Some("kt_test.01".into()), false),
+                &params(Some("kt_test.00".into()), false),
                 SignalCliMode::KtEngine,
             )
             .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-        let error = service
-            .prepare_accounts_set_username(&params(None, true), SignalCliMode::KtEngine)
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
         // JVM payloads.
         assert_eq!(
