@@ -269,6 +269,18 @@ async fn mutating_request_crash_is_an_unknown_outcome() {
 async fn remote_delete_slow_answer_and_crash_are_unknown_outcomes() {
     let (_temp, slow_engine, _receives) = engine(Duration::from_millis(100)).await;
     let mut events = slow_engine.subscribe();
+    // Warm the engine past the child's startup latency (a generous budget)
+    // so the 100 ms deadline below measures the fixture's deliberate slow
+    // answer, never the child's first-read time.
+    slow_engine
+        .call_with_timeout(
+            "version",
+            json!({}),
+            CallClass::ReadOnly,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
     assert_eq!(
         slow_engine
             .call(
@@ -307,6 +319,18 @@ async fn remote_delete_slow_answer_and_crash_are_unknown_outcomes() {
 async fn send_reaction_slow_answer_and_crash_are_unknown_outcomes() {
     let (_temp, slow_engine, _receives) = engine(Duration::from_millis(100)).await;
     let mut events = slow_engine.subscribe();
+    // Warm the engine past the child's startup latency (a generous budget)
+    // so the 100 ms deadline below measures the fixture's deliberate slow
+    // answer, never the child's first-read time.
+    slow_engine
+        .call_with_timeout(
+            "version",
+            json!({}),
+            CallClass::ReadOnly,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
     assert_eq!(
         slow_engine
             .call(
