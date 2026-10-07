@@ -64,7 +64,7 @@ const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 /// peer keys, which the schema bounds at 128 (opaqueId/peerKey family in
 /// schemas/connector-api-v1.schema.json); accepting a longer one inbound would
 /// create a conversation the host contract forbids addressing.
-const MAX_RECEIVE_ID_CHARS: usize = 128;
+pub(crate) const MAX_RECEIVE_ID_CHARS: usize = 128;
 const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
@@ -598,6 +598,26 @@ pub struct NormalizedRich {
     /// descriptor list, never this shape. Absent on plain and pre-1.78 rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<NormalizedContact>,
+    /// Backfill poll face (contract 1.81, §4.38): the archive's per-message
+    /// `poll` item, aggregated onto the desktop's read-only render face —
+    /// question, options, the aggregate flag, the per-voter projection and
+    /// the ended bit. No live-receive counterpart exists (the connector has
+    /// no poll face), so the shape is import-only material. Absent on plain
+    /// and pre-1.81 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<NormalizedPoll>,
+    /// Backfill payment face (contract 1.81, §4.38): the desktop's
+    /// consumable slice of the archive's per-message `payment` item — the
+    /// note alone; amounts, fees and the transaction blob have no desktop
+    /// render face. Absent on plain and pre-1.81 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment: Option<NormalizedPayment>,
+    /// Backfill gift-badge face (contract 1.81, §4.38): the archive's
+    /// per-message `giftBadge` item, lowercased onto the desktop's state
+    /// vocabulary — the state alone, no credential material. Absent on plain
+    /// and pre-1.81 rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gift_badge: Option<NormalizedGiftBadge>,
 }
 
 /// One story-reply context (contract 1.76, §4.67): the addressed story's
@@ -624,6 +644,9 @@ impl NormalizedRich {
             && self.group_name.is_none()
             && self.story_reply.is_none()
             && self.contact.is_none()
+            && self.poll.is_none()
+            && self.payment.is_none()
+            && self.gift_badge.is_none()
     }
 }
 
@@ -699,6 +722,88 @@ pub struct NormalizedContactField {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// Backfill poll face (contract revision 1.81, §4.38): the archive's
+/// per-message `poll` item folded onto the desktop's read-only render face
+/// (engine 592b1d3 projects the official import's poll face verbatim —
+/// options carry their votes nested as `{voterId, voteCount}` — and the
+/// connector aggregates; behavior reference, zero code copied). The fold is
+/// exactly the official import's: one entry per voter in first-seen order
+/// with the option indexes they picked, a voter the §4.38 recipient ladder
+/// cannot resolve dropping vote-level (the official unknown-voterId
+/// warn-and-skip, never the row). The engine drops empty option entries, so
+/// the projected option list is self-consistent for index addressing.
+/// `terminated` is the desktop's boolean face of `hasEnded` — the official
+/// `terminatedAt` stamp is the poll message's own timestamp (the row's
+/// `sentAt`), so it is not repeated. No live-receive counterpart exists, so
+/// the shape is import-only material riding [`NormalizedRich`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedPoll {
+    /// Poll question; the face always carries the key (the official
+    /// `poll.question ?? ''`), an unstated question rides empty.
+    pub question: String,
+    /// Option labels in archive order — positional integrity matters: votes
+    /// address options by index, so the list always rides (the official
+    /// `options` face is unconditionally serialized).
+    pub options: Vec<String>,
+    /// The official `allowMultiple`; serialized only when true (the
+    /// desktop's optional-truthy face).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_multiple: bool,
+    /// The official `hasEnded` as the desktop's boolean face; serialized
+    /// only when true — the termination stamp is the row's own timestamp.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub terminated: bool,
+    /// Aggregated per-voter projection; absent while no vote resolved (the
+    /// official `votes.length > 0 ? votes : undefined`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub votes: Vec<NormalizedPollVote>,
+}
+
+/// One aggregated poll vote (contract 1.81, §4.38): the voter resolved
+/// through the §4.38 author-resolution ladder and the option indexes they
+/// picked in poll order. The official `voteCount` per-vote tally has no
+/// desktop timeline face and is not transported (the projection gap the
+/// desktop batch records).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedPollVote {
+    pub voter_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub option_indexes: Vec<u32>,
+}
+
+/// Backfill payment face (contract revision 1.81, §4.38): the desktop's
+/// consumable slice of the archive's `payment` item. The engine projects the
+/// official import face — `{amountMob?, feeMob?, note?,
+/// transactionDetailsBase64?}` — but only `note` crosses: the official
+/// timeline renders a placeholder label plus the optional note, and amounts,
+/// fees and the opaque TransactionDetails blob have no desktop render face
+/// (KT carries no MobileCoin ledger), so the connector does not transport
+/// them (the projection gap the desktop batch records). Rides
+/// [`NormalizedRich`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedPayment {
+    /// Free-form payment note; absent stays absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Backfill gift-badge face (contract revision 1.81, §4.38): the desktop's
+/// state-only face of the archive's `giftBadge` item. The engine projects
+/// the official capitalized `GiftBadgeStates` vocabulary (Unopened / Opened
+/// / Redeemed / Failed); the connector lowercases onto the desktop's wire
+/// vocabulary. The receipt-credential presentation (the engine's face on
+/// every non-FAILED state) stays engine-side: it is zk credential material
+/// with no desktop data face (the projection gap the desktop batch
+/// records). Rides [`NormalizedRich`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedGiftBadge {
+    pub state: String,
 }
 
 /// Delivery tier of an inbound receipt (`envelope.receiptMessage`). Order is

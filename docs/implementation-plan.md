@@ -5,7 +5,31 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.80 (2026-10-08; the official-desktop local-backup
+- Contract revision: 1.81 (2026-10-08; the history-import non-text expansion
+  batch (§4.38): the engine NDJSON archive's seven backup5 row types now
+  land — frame-level `adhocCall` call records and the ChatItem
+  `payment`/`giftBadge`/`viewOnce`/`storyReply`/`poll`/`adminDeleted`
+  faces (engine 592b1d3, compat §5 递补批; desktop 67abb977+42801981 fix
+  the wire shapes). The connector consumes the engine's live-key
+  projections with no import-only parse for view-once (`viewOnce` /
+  `isErased` / `viewOnceInvalid` top-level markers, the single medium on
+  the row's standard `attachments` list); `storyReply`'s body rides the
+  receive ladder and its author resolves connector-side (outgoing = the
+  peer key, incoming = the account, direct conversations only — the
+  engine exports no story context; `sentTimestamp` pins 0, stories are
+  never imported); `poll` aggregates votes connector-side onto the
+  desktop's read-only face (per-voter `voterId`+`optionIndexes`,
+  `terminated` as the boolean face of `hasEnded`, the official voteCount
+  tally has no desktop timeline face); `payment` crosses note-only and
+  `giftBadge` state-only lowercased — amounts, fees, the
+  TransactionDetails blob and the receipt-credential presentation have no
+  desktop render/data face (recorded projection gaps, never transported);
+  `adminDeleted` flips the 1.33 tombstone flag with the status ladder
+  untouched (the admin identity has no row face, a recorded v1 gap); the
+  `adhocCall` frame is recognized and honestly skip-counted — the
+  connector keeps no call-history store. All faces ride the additive rich
+  channel; no schema, capability, or store-version change) —
+  previously 1.80 (2026-10-08; the official-desktop local-backup
   snapshot import opening (§4.68): the host surface grows two methods —
   `backups.importSnapshot` and `backups.importSnapshotStatus` — that hand a
   user-selected official Signal Desktop snapshot directory (`metadata` + `main`
@@ -2189,6 +2213,64 @@ documented data-directory artifact instead of an RPC surface.
   `additionalMessages` semantics. Presence without material (`details` missing or empty)
   is no face: the row behind it keeps plain skip routing. A re-run converges through the
   identity discipline, as every import row does.
+- The non-text expansion batch lands (contract 1.81, 2026-10-08; engine counterpart 592b1d3
+  recorded in kt-signal-engine `docs/jsonrpc-compat.md` §5 递补批; desktop wire shapes fixed
+  by kt-desktop 67abb977+42801981): the seven backup5 row types — frame-level `adhocCall`
+  call records and the ChatItem `payment`/`giftBadge`/`viewOnce`/`storyReply`/`poll`/
+  `adminDeleted` faces, unprojected since 1.39's tolerant frame list — now consume:
+  - **viewOnce** needs no import-only parse: the engine projects the live receive keys —
+    the top-level `viewOnce`/`isErased`/`viewOnceInvalid` markers with the single medium on
+    the row's standard `attachments` list — so the existing attachment pathway and the
+    §4.25 `viewOnce`/`viewOnceInvalid` rich flags carry it verbatim (`view_once_invalid` =
+    `isErased || viewOnceInvalid`, the erased/invalid form rendering the same placeholder a
+    burned live row does). A `viewOnce` row counts as bodyful even with no medium (the
+    burned placeholder row).
+  - **storyReply**: the face's `body` rides the receive ladder as the row's body (byte
+    ladder, honest truncation flag) and `bodyAttachment` marks the metadata-only long-text
+    overflow (no descriptor, the standard long-text posture). The story author resolves
+    connector-side (the engine exports no story context): an outgoing reply answers the
+    conversation peer's story, an incoming reply the account's own, and only a direct
+    conversation carries a story context — a group row lands its body plain with the face
+    honestly absent. Both resolved forms are existing row identities (peer key, account
+    number); nothing is invented. `rich.story_reply.sent_timestamp` pins 0 (stories are
+    never imported, so the answered story has no upstream timestamp); the emoji arm (the
+    official storyReaction face) has no row face connector-side and honest-skips (a recorded
+    v1 gap).
+  - **poll**: the engine projects the official import face (options carrying their votes
+    nested as `{voterId, voteCount}`); the connector aggregates onto the desktop's read-only
+    face — one entry per voter in first-seen order with the option indexes they picked
+    (`voterId` + `optionIndexes`), a voter the §4.38 recipient ladder cannot resolve
+    dropping vote-level (the official unknown-voterId warn-and-skip, never the row).
+    `terminated` is the boolean face of `hasEnded` — the official `terminatedAt` stamp is
+    the poll message's own timestamp (the row's `sentAt`), not repeated. The official
+    `voteCount` tally has no desktop timeline face and is not transported (recorded
+    projection gap). Question/options always ride (the official `?? ''`/`[]` defaults);
+    hostile-line caps: options ≤32, votes ≤64, indexes ≤32, question/option text 256 chars —
+    truncation drops trailing entries whole, their votes dangling with them, never fatal.
+  - **payment** crosses note-only: the engine's face carries `{amountMob?, feeMob?, note?,
+    transactionDetailsBase64?}` but amounts, fees and the TransactionDetails blob have no
+    desktop render face (KT carries no MobileCoin ledger) — not transported (recorded
+    projection gap). The face is structural: an object with no note is still the payment
+    notification.
+  - **giftBadge** crosses state-only: the engine's capitalized `GiftBadgeStates` vocabulary
+    lowercases onto the desktop's wire vocabulary; the receipt-credential presentation (the
+    engine's face on every non-FAILED state) stays engine-side — zk credential material with
+    no desktop data face (recorded projection gap).
+  - **adminDeleted**: the face's presence (the engine always projects `adminId`, 0 included)
+    flips the 1.33 `admin_deleted` tombstone flag beside an intact row — the status ladder is
+    untouched (the live `mark_admin_deleted` posture), the body (when the archive carried
+    one) stays for the audit window. The admin identity has no row face (a recorded v1 gap;
+    the official join is a conversation-table name lookup KT cannot make from an opaque id).
+  - **adhocCall**: the frame-level call record is recognized (never the junk `skippedLines`
+    bucket) and honestly skip-counted — the connector keeps no call-history store and no
+    call-link conversation kind (§4.49: the connector is the signaling pipe), so the
+    official drop path is total (the official import drops unresolvable call-link rows too).
+  All faces ride the additive rich channel (`NormalizedRich.poll`/`payment`/`gift_badge` +
+  the existing view-once/story-reply flags), the body gate counts each face as a body, and
+  wrong-typed faces (a non-object `payment`, a non-string badge state, a direction-less poll)
+  answer no face — the row behind them keeps plain skip routing. No host wire shape beyond
+  the additive `poll`/`payment`/`giftBadge` row fields; no schema JSON change, no capability
+  change, no store schema version change.
 
 ### 4.39 Group member roster: groups.get `members` (contract revision 1.40, 2026-10-05)
 
@@ -4917,6 +4999,18 @@ The §4.38 honesty rules are inherited whole: the engine's failure modes land as
 again. What this restores is bounded by the same §7.1.1 retention bounds as every other stored
 message — "what the official desktop backed up, to the connector's normal retention bounds",
 not a full-archive shadow.
+
+**Contract revision 1.81 (2026-10-08) lands the seven non-text backup5 row types (§4.38)**:
+frame-level `adhocCall` call records and the ChatItem `payment`/`giftBadge`/`viewOnce`/
+`storyReply`/`poll`/`adminDeleted` faces. The connector consumes the engine's live-key
+projections — view-once through the existing receive pathway untouched, the rest through the
+additive rich channel — with the aggregation and resolution the official import assigns the
+consumer: poll votes fold per voter, the story author resolves from direction and
+conversation, the admin tombstone flips the 1.33 flag. What does not cross is recorded, not
+invented: payment amounts/fees/transaction blobs, the gift-badge credential presentation,
+the poll voteCount tally, the storyReaction emoji face, the admin identity, and the call
+records themselves (no call-history store) all have no KT row face today. The desktop
+renders what arrives (67abb977); rows the archive carries but KT cannot express honest-skip.
 
 ### 6.7 Media limitation
 

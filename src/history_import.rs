@@ -396,6 +396,18 @@ impl<'a> Importer<'a> {
             // Recipient/chat frames were staged by pass 1; they carry no rows.
             Some("recipient") | Some("chat") => {}
             Some("message") => self.handle_message(&value)?,
+            // The call-history record frame (contract 1.81, §4.38): the
+            // official backup carries call-link (ad-hoc) calls as top-level
+            // frames — never chat items, they are "not tied to threads" —
+            // and the official import drops one whose call-link recipient
+            // does not resolve (`ts/services/backups/import.preload.ts`
+            // #fromAdHocCall's drop-and-warn; behavior reference, zero code
+            // copied). The connector keeps no call-history store and no
+            // call-link conversation kind (§4.49: the connector is the
+            // signaling pipe, it persists no call state), so the official
+            // drop path is total: the line is recognized — never the junk
+            // `skippedLines` bucket — and honestly skip-counted.
+            Some("adhocCall") => self.counters.skipped_messages += 1,
             _ => self.counters.skipped_lines += 1,
         }
         Ok(())
@@ -483,17 +495,62 @@ impl<'a> Importer<'a> {
                 Some(source),
             )
         };
+        // The §4.38 expansion item faces (contract 1.81): view-once, story
+        // reply, poll, payment and gift badge ride the row as bounded rich
+        // faces; the admin-deleted face is the row's own tombstone flag. All
+        // are directed bubble faces (official ChatItem `item` oneof members,
+        // backup.proto:462-473) — a direction-less row behind one keeps the
+        // plain skip routing (the official "if unset, importers should skip
+        // this item" posture; only the timer and group notices are
+        // conversation-scoped state and land as system rows). The engine
+        // projects the faces at their live receive keys (engine 592b1d3,
+        // compat §5 递补批): view-once as the top-level
+        // `viewOnce`/`isErased`/`viewOnceInvalid` markers with the single
+        // medium on the row's standard `attachments` list — one receive
+        // pathway, no import-only parse — and the rest as `storyReply` /
+        // `poll` / `payment` / `giftBadge` / `adminDeleted` object faces.
+        let view_once = value
+            .get("viewOnce")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let view_once_erased = value
+            .get("isErased")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let view_once_invalid = value
+            .get("viewOnceInvalid")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let story_reply = import_story_reply(value.get("storyReply"));
+        let payment = import_payment(value.get("payment"));
+        let gift_badge = import_gift_badge(value.get("giftBadge"));
+        let admin_deleted_face = import_admin_deleted(value.get("adminDeleted"));
+        let poll = self.import_poll(value.get("poll"))?;
         // Body presence: a tombstone carries none by definition; anything else
         // without text, a long-text pointer, an attachment, a sticker face, or
         // a contact card stores nothing (contract 1.78 §4.38: the contact
-        // identity is the body of a contact row).
+        // identity is the body of a contact row). The expansion faces are
+        // bodies the same way (contract 1.81 §4.38): a poll, a payment, a
+        // gift badge, a view-once marker or a story reply is the row's
+        // bubble; an admin-deleted face is the tombstone exception beside
+        // `remoteDeleted`.
         let text = value
             .get("text")
             .and_then(Value::as_str)
-            .filter(|text| !text.is_empty());
+            .filter(|text| !text.is_empty())
+            // The story-reply body is the row's body (the official
+            // textReply projection): it rides the receive ladder beside any
+            // frame text.
+            .or_else(|| {
+                story_reply
+                    .as_ref()
+                    .and_then(|story| story.body.as_deref())
+                    .filter(|body| !body.is_empty())
+            });
         let has_long_text = value
             .get("longText")
-            .is_some_and(|pointer| !pointer.is_null());
+            .is_some_and(|pointer| !pointer.is_null())
+            || story_reply.as_ref().is_some_and(|story| story.long_text);
         let raw_attachments = value.get("attachments").and_then(Value::as_array);
         // The sticker face (contract 1.35 identity beside the message) parses
         // with the live-receive bounds; the data pointer rides the descriptor
@@ -504,11 +561,17 @@ impl<'a> Importer<'a> {
         // attachment parity.
         let contact = import_contact(value.get("contact"));
         if !remote_deleted
+            && !admin_deleted_face
             && text.is_none()
             && !has_long_text
             && raw_attachments.is_none_or(Vec::is_empty)
             && sticker.is_none()
             && contact.is_none()
+            && !view_once
+            && story_reply.is_none()
+            && poll.is_none()
+            && payment.is_none()
+            && gift_badge.is_none()
         {
             self.counters.skipped_messages += 1;
             return Ok(());
@@ -602,21 +665,67 @@ impl<'a> Importer<'a> {
             quote_message_id,
             quote_snapshot: quote,
             attachments,
-            // The contact card rides the rich channel (contract 1.78, §4.38):
-            // the additive §4.37/§4.40 route — persisted in `rich_json`
-            // without a store schema bump.
-            rich: contact
-                .as_ref()
-                .map(|(card, _)| crate::engine::NormalizedRich {
-                    contact: Some(card.clone()),
-                    ..Default::default()
-                }),
+            // The rich faces ride the additive §4.37/§4.40 channel (contract
+            // 1.78/1.81, §4.38) — persisted in `rich_json` without a store
+            // schema bump; an all-absent composition collapses to None so
+            // plain rows carry nothing.
+            rich: {
+                let mut rich = crate::engine::NormalizedRich::default();
+                if let Some((card, _)) = &contact {
+                    rich.contact = Some(card.clone());
+                }
+                // The view-once markers are the engine's top-level keys, the
+                // live receive projection shape: the erased/invalid form is
+                // the live no-renderable-media shape (§4.25
+                // `viewOnceInvalid`), which renders the same placeholder a
+                // burned live row does; the medium, when the archive still
+                // carries it, rode the standard attachment list above.
+                if view_once {
+                    rich.view_once = true;
+                    rich.view_once_invalid = view_once_erased || view_once_invalid;
+                }
+                if story_reply.is_some() {
+                    // The story author resolves connector-side (the engine
+                    // exports no story context): an outgoing reply answers
+                    // the conversation peer's story, an incoming reply the
+                    // account's own — and only a direct conversation carries
+                    // a story context at all, so a group row lands its body
+                    // plain with the face honestly absent (the official
+                    // replies always live in the story author's 1:1). Both
+                    // resolved forms are existing row identities — the peer
+                    // key and the account number — nothing is invented.
+                    rich.story_reply = if chat.kind == "direct" {
+                        Some(crate::engine::NormalizedStoryReply {
+                            author_aci: if direction == "outgoing" {
+                                chat.peer_key.clone()
+                            } else {
+                                self.signal_account.to_string()
+                            },
+                            // Stories are never imported, so the answered
+                            // story carries no upstream timestamp — the zero
+                            // the desktop's import-row spec pins.
+                            sent_timestamp: 0,
+                        })
+                    } else {
+                        None
+                    };
+                }
+                rich.poll = poll;
+                rich.payment = payment;
+                rich.gift_badge = gift_badge;
+                (rich != crate::engine::NormalizedRich::default()).then_some(rich)
+            },
             edited_at: None,
             reactions: Vec::new(),
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
-            admin_deleted: false,
+            // The admin-deleted tombstone (contract 1.33 wire face; contract
+            // 1.81 §4.38 import): the face marks the row the way a live
+            // inbound adminDelete does — the additive flag beside an intact
+            // row, the body (when the archive carried one) stays for the
+            // audit window, the status ladder untouched.
+            admin_deleted: admin_deleted_face,
             sticker: sticker.map(|(meta, _)| meta),
             expire_seconds,
             expire_start_at,
@@ -841,6 +950,117 @@ impl<'a> Importer<'a> {
             self.flush()?;
         }
         Ok(())
+    }
+
+    /// The archive's poll face (contract 1.81, §4.38): the engine projects
+    /// the official import's poll face verbatim — options carry their votes
+    /// nested as `{voterId, voteCount}` (`ts/services/backups/import.preload.ts`
+    /// poll arm; behavior reference, zero code copied) — and this fold is
+    /// exactly the official import's aggregation: one entry per voter in
+    /// first-seen order with the option indexes they picked, a voter the
+    /// §4.38 recipient ladder cannot resolve dropping vote-level (the
+    /// official unknown-voterId warn-and-skip, never the row). `terminated`
+    /// is the desktop's boolean face of `hasEnded` — the official
+    /// `terminatedAt` stamp is the poll message's own timestamp (the row's
+    /// `sentAt`), so it is not repeated. The face is structural — an object
+    /// answers a poll even when every field is absent (the official
+    /// bare-poll projection: `question ?? ''`, `options ?? []`).
+    fn import_poll(
+        &self,
+        raw: Option<&Value>,
+    ) -> Result<Option<crate::engine::NormalizedPoll>, ImportFailure> {
+        let Some(object) = raw.and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        // Options keep positional integrity: votes address options by index,
+        // so an entry rides even when its label is absent (the official
+        // `options.map(option => option.option ?? '')`), capped with the
+        // trailing entries dropped whole — their votes dangle and drop with
+        // them below.
+        let options: Vec<String> = object
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(MAX_POLL_OPTIONS)
+            .map(|option| {
+                option
+                    .get("option")
+                    .and_then(Value::as_str)
+                    .map(|text| bounded_chars(text, MAX_POLL_OPTION_CHARS))
+                    .unwrap_or_default()
+            })
+            .collect();
+        let option_cap = options.len() as u32;
+        let mut order: Vec<String> = Vec::new();
+        let mut indexes: HashMap<String, Vec<u32>> = HashMap::new();
+        for (option_index, option) in object
+            .get("options")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(MAX_POLL_OPTIONS)
+            .enumerate()
+        {
+            for vote in option
+                .get("votes")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(voter_id) = vote.get("voterId").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(recipient) = self.store.history_recipient(self.account_id, voter_id)?
+                else {
+                    continue;
+                };
+                let Some(source) = recipient_source(&recipient, self.signal_account) else {
+                    continue;
+                };
+                let entry = indexes.entry(source.clone()).or_insert_with(|| {
+                    order.push(source.clone());
+                    Vec::new()
+                });
+                if entry.len() < MAX_POLL_VOTE_INDEXES && !entry.contains(&(option_index as u32)) {
+                    entry.push(option_index as u32);
+                }
+            }
+        }
+        let mut votes = Vec::new();
+        for voter in order.into_iter().take(MAX_POLL_VOTES) {
+            let Some(voter_indexes) = indexes.remove(&voter) else {
+                continue;
+            };
+            let kept: Vec<u32> = voter_indexes
+                .into_iter()
+                .filter(|index| *index < option_cap)
+                .collect();
+            if kept.is_empty() {
+                continue;
+            }
+            votes.push(crate::engine::NormalizedPollVote {
+                voter_id: voter,
+                option_indexes: kept,
+            });
+        }
+        Ok(Some(crate::engine::NormalizedPoll {
+            question: object
+                .get("question")
+                .and_then(Value::as_str)
+                .map(|text| bounded_chars(text, MAX_POLL_QUESTION_CHARS))
+                .unwrap_or_default(),
+            options,
+            allow_multiple: object
+                .get("allowMultiple")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            terminated: object
+                .get("hasEnded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            votes,
+        }))
     }
 
     /// Resolve one chat's store identity, once per run: the staged recipient
@@ -1206,6 +1426,20 @@ fn non_empty(text: &str) -> Option<&str> {
 const MAX_LOCATOR_BASE64_CHARS: usize = 512;
 const MAX_LOCATOR_HEX_CHARS: usize = 128;
 
+/// Ingest caps for the §4.38 expansion faces (contract 1.81): generous
+/// multiples over the real official shapes — the proto comments bound poll
+/// question/option text at 1-100 chars and payment notes are one line —
+/// tight enough that a hostile line cannot bloat the rich column. String
+/// faces truncate at the cap (renderable-prefix honesty, the contact
+/// precedent); the only faces dropped whole are poll entries past the caps,
+/// entries whose votes dangle with them.
+const MAX_POLL_QUESTION_CHARS: usize = 256;
+const MAX_POLL_OPTION_CHARS: usize = 256;
+const MAX_POLL_OPTIONS: usize = 32;
+const MAX_POLL_VOTES: usize = 64;
+const MAX_POLL_VOTE_INDEXES: usize = 32;
+const MAX_PAYMENT_NOTE_CHARS: usize = 512;
+
 /// Parse one engine NDJSON attachment's `locator` object into the ingest
 /// face (contract 1.55). Proto-only discipline on the connector side too:
 /// unknown keys are ignored, wrong-shaped keys are dropped (never guessed),
@@ -1485,6 +1719,104 @@ fn import_group_update(raw: Option<&Value>) -> Option<ImportedGroupUpdate> {
         })
         .map(|title| truncate_utf8_bytes(title, GROUP_NAME_MAX_BYTES));
     Some(ImportedGroupUpdate { group_name })
+}
+
+/// Char-truncate to `cap` characters (the contact precedent's bounded-string
+/// discipline: a renderable prefix is honest, a dropped tail is recorded by
+/// the face's own bounds).
+fn bounded_chars(text: &str, cap: usize) -> String {
+    text.chars().take(cap).collect()
+}
+
+/// A bounded optional string face: present, string-typed, verbatim (no
+/// trim — the payment faces keep the archive's values as stated), capped.
+fn bounded_field(object: &serde_json::Map<String, Value>, key: &str, cap: usize) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|text| bounded_chars(text, cap))
+}
+
+/// The archive's `storyReply` face (contract 1.81, §4.38): the engine
+/// projects the official textReply arm as `{body?, bodyAttachment?}` — the
+/// body non-empty, the long-text pointer as `bodyAttachment` — and the emoji
+/// arm as `{emoji}` (`ts/services/backups/import.preload.ts`
+/// #fromDirectStoryReplyMessage; behavior reference, zero code copied). The
+/// body is the row's body: it rides the receive ladder beside any frame
+/// text, byte-bounded by the ladder with its honest truncation flag. A
+/// `bodyAttachment` marks the metadata-only long-text overflow, no
+/// descriptor (the standard long-text row posture). The emoji arm is the
+/// official storyReaction face — a reaction against a story the archive
+/// never imports — and has no row face connector-side: it answers None (a
+/// recorded v1 gap), exactly like a bare object. The story's author resolves
+/// at the row from direction and conversation, not here.
+struct ImportedStoryReply {
+    body: Option<String>,
+    long_text: bool,
+}
+
+fn import_story_reply(raw: Option<&Value>) -> Option<ImportedStoryReply> {
+    let object = raw?.as_object()?;
+    let body = object
+        .get("body")
+        .and_then(Value::as_str)
+        .filter(|body| !body.is_empty())
+        .map(str::to_string);
+    let long_text = object
+        .get("bodyAttachment")
+        .is_some_and(|pointer| !pointer.is_null());
+    (body.is_some() || long_text).then_some(ImportedStoryReply { body, long_text })
+}
+
+/// The archive's `payment` face (contract 1.81, §4.38): the engine projects
+/// the official import face verbatim (`amountMob`/`feeMob`/`note`/
+/// `transactionDetailsBase64`; `ts/services/backups/import.preload.ts`
+/// paymentNotification arm; behavior reference, zero code copied) but only
+/// `note` crosses — amounts, fees and the transaction blob have no desktop
+/// render face (KT carries no MobileCoin ledger), the projection gap the
+/// desktop batch records. The face is structural — an object answers the
+/// face even when the note is absent, exactly the official all-undefined
+/// projection (a different rule from the contact card's usable-content
+/// gate: a payment notification with no stated note is still the
+/// notification). A non-object face answers None.
+fn import_payment(raw: Option<&Value>) -> Option<crate::engine::NormalizedPayment> {
+    let object = raw?.as_object()?;
+    Some(crate::engine::NormalizedPayment {
+        note: bounded_field(object, "note", MAX_PAYMENT_NOTE_CHARS),
+    })
+}
+
+/// The archive's `giftBadge` face (contract 1.81, §4.38): the engine
+/// projects the official `GiftBadgeStates` vocabulary verbatim —
+/// "Unopened"/"Opened"/"Redeemed"/"Failed", the FAILED arm carrying no
+/// presentation (`ts/services/backups/import.preload.ts` giftBadge arm;
+/// behavior reference, zero code copied) — and the connector lowercases it
+/// onto the desktop's wire vocabulary. The receipt-credential presentation
+/// stays engine-side: zk credential material with no desktop data face (the
+/// recorded projection gap). A non-object face, or a state that is not a
+/// string, answers None — plain routing behind it.
+fn import_gift_badge(raw: Option<&Value>) -> Option<crate::engine::NormalizedGiftBadge> {
+    let state = raw?
+        .as_object()?
+        .get("state")?
+        .as_str()?
+        .to_ascii_lowercase();
+    Some(crate::engine::NormalizedGiftBadge { state })
+}
+
+/// The archive's `adminDeleted` face (contract 1.81, §4.38): the row's own
+/// tombstone — the official import lands the item as `deletedForEveryone`
+/// with the admin's ACI (`ts/services/backups/import.preload.ts`
+/// adminDeletedMessage arm; behavior reference, zero code copied). The KT
+/// row model carries the live admin-delete flag only (contract 1.33), so
+/// the face consumes presence: the official gate requires the `adminId` key
+/// (strictAssert) and the connector mirrors that shape gate while the admin
+/// identity itself has no row face (a recorded v1 gap). A missing
+/// /non-object face or a missing `adminId` answers false — plain routing
+/// behind it.
+fn import_admin_deleted(raw: Option<&Value>) -> bool {
+    raw.and_then(Value::as_object)
+        .is_some_and(|object| object.get("adminId").and_then(Value::as_u64).is_some())
 }
 
 #[cfg(test)]
@@ -3019,5 +3351,430 @@ mod tests {
         // A re-run converges (identity discipline covers group rows too).
         let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
         assert_eq!(second.imported, 0);
+    }
+
+    /// Contract 1.81 (§4.38): the seven non-text expansion faces land whole.
+    /// The poll folds per-voter through the recipient ladder (contact →
+    /// E164, self → the account itself), the payment crosses note-only, the
+    /// gift badge lowercases onto the wire vocabulary, a burned view-once
+    /// marker is a bodyless-yet-real placeholder row, the story reply
+    /// resolves its author from direction (outgoing = the peer, incoming =
+    /// the account, sentTimestamp pinned 0), and the admin-deleted face is
+    /// a tombstone flag beside an intact row with the status ladder
+    /// untouched.
+    #[test]
+    fn imported_expansion_faces_land_whole() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "recipient", "id": 3, "kind": "self", "name": ""})
+                    .to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // Poll: alice picks option 0, the account picks option 1
+                // twice (the dedupe is the official aggregation's).
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "poll": {
+                        "question": "Lunch?",
+                        "options": [
+                            {"option": "Ramen", "votes": [{"voterId": 1, "voteCount": 1}]},
+                            {"option": "Sushi", "votes": [{"voterId": 3, "voteCount": 1},
+                                {"voterId": 3, "voteCount": 1}]}
+                        ],
+                        "allowMultiple": true, "hasEnded": true
+                    }
+                })
+                .to_string(),
+                // Payment: the note crosses, the ledger material never does.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming",
+                    "payment": {"amountMob": 100, "feeMob": 1, "note": "coffee",
+                        "transactionDetailsBase64": "AAAA"}
+                })
+                .to_string(),
+                // Gift badge: the capitalized official state lowercases.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 3000,
+                    "direction": "incoming",
+                    "giftBadge": {"state": "Unopened"}
+                })
+                .to_string(),
+                // Burned view-once: no medium, no text — the placeholder row.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 4000,
+                    "direction": "incoming", "viewOnce": true, "isErased": true
+                })
+                .to_string(),
+                // Incoming story reply: the answered story is the account's.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 5000,
+                    "direction": "incoming",
+                    "storyReply": {"body": "nice story"}
+                })
+                .to_string(),
+                // Outgoing story reply with the long-text overflow: the
+                // answered story is the peer's.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 6000,
+                    "direction": "outgoing",
+                    "storyReply": {"bodyAttachment": {"contentType": "text/plain"}}
+                })
+                .to_string(),
+                // Admin-deleted tombstone beside an intact body.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 7000,
+                    "direction": "incoming", "text": "spam",
+                    "adminDeleted": {"adminId": 0}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 7);
+        assert_eq!(counters.skipped_messages, 0);
+        let conversation = alice_conversation_id(&account.id);
+        let message_at = |sent_at: u64| {
+            store
+                .message_by_signal_identity(
+                    &account.id,
+                    &conversation,
+                    "incoming",
+                    sent_at,
+                    &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+                )
+                .unwrap()
+                .expect("imported expansion row")
+        };
+
+        // Poll: first-seen voter order, deduped option indexes, camelCase
+        // wire keys.
+        let poll_row = message_at(1000);
+        let poll = poll_row
+            .rich
+            .as_ref()
+            .expect("rich")
+            .poll
+            .as_ref()
+            .expect("poll");
+        assert_eq!(poll.question, "Lunch?");
+        assert_eq!(poll.options, vec!["Ramen", "Sushi"]);
+        assert!(poll.allow_multiple);
+        assert!(poll.terminated);
+        assert_eq!(poll.votes.len(), 2);
+        assert_eq!(poll.votes[0].voter_id, ALICE_E164);
+        assert_eq!(poll.votes[0].option_indexes, vec![0]);
+        assert_eq!(poll.votes[1].voter_id, SIGNAL_ACCOUNT);
+        assert_eq!(poll.votes[1].option_indexes, vec![1]);
+        let poll_wire = serde_json::to_value(&poll_row).expect("wire");
+        assert_eq!(poll_wire["poll"]["question"], "Lunch?");
+        assert_eq!(poll_wire["poll"]["allowMultiple"], true);
+        assert_eq!(poll_wire["poll"]["terminated"], true);
+        assert_eq!(poll_wire["poll"]["votes"][0]["voterId"], ALICE_E164);
+        assert_eq!(
+            poll_wire["poll"]["votes"][0]["optionIndexes"],
+            serde_json::json!([0])
+        );
+        assert_eq!(poll_wire["poll"]["votes"][1]["voterId"], SIGNAL_ACCOUNT);
+        assert!(
+            !poll_wire.to_string().contains("voteCount"),
+            "the official per-vote tally has no desktop face"
+        );
+
+        // Payment: note-only on the wire.
+        let payment_row = message_at(2000);
+        let payment = payment_row
+            .rich
+            .as_ref()
+            .expect("rich")
+            .payment
+            .as_ref()
+            .expect("payment");
+        assert_eq!(payment.note.as_deref(), Some("coffee"));
+        let payment_wire = serde_json::to_value(&payment_row).expect("wire");
+        assert_eq!(payment_wire["payment"]["note"], "coffee");
+        let payment_wire_text = payment_wire.to_string();
+        assert!(
+            !payment_wire_text.contains("amountMob")
+                && !payment_wire_text.contains("feeMob")
+                && !payment_wire_text.contains("transactionDetailsBase64")
+                && !payment_wire_text.contains("AAAA"),
+            "the ledger material never rides the wire"
+        );
+
+        // Gift badge: lowercased state.
+        let badge_row = message_at(3000);
+        let badge = badge_row
+            .rich
+            .as_ref()
+            .expect("rich")
+            .gift_badge
+            .as_ref()
+            .expect("gift badge");
+        assert_eq!(badge.state, "unopened");
+        let badge_wire = serde_json::to_value(&badge_row).expect("wire");
+        assert_eq!(badge_wire["giftBadge"]["state"], "unopened");
+
+        // Burned view-once placeholder: no medium, the live no-renderable
+        // flags, standard row identity.
+        let burned = message_at(4000);
+        let burned_rich = burned.rich.as_ref().expect("rich");
+        assert!(burned_rich.view_once);
+        assert!(burned_rich.view_once_invalid);
+        assert!(burned.text.is_none());
+        assert!(burned.attachments.is_empty());
+
+        // Incoming story reply: the account's own story, timestamp pinned 0.
+        let reply_in = message_at(5000);
+        assert_eq!(reply_in.text.as_deref(), Some("nice story"));
+        let story_in = reply_in
+            .rich
+            .as_ref()
+            .expect("rich")
+            .story_reply
+            .as_ref()
+            .expect("story reply");
+        assert_eq!(story_in.author_aci, SIGNAL_ACCOUNT);
+        assert_eq!(story_in.sent_timestamp, 0);
+        let story_in_wire = serde_json::to_value(&reply_in).expect("wire");
+        assert_eq!(story_in_wire["storyReply"]["authorAci"], SIGNAL_ACCOUNT);
+        assert_eq!(story_in_wire["storyReply"]["sentTimestamp"], 0);
+
+        // Outgoing story reply: the peer's story; the long-text pointer
+        // marks the metadata-only body.
+        let reply_out = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "outgoing",
+                6000,
+                &account.id,
+                &account.id,
+            )
+            .unwrap()
+            .expect("outgoing story reply row");
+        let story_out = reply_out
+            .rich
+            .as_ref()
+            .expect("rich")
+            .story_reply
+            .as_ref()
+            .expect("story reply");
+        assert_eq!(story_out.author_aci, ALICE_E164);
+        assert!(reply_out.text_truncated, "long-text pointer = truncated");
+        assert!(!reply_out.text_retrievable);
+
+        // Admin-deleted: the tombstone flag beside the intact body, the
+        // status ladder untouched.
+        let admin_row = message_at(7000);
+        assert_eq!(admin_row.text.as_deref(), Some("spam"));
+        assert!(admin_row.admin_deleted);
+        assert_eq!(admin_row.status, "delivered");
+
+        // A re-run converges (identity discipline covers every face).
+        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(second.imported, 0);
+    }
+
+    /// Contract 1.81 (§4.38): honest routing around damaged faces — a voter
+    /// the ladder cannot resolve drops vote-level (never the poll), a
+    /// wrong-typed face answers no face so the bodyless row behind it keeps
+    /// plain skip routing, the adhocCall frame is recognized (skip-counted
+    /// as a message, never the junk-lines bucket), and a group conversation
+    /// carries no story context (the body lands plain, the face honestly
+    /// absent).
+    #[test]
+    fn expansion_face_malformation_keeps_plain_routing() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                group().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({"type": "chat", "id": 11, "recipientId": 2}).to_string(),
+                // Unresolvable voter: vote-level drop, the poll stays.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "poll": {"question": "Q?", "options": [{"option": "A",
+                        "votes": [{"voterId": 99, "voteCount": 1}]}]}
+                })
+                .to_string(),
+                // Wrong-typed faces behind bodyless rows: plain skip.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming", "payment": "junk"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2100,
+                    "direction": "incoming", "poll": "junk"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2200,
+                    "direction": "incoming", "giftBadge": {"state": 42}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2300,
+                    "direction": "incoming", "storyReply": "junk"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2400,
+                    "direction": "incoming", "adminDeleted": "junk"
+                })
+                .to_string(),
+                // Group story reply: no story context, the body lands plain.
+                serde_json::json!({
+                    "type": "message", "chatId": 11, "authorId": 1, "dateSent": 3000,
+                    "direction": "incoming",
+                    "storyReply": {"body": "group reply"}
+                })
+                .to_string(),
+                // The adhocCall frame: recognized, skip-counted as a message.
+                serde_json::json!({
+                    "type": "adhocCall", "callId": "c1", "recipientId": 1,
+                    "state": "GenericAdhocCall", "callTimestamp": 4000
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 2, "the poll and the group reply");
+        assert_eq!(counters.skipped_messages, 6, "5 wrong-typed + adhocCall");
+        assert_eq!(counters.skipped_lines, 0, "adhocCall is never junk");
+
+        // The poll survives with no votes (the key stays off the wire).
+        let conversation = alice_conversation_id(&account.id);
+        let poll_row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("poll row");
+        let poll = poll_row
+            .rich
+            .as_ref()
+            .expect("rich")
+            .poll
+            .as_ref()
+            .expect("poll");
+        assert_eq!(poll.question, "Q?");
+        assert!(poll.votes.is_empty());
+        let poll_wire = serde_json::to_value(&poll_row).expect("wire");
+        assert!(poll_wire["poll"].get("votes").is_none());
+
+        // The group reply keeps its body, the face honestly absent.
+        let group_conversation = stable_hash_id(&[&account.id, "group", GROUP_MASTER_KEY]);
+        let group_row = store
+            .message_by_signal_identity(
+                &account.id,
+                &group_conversation,
+                "incoming",
+                3000,
+                &stable_hash_id(&[&account.id, "group", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "group", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("group reply row");
+        assert_eq!(group_row.text.as_deref(), Some("group reply"));
+        assert!(
+            group_row
+                .rich
+                .as_ref()
+                .is_none_or(|rich| rich.story_reply.is_none()),
+            "a group carries no story context"
+        );
+    }
+
+    /// Contract 1.81 (§4.38): the hostile-line caps truncate with the
+    /// renderable-prefix honesty — option entries past the cap drop whole
+    /// (their votes dangle with them), the question truncates at its char
+    /// cap, and neither is fatal.
+    #[test]
+    fn poll_caps_truncate_never_fatal() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let mut options: Vec<Value> = (0..MAX_POLL_OPTIONS)
+            .map(|index| serde_json::json!({"option": format!("opt{index}"), "votes": []}))
+            .collect();
+        // The entry past the cap carries the only vote — it drops whole.
+        options.push(serde_json::json!({"option": "overflow",
+            "votes": [{"voterId": 1, "voteCount": 1}]}));
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "poll": {"question": "長".repeat(MAX_POLL_QUESTION_CHARS + 50),
+                        "options": options}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 1);
+        let conversation = alice_conversation_id(&account.id);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("capped poll row");
+        let poll = row
+            .rich
+            .as_ref()
+            .expect("rich")
+            .poll
+            .as_ref()
+            .expect("poll");
+        assert_eq!(poll.question.chars().count(), MAX_POLL_QUESTION_CHARS);
+        assert_eq!(poll.options.len(), MAX_POLL_OPTIONS);
+        assert_eq!(poll.options[0], "opt0");
+        assert_eq!(
+            poll.options[MAX_POLL_OPTIONS - 1],
+            format!("opt{}", MAX_POLL_OPTIONS - 1)
+        );
+        assert!(
+            poll.votes.is_empty(),
+            "the overflowing entry's vote dangles"
+        );
     }
 }

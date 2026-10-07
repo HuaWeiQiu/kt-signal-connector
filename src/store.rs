@@ -3577,9 +3577,10 @@ impl Store {
                         received_at, stored_at, body, body_bytes, body_truncated, status,
                         client_request_id, quote_message_id, quote_snapshot, attachments_json,
                         attachment_locators, rich_json, edited_at, sender_name, mentions_self,
-                        sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        sticker_json, expire_seconds, expire_start_at, expire_at, server_guid,
+                        admin_deleted
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL)",
+                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL, ?23)",
                     params![
                             record.id,
                             record.account_id,
@@ -3621,6 +3622,10 @@ impl Store {
                             record.sticker.as_ref().map(
                                 |sticker| serde_json::to_string(sticker).expect("sticker json")
                             ),
+                            // The 1.33 tombstone (contract 1.81 §4.38): the
+                            // batch writer lands the importer's flag beside
+                            // the intact row, exactly the live posture.
+                            i64::from(record.admin_deleted),
                         ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
