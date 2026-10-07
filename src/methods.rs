@@ -223,6 +223,17 @@ pub const METHODS: &[MethodRow] = &[
     ("backups.exportFile.open", Lane::Read, false, "read"),
     ("backups.exportFile.readChunk", Lane::Read, false, "read"),
     ("backups.exportFile.closeHandle", Lane::Read, false, "read"),
+    // Official-desktop snapshot import (contract revision 1.78, §4.68): the
+    // engine consumes an official Signal Desktop snapshot directory and
+    // produces the §4.38 archive. The start face is account-mutating state
+    // (the engine's own per-account import gate), so it rides the send lane
+    // behind the reaction-class write-lane mutex and delete barrier — the
+    // backups.export class verbatim; the status poll is a bounded read.
+    // Advertised through the existing `history-import` tag (no new capability
+    // bit: the face's entire output is the history-import archive and
+    // ledger).
+    ("backups.importSnapshot", Lane::Send, true, "accounts"),
+    ("backups.importSnapshotStatus", Lane::Read, false, "read"),
     // Report spam (contract revision 1.49, §4.48): mutating, send-lane
     // upstream traffic — the groups class verbatim, same-account mutex and
     // delete barrier included; advertised through `report-spam`. Zero local
@@ -354,7 +365,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (the `running` `progress` object plus the `history.importRetry` manual
 /// retry face; no new capability bit, so a 1.39-aware desktop keeps gating
 /// on the same tag) and by revision 1.57 (the `history.attachmentDownload`
-/// transit byte chain; the same no-new-bit discipline) —
+/// transit byte chain; the same no-new-bit discipline) and by revision 1.78
+/// (the `backups.importSnapshot` / `backups.importSnapshotStatus`
+/// official-desktop snapshot import faces — the face's entire output is the
+/// history-import archive and ledger) —
 /// `disappearing-messages`
 /// (contract revision 1.42) marks the §4.41 receive metadata, timer-notice
 /// and bounded-sweep faces plus `conversations.setExpireTimer`, and
@@ -460,6 +474,7 @@ mod tests {
             "backups.exportFile.open",
             "backups.exportFile.readChunk",
             "backups.exportFile.closeHandle",
+            "backups.importSnapshotStatus",
             "calls.getState",
             "accounts.getUsername",
             "username.lookup",
@@ -497,6 +512,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "backups.importSnapshot",
             "history.importRetry",
             "history.attachmentDownload",
             "attachments.download",
@@ -541,6 +557,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "backups.importSnapshot",
             "history.importRetry",
             "history.attachmentDownload",
             "attachments.download",

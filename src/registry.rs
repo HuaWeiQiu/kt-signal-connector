@@ -1184,6 +1184,26 @@ impl ProxyGroupRuntime {
         slot.supervisor.export_backup_status(account_id).await
     }
 
+    /// backups.importSnapshot / backups.importSnapshotStatus (contract
+    /// revision 1.78, §4.68): account-addressed, routed to the owning group's
+    /// supervisor like every account-scoped face — the start face's watcher
+    /// and the produced archive live with the account's group.
+    pub async fn import_local_snapshot(
+        &self,
+        account_id: &str,
+        snapshot_dir: &str,
+    ) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor
+            .import_local_snapshot(account_id, snapshot_dir)
+            .await
+    }
+
+    pub async fn import_snapshot_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.import_snapshot_status(account_id).await
+    }
+
     /// backups.exportFile.open: account-addressed — the snapshot lives in the
     /// owning group's engine data directory, so the owning group resolves it.
     pub async fn export_file_open(

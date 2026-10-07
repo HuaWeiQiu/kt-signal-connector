@@ -163,6 +163,12 @@ pub const MAX_ATTACHMENT_ID_BYTES: usize = 128;
 /// messageId, clientRequestId, operationId, peerKey, peerTitle, query,
 /// groupKey — the schema's opaqueId family and its inline 128 peers).
 pub const MAX_OPAQUE_ID_BYTES: usize = 128;
+/// backups.importSnapshot's snapshotDir bound (contract revision 1.78,
+/// §4.68): the caller-chosen official snapshot directory path, 1..4096 bytes
+/// and absolute. The connector never dereferences the path — the engine is
+/// the only reader — so this shape gate is the connector's entire local
+/// enforcement; it fails closed before any engine traffic.
+pub const MAX_SNAPSHOT_DIR_BYTES: usize = 4096;
 /// The receipt selection cap (contract revision 1.34, §4.29): both the
 /// absent-`messageIds` scan and an explicit list are bounded at 512 incoming
 /// rows — the schema declares the same bound as the early shape guard, this
@@ -418,6 +424,40 @@ impl ServiceError {
                     "BACKUP_IO_FAILED" => ApiError::new(
                         "BACKUP_IO_FAILED",
                         "the backup export hit a filesystem failure",
+                        true,
+                    ),
+                    // §4.68 official-desktop snapshot import (engine backup
+                    // contract): the import-task faces pass through under
+                    // their own literals. MISSING/METADATA_INVALID/
+                    // KEY_MISMATCH are deterministic answers about the named
+                    // snapshot (absent, failed the strict official metadata
+                    // verification, belongs to another account);
+                    // ALREADY_RUNNING is the engine's per-account import
+                    // gate (poll backups.importSnapshotStatus instead);
+                    // IO_FAILED is a transient disk condition.
+                    "BACKUP_IMPORT_ALREADY_RUNNING" => ApiError::new(
+                        "BACKUP_IMPORT_ALREADY_RUNNING",
+                        "a snapshot import task is already running for this account",
+                        false,
+                    ),
+                    "BACKUP_SNAPSHOT_MISSING" => ApiError::new(
+                        "BACKUP_SNAPSHOT_MISSING",
+                        "the snapshot directory does not exist or holds no metadata",
+                        false,
+                    ),
+                    "BACKUP_SNAPSHOT_METADATA_INVALID" => ApiError::new(
+                        "BACKUP_SNAPSHOT_METADATA_INVALID",
+                        "the snapshot metadata failed the strict official verification",
+                        false,
+                    ),
+                    "BACKUP_SNAPSHOT_KEY_MISMATCH" => ApiError::new(
+                        "BACKUP_SNAPSHOT_KEY_MISMATCH",
+                        "the snapshot belongs to a different Signal account",
+                        false,
+                    ),
+                    "BACKUP_SNAPSHOT_IO_FAILED" => ApiError::new(
+                        "BACKUP_SNAPSHOT_IO_FAILED",
+                        "the snapshot import hit a filesystem failure",
                         true,
                     ),
                     // §4.66 username write face (contract 1.75, engine
@@ -3226,6 +3266,46 @@ impl ConnectorService {
     pub fn prepare_backups_account(&self, account_id: &str) -> Result<String, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         Ok(self.resolve_account(account_id)?.signal_account)
+    }
+
+    /// backups.importSnapshot (contract revision 1.78, §4.68): resolve the
+    /// account and gate the snapshot directory's shape. The directory rides
+    /// verbatim — the connector never dereferences it, the engine is the only
+    /// reader — so the shape gate (absolute, 1..4096 bytes) is the connector's
+    /// entire local enforcement and fails closed before any engine traffic.
+    /// Same-machine path handoff, the §4.46 artifact run in reverse. The mode
+    /// seam is the tail of the ladder (validation precedes it, the §4.67
+    /// precedent): the face rides the kt-engine-only `history-import`
+    /// capability — no new bit.
+    pub fn prepare_import_snapshot(
+        &self,
+        account_id: &str,
+        snapshot_dir: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if snapshot_dir.is_empty()
+            || snapshot_dir.len() > MAX_SNAPSHOT_DIR_BYTES
+            || !std::path::Path::new(snapshot_dir).is_absolute()
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "snapshotDir must be an absolute path of 1..4096 bytes",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({
+                "account": account.signal_account,
+                "snapshotDir": snapshot_dir,
+            })),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "official snapshot import requires the kt-engine mode",
+                false,
+            ))),
+        }
     }
 
     /// conversations.getAvatar (contract revision 1.48, §4.47): bounds +
@@ -6811,6 +6891,23 @@ pub struct BackupsExportParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupsExportStatusParams {
+    pub account_id: String,
+}
+
+/// backups.importSnapshot / backups.importSnapshotStatus (contract revision
+/// 1.78, §4.68): the official-desktop snapshot import faces. snapshot_dir is
+/// the caller-chosen absolute directory path, forwarded verbatim — the
+/// connector never dereferences it, the engine is the only reader.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsImportSnapshotParams {
+    pub account_id: String,
+    pub snapshot_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsImportSnapshotStatusParams {
     pub account_id: String,
 }
 

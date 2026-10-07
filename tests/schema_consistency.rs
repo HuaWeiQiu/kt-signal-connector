@@ -39,7 +39,7 @@ use kt_signal_connector::service::{
     MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_OPAQUE_ID_BYTES,
     MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES,
-    MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
+    MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
     MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_TEXT_BYTES,
     REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
     STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
@@ -729,6 +729,16 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesSendStoryParams/properties/recipients/items",
             "maxLength",
             MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        // Official-desktop snapshot import (contract 1.78, §4.68): the
+        // caller-chosen directory path is shape-gated by the connector
+        // (absolute, 1..4096 bytes) before any engine traffic — the connector
+        // never dereferences it. The account id rides the shared opaqueId
+        // `$ref`, whose bound is already paired above — no second pair.
+        (
+            "/$defs/backupsImportSnapshotParams/properties/snapshotDir",
+            "maxLength",
+            MAX_SNAPSHOT_DIR_BYTES as u64,
         ),
     ];
     assert!(!pairs.is_empty());

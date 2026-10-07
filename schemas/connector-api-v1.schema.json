@@ -106,6 +106,8 @@
             "backups.exportFile.open",
             "backups.exportFile.readChunk",
             "backups.exportFile.closeHandle",
+            "backups.importSnapshot",
+            "backups.importSnapshotStatus",
             "calls.sendSignal",
             "calls.getState",
             "messages.sendStory",
@@ -858,6 +860,30 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/backupsExportFileCloseHandleParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.importSnapshot" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsImportSnapshotParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "backups.importSnapshotStatus" }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsImportSnapshotStatusParams" }
             }
           }
         },
@@ -2343,6 +2369,30 @@
         }
       }
     },
+    "backupsImportSnapshotParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "snapshotDir"],
+      "description": "Import an official Signal Desktop local-backup snapshot for the account (contract revision 1.78, §4.68, capability history-import — no new capability bit): the counterpart of backups.export — the official desktop writes SignalBackups/signal-backup-<UTC ts>/{metadata, main, files/}, the desktop picks the directory through its own OS folder dialog, and the connector forwards the path to the engine, which verifies the snapshot metadata strictly (version 1, 12-byte IV, 16-byte encryptedId, CTR-decrypted backupId compared byte-for-byte against the account's keys) and decrypts main with the official FramesReader (HMAC tail verified end to end), producing the §4.38 history-import NDJSON the existing import pass consumes. snapshotDir is the caller-chosen absolute directory path; a relative path answers INVALID_REQUEST before any engine traffic — the connector never dereferences it, the engine is the only reader. One import task per account at a time; a duplicate start answers BACKUP_IMPORT_ALREADY_RUNNING (poll backups.importSnapshotStatus instead). The call is account-scoped mutating, so an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and never retries. Result {status: 'started'}; progress and the terminal state come from backups.importSnapshotStatus, and the watcher drives the §4.38 ledger row. Engine structured codes pass through verbatim: BACKUP_SNAPSHOT_MISSING, BACKUP_SNAPSHOT_METADATA_INVALID, BACKUP_SNAPSHOT_KEY_MISMATCH (retryable=false), BACKUP_SNAPSHOT_IO_FAILED (retryable=true), BACKUP_IMPORT_ALREADY_RUNNING (retryable=false). Wire-frame registration lands with the connector implementation batch (§4.68 plan); see backupsExportParams for the producing face.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "snapshotDir": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "description": "Absolute path of the official desktop snapshot directory (a signal-backup-<UTC ts> directory holding metadata and main); length bounded in bytes, 1..4096; relative paths are refused by the connector before any engine traffic."
+        }
+      }
+    },
+    "backupsImportSnapshotStatusParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Poll the engine's official-desktop snapshot import task (contract revision 1.78, §4.68, capability history-import): the engine's status projection verbatim minus the raw account echo — {state: idle|running|completed|failed, ndjsonPresent, startedAtMs?, finishedAtMs?, lines?, frames?, error?} with absent keys omitted rather than zero-filled; lines counts projected NDJSON rows (recipient+chat+message), frames counts archive frames including the BackupInfo meta-frame, and ndjsonPresent is the disk truth. An engine that is down or an indeterminate read degrades to the disk-truth idle projection ({state: idle, ndjsonPresent: <the archive's real disk presence>}) rather than inventing a state (the §4.46 disk-truth posture): an engine restart resets the engine-side state to idle while the produced NDJSON stays. Desktops poll while running; deliberately no push event (§4.38 precedent). Wire-frame registration lands with the connector implementation batch (§4.68 plan); see backupsImportSnapshotParams.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "backupsExportParams": {
       "type": "object",
       "additionalProperties": false,
@@ -2815,6 +2865,10 @@
             "BACKUP_SNAPSHOT_EXISTS",
             "BACKUP_IO_FAILED",
             "BACKUP_SNAPSHOT_MISSING",
+            "BACKUP_IMPORT_ALREADY_RUNNING",
+            "BACKUP_SNAPSHOT_METADATA_INVALID",
+            "BACKUP_SNAPSHOT_KEY_MISMATCH",
+            "BACKUP_SNAPSHOT_IO_FAILED",
             "REPORT_SPAM_FAILED",
             "PROFILE_UPLOAD_FAILED",
             "USERNAME_TAKEN",

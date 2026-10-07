@@ -5,7 +5,27 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.79 (2026-10-08; the history-import group-update
+- Contract revision: 1.80 (2026-10-08; the official-desktop local-backup
+  snapshot import opening (§4.68): the host surface grows two methods —
+  `backups.importSnapshot` and `backups.importSnapshotStatus` — that hand a
+  user-selected official Signal Desktop snapshot directory (`metadata` + `main`
+  under `SignalBackups/signal-backup-<ts>/`) to the engine's new
+  `backup.importSnapshot` face (engine backup-export-contract §11). The engine
+  verifies the snapshot's metadata against the account's own key material
+  (version, IV shape, and the CTR-decrypted backupId compared byte-for-byte —
+  a foreign account's snapshot is refused before any decryption work), then in
+  the background decrypts `main` through the official `FramesReader` and
+  streams the same NDJSON projection the link-time transfer archive lands at
+  (`history-import.ndjson`, atomic tmp+rename). The connector watches the
+  engine's status to a terminal state and then drives the *existing* §4.38
+  import pass on the produced archive — one store ledger row, the same
+  `history.importStatus`/`history.importRetry` faces, no new capability bit
+  (rides `history-import`, kt-engine only). Engine structured codes
+  (BACKUP_SNAPSHOT_MISSING / BACKUP_SNAPSHOT_METADATA_INVALID /
+  BACKUP_SNAPSHOT_KEY_MISMATCH / BACKUP_SNAPSHOT_IO_FAILED /
+  BACKUP_IMPORT_ALREADY_RUNNING) pass through verbatim as retryable=false
+  except the IO face (retryable=true). No schema store version change) —
+  previously 1.79 (2026-10-08; the history-import group-update
   notice opening (§4.38): the engine NDJSON archive's per-message
   `groupUpdate` face now lands as the same system row a live group
   update does — 「群聊信息已更新」 with the `is_group_update` rich flag
@@ -4484,6 +4504,86 @@ caller-computed expansion forwarded verbatim and the prepare ladder
 owns the cap). The real-sidecar smoke grows the `sendStory` arm (the
 fake's `{timestamp, results: []}` shape asserted).
 
+### 4.68 Official-desktop snapshot import: `backups.importSnapshot`, `backups.importSnapshotStatus` (contract revision 1.80, 2026-10-08)
+
+The counterpart of §4.46 (the engine *produces* Android-restorable snapshots;
+this face makes the engine *consume* official Signal Desktop snapshots). The
+official desktop writes local backups under
+`SignalBackups/signal-backup-<yyyy-MM-dd-HH-mm-ss>/{metadata, main, files/}`;
+the desktop picks the directory (its own OS folder dialog), the connector
+forwards the path to the engine (the same-machine path handoff the §4.46
+artifact runs in reverse), and the engine answers with the §4.38 NDJSON the
+existing import pass already consumes. Anchors (AGPL read-only, zero copy):
+`ts/services/backups/index.preload.ts:572-595` (`importLocalBackup`) and
+`ts/services/backups/util/localBackup.node.ts` (`verifyLocalBackupMetadata`) —
+strict metadata verification (version 1, 12-byte IV, 16-byte encryptedId,
+CTR-decrypted backupId compared byte-for-byte) then the official
+`FramesReader` decrypt of `main` (HMAC tail verified end to end).
+
+- **`backups.importSnapshot`** `{accountId, snapshotDir}` →
+  `{status: "started"}`. `snapshotDir` is the caller-chosen absolute
+  directory path (1..4096 bytes; a relative path answers INVALID_REQUEST
+  before any engine traffic — the connector never dereferences it, the
+  engine is the only reader). The account resolution and engine-mode gate
+  ride the §4.38 faces: JVM/native answers CAPABILITY_UNAVAILABLE
+  (retryable=false, capability `history-import` — no new capability bit).
+  The engine call is Mutating, so an indeterminate outcome answers
+  SEND_OUTCOME_UNKNOWN and never retries (the engine's own per-account
+  import gate makes a duplicate start fail-closed with
+  BACKUP_IMPORT_ALREADY_RUNNING). Engine structured codes pass through
+  verbatim (`-1` + message): BACKUP_SNAPSHOT_MISSING,
+  BACKUP_SNAPSHOT_METADATA_INVALID, BACKUP_SNAPSHOT_KEY_MISMATCH (all
+  retryable=false), BACKUP_SNAPSHOT_IO_FAILED (retryable=true),
+  BACKUP_IMPORT_ALREADY_RUNNING (retryable=false). Param-face failures
+  (unknown account, missing/empty/relative/too-long snapshotDir) answer
+  INVALID_REQUEST `-32603`-class per the host boundary.
+- **`backups.importSnapshotStatus`** `{accountId}` → the engine's status
+  projection verbatim minus the raw account echo (`accountId` rides in its
+  place, the §4.46 precedent): `{state: idle|running|completed|failed,
+  ndjsonPresent, startedAtMs?, finishedAtMs?, lines?, frames?, error?}`.
+  `lines` counts projected NDJSON rows (recipient+chat+message), `frames`
+  counts archive frames including the BackupInfo meta-frame, absent keys
+  are omitted rather than zero-filled, and `ndjsonPresent` is the disk
+  truth (an engine restart resets the engine-side state to idle while the
+  produced NDJSON stays). Read lane; an engine that is down or an
+  indeterminate read degrades to the disk-truth idle projection
+  (`{state: "idle", ndjsonPresent: <the archive's real disk presence>}`)
+  rather than inventing a state (the §4.46 disk-truth posture).
+- **The consumption watcher**: on a definite `started` the connector spawns
+  a per-account watcher that polls the engine status (~3s, 30-minute
+  ceiling) and on a terminal state drives the §4.38 import pass directly —
+  `completed` constructs the import job immediately (bypassing the
+  link-time probe's completed/attempts gates on purpose: this is an
+  explicit user request, not a link-time sweep), reusing the group's
+  single-flight import slot; `failed` (or the ceiling/expired-idle escape)
+  lands an honest failed ledger row with `error_class = "engine"` so
+  `history.importStatus` renders the failure and `history.importRetry`
+  answers NO_ARCHIVE (the archive never landed) — the desktop re-invokes
+  `backups.importSnapshot` to try again, exactly the official Retry
+  semantics. The store ledger row, the masked status face, and the
+  retention convergence are the §4.38 faces unchanged.
+- **Lane/capability**: `backups.importSnapshot` is send lane,
+  account-scoped mutating; `backups.importSnapshotStatus` is read. The
+  capability set does not grow: the face rides `history-import` (kt-engine
+  only) because its entire output is the history-import archive and its
+  ledger. The schema request surface grows the two method enum entries,
+  the two dispatch literals, and the two params defs; no schema store
+  version change.
+
+Tests: the supervisor engine-mode test rides the fixture's new
+`backup.importSnapshot`/`backup.importSnapshotStatus` arms
+(`snapshot_import_happy_chain_lands_store_rows` — started → watcher →
+engine completed → the NDJSON import pass writes real message rows under
+the §4.38 dedupe keys; `snapshot_import_structured_codes_pass_through` —
+the five engine codes ride the wire verbatim with the mapped retryability;
+`snapshot_import_param_gates_and_mode_seam` — relative/empty/oversized
+snapshotDir fail closed before any engine traffic and JVM/native answers
+CAPABILITY_UNAVAILABLE; `snapshot_import_engine_failure_lands_honest_row`
+— the engine's failed status lands a failed ledger row whose retry
+answers NO_ARCHIVE). The schema consistency pair grows the snapshotDir
+bound (1..4096); the account id rides the shared opaqueId `$ref`, whose
+bound is already paired.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -4805,6 +4905,18 @@ a full-archive shadow. Engine-side dependency registered for the engine's S3 tas
 does not yet project recipient service identity (`aci`/`e164`/`masterKey`), so against the
 current engine build a run completes with every chat skip-counted; the connector consumes the
 fields the moment the engine adds them (no further connector change).
+
+**Contract revision 1.80 (2026-10-08) adds the manual snapshot arm (§4.68)**: the same import
+pass is now reachable without a phone at all — the desktop hands the engine a user-selected
+official Signal Desktop snapshot directory (`backups.importSnapshot`), the engine verifies it
+against the account's own key material and streams the same `history-import.ndjson`, and the
+connector drives the identical §4.38 pass (one ledger row, the same
+`history.importStatus`/`history.importRetry` faces, the same retention bounds and dedupe keys).
+The §4.38 honesty rules are inherited whole: the engine's failure modes land as failed rows with
+`error_class = "engine"` and the retry face answers NO_ARCHIVE until a snapshot is imported
+again. What this restores is bounded by the same §7.1.1 retention bounds as every other stored
+message — "what the official desktop backed up, to the connector's normal retention bounds",
+not a full-archive shadow.
 
 ### 6.7 Media limitation
 

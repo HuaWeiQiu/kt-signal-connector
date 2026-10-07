@@ -29,23 +29,23 @@ use crate::service::{
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
     BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
-    CallsGetStateParams, CallsSendSignalParams, ContactsListParams, ContactsSetLocalAliasParams,
-    ContactsSyncParams, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
-    ConversationsGetPinnedParams, ConversationsListParams, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams,
-    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
-    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessageRequestParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
-    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, CallsGetStateParams,
+    CallsSendSignalParams, ContactsListParams, ContactsSetLocalAliasParams, ContactsSyncParams,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetPinnedParams, GroupsApproveJoinRequestsParams, GroupsGetParams,
+    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
+    HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams, LinkSessionParams, LinkStartParams,
+    MessageGetTextParams, MessageRequestParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
+    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesSetDisabledParams,
     UsernameLookupParams,
 };
@@ -1283,6 +1283,43 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid backups.exportFile.closeHandle params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.importSnapshot" => {
+            match serde_json::from_value::<BackupsImportSnapshotParams>(request.params) {
+                Ok(params) => {
+                    match runtime
+                        .import_local_snapshot(&params.account_id, &params.snapshot_dir)
+                        .await
+                    {
+                        Ok(result) => HostResponse::success(request_id, result),
+                        Err(error) => HostResponse::failure(request_id, error.into_api()),
+                    }
+                }
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.importSnapshot params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.importSnapshotStatus" => {
+            match serde_json::from_value::<BackupsImportSnapshotStatusParams>(request.params) {
+                Ok(params) => match runtime.import_snapshot_status(&params.account_id).await {
+                    Ok(status) => HostResponse::success(request_id, status),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.importSnapshotStatus params",
                         false,
                     ),
                 ),

@@ -35,6 +35,11 @@ if os.environ.get("KT_FAKE_EXPECT_NO_JAVA") is not None:
 LINKED_ACCOUNT = "+15555550100"
 ACTIVE_LINK_URI = "sgnl://link?uuid=fixture&pub_key=fixture"
 WRITE_LOCK = threading.Lock()
+# §4.68 snapshot-import fixture: the archive identity the background import
+# task projects into the §4.38 NDJSON (one contact recipient + one chat + two
+# messages), matching the seed shape tests/history_import.rs lays out.
+IMPORT_ALICE_ACI = "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b"
+IMPORT_ALICE_E164 = "+15550000001"
 # Contract 1.36 pin-sync fixture state: the cloud-order pinned list the
 # engine would read from the storage record; setConversationPinned mutates it
 # in place so a read-back after a write observes the write.
@@ -1595,6 +1600,124 @@ for line in sys.stdin:
                 "artifactPresent": False,
                 "snapshots": snapshots,
             }
+    elif method == "backup.importSnapshot":
+        # §4.68 snapshot-import face: the engine consumes the caller-chosen
+        # official snapshot directory. The directory string is the steering
+        # channel — sentinel substrings pick the structured-error ladder; the
+        # happy path answers `started` immediately and a background thread
+        # writes the §4.38 NDJSON archive, with a `.fixture-import-running`
+        # marker holding the status polls in `running` (the export pattern).
+        snapshot_dir = params.get("snapshotDir") or ""
+        account_dir = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    account_dir = SIGNAL_DATA_DIR / entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            account_dir = None
+        if account_dir is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        import_error = None
+        if "[fixture-snapshot-missing]" in snapshot_dir:
+            import_error = "BACKUP_SNAPSHOT_MISSING"
+        elif "[fixture-snapshot-metadata-invalid]" in snapshot_dir:
+            import_error = "BACKUP_SNAPSHOT_METADATA_INVALID"
+        elif "[fixture-snapshot-key-mismatch]" in snapshot_dir:
+            import_error = "BACKUP_SNAPSHOT_KEY_MISMATCH"
+        elif "[fixture-io-failed]" in snapshot_dir:
+            import_error = "BACKUP_SNAPSHOT_IO_FAILED"
+        elif "[fixture-import-running]" in snapshot_dir:
+            import_error = "BACKUP_IMPORT_ALREADY_RUNNING"
+        if import_error is not None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": import_error},
+            }
+            emit_json(response)
+            continue
+
+        def run_import_task(account_dir=account_dir, snapshot_dir=snapshot_dir, running_marker=None):
+            time.sleep(0.2)
+            if "[fixture-import-fails-later]" in snapshot_dir:
+                (SIGNAL_DATA_DIR / ".fixture-import-failed").touch()
+            else:
+                recipient = (
+                    '{"type":"recipient","id":1,"kind":"contact","name":"Alice Import",'
+                    '"aci":"' + IMPORT_ALICE_ACI + '","e164":"' + IMPORT_ALICE_E164 + '"}'
+                )
+                chat = '{"type":"chat","id":10,"recipientId":1}'
+                incoming = (
+                    '{"type":"message","chatId":10,"authorId":1,"dateSent":1000,'
+                    '"direction":"incoming","text":"archived hello"}'
+                )
+                outgoing = (
+                    '{"type":"message","chatId":10,"authorId":1,"dateSent":2000,'
+                    '"direction":"outgoing","text":"archived reply"}'
+                )
+                (account_dir / "history-import.ndjson").write_text(
+                    recipient + "\n" + chat + "\n" + incoming + "\n" + outgoing + "\n"
+                )
+            if running_marker is not None:
+                running_marker.unlink(missing_ok=True)
+
+        running_marker = SIGNAL_DATA_DIR / ".fixture-import-running"
+        running_marker.touch()
+        threading.Thread(
+            target=run_import_task, kwargs={"running_marker": running_marker}, daemon=True
+        ).start()
+        result = {"status": "started"}
+    elif method == "backup.importSnapshotStatus":
+        # §4.68 status face: the import-task registry is process memory,
+        # mirrored by the `.fixture-import-running` / `.fixture-import-failed`
+        # markers; `ndjsonPresent` is the archive's disk truth and the counts
+        # mirror the fixture archive's fixed shape (4 projected rows, 5 frames
+        # including the BackupInfo meta-frame).
+        account_dir = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    account_dir = SIGNAL_DATA_DIR / entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            account_dir = None
+        if account_dir is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        archive = account_dir / "history-import.ndjson"
+        ndjson_present = archive.is_file() and archive.stat().st_size > 0
+        if (SIGNAL_DATA_DIR / ".fixture-import-running").exists():
+            result = {"state": "running", "ndjsonPresent": ndjson_present}
+        elif (SIGNAL_DATA_DIR / ".fixture-import-failed").exists():
+            result = {
+                "state": "failed",
+                "ndjsonPresent": ndjson_present,
+                "error": "fixture import failed",
+            }
+        elif ndjson_present:
+            result = {
+                "state": "completed",
+                "ndjsonPresent": True,
+                "finishedAtMs": int(time.time() * 1000),
+                "lines": 4,
+                "frames": 5,
+            }
+        else:
+            result = {"state": "idle", "ndjsonPresent": False}
     elif method == "transfer.downloadStatus":
         # §4.38 progress face (contract 1.53): the real engine answers from an
         # in-process per-account download snapshot. The fixture mirrors that

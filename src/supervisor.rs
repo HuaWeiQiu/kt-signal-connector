@@ -4066,6 +4066,208 @@ impl RuntimeSupervisor {
         }))
     }
 
+    /// backups.importSnapshot (contract revision 1.78, §4.68): forward the
+    /// caller-chosen official snapshot directory to the engine's import task,
+    /// then arm the consumption watcher. The account resolution and engine-mode
+    /// gate ride the §4.38 faces (kt-engine only, capability `history-import`
+    /// — no new bit); the Mutating engine call answers SEND_OUTCOME_UNKNOWN on
+    /// an indeterminate outcome and never retries — the watcher still spawns so
+    /// an import that actually started is observed to its terminal state.
+    pub async fn import_local_snapshot(
+        self: &Arc<Self>,
+        account_id: &str,
+        snapshot_dir: &str,
+    ) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_import_snapshot(account_id, snapshot_dir, self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call("backup.importSnapshot", params, CallClass::Mutating)
+            .await
+        {
+            Ok(value) => {
+                if value.get("status").and_then(Value::as_str) == Some("started") {
+                    self.spawn_import_snapshot_watcher(account_id);
+                    Ok(json!({ "status": "started" }))
+                } else {
+                    Err(ServiceError::Api(ApiError::new(
+                        "UPSTREAM_PROTOCOL_ERROR",
+                        "backup.importSnapshot answered without a started status",
+                        true,
+                    )))
+                }
+            }
+            Err(EngineError::UnknownOutcome) => {
+                self.spawn_import_snapshot_watcher(account_id);
+                Err(ServiceError::Api(ApiError::new(
+                    "SEND_OUTCOME_UNKNOWN",
+                    "backup.importSnapshot outcome is unknown; poll backups.importSnapshotStatus",
+                    false,
+                )))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// backups.importSnapshotStatus (contract revision 1.78, §4.68): poll the
+    /// engine read-only and project the answer — the upstream `account` echo
+    /// is stripped and `accountId` rides in its place (the §4.46 precedent).
+    /// Read-only, so an engine that is down or an indeterminate read degrades
+    /// to the disk-truth idle projection rather than inventing a task state.
+    /// The mode gate sits first (the exportStatus launcher-capability
+    /// precedent): the face has no store fallback, its whole truth is the
+    /// engine's import task.
+    pub async fn import_snapshot_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        if !self.history_import_capable() {
+            return Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "official snapshot import requires the kt-engine mode",
+                false,
+            )));
+        }
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        let upstream = match self.running_engine().await {
+            Ok(engine) => Some(
+                engine
+                    .call(
+                        "backup.importSnapshotStatus",
+                        json!({ "account": signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await,
+            ),
+            // Engine down (or the read raced a crash): the produced NDJSON
+            // lives on disk — report the disk-truth projection rather than
+            // failing the poll. Read-only, so this is honest, not a guess.
+            Err(_) => None,
+        };
+        match upstream {
+            Some(Ok(result)) => Ok(import_snapshot_status_from_engine(account_id, result)),
+            Some(Err(EngineError::UnknownOutcome)) | None => {
+                let data_dir = self.config.data_dir.clone();
+                let account = account_id.to_string();
+                blocking_service(move || {
+                    Ok(import_snapshot_status_idle_projection(
+                        &data_dir,
+                        &account,
+                        &signal_account,
+                    ))
+                })
+                .await
+            }
+            Some(Err(error)) => Err(error.into()),
+        }
+    }
+
+    /// The §4.68 consumption watcher: poll the engine's import status (~3 s,
+    /// 30-minute ceiling) and on a terminal state drive the §4.38 import pass
+    /// directly — `completed` constructs the job immediately (bypassing the
+    /// link-time probe's completed/attempts gates on purpose: this is an
+    /// explicit user request, not a link-time sweep) under the group's
+    /// single-flight slot; `failed` or the expired-idle escape lands an honest
+    /// failed ledger row with the engine class. `history.importRetry` then
+    /// answers NO_ARCHIVE for that row — retry is re-invoking
+    /// backups.importSnapshot, the official Retry semantics.
+    fn spawn_import_snapshot_watcher(self: &Arc<Self>, account_id: &str) {
+        let supervisor = Arc::clone(self);
+        let account = account_id.to_string();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            // `completed` observed but the group slot busy: keep polling while
+            // the engine still reports it (its task registry is process
+            // memory) so a link-time pass holding the slot only delays the
+            // claim, never fakes a failure.
+            let mut completed_seen = false;
+            loop {
+                if started.elapsed() >= IMPORT_SNAPSHOT_CEILING {
+                    if !completed_seen {
+                        land_import_engine_failure(&supervisor.store, &account);
+                    }
+                    tracing::warn!(
+                        account_id = %account,
+                        "snapshot import watcher hit its ceiling"
+                    );
+                    return;
+                }
+                sleep(IMPORT_SNAPSHOT_POLL).await;
+                // A deleted account has no ledger row to land and nothing
+                // left to observe — exit quietly.
+                let signal_account = match supervisor
+                    .service
+                    .lock()
+                    .await
+                    .prepare_backups_account(&account)
+                {
+                    Ok(number) => number,
+                    Err(_) => return,
+                };
+                let engine = match supervisor.running_engine().await {
+                    Ok(engine) => engine,
+                    // The task registry is engine-process memory: a down
+                    // engine keeps polling within the ceiling in case the
+                    // process restarts around it.
+                    Err(_) => continue,
+                };
+                let status = engine
+                    .call(
+                        "backup.importSnapshotStatus",
+                        json!({ "account": signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await;
+                match status {
+                    Ok(status) => match status.get("state").and_then(Value::as_str) {
+                        Some("running") => continue,
+                        Some("completed") => {
+                            completed_seen = true;
+                            let Some(archive) = crate::history_import::archive_path(
+                                &supervisor.config.data_dir,
+                                &signal_account,
+                            ) else {
+                                land_import_engine_failure(&supervisor.store, &account);
+                                return;
+                            };
+                            let claimed = claim_and_run_history_import(
+                                Arc::clone(&supervisor.history_import_running),
+                                Arc::clone(&supervisor.history_import_holder),
+                                Arc::clone(&supervisor.store),
+                                HistoryImportJob {
+                                    account_id: account.clone(),
+                                    signal_account,
+                                    archive,
+                                },
+                            )
+                            .await;
+                            if claimed {
+                                return;
+                            }
+                            // Slot busy: the next tick retries while the
+                            // engine still reports completed.
+                        }
+                        Some("failed") => {
+                            land_import_engine_failure(&supervisor.store, &account);
+                            return;
+                        }
+                        // Expired-idle escape: the engine restarted and its
+                        // task registry lost the run — the import is gone.
+                        _ => {
+                            land_import_engine_failure(&supervisor.store, &account);
+                            return;
+                        }
+                    },
+                    // Read-only: every error flavor reads as "not yet
+                    // terminal" — keep polling within the ceiling.
+                    Err(_) => continue,
+                }
+            }
+        });
+    }
+
     /// Read-only view of the contacts cache; never triggers an upstream call.
     pub async fn list_contacts(
         &self,
@@ -4835,6 +5037,55 @@ async fn run_history_import(store: &Arc<Store>, job: &HistoryImportJob) {
             tracing::warn!(account_id = %job.account_id, "history import task died");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Official-desktop snapshot import plumbing (contract revision 1.78, §4.68).
+// ---------------------------------------------------------------------------
+
+/// The §4.68 consumption-watcher cadence: ~3 s polls, a 30-minute ceiling.
+const IMPORT_SNAPSHOT_POLL: Duration = Duration::from_secs(3);
+const IMPORT_SNAPSHOT_CEILING: Duration = Duration::from_secs(30 * 60);
+
+/// Land the watcher's honest failure row: an engine-side task failure, the
+/// expired-idle escape, or the ceiling. `begin` upserts the row (an account
+/// may never have had a link-time import), `complete` stamps the failed
+/// terminal state with the engine class so `history.importStatus` renders it
+/// and `history.importRetry` answers NO_ARCHIVE — retry is re-invoking
+/// backups.importSnapshot, the official Retry semantics.
+fn land_import_engine_failure(store: &Arc<Store>, account_id: &str) {
+    let _ = store.begin_history_import(account_id, crate::link::now_ms());
+    let _ = store.complete_history_import(
+        account_id,
+        "failed",
+        &crate::store::ImportCounters::default(),
+        Some("engine"),
+        crate::link::now_ms(),
+    );
+}
+
+/// The §4.68 status projection: the engine's answer verbatim minus the raw
+/// `account` echo, `accountId` riding in its place (the §4.46 precedent).
+fn import_snapshot_status_from_engine(account_id: &str, mut result: Value) -> Value {
+    if let Some(object) = result.as_object_mut() {
+        object.remove("account");
+        object.insert("accountId".to_owned(), json!(account_id));
+    }
+    result
+}
+
+/// The disk-truth degradation (the §4.46 posture): an engine that is down or
+/// an indeterminate read never invents a task state — idle plus the NDJSON
+/// presence the produced archive actually shows.
+fn import_snapshot_status_idle_projection(
+    data_dir: &Path,
+    account_id: &str,
+    signal_account: &str,
+) -> Value {
+    let present = crate::history_import::archive_path(data_dir, signal_account)
+        .map(|archive| crate::history_import::archive_ready(&archive))
+        .unwrap_or(false);
+    json!({ "accountId": account_id, "state": "idle", "ndjsonPresent": present })
 }
 
 /// §4.38: one bounded retention pass after a completed import, so the store
