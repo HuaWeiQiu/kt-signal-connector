@@ -80,8 +80,12 @@
   modes: the pinned signal-cli and the kt-engine receive faces still drop the
   sync on the wire today (the recorded §4.58 engine gap for the projection
   half); the consume path activates automatically the moment an engine ships
-  the projection — engine-repo work out of this batch's boundary; 1.72
-  has since landed above (the §4.62 receive half, the bodyRanges
+  the projection — engine-repo work out of this batch's boundary (the "still
+  drop" line is a write-time snapshot: the kt-engine projection has since
+  landed, engine `bbf3087` — the `syncMessage.messageRequestResponse`
+  receive projection — so kt-engine mode consumes live from that build on,
+  while the pinned signal-cli face still drops the sync, an upstream gap);
+  1.72 has since landed above (the §4.62 receive half, the bodyRanges
   pass-through batch — its entry tops the chain)) —
   previously 1.69 (2026-10-06; §4.62 — the send-side text-formatting
   face opens: `messages.sendText` gains an optional `textStyle:
