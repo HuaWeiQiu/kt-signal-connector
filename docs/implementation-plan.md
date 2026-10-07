@@ -5,7 +5,32 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.75 (2026-10-08; the username write-face opening —
+- Contract revision: 1.76 (2026-10-08; the stories batch — the send face
+  `messages.sendStory` opens on the kt-engine arm (the engine's
+  `sendStory` KT extension method, engine compat §3): a rowless send —
+  no clientRequestId, no pending settlement, the synchronous
+  `{timestamp, results}` projection is the whole answer, an
+  indeterminate outcome answers SEND_OUTCOME_UNKNOWN without retry;
+  `recipients` is the caller-computed expansion (1..1001 entries — the
+  desktop owns v1 list storage), `distributionListId` mirrors the
+  official isStoryDistributionId face fail-closed (absent = the My
+  story zero UUID, otherwise a strict 36-char UUID lowercased),
+  `textStyle` is the official TextDisplayStyle vocabulary (DEFAULT =
+  the key omitted), `bodyRanges` ride the §4.62 face verbatim,
+  `previewImage` a data URI within the avatar budget; JVM/native
+  answers CAPABILITY_UNAVAILABLE (retryable=false). The receive face:
+  story envelopes forward as the transient `story.received` event (the
+  bounded storyMessage projection verbatim — no row, no timeline
+  state, the desktop owns the story timeline), `dataMessage.storyReply`
+  rides a normal row's rich payload, and the stories-disabled gate
+  (the official getStoriesBlocked leg, default false) drops both
+  silently when the account opts out — `stories.setDisabled` /
+  `stories.getDisabled` are the connector-local toggle faces (store
+  meta KV, every mode answers). Capability `stories`; the schema event
+  enum grows `story.received` and the request surface grows three
+  params defs; no schema store version change (the toggle rides the
+  existing meta KV under schema 20)) —
+  previously 1.75 (2026-10-08; the username write-face opening —
   `accounts.setUsername`'s kt-engine arm comes alive as the engine's
   two-hop `usernameReserve`→`usernameConfirm` orchestration, with
   `deleteUsername` riding `usernameDelete` (§4.66; the engine's username
@@ -4246,6 +4271,112 @@ SEND_OUTCOME_UNKNOWN with exactly one reserve dispatch and no confirm
 hop (never retried; the explicit restart lands a fresh engine and the
 next set works), and the dispatch log pinning the hop order/payloads
 with the raw account id never riding the frame.
+
+### 4.67 Stories faces: `messages.sendStory`, the `story.received` event, the `stories.setDisabled`/`stories.getDisabled` toggle (contract revision 1.76, 2026-10-08)
+
+The connector's story faces open with the engine's stories batch (engine
+`docs/jsonrpc-compat.md` §3 send row and §5 Stories 发送批 — the KT
+extension `sendStory` with the official text-story construction, plus
+the receive side's envelope-level `storyMessage` /
+`dataMessage.storyReply` projection). Stories never touch the
+conversation stream in either direction: the send is rowless, the
+receive forwards as one transient event, and the connector keeps no
+story timeline — the desktop owns it.
+
+- **`messages.sendStory` (kt-engine face only)**: a rowless send — no
+  `clientRequestId`, no pending row, no settlement: prepare under the
+  service lock, one account-scoped mutating call, and the synchronous
+  `{timestamp, results}` projection is the whole answer (the story's
+  own timestamp is its upstream identity; a re-send is a new story). An
+  indeterminate outcome answers SEND_OUTCOME_UNKNOWN and nothing
+  retries (the §5 send discipline, rowless variant — there is no
+  pending row to settle). `recipients` is the caller-computed expansion
+  (1..1001 entries): the desktop owns v1 list storage — the official
+  desktop expands MY_STORY from its own connections minus exclusions
+  (`ts/util/sendStoryMessage.preload.ts:87-116`) and custom lists from
+  its own member tables — so the connector neither re-expands nor
+  filters. `distributionListId` mirrors the official
+  `isStoryDistributionId` face fail-closed: absent means the My-story
+  zero UUID, any other value must be a strict UUID and passes through
+  lowercased (`normalizeStoryDistributionId`); anything else is the
+  officially unreachable shape and answers INVALID_REQUEST before any
+  frame (the engine passes the id through without re-validating the
+  shape). `textStyle` is the official TextDisplayStyle vocabulary
+  (DEFAULT/REGULAR/BOLD/SERIF/SCRIPT/CONDENSED — DEFAULT means the key
+  is omitted from the frame), `bodyRanges` ride the §4.62 face verbatim
+  (≤64 entries), `previewImage` is a data URI within the avatar
+  budget, and `allowsReplies` is always explicit (default false).
+  Parameter failures surface twice: connector-side INVALID_REQUEST
+  before the frame, the engine's `-32603` beyond it — no new error
+  codes (per-recipient upstream failures fold into one upstream error,
+  the engine's discipline). The JVM/native faces answer
+  CAPABILITY_UNAVAILABLE (retryable=false — the pinned signal-cli has
+  no story face); validation outranks the mode seam.
+- **The receive face**: a story addresses no conversation, so the
+  envelope-level `storyMessage` projection routes with the
+  call-signaling posture — control-plane material, no row, no timeline
+  state. The bounded projection (the 3 MiB coarse material bound, the
+  call face's family) forwards verbatim as the transient
+  `story.received` event; an oversized or unusable face drops the whole
+  envelope (宁缺勿错). Delivery is at-least-once and the event is never
+  persisted: the desktop owns the story timeline and its retention (the
+  official 24h expiry is client-side) and dedupes by sender + timestamp
+  (the story's protocol identity). The `isStory` bit alone never routes
+  — the storyMessage face does; the sender's own linked-device sync
+  mirror is not this face (the `{timestamp, results}` answer is the
+  sender's local record).
+- **Story replies**: `dataMessage.storyReply` (`{authorAci,
+  sentTimestamp}` — both required) rides a regular conversation row's
+  rich payload (the §4.64 receive-formatting family, store schema 20
+  unchanged): a malformed reply drops the key, never the row. The same
+  stories-disabled gate faces it in both directions — a peer's reply
+  and the linked-device sync mirror alike drop before any conversation
+  or row exists; re-enabling stories re-receives nothing (the upstream
+  already considers it delivered).
+- **The toggle faces**: `stories.setDisabled`/`stories.getDisabled`
+  are the connector-local mirror of the official `getStoriesBlocked`
+  receive gate (itemStorage `hasStoriesDisabled`, default false —
+  stories enabled). Pure local store faces under the existing meta KV
+  (no migration, store schema 20 unchanged): setDisabled is an
+  account-state write with no engine frame, so it rides the send lane
+  behind the same-account mutex and delete barrier (the
+  `contacts.setLocalAlias` §4.9 precedent) and answers the stored truth
+  read back, not an echo of the request; getDisabled is a bounded
+  read. Every engine mode answers both.
+- **Lane/capability**: `messages.sendStory` and `stories.setDisabled`
+  are send lane, account-scoped mutating; `stories.getDisabled` is
+  read. The capability set grows `stories`. The schema event enum grows
+  `story.received` (data requires `accountId` + `story`; the optional
+  sender/senderAci/senderName/timestamp keys ride the envelope) and the
+  request surface grows the three params defs with the bounds pinned to
+  the constants; no schema store version change.
+
+Tests: the engine normalization pins the story faces
+(`story_envelopes_route_verbatim_and_oversized_skip` — the verbatim
+projection plus the oversized-envelope skip;
+`story_reply_parses_onto_rich_and_malformed_drops_key`); the service
+prepare face pins the gate order and the frame shapes
+(`send_story_preparation_gates_then_frames` — validation outranks the
+mode seam, the kt-engine lean/full frames, the JVM/native refusal;
+`stories_toggle_preparation_pins_account`) and the ingest gate
+(`story_ingest_gate_emits_or_drops_by_the_toggle` — the transient
+StoryReceived emission vs the silent drop, and the reply row surviving
+with its storyReply key intact). The supervisor engine-mode test rides
+the fixture's new `sendStory` arm
+(`story_faces_route_engine_send_and_local_toggle_in_engine_mode`): the
+toggle round-trip from the official default, the lean and full-option
+frames carrying the resolved signal account and never the store account
+id, the crash sentinel answering SEND_OUTCOME_UNKNOWN exactly once with
+no retry, the explicit restart landing a fresh engine, and the dispatch
+log pinning all four story dispatches. The schema consistency pairs
+grow the four story bounds (message↔MAX_TEXT_BYTES,
+distributionListId↔MAX_STORY_DISTRIBUTION_ID_CHARS,
+previewImage↔MAX_AVATAR_DATA_URI_CHARS, recipients
+items↔MAX_OPAQUE_ID_BYTES; the recipients maxItems cap stays
+inventory-side like the sibling roster faces — the array is the
+caller-computed expansion forwarded verbatim and the prepare ladder
+owns the cap). The real-sidecar smoke grows the `sendStory` arm (the
+fake's `{timestamp, results: []}` shape asserted).
 
 ## 5. signal-cli Boundary
 

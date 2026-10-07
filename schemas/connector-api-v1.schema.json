@@ -107,7 +107,10 @@
             "backups.exportFile.readChunk",
             "backups.exportFile.closeHandle",
             "calls.sendSignal",
-            "calls.getState"
+            "calls.getState",
+            "messages.sendStory",
+            "stories.setDisabled",
+            "stories.getDisabled"
           ]
         },
         "params": {
@@ -877,6 +880,39 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/callsGetStateParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendStory" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendStoryParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stories.setDisabled" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storiesSetDisabledParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stories.getDisabled" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storiesGetDisabledParams" }
             }
           }
         }
@@ -2361,6 +2397,94 @@
         "fileHandle": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "messagesSendStoryParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "message", "recipients"],
+      "description": "Post one story (contract revision 1.76, §4.67, capability stories) through the engine's sendStory face (engine compat §3). There is no clientRequestId and no conversation addressing: a story lands in no conversation row, so there is no pending settlement — the synchronous result is {timestamp, results: [{recipientNumber, success: {timestamp}}]} and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN without retry. recipients is the caller-computed expansion (1..1001 entries, each 1..128 chars): the desktop owns v1 list storage — the official desktop expands My story from its own connections minus exclusions and custom lists from its own member tables (ts/util/sendStoryMessage.preload.ts:87-116) — so the connector neither re-expands nor filters. distributionListId is the official isStoryDistributionId face mirrored fail-closed: absent means the official My story zero UUID (00000000-0000-0000-0000-000000000000), any other value must be a strict 36-char UUID and passes through lowercased (normalizeStoryDistributionId); anything else is the officially unreachable shape and answers INVALID_REQUEST. textStyle is the official TextDisplayStyle vocabulary (DEFAULT = the key omitted on the engine frame); bodyRanges ride the §4.62 write face verbatim (64-entry cap, unknown style fails closed). previewImage is a data URI within the avatar frame budget. JVM/native modes answer CAPABILITY_UNAVAILABLE (retryable=false): the pinned signal-cli has no story send face. Send lane, account-scoped mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "description": "Non-empty story body; the service authoritatively enforces at most 65536 UTF-8 bytes."
+        },
+        "recipients": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1001,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "One expanded recipient (phone number or UUID-shaped ACI); the caller-computed expansion is forwarded verbatim."
+          }
+        },
+        "distributionListId": {
+          "type": "string",
+          "minLength": 36,
+          "maxLength": 36,
+          "description": "Strict 36-char UUID (lowercased by the connector); absent = the official My story zero UUID."
+        },
+        "allowsReplies": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether peers may reply to the story; the key always rides the engine frame explicitly."
+        },
+        "textStyle": {
+          "type": "string",
+          "enum": ["DEFAULT", "REGULAR", "BOLD", "SERIF", "SCRIPT", "CONDENSED"],
+          "description": "The official TextDisplayStyle; DEFAULT (also the absent form) omits the key on the engine frame."
+        },
+        "bodyRanges": {
+          "type": "array",
+          "maxItems": 64,
+          "description": "The §4.62 text-style write face verbatim (the official bodyRanges): unknown style or more than 64 entries answer INVALID_REQUEST.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["style", "start", "length"],
+            "properties": {
+              "style": {
+                "type": "string",
+                "enum": ["BOLD", "ITALIC", "STRIKETHROUGH", "MONOSPACE", "SPOILER"]
+              },
+              "start": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+              "length": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+            }
+          }
+        },
+        "previewImage": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 13981080,
+          "description": "Optional story preview as a data URI within the avatar frame budget."
+        }
+      }
+    },
+    "storiesSetDisabledParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "disabled"],
+      "description": "Set the account's stories-disabled toggle (contract revision 1.76, §4.67, capability stories): the connector-side mirror of the official getStoriesBlocked receive gate (itemStorage hasStoriesDisabled, default false — stories enabled). Local store only — no engine frame exists and every engine mode answers; the toggle governs what this connector's receive path forwards (story envelopes and story replies drop silently while disabled; enabling again re-receives nothing — the upstream already considers it delivered). Result is the stored truth {disabled}, not an echo. Send lane, account-scoped mutating (the setLocalAlias precedent: an account-state write behind the same-account mutex and delete barrier).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "disabled": {
+          "type": "boolean",
+          "description": "true = drop incoming story material at the gate; false = forward it."
+        }
+      }
+    },
+    "storiesGetDisabledParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's stories-disabled toggle (contract revision 1.76, §4.67, capability stories): the read side of stories.setDisabled — store-only, an account with no stored state answers the official default {disabled: false}. Read lane.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "response": {
       "type": "object",
       "additionalProperties": false,
@@ -2403,7 +2527,8 @@
             "message.statusChanged",
             "message.viewOnceOpened",
             "message.expired",
-            "call.incoming"
+            "call.incoming",
+            "story.received"
           ]
         },
         "data": {
@@ -2593,6 +2718,52 @@
                   "payload": {
                     "type": "object",
                     "description": "The engine's projected signaling face verbatim: {opaque, urgency, destinationDeviceId} on the modern face, the projected frame under its own key (offer/answer/busy/hangup) or {iceUpdate: [...]} on the legacy faces. The connector never parses the RingRTC content."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "story.received" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "story"],
+                "description": "Inbound story (contract 1.76, §4.67, capability stories): the engine's envelope-level storyMessage projection (official Content.storyMessage=8 face) forwarded as a transient event — the connector keeps no story row and no timeline state, so a missed delivery or a connector restart loses the story view and nothing self-heals (the desktop owns the story timeline and its retention, the official receive face is equally un-queried past delivery). story is the bounded projection verbatim ({textAttachment{...}|fileAttachment, allowsReplies, profileKey?, group?}) — never parsed or re-shaped connector-side. sender/senderAci/senderName/timestamp are absent when the envelope did not carry them (a masked source stays absent, never guessed); the stories-disabled gate has already dropped the envelope when the account opted out (stories.setDisabled).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "sender": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The envelope source when the engine projected one (phone number or masked peer id)."
+                  },
+                  "senderAci": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The sender's ACI UUID (envelope sourceUuid) when present."
+                  },
+                  "senderName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The sender's profile/contact display name (envelope sourceName) when present."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The story envelope's Signal timestamp when the engine projected one; absent means the envelope carried none (the desktop keys dedup on sender+timestamp pairs it can pair)."
+                  },
+                  "story": {
+                    "type": "object",
+                    "description": "The engine's storyMessage projection verbatim — textAttachment (with optional text/textStyle/preview) or fileAttachment, plus allowsReplies and the optional profileKey/group context. The connector never parses the story body."
                   }
                 }
               }

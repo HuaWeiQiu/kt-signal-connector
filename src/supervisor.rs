@@ -30,18 +30,19 @@ use crate::service::{
     GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView,
-    MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
-    MessagesSendStickerParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
-    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, UsernameLookupEntry,
-    UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
-    identity_from_engine, pinned_conversations_result, sticker_pack_syncs_result,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest,
+    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StoriesDisabled, StoriesGetDisabledParams, StoriesSetDisabledParams, StorySendRecipientResult,
+    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_limit_error, blocked_conversations_result, identity_from_engine,
+    pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2010,6 +2011,80 @@ impl RuntimeSupervisor {
                 }
             },
         }
+    }
+
+    /// messages.sendStory (contract revision 1.76, §4.67): one bounded story
+    /// text out through the engine's `sendStory` face (engine compat §3
+    /// send batch). Stories live outside every conversation — no local row,
+    /// no `clientRequestId`, no pending settlement: prepare under the
+    /// service lock, one mutating call, and the answer is the upstream
+    /// truth projected (`story_from_engine`). An indeterminate mutating
+    /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried (the §5
+    /// send discipline, rowless variant — there is no pending row to
+    /// settle, and a story is idempotent upstream by its own timestamp).
+    pub async fn send_story(
+        &self,
+        params: MessagesSendStoryParams,
+    ) -> Result<StorySendResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let frame = {
+            let service = self.service.lock().await;
+            service.prepare_send_story(&params, self.config.mode)?
+        };
+        match engine.call("sendStory", frame, CallClass::Mutating).await {
+            Ok(result) => story_from_engine(&result),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// stories.setDisabled (contract revision 1.76, §4.67): the account's
+    /// stories-disabled toggle — the receive-gate mirror of the official
+    /// `getStoriesBlocked` leg. Local store only (no engine frame exists,
+    /// every engine mode answers): validation + account pin under the
+    /// service lock, then the meta-KV write on the blocking pool. The
+    /// result is the stored truth, not an echo of the request.
+    pub async fn set_stories_disabled(
+        &self,
+        params: StoriesSetDisabledParams,
+    ) -> Result<StoriesDisabled, ServiceError> {
+        {
+            let service = self.service.lock().await;
+            service.prepare_stories_set_disabled(&params)?;
+        }
+        let store = Arc::clone(&self.store);
+        let account_id = params.account_id;
+        let disabled = params.disabled;
+        blocking_service(move || {
+            store.set_stories_disabled(&account_id, disabled)?;
+            Ok(StoriesDisabled { disabled })
+        })
+        .await
+    }
+
+    /// stories.getDisabled (contract revision 1.76, §4.67): the same local
+    /// toggle, read side — an account with no stored state answers the
+    /// official default (stories enabled).
+    pub async fn get_stories_disabled(
+        &self,
+        params: StoriesGetDisabledParams,
+    ) -> Result<StoriesDisabled, ServiceError> {
+        {
+            let service = self.service.lock().await;
+            service.prepare_stories_get_disabled(&params)?;
+        }
+        let store = Arc::clone(&self.store);
+        let account_id = params.account_id;
+        blocking_service(move || {
+            Ok(StoriesDisabled {
+                disabled: store.stories_disabled(&account_id)?,
+            })
+        })
+        .await
     }
 
     /// Send one attachment (optionally with a caption) — implementation-plan
@@ -5557,6 +5632,45 @@ pub(crate) fn avatar_from_engine_for_tests(result: &Value) -> Result<AvatarDownl
     avatar_from_engine(result)
 }
 
+/// The `sendStory` engine answer projected (contract revision 1.76, §4.67):
+/// the story `timestamp` plus the per-recipient `results` list, projected
+/// entry for entry. The engine face is pinned — a missing or wrong-typed
+/// required key is a protocol defect, answered loudly rather than smoothed
+/// into a row-less send truth the desktop cannot reconcile; an entry count
+/// past the request cap is the same drift (a silently dropped entry would
+/// misreport one recipient's send state).
+fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
+    let timestamp = result
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let entries = result
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    if entries.len() > MAX_STORY_RECIPIENTS {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in entries {
+        results.push(StorySendRecipientResult {
+            recipient_number: entry
+                .get("recipientNumber")
+                .and_then(Value::as_str)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                .to_string(),
+            success: StorySendSuccess {
+                timestamp: entry
+                    .get("success")
+                    .and_then(|success| success.get("timestamp"))
+                    .and_then(Value::as_u64)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            },
+        });
+    }
+    Ok(StorySendResult { timestamp, results })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -7440,6 +7554,183 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.expire_timer_seconds, None);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// Contract 1.76 (§4.67): the kt-engine story send routes to the engine's
+    /// `sendStory` face — the frame carries the resolved signal account and
+    /// omits the default-keyed options (distributionListId absent = the
+    /// MY_STORY zero-UUID semantic, textStyle DEFAULT = the key absent,
+    /// allowsReplies always explicit); the crash sentinel answers
+    /// SEND_OUTCOME_UNKNOWN and is never retried (rowless discipline — there
+    /// is no pending row, the restart is explicit). The stories-disabled
+    /// toggle round-trips through the store from the official default
+    /// (enabled) in the same engine mode — the faces are mode-independent.
+    #[tokio::test]
+    async fn story_faces_route_engine_send_and_local_toggle_in_engine_mode() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.mode = crate::engine::SignalCliMode::KtEngine;
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        // The toggle round-trips from the official default (enabled).
+        let before = supervisor
+            .get_stories_disabled(crate::service::StoriesGetDisabledParams {
+                account_id: account.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(!before.disabled);
+        let set = supervisor
+            .set_stories_disabled(crate::service::StoriesSetDisabledParams {
+                account_id: account.id.clone(),
+                disabled: true,
+            })
+            .await
+            .unwrap();
+        assert!(set.disabled);
+        let after = supervisor
+            .get_stories_disabled(crate::service::StoriesGetDisabledParams {
+                account_id: account.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(after.disabled);
+        supervisor
+            .set_stories_disabled(crate::service::StoriesSetDisabledParams {
+                account_id: account.id.clone(),
+                disabled: false,
+            })
+            .await
+            .unwrap();
+
+        let story_params = |message: &str, full: bool| crate::service::MessagesSendStoryParams {
+            account_id: account.id.clone(),
+            message: message.to_string(),
+            recipients: vec!["+15555550101".into()],
+            distribution_list_id: full.then(|| "11111111-2222-3333-4444-555555555555".into()),
+            allows_replies: full,
+            text_style: full.then(|| "BOLD".to_string()),
+            body_ranges: full.then(|| {
+                vec![crate::service::SendTextStyleParams {
+                    style: "BOLD".to_string(),
+                    start: 0,
+                    length: 6,
+                }]
+            }),
+            preview_image: full.then(|| "data:image/png;base64,AAAA".to_string()),
+        };
+
+        // The default-shape send projects the lean frame and the fake's
+        // empty per-recipient list.
+        let story = supervisor
+            .send_story(story_params("fixture story body", false))
+            .await
+            .unwrap();
+        assert!(story.timestamp > 0);
+        assert!(story.results.is_empty(), "the fake answers the empty list");
+
+        // The full-option send carries every optional key.
+        let styled = supervisor
+            .send_story(story_params("styled", true))
+            .await
+            .unwrap();
+        assert!(styled.timestamp > 0);
+
+        // Crash with the mutating call in flight: SEND_OUTCOME_UNKNOWN,
+        // never retried; an explicit restart lands a fresh engine and the
+        // next send works.
+        let crash = supervisor
+            .send_story(story_params("fixture_story_crash.31", false))
+            .await
+            .unwrap_err();
+        assert!(matches!(crash, crate::service::ServiceError::Api(ref api)
+                if api.code == "SEND_OUTCOME_UNKNOWN" && !api.retryable));
+        supervisor.start().await.unwrap();
+        let recovered = supervisor
+            .send_story(story_params("after crash", false))
+            .await
+            .unwrap();
+        assert!(recovered.timestamp > 0);
+
+        // The dispatch log pins the frame shapes: the resolved signal
+        // account rides every story frame, the default-keyed options stay
+        // absent, the full-option frame carries them all, the crash sentinel
+        // dispatched exactly once (no retry), and the raw account id never
+        // rides any frame.
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatches");
+        let dispatches: Vec<serde_json::Value> = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let story_dispatches: Vec<&serde_json::Value> = dispatches
+            .iter()
+            .filter(|params| params.get("recipients").is_some())
+            .collect();
+        assert_eq!(story_dispatches.len(), 4, "three sends + the crash");
+        for dispatch in &story_dispatches {
+            assert_eq!(dispatch["account"], "+15555550100");
+            assert!(
+                dispatch.get("accountId").is_none(),
+                "the store account id never rides the frame"
+            );
+        }
+        let lean = story_dispatches
+            .iter()
+            .find(|params| params["message"] == "fixture story body")
+            .expect("the default-shape dispatch must land");
+        assert!(lean.get("distributionListId").is_none());
+        assert!(lean.get("textStyle").is_none());
+        assert!(lean.get("bodyRanges").is_none());
+        assert!(lean.get("previewImage").is_none());
+        assert_eq!(lean["allowsReplies"], false);
+        let full = story_dispatches
+            .iter()
+            .find(|params| params["message"] == "styled")
+            .expect("the full-option dispatch must land");
+        assert_eq!(
+            full["distributionListId"],
+            "11111111-2222-3333-4444-555555555555"
+        );
+        assert_eq!(full["textStyle"], "BOLD");
+        assert_eq!(full["allowsReplies"], true);
+        assert_eq!(full["bodyRanges"][0]["style"], "BOLD");
+        assert_eq!(full["bodyRanges"][0]["start"], 0);
+        assert_eq!(full["bodyRanges"][0]["length"], 6);
+        assert!(full.get("previewImage").is_some());
+        assert_eq!(
+            story_dispatches
+                .iter()
+                .filter(|params| params["message"] == "fixture_story_crash.31")
+                .count(),
+            1,
+            "an unknown sendStory outcome is never retried"
+        );
         supervisor.shutdown().await.unwrap();
     }
 }

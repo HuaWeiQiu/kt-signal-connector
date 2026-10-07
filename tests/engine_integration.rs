@@ -589,6 +589,30 @@ async fn kt_engine_sidecar_round_trips_over_the_engine_actor() {
         .expect("usernameDelete round-trips");
     assert_eq!(deleted, json!({}));
 
+    // Contract 1.76 (§4.67): the story send face round-trips over the
+    // engine actor — the write-back shape {timestamp, results}; the fake
+    // service answers the empty per-recipient list (the honest offline
+    // face).
+    let story = engine
+        .call(
+            "sendStory",
+            json!({
+                "account": "+15559990000",
+                "message": "smoke story",
+                "recipients": ["+15551112222"],
+                "allowsReplies": false,
+            }),
+            CallClass::Mutating,
+        )
+        .await
+        .expect("sendStory round-trips");
+    assert!(
+        story
+            .get("timestamp")
+            .is_some_and(serde_json::Value::is_u64)
+    );
+    assert_eq!(story.get("results"), Some(&json!([])));
+
     let sent = engine
         .call(
             "send",

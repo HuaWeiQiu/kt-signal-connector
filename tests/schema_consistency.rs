@@ -36,12 +36,14 @@ use kt_signal_connector::service::{
     GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES, GROUP_NAME_MAX_BYTES,
     IDENTITY_SAFETY_NUMBER_MAX_CHARS, MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES,
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES,
-    MAX_ATTACHMENT_ID_BYTES, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
-    MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
-    MAX_STICKER_PACK_KEY_CHARS, MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT,
-    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
-    USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES, USERNAME_MAX_WIRE_CHARS,
+    MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_OPAQUE_ID_BYTES,
+    MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES,
+    MAX_SEND_MENTIONS, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
+    MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_TEXT_BYTES,
+    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
+    USERNAME_MAX_WIRE_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -353,6 +355,12 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   the filesystem is touched) — are enforced by mechanism, not by a named
 ///   constant. The chunk ceiling (`CHUNK_BYTES` 262_144) is pinned by the
 ///   §4.46 integration test's `chunkBytes` assertion.
+/// - the §4.67 story recipient-array cap (contract 1.76,
+///   `MAX_STORY_RECIPIENTS` = 1001): the schema `maxItems` mirrors the
+///   §4.39 roster ceiling, but the pairing stays inventory-side like the
+///   story send's sibling faces — the array is the caller-computed
+///   expansion forwarded verbatim, the prepare ladder owns the cap, and
+///   the §4.67 unit tests pin both sides.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[
@@ -697,6 +705,30 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/identitiesVerifyParams/properties/safetyNumber",
             "maxLength",
             IDENTITY_SAFETY_NUMBER_MAX_CHARS as u64,
+        ),
+        // Stories send (contract 1.76, §4.67): the body/preview bounds and
+        // the per-recipient id bound mirror the prepare-ladder constants
+        // (the recipient-array cap mirrors the §4.39 roster ceiling but
+        // stays inventory-side — see the note below).
+        (
+            "/$defs/messagesSendStoryParams/properties/message",
+            "maxLength",
+            MAX_TEXT_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/distributionListId",
+            "maxLength",
+            MAX_STORY_DISTRIBUTION_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/previewImage",
+            "maxLength",
+            MAX_AVATAR_DATA_URI_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/recipients/items",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
         ),
     ];
     assert!(!pairs.is_empty());

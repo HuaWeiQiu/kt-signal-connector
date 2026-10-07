@@ -183,6 +183,31 @@ pub const MAX_SEND_ATTACHMENTS: usize = 32;
 /// receive projection cap mirrored — a `messages.sendText` `textStyle` array
 /// answers INVALID_REQUEST past 64 entries before any pending row exists.
 pub const MAX_SEND_TEXT_STYLES: usize = 64;
+/// Story recipients cap (contract revision 1.76, §4.67): the official
+/// GroupsV2 group-size ceiling (`MAX_GROUP_MEMBERS`) reused as the
+/// contacts-scale bound — one My-story send fans out to every contact, so
+/// the array answers INVALID_REQUEST past 1001 entries before any upstream
+/// frame exists, keeping the worst case inside one host frame.
+pub const MAX_STORY_RECIPIENTS: usize = 1001;
+/// Story distribution-list id bound (contract revision 1.76, §4.67): the
+/// canonical UUID wire length. The grammar below the wire bound — strict
+/// 8-4-4-4-12 hex, the official `isStoryDistributionId` face — is enforced
+/// connector-side and answers INVALID_REQUEST.
+pub const MAX_STORY_DISTRIBUTION_ID_CHARS: usize = 36;
+/// The official My-story id (contract revision 1.76, §4.67): the zero UUID,
+/// `MY_STORY_ID` in the official desktop (ts/types/Stories.std.ts:114-115,
+/// AGPL read-only anchor). An absent `distributionListId` means this id; any
+/// other valid UUID passes through verbatim (lowercased, the official
+/// `normalizeStoryDistributionId` behavior) as a desktop-owned custom list.
+pub const OFFICIAL_MY_STORY_ID: &str = "00000000-0000-0000-0000-000000000000";
+/// The story send's overall text style vocabulary (contract revision 1.76,
+/// §4.67): the six-value word list the engine face pins — the official
+/// `TextAttachment.Style` enum names (signal-desktop
+/// `ts/protobuf/SignalProto.ts` TextAttachment, AGPL read-only anchor).
+/// DEFAULT is the proto field omitted upstream, so the word maps to key
+/// absence on the engine frame.
+pub const STORY_TEXT_STYLES: [&str; 6] =
+    ["DEFAULT", "REGULAR", "BOLD", "SERIF", "SCRIPT", "CONDENSED"];
 /// The group roster cap (contract revision 1.40, §4.39): the official
 /// GroupsV2 group-size ceiling. The contacts sync projects at most this many
 /// members into the cached group row; entries past the cap drop.
@@ -521,6 +546,22 @@ pub enum HostSideEvent {
         call_id: u64,
         signal_type: &'static str,
         payload: Value,
+    },
+    /// Inbound story (contract 1.76, §4.67): the engine's envelope-level
+    /// `storyMessage` projection forwarded as a transient event — the
+    /// connector keeps no story row and no timeline state, so a missed
+    /// delivery or a connector restart loses the story view the same way
+    /// the official desktop loses one it received while locked (the
+    /// desktop owns the story timeline and its retention). The payload is
+    /// the bounded projection verbatim; the stories-disabled gate has
+    /// already dropped the envelope when the account opted out.
+    StoryReceived {
+        account_id: String,
+        sender: Option<String>,
+        sender_aci: Option<String>,
+        sender_name: Option<String>,
+        timestamp: Option<u64>,
+        story: Value,
     },
 }
 
@@ -2985,6 +3026,159 @@ impl ConnectorService {
         }
     }
 
+    /// messages.sendStory (contract revision 1.76, §4.67): validation runs
+    /// entirely before the mode seam — a shape-invalid request answers
+    /// INVALID_REQUEST on every mode, and the JVM/native faces answer the
+    /// honest CAPABILITY_UNAVAILABLE debt only after validation and account
+    /// resolution (the §4.65 username read-face ladder). The kt-engine face
+    /// builds the engine's `sendStory` frame; the story send creates no local
+    /// row (stories live outside every conversation), so there is no pending
+    /// settlement and no clientRequestId.
+    ///
+    /// Semantics (official-behavior anchors, AGPL read-only): the recipients
+    /// array is the caller-computed expansion — the desktop owns v1 list
+    /// storage (the official desktop expands MY_STORY from its own
+    /// connections minus exclusions, ts/util/sendStoryMessage.preload.ts:87-116,
+    /// and custom lists from its own member tables), so the connector
+    /// neither re-expands nor filters. `distributionListId` is the official
+    /// `isStoryDistributionId` face mirrored fail-closed: absent = the
+    /// MY_STORY zero UUID, any other strict UUID passes through lowercased
+    /// (`normalizeStoryDistributionId`), anything else is the officially
+    /// unreachable shape and answers INVALID_REQUEST.
+    pub fn prepare_send_story(
+        &self,
+        params: &MessagesSendStoryParams,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        let message = params.message.trim();
+        if message.is_empty() || message.len() > MAX_TEXT_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "message must contain between 1 and 65536 bytes",
+                false,
+            )));
+        }
+        if params.recipients.is_empty() || params.recipients.len() > MAX_STORY_RECIPIENTS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "recipients must contain between 1 and 1001 entries",
+                false,
+            )));
+        }
+        for recipient in &params.recipients {
+            if recipient.trim().is_empty() || recipient.chars().count() > MAX_OPAQUE_ID_BYTES {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "each recipient must contain between 1 and 128 characters",
+                    false,
+                )));
+            }
+        }
+        let distribution_list_id = match &params.distribution_list_id {
+            None => None,
+            Some(id) => {
+                let normalized = id.trim().to_ascii_lowercase();
+                if !is_uuid_shaped(&normalized) {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "distributionListId must be a UUID (absent means the official My story id)",
+                        false,
+                    )));
+                }
+                Some(normalized)
+            }
+        };
+        let text_style = match params.text_style.as_deref() {
+            None => None,
+            Some("DEFAULT") => None,
+            Some(word) if STORY_TEXT_STYLES.contains(&word) => Some(word),
+            Some(_) => {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "textStyle must be one of DEFAULT, REGULAR, BOLD, SERIF, SCRIPT, CONDENSED",
+                    false,
+                )));
+            }
+        };
+        let body_ranges = self.text_styles_to_upstream(params.body_ranges.clone())?;
+        if let Some(preview) = params.preview_image.as_deref()
+            && (preview.is_empty() || preview.len() > MAX_AVATAR_DATA_URI_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "previewImage must be a non-empty data URI within the frame budget",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => {
+                let mut frame = json!({
+                    "account": account.signal_account,
+                    "message": message,
+                    "recipients": params.recipients,
+                    "allowsReplies": params.allows_replies,
+                });
+                if let Some(id) = distribution_list_id {
+                    frame["distributionListId"] = json!(id);
+                }
+                if let Some(style) = text_style {
+                    frame["textStyle"] = json!(style);
+                }
+                if let Some(ranges) = body_ranges {
+                    frame["bodyRanges"] = json!(
+                        ranges
+                            .iter()
+                            .map(|range| json!({
+                                "style": range.style,
+                                "start": range.start,
+                                "length": range.length,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                if let Some(preview) = params.preview_image.as_deref() {
+                    frame["previewImage"] = json!(preview);
+                }
+                Ok(frame)
+            }
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the pinned signal-cli has no story send face; stories require the kt-engine face",
+                false,
+            ))),
+        }
+    }
+
+    /// stories.setDisabled / stories.getDisabled (contract revision 1.76,
+    /// §4.67): the stories-disabled toggle faces — the connector-side
+    /// mirror of the official `getStoriesBlocked` receive gate (itemStorage
+    /// `hasStoriesDisabled`, default false). Pure local store faces: the
+    /// toggle governs what this connector's own receive path forwards, no
+    /// engine frame exists, and the store is the connector's record of
+    /// record — so prepare only validates and pins the account (every
+    /// engine mode answers), and the supervisor performs the write/read on
+    /// the same store instance under the blocking pool.
+    pub fn prepare_stories_set_disabled(
+        &self,
+        params: &StoriesSetDisabledParams,
+    ) -> Result<(), ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        self.resolve_account(&params.account_id)?;
+        Ok(())
+    }
+
+    /// stories.getDisabled — the read side of the same local toggle.
+    pub fn prepare_stories_get_disabled(
+        &self,
+        params: &StoriesGetDisabledParams,
+    ) -> Result<(), ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        self.resolve_account(&params.account_id)?;
+        Ok(())
+    }
+
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
     /// opens with contract 1.74, §4.65): entries resolve through the pinned
     /// `getUserStatus --username` face on the JVM/native faces
@@ -4721,6 +4915,21 @@ impl ConnectorService {
         let account = self
             .store
             .upsert_account_from_signal(&signal_account, None, owner_group)?;
+        // Contract 1.76 (§4.67): a story reply rides a regular dataMessage
+        // (`dataMessage.storyReply`) and lands as a conversation row. The
+        // same stories-disabled gate the story envelope itself faces drops
+        // the reply in both directions — a peer's reply to a story and the
+        // linked-device sync mirror alike — before any conversation or row
+        // exists; enabling stories later re-receives nothing (the upstream
+        // already considers it delivered).
+        if receive
+            .rich
+            .as_ref()
+            .is_some_and(|rich| rich.story_reply.is_some())
+            && self.store.stories_disabled(&account.id)?
+        {
+            return Ok(Vec::new());
+        }
         let (kind, peer_key, title) = if let Some(group_id) = receive.group_id.as_deref() {
             ("group", group_id.to_string(), "group".to_string())
         } else if let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) {
@@ -4994,6 +5203,25 @@ impl ConnectorService {
                 thread_aci.as_deref(),
                 group_id.as_deref(),
             );
+        }
+        // Story receives (contract 1.76, §4.67): a story addresses no
+        // conversation — the bounded projection forwards as the transient
+        // `story.received` event and the connector keeps no row. The
+        // stories-disabled gate (the official `getStoriesBlocked` leg —
+        // itemStorage `hasStoriesDisabled`, default false) drops the
+        // envelope silently before anything downstream sees it.
+        if let ControlReceive::Story { message } = &control {
+            if self.store.stories_disabled(&account.id)? {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![HostSideEvent::StoryReceived {
+                account_id: account.id.clone(),
+                sender: receive.source.clone(),
+                sender_aci: receive.source_uuid.clone(),
+                sender_name: receive.peer_name.clone(),
+                timestamp: receive.timestamp,
+                story: message.clone(),
+            }]);
         }
         // Resolve the conversation: group id, or peer (incoming source /
         // outgoing destination). Control receives address existing
@@ -5331,6 +5559,10 @@ impl ConnectorService {
             // (it addresses its thread by ACI / group key), so this arm is
             // the unreachable fall-through too.
             ControlReceive::MessageRequestResponse { .. } => Ok(Vec::new()),
+            // Story receives are intercepted before the conversation ladder
+            // as well (a story addresses no conversation), so this arm is
+            // the unreachable fall-through too.
+            ControlReceive::Story { .. } => Ok(Vec::new()),
             // Call signaling (contract 1.51, §4.49): no row, no local state
             // — the signaling payload forwards as the transient
             // `call.incoming` event addressed by the conversation it routed
@@ -6678,7 +6910,7 @@ pub struct SendTextMentionParams {
 /// indexes against the caller's own body (the official BodyRange semantics —
 /// identical to the §4.29 mention offsets). A malformed entry fails params
 /// deserialization with INVALID_REQUEST before anything else runs.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SendTextStyleParams {
     pub style: String,
@@ -7022,6 +7254,82 @@ pub struct AccountsGetUsernameParams {
 pub struct UsernameLookupParams {
     pub account_id: String,
     pub usernames: Vec<String>,
+}
+
+/// `messages.sendStory` params (contract revision 1.76, §4.67): the story
+/// text plus the caller-computed recipient expansion. There is no
+/// `clientRequestId` and no conversation addressing: a story lands in no
+/// conversation row, so there is no pending row to dedupe or settle (the
+/// result is synchronous; the sender's own timeline converges through the
+/// desktop's own bookkeeping of the returned timestamp, the official
+/// sendStory job shape). `distributionListId` is optional — absent means the
+/// official MY_STORY id; any other valid UUID passes through as a
+/// desktop-owned custom list (the desktop holds v1 list storage, members
+/// ride `recipients` explicitly).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendStoryParams {
+    pub account_id: String,
+    pub message: String,
+    pub recipients: Vec<String>,
+    pub distribution_list_id: Option<String>,
+    #[serde(default)]
+    pub allows_replies: bool,
+    pub text_style: Option<String>,
+    pub body_ranges: Option<Vec<SendTextStyleParams>>,
+    pub preview_image: Option<String>,
+}
+
+/// `stories.setDisabled` params (contract revision 1.76, §4.67): the
+/// stories-disabled toggle, required (absent fails params deserialization).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoriesSetDisabledParams {
+    pub account_id: String,
+    pub disabled: bool,
+}
+
+/// `stories.getDisabled` params (contract revision 1.76, §4.67).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoriesGetDisabledParams {
+    pub account_id: String,
+}
+
+/// The stories faces' shared result (contract revision 1.76, §4.67): the
+/// stored truth, so a toggle write-back and a poll read one shape.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoriesDisabled {
+    pub disabled: bool,
+}
+
+/// The `messages.sendStory` result (contract revision 1.76, §4.67): the
+/// single story timestamp plus the upstream per-recipient outcome list,
+/// projected entry-for-entry (the fake's empty list is the honest offline
+/// shape; the real engine answers one success entry per recipient —
+/// any-failure sends fold into an upstream error instead of a partial
+/// list, the §5 send discipline).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorySendResult {
+    pub timestamp: u64,
+    pub results: Vec<StorySendRecipientResult>,
+}
+
+/// One per-recipient story outcome (contract revision 1.76, §4.67): the
+/// upstream's own success shape, echoed verbatim.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorySendRecipientResult {
+    pub recipient_number: String,
+    pub success: StorySendSuccess,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorySendSuccess {
+    pub timestamp: u64,
 }
 
 /// `conversations.getAvatar` params (contract revision 1.48, §4.47): the
@@ -13855,6 +14163,365 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 50, None)
             .unwrap();
         assert!(listed.items.is_empty(), "no row may be created");
+    }
+
+    /// messages.sendStory (contract 1.76, §4.67): every parameter gate runs
+    /// before the account ladder, the account ladder before the mode seam
+    /// (the username ordering); the kt-engine frame carries the resolved
+    /// signal account and omits the default-keyed options, the full-option
+    /// frame carries them all (distributionListId lowercased), and the
+    /// JVM/native seam answers the honest CAPABILITY_UNAVAILABLE.
+    #[test]
+    fn send_story_preparation_gates_then_frames() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let params = |message: &str, full: bool, account_id: &str| MessagesSendStoryParams {
+            account_id: account_id.to_string(),
+            message: message.to_string(),
+            recipients: vec!["+15555550101".into()],
+            distribution_list_id: full.then(|| "11111111-2222-3333-4444-555555555555".into()),
+            allows_replies: full,
+            text_style: full.then(|| "BOLD".to_string()),
+            body_ranges: full.then(|| {
+                vec![SendTextStyleParams {
+                    style: "BOLD".to_string(),
+                    start: 0,
+                    length: 6,
+                }]
+            }),
+            preview_image: full.then(|| "data:image/png;base64,AAAA".to_string()),
+        };
+        let gate = |params: &MessagesSendStoryParams| {
+            matches!(
+                service.prepare_send_story(params, SignalCliMode::KtEngine),
+                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
+            )
+        };
+
+        // Parameter gates, every one ahead of the account ladder.
+        assert!(gate(&params("", false, &account.id)), "empty message");
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.recipients = Vec::new();
+                over
+            }),
+            "empty recipients"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.recipients = vec!["+15555550101".to_string(); MAX_STORY_RECIPIENTS + 1];
+                over
+            }),
+            "over-cap recipients"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.recipients = vec!["   ".to_string()];
+                over
+            }),
+            "blank recipient"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.recipients = vec!["k".repeat(MAX_OPAQUE_ID_BYTES + 1)];
+                over
+            }),
+            "oversized recipient"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.distribution_list_id = Some("my-story".into());
+                over
+            }),
+            "non-UUID distribution list"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.text_style = Some("CURSIVE".into());
+                over
+            }),
+            "unknown text style"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.body_ranges = Some(vec![SendTextStyleParams {
+                    style: "CURSIVE".to_string(),
+                    start: 0,
+                    length: 1,
+                }]);
+                over
+            }),
+            "unknown body-range style"
+        );
+        assert!(
+            gate(&{
+                let mut over = params("x", false, &account.id);
+                over.preview_image = Some(String::new());
+                over
+            }),
+            "empty preview image"
+        );
+
+        // Unknown account after the parameter gates, before the mode seam.
+        let error = service
+            .prepare_send_story(&params("x", false, "acct-absent"), SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+
+        // The mode seam: JVM/native answers the honest capability debt on a
+        // fully valid frame.
+        let error = service
+            .prepare_send_story(&params("x", false, &account.id), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+
+        // The kt-engine lean frame: resolved account, defaults omitted,
+        // allowsReplies always explicit.
+        assert_eq!(
+            service
+                .prepare_send_story(
+                    &params("story body", false, &account.id),
+                    SignalCliMode::KtEngine
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "message": "story body",
+                "recipients": ["+15555550101"],
+                "allowsReplies": false,
+            })
+        );
+
+        // The full-option frame: every key rides, the distribution id is
+        // lowercased, absent-id normalization is upstream-side.
+        assert_eq!(
+            service
+                .prepare_send_story(
+                    &params("styled", true, &account.id),
+                    SignalCliMode::KtEngine
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "message": "styled",
+                "recipients": ["+15555550101"],
+                "allowsReplies": true,
+                "distributionListId": "11111111-2222-3333-4444-555555555555",
+                "textStyle": "BOLD",
+                "bodyRanges": [{"style": "BOLD", "start": 0, "length": 6}],
+                "previewImage": "data:image/png;base64,AAAA",
+            })
+        );
+
+        // Uppercase distribution id passes and lands lowercased.
+        let mut upper = params("x", false, &account.id);
+        upper.distribution_list_id = Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE".into());
+        assert_eq!(
+            service
+                .prepare_send_story(&upper, SignalCliMode::KtEngine)
+                .unwrap()["distributionListId"],
+            json!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        );
+    }
+
+    /// stories.setDisabled / stories.getDisabled (contract 1.76, §4.67):
+    /// mode-independent local faces — prepare validates and pins the account
+    /// on both, and the store default is the official enabled.
+    #[test]
+    fn stories_toggle_preparation_pins_account() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        service
+            .prepare_stories_set_disabled(&StoriesSetDisabledParams {
+                account_id: account.id.clone(),
+                disabled: true,
+            })
+            .unwrap();
+        service
+            .prepare_stories_get_disabled(&StoriesGetDisabledParams {
+                account_id: account.id.clone(),
+            })
+            .unwrap();
+        let error = service
+            .prepare_stories_set_disabled(&StoriesSetDisabledParams {
+                account_id: "acct-absent".into(),
+                disabled: true,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+        let error = service
+            .prepare_stories_get_disabled(&StoriesGetDisabledParams {
+                account_id: "acct-absent".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+    }
+
+    /// The stories-disabled gate (contract 1.76, §4.67): a story envelope
+    /// forwards as exactly one transient StoryReceived event while enabled
+    /// (no row — the connector keeps no story state); the same envelope
+    /// drops silently while disabled; a story reply rides a normal message
+    /// row with its rich context while enabled and creates nothing while
+    /// disabled — both directions gated before any conversation or row
+    /// exists.
+    #[test]
+    fn story_ingest_gate_emits_or_drops_by_the_toggle() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let story_receive = crate::engine::NormalizedReceive {
+            timestamp: Some(1727000000000),
+            content_kind: "storyMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            peer_name: Some("Peer".into()),
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            control: Some(crate::engine::ControlReceive::Story {
+                message: json!({
+                    "textAttachment": {"text": "story body"},
+                    "allowsReplies": true,
+                }),
+            }),
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+        };
+        let story_reply_receive = crate::engine::NormalizedReceive {
+            timestamp: Some(1727000001000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: Some("Peer".into()),
+            group_id: None,
+            text: Some("nice story".to_string()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                story_reply: Some(crate::engine::NormalizedStoryReply {
+                    author_aci: "22222222-2222-2222-2222-222222222222".to_string(),
+                    sent_timestamp: 1726999999000,
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            control: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+        };
+
+        // Enabled (the official default): the story forwards, the reply
+        // lands.
+        let events = service
+            .ingest_receive(story_receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryReceived {
+            account_id: event_account,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+            story,
+        } = &events[0]
+        else {
+            panic!("expected a StoryReceived event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(sender.as_deref(), Some("+15555550101"));
+        assert_eq!(
+            sender_aci.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(sender_name.as_deref(), Some("Peer"));
+        assert_eq!(*timestamp, Some(1727000000000));
+        assert_eq!(story["textAttachment"]["text"], "story body");
+        // The story never persists: it addresses no conversation and
+        // creates none.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(listed.items.is_empty(), "a story creates no row");
+        let reply_events = service
+            .ingest_receive(story_reply_receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            reply_events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
+            "the reply lands as a normal row: {reply_events:?}"
+        );
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert_eq!(listed.items.len(), 1, "the reply is a normal row");
+        assert!(
+            listed.items[0]
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.story_reply.as_ref())
+                .is_some(),
+            "the reply row carries its story context"
+        );
+
+        // Disabled: the story drops silently, the reply creates nothing.
+        service
+            .store_ref()
+            .set_stories_disabled(&account.id, true)
+            .unwrap();
+        let events = service
+            .ingest_receive(story_receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(events.is_empty(), "a disabled story forwards nothing");
+        let reply_events = service
+            .ingest_receive(story_reply_receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(reply_events.is_empty(), "a disabled reply lands nothing");
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert_eq!(listed.items.len(), 1, "no second reply row");
     }
 
     /// The §4.35 sticker-quote face: the quote resolves through the same

@@ -586,6 +586,24 @@ pub struct NormalizedRich {
     /// as mirror material, not as a diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_name: Option<String>,
+    /// Story-reply context (contract 1.76, §4.67): the dataMessage's
+    /// `storyReply` face — {authorAci, sentTimestamp} verbatim, the story the
+    /// reply answers. The reply itself is a normal DM/group row; absent on
+    /// plain and pre-1.76 rows. A malformed face (missing/empty author,
+    /// missing timestamp) drops the key, never the row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub story_reply: Option<NormalizedStoryReply>,
+}
+
+/// One story-reply context (contract 1.76, §4.67): the addressed story's
+/// author ACI and its upstream timestamp, exactly the two keys the engine
+/// projects off `dataMessage.storyContext`. The reply row is a normal
+/// message; this face only names the story it answers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedStoryReply {
+    pub author_aci: String,
+    pub sent_timestamp: u64,
 }
 
 impl NormalizedRich {
@@ -599,6 +617,7 @@ impl NormalizedRich {
             && !self.is_expiration_update
             && !self.is_group_update
             && self.group_name.is_none()
+            && self.story_reply.is_none()
     }
 }
 
@@ -739,6 +758,17 @@ pub enum ControlReceive {
         response_type: u8,
         thread_aci: Option<String>,
         group_id: Option<String>,
+    },
+    /// Story receives (contract 1.76, §4.67): the engine's envelope-level
+    /// `storyMessage` projection — the official Content.storyMessage=8 face.
+    /// The connector is a story pipe like the call-signaling pipe: `message`
+    /// is the bounded projection verbatim ({textAttachment{…}|
+    /// fileAttachment, allowsReplies, profileKey?, group?}) — never parsed
+    /// or re-shaped connector-side (the desktop owns the story timeline; the
+    /// connector keeps no story row). The stories-disabled gate (the
+    /// official getStoriesBlocked leg) is the service layer's.
+    Story {
+        message: Value,
     },
 }
 
@@ -2253,6 +2283,23 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
             })
             .collect();
     }
+    // Story-reply context (contract 1.76, §4.67): `dataMessage.storyReply` →
+    // {authorAci, sentTimestamp}, both keys required — the engine projects the
+    // face only when the author resolves, and a degraded shape here drops the
+    // key (never the row), the §4.20 per-entry discipline.
+    if let Some(reply) = message.get("storyReply").and_then(Value::as_object) {
+        rich.story_reply = reply
+            .get("authorAci")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
+            .zip(reply.get("sentTimestamp").and_then(Value::as_u64))
+            .map(|(author_aci, sent_timestamp)| NormalizedStoryReply {
+                author_aci,
+                sent_timestamp,
+            });
+    }
     rich.view_once = message
         .get("viewOnce")
         .and_then(Value::as_bool)
@@ -2298,6 +2345,20 @@ fn bounded_range_u32(object: &serde_json::Map<String, Value>, key: &str) -> Opti
         .and_then(Value::as_u64)
         .filter(|value| *value <= u32::MAX as u64)
         .map(|value| value as u32)
+}
+
+/// Story receive material bound (contract 1.76, §4.67): the coarse guard
+/// family the call-signaling opaque face rides (one host frame discipline) —
+/// real story projections are far smaller; only hostile or absurd material
+/// trips it, and an oversized face drops the whole envelope. The projection
+/// itself passes through verbatim — the connector neither re-shapes nor
+/// prunes it.
+const MAX_STORY_MATERIAL_BYTES: usize = 3 * 1024 * 1024;
+
+fn bounded_story_material(story: &serde_json::Map<String, Value>) -> Option<Value> {
+    let value = Value::Object(story.clone());
+    let serialized = serde_json::to_string(&value).ok()?;
+    (serialized.len() <= MAX_STORY_MATERIAL_BYTES).then_some(value)
 }
 
 /// Bounded reaction payload: emoji shortened, author bounded, malformed shapes
@@ -2847,6 +2908,44 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             None,
             Some(control),
         ));
+    }
+
+    // Story receives (contract 1.76, §4.67): the envelope-level `storyMessage`
+    // face. The story body is not a conversation message — it routes as
+    // control-plane material (the call-signaling posture): no row, the
+    // bounded projection forwards verbatim, and the stories-disabled gate is
+    // the service layer's. The envelope `isStory` bit is the same fact and
+    // rides story sends and group story replies alike; the bit alone never
+    // routes (a remote delete under a story bit was already consumed by the
+    // control ladder above — the official exempt leg). An oversized or
+    // otherwise unusable face drops the whole envelope (宁缺勿错).
+    if let Some(story_message) = envelope.get("storyMessage").and_then(Value::as_object) {
+        return Ok(match bounded_story_material(story_message) {
+            Some(message) => make(
+                timestamp,
+                "storyMessage",
+                "incoming",
+                peer_source,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                Some(ControlReceive::Story { message }),
+            ),
+            None => make(
+                timestamp,
+                "storyMessage",
+                "skip",
+                peer_source,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+            ),
+        });
     }
 
     // Multi-device: phone/other linked device sent a text → show as our outgoing.
@@ -4988,6 +5087,162 @@ mod tests {
         );
         let oversized = "A".repeat(3 * 1024 * 1024 + 1);
         assert!(routing(envelope(json!({ "opaque": oversized }))).is_none());
+    }
+
+    /// Story receives (contract 1.76, §4.67): the envelope-level
+    /// `storyMessage` face routes as a body-less control receive — the
+    /// bounded projection forwards verbatim (identities ride along), an
+    /// oversized face drops the whole envelope into the skip routing (the
+    /// coarse one-frame discipline the call-signaling opaque face rides),
+    /// and the `isStory` bit alone never routes (it rides story sends and
+    /// story replies alike; the plain dataMessage ladder keeps them).
+    #[test]
+    fn story_envelopes_route_verbatim_and_oversized_skip() {
+        let normalize = |envelope: serde_json::Value| {
+            normalize_receive(&json!({ "envelope": envelope }))
+                .unwrap()
+                .unwrap()
+        };
+        let base = json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "sourceUuid": "11111111-1111-1111-1111-111111111111",
+            "sourceName": "Peer",
+            "isStory": true,
+        });
+
+        // The text-attachment projection: every key rides verbatim.
+        let normalized = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "sourceUuid": "11111111-1111-1111-1111-111111111111",
+            "sourceName": "Peer",
+            "storyMessage": {
+                "textAttachment": {
+                    "text": "story body",
+                    "textStyle": "BOLD",
+                },
+                "allowsReplies": true,
+                "profileKey": "cHJvZmlsZQ==",
+            },
+        }));
+        assert_eq!(normalized.content_kind, "storyMessage");
+        assert_eq!(normalized.direction, "incoming");
+        assert_eq!(normalized.source.as_deref(), Some("+15555550101"));
+        assert_eq!(normalized.timestamp, Some(1727000000000));
+        let Some(ControlReceive::Story { message }) = normalized.control else {
+            panic!("expected a story control");
+        };
+        assert_eq!(message["textAttachment"]["text"], "story body");
+        assert_eq!(message["textAttachment"]["textStyle"], "BOLD");
+        assert_eq!(message["allowsReplies"], true);
+        assert_eq!(message["profileKey"], "cHJvZmlsZQ==");
+        let _ = &base;
+
+        // The file-attachment shape routes the same way (no text key).
+        let Some(ControlReceive::Story { message }) = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "storyMessage": { "fileAttachment": {} },
+        }))
+        .control
+        else {
+            panic!("expected a story control");
+        };
+        assert!(message.get("fileAttachment").is_some());
+
+        // Oversized material drops the whole envelope: the skip routing,
+        // no control, no row material.
+        let mut giant_attachment = String::from("data:image/png;base64,");
+        giant_attachment.push_str(&"A".repeat(3 * 1024 * 1024));
+        let oversized = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "storyMessage": {
+                "fileAttachment": { "data": giant_attachment },
+            },
+        }));
+        assert_eq!(oversized.content_kind, "storyMessage");
+        assert_eq!(oversized.direction, "skip");
+        assert!(oversized.control.is_none());
+
+        // The bit alone never routes: a plain dataMessage under `isStory`
+        // keeps the normal message ladder (no story control).
+        let plain = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "isStory": true,
+            "dataMessage": { "message": "hello" },
+        }));
+        assert_eq!(plain.direction, "incoming");
+        assert!(plain.control.is_none());
+        assert!(plain.rich.is_none() || !plain.rich.as_ref().unwrap().is_group_update);
+    }
+
+    /// Story replies (contract 1.76, §4.67): `dataMessage.storyReply`
+    /// parses onto the rich payload as {authorAci, sentTimestamp}; a
+    /// degraded face (missing timestamp, blank author) drops the key and
+    /// never the row — the reply stays a normal message without story
+    /// context.
+    #[test]
+    fn story_reply_parses_onto_rich_and_malformed_drops_key() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+            .unwrap()
+        };
+
+        // The well-formed face: both keys ride verbatim.
+        let rich = normalize(json!({
+            "message": "nice story",
+            "storyReply": {
+                "authorAci": "22222222-2222-2222-2222-222222222222",
+                "sentTimestamp": 1726999999000u64,
+            },
+        }))
+        .rich
+        .expect("rich payload");
+        assert_eq!(
+            rich.story_reply,
+            Some(crate::engine::NormalizedStoryReply {
+                author_aci: "22222222-2222-2222-2222-222222222222".to_string(),
+                sent_timestamp: 1726999999000,
+            })
+        );
+
+        // Missing timestamp: the key drops, the row stays.
+        let degraded = normalize(json!({
+            "message": "nice story",
+            "storyReply": { "authorAci": "22222222-2222-2222-2222-222222222222" },
+        }));
+        assert_eq!(degraded.direction, "incoming");
+        assert!(
+            degraded
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.story_reply.as_ref())
+                .is_none(),
+            "a degraded storyReply drops the key, never the row"
+        );
+
+        // Blank author: same drop.
+        let blank = normalize(json!({
+            "message": "nice story",
+            "storyReply": { "authorAci": "  ", "sentTimestamp": 1726999999000u64 },
+        }));
+        assert!(
+            blank
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.story_reply.as_ref())
+                .is_none()
+        );
     }
 
     /// Contract 1.38 (§4.36): a metadata-only view-once marker

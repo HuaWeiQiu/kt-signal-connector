@@ -290,6 +290,19 @@ pub const METHODS: &[MethodRow] = &[
     // pinned JSON-RPC projection and stays out of the contract. Zero local
     // writes: trust level converges through the next `identities.get`.
     ("identities.verify", Lane::Send, true, "send"),
+    // Stories faces (contract revision 1.76, §4.67): `messages.sendStory` is
+    // mutating send-lane upstream traffic — the reaction class verbatim,
+    // same-account mutex and delete barrier included (rowless: no pending
+    // row, no conversation addressing). The stories-disabled toggle is the
+    // connector's own receive gate — local store only, no engine frame, but
+    // still an account-state write, so setDisabled rides the send lane
+    // behind the same-account mutex and delete barrier (the setLocalAlias
+    // precedent) and getDisabled is a bounded store read; both are
+    // mode-independent (every engine face answers them). Advertised through
+    // `stories`.
+    ("messages.sendStory", Lane::Send, true, "send"),
+    ("stories.setDisabled", Lane::Send, true, "send"),
+    ("stories.getDisabled", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -378,7 +391,12 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// the §4.61 safety-number faces (`identities.get` read over the pinned
 /// upstream's native `listIdentities` projection plus the `identities.verify`
 /// write over its native `trust` verifiedSafetyNumber form — one capability,
-/// read and write halves together, the 1.53 appendix discipline). They never
+/// read and write halves together, the 1.53 appendix discipline); and
+/// `stories` (contract revision 1.76) marks the §4.67 stories faces
+/// (`messages.sendStory` over the kt-engine `sendStory` face plus the
+/// `stories.setDisabled` / `stories.getDisabled` local toggle — the receive
+/// gate mirror of the official `getStoriesBlocked` leg — and the transient
+/// `story.received` event). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -408,6 +426,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "username",
     "message-requests",
     "safety-number",
+    "stories",
 ];
 
 #[cfg(test)]
@@ -445,6 +464,7 @@ mod tests {
             "accounts.getUsername",
             "username.lookup",
             "identities.get",
+            "stories.getDisabled",
         ];
         let send_lane = [
             "messages.sendText",
@@ -485,6 +505,8 @@ mod tests {
             "conversations.acceptRequest",
             "conversations.declineRequest",
             "identities.verify",
+            "messages.sendStory",
+            "stories.setDisabled",
         ];
         let mutating = [
             "messages.sendText",
@@ -527,6 +549,8 @@ mod tests {
             "conversations.acceptRequest",
             "conversations.declineRequest",
             "identities.verify",
+            "messages.sendStory",
+            "stories.setDisabled",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

@@ -891,6 +891,36 @@ impl ProxyGroupRuntime {
         slot.supervisor.lookup_usernames(params).await
     }
 
+    /// messages.sendStory (contract 1.76, §4.67): a story goes out through
+    /// the sender account's own engine like every mutating face.
+    pub async fn send_story(
+        &self,
+        params: crate::service::MessagesSendStoryParams,
+    ) -> Result<crate::service::StorySendResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_story(params).await
+    }
+
+    /// stories.setDisabled / stories.getDisabled (contract 1.76, §4.67):
+    /// the toggle is connector-local state, but it is still account-scoped —
+    /// the ladder resolves the owning slot first so ACCOUNT_NOT_FOUND keeps
+    /// its precedence, then the store write/read answers.
+    pub async fn set_stories_disabled(
+        &self,
+        params: crate::service::StoriesSetDisabledParams,
+    ) -> Result<crate::service::StoriesDisabled, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_stories_disabled(params).await
+    }
+
+    pub async fn get_stories_disabled(
+        &self,
+        params: crate::service::StoriesGetDisabledParams,
+    ) -> Result<crate::service::StoriesDisabled, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_stories_disabled(params).await
+    }
+
     /// conversations.getAvatar (contract 1.48, §4.47): the avatar bytes are
     /// account-scoped upstream state, so the read routes through the
     /// account's owning engine like every other account face.

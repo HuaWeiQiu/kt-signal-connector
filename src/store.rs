@@ -4860,6 +4860,42 @@ impl Store {
         Ok(value.and_then(|value| value.parse::<u64>().ok()))
     }
 
+    /// The account's stories-disabled flag (contract 1.76, §4.67, meta-backed;
+    /// survives restarts). Absent = false — the official default posture
+    /// (itemStorage `hasStoriesDisabled` defaults off, stories on,
+    /// ts/util/stories.preload.ts:5-7, AGPL read-only anchor). The flag is
+    /// connector-local: the pinned upstream faces carry no stories-disabled
+    /// storage record, so the server keeps delivering and the ingest gate
+    /// (the official getStoriesBlocked leg, MessageReceiver.preload.ts:
+    /// 1550) drops story material on arrival instead.
+    pub fn stories_disabled(&self, account_id: &str) -> Result<bool, StoreError> {
+        let value = self
+            .lock_conn()?
+            .query_row(
+                "SELECT value FROM meta WHERE key=?1",
+                params![format!("stories_disabled:{account_id}")],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(value.is_some_and(|value| value == "1"))
+    }
+
+    /// Write the account's stories-disabled flag (contract 1.76, §4.67).
+    pub fn set_stories_disabled(&self, account_id: &str, disabled: bool) -> Result<(), StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![
+                    format!("stories_disabled:{account_id}"),
+                    if disabled { "1" } else { "0" }
+                ],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
     /// Test-only wrapper; production writes the marker inside the
     /// `upsert_synced_contacts` transaction.
     #[cfg(test)]

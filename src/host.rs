@@ -43,9 +43,11 @@ use crate::service::{
     MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
     MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
     MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
-    StickerPackManifestParams, StickerPackSetSyncParams, UsernameLookupParams,
+    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesSetDisabledParams,
+    UsernameLookupParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1407,6 +1409,63 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "messages.sendStory" => {
+            match serde_json::from_value::<MessagesSendStoryParams>(request.params) {
+                Ok(params) => match runtime.send_story(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendStory params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "stories.setDisabled" => {
+            match serde_json::from_value::<StoriesSetDisabledParams>(request.params) {
+                Ok(params) => match runtime.set_stories_disabled(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.setDisabled params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "stories.getDisabled" => {
+            match serde_json::from_value::<StoriesGetDisabledParams>(request.params) {
+                Ok(params) => match runtime.get_stories_disabled(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.getDisabled params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "messages.retryText" => {
             match serde_json::from_value::<MessagesRetryTextParams>(request.params) {
                 Ok(params) => {
@@ -2450,6 +2509,35 @@ where
                 ),
             )
             .await
+        }
+        HostSideEvent::StoryReceived {
+            account_id,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+            story,
+        } => {
+            // Contract 1.76, §4.67: transient story receive — absent
+            // optional identities stay absent so the host never has to
+            // distinguish a masked source from a missing one.
+            let mut payload = json!({
+                "accountId": account_id,
+                "story": story,
+            });
+            if let Some(sender) = sender {
+                payload["sender"] = json!(sender);
+            }
+            if let Some(aci) = sender_aci {
+                payload["senderAci"] = json!(aci);
+            }
+            if let Some(name) = sender_name {
+                payload["senderName"] = json!(name);
+            }
+            if let Some(at) = timestamp {
+                payload["timestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("story.received", payload)).await
         }
     }
 }

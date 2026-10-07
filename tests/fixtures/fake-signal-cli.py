@@ -1054,6 +1054,25 @@ for line in sys.stdin:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         result = {}
+    elif method == "sendStory":
+        # Contract 1.76 §4.67: the kt-engine story send face. Record the
+        # exact upstream params (tests assert the resolved account, the
+        # message/recipients keys, and the omitted-by-default option keys).
+        # Sentinel: message "fixture_story_crash.31" crashes with the
+        # mutating call in flight (os._exit(31), the usernameReserve
+        # discipline; disjoint from the JVM send magic). Success answers the
+        # upstream write shape {timestamp, results} — the fake answers an
+        # empty per-recipient list (the honest offline face; the real engine
+        # lists one success entry per recipient).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("message") == "fixture_story_crash.31":
+            os._exit(31)
+        result = {
+            "timestamp": int(time.time() * 1000),
+            "results": [],
+        }
     elif method == "getBlockedConversations":
         # Contract 1.46 §4.45 blocked read: the storage-order projection as a
         # fixture constant (one contact + one legacy group). Read face, no
