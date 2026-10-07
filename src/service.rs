@@ -2917,35 +2917,52 @@ impl ConnectorService {
         }
     }
 
-    /// accounts.getUsername (contract revision 1.59, §4.55, capability
-    /// username): the pinned signal-cli has no JSON-RPC reader for the local
-    /// account's username — `JsonAccountResponse` is a private record inside
-    /// UpdateAccountCommand fed by the write-back only, and no listAccounts/
-    /// getAccount face carries the field. The read face therefore answers
-    /// CAPABILITY_UNAVAILABLE after the standard ladder: honest engine-surface
-    /// debt (same shape as the kt-engine arms), with display fed by the
-    /// setUsername write-back mirror instead of a live read. Mode-independent:
-    /// neither engine face has the reader.
-    pub fn prepare_accounts_get_username(&self, account_id: &str) -> Result<Value, ServiceError> {
+    /// accounts.getUsername (contract revision 1.59, §4.55; the kt-engine
+    /// read face opens with contract 1.74, §4.65): the pinned signal-cli has
+    /// no JSON-RPC reader for the local account's username —
+    /// `JsonAccountResponse` is a private record inside UpdateAccountCommand
+    /// fed by the write-back only, and no listAccounts/getAccount face
+    /// carries the field — so the JVM/native faces answer
+    /// CAPABILITY_UNAVAILABLE after the standard ladder (honest engine-surface
+    /// debt, display fed by the setUsername write-back mirror instead of a
+    /// live read). The kt-engine face resolves to the engine's `getUsername`
+    /// reader (engine compat §3 username read-face batch:
+    /// AccountRecord.username(33)/usernameLink(35) storage projection, both
+    /// keys absent = unset).
+    pub fn prepare_accounts_get_username(
+        &self,
+        account_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
-        self.resolve_account(account_id)?;
-        Err(ServiceError::Api(ApiError::new(
-            "CAPABILITY_UNAVAILABLE",
-            "the pinned signal-cli has no username read face; the connector mirrors the setUsername write-back instead",
-            false,
-        )))
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({
+                "account": account.signal_account,
+            })),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the pinned signal-cli has no username read face; the connector mirrors the setUsername write-back instead",
+                false,
+            ))),
+        }
     }
 
-    /// username.lookup (contract revision 1.59, §4.55, capability username):
-    /// entries resolve through the pinned `getUserStatus --username` face
+    /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
+    /// opens with contract 1.74, §4.65): entries resolve through the pinned
+    /// `getUserStatus --username` face on the JVM/native faces
     /// (`resolveRecipientByUsernameOrLink`, so entries are full usernames or
-    /// username-link URLs, not bare nicknames). The batch cap bounds one host
-    /// frame (the upstream takes an open array); entries stay 1..64 chars —
-    /// a bound, not the upstream grammar, which the link resolution owns.
+    /// username-link URLs, not bare nicknames), through the engine's
+    /// `usernameLookup` on the kt-engine face (same server lookups, engine
+    /// compat §3 read-face batch). Both faces share the frame the batch caps
+    /// bounds — one host frame, entries 1..64 chars: a bound, not the
+    /// upstream grammar, which the link resolution owns. The mode picks only
+    /// the engine method name (supervisor side); the upstream frame is
+    /// identical.
     pub fn prepare_username_lookup(
         &self,
         params: &UsernameLookupParams,
-        mode: SignalCliMode,
+        _mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         if params.usernames.is_empty() || params.usernames.len() > USERNAME_LOOKUP_MAX_ENTRIES {
@@ -2965,17 +2982,10 @@ impl ConnectorService {
             }
         }
         let account = self.resolve_account(&params.account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no username method yet",
-                false,
-            ))),
-            _ => Ok(json!({
-                "account": account.signal_account,
-                "usernames": params.usernames,
-            })),
-        }
+        Ok(json!({
+            "account": account.signal_account,
+            "usernames": params.usernames,
+        }))
     }
 
     /// backups.export / backups.exportStatus (contract revision 1.47, §4.46):
@@ -16633,26 +16643,35 @@ mod tests {
         ));
     }
 
-    /// accounts.getUsername answers CAPABILITY_UNAVAILABLE in both modes
-    /// after account resolution; unknown accounts answer first.
+    /// accounts.getUsername: the JVM/native faces answer
+    /// CAPABILITY_UNAVAILABLE after account resolution; the kt-engine face
+    /// resolves the engine frame (contract 1.74, §4.65); unknown accounts
+    /// answer first on every mode.
     #[test]
-    fn get_username_preparation_answers_honest_capability_debt() {
+    fn get_username_preparation_gates_mode_after_resolution() {
         use crate::engine::SignalCliMode;
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
-        for mode in [SignalCliMode::Jvm, SignalCliMode::KtEngine] {
-            let error = service
-                .prepare_accounts_get_username(&account.id)
-                .unwrap_err();
-            assert!(matches!(error, ServiceError::Api(ref api)
-                    if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-            let _ = mode;
-        }
+        // JVM/native: honest engine-surface debt (the pinned signal-cli has
+        // no username reader).
         let error = service
-            .prepare_accounts_get_username("acct-absent")
+            .prepare_accounts_get_username(&account.id, SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        // kt-engine: the engine's getUsername frame.
+        assert_eq!(
+            service
+                .prepare_accounts_get_username(&account.id, SignalCliMode::KtEngine)
+                .unwrap(),
+            json!({ "account": "+15555550100" })
+        );
+        // Unknown account answers before any mode gate.
+        let error = service
+            .prepare_accounts_get_username("acct-absent", SignalCliMode::KtEngine)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -16660,10 +16679,11 @@ mod tests {
         ));
     }
 
-    /// username.lookup bounds the batch, forwards entries verbatim, and
-    /// answers the kt-engine debt after validation.
+    /// username.lookup bounds the batch and forwards entries verbatim on
+    /// both engine faces (contract 1.74, §4.65: the frame is mode-shared;
+    /// the mode picks the engine method name supervisor-side).
     #[test]
-    fn username_lookup_preparation_bounds_batch_and_gates_mode() {
+    fn username_lookup_preparation_bounds_batch_and_shares_frame() {
         use crate::engine::SignalCliMode;
         let (_temp, service) = service();
         let account = service
@@ -16691,14 +16711,11 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
-        // KtEngine debt after validation.
-        let error = service
-            .prepare_username_lookup(&params(vec!["kt_test.01".into()]), SignalCliMode::KtEngine)
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-
-        // JVM payload: entries forwarded verbatim.
+        // Both faces: entries forwarded verbatim, same frame.
+        let expected = json!({
+            "account": "+15555550100",
+            "usernames": ["kt_test.01", "https://signal.me/#eu"],
+        });
         assert_eq!(
             service
                 .prepare_username_lookup(
@@ -16706,10 +16723,16 @@ mod tests {
                     SignalCliMode::Jvm
                 )
                 .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "usernames": ["kt_test.01", "https://signal.me/#eu"],
-            })
+            expected
+        );
+        assert_eq!(
+            service
+                .prepare_username_lookup(
+                    &params(vec!["kt_test.01".into(), "https://signal.me/#eu".into()]),
+                    SignalCliMode::KtEngine
+                )
+                .unwrap(),
+            expected
         );
     }
 

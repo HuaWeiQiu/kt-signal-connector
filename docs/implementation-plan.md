@@ -5,7 +5,18 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.73 (2026-10-07; the read-only post-deadline
+- Contract revision: 1.74 (2026-10-08; the username read-face opening —
+  the kt-engine arms of `accounts.getUsername` and `username.lookup`
+  (§4.65) come alive against the engine's `getUsername`/`usernameLookup`
+  readers (the engine's username read-face batch, engine compat §3:
+  AccountRecord username(33)/usernameLink(35) storage projection and the
+  anonymous server-lookup path), while the pinned signal-cli JVM/native
+  arms keep their honest CAPABILITY_UNAVAILABLE debt (`accounts.getUsername`)
+  and their pinned `getUserStatus --username` route (`username.lookup`).
+  The upstream frame is mode-shared; the mode picks only the engine
+  method name. No wire shape change, no capability change, no schema
+  store version change) —
+  previously 1.73 (2026-10-07; the read-only post-deadline
   convergence batch — the P1 follow-up in the 758 hang-reconnaissance
   lineage (P0 deadline-ization `40e2248`, gate process-group hygiene
   `632fb39`): the engine-side lifecycle of a late response after a
@@ -4101,6 +4112,65 @@ full-stack round trip over the fake engine is new and standalone
 `messages.search`) project the same arrays, a hostile mix keeps only its
 well-formed entries, an all-invalid list collapses to the key-absent
 plain shape, and a plain body never grows the key.
+
+### 4.65 Username read face, kt-engine opening: `accounts.getUsername`, `username.lookup` (contract revision 1.74, 2026-10-08)
+
+The §4.55 username read faces stop being honest debt on the kt-engine
+face: the engine lands its username read-face batch (engine
+`docs/jsonrpc-compat.md` §3 — the KT extension methods `getUsername` /
+`usernameLookup`), and this batch opens the connector arms against it.
+The JVM/native faces keep their recorded posture — the pinned signal-cli
+has no local-account username reader (`JsonAccountResponse` is a private
+record inside UpdateAccountCommand fed by the write-back only), and
+`username.lookup` keeps its pinned `getUserStatus --username` route
+there.
+
+- **accounts.getUsername (kt-engine)**: a read-only engine `getUsername`
+  call with `{account}`; the answer projects the engine's
+  `{username?, usernameLink?}` storage truth — AccountRecord
+  username(33)/usernameLink(35), engine-side storage sync is the single
+  truth source (the official proto's "only updated on server
+  confirm/delete" anchor; the engine never invents a second one). Both
+  keys absent = never set: the §4.55 `AccountUsername` shape carries
+  both fields null and the call succeeds — the unset state is the
+  answer, not an error. The connector persists nothing locally (the
+  JVM write-back mirror stays the display path there); the read is
+  always live.
+- **username.lookup (kt-engine)**: a read-only engine `usernameLookup`
+  call with the same frame the JVM face takes (`{account,
+  usernames[1..20]}`, entries 1..64 chars — the frame gate is
+  mode-shared, the prepare layer is now mode-agnostic). The upstream
+  answer is a top-level array of `{recipient, username?, uuid?,
+  isRegistered}` records and the projection is byte-for-byte the §4.55
+  ladder — a missing field is a protocol face, not a silently-dropped
+  item; per-entry failures arrive pre-degraded (`isRegistered:false`)
+  by the engine; the engine record carries no `number` key (that key is
+  the pinned `getUserStatus` face's alone). Engine-side server path
+  (recorded for the audit trail, owned by the engine): anonymous lookups
+  only (`GET v1/accounts/username_hash/{hash}`, `GET
+  v1/accounts/username_link/{uuid}` — credentials there are a 400, not
+  a shortcut), full-name entries hash via the libsignal usernames
+  crate, link entries decrypt (`decrypt_username`) then re-hash — the
+  official `resolveUsernameLink` order.
+- **Lane/capability**: unchanged — both faces keep their §4.55 lanes
+  (`accounts.getUsername` read lane, `username.lookup` read lane) and
+  the capability `username` tag; no wire shape change, no schema store
+  version change.
+- **Mode seam**: the supervisor picks the engine method name —
+  `getUsername`/`usernameLookup` vs `getUserStatus` — and nothing else
+  diverges; the JVM `accounts.getUsername` debt answer stays
+  CAPABILITY_UNAVAILABLE after account resolution.
+
+Tests: the two prepare faces pin the new mode seams (kt-engine frames,
+JVM debt after resolution, unknown-account-first); a supervisor-level
+engine-mode test routes both method names through a live engine process
+(the §4.55 fixture gains `getUsername`/`usernameLookup` arms with a
+never-set marker): the set shape projects both fields, the unset shape
+projects the null face, the lookup array projects entry-for-entry
+without inventing a `number` key, and the dispatch log pins the engine
+method names and the resolved signal account. The real-sidecar smoke
+(engine_integration `kt_engine_sidecar`) extends to the two engine
+method names under the same gate as before.
 
 ## 5. signal-cli Boundary
 

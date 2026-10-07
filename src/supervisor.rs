@@ -3008,39 +3008,64 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// accounts.getUsername (contract revision 1.59, §4.55, capability
-    /// username): the ladder answers CAPABILITY_UNAVAILABLE — the pinned
-    /// signal-cli has no local-account username reader on either engine face
-    /// (see `prepare_accounts_get_username`). No engine call is attempted.
+    /// accounts.getUsername (contract revision 1.59, §4.55; the kt-engine
+    /// read face opens with contract 1.74, §4.65): on the kt-engine face a
+    /// read-only engine `getUsername` call projects the
+    /// `{username?, usernameLink?}` storage truth (both keys absent = unset —
+    /// the honest never-set answer, not an error); on the JVM/native faces
+    /// the ladder answers CAPABILITY_UNAVAILABLE (the pinned signal-cli has
+    /// no local-account username reader — see `prepare_accounts_get_username`).
     pub async fn get_username(
         &self,
         params: AccountsGetUsernameParams,
     ) -> Result<AccountUsername, ServiceError> {
-        let service = self.service.lock().await;
-        match service.prepare_accounts_get_username(&params.account_id) {
-            Err(error) => Err(error),
-            Ok(_) => Err(ServiceError::Engine(EngineError::Protocol)),
+        let upstream = {
+            let service = self.service.lock().await;
+            match service.prepare_accounts_get_username(&params.account_id, self.config.mode) {
+                Err(error) => return Err(error),
+                Ok(upstream) => upstream,
+            }
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call("getUsername", upstream, CallClass::ReadOnly)
+            .await
+        {
+            Ok(result) => Ok(AccountUsername {
+                username: result
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                username_link: result
+                    .get("usernameLink")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            Err(error) => Err(error.into()),
         }
     }
 
-    /// username.lookup (contract revision 1.59, §4.55, capability username):
-    /// resolution under the service lock, then the read-only `getUserStatus`
-    /// call (entries are usernames or username links). The upstream answer is
-    /// a top-level array (`JsonUserStatus` records); the connector projects
-    /// it entry-for-entry — a missing field is a protocol face, not a
-    /// silently-dropped item.
+    /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
+    /// opens with contract 1.74, §4.65): resolution under the service lock,
+    /// then the read-only call — `getUserStatus` on the pinned faces,
+    /// `usernameLookup` on the kt-engine face (same server lookups, same
+    /// frame). Both upstream answers are a top-level array; the connector
+    /// projects it entry-for-entry — a missing field is a protocol face, not
+    /// a silently-dropped item.
     pub async fn lookup_usernames(
         &self,
         params: UsernameLookupParams,
     ) -> Result<UsernameLookupResult, ServiceError> {
         let engine = self.running_engine().await?;
-        let upstream = {
+        let (method, upstream) = {
             let service = self.service.lock().await;
-            service.prepare_username_lookup(&params, self.config.mode)?
+            let upstream = service.prepare_username_lookup(&params, self.config.mode)?;
+            match self.config.mode {
+                SignalCliMode::KtEngine => ("usernameLookup", upstream),
+                _ => ("getUserStatus", upstream),
+            }
         };
-        let result = engine
-            .call("getUserStatus", upstream, CallClass::ReadOnly)
-            .await?;
+        let result = engine.call(method, upstream, CallClass::ReadOnly).await?;
         let entries = result
             .as_array()
             .ok_or(ServiceError::Engine(EngineError::Protocol))?;
@@ -6950,6 +6975,117 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.expire_timer_seconds, Some(604_800));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// Contract 1.74 (§4.65): the kt-engine username read faces route to the
+    /// engine's `getUsername`/`usernameLookup` method names — getUsername
+    /// projects the storage truth (set shape: both fields; the unset marker:
+    /// both keys absent project the null face), usernameLookup shares the
+    /// §4.55 array projection (no `number` key on the engine record). The
+    /// dispatch log pins the engine method name and the resolved account.
+    #[tokio::test]
+    async fn username_read_faces_route_engine_methods_in_engine_mode() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.mode = crate::engine::SignalCliMode::KtEngine;
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        // getUsername: the set shape projects both fields.
+        let read = supervisor
+            .get_username(crate::service::AccountsGetUsernameParams {
+                account_id: account.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.username.as_deref(), Some("fixture_user.01"));
+        assert_eq!(
+            read.username_link.as_deref(),
+            Some("https://signal.me/username/fixture-link")
+        );
+
+        // The never-set shape (engine answers both keys absent): the null
+        // face, not an error.
+        let unset_marker = temp
+            .path()
+            .join("signal-data")
+            .join(".fixture-username-unset");
+        std::fs::write(&unset_marker, b"").unwrap();
+        let unset = supervisor
+            .get_username(crate::service::AccountsGetUsernameParams {
+                account_id: account.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(unset.username, None);
+        assert_eq!(unset.username_link, None);
+        std::fs::remove_file(&unset_marker).unwrap();
+
+        // usernameLookup: the engine array projects entry-for-entry.
+        let lookup = supervisor
+            .lookup_usernames(crate::service::UsernameLookupParams {
+                account_id: account.id.clone(),
+                usernames: vec!["kt_registered.01".into(), "kt_unregistered.02".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(lookup.results.len(), 2);
+        assert_eq!(lookup.results[0].recipient, "kt_registered.01");
+        assert_eq!(
+            lookup.results[0].username.as_deref(),
+            Some("kt_registered.01")
+        );
+        assert!(lookup.results[0].uuid.is_some());
+        assert!(
+            lookup.results[0].number.is_none(),
+            "engine records carry no number key"
+        );
+        assert!(lookup.results[0].is_registered);
+        assert_eq!(lookup.results[1].recipient, "kt_unregistered.02");
+        assert!(!lookup.results[1].is_registered);
+
+        // The dispatch log carries the engine method names and the resolved
+        // signal account (the raw account id never rides the frame).
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatches");
+        let dispatches: Vec<serde_json::Value> = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let get_dispatch = dispatches
+            .iter()
+            .find(|params| params.get("usernames").is_none() && params.get("account").is_some())
+            .expect("a getUsername dispatch must land");
+        assert_eq!(get_dispatch["account"], "+15555550100");
+        let lookup_dispatch = dispatches
+            .iter()
+            .find(|params| params.get("usernames").is_some())
+            .expect("a usernameLookup dispatch must land");
+        assert_eq!(lookup_dispatch["account"], "+15555550100");
         supervisor.shutdown().await.unwrap();
     }
 

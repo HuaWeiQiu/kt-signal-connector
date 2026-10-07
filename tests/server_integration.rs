@@ -7191,7 +7191,8 @@ async fn safety_number_faces_round_trip_and_gate_the_shape() {
 /// (the updateAccount write with the upstream write-back projection, the
 /// InvalidUsernameException face via the -1 sentinel, the crash-with-
 /// in-flight-write unknown outcome with no retry), accounts.getUsername
-/// (the honest CAPABILITY_UNAVAILABLE read in every mode), and
+/// (the honest CAPABILITY_UNAVAILABLE read on the JVM/native faces; the
+/// kt-engine face opened with contract 1.74, §4.65), and
 /// username.lookup (the getUserStatus array projection entry-for-entry,
 /// including the unregistered face and the CDSI rate-limit sentinel).
 #[tokio::test]
@@ -7324,7 +7325,8 @@ async fn username_faces_round_trip_and_gate_the_mode() {
         "the grammar refusal stays local"
     );
 
-    // getUsername: the honest capability debt in every mode.
+    // getUsername: the honest capability debt on the JVM/native faces (the
+    // kt-engine face routes the engine's getUsername reader since 1.74).
     let get = request(
         &mut client,
         "username-get",

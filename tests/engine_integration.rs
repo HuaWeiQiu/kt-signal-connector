@@ -517,6 +517,34 @@ async fn kt_engine_sidecar_round_trips_over_the_engine_actor() {
         .expect("getUserStatus round-trips");
     assert_eq!(status, json!({ "isRegistered": true }));
 
+    // Contract 1.74 (§4.65): the username read faces round-trip over the
+    // engine actor — getUsername's fake never-set shape (both keys absent)
+    // and usernameLookup's per-entry degraded array.
+    let read = engine
+        .call(
+            "getUsername",
+            json!({ "account": "+15559990000" }),
+            CallClass::ReadOnly,
+        )
+        .await
+        .expect("getUsername round-trips");
+    assert_eq!(read, json!({}));
+    let lookup = engine
+        .call(
+            "usernameLookup",
+            json!({
+                "account": "+15559990000",
+                "usernames": ["kt_smoke.01"]
+            }),
+            CallClass::ReadOnly,
+        )
+        .await
+        .expect("usernameLookup round-trips");
+    assert_eq!(
+        lookup,
+        json!([{ "recipient": "kt_smoke.01", "isRegistered": false }])
+    );
+
     let sent = engine
         .call(
             "send",

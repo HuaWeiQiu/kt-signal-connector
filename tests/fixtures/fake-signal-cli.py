@@ -107,6 +107,7 @@ FAIL_USER_STATUS_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status"
 FAIL_USER_STATUS_COUNT_MARKER = SIGNAL_DATA_DIR / ".fixture-fail-user-status-count"
 AUTH_FAILED_MARKER = SIGNAL_DATA_DIR / ".fixture-auth-failed-user-status"
 UNREGISTERED_MARKER = SIGNAL_DATA_DIR / ".fixture-unregistered-user-status"
+USERNAME_UNSET_MARKER = SIGNAL_DATA_DIR / ".fixture-username-unset"
 SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
@@ -939,6 +940,54 @@ for line in sys.stdin:
                 "username": username,
                 "usernameLink": "https://signal.me/username/fixture-link",
             }
+    elif method == "getUsername":
+        # Contract 1.74 §4.65: the kt-engine username read route. Record the
+        # exact upstream params (tests assert the resolved account key). The
+        # unset marker answers the both-keys-absent never-set shape; the
+        # default answers the set shape (the same link the updateAccount
+        # write-back carries).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if USERNAME_UNSET_MARKER.exists():
+            result = {}
+        else:
+            result = {
+                "username": "fixture_user.01",
+                "usernameLink": "https://signal.me/username/fixture-link",
+            }
+    elif method == "usernameLookup":
+        # Contract 1.74 §4.65: the kt-engine lookup route — the same top-level
+        # array contract as the getUserStatus --username face (first entry
+        # registered with username+uuid, the rest the unregistered face; the
+        # ratelimit sentinel answers the plain upstream error). The engine
+        # record carries no `number` key — that key is the pinned
+        # getUserStatus face's alone.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if "[fixture-username-ratelimited]" in params.get("usernames", []):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "fixture usernameLookup failure"},
+            }
+            emit_json(response)
+            continue
+        entries = []
+        for index, name in enumerate(params.get("usernames", [])):
+            if index == 0:
+                entries.append(
+                    {
+                        "recipient": name,
+                        "username": name,
+                        "uuid": "00000000-0000-0000-0000-00000000000" + str(index % 10),
+                        "isRegistered": True,
+                    }
+                )
+            else:
+                entries.append({"recipient": name, "isRegistered": False})
+        result = entries
     elif method == "getBlockedConversations":
         # Contract 1.46 §4.45 blocked read: the storage-order projection as a
         # fixture constant (one contact + one legacy group). Read face, no
