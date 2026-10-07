@@ -3579,7 +3579,7 @@ impl Store {
                         attachment_locators, rich_json, edited_at, sender_name, mentions_self,
                         sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, NULL, ?17, ?18, ?19, NULL)",
+                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL)",
                     params![
                             record.id,
                             record.account_id,
@@ -3615,6 +3615,12 @@ impl Store {
                                 serde_json::to_string(&row.locators)
                                     .expect("attachment locators json")
                             }),
+                            // The 1.35 sticker identity (contract 1.76 §4.38):
+                            // the batch writer lands what the importer
+                            // projected — absent stays NULL like plain rows.
+                            record.sticker.as_ref().map(
+                                |sticker| serde_json::to_string(sticker).expect("sticker json")
+                            ),
                         ],
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;

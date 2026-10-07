@@ -470,7 +470,9 @@ impl<'a> Importer<'a> {
             )
         };
         // Body presence: a tombstone carries none by definition; anything else
-        // without text, a long-text pointer, or an attachment stores nothing.
+        // without text, a long-text pointer, an attachment, or a sticker face
+        // stores nothing (contract 1.76 §4.38: the sticker identity is the
+        // body of a sticker row).
         let text = value
             .get("text")
             .and_then(Value::as_str)
@@ -479,10 +481,15 @@ impl<'a> Importer<'a> {
             .get("longText")
             .is_some_and(|pointer| !pointer.is_null());
         let raw_attachments = value.get("attachments").and_then(Value::as_array);
+        // The sticker face (contract 1.35 identity beside the message) parses
+        // with the live-receive bounds; the data pointer rides the descriptor
+        // list below, exactly as a live envelope's sticker image does.
+        let sticker = import_sticker(value.get("sticker"));
         if !remote_deleted
             && text.is_none()
             && !has_long_text
             && raw_attachments.is_none_or(Vec::is_empty)
+            && sticker.is_none()
         {
             self.counters.skipped_messages += 1;
             return Ok(());
@@ -514,9 +521,17 @@ impl<'a> Importer<'a> {
         } else {
             None
         };
-        let (attachments, locators) = raw_attachments
-            .map(|raws| self.import_attachments(raws, &message_id))
-            .unwrap_or_default();
+        // Descriptors: the archive's top-level attachments plus the sticker's
+        // own byte pointer (contract 1.35: the sticker's data rides the
+        // descriptor list, live receive parity — a live sticker envelope
+        // pushes its image onto `attachments` at normalization). The pointer
+        // face is metadata-only here as everywhere else: nothing downloads in
+        // this path.
+        let mut attachment_raws: Vec<Value> = raw_attachments.cloned().unwrap_or_default();
+        if let Some((_, data)) = &sticker {
+            attachment_raws.push(data.clone());
+        }
+        let (attachments, locators) = self.import_attachments(&attachment_raws, &message_id);
         // The archive's disappearing-message metadata (contract 1.42,
         // §4.41): `expiresInMs` converts to seconds rounding up — a row must
         // never sweep before its real deadline — and `expireStartDate` (>0)
@@ -569,7 +584,7 @@ impl<'a> Importer<'a> {
             delivered_at: None,
             read_at: None,
             admin_deleted: false,
-            sticker: None,
+            sticker: sticker.map(|(meta, _)| meta),
             expire_seconds,
             expire_start_at,
             // The §4.38 archive frames carry no server GUID — the report face
@@ -1110,6 +1125,70 @@ fn import_locator(raw: Option<&Value>) -> HistoryAttachmentLocator {
         .and_then(Value::as_u64)
         .filter(|timestamp| *timestamp > 0);
     face
+}
+
+/// Parse one engine NDJSON message's `sticker` object into the 1.35 face
+/// (contract 1.76 §4.38): bounded pack identity beside the message plus the
+/// `data` byte pointer, which the caller appends to the descriptor list —
+/// the exact shape a live envelope's sticker normalization produces. Bounds
+/// are the 1.35 live-face caps (`MAX_STICKER_*`, one source of truth across
+/// live receive and import): packId ≤64, packKey ≤128 base64, stickerId
+/// within u32, emoji ≤32 and optional. The face rides only whole — a
+/// missing identity field or a missing/malformed `data` pointer answers
+/// None so the row keeps plain routing instead of carrying half a sticker
+/// (the live `normalized_sticker` discipline, engine.rs; the engine export
+/// gate keeps malformed pack byte lengths off the wire entirely, so what
+/// reaches here is hostile-line territory only).
+fn import_sticker(raw: Option<&Value>) -> Option<(crate::engine::NormalizedSticker, Value)> {
+    let object = raw?.as_object()?;
+    let pack_id = object
+        .get("packId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(crate::engine::MAX_STICKER_PACK_ID_CHARS)
+                .collect::<String>()
+        })?;
+    let pack_key = object
+        .get("packKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(crate::engine::MAX_STICKER_PACK_KEY_CHARS)
+                .collect::<String>()
+        })?;
+    let sticker_id = object
+        .get("stickerId")
+        .and_then(Value::as_u64)
+        .filter(|id| *id <= u32::MAX as u64)
+        .map(|id| id as u32)?;
+    let emoji = object
+        .get("emoji")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(crate::engine::MAX_STICKER_EMOJI_CHARS)
+                .collect::<String>()
+        });
+    // The byte pointer must be an object for the face to ride (usable data
+    // pointer, live parity); its inner fields parse through
+    // `import_attachments` like any archive attachment.
+    let data = object.get("data")?.as_object()?; // shape gate: object only
+    Some((
+        crate::engine::NormalizedSticker {
+            pack_id,
+            pack_key,
+            sticker_id,
+            emoji,
+        },
+        Value::Object(data.clone()),
+    ))
 }
 
 #[cfg(test)]
@@ -2075,5 +2154,231 @@ mod tests {
             vec![regular.id.as_str()],
             "only the live-timer row sweeps"
         );
+    }
+
+    /// Contract 1.76 (§4.38): the archive's sticker rows land whole — the
+    /// 1.35 pack identity rides the row's `sticker` wire field (emoji
+    /// optional, absent stays absent) and the `data` byte pointer joins the
+    /// descriptor list exactly like a live envelope's sticker image, so its
+    /// locator face lands in the internal column only (no key material on
+    /// the wire). A v1-shape sticker data (no locator key) keeps the
+    /// descriptor-only face.
+    #[test]
+    fn imported_sticker_rows_carry_identity_and_ride_the_descriptor_list() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let pack_id = "9b".repeat(32);
+        let pack_key = "5j9vTQnMDqGtYvXq3KpeNbJZ2fM8x4mLr6hUcA1sW0E=";
+        let key_b64 = "q83vLNoechoM6CiZ+hr3P5ePE3YGAibLE4bAl1jv20Y=";
+        let hash_hex = "b".repeat(64);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // Full face: identity + emoji + transit-locator byte pointer.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "sticker": {
+                        "packId": pack_id, "packKey": pack_key, "stickerId": 7,
+                        "emoji": "🎉",
+                        "data": {
+                            "contentType": "image/webp", "fileName": "s.webp", "size": 128,
+                            "locator": {
+                                "key": key_b64, "cdnKey": "sk1", "cdnNumber": 0,
+                                "uploadTimestamp": 1_700_000_000_000_u64,
+                                "plaintextHash": hash_hex
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                // Emoji-less face over v1-shape data: the sticker still rides,
+                // descriptor-only, no locator row.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming",
+                    "sticker": {
+                        "packId": pack_id, "packKey": pack_key, "stickerId": 9,
+                        "data": {"contentType": "image/webp", "fileName": "t.webp", "size": 64}
+                    }
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 2);
+        assert_eq!(counters.skipped_messages, 0);
+        let conversation = alice_conversation_id(&account.id);
+        let message_at = |sent_at: u64| {
+            store
+                .message_by_signal_identity(
+                    &account.id,
+                    &conversation,
+                    "incoming",
+                    sent_at,
+                    &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                    &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+                )
+                .unwrap()
+                .expect("imported sticker row")
+        };
+
+        // Full face: the identity rides the row's own wire field — never
+        // smuggled through the descriptor list — and the byte pointer rides
+        // the descriptor list with its locator face in the internal column.
+        let full = message_at(1000);
+        let sticker = full.sticker.as_ref().expect("sticker identity");
+        assert_eq!(sticker.pack_id, pack_id);
+        assert_eq!(sticker.pack_key, pack_key);
+        assert_eq!(sticker.sticker_id, 7);
+        assert_eq!(sticker.emoji.as_deref(), Some("🎉"));
+        assert_eq!(full.attachments.len(), 1, "data joined the descriptor list");
+        assert_eq!(
+            full.attachments[0].content_type.as_deref(),
+            Some("image/webp")
+        );
+        assert_eq!(full.attachments[0].size, Some(128));
+        let faces = store
+            .history_attachment_locators(&account.id, &full.id)
+            .unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].key.as_deref(), Some(key_b64));
+        assert_eq!(faces[0].cdn_key.as_deref(), Some("sk1"));
+        let wire = serde_json::to_value(&full).expect("wire row");
+        assert_eq!(wire["sticker"]["packId"], pack_id.as_str());
+        assert_eq!(wire["sticker"]["stickerId"], 7);
+        let wire_text = wire.to_string();
+        assert!(
+            wire_text.contains(pack_key),
+            "the pack identity is the 1.35 wire face"
+        );
+        assert!(
+            !wire_text.contains(key_b64),
+            "locator key material never rides the wire"
+        );
+        assert!(
+            !wire_text.contains("cdnKey"),
+            "no transit face on the wire descriptor"
+        );
+
+        // Emoji-less face: the identity still rides, emoji stays absent on
+        // the wire, and v1-shape data lands descriptor-only (no faces row).
+        let bare = message_at(2000);
+        let sticker = bare.sticker.as_ref().expect("sticker identity");
+        assert_eq!(sticker.sticker_id, 9);
+        assert_eq!(sticker.emoji, None);
+        assert_eq!(bare.attachments[0].size, Some(64));
+        let wire = serde_json::to_value(&bare).expect("wire row");
+        assert!(
+            wire["sticker"].get("emoji").is_none(),
+            "absent stays absent"
+        );
+        assert_eq!(
+            store
+                .history_attachment_locators(&account.id, &bare.id)
+                .unwrap(),
+            Vec::new(),
+            "no locator key → no faces row"
+        );
+
+        // A re-run converges (identity discipline covers sticker rows too).
+        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(second.imported, 0);
+    }
+
+    /// Contract 1.76 (§4.38): the sticker face rides only whole — a missing
+    /// or non-object `data` pointer answers None, and a bodyless message
+    /// behind it keeps plain skip routing instead of storing an empty
+    /// sticker row (the live `normalized_sticker` discipline).
+    #[test]
+    fn sticker_rows_without_a_usable_data_pointer_skip() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // Identity only: no data key at all.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "sticker": {"packId": "9b".repeat(32), "packKey": "5j9vTQnMDqGtYvXq3KpeNbJZ2fM8x4mLr6hUcA1sW0E=", "stickerId": 7}
+                })
+                .to_string(),
+                // A non-object data pointer is the same skip class.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming",
+                    "sticker": {"packId": "9b".repeat(32), "packKey": "5j9vTQnMDqGtYvXq3KpeNbJZ2fM8x4mLr6hUcA1sW0E=", "stickerId": 8, "data": "gone"}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 0);
+        assert_eq!(counters.skipped_messages, 2, "the face rode incomplete");
+        let row = store.history_import_row(&account.id).unwrap().unwrap();
+        assert_eq!(row.state, "completed");
+        assert_eq!(row.imported_messages, 0);
+    }
+
+    /// Contract 1.76 (§4.38): identity gaps skip the row — a missing packId
+    /// or packKey, or a stickerId past u32, drops the whole face (never
+    /// stored, never fatal), mirroring the live bounded parse.
+    #[test]
+    fn imported_sticker_identity_gaps_skip_the_row() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        let data =
+            serde_json::json!({"contentType": "image/webp", "fileName": "s.webp", "size": 128});
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                // No packId.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming",
+                    "sticker": {"packKey": "5j9vTQnMDqGtYvXq3KpeNbJZ2fM8x4mLr6hUcA1sW0E=", "stickerId": 7, "data": data}
+                })
+                .to_string(),
+                // No packKey.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 2000,
+                    "direction": "incoming",
+                    "sticker": {"packId": "9b".repeat(32), "stickerId": 7, "data": data}
+                })
+                .to_string(),
+                // stickerId past u32.
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 3000,
+                    "direction": "incoming",
+                    "sticker": {"packId": "9b".repeat(32), "packKey": "5j9vTQnMDqGtYvXq3KpeNbJZ2fM8x4mLr6hUcA1sW0E=", "stickerId": 4294967296_u64, "data": data}
+                })
+                .to_string(),
+            ],
+        );
+
+        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        assert_eq!(counters.imported, 0);
+        assert_eq!(counters.skipped_messages, 3);
     }
 }
