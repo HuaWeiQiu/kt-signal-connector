@@ -5,7 +5,24 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.75 (2026-10-08; the username write-face opening —
+- Contract revision: 1.76 (2026-10-08; the history-import sticker row
+  opening (§4.38): the engine NDJSON archive's per-message `sticker`
+  face now lands — the 1.35 pack identity parses with the live-receive
+  bounds as one source of truth (`MAX_STICKER_*`: packId ≤64 chars,
+  packKey ≤128 base64, stickerId within u32, emoji ≤32 and optional),
+  the row's body presence counts the sticker face as its body, and the
+  `data` byte pointer joins the descriptor list exactly as a live
+  envelope's sticker image does — metadata-only, its locator face rides
+  the internal `attachment_locators` column, nothing downloads. The
+  face rides only whole: a missing identity field or a missing/malformed
+  `data` pointer answers no sticker, and the bodyless row behind the
+  dropped face keeps plain skip routing. Store-side the import batch
+  writer now persists `sticker_json` (previously hardwired NULL — a
+  latent write-face gap unobservable while the importer projected no
+  sticker). No host wire shape change: the `sticker` field has ridden
+  the message wire face since 1.35; no capability change, no schema
+  change, no schema store version change) —
+  previously 1.75 (2026-10-08; the username write-face opening —
   `accounts.setUsername`'s kt-engine arm comes alive as the engine's
   two-hop `usernameReserve`→`usernameConfirm` orchestration, with
   `deleteUsername` riding `usernameDelete` (§4.66; the engine's username
@@ -2038,6 +2055,25 @@ documented data-directory artifact instead of an RPC surface.
   with its error class until the account is deleted or re-linked (only-first-link semantics,
   ADR 0005 §风险与边界). The connector never deletes or rewrites the engine's archive file; the
   completed row in the connector store is the consumption marker.
+- Sticker rows land whole (contract 1.76, 2026-10-08; engine counterpart recorded in
+  kt-signal-engine `docs/jsonrpc-compat.md` §5): the archive's per-message `sticker` face —
+  unprojected since 1.39's tolerant frame list — now parses with the live-receive 1.35 bounds
+  as the single source of truth (`engine::MAX_STICKER_*`: packId ≤64 chars, packKey ≤128
+  base64, stickerId within u32, emoji ≤32 and optional; the engine's export gate already keeps
+  the official shapes on the wire — packId from exactly 16 bytes, packKey from exactly 32 — so
+  oversized identities reaching the import are hostile-line territory only). The sticker
+  identity is the row's body: a bodyless row carrying a sticker face imports instead of
+  skip-counting, and the `data` byte pointer joins the descriptor list exactly as a live
+  envelope's sticker normalization does — metadata-only, its `locator` face (when present)
+  lands in the internal `attachment_locators` column under the same attachv2 rules, nothing
+  downloads. The face rides only whole: a missing identity field or a missing/non-object
+  `data` pointer answers no sticker, and the bodyless row behind the dropped face keeps plain
+  skip routing — never a half sticker row (the live `normalized_sticker` discipline). The
+  import batch writer now also persists `sticker_json` (previously hardwired NULL in its
+  INSERT — a latent write-face gap unobservable while the importer projected no sticker).
+  Host wire unchanged: the `sticker` field has ridden the message wire face since 1.35, so
+  this batch is wire-shape-zero — no schema JSON change, no capability change, no schema
+  store version change.
 
 ### 4.39 Group member roster: groups.get `members` (contract revision 1.40, 2026-10-05)
 

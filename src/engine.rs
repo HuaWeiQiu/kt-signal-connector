@@ -764,10 +764,12 @@ const MAX_PREVIEW_FIELD_BYTES: usize = 512;
 const MAX_MENTION_NAME_BYTES: usize = 128;
 /// Sticker bounds (contract revision 1.35): the same face bounds the send
 /// method enforces — pack id 64 hex chars, pack key 128 base64 chars, emoji
-/// label 32 chars.
-const MAX_STICKER_PACK_ID_CHARS: usize = 64;
-const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
-const MAX_STICKER_EMOJI_CHARS: usize = 32;
+/// label 32 chars. `pub(crate)` since the §4.38 history import face parses
+/// the same NDJSON `sticker` identity with these bounds (one source of truth
+/// for the 1.35 face across live receive and import).
+pub(crate) const MAX_STICKER_PACK_ID_CHARS: usize = 64;
+pub(crate) const MAX_STICKER_PACK_KEY_CHARS: usize = 128;
+pub(crate) const MAX_STICKER_EMOJI_CHARS: usize = 32;
 /// Group-update title mirror cap (contract 1.45, §4.44): the update's
 /// resulting `groupName` truncates to the same 64-char budget the envelope's
 /// `sourceName` peer-name material uses before it rides the rich payload.
