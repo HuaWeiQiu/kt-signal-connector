@@ -84,10 +84,13 @@ pub struct ApiError {
     /// Contract 1.50: optional engine-supplied error facts, pass-through only.
     /// Carried today by `PROFILE_UPLOAD_FAILED` (`{retryable, textSaved}` —
     /// the engine's honest "the text face landed, the avatar upload failed"
-    /// partial-success report) and `GROUP_TERMINATE_FAILED`/`REPORT_SPAM_*`
-    /// HTTP status echoes. The connector never invents a `data` object and
-    /// never strips keys from one the engine sent; hosts that predate this
-    /// field ignore it as an unknown JSON member.
+    /// partial-success report), `GROUP_TERMINATE_FAILED`/`REPORT_SPAM_*`
+    /// HTTP status echoes, and the promised `{detail}` face of the
+    /// message-carrying cloud-backup families (since 1.83 the restore four,
+    /// since 1.87 the upload three — engine cloud-backup-contract §2/§6.2).
+    /// The connector never invents a `data` object and never strips keys from
+    /// one the engine sent; hosts that predate this field ignore it as an
+    /// unknown JSON member.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }

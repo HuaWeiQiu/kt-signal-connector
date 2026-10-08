@@ -5,7 +5,55 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.86 (2026-10-08; the story-anchored attachment byte
+- Contract revision: 1.87 (2026-10-09; the cloud-backup upload passthrough
+  batch (§4.72): the engine's upload half (engine cloud-backup-contract §6,
+  v2 2026-10-08 — the five rulings and the measured pins; engine
+  `jsonrpc-compat.md` §3 per-method rows) lands its connector pipe —
+  `backups.uploadToCloud` `{accountId}` → `{status: "started"}` and
+  `backups.uploadStatus` `{accountId}` → the progress snapshot mirror. The
+  connector owns the chain's first stage: it (re)builds the §10.2
+  transitional artifact `backup-export-input.ndjson` in the engine's
+  per-account data directory with the §4.46 machine verbatim (write-once,
+  rebuilt before every attempt; a failed build removes the partial file
+  and answers before any engine traffic) and then forwards the start —
+  send lane, account-scoped mutating, an indeterminate outcome answering
+  SEND_OUTCOME_UNKNOWN and never retrying (a retry is the caller's fresh
+  start: a new form, a new artifact, the server keeping the latest
+  successful upload). The eight-family structured error table mirrors the
+  engine's `CloudUploadError::rpc_code` single mapping source — shared
+  with the uploadStatus failed phase so the two ends cannot drift: the
+  five state families (BACKUP_AUTH_FAILED / BACKUP_NOT_PROVISIONED /
+  BACKUP_ARTIFACT_MISSING / BACKUP_ARTIFACT_INVALID /
+  BACKUP_UPLOAD_ALREADY_RUNNING) stay content-free retryable=false, the
+  three message families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED
+  retryable=true, BACKUP_IO_FAILED retryable=false) carry the engine's
+  `data.detail` verbatim. Two per-face divergences are reasserted at the
+  upload call site: BACKUP_IO_FAILED is retryable=false with detail here
+  while its §4.46 export face stays retryable=true content-free (the face,
+  not the code, owns the face), and BACKUP_TRANSPORT_FAILED keeps its
+  restore text on the restore path while the upload path names the upload
+  chain. The two new code positions (BACKUP_UPLOAD_ALREADY_RUNNING,
+  BACKUP_UPLOAD_FAILED) register in the structured-error whitelist — the
+  registration the engine's compat rows assign to this batch. The
+  capability set does not grow: `backup-export` widens in place (the 1.82
+  call-signaling precedent — the upload's entire input is the
+  backup-export artifact chain); kt-engine only (the §4.69 mode seam).
+  `backups.uploadStatus` is the read-lane mirror of the engine's
+  process-wide single-slot snapshot: `{present: false}` when absent (never
+  started / succeeded — a success leaves no trace — / the engine
+  restarted), else `{present: true, phase:
+  exporting|uploading|failed, bytesRead, bytesTotal?, errorCode?}` through
+  the same shape-gate discipline as cloudStatus (an absent `bytesTotal`
+  stays an absent key, a malformed present-face fails
+  UPSTREAM_PROTOCOL_ERROR rather than claiming absence, a down engine or
+  an indeterminate read honestly answers `{present: false}`). Deliberately
+  out: the media tier and the subscription/level query face (the engine
+  does not check levels — the server refuses honestly), the desktop
+  settings-page upload entry (the follow-up batch), a consumption watcher
+  (the upload produces nothing local), and the export face's snapshot
+  caretaker / skip-counter merge (the upload creates no snapshot and has
+  no status face to merge counters into))
+  — previously 1.86 (2026-10-08; the story-anchored attachment byte
   faces (§4.71): `stories.downloadAttachment` +
   `stories.openAttachment` — the byte half of the story surface. Stories
   land in no conversation row (§4.67), so the row-anchored
@@ -5276,6 +5324,147 @@ including the whole rendering projection passed verbatim, and a digest
 mismatch is terminal with nothing landed and no temp residue); and the
 schema diff (method enum, dispatch arms, the three param defs, and the
 numeric-bound pairs keyed to the code constants).
+
+### 4.72 Cloud-backup upload passthrough: `backups.uploadToCloud`, `backups.uploadStatus` (contract revision 1.87, 2026-10-09)
+
+The engine's cloud-backup upload half (engine `docs/cloud-backup-contract.md`
+§6 — the five rulings at §6.0, the measured pins at §6.1, the method faces
+and the eight-code table at §6.2, the chain shape at §6.3; the engine-side
+method rows live in engine `docs/jsonrpc-compat.md` §3, which names the two
+new code positions as this batch's whitelist registration) lands its
+connector pipe: two faces plus the connector-owned artifact stage. The
+engine's chain (assembly on a dedicated OS thread → backup credential fetch
+with the 404 bootstrap self-heal → zkgroup redemption/presentation →
+unauthenticated chat gRPC `get_upload_form` with cdn 3 enforced → the TUS
+create-with-upload single POST → `refresh_backup`) runs entirely in the
+engine's background; the faces start it and observe it.
+
+- **`backups.uploadToCloud`** `{accountId}` → `{status: "started"}`. Send
+  lane, account-scoped mutating — the §4.69 restore class verbatim. The
+  connector's own stage runs first (the §6.3 chain shape: "connector writes
+  the artifact, §10.2 same shape"): the §10.2 transitional artifact
+  `backup-export-input.ndjson` is (re)built in the engine's per-account
+  data directory with the §4.46 `build_artifact` machine verbatim —
+  write-once, rebuilt before every attempt, a failed build removing the
+  partial file so the engine never sees a stale one, and the build's own
+  failures (registry gap, store, caps, IO) answering with the §4.46
+  BuildError faces before any engine traffic. With the artifact landed the
+  start forwards `{account}`; the engine's own start gates (registered
+  account → artifact present → first line valid → the process-wide
+  single-slot gate) then answer their structured codes. A definite
+  acceptance answers `{"status": "started"}`; a non-started answer fails
+  UPSTREAM_PROTOCOL_ERROR; an indeterminate mutating outcome answers
+  SEND_OUTCOME_UNKNOWN and never retries — the terminal state is observed
+  through `backups.uploadStatus`, and a retry is the caller's fresh
+  `backups.uploadToCloud` (a new form, a new artifact; the server keeps
+  the latest successful upload — the §6.2/§6.4 single-shot-no-resume
+  semantics, the AGENTS.md unknown-outcome red line). The eight-family
+  ladder maps through `cloud_upload_face_error`, the engine's
+  `CloudUploadError::rpc_code` table as the single mapping source (shared
+  with the failed-phase `errorCode`, so the two ends cannot drift):
+  BACKUP_AUTH_FAILED (unregistered/fake account, AEP/registration/identity
+  key material missing, zkgroup redemption rejected), BACKUP_NOT_PROVISIONED
+  (never provisioned after the bootstrap self-heal),
+  BACKUP_ARTIFACT_MISSING / BACKUP_ARTIFACT_INVALID (the artifact gates),
+  and BACKUP_UPLOAD_ALREADY_RUNNING (the engine's process-wide single-slot
+  re-entry gate — poll the status face instead of re-starting) answer
+  retryable=false content-free; BACKUP_TRANSPORT_FAILED (credentials /
+  form gRPC / refresh) and BACKUP_UPLOAD_FAILED (non-2xx, cdn≠3, the
+  1 GiB cap, uplink read) answer retryable=true with `error.data {detail}`
+  verbatim; BACKUP_IO_FAILED (the temp-archive write) answers
+  retryable=false with `data.detail` verbatim. **Two per-face divergences
+  are reasserted at the upload call site**: BACKUP_IO_FAILED's §4.46
+  export face stays retryable=true content-free (a transient disk race the
+  desktop may retry after the connector clears) while the upload face is
+  contract-fixed retryable=false with detail — the face, not the code,
+  owns the face, so the global mapping keeps the export shape and the
+  upload path remaps; and BACKUP_TRANSPORT_FAILED keeps its restore text
+  on the restore path while the upload path names the upload chain. The
+  two new code positions (BACKUP_UPLOAD_ALREADY_RUNNING,
+  BACKUP_UPLOAD_FAILED) register in `ENGINE_STRUCTURED_ERROR_CODES` — the
+  registration the engine's compat rows assign to this batch; every other
+  code the face carries was already whitelisted by its owning batch
+  (§4.46, §4.69).
+- **`backups.uploadStatus`** `{accountId}` → the engine's progress snapshot
+  mirrored: `{present: false}` when no snapshot exists (never started, or
+  succeeded — a success leaves no trace, §6.4 —, or the engine restarted),
+  else `{present: true, phase: "exporting"|"uploading"|"failed",
+  bytesRead, bytesTotal?, errorCode?}`. Read lane, non-mutating (the
+  `backups.cloudStatus` discipline). `exporting` is the assembly stage
+  (byte counts carry no semantics: the engine holds bytesRead at 0 and the
+  total absent); `uploading` is the uplink stage (block counts valid;
+  `bytesTotal` is the assembled artifact's byte count — absent only as
+  honest uncertainty, never a zero-filled stand-in); `failed` is the
+  terminal snapshot, persisting until the next start overwrites it and
+  carrying the same structured `errorCode` table as the start face's error
+  ladder. An engine that is down (or an indeterminate read) answers
+  `{present: false}` — the snapshot is engine-process memory (a
+  process-wide single slot), so "not observable" is exactly the
+  post-restart truth, not an invented state; a malformed present-snapshot
+  face fails UPSTREAM_PROTOCOL_ERROR instead of degrading to
+  `{present: false}` (a read that delivered junk knows nothing). The
+  answer is rebuilt key-for-key through the projection's shape gate, so no
+  unplanned key rides. Deliberately no push event (the §4.68 polling
+  precedent).
+- **Lane/capability**: `backups.uploadToCloud` is send lane, account-scoped
+  mutating; `backups.uploadStatus` is read. The capability set does not
+  grow: both faces ride `backup-export`, widened in place (the 1.82
+  call-signaling precedent) — the upload's entire input is the
+  backup-export artifact chain, and the desktop's backup section already
+  gates on the tag; kt-engine only (the §4.69 mode seam,
+  CAPABILITY_UNAVAILABLE on the JVM/native faces — the engine methods are
+  KT extensions a stock signal-cli does not carry). The schema grows the
+  two method enum entries, the two dispatch literals, the two params defs,
+  and the two error codes; no schema store version change.
+- **Deliberately out of this batch** (recorded, not worked around): the
+  media tier and the subscription/level query face (the engine does not
+  check levels — the server refuses honestly and the code passes through;
+  §6.4), and the desktop settings-page upload entry (the engine contract's
+  follow-up batch). No consumption watcher exists or is needed: the upload
+  produces nothing local, a success leaves no trace. The §4.46 snapshot
+  caretaker and skip-counter merge stay the export face's own — the upload
+  creates no snapshot and has no status face to merge counters into, so
+  `backup_counters` is deliberately untouched (a later `backups.exportStatus`
+  keeps describing the last export build, not an upload's). Artifact
+  residue converges by overwrite: the artifact is write-once and rebuilt
+  before every attempt (the §4.46 posture), and the engine deletes it only
+  on the invalid-first-line hard boundary (§6.2).
+- **Fixture**: `fake-signal-cli.py` mirrors the negotiated wire face —
+  marker files steer the eight-family ladder
+  (`.fixture-cloud-upload-running` = the single-slot re-entry gate;
+  `.fixture-cloud-upload-error` = a family sentinel, the three message
+  families additionally carrying `data.detail`) and the status states
+  (`.fixture-cloud-upload-status` = `<phase> <read> [<total|code>]`), and
+  the start arm mirrors the engine's artifact gate honestly: with no
+  steering marker, a missing `backup-export-input.ndjson` in the account
+  directory answers BACKUP_ARTIFACT_MISSING, so the happy path through the
+  real connector pins that the artifact build landed. Real-device upload
+  (an enabled-cloud-backup account end to end, the official client reading
+  the upload back through restore) is the engine batch's own acceptance
+  (§6.5), not this batch's.
+
+Tests: the unit chain pins the whitelist sets (`methods.rs` — both faces in
+the read/send/mutating arrays), the eight-code mapping totality with the
+content-free/detail split and the two per-face divergences (`service.rs` —
+including the pin that BACKUP_IO_FAILED's export face stays retryable=true
+content-free while the upload face answers retryable=false with detail),
+and the uploadStatus shape gate (`supervisor.rs` — the three-phase set, the
+honest absent total, the malformed junk ladder, and the restore phase enum
+refused on this face). The fixture chain (`tests/backup_cloud_upload.rs`)
+pins the start's connector-owned half (the artifact rebuilt and landed
+ahead of the call — a planted stale artifact is never served — with the
+§10.2 account line first), the started acceptance, the eight-family ladder
+verbatim with the contract-fixed retryability and the detail pass-through,
+the three status states, and the mode/account/params gates. The integration
+roundtrip (`server_integration.rs::
+cloud_upload_faces_round_trip_in_kt_engine_mode`) drives the host IPC end
+to end in kt-engine mode: the handshake advertises both faces with no new
+feature tag (the upload rides `backup-export`), the started acceptance with
+the artifact on disk, the ladder families plus the re-entry gate across the
+wire, and the status states. The schema diff is the method enum, the two
+dispatch arms, the two params defs, the two error codes, and the `data`
+description's third family sentence; the schema-consistency scans cover the
+method set, the error-code set, and the unchanged bounds pairs.
 
 ## 5. signal-cli Boundary
 

@@ -576,6 +576,14 @@ impl RuntimeSupervisor {
         self.config.mode == SignalCliMode::KtEngine
     }
 
+    /// Cloud-backup upload (contract revision 1.87, §4.72) exists only under
+    /// kt-engine mode: the engine's upload faces are KT-extension methods a
+    /// stock signal-cli does not carry (the §4.69 seam, mirrored for the
+    /// outbound half).
+    fn cloud_upload_capable(&self) -> bool {
+        self.config.mode == SignalCliMode::KtEngine
+    }
+
     /// Once-per-start sweep: import any group account whose archive exists
     /// but has no completed row — the connector may have restarted between
     /// link and import, or a previous attempt failed. Settles first so the
@@ -4323,6 +4331,123 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// backups.uploadToCloud (contract revision 1.87, §4.72, engine
+    /// cloud-backup-contract §6.2/§6.3): the outbound half of cloud backup.
+    /// The connector's own chain stage comes first — (re)build the §10.2
+    /// transitional artifact (`backup-export-input.ndjson`) in the engine's
+    /// per-account data directory with the §4.46 machine verbatim
+    /// (write-once, rebuilt before every attempt; a failed build removes
+    /// the partial file, so the engine never sees a stale one; the
+    /// engine's start gate answers BACKUP_ARTIFACT_MISSING only when this
+    /// build never landed) — then the start forwards to the engine, whose
+    /// whole chain (assembly thread → credentials with the 404 bootstrap
+    /// self-heal → zkgroup → form gRPC → cdn3 TUS single POST →
+    /// refresh_backup) runs in its own background. The Mutating engine
+    /// call answers SEND_OUTCOME_UNKNOWN on an indeterminate outcome and
+    /// never retries — the terminal state is observed through
+    /// `backups.uploadStatus` (the engine keeps the failed phase until the
+    /// next start overwrites; a retry is the caller's fresh
+    /// backups.uploadToCloud — a new form, a new artifact). The
+    /// eight-family structured error ladder maps through
+    /// `cloud_upload_face_error`: the engine's `CloudUploadError::rpc_code`
+    /// single mapping source, with the two per-face divergences (the
+    /// transport family's upload text, BACKUP_IO_FAILED retryable=false +
+    /// detail) reasserted over the global mapping. Deliberately no
+    /// consumption watcher (the upload produces nothing local — a success
+    /// leaves no trace), no snapshot caretaker and no skip-counter merge
+    /// (both are the export face's own: the upload creates no snapshot and
+    /// has no status face to merge counters into).
+    pub async fn upload_to_cloud(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_cloud_upload_account(account_id, self.config.mode)?
+        };
+        let store = Arc::clone(&self.store);
+        let data_dir = self.config.data_dir.clone();
+        let account = account_id.to_string();
+        tokio::task::spawn_blocking({
+            let signal_account = signal_account.clone();
+            move || {
+                crate::backup_export::build_artifact(&store, &data_dir, &account, &signal_account)
+            }
+        })
+        .await
+        .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)))?
+        .map_err(ServiceError::from)?;
+        let engine = self.running_engine().await?;
+        match engine
+            .call(
+                "backups.uploadToCloud",
+                json!({ "account": signal_account }),
+                CallClass::Mutating,
+            )
+            .await
+        {
+            Ok(value) => {
+                if value.get("status").and_then(Value::as_str) == Some("started") {
+                    Ok(json!({ "status": "started" }))
+                } else {
+                    Err(ServiceError::Api(ApiError::new(
+                        "UPSTREAM_PROTOCOL_ERROR",
+                        "backups.uploadToCloud answered without a started status",
+                        true,
+                    )))
+                }
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "backups.uploadToCloud outcome is unknown; poll backups.uploadStatus",
+                false,
+            ))),
+            Err(EngineError::UpstreamCode { code, data }) => Err(ServiceError::Api(
+                crate::service::cloud_upload_face_error(code, data),
+            )),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// backups.uploadStatus (contract revision 1.87, §4.72, engine
+    /// cloud-backup-contract §6.2): poll the engine's cloud-upload progress
+    /// snapshot read-only and mirror it — the `cloud_backup_status`
+    /// discipline verbatim. The snapshot is engine-process memory (a
+    /// process-wide single slot), so an engine that is down or an
+    /// indeterminate read answers `{present: false}` — "not observable" is
+    /// exactly the post-restart truth, not an invented state. The mode
+    /// gate sits first (the §4.69 status-face precedent): the face has no
+    /// store fallback, its whole truth is the engine's upload task.
+    pub async fn cloud_upload_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        if !self.cloud_upload_capable() {
+            return Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "cloud backup upload requires the kt-engine mode",
+                false,
+            )));
+        }
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        let upstream = match self.running_engine().await {
+            Ok(engine) => Some(
+                engine
+                    .call(
+                        "backups.uploadStatus",
+                        json!({ "account": signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await,
+            ),
+            Err(_) => None,
+        };
+        match upstream {
+            Some(Ok(result)) => upload_status_from_engine(&result),
+            // Read-only: an indeterminate read degrades to the same
+            // not-observable answer as a down engine (never a guessed state).
+            Some(Err(EngineError::UnknownOutcome)) | None => Ok(json!({ "present": false })),
+            Some(Err(error)) => Err(error.into()),
+        }
+    }
+
     /// The §4.68 consumption watcher: poll the engine's import status (~3 s,
     /// 30-minute ceiling) and on a terminal state drive the §4.38 import pass
     /// directly — `completed` constructs the job immediately (bypassing the
@@ -5462,6 +5587,59 @@ fn cloud_status_from_engine(result: &Value) -> Result<Value, ServiceError> {
     Ok(Value::Object(payload))
 }
 
+/// The §4.72 uploadStatus projection (contract 1.87, engine
+/// cloud-backup-contract §6.2): the engine's progress snapshot mirrored
+/// through a shape gate — the `cloud_status_from_engine` posture verbatim
+/// (engine output is not trusted input), with the upload three-value phase
+/// set: `exporting` (the assembly stage — byte counts carry no semantics
+/// there, the engine keeps bytesRead at 0 and the total absent),
+/// `uploading` (the uplink stage — block counts valid, the total is the
+/// assembled artifact's byte count), `failed` (the terminal failure —
+/// errorCode carries the same code table as the start face's error ladder,
+/// the snapshot persists until the next start overwrites it).
+/// `present:false` passes as the bare absent face (never started /
+/// succeeded — a success leaves no trace — / the engine restarted); a
+/// `bytesTotal` absence stays an honest absence (never a zero); the answer
+/// is rebuilt key-by-key so no unplanned key rides; a malformed
+/// present-snapshot face fails UPSTREAM_PROTOCOL_ERROR instead of
+/// degrading to `present:false` — a read that delivered junk knows
+/// nothing.
+fn upload_status_from_engine(result: &Value) -> Result<Value, ServiceError> {
+    if result.get("present") == Some(&Value::Bool(false)) {
+        return Ok(json!({ "present": false }));
+    }
+    let phase = result.get("phase").and_then(Value::as_str);
+    let bytes_read = result.get("bytesRead").and_then(Value::as_u64);
+    let bytes_total = result.get("bytesTotal").and_then(Value::as_u64);
+    let error_code = result.get("errorCode").and_then(Value::as_str);
+    let shaped = result.get("present") == Some(&Value::Bool(true))
+        && matches!(
+            phase,
+            Some("exporting") | Some("uploading") | Some("failed")
+        )
+        && bytes_read.is_some()
+        && result.get("bytesTotal").is_some() == bytes_total.is_some()
+        && result.get("errorCode").is_some() == error_code.is_some();
+    if !shaped {
+        return Err(ServiceError::Api(ApiError::new(
+            "UPSTREAM_PROTOCOL_ERROR",
+            "backups.uploadStatus answered a malformed snapshot",
+            true,
+        )));
+    }
+    let mut payload = serde_json::Map::new();
+    payload.insert("present".to_owned(), json!(true));
+    payload.insert("phase".to_owned(), json!(phase));
+    payload.insert("bytesRead".to_owned(), json!(bytes_read));
+    if let Some(total) = bytes_total {
+        payload.insert("bytesTotal".to_owned(), json!(total));
+    }
+    if let Some(code) = error_code {
+        payload.insert("errorCode".to_owned(), json!(code));
+    }
+    Ok(Value::Object(payload))
+}
+
 /// §4.38: one bounded retention pass after a completed import, so the store
 /// converges to the per-conversation cap within the same session. Same batch
 /// discipline as the once-per-start retention pass.
@@ -6311,7 +6489,7 @@ mod tests {
     use super::{
         RuntimeSupervisor, cloud_archive_face, cloud_status_from_engine,
         compose_contact_display_name, compose_import_progress, group_extra_json,
-        is_receive_fatal_stderr,
+        is_receive_fatal_stderr, upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -6409,6 +6587,105 @@ mod tests {
             }),
         ] {
             let error = cloud_status_from_engine(&junk)
+                .expect_err("malformed snapshots must fail the gate")
+                .into_api();
+            assert_eq!(error.code, "UPSTREAM_PROTOCOL_ERROR", "{junk}");
+            assert!(error.retryable, "{junk}");
+        }
+    }
+
+    /// §4.72 uploadStatus shape gate (contract 1.87, engine
+    /// cloud-backup-contract §6.2): well-formed snapshots mirror key-for-key
+    /// across the three-phase set (exporting with its zero-count face,
+    /// uploading with and without a total — an absent `bytesTotal` staying
+    /// an honest absence —, failed with the structured errorCode), and
+    /// every malformed present-face fails UPSTREAM_PROTOCOL_ERROR rather
+    /// than degrading to `present:false` (a read that delivered junk knows
+    /// nothing — claiming absence would be the fake-0 lie in state form).
+    #[test]
+    fn upload_status_projection_gates_the_engine_shape() {
+        let absent = upload_status_from_engine(&json!({ "present": false })).unwrap();
+        assert_eq!(absent, json!({ "present": false }));
+
+        let exporting = upload_status_from_engine(&json!({
+            "present": true,
+            "phase": "exporting",
+            "bytesRead": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            exporting,
+            json!({ "present": true, "phase": "exporting", "bytesRead": 0 })
+        );
+        assert!(
+            exporting.get("bytesTotal").is_none(),
+            "the assembly stage carries no total: {exporting}"
+        );
+
+        let uploading = upload_status_from_engine(&json!({
+            "present": true,
+            "phase": "uploading",
+            "bytesRead": 131072,
+            "bytesTotal": 1048576
+        }))
+        .unwrap();
+        assert_eq!(
+            uploading,
+            json!({
+                "present": true,
+                "phase": "uploading",
+                "bytesRead": 131072,
+                "bytesTotal": 1048576
+            })
+        );
+
+        // The honest-uncertainty form: no total is no key, never a zero.
+        let totalless = upload_status_from_engine(&json!({
+            "present": true,
+            "phase": "uploading",
+            "bytesRead": 131072
+        }))
+        .unwrap();
+        assert_eq!(
+            totalless,
+            json!({ "present": true, "phase": "uploading", "bytesRead": 131072 })
+        );
+        assert!(totalless.get("bytesTotal").is_none());
+
+        let failed = upload_status_from_engine(&json!({
+            "present": true,
+            "phase": "failed",
+            "bytesRead": 131072,
+            "errorCode": "BACKUP_UPLOAD_FAILED"
+        }))
+        .unwrap();
+        assert_eq!(failed["phase"], "failed");
+        assert_eq!(failed["errorCode"], "BACKUP_UPLOAD_FAILED");
+
+        for junk in [
+            json!({}),
+            json!({ "present": "yes" }),
+            json!({ "present": true }),
+            json!({ "present": true, "phase": "uploading" }),
+            // The restore phase enum does not pass the upload gate (and
+            // vice versa): the two faces keep their own phase sets.
+            json!({ "present": true, "phase": "downloading", "bytesRead": 1 }),
+            json!({ "present": true, "phase": "teleporting", "bytesRead": 1 }),
+            json!({ "present": true, "phase": "uploading", "bytesRead": "40" }),
+            json!({
+                "present": true,
+                "phase": "uploading",
+                "bytesRead": 40,
+                "bytesTotal": "100"
+            }),
+            json!({
+                "present": true,
+                "phase": "failed",
+                "bytesRead": 40,
+                "errorCode": 7
+            }),
+        ] {
+            let error = upload_status_from_engine(&junk)
                 .expect_err("malformed snapshots must fail the gate")
                 .into_api();
             assert_eq!(error.code, "UPSTREAM_PROTOCOL_ERROR", "{junk}");

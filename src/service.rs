@@ -506,6 +506,28 @@ impl ServiceError {
                     "BACKUP_DECRYPT_FAILED" | "BACKUP_EXPORT_FAILED" => {
                         cloud_restore_message_family_error(code, data, false)
                     }
+                    // §4.72 cloud-backup upload passthrough (contract 1.87,
+                    // engine cloud-backup-contract §6.2): the two code
+                    // positions the upload face adds over the restore table.
+                    // UPLOAD_ALREADY_RUNNING is the engine's process-wide
+                    // single-slot re-entry gate — content-free,
+                    // deterministic (poll backups.uploadStatus instead of
+                    // re-starting). UPLOAD_FAILED only ever originates from
+                    // the upload face, so its global face IS the upload
+                    // face: the CDN uplink message family, `data.detail`
+                    // verbatim, retryable=true — a retry is the caller's
+                    // fresh backups.uploadToCloud (new form, new artifact),
+                    // never an automatic retry of an unknown-outcome POST.
+                    // The upload face's per-face divergence on the SHARED
+                    // codes (BACKUP_TRANSPORT_FAILED message text,
+                    // BACKUP_IO_FAILED retryable=false + detail) is mapped
+                    // at the upload call site — see `cloud_upload_face_error`.
+                    "BACKUP_UPLOAD_ALREADY_RUNNING" => ApiError::new(
+                        "BACKUP_UPLOAD_ALREADY_RUNNING",
+                        "a cloud backup upload is already running; poll backups.uploadStatus",
+                        false,
+                    ),
+                    "BACKUP_UPLOAD_FAILED" => cloud_upload_message_family_error(code, data, true),
                     // §4.66 username write face (contract 1.75, engine
                     // username write-face batch): the reserve/confirm/delete
                     // server-state ladder. TAKEN (reserve 409 / confirm 410)
@@ -598,6 +620,70 @@ fn cloud_restore_message_family_error(
             "BACKUP_DOWNLOAD_FAILED" => ApiError::new("BACKUP_DOWNLOAD_FAILED", message, retryable),
             "BACKUP_DECRYPT_FAILED" => ApiError::new("BACKUP_DECRYPT_FAILED", message, retryable),
             _ => ApiError::new("BACKUP_EXPORT_FAILED", message, retryable),
+        };
+    };
+    let mut api = ApiError::with_data(code, message, data);
+    api.retryable = retryable;
+    api
+}
+
+/// The §4.72 upload-face structured error mapping (contract 1.87, engine
+/// cloud-backup-contract §6.2 — the engine's `CloudUploadError::rpc_code`
+/// table is the single mapping source, shared with the uploadStatus failed
+/// phase, so the two ends cannot drift). The upload face carries EIGHT
+/// codes: the five state families it shares with restore/export
+/// (BACKUP_AUTH_FAILED / BACKUP_NOT_PROVISIONED / BACKUP_ARTIFACT_MISSING /
+/// BACKUP_ARTIFACT_INVALID / BACKUP_UPLOAD_ALREADY_RUNNING) ride the global
+/// mapping verbatim — content-free deterministic refusals — and the three
+/// message-carrying families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED
+/// / BACKUP_IO_FAILED, the engine's `detail()` Some set) are mapped here.
+/// Two of the shared codes DIVERGE per face and must not ride the global
+/// mapping on the upload path: BACKUP_TRANSPORT_FAILED keeps the global
+/// restore-flavored message text on restore calls, so the upload path
+/// reasserts the upload text; BACKUP_IO_FAILED is retryable=true
+/// content-free on the §4.46 export face but the upload contract fixes it
+/// retryable=false (a temp-archive write failure is terminal for the
+/// attempt) with the engine's `data.detail` riding verbatim.
+pub(crate) fn cloud_upload_face_error(code: &'static str, data: Option<Value>) -> ApiError {
+    match code {
+        "BACKUP_TRANSPORT_FAILED" => cloud_upload_message_family_error(code, data, true),
+        "BACKUP_IO_FAILED" => cloud_upload_message_family_error(code, data, false),
+        // Every other upload-face code is identical to its global face:
+        // BACKUP_UPLOAD_FAILED's global arm IS the upload face (only the
+        // upload path emits it), and the shared state families are
+        // content-free on both faces.
+        _ => ServiceError::Engine(EngineError::UpstreamCode { code, data }).into_api(),
+    }
+}
+
+/// The §4.72 message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED
+/// / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED): the engine's `data.detail`
+/// rides verbatim when present, the fixed content-free face answers without
+/// it, and the contract-fixed family retryability (transport/upload true —
+/// a later fresh attempt may succeed; io false — terminal for the attempt)
+/// always wins over the `with_data` default. The `cloud_restore_message_
+/// family_error` sibling discipline, with the upload text faces.
+fn cloud_upload_message_family_error(
+    code: &'static str,
+    data: Option<Value>,
+    retryable: bool,
+) -> ApiError {
+    let message = match code {
+        "BACKUP_TRANSPORT_FAILED" => "the cloud backup upload transport failed",
+        "BACKUP_UPLOAD_FAILED" => "the cloud backup upload failed",
+        _ => "the cloud backup upload hit a filesystem failure",
+    };
+    let Some(data) = data else {
+        // The literal `ApiError::new` sites are the schema-consistency
+        // scanner's code-side anchor (tests/schema_consistency.rs): every
+        // host error code must appear at one, so the content-free face
+        // spells each family out instead of reusing the `code` variable.
+        return match code {
+            "BACKUP_TRANSPORT_FAILED" => {
+                ApiError::new("BACKUP_TRANSPORT_FAILED", message, retryable)
+            }
+            "BACKUP_UPLOAD_FAILED" => ApiError::new("BACKUP_UPLOAD_FAILED", message, retryable),
+            _ => ApiError::new("BACKUP_IO_FAILED", message, retryable),
         };
     };
     let mut api = ApiError::with_data(code, message, data);
@@ -3496,6 +3582,36 @@ impl ConnectorService {
             _ => Err(ServiceError::Api(ApiError::new(
                 "CAPABILITY_UNAVAILABLE",
                 "cloud restore requires the kt-engine mode",
+                false,
+            ))),
+        }
+    }
+
+    /// backups.uploadToCloud / backups.uploadStatus (contract revision 1.87,
+    /// §4.72, engine cloud-backup-contract §6.2): resolve the account and
+    /// gate the engine mode. The faces carry only `{account}` to the engine
+    /// — the connector's own half of the upload chain is the §10.2 artifact
+    /// build (the §4.46 machine verbatim) ahead of the start call, and the
+    /// assembly/upload/refresh chain runs engine-side. The mode seam rides
+    /// the §4.69 ladder (the §4.67 precedent: shape validation precedes the
+    /// seam): the upload faces are KT-extension methods a stock signal-cli
+    /// does not carry, so the face rides the kt-engine-only mode gate while
+    /// the capability advertisement widens `backup-export` in place (the
+    /// upload's entire input is the backup-export artifact chain) — no new
+    /// bit. Returns the resolved signal account (the artifact build needs
+    /// it beside the wire params, the §4.46 export posture).
+    pub fn prepare_cloud_upload_account(
+        &self,
+        account_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<String, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(account.signal_account),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "cloud backup upload requires the kt-engine mode",
                 false,
             ))),
         }
@@ -7449,6 +7565,22 @@ pub struct BackupsCloudStatusParams {
     pub account_id: String,
 }
 
+/// backups.uploadToCloud / backups.uploadStatus (contract revision 1.87,
+/// §4.72): the cloud-backup upload passthrough faces. The only parameter is
+/// the account — the connector builds the §10.2 artifact ahead of the start
+/// call and the whole upload chain runs engine-side in the background.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsUploadToCloudParams {
+    pub account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsUploadStatusParams {
+    pub account_id: String,
+}
+
 /// backups.exportFile.open (contract revision 1.47, §4.46): `file` is the
 /// two-value snapshot-file enum — no path component is accepted anywhere.
 #[derive(Debug, Deserialize)]
@@ -9758,6 +9890,112 @@ mod tests {
                 data: Some(detail.clone()),
             })
             .into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert!(!api.retryable, "{code} stays deterministic");
+            assert!(
+                api.data.is_none(),
+                "{code} never leaks unpromised engine data: {api:?}"
+            );
+        }
+    }
+
+    /// §4.72 cloud-upload faces (contract 1.87, engine cloud-backup-contract
+    /// §6.2): the two new code positions map to themselves with the
+    /// contract-fixed retryability (the re-entry gate deterministic
+    /// content-free; the CDN uplink family retryable with `data.detail`
+    /// verbatim), and the per-face divergence on the shared codes holds —
+    /// BACKUP_IO_FAILED is retryable=true content-free on the §4.46 export
+    /// face but retryable=false with detail on the upload face, and
+    /// BACKUP_TRANSPORT_FAILED keeps its restore text globally while the
+    /// upload face carries the upload text. The shared state families pass
+    /// the upload mapping through to their global faces unchanged.
+    #[test]
+    fn cloud_upload_code_faces_match_the_contract_table() {
+        // The global faces of the two new codes (UPLOAD_FAILED's global arm
+        // IS the upload face — only the upload path emits it).
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "BACKUP_UPLOAD_ALREADY_RUNNING",
+            data: Some(json!({ "detail": "must not ride" })),
+        })
+        .into_api();
+        assert_eq!(api.code, "BACKUP_UPLOAD_ALREADY_RUNNING");
+        assert!(!api.retryable);
+        assert!(
+            api.data.is_none(),
+            "the re-entry gate never leaks unpromised engine data: {api:?}"
+        );
+
+        // The upload-face mapping: message families carry the detail
+        // verbatim with the contract-fixed retryability.
+        for (code, retryable) in [
+            ("BACKUP_TRANSPORT_FAILED", true),
+            ("BACKUP_UPLOAD_FAILED", true),
+            ("BACKUP_IO_FAILED", false),
+        ] {
+            let api = cloud_upload_face_error(code, Some(json!({ "detail": "cdn 502" })));
+            assert_eq!(api.code, code, "{code}");
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert_eq!(
+                api.data,
+                Some(json!({ "detail": "cdn 502" })),
+                "{code} detail face"
+            );
+            // A data-less older-engine face keeps the fixed content-free
+            // answer with the same retryability.
+            let api = cloud_upload_face_error(code, None);
+            assert_eq!(api.code, code, "{code}");
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert!(api.data.is_none(), "{code} content-free without data");
+        }
+
+        // The per-face divergence is real: the export face of
+        // BACKUP_IO_FAILED stays retryable=true and content-free, and the
+        // global transport text stays the restore face's.
+        let export_face = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "BACKUP_IO_FAILED",
+            data: Some(json!({ "detail": "export never promised detail" })),
+        })
+        .into_api();
+        assert_eq!(export_face.code, "BACKUP_IO_FAILED");
+        assert!(export_face.retryable, "the export face stays transient");
+        assert!(
+            export_face.data.is_none(),
+            "the export face stays content-free: {export_face:?}"
+        );
+        let upload_face = cloud_upload_face_error(
+            "BACKUP_IO_FAILED",
+            Some(json!({ "detail": "temp archive write" })),
+        );
+        assert_eq!(upload_face.code, "BACKUP_IO_FAILED");
+        assert!(!upload_face.retryable, "the upload face is terminal");
+        assert_eq!(
+            upload_face.data,
+            Some(json!({ "detail": "temp archive write" }))
+        );
+        let restore_transport = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "BACKUP_TRANSPORT_FAILED",
+            data: None,
+        })
+        .into_api();
+        let upload_transport = cloud_upload_face_error("BACKUP_TRANSPORT_FAILED", None);
+        assert_ne!(
+            restore_transport.message, upload_transport.message,
+            "the two faces name their own chain"
+        );
+        assert_eq!(
+            upload_transport.message,
+            "the cloud backup upload transport failed"
+        );
+
+        // The shared state families pass through to their global faces.
+        for code in [
+            "BACKUP_AUTH_FAILED",
+            "BACKUP_NOT_PROVISIONED",
+            "BACKUP_ARTIFACT_MISSING",
+            "BACKUP_ARTIFACT_INVALID",
+            "BACKUP_UPLOAD_ALREADY_RUNNING",
+        ] {
+            let api = cloud_upload_face_error(code, Some(json!({ "detail": "unpromised" })));
             assert_eq!(api.code, code, "{code}");
             assert!(!api.retryable, "{code} stays deterministic");
             assert!(

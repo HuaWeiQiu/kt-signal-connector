@@ -110,6 +110,8 @@
             "backups.importSnapshotStatus",
             "backups.restoreFromCloud",
             "backups.cloudStatus",
+            "backups.uploadToCloud",
+            "backups.uploadStatus",
             "calls.sendSignal",
             "calls.getState",
             "messages.sendStory",
@@ -911,6 +913,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/backupsCloudStatusParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.uploadToCloud" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsUploadToCloudParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.uploadStatus" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsUploadStatusParams" }
             }
           }
         },
@@ -2471,6 +2495,24 @@
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "backupsUploadToCloudParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Start the engine's cloud-backup upload for the account (contract revision 1.87, §4.72, capability backup-export widened in place — no new capability bit; kt-engine only, the §4.69 mode seam): the outbound half of cloud backup (engine cloud-backup-contract §6). The connector's own chain stage runs first — it (re)builds the §10.2 transitional artifact (backup-export-input.ndjson) in the engine's per-account data directory with the §4.46 backup-export machine verbatim (write-once, rebuilt before every attempt; a failed build removes the partial file and answers before any engine traffic) — then forwards the start, and the engine runs the whole chain in its own background (assembly on a dedicated thread → backup credential fetch with the 404 bootstrap self-heal → zkgroup redemption → unauthenticated chat gRPC upload form, cdn 3 enforced → TUS create-with-upload single POST → refresh_backup). Result {status: 'started'} on a definite acceptance; the terminal state is observed through backups.uploadStatus (deliberately no push event). The call is account-scoped mutating, so an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and never retries — a retry is the caller's fresh backups.uploadToCloud (a new form, a new artifact; the server keeps the latest successful upload). Engine structured codes pass through verbatim, the engine's CloudUploadError::rpc_code table as the single mapping source shared with the uploadStatus failed phase: BACKUP_AUTH_FAILED / BACKUP_NOT_PROVISIONED / BACKUP_ARTIFACT_MISSING / BACKUP_ARTIFACT_INVALID / BACKUP_UPLOAD_ALREADY_RUNNING (retryable=false — missing or rejected key material, a never-provisioned account after the bootstrap self-heal, the artifact gates, the engine's process-wide single-slot re-entry gate: poll backups.uploadStatus instead of re-starting), BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED (retryable=true — the credential/form/refresh transport and the CDN uplink may succeed on a later fresh attempt), BACKUP_IO_FAILED (retryable=false on this face — a temp-archive write failure is terminal for the attempt; its §4.46 export face stays retryable=true). The three message-carrying families (TRANSPORT/UPLOAD/IO) carry error.data {detail} verbatim (the engine's promised detail face); the five state families stay content-free. The upload produces nothing local: a success leaves no trace, no snapshot is created, and the connector merges no skip counters anywhere (those are the export face's own).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "backupsUploadStatusParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Poll the engine's cloud-backup upload progress snapshot (contract revision 1.87, §4.72, capability backup-export; read lane, the backups.cloudStatus read discipline): {present: false} when no snapshot exists (never started, succeeded — a success leaves no trace —, or the engine restarted), otherwise {present: true, phase: 'exporting'|'uploading'|'failed', bytesRead, bytesTotal?, errorCode?}. exporting is the assembly stage (byte counts carry no semantics: bytesRead stays 0, the total stays absent); uploading is the uplink stage (block counts valid, bytesTotal is the assembled artifact's byte count — absent only in the honest-uncertainty form, never a zero-filled stand-in); failed is the terminal snapshot (persists until the next start overwrites it), carrying the same structured errorCode table as the uploadToCloud error face (the two ends share the engine's single mapping). The snapshot is a process-wide single slot in engine-process memory: an engine that is down or an indeterminate read answers {present: false} — 'not observable' is the restart truth, not an invented state. A malformed present-snapshot face fails UPSTREAM_PROTOCOL_ERROR rather than claiming absence. Desktops poll; deliberately no push event.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "backupsExportParams": {
       "type": "object",
       "additionalProperties": false,
@@ -3163,6 +3205,8 @@
             "BACKUP_DOWNLOAD_FAILED",
             "BACKUP_DECRYPT_FAILED",
             "BACKUP_EXPORT_FAILED",
+            "BACKUP_UPLOAD_ALREADY_RUNNING",
+            "BACKUP_UPLOAD_FAILED",
             "REPORT_SPAM_FAILED",
             "PROFILE_UPLOAD_FAILED",
             "USERNAME_TAKEN",
@@ -3195,7 +3239,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

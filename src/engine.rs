@@ -2022,6 +2022,24 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "BACKUP_DOWNLOAD_FAILED",
     "BACKUP_DECRYPT_FAILED",
     "BACKUP_EXPORT_FAILED",
+    // §4.72 cloud-backup upload passthrough (contract 1.87, engine
+    // cloud-backup-contract §6.2): the two code positions the upload face
+    // adds over the restore table, mirrored verbatim from the engine's
+    // `CloudUploadError::rpc_code` single mapping source.
+    // UPLOAD_ALREADY_RUNNING is the engine's process-wide single-slot
+    // re-entry gate (poll backups.uploadStatus instead of re-starting), a
+    // deterministic content-free refusal; UPLOAD_FAILED is the CDN uplink
+    // message family (non-2xx / cdn≠3 / over-cap / uplink read failure) —
+    // retryable=true, but a retry is always the caller's fresh
+    // backups.uploadToCloud (a new form, a new artifact), never an
+    // automatic retry of an unknown-outcome POST. The six codes the upload
+    // face shares with restore/export stay registered at their original
+    // sites above; the upload face's per-face divergence (BACKUP_IO_FAILED
+    // retryable=false + detail, the transport family's upload message
+    // text) is mapped at the upload call site — see service.rs
+    // `cloud_upload_face_error`.
+    "BACKUP_UPLOAD_ALREADY_RUNNING",
+    "BACKUP_UPLOAD_FAILED",
     // §4.66 username write face (contract 1.75, engine username write-face
     // batch): the reserve/confirm/delete server-state ladder. TAKEN and
     // RESERVATION_GONE are deterministic refusals (a new name / a fresh

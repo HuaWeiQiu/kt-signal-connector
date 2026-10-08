@@ -244,6 +244,21 @@ pub const METHODS: &[MethodRow] = &[
     // bit: the restore's entire output is the history-import NDJSON chain).
     ("backups.restoreFromCloud", Lane::Send, true, "accounts"),
     ("backups.cloudStatus", Lane::Read, false, "read"),
+    // Cloud-backup upload passthrough (contract revision 1.87, §4.72): the
+    // outbound half of cloud backup. The start face first (re)builds the
+    // §10.2 transitional artifact with the §4.46 machine — connector-local
+    // store + filesystem work — then forwards to the engine, whose whole
+    // chain (assembly → credentials → zkgroup → form gRPC → cdn3 TUS
+    // single POST → refresh_backup) runs in its background: account-
+    // mutating engine state, so send lane behind the reaction-class
+    // write-lane mutex and delete barrier, the §4.69 restore class
+    // verbatim; the status poll is a bounded read over the engine's
+    // process-wide single-slot progress snapshot. Advertised through the
+    // existing `backup-export` tag, widened in place (the 1.82
+    // call-signaling precedent — the upload's entire input is the
+    // backup-export artifact chain); kt-engine only (the §4.69 mode seam).
+    ("backups.uploadToCloud", Lane::Send, true, "accounts"),
+    ("backups.uploadStatus", Lane::Read, false, "read"),
     // Report spam (contract revision 1.49, §4.48): mutating, send-lane
     // upstream traffic — the groups class verbatim, same-account mutex and
     // delete barrier included; advertised through `report-spam`. Zero local
@@ -419,7 +434,11 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (contract revision 1.46) mark the §4.45 account-record write faces and
 /// the blocked-list read face, and `backup-export` (contract revision 1.47)
 /// marks the §4.46 Android local-backup export face (`backups.export`,
-/// `backups.exportStatus`, the `backups.exportFile` three-chain);
+/// `backups.exportStatus`, the `backups.exportFile` three-chain), widened in
+/// place by revision 1.87 (the §4.72 cloud-backup upload faces
+/// `backups.uploadToCloud` / `backups.uploadStatus` — the upload's entire
+/// input is the backup-export artifact chain; the 1.82 call-signaling
+/// no-new-bit discipline);
 /// `avatar-fetch` / `blocked-write` (contract revision 1.48) mark the §4.47
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
@@ -523,6 +542,7 @@ mod tests {
             "backups.exportFile.closeHandle",
             "backups.importSnapshotStatus",
             "backups.cloudStatus",
+            "backups.uploadStatus",
             "calls.getState",
             "accounts.getUsername",
             "username.lookup",
@@ -563,6 +583,7 @@ mod tests {
             "backups.export",
             "backups.importSnapshot",
             "backups.restoreFromCloud",
+            "backups.uploadToCloud",
             "history.importRetry",
             "history.attachmentDownload",
             "attachments.download",
@@ -611,6 +632,7 @@ mod tests {
             "backups.export",
             "backups.importSnapshot",
             "backups.restoreFromCloud",
+            "backups.uploadToCloud",
             "history.importRetry",
             "history.attachmentDownload",
             "attachments.download",

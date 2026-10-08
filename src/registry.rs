@@ -1252,6 +1252,21 @@ impl ProxyGroupRuntime {
         slot.supervisor.cloud_backup_status(account_id).await
     }
 
+    /// backups.uploadToCloud / backups.uploadStatus (contract revision 1.87,
+    /// §4.72): account-addressed, routed to the owning group's supervisor
+    /// like every account-scoped face — the artifact build and the upload
+    /// run against that group's engine and its data directory, and the
+    /// progress snapshot lives in the same process.
+    pub async fn upload_to_cloud(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.upload_to_cloud(account_id).await
+    }
+
+    pub async fn cloud_upload_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.cloud_upload_status(account_id).await
+    }
+
     /// backups.exportFile.open: account-addressed — the snapshot lives in the
     /// owning group's engine data directory, so the owning group resolves it.
     pub async fn export_file_open(

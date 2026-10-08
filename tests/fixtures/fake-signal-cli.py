@@ -1869,6 +1869,98 @@ for line in sys.stdin:
                         result["bytesTotal"] = max(int(parts[2]), 0)
                     else:
                         result["errorCode"] = parts[2]
+    elif method == "backups.uploadToCloud":
+        # §4.72 cloud-upload start face (contract 1.87, engine
+        # cloud-backup-contract §6.2): the negotiated wire mirror of the
+        # engine's KT-extension method — the params face is only {account},
+        # the happy path answers {"status": "started"} (the whole chain runs
+        # in the engine's background), and the eight-family structured-error
+        # ladder steers from markers the driving test writes:
+        # `.fixture-cloud-upload-running` present = the engine's process-wide
+        # single-slot re-entry gate (BACKUP_UPLOAD_ALREADY_RUNNING, no
+        # detail); `.fixture-cloud-upload-error` carries a family sentinel —
+        # AUTH / NOT_PROVISIONED / ARTIFACT_MISSING / ARTIFACT_INVALID /
+        # TRANSPORT / UPLOAD / IO — mapped onto the BACKUP_* code, where the
+        # three message-carrying families (TRANSPORT/UPLOAD/IO, the engine's
+        # detail() Some set) additionally carry data.detail and the five
+        # state families answer content-free. Without a steering marker the
+        # arm mirrors the engine's start artifact gate honestly: the
+        # §10.2 input artifact (`backup-export-input.ndjson`) must exist in
+        # the account directory — the connector builds it ahead of the
+        # start call, so a happy path through the real connector always
+        # lands it and its absence answers BACKUP_ARTIFACT_MISSING.
+        upload_error = None
+        upload_error_marker = SIGNAL_DATA_DIR / ".fixture-cloud-upload-error"
+        if (SIGNAL_DATA_DIR / ".fixture-cloud-upload-running").exists():
+            upload_error = "BACKUP_UPLOAD_ALREADY_RUNNING"
+        elif upload_error_marker.exists():
+            sentinel = upload_error_marker.read_text().strip()
+            upload_error = {
+                "AUTH": "BACKUP_AUTH_FAILED",
+                "NOT_PROVISIONED": "BACKUP_NOT_PROVISIONED",
+                "ARTIFACT_MISSING": "BACKUP_ARTIFACT_MISSING",
+                "ARTIFACT_INVALID": "BACKUP_ARTIFACT_INVALID",
+                "TRANSPORT": "BACKUP_TRANSPORT_FAILED",
+                "UPLOAD": "BACKUP_UPLOAD_FAILED",
+                "IO": "BACKUP_IO_FAILED",
+            }.get(sentinel)
+        upload_account_dir = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    upload_account_dir = SIGNAL_DATA_DIR / entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            upload_account_dir = None
+        if upload_account_dir is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        if upload_error is None and not (
+            upload_account_dir / "backup-export-input.ndjson"
+        ).is_file():
+            upload_error = "BACKUP_ARTIFACT_MISSING"
+        if upload_error is not None:
+            response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -1, "message": upload_error}}
+            if upload_error in (
+                "BACKUP_TRANSPORT_FAILED",
+                "BACKUP_UPLOAD_FAILED",
+                "BACKUP_IO_FAILED",
+            ):
+                response["error"]["data"] = {"detail": f"fixture {upload_error}"}
+            emit_json(response)
+            continue
+        result = {"status": "started"}
+    elif method == "backups.uploadStatus":
+        # §4.72 cloud-upload status face (contract 1.87): the progress
+        # snapshot is engine-process memory (a process-wide single slot);
+        # the fixture mirrors the negotiated states from
+        # `.fixture-cloud-upload-status` ("<phase> <read> [<total|code>]",
+        # written by the driving test) — absent/empty answers
+        # {present: false}, `exporting 0` carries the zero-count assembly
+        # face, `uploading <read> [total]` carries the block counts (total
+        # absent = the honest-uncertainty form, never a fake 0), and
+        # `failed <read> <code>` carries the structured errorCode.
+        result = {"present": False}
+        upload_status_marker = SIGNAL_DATA_DIR / ".fixture-cloud-upload-status"
+        if upload_status_marker.exists():
+            parts = upload_status_marker.read_text().split()
+            if len(parts) >= 2 and parts[0] in ("exporting", "uploading", "failed"):
+                result = {
+                    "present": True,
+                    "phase": parts[0],
+                    "bytesRead": max(int(parts[1]), 0),
+                }
+                if len(parts) > 2:
+                    if parts[0] == "uploading":
+                        result["bytesTotal"] = max(int(parts[2]), 0)
+                    elif parts[0] == "failed":
+                        result["errorCode"] = parts[2]
     elif method == "getUserStatus":
         if AUTH_FAILED_MARKER.exists():
             # Contract 1.21: the account holder unlinked this device. The

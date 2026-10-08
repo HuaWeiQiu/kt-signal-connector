@@ -9814,6 +9814,289 @@ async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.87 (§4.72): the cloud-backup upload round trip in
+/// kt-engine mode (the engine-only face, the §4.69 seam mirrored). The
+/// handshake advertises both faces with no new feature tag (the upload
+/// rides `backup-export`, widened in place); the start face's
+/// connector-owned half lands first — the §10.2 artifact is rebuilt into
+/// the registry-named engine account directory before the engine call (the
+/// fixture's own artifact gate would answer BACKUP_ARTIFACT_MISSING
+/// otherwise) — and a definite acceptance answers {"status": "started"}.
+/// The structured ladder forwards verbatim: the state families
+/// content-free, the three message families with the engine's data.detail,
+/// the contract-fixed retryability on every family — including the
+/// per-face divergence (BACKUP_IO_FAILED retryable=false here while its
+/// §4.46 export face stays retryable=true). The status face mirrors the
+/// three-phase snapshot with an absent bytesTotal staying an absent key.
+/// The fixture mirrors the negotiated wire face: these pins cover the
+/// connector's routing, artifact wiring, and error fidelity, never real
+/// engine upload behavior.
+#[tokio::test]
+async fn cloud_upload_faces_round_trip_in_kt_engine_mode() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [49_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_SIGNAL_CLI_ENGINE", "kt-engine")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries both faces before anything else runs — and
+    // still no new feature tag: the upload rides the backup-export bit.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "backups.uploadToCloud",
+        "backups.uploadStatus",
+        "backup-export",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-CloudUpload" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The absent snapshot: the honest {present: false} before anything runs.
+    let absent = request(
+        &mut client,
+        "upload-status-absent",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(absent["result"], json!({ "present": false }), "{absent}");
+
+    // The registry the artifact build and the fixture's account resolution
+    // both read — the same seeding the supervisor tests lay out.
+    let signal_data = temp.path().join("signal-data");
+    let account_dir = signal_data.join("accounts").join("lk-abc");
+    fs::create_dir_all(&account_dir).unwrap();
+    fs::write(
+        signal_data.join("engine-state.json"),
+        r#"{"version":2,"accounts":[{"number":"+15555550100","dir":"accounts/lk-abc"}]}"#,
+    )
+    .unwrap();
+
+    // The definite acceptance — and the connector's own half landed: the
+    // §10.2 artifact exists in the engine account directory (the fixture's
+    // artifact gate mirrors the engine's start gate).
+    let accepted = request(
+        &mut client,
+        "cloud-upload-start",
+        "backups.uploadToCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        accepted["result"],
+        json!({ "status": "started" }),
+        "{accepted}"
+    );
+    let artifact = account_dir.join("backup-export-input.ndjson");
+    assert!(
+        artifact.is_file() && fs::metadata(&artifact).unwrap().len() > 0,
+        "the connector built the §10.2 artifact ahead of the start call"
+    );
+
+    // The structured ladder across the wire: the state families ride
+    // content-free with their deterministic retryability, the message
+    // families carry the engine's data.detail — BACKUP_IO_FAILED answering
+    // retryable=false on this face — and the re-entry gate answers its own
+    // code (the fixture marker plays the engine's single-slot gate).
+    let error_marker = signal_data.join(".fixture-cloud-upload-error");
+    let running_marker = signal_data.join(".fixture-cloud-upload-running");
+    for (sentinel, code, retryable, detail) in [
+        ("AUTH", "BACKUP_AUTH_FAILED", false, None),
+        ("NOT_PROVISIONED", "BACKUP_NOT_PROVISIONED", false, None),
+        (
+            "TRANSPORT",
+            "BACKUP_TRANSPORT_FAILED",
+            true,
+            Some("fixture BACKUP_TRANSPORT_FAILED"),
+        ),
+        (
+            "UPLOAD",
+            "BACKUP_UPLOAD_FAILED",
+            true,
+            Some("fixture BACKUP_UPLOAD_FAILED"),
+        ),
+        (
+            "IO",
+            "BACKUP_IO_FAILED",
+            false,
+            Some("fixture BACKUP_IO_FAILED"),
+        ),
+    ] {
+        fs::write(&error_marker, sentinel).unwrap();
+        let refused = request(
+            &mut client,
+            &format!("upload-refuse-{sentinel}"),
+            "backups.uploadToCloud",
+            json!({ "accountId": account_id }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+        assert_eq!(refused["error"]["retryable"], retryable, "{refused}");
+        match detail {
+            Some(detail) => assert_eq!(
+                refused["error"]["data"],
+                json!({ "detail": detail }),
+                "{refused}"
+            ),
+            None => assert!(
+                refused["error"].get("data").is_none(),
+                "{sentinel} stays content-free across the wire: {refused}"
+            ),
+        }
+    }
+    fs::remove_file(&error_marker).unwrap();
+    fs::write(&running_marker, "1").unwrap();
+    let running = request(
+        &mut client,
+        "upload-refuse-running",
+        "backups.uploadToCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        running["error"]["code"], "BACKUP_UPLOAD_ALREADY_RUNNING",
+        "{running}"
+    );
+    assert_eq!(running["error"]["retryable"], false, "{running}");
+    assert!(
+        running["error"].get("data").is_none(),
+        "the re-entry gate stays content-free: {running}"
+    );
+    fs::remove_file(&running_marker).unwrap();
+
+    // The status states across the wire: the exporting zero-count face,
+    // uploading with both byte counts, uploading with the honest missing
+    // total, failed with the structured errorCode, and the cleared absence.
+    let status_marker = signal_data.join(".fixture-cloud-upload-status");
+    fs::write(&status_marker, "exporting 0").unwrap();
+    let exporting = request(
+        &mut client,
+        "upload-status-exporting",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        exporting["result"],
+        json!({ "present": true, "phase": "exporting", "bytesRead": 0 }),
+        "{exporting}"
+    );
+    fs::write(&status_marker, "uploading 131072 1048576").unwrap();
+    let uploading = request(
+        &mut client,
+        "upload-status-uploading",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        uploading["result"],
+        json!({
+            "present": true,
+            "phase": "uploading",
+            "bytesRead": 131072,
+            "bytesTotal": 1048576
+        }),
+        "{uploading}"
+    );
+    fs::write(&status_marker, "uploading 131072").unwrap();
+    let totalless = request(
+        &mut client,
+        "upload-status-totalless",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        totalless["result"],
+        json!({ "present": true, "phase": "uploading", "bytesRead": 131072 }),
+        "{totalless}"
+    );
+    assert!(
+        totalless["result"].get("bytesTotal").is_none(),
+        "a missing total stays a missing key on the wire: {totalless}"
+    );
+    fs::write(&status_marker, "failed 131072 BACKUP_UPLOAD_FAILED").unwrap();
+    let failed = request(
+        &mut client,
+        "upload-status-failed",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        failed["result"],
+        json!({
+            "present": true,
+            "phase": "failed",
+            "bytesRead": 131072,
+            "errorCode": "BACKUP_UPLOAD_FAILED"
+        }),
+        "{failed}"
+    );
+    fs::remove_file(&status_marker).unwrap();
+    let cleared = request(
+        &mut client,
+        "upload-status-cleared",
+        "backups.uploadStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(cleared["result"], json!({ "present": false }), "{cleared}");
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract 1.52 (§4.50): the groups.terminate round trip. The handshake
 /// advertises the method plus the `group-terminate` capability; the terminate
 /// addresses the resolved group row and dispatches the pinned 0.14.8
