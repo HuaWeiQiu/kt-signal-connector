@@ -891,10 +891,14 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_username(params).await
     }
 
-    /// accounts.getUsername (contract 1.59, §4.55): the read answers
-    /// CAPABILITY_UNAVAILABLE (no upstream username reader in the pinned
-    /// signal-cli), but the ladder still resolves the account's owning slot
-    /// first so ACCOUNT_NOT_FOUND keeps its precedence.
+    /// accounts.getUsername (contract 1.59, §4.55; the kt-engine read face
+    /// opens with contract 1.74, §4.65): the read routes through the
+    /// account's owning engine like every account-scoped read, so
+    /// ACCOUNT_NOT_FOUND keeps its precedence — the supervisor's prepare
+    /// seam then answers the honest CAPABILITY_UNAVAILABLE on the JVM/native
+    /// faces (the pinned signal-cli has no upstream username reader) while
+    /// the kt-engine face rides the engine's `getUsername` storage
+    /// projection.
     pub async fn get_username(
         &self,
         params: crate::service::AccountsGetUsernameParams,
