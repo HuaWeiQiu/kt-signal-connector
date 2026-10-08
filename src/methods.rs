@@ -234,6 +234,16 @@ pub const METHODS: &[MethodRow] = &[
     // ledger).
     ("backups.importSnapshot", Lane::Send, true, "accounts"),
     ("backups.importSnapshotStatus", Lane::Read, false, "read"),
+    // Cloud-backup restore passthrough (contract revision 1.83, §4.69):
+    // the engine's cloud restore runs entirely in its background (credentials
+    // → zkgroup → chat gRPC → CDN → decrypt → NDJSON), so the start face is
+    // account-mutating engine state — send lane behind the reaction-class
+    // write-lane mutex and delete barrier, the backups.export class verbatim;
+    // the status poll is a bounded read over the engine's progress snapshot.
+    // Advertised through the existing `history-import` tag (no new capability
+    // bit: the restore's entire output is the history-import NDJSON chain).
+    ("backups.restoreFromCloud", Lane::Send, true, "accounts"),
+    ("backups.cloudStatus", Lane::Read, false, "read"),
     // Report spam (contract revision 1.49, §4.48): mutating, send-lane
     // upstream traffic — the groups class verbatim, same-account mutex and
     // delete barrier included; advertised through `report-spam`. Zero local
@@ -368,7 +378,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// transit byte chain; the same no-new-bit discipline) and by revision 1.78
 /// (the `backups.importSnapshot` / `backups.importSnapshotStatus`
 /// official-desktop snapshot import faces — the face's entire output is the
-/// history-import archive and ledger) —
+/// history-import archive and ledger) and by revision 1.83 (the
+/// `backups.restoreFromCloud` / `backups.cloudStatus` cloud-backup restore
+/// passthrough — the restore's entire output is again the history-import
+/// NDJSON chain) —
 /// `disappearing-messages`
 /// (contract revision 1.42) marks the §4.41 receive metadata, timer-notice
 /// and bounded-sweep faces plus `conversations.setExpireTimer`, and
@@ -476,6 +489,7 @@ mod tests {
             "backups.exportFile.readChunk",
             "backups.exportFile.closeHandle",
             "backups.importSnapshotStatus",
+            "backups.cloudStatus",
             "calls.getState",
             "accounts.getUsername",
             "username.lookup",
@@ -514,6 +528,7 @@ mod tests {
             "stickerPacks.setSync",
             "backups.export",
             "backups.importSnapshot",
+            "backups.restoreFromCloud",
             "history.importRetry",
             "history.attachmentDownload",
             "attachments.download",
@@ -559,6 +574,7 @@ mod tests {
             "stickerPacks.setSync",
             "backups.export",
             "backups.importSnapshot",
+            "backups.restoreFromCloud",
             "history.importRetry",
             "history.attachmentDownload",
             "attachments.download",

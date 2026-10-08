@@ -27,25 +27,26 @@ use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailur
 use crate::service::{
     AccountDeleteLocalDataParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
-    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
+    BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
-    BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, CallsGetStateParams,
-    CallsSendSignalParams, ContactsListParams, ContactsSetLocalAliasParams, ContactsSyncParams,
-    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, GroupsApproveJoinRequestsParams, GroupsGetParams,
-    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
-    HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessageRequestParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
+    CallsGetStateParams, CallsSendSignalParams, ContactsListParams, ContactsSetLocalAliasParams,
+    ContactsSyncParams, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsListParams, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams,
+    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessageRequestParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesSetDisabledParams,
     UsernameLookupParams,
 };
@@ -1320,6 +1321,45 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid backups.importSnapshotStatus params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Cloud-backup restore passthrough (contract revision 1.83, §4.69):
+        // both arms are the params-gate shape — the account resolution and the
+        // kt-engine mode seam ride the runtime call; the start face answers
+        // {"status": "started"} for a definite acceptance and
+        // SEND_OUTCOME_UNKNOWN on an indeterminate mutating outcome, the
+        // status face mirrors the engine's progress snapshot through the
+        // projection's shape gate.
+        "backups.restoreFromCloud" => {
+            match serde_json::from_value::<BackupsRestoreFromCloudParams>(request.params) {
+                Ok(params) => match runtime.restore_from_cloud(&params.account_id).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.restoreFromCloud params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "backups.cloudStatus" => {
+            match serde_json::from_value::<BackupsCloudStatusParams>(request.params) {
+                Ok(params) => match runtime.cloud_backup_status(&params.account_id).await {
+                    Ok(status) => HostResponse::success(request_id, status),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.cloudStatus params",
                         false,
                     ),
                 ),

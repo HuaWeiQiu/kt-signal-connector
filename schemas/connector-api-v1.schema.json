@@ -108,6 +108,8 @@
             "backups.exportFile.closeHandle",
             "backups.importSnapshot",
             "backups.importSnapshotStatus",
+            "backups.restoreFromCloud",
+            "backups.cloudStatus",
             "calls.sendSignal",
             "calls.getState",
             "messages.sendStory",
@@ -884,6 +886,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/backupsImportSnapshotStatusParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.restoreFromCloud" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsRestoreFromCloudParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.cloudStatus" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsCloudStatusParams" }
             }
           }
         },
@@ -2393,6 +2417,24 @@
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "backupsRestoreFromCloudParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Start the engine's cloud-backup restore for the account (contract revision 1.83, §4.69, capability history-import — no new capability bit): pure passthrough — the engine runs the whole chain in its own background (backup credential fetch with the 404 bootstrap self-heal → zkgroup redemption/presentation → unauthenticated chat gRPC backup location → CDN download → AEP decrypt → NDJSON at history-import-cloud.ndjson), so the connector carries only the resolved account. Result {status: 'started'} on a definite acceptance; the terminal state is observed through backups.cloudStatus (deliberately no push event). The call is account-scoped mutating, so an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and never retries. Engine structured codes pass through verbatim, the engine's CloudRestoreError::rpc_code table as the single mapping source: BACKUP_NOT_PROVISIONED / BACKUP_AUTH_FAILED / BACKUP_RUNNING (retryable=false — a never-provisioned account after the bootstrap self-heal, missing or rejected key material, the engine's own re-entry gate: poll backups.cloudStatus instead of re-starting), BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED (retryable=true), BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED (retryable=false). The four message-carrying families carry error.data {detail} verbatim (the engine's promised detail face); the three state families stay content-free.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "backupsCloudStatusParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Poll the engine's cloud-backup restore progress snapshot (contract revision 1.83, §4.69, capability history-import; read lane, the transfer.downloadStatus/backup.exportStatus read discipline): {present: false} when no snapshot exists (never started, succeeded — a success leaves no trace and its NDJSON rides the history-import chain —, or the engine restarted), otherwise {present: true, phase: 'downloading'|'failed', bytesRead, bytesTotal?, errorCode?}. bytesRead counts the CDN ciphertext bytes; bytesTotal is absent whenever the engine could not learn a content-length — honest uncertainty, never a zero-filled stand-in; the failed phase is a terminal snapshot that persists until the next start overwrites it, carrying the same structured errorCode table as the restoreFromCloud error face (the two ends share the engine's single mapping). An engine that is down or an indeterminate read answers {present: false}: the snapshot is engine-process memory, so 'not observable' is the restart truth, not an invented state. A malformed present-snapshot face fails UPSTREAM_PROTOCOL_ERROR rather than claiming absence. Desktops poll; deliberately no push event.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "backupsExportParams": {
       "type": "object",
       "additionalProperties": false,
@@ -2912,6 +2954,13 @@
             "BACKUP_SNAPSHOT_METADATA_INVALID",
             "BACKUP_SNAPSHOT_KEY_MISMATCH",
             "BACKUP_SNAPSHOT_IO_FAILED",
+            "BACKUP_NOT_PROVISIONED",
+            "BACKUP_AUTH_FAILED",
+            "BACKUP_RUNNING",
+            "BACKUP_TRANSPORT_FAILED",
+            "BACKUP_DOWNLOAD_FAILED",
+            "BACKUP_DECRYPT_FAILED",
+            "BACKUP_EXPORT_FAILED",
             "REPORT_SPAM_FAILED",
             "PROFILE_UPLOAD_FAILED",
             "USERNAME_TAKEN",
@@ -2944,7 +2993,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); the connector never invents or strips keys. Absent on every other error face of engines at this revision."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

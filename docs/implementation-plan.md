@@ -5,7 +5,41 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.82 (2026-10-08; the group-signaling batch (§4.49.2):
+- Contract revision: 1.83 (2026-10-08; the cloud-backup restore passthrough
+  batch (§4.69): the engine-side cloud restore (engine cloud-backup-contract
+  §2, worktree feat/cloud-restore 9090ec5) lands its connector pipe — two
+  faces, no local state, no consumption wiring. `backups.restoreFromCloud`
+  `{accountId}` → `{status: "started"}`: the whole chain (backup credential
+  fetch with the 404 bootstrap self-heal → zkgroup redemption/presentation →
+  unauthenticated chat gRPC backup location → CDN download → AEP decrypt →
+  NDJSON) runs in the engine's background, so the face is the
+  `backups.export` class verbatim — send lane, account-scoped mutating, an
+  indeterminate outcome answers SEND_OUTCOME_UNKNOWN and never retries, the
+  terminal state is observed through the status face. The engine's
+  `CloudRestoreError::rpc_code` table (the single mapping source) passes
+  through verbatim as seven host codes: BACKUP_NOT_PROVISIONED /
+  BACKUP_AUTH_FAILED / BACKUP_RUNNING (retryable=false), BACKUP_TRANSPORT_FAILED
+  / BACKUP_DOWNLOAD_FAILED (retryable=true), BACKUP_DECRYPT_FAILED /
+  BACKUP_EXPORT_FAILED (retryable=false); the four message-carrying families
+  carry `error.data {detail}` verbatim (the promised contract detail face —
+  the 1.50 pass-through discipline, generalized to a fixed shape), the three
+  state families stay content-free. `backups.cloudStatus` `{accountId}` is a
+  read over the engine's process-memory progress snapshot:
+  `{present: false}` when absent (never started, succeeded — success leaves
+  no trace —, or the engine restarted), else `{present: true, phase:
+  downloading|failed, bytesRead, bytesTotal?, errorCode?}`; a missing
+  `bytesTotal` stays a missing key (honest uncertainty, never a zero), the
+  failed phase persists until the next start overwrites it, and an engine
+  that is down or a malformed snapshot face answers honestly — down degrades
+  to `{present: false}` (the restart truth), malformed fails
+  UPSTREAM_PROTOCOL_ERROR (a read that delivered junk knows nothing).
+  Capability: no new bit — both faces ride `history-import`, kt-engine only
+  (the §4.68 mode seam, CAPABILITY_UNAVAILABLE). Deliberately out of this
+  batch: the produced `history-import-cloud.ndjson` joining the §4.38 import
+  pass and the desktop settings entry (the engine contract's follow-up
+  batches — recorded, not worked around); the fixture mirrors the negotiated
+  wire face only, real-device restore is the engine batch's acceptance) —
+  previously 1.82 (2026-10-08; the group-signaling batch (§4.49.2):
   the call signaling pipe grows the group leg in both directions. Inbound,
   the v1.51 「解析失败即丢」 discipline is revised for the envelope-level
   opaque face: opaque signaling whose (account, direct, sender) ladder
@@ -4781,6 +4815,90 @@ CAPABILITY_UNAVAILABLE; `snapshot_import_engine_failure_lands_honest_row`
 answers NO_ARCHIVE). The schema consistency pair grows the snapshotDir
 bound (1..4096); the account id rides the shared opaqueId `$ref`, whose
 bound is already paired.
+
+### 4.69 Cloud-backup restore passthrough: `backups.restoreFromCloud`, `backups.cloudStatus` (contract revision 1.83, 2026-10-08)
+
+The engine-side cloud restore (engine `docs/cloud-backup-contract.md` §2,
+KT extension methods, worktree `feat/cloud-restore` 9090ec5) lands its
+connector pipe: two faces, pure passthrough — the connector writes no local
+state, runs no chain stage, and owns no consumption in this batch. The
+engine's chain (backup credential fetch with the 404 → `PUT v1/archives/
+backupid` bootstrap self-heal → zkgroup redemption/presentation →
+unauthenticated chat gRPC backup location → CDN download → AEP decrypt →
+NDJSON at `history-import-cloud.ndjson`) runs entirely in the engine's
+background task; the faces only start it and observe it.
+
+- **`backups.restoreFromCloud`** `{accountId}` → `{status: "started"}`.
+  Send lane, account-scoped mutating — the `backups.export` class verbatim
+  (the engine's background restore is account-mutating engine state): an
+  indeterminate outcome answers SEND_OUTCOME_UNKNOWN and never retries; the
+  terminal state is observed through the status face (the engine keeps the
+  failed phase until the next start overwrites it). The seven structured
+  engine codes pass through verbatim — the engine's
+  `CloudRestoreError::rpc_code` table is the single mapping source, shared
+  with the failed-phase `errorCode`, so the two ends cannot drift:
+  BACKUP_NOT_PROVISIONED (never provisioned after the bootstrap self-heal),
+  BACKUP_AUTH_FAILED, BACKUP_RUNNING (the engine's own atomic re-entry gate
+  — poll the status face instead of re-starting) answer retryable=false;
+  BACKUP_TRANSPORT_FAILED, BACKUP_DOWNLOAD_FAILED answer retryable=true;
+  BACKUP_DECRYPT_FAILED, BACKUP_EXPORT_FAILED answer retryable=false. The
+  four message-carrying families carry `error.data {detail}` verbatim — the
+  detail is the promised contract face, so unlike the unpromised engine data
+  other codes may carry it passes instead of being dropped (the 1.50
+  PROFILE_UPLOAD_FAILED pass-through discipline at a fixed shape); the three
+  state families stay content-free. A non-started engine answer fails
+  UPSTREAM_PROTOCOL_ERROR.
+- **`backups.cloudStatus`** `{accountId}` → the engine's progress snapshot
+  mirrored: `{present: false}` when no snapshot exists (never started, or
+  succeeded — a success leaves no trace, its NDJSON rides the history-import
+  chain —, or the engine restarted), else `{present: true, phase:
+  "downloading"|"failed", bytesRead, bytesTotal?, errorCode?}`. Read lane,
+  non-mutating (the `transfer.downloadStatus`/`backup.exportStatus` read
+  discipline). `bytesRead` counts CDN ciphertext bytes; `bytesTotal` is
+  absent whenever the engine could not learn a content-length — honest
+  uncertainty, never a zero-filled stand-in; the failed phase is a terminal
+  snapshot that persists until the next start overwrites it, carrying the
+  same structured `errorCode` table as the start face's error ladder. An
+  engine that is down (or an indeterminate read) answers `{present: false}`:
+  the snapshot is engine-process memory, so "not observable" is exactly the
+  post-restart truth, not an invented state. A malformed present-snapshot
+  face (wrong phase enum, untyped bytes, junk shape) fails
+  UPSTREAM_PROTOCOL_ERROR instead of degrading to `{present: false}` — a
+  read that delivered junk knows nothing, and claiming absence would be the
+  fake-zero lie in state form. The answer is rebuilt key-for-key through the
+  projection's shape gate, so no unplanned key rides. Deliberately no push
+  event (the §4.68 polling precedent).
+- **Lane/capability**: `backups.restoreFromCloud` is send lane,
+  account-scoped mutating; `backups.cloudStatus` is read. The capability set
+  does not grow: both faces ride `history-import` (kt-engine only — the §4.68
+  mode seam answers CAPABILITY_UNAVAILABLE) because the restore's entire
+  output is the history-import NDJSON chain. The schema grows the two method
+  enum entries, the two dispatch literals, the two params defs, and the
+  seven error codes; no schema store version change.
+- **Deliberately out of this batch** (recorded, not worked around): the
+  produced `history-import-cloud.ndjson` joining the §4.38 import pass (the
+  §4.68 watcher pattern, on the engine contract's follow-up batch), and the
+  desktop settings-page backup entry (the engine contract's third follow-up).
+  Until the consumption batch lands, a successful restore's archive sits
+  engine-side unconsumed — the faces never claim otherwise.
+
+Tests: the fixture gains `backups.restoreFromCloud`/`backups.cloudStatus`
+arms mirroring the negotiated wire face only — marker files steer the
+seven-family ladder and the three status states
+(`tests/backup_cloud_restore.rs`: the three-state mirror with the absent
+`bytesTotal` staying an absent key; the started acceptance plus the
+seven-family ladder verbatim with the contract-fixed retryability and the
+detail pass-through; the mode/account/params gates). The unit chain pins the
+whitelist sets (`methods.rs`), the seven-code mapping totality with the
+content-free/detail split (`service.rs`), and the cloudStatus shape gate
+(`supervisor.rs`). The integration roundtrip
+(`server_integration.rs::cloud_restore_faces_round_trip_in_kt_engine_mode`)
+drives the host IPC end to end in kt-engine mode: the handshake advertises
+both faces with no new feature tag, the started acceptance, four ladder
+families plus the re-entry gate across the wire, and the three status
+states. These pins cover the connector's routing and error fidelity, never
+real engine restore behavior — the real-device restore chain is the engine
+batch's own acceptance, not this batch's.
 
 ## 5. signal-cli Boundary
 

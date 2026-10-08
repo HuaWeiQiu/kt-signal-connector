@@ -2006,6 +2006,22 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     "BACKUP_SNAPSHOT_METADATA_INVALID",
     "BACKUP_SNAPSHOT_KEY_MISMATCH",
     "BACKUP_SNAPSHOT_IO_FAILED",
+    // §4.69 cloud-backup restore passthrough (contract 1.83, engine
+    // cloud-backup-contract §2): the seven-family `CloudRestoreError::rpc_code`
+    // table, one mapping source engine-side, mirrored verbatim here.
+    // NOT_PROVISIONED (never enabled cloud backups), AUTH_FAILED, and RUNNING
+    // (the engine's own re-entry gate — poll backups.cloudStatus instead) are
+    // deterministic refusals; TRANSPORT/DOWNLOAD may succeed on a later
+    // attempt; DECRYPT/EXPORT are terminal. The four message-carrying
+    // families ride the engine's `data.detail` verbatim (the promised
+    // contract face — see the service-layer mapping).
+    "BACKUP_NOT_PROVISIONED",
+    "BACKUP_AUTH_FAILED",
+    "BACKUP_RUNNING",
+    "BACKUP_TRANSPORT_FAILED",
+    "BACKUP_DOWNLOAD_FAILED",
+    "BACKUP_DECRYPT_FAILED",
+    "BACKUP_EXPORT_FAILED",
     // §4.66 username write face (contract 1.75, engine username write-face
     // batch): the reserve/confirm/delete server-state ladder. TAKEN and
     // RESERVATION_GONE are deterministic refusals (a new name / a fresh

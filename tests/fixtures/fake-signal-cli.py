@@ -1753,6 +1753,69 @@ for line in sys.stdin:
             result = {"present": True, "bytesRead": bytes_read}
             if len(parts) > 1:
                 result["bytesTotal"] = max(int(parts[1]), 0)
+    elif method == "backups.restoreFromCloud":
+        # §4.69 cloud-restore start face (contract 1.83): the negotiated wire
+        # mirror of the engine's KT-extension method — the params face is only
+        # {account}, the happy path answers {"status": "started"} (the whole
+        # chain runs in the engine's background), and the seven-family
+        # structured-error ladder steers from markers the driving test writes:
+        # `.fixture-cloud-restore-running` present = the engine's atomic
+        # re-entry gate (BACKUP_RUNNING, no detail); `.fixture-cloud-restore-error`
+        # carries a family sentinel — NOT_PROVISIONED / AUTH / TRANSPORT /
+        # DOWNLOAD / DECRYPT / EXPORT — mapped onto the BACKUP_* code, where
+        # the four message-carrying families additionally carry data.detail
+        # (the engine's CloudRestoreError::rpc_code table; the three state
+        # families answer content-free).
+        cloud_error = None
+        error_marker = SIGNAL_DATA_DIR / ".fixture-cloud-restore-error"
+        if (SIGNAL_DATA_DIR / ".fixture-cloud-restore-running").exists():
+            cloud_error = "BACKUP_RUNNING"
+        elif error_marker.exists():
+            sentinel = error_marker.read_text().strip()
+            cloud_error = {
+                "NOT_PROVISIONED": "BACKUP_NOT_PROVISIONED",
+                "AUTH": "BACKUP_AUTH_FAILED",
+                "TRANSPORT": "BACKUP_TRANSPORT_FAILED",
+                "DOWNLOAD": "BACKUP_DOWNLOAD_FAILED",
+                "DECRYPT": "BACKUP_DECRYPT_FAILED",
+                "EXPORT": "BACKUP_EXPORT_FAILED",
+            }.get(sentinel)
+        if cloud_error is None:
+            result = {"status": "started"}
+        else:
+            response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -1, "message": cloud_error}}
+            if cloud_error in (
+                "BACKUP_TRANSPORT_FAILED",
+                "BACKUP_DOWNLOAD_FAILED",
+                "BACKUP_DECRYPT_FAILED",
+                "BACKUP_EXPORT_FAILED",
+            ):
+                response["error"]["data"] = {"detail": f"fixture {cloud_error}"}
+            emit_json(response)
+            continue
+    elif method == "backups.cloudStatus":
+        # §4.69 cloud-status face (contract 1.83): the progress snapshot is
+        # engine-process memory; the fixture mirrors the three negotiated
+        # states from `.fixture-cloud-status` ("<phase> <read> [<total|code>]",
+        # written by the driving test) — absent/empty answers {present: false},
+        # `downloading <read> [total]` carries the byte counts (total absent =
+        # the honest-uncertainty form, never a fake 0), and
+        # `failed <read> <code>` carries the structured errorCode.
+        result = {"present": False}
+        status_marker = SIGNAL_DATA_DIR / ".fixture-cloud-status"
+        if status_marker.exists():
+            parts = status_marker.read_text().split()
+            if len(parts) >= 2 and parts[0] in ("downloading", "failed"):
+                result = {
+                    "present": True,
+                    "phase": parts[0],
+                    "bytesRead": max(int(parts[1]), 0),
+                }
+                if len(parts) > 2:
+                    if parts[0] == "downloading":
+                        result["bytesTotal"] = max(int(parts[2]), 0)
+                    else:
+                        result["errorCode"] = parts[2]
     elif method == "getUserStatus":
         if AUTH_FAILED_MARKER.exists():
             # Contract 1.21: the account holder unlinked this device. The

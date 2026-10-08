@@ -1204,6 +1204,20 @@ impl ProxyGroupRuntime {
         slot.supervisor.import_snapshot_status(account_id).await
     }
 
+    /// backups.restoreFromCloud / backups.cloudStatus (contract revision
+    /// 1.83, §4.69): account-addressed, routed to the owning group's
+    /// supervisor like every account-scoped face — the restore runs in that
+    /// group's engine and its progress snapshot lives in the same process.
+    pub async fn restore_from_cloud(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.restore_from_cloud(account_id).await
+    }
+
+    pub async fn cloud_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.cloud_backup_status(account_id).await
+    }
+
     /// backups.exportFile.open: account-addressed — the snapshot lives in the
     /// owning group's engine data directory, so the owning group resolves it.
     pub async fn export_file_open(

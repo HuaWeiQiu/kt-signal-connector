@@ -4164,6 +4164,89 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// backups.restoreFromCloud (contract revision 1.83, §4.69): forward the
+    /// cloud-restore start to the engine — pure passthrough, the account
+    /// resolution and engine-mode gate ride the §4.68 ladder (kt-engine only,
+    /// capability `history-import` — no new bit), and the engine runs the
+    /// whole chain (credentials 404-bootstrap → zkgroup → chat gRPC → CDN →
+    /// decrypt → NDJSON) in its own background. The Mutating engine call
+    /// answers SEND_OUTCOME_UNKNOWN on an indeterminate outcome and never
+    /// retries — the terminal state is observed through `backups.cloudStatus`
+    /// (the engine keeps the failed phase until the next start overwrites).
+    /// Deliberately no consumption watcher in this batch: the produced
+    /// `history-import-cloud.ndjson` joins the §4.38 import pass in the
+    /// follow-up batch (recorded, not worked around).
+    pub async fn restore_from_cloud(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_cloud_restore_account(account_id, self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call("backups.restoreFromCloud", params, CallClass::Mutating)
+            .await
+        {
+            Ok(value) => {
+                if value.get("status").and_then(Value::as_str) == Some("started") {
+                    Ok(json!({ "status": "started" }))
+                } else {
+                    Err(ServiceError::Api(ApiError::new(
+                        "UPSTREAM_PROTOCOL_ERROR",
+                        "backups.restoreFromCloud answered without a started status",
+                        true,
+                    )))
+                }
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "backups.restoreFromCloud outcome is unknown; poll backups.cloudStatus",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// backups.cloudStatus (contract revision 1.83, §4.69): poll the engine's
+    /// cloud-restore progress snapshot read-only and mirror it. The snapshot
+    /// is engine-process memory (the transfer.downloadStatus discipline), so
+    /// an engine that is down or an indeterminate read answers
+    /// `{present: false}` — "not observable" is exactly the post-restart
+    /// truth, not an invented state. The mode gate sits first (the §4.68
+    /// status-face precedent): the face has no store fallback, its whole
+    /// truth is the engine's restore task.
+    pub async fn cloud_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
+        if !self.history_import_capable() {
+            return Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "cloud restore requires the kt-engine mode",
+                false,
+            )));
+        }
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        let upstream = match self.running_engine().await {
+            Ok(engine) => Some(
+                engine
+                    .call(
+                        "backups.cloudStatus",
+                        json!({ "account": signal_account }),
+                        CallClass::ReadOnly,
+                    )
+                    .await,
+            ),
+            Err(_) => None,
+        };
+        match upstream {
+            Some(Ok(result)) => cloud_status_from_engine(&result),
+            // Read-only: an indeterminate read degrades to the same
+            // not-observable answer as a down engine (never a guessed state).
+            Some(Err(EngineError::UnknownOutcome)) | None => Ok(json!({ "present": false })),
+            Some(Err(error)) => Err(error.into()),
+        }
+    }
+
     /// The §4.68 consumption watcher: poll the engine's import status (~3 s,
     /// 30-minute ceiling) and on a terminal state drive the §4.38 import pass
     /// directly — `completed` constructs the job immediately (bypassing the
@@ -5088,6 +5171,49 @@ fn import_snapshot_status_idle_projection(
     json!({ "accountId": account_id, "state": "idle", "ndjsonPresent": present })
 }
 
+/// The §4.69 cloudStatus projection: the engine's progress snapshot mirrored
+/// through a shape gate (engine output is not trusted input — the
+/// transfer.downloadStatus gate posture). `present:false` passes as the bare
+/// absent face; a present snapshot must carry the two-value phase
+/// (`downloading`/`failed`) and a non-negative integer `bytesRead`, with
+/// `bytesTotal`/`errorCode` optional and typed. The answer is rebuilt
+/// key-by-key so no unplanned key rides and a `bytesTotal` absence stays an
+/// honest absence (never a zero). A malformed present-snapshot face fails
+/// UPSTREAM_PROTOCOL_ERROR instead of degrading to `present:false` — a read
+/// that delivered junk knows nothing, and `present:false` would claim it does.
+fn cloud_status_from_engine(result: &Value) -> Result<Value, ServiceError> {
+    if result.get("present") == Some(&Value::Bool(false)) {
+        return Ok(json!({ "present": false }));
+    }
+    let phase = result.get("phase").and_then(Value::as_str);
+    let bytes_read = result.get("bytesRead").and_then(Value::as_u64);
+    let bytes_total = result.get("bytesTotal").and_then(Value::as_u64);
+    let error_code = result.get("errorCode").and_then(Value::as_str);
+    let shaped = result.get("present") == Some(&Value::Bool(true))
+        && matches!(phase, Some("downloading") | Some("failed"))
+        && bytes_read.is_some()
+        && result.get("bytesTotal").is_some() == bytes_total.is_some()
+        && result.get("errorCode").is_some() == error_code.is_some();
+    if !shaped {
+        return Err(ServiceError::Api(ApiError::new(
+            "UPSTREAM_PROTOCOL_ERROR",
+            "backups.cloudStatus answered a malformed snapshot",
+            true,
+        )));
+    }
+    let mut payload = serde_json::Map::new();
+    payload.insert("present".to_owned(), json!(true));
+    payload.insert("phase".to_owned(), json!(phase));
+    payload.insert("bytesRead".to_owned(), json!(bytes_read));
+    if let Some(total) = bytes_total {
+        payload.insert("bytesTotal".to_owned(), json!(total));
+    }
+    if let Some(code) = error_code {
+        payload.insert("errorCode".to_owned(), json!(code));
+    }
+    Ok(Value::Object(payload))
+}
+
 /// §4.38: one bounded retention pass after a completed import, so the store
 /// converges to the per-conversation cap within the same session. Same batch
 /// discipline as the once-per-start retention pass.
@@ -5935,8 +6061,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RuntimeSupervisor, compose_contact_display_name, compose_import_progress, group_extra_json,
-        is_receive_fatal_stderr,
+        RuntimeSupervisor, cloud_status_from_engine, compose_contact_display_name,
+        compose_import_progress, group_extra_json, is_receive_fatal_stderr,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -5966,6 +6092,79 @@ mod tests {
         // account's pass — the boolean is already account-attributed by the
         // caller): the honest pre-1.53 shape, no progress invented.
         assert_eq!(compose_import_progress(None, false), None);
+    }
+
+    /// §4.69 cloudStatus shape gate (contract 1.83): well-formed snapshots
+    /// mirror key-for-key with an absent `bytesTotal` staying an honest
+    /// absence, and every malformed present-face fails UPSTREAM_PROTOCOL_ERROR
+    /// rather than degrading to `present:false` (a read that delivered junk
+    /// knows nothing — claiming absence would be the fake-0 lie in state form).
+    #[test]
+    fn cloud_status_projection_gates_the_engine_shape() {
+        let absent = cloud_status_from_engine(&json!({ "present": false })).unwrap();
+        assert_eq!(absent, json!({ "present": false }));
+
+        let downloading = cloud_status_from_engine(&json!({
+            "present": true,
+            "phase": "downloading",
+            "bytesRead": 40,
+            "bytesTotal": 100
+        }))
+        .unwrap();
+        assert_eq!(
+            downloading,
+            json!({ "present": true, "phase": "downloading", "bytesRead": 40, "bytesTotal": 100 })
+        );
+
+        // The honest-uncertainty form: no total is no key, never a zero.
+        let totalless = cloud_status_from_engine(&json!({
+            "present": true,
+            "phase": "downloading",
+            "bytesRead": 40
+        }))
+        .unwrap();
+        assert_eq!(
+            totalless,
+            json!({ "present": true, "phase": "downloading", "bytesRead": 40 })
+        );
+        assert!(totalless.get("bytesTotal").is_none());
+
+        let failed = cloud_status_from_engine(&json!({
+            "present": true,
+            "phase": "failed",
+            "bytesRead": 40,
+            "errorCode": "BACKUP_DOWNLOAD_FAILED"
+        }))
+        .unwrap();
+        assert_eq!(failed["phase"], "failed");
+        assert_eq!(failed["errorCode"], "BACKUP_DOWNLOAD_FAILED");
+
+        for junk in [
+            json!({}),
+            json!({ "present": "yes" }),
+            json!({ "present": true }),
+            json!({ "present": true, "phase": "downloading" }),
+            json!({ "present": true, "phase": "teleporting", "bytesRead": 1 }),
+            json!({ "present": true, "phase": "downloading", "bytesRead": "40" }),
+            json!({
+                "present": true,
+                "phase": "downloading",
+                "bytesRead": 40,
+                "bytesTotal": "100"
+            }),
+            json!({
+                "present": true,
+                "phase": "failed",
+                "bytesRead": 40,
+                "errorCode": 7
+            }),
+        ] {
+            let error = cloud_status_from_engine(&junk)
+                .expect_err("malformed snapshots must fail the gate")
+                .into_api();
+            assert_eq!(error.code, "UPSTREAM_PROTOCOL_ERROR", "{junk}");
+            assert!(error.retryable, "{junk}");
+        }
     }
 
     /// Every test store is encrypted (Phase 3); secondary observer connections

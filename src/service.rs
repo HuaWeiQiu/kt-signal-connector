@@ -460,6 +460,43 @@ impl ServiceError {
                         "the snapshot import hit a filesystem failure",
                         true,
                     ),
+                    // §4.69 cloud-backup restore passthrough (contract 1.83,
+                    // engine cloud-backup-contract §2): the seven-family table
+                    // mirrors the engine's `CloudRestoreError::rpc_code` single
+                    // mapping source. The three state families are
+                    // content-free deterministic refusals (a never-provisioned
+                    // account, missing/rejected credentials, the engine's own
+                    // re-entry gate — poll backups.cloudStatus instead of
+                    // re-starting). The four message-carrying families carry
+                    // the engine's `data.detail` verbatim — the detail is part
+                    // of the promised contract face, so unlike the unpromised
+                    // data above it passes instead of being dropped; a
+                    // data-less older-engine face keeps the fixed content-free
+                    // answer. Retryability is the contract-fixed family face
+                    // (transport/download may succeed on a later attempt;
+                    // decrypt/export are terminal), reasserted over the
+                    // `with_data` default.
+                    "BACKUP_NOT_PROVISIONED" => ApiError::new(
+                        "BACKUP_NOT_PROVISIONED",
+                        "the account has never enabled cloud backups",
+                        false,
+                    ),
+                    "BACKUP_AUTH_FAILED" => ApiError::new(
+                        "BACKUP_AUTH_FAILED",
+                        "the account's cloud-backup key material is missing or rejected",
+                        false,
+                    ),
+                    "BACKUP_RUNNING" => ApiError::new(
+                        "BACKUP_RUNNING",
+                        "a cloud restore is already running; poll backups.cloudStatus",
+                        false,
+                    ),
+                    "BACKUP_TRANSPORT_FAILED" | "BACKUP_DOWNLOAD_FAILED" => {
+                        cloud_restore_message_family_error(code, data, true)
+                    }
+                    "BACKUP_DECRYPT_FAILED" | "BACKUP_EXPORT_FAILED" => {
+                        cloud_restore_message_family_error(code, data, false)
+                    }
                     // §4.66 username write face (contract 1.75, engine
                     // username write-face batch): the reserve/confirm/delete
                     // server-state ladder. TAKEN (reserve 409 / confirm 410)
@@ -522,6 +559,41 @@ impl ServiceError {
             }
         }
     }
+}
+
+/// The §4.69 message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED
+/// / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED):
+/// the engine's `data.detail` rides verbatim when present, the fixed
+/// content-free face answers without it, and the contract-fixed family
+/// retryability always wins over the `with_data` default derivation.
+fn cloud_restore_message_family_error(
+    code: &'static str,
+    data: Option<Value>,
+    retryable: bool,
+) -> ApiError {
+    let message = match code {
+        "BACKUP_TRANSPORT_FAILED" => "the cloud restore transport failed",
+        "BACKUP_DOWNLOAD_FAILED" => "the cloud backup download failed",
+        "BACKUP_DECRYPT_FAILED" => "the downloaded cloud backup failed to decrypt",
+        _ => "the decrypted cloud backup failed to export",
+    };
+    let Some(data) = data else {
+        // The literal `ApiError::new` sites are the schema-consistency
+        // scanner's code-side anchor (tests/schema_consistency.rs): every
+        // host error code must appear at one, so the content-free face
+        // spells each family out instead of reusing the `code` variable.
+        return match code {
+            "BACKUP_TRANSPORT_FAILED" => {
+                ApiError::new("BACKUP_TRANSPORT_FAILED", message, retryable)
+            }
+            "BACKUP_DOWNLOAD_FAILED" => ApiError::new("BACKUP_DOWNLOAD_FAILED", message, retryable),
+            "BACKUP_DECRYPT_FAILED" => ApiError::new("BACKUP_DECRYPT_FAILED", message, retryable),
+            _ => ApiError::new("BACKUP_EXPORT_FAILED", message, retryable),
+        };
+    };
+    let mut api = ApiError::with_data(code, message, data);
+    api.retryable = retryable;
+    api
 }
 
 #[derive(Clone, Debug)]
@@ -3320,6 +3392,31 @@ impl ConnectorService {
             _ => Err(ServiceError::Api(ApiError::new(
                 "CAPABILITY_UNAVAILABLE",
                 "official snapshot import requires the kt-engine mode",
+                false,
+            ))),
+        }
+    }
+
+    /// backups.restoreFromCloud / backups.cloudStatus (contract revision
+    /// 1.83, §4.69): resolve the account and gate the engine mode. The faces
+    /// are pure passthrough — the connector carries only `{account}` to the
+    /// engine, and the restore's whole chain runs engine-side. The mode seam
+    /// rides the §4.68 ladder (the §4.67 precedent: shape validation precedes
+    /// the seam): the restore's entire output is the history-import NDJSON
+    /// chain, so the face rides the kt-engine-only `history-import`
+    /// capability — no new bit.
+    pub fn prepare_cloud_restore_account(
+        &self,
+        account_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({ "account": account.signal_account })),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "cloud restore requires the kt-engine mode",
                 false,
             ))),
         }
@@ -6975,6 +7072,21 @@ pub struct BackupsImportSnapshotStatusParams {
     pub account_id: String,
 }
 
+/// backups.restoreFromCloud / backups.cloudStatus (contract revision 1.83,
+/// §4.69): the cloud-backup restore passthrough faces. The only parameter is
+/// the account — the whole restore chain runs engine-side in the background.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsRestoreFromCloudParams {
+    pub account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsCloudStatusParams {
+    pub account_id: String,
+}
+
 /// backups.exportFile.open (contract revision 1.47, §4.46): `file` is the
 /// two-value snapshot-file enum — no path component is accepted anywhere.
 #[derive(Debug, Deserialize)]
@@ -9219,6 +9331,65 @@ mod tests {
                 ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
             assert_eq!(api.code, code);
             assert_eq!(api.retryable, retryable, "{code} retryable face");
+        }
+        // The §4.69 cloud-restore families (contract 1.83): the contract-fixed
+        // retryability per family — three deterministic refusals, transport/
+        // download retriable, decrypt/export terminal.
+        for (code, retryable) in [
+            ("BACKUP_NOT_PROVISIONED", false),
+            ("BACKUP_AUTH_FAILED", false),
+            ("BACKUP_RUNNING", false),
+            ("BACKUP_TRANSPORT_FAILED", true),
+            ("BACKUP_DOWNLOAD_FAILED", true),
+            ("BACKUP_DECRYPT_FAILED", false),
+            ("BACKUP_EXPORT_FAILED", false),
+        ] {
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert!(api.data.is_none(), "{code} stays content-free without data");
+        }
+    }
+
+    /// §4.69: the four message-carrying cloud-restore families pass the
+    /// engine's `data.detail` verbatim (the promised contract face) with the
+    /// family retryability reasserted over the `with_data` default; the three
+    /// state families drop any data (nothing was promised for them).
+    #[test]
+    fn cloud_restore_detail_data_rides_verbatim_on_message_families() {
+        let detail = json!({ "detail": "cdn 502" });
+        for (code, retryable) in [
+            ("BACKUP_TRANSPORT_FAILED", true),
+            ("BACKUP_DOWNLOAD_FAILED", true),
+            ("BACKUP_DECRYPT_FAILED", false),
+            ("BACKUP_EXPORT_FAILED", false),
+        ] {
+            let api = ServiceError::Engine(EngineError::UpstreamCode {
+                code,
+                data: Some(detail.clone()),
+            })
+            .into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert_eq!(api.data, Some(detail.clone()), "{code} detail face");
+        }
+        for code in [
+            "BACKUP_NOT_PROVISIONED",
+            "BACKUP_AUTH_FAILED",
+            "BACKUP_RUNNING",
+        ] {
+            let api = ServiceError::Engine(EngineError::UpstreamCode {
+                code,
+                data: Some(detail.clone()),
+            })
+            .into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert!(!api.retryable, "{code} stays deterministic");
+            assert!(
+                api.data.is_none(),
+                "{code} never leaks unpromised engine data: {api:?}"
+            );
         }
     }
 

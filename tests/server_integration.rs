@@ -9564,6 +9564,244 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.83 (§4.69): the cloud-backup restore passthrough round
+/// trip in kt-engine mode (the engine-only face, the §4.68 spawn posture). The
+/// handshake advertises both faces with no new feature tag (the restore rides
+/// `history-import`); the start face answers {"status": "started"} and
+/// forwards the structured seven-family ladder verbatim — the three state
+/// families content-free, the transport family with its data.detail, the
+/// contract-fixed retryability on every family; the status face mirrors the
+/// three negotiated states with an absent bytesTotal staying an absent key.
+/// The fixture mirrors the negotiated wire face only: these pins cover the
+/// connector's routing and error fidelity, never real engine restore behavior.
+#[tokio::test]
+async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [48_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_SIGNAL_CLI_ENGINE", "kt-engine")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries both faces before anything else runs — and still
+    // no new feature tag: the restore rides the history-import bit.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "backups.restoreFromCloud",
+        "backups.cloudStatus",
+        "history-import",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-CloudRestore" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The absent snapshot: the honest {present: false} before anything runs.
+    let absent = request(
+        &mut client,
+        "cloud-status-absent",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(absent["result"], json!({ "present": false }), "{absent}");
+
+    // The definite acceptance; the whole chain stays in the engine's
+    // background, so the answer is the bare started status.
+    let accepted = request(
+        &mut client,
+        "cloud-restore-start",
+        "backups.restoreFromCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        accepted["result"],
+        json!({ "status": "started" }),
+        "{accepted}"
+    );
+
+    // The structured ladder across the wire: the state families ride
+    // content-free with their deterministic retryability, the transport
+    // family carries the engine's data.detail, and the re-entry gate answers
+    // its own code (the fixture marker plays the engine's atomic gate).
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    let error_marker = signal_data.join(".fixture-cloud-restore-error");
+    let running_marker = signal_data.join(".fixture-cloud-restore-running");
+    for (sentinel, code, retryable, detail) in [
+        ("NOT_PROVISIONED", "BACKUP_NOT_PROVISIONED", false, None),
+        ("AUTH", "BACKUP_AUTH_FAILED", false, None),
+        (
+            "TRANSPORT",
+            "BACKUP_TRANSPORT_FAILED",
+            true,
+            Some("fixture BACKUP_TRANSPORT_FAILED"),
+        ),
+        (
+            "DOWNLOAD",
+            "BACKUP_DOWNLOAD_FAILED",
+            true,
+            Some("fixture BACKUP_DOWNLOAD_FAILED"),
+        ),
+    ] {
+        fs::write(&error_marker, sentinel).unwrap();
+        let refused = request(
+            &mut client,
+            &format!("cloud-refuse-{sentinel}"),
+            "backups.restoreFromCloud",
+            json!({ "accountId": account_id }),
+        )
+        .await;
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+        assert_eq!(refused["error"]["retryable"], retryable, "{refused}");
+        match detail {
+            Some(detail) => assert_eq!(
+                refused["error"]["data"],
+                json!({ "detail": detail }),
+                "{refused}"
+            ),
+            None => assert!(
+                refused["error"].get("data").is_none(),
+                "{sentinel} stays content-free across the wire: {refused}"
+            ),
+        }
+    }
+    fs::remove_file(&error_marker).unwrap();
+    fs::write(&running_marker, "1").unwrap();
+    let running = request(
+        &mut client,
+        "cloud-refuse-running",
+        "backups.restoreFromCloud",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(running["error"]["code"], "BACKUP_RUNNING", "{running}");
+    assert_eq!(running["error"]["retryable"], false, "{running}");
+    assert!(
+        running["error"].get("data").is_none(),
+        "the re-entry gate stays content-free: {running}"
+    );
+    fs::remove_file(&running_marker).unwrap();
+
+    // The three status states across the wire: downloading with both byte
+    // counts, downloading with the honest missing total, failed with the
+    // structured errorCode, and the cleared absence again.
+    let status_marker = signal_data.join(".fixture-cloud-status");
+    fs::write(&status_marker, "downloading 1048576 4194304").unwrap();
+    let downloading = request(
+        &mut client,
+        "cloud-status-downloading",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        downloading["result"],
+        json!({
+            "present": true,
+            "phase": "downloading",
+            "bytesRead": 1048576,
+            "bytesTotal": 4194304
+        }),
+        "{downloading}"
+    );
+    fs::write(&status_marker, "downloading 1048576").unwrap();
+    let totalless = request(
+        &mut client,
+        "cloud-status-totalless",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        totalless["result"],
+        json!({ "present": true, "phase": "downloading", "bytesRead": 1048576 }),
+        "{totalless}"
+    );
+    assert!(
+        totalless["result"].get("bytesTotal").is_none(),
+        "a missing total stays a missing key on the wire: {totalless}"
+    );
+    fs::write(&status_marker, "failed 1048576 BACKUP_DOWNLOAD_FAILED").unwrap();
+    let failed = request(
+        &mut client,
+        "cloud-status-failed",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(
+        failed["result"],
+        json!({
+            "present": true,
+            "phase": "failed",
+            "bytesRead": 1048576,
+            "errorCode": "BACKUP_DOWNLOAD_FAILED"
+        }),
+        "{failed}"
+    );
+    fs::remove_file(&status_marker).unwrap();
+    let cleared = request(
+        &mut client,
+        "cloud-status-cleared",
+        "backups.cloudStatus",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(cleared["result"], json!({ "present": false }), "{cleared}");
+
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract 1.52 (§4.50): the groups.terminate round trip. The handshake
 /// advertises the method plus the `group-terminate` capability; the terminate
 /// addresses the resolved group row and dispatches the pinned 0.14.8
