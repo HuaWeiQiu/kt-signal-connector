@@ -5,7 +5,40 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.84 (2026-10-08; the cloud-restore consumption batch
+- Contract revision: 1.85 (2026-10-08; the story view receipt batch
+  (§4.70): the stories watch receipt lands both legs. Send leg:
+  `stories.markViewed` `{accountId, storyAuthor, storySentAt}` →
+  `{status: "sent"|"unknown"}` — the `messages.markViewed` receipt class
+  verbatim (best-effort, any upstream failure degrades, nothing retries)
+  with the §4.29 row selection replaced by the story anchor frame: exactly
+  one upstream `sendViewedReceipt` call `{account, recipient (the trimmed
+  author), timestamps: [storySentAt]}` — a story receipt names exactly one
+  story, so there is no author fan-out and the 100-timestamp chunk framing
+  never engages. `storySentAt: 0` answers INVALID_REQUEST (the official
+  face has no meaningful "mark nothing viewed"), the author rides the
+  opaque-id bound; mode-independent — the upstream face is the pinned
+  upstream's own method, so no capability seam exists to answer, and the
+  capability set does not grow (`stories` extends in place, the 1.82
+  call-signaling precedent). Receive leg: the upstream receiptMessage
+  carries no story bit on the wire (`{timestamp[], when, isDelivery,
+  isRead, isViewed}`, compat §3), so the split happens at the local row
+  face only — a VIEWED receipt is intercepted before the conversation
+  ladder: with a resolvable source, an existing direct conversation still
+  runs the §4.29 fold unchanged (message viewed receipts keep one
+  statusChanged per real transition), timestamps that hit outgoing rows —
+  decided by the hit rows, not the moved rows, so a replayed viewed
+  receipt never leaks onto the story face — are consumed, and the
+  leftovers ride exactly one transient `story.viewed` event
+  `{accountId, sentTimestamps, viewedAt, viewer?, viewerAci?, viewerName?}`
+  (absent optional keys stay absent); a conversation-less viewer forwards
+  the whole receipt as story candidates (where the pre-1.85 pipeline
+  evaporated the envelope), a source-less envelope drops whole (宁缺勿错),
+  and the stories-disabled gate does not apply (it gates incoming story
+  material, not receipts about the account's own stories). The event is
+  rowless and transient — no row, no self-heal, the story.received
+  discipline; the desktop's own timeline join stays the authoritative
+  anchor, the connector only claims candidacy)
+  — previously 1.84 (2026-10-08; the cloud-restore consumption batch
   (§4.69 记档): the restore's NDJSON product joins the §4.38 import pass —
   exactly the batch 1.83 deliberately left out. The engine writes
   `history-import-cloud.ndjson` whole into the registry-recorded account
@@ -5026,6 +5059,78 @@ counters — imported 0, the two duplicates surfacing in `skippedMessages`,
 the importer's own §4.38 counter semantics). The unit chain pins the
 freshness face itself (absent → `None`, stable while untouched, changed on
 rewrite).
+
+### 4.70 Story view receipts: `stories.markViewed` + the `story.viewed` receive projection (contract revision 1.85, 2026-10-08)
+
+The stories watch receipt lands both legs: the send leg lets the desktop
+acknowledge a story it rendered as viewed; the receive leg projects the
+account's own stories' view receipts as a distinct event instead of
+folding them into the §4.29 message fold. The engine's `sendViewedReceipt`
+is `{account, recipient (a single author), timestamps[]}` → `{}` — an
+empty, missing, or non-numeric timestamps array fails upstream — and the
+receive-side receiptMessage projection carries no story bit on the wire
+(`{timestamp[], when, isDelivery, isRead, isViewed}`, compat §3):
+story-ness exists only on the local row face, which is where the split
+lives.
+
+- **`stories.markViewed`** `{accountId, storyAuthor, storySentAt}` →
+  `{status: "sent"|"unknown"}`. Send lane, account-scoped mutating. The
+  receipt class is the `messages.markViewed` one verbatim: best-effort,
+  any upstream failure (a definite error, transport trouble, or an
+  unknown outcome) degrades the answer and nothing is ever retried; a
+  non-running engine stays a structural error (the send_receipt
+  discipline). The §4.29 row selection is replaced by the story anchor:
+  exactly one upstream call `{account (the resolved signal account),
+  recipient (the trimmed storyAuthor), timestamps: [storySentAt]}` — a
+  story receipt names exactly one story, so there is no author fan-out
+  and the 100-timestamp chunk framing never engages. `storySentAt: 0`
+  answers INVALID_REQUEST (there is no meaningful "mark nothing viewed");
+  the author rides the opaque-id bound (MAX_OPAQUE_ID_BYTES). The raw
+  store account id never rides the frame.
+- **Mode/capability**: mode-independent — the upstream face is the pinned
+  upstream's own method, available in every engine mode, so no capability
+  seam exists to answer. The capability set does not grow: the `stories`
+  tag extends in place (the 1.82 call-signaling precedent).
+- **Receive leg (`story.viewed`)**: a VIEWED receipt is intercepted in the
+  control-receive ingest before the conversation ladder. With a
+  resolvable source: an existing direct conversation first runs the §4.29
+  `upgrade_outgoing_receipts` unchanged (message viewed receipts keep the
+  one statusChanged-per-real-transition fold on the read tier), then the
+  timestamps whose outgoing rows exist — decided by the hit rows, not the
+  moved rows, so a replayed viewed receipt (its row already read) leaks
+  nothing onto the story face — are consumed, and the leftovers ride
+  exactly one transient event `story.viewed`
+  `{accountId, sentTimestamps, viewedAt, viewer?, viewerAci?, viewerName?}`
+  with the absent-optional-keys discipline (the story.received emission
+  shape). A viewer with no direct conversation forwards the whole receipt
+  as story candidates — exactly where the pre-1.85 pipeline evaporated
+  the envelope on the conversation ladder. A source-less envelope drops
+  whole (宁缺勿错: neither a conversation to fold against nor a viewer
+  the desktop could record). The stories-disabled gate does not apply: it
+  gates incoming story material, not receipts about the account's own
+  stories.
+- **Boundary discipline**: the event is rowless and transient — no row is
+  written, no story state is kept, no self-heal exists (the story.received
+  discipline); the split is the connector declaring candidacy, and the
+  desktop's own timeline join (sentAt × sender key against its story
+  store) stays the authoritative anchor. Second-phase items recorded
+  deliberately: a `storyViewReceiptsEnabled` account preference (the
+  engine AccountRecord written-bit family) is not in this batch, and the
+  desktop wiring (the `signalStoryApplyView` / `signalStoryViewsOf`
+  consumption) is its own batch.
+
+Tests: the preparation gates and the frame shape (`service.rs` — empty /
+blank / oversized author, zero sentAt, unknown account, then the resolved
+signal account with the trimmed author and exactly one timestamp); the
+receive split (`service.rs` — the mixed receipt folds its message half
+and rides its story half, the replayed viewed receipt stays silent, the
+conversation-less viewer forwards whole, a READ receipt never grows a
+story leg, the stories-disabled toggle does not apply, the source-less
+envelope drops, and nothing persists); and the engine-mode roundtrip
+(`supervisor.rs` — `sent`, the in-flight crash sentinel degrading to
+`unknown` without a retry, the explicit restart and the next receipt
+sending again, and the dispatch log pinning the frame shapes with the
+store account id never riding).
 
 ## 5. signal-cli Boundary
 

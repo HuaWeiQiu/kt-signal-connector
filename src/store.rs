@@ -3780,6 +3780,47 @@ impl Store {
         Ok(record.map(|record| (record, changed)))
     }
 
+    /// Which of the given upstream timestamps exist as outgoing rows in one
+    /// conversation (contract 1.85, §4.70): the story-viewed split's hit
+    /// face. A timestamp that hits any outgoing row — whatever its status —
+    /// is a message receipt, so a replayed `read`-already receipt never
+    /// leaks onto the story-viewed event; the leftovers are the story
+    /// candidates. Input order preserved, bounded at the same 256 the
+    /// receipt upgrade takes.
+    pub fn existing_outgoing_sent_at(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: &[u64],
+    ) -> Result<Vec<u64>, StoreError> {
+        if target_sent_at.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT 1 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND direction='outgoing'
+                 LIMIT 1",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut hits = Vec::new();
+        for timestamp in target_sent_at.iter().copied().take(256) {
+            let found = stmt
+                .query_row(
+                    params![account_id, conversation_id, timestamp as i64],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if found.is_some() {
+                hits.push(timestamp);
+            }
+        }
+        Ok(hits)
+    }
+
     /// Upgrade earlier outgoing rows on an inbound peer receipt (delivery /
     /// read). The status ladder is monotonic — `pending|sent` → `delivered` →
     /// `read` — and a receipt never downgrades a row (`read` over

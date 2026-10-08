@@ -1098,6 +1098,17 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Story-anchored viewed receipt routing (contract revision 1.85,
+    /// §4.70): the owning group's supervisor sends the single-author frame
+    /// over its own engine, receipt-class semantics end to end.
+    pub async fn send_story_viewed(
+        &self,
+        params: crate::service::StoriesMarkViewedParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_story_viewed(params).await
+    }
+
     /// View-once open sync routing (contract revision 1.38): the owning
     /// group's supervisor forwards the bare passthrough; receipt-class
     /// semantics end to end.

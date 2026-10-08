@@ -47,8 +47,8 @@ use crate::service::{
     MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
     MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesSetDisabledParams,
-    UsernameLookupParams,
+    StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSetDisabledParams, UsernameLookupParams,
 };
 use crate::store::MAX_PAGE_LIMIT;
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1543,6 +1543,26 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Story viewed receipt (contract revision 1.85, §4.70): the
+        // messages.markViewed receipt shape — params shape errors answer
+        // INVALID_REQUEST, and the answer is {status: sent|unknown}; a
+        // receipt send failure never fails the request.
+        "stories.markViewed" => {
+            match serde_json::from_value::<StoriesMarkViewedParams>(request.params) {
+                Ok(params) => match runtime.send_story_viewed(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.markViewed params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "messages.retryText" => {
             match serde_json::from_value::<MessagesRetryTextParams>(request.params) {
                 Ok(params) => {
@@ -2638,6 +2658,35 @@ where
                 payload["timestamp"] = json!(at);
             }
             send_shared(writer, &HostEvent::new("story.received", payload)).await
+        }
+        HostSideEvent::StoryViewed {
+            account_id,
+            viewer,
+            viewer_aci,
+            viewer_name,
+            sent_timestamps,
+            viewed_at,
+        } => {
+            // Contract 1.85, §4.70: transient own-story view receipts — the
+            // story.received absent-optional-identity discipline, plus the
+            // receipt face the desktop joins against its own story timeline
+            // (signalStoryApplyView: senderKey 'self', sentAt per entry,
+            // viewerKey = viewerAci ?? viewer, viewedAtMs = viewedAt).
+            let mut payload = json!({
+                "accountId": account_id,
+                "sentTimestamps": sent_timestamps,
+                "viewedAt": viewed_at,
+            });
+            if let Some(viewer) = viewer {
+                payload["viewer"] = json!(viewer);
+            }
+            if let Some(aci) = viewer_aci {
+                payload["viewerAci"] = json!(aci);
+            }
+            if let Some(name) = viewer_name {
+                payload["viewerName"] = json!(name);
+            }
+            send_shared(writer, &HostEvent::new("story.viewed", payload)).await
         }
     }
 }

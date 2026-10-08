@@ -114,7 +114,8 @@
             "calls.getState",
             "messages.sendStory",
             "stories.setDisabled",
-            "stories.getDisabled"
+            "stories.getDisabled",
+            "stories.markViewed"
           ]
         },
         "params": {
@@ -963,6 +964,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/storiesGetDisabledParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stories.markViewed" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storiesMarkViewedParams" }
             }
           }
         }
@@ -2577,6 +2589,26 @@
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "storiesMarkViewedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "storyAuthor", "storySentAt"],
+      "description": "Send the upstream viewed receipt for one story (contract revision 1.85, §4.70, capability stories): the story-anchored viewed receipt — the send leg of the story viewed-receipt chain. messages.markViewed's row-based selection can never address a story (stories land in no conversation row, contract 1.76 §4.67, so its group selection is always empty); this face replaces that selection with the story anchor — storyAuthor is the author's address (phone number or UUID-shaped ACI, the story recipients' per-entry bound) and storySentAt is the story's own Signal timestamp (a zero timestamp is the officially meaningless marker and answers INVALID_REQUEST). The upstream frame is exactly the engine's sendViewedReceipt params {account, recipient (single author), timestamps: [storySentAt]} — one timestamp per frame, no fan-out (a story receipt names exactly one story; the official desktop's story-read flow sends the same single-timestamp VIEWED receipt to the author). The upstream face is the pinned upstream's own method, so the face answers on every engine mode. The result is {status: 'sent'} when the upstream confirmed, or {status: 'unknown'} when the outcome cannot be determined — receipt-class degradation, a receipt failure never fails the request and 'unknown' is never retried automatically. Send lane, account-scoped mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "storyAuthor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The story author's address (phone number or ACI UUID), forwarded as the receipt's single recipient."
+        },
+        "storySentAt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The story's own Signal timestamp (the story's protocol identity); the receipt's only timestamp entry."
+        }
+      }
+    },
     "response": {
       "type": "object",
       "additionalProperties": false,
@@ -2621,7 +2653,8 @@
             "message.expired",
             "call.incoming",
             "call.groupIncoming",
-            "story.received"
+            "story.received",
+            "story.viewed"
           ]
         },
         "data": {
@@ -2899,6 +2932,54 @@
                   "story": {
                     "type": "object",
                     "description": "The engine's storyMessage projection verbatim — textAttachment (with optional text/textStyle/preview) or fileAttachment, plus allowsReplies and the optional profileKey/group context. The connector never parses the story body."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "story.viewed" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "sentTimestamps", "viewedAt"],
+                "description": "Own-story view receipts (contract 1.85, §4.70, capability stories): the VIEWED receipt timestamps that hit no outgoing row, forwarded as one transient event. The ReceiptMessage proto carries no story bit, and the connector's own stories are rowless (contract 1.76 §4.67), so the split is local — timestamps that hit an outgoing row keep the contract 1.34 fold (message.statusChanged, Viewed still upgrades rows to read); the leftovers ride this event, with the desktop's own story timeline as the authoritative join (signalStoryApplyView applies an exact (self, sentAt) match and no-ops otherwise) — the event claims candidacy, not identity. Transient like story.received: nothing persists, a missed delivery is not self-healed. viewer/viewerAci/viewerName are absent when the receipt envelope did not carry them; the stories-disabled gate does not apply (it gates incoming story material, not receipts about the account's own stories).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "viewer": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The viewing peer as the upstream resolved it (E.164 on a contacts hit, ACI otherwise) — the desktop's viewerKey fallback."
+                  },
+                  "viewerAci": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The viewer's ACI UUID (envelope sourceUuid) when present — the desktop's viewerKey of first choice."
+                  },
+                  "viewerName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The viewer's profile/contact display name when present."
+                  },
+                  "sentTimestamps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "integer", "minimum": 1 },
+                    "description": "The receipt's story timestamps that hit no outgoing row — one signalStoryApplyView (sentAt) per entry; bounded by the receipt batch cap."
+                  },
+                  "viewedAt": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The receipt's arrival instant (the envelope timestamp, contract 1.32; connector clock when the envelope carried none) — the desktop's viewedAtMs."
                   }
                 }
               }

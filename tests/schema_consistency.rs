@@ -730,6 +730,15 @@ fn schema_numeric_bounds_match_code_constants() {
             "maxLength",
             MAX_OPAQUE_ID_BYTES as u64,
         ),
+        // Story viewed receipt (contract 1.85, §4.70): the story-author
+        // bound mirrors the story recipients' per-entry bound (the receipt's
+        // single recipient address); storySentAt's minimum 1 is a structural
+        // shape rule (the officially meaningless zero marker), no constant.
+        (
+            "/$defs/storiesMarkViewedParams/properties/storyAuthor",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
         // Official-desktop snapshot import (contract 1.78, §4.68): the
         // caller-chosen directory path is shape-gated by the connector
         // (absolute, 1..4096 bytes) before any engine traffic — the connector

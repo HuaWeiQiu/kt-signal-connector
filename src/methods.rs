@@ -324,6 +324,15 @@ pub const METHODS: &[MethodRow] = &[
     ("messages.sendStory", Lane::Send, true, "send"),
     ("stories.setDisabled", Lane::Send, true, "send"),
     ("stories.getDisabled", Lane::Read, false, "read"),
+    // Story viewed receipt (contract revision 1.85, §4.70): the send leg of
+    // the story viewed-receipt chain — mutating, send-lane upstream traffic,
+    // the messages.markViewed receipt class verbatim (best-effort, failures
+    // degrade to `unknown`, nothing retries), with the §4.29 row selection
+    // replaced by the story anchor (storyAuthor + storySentAt). The upstream
+    // face is the pinned upstream's own `sendViewedReceipt` (it exists on
+    // every mode), so no capability seam. Advertised through the existing
+    // `stories` tag (widened in place, the 1.82 call-signaling precedent).
+    ("stories.markViewed", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -424,7 +433,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (`messages.sendStory` over the kt-engine `sendStory` face plus the
 /// `stories.setDisabled` / `stories.getDisabled` local toggle — the receive
 /// gate mirror of the official `getStoriesBlocked` leg — and the transient
-/// `story.received` event). They never
+/// `story.received` event), widened in place by revision 1.85 (the
+/// `stories.markViewed` story-anchored viewed receipt — the send leg of the
+/// story viewed-receipt chain — plus the transient `story.viewed` event;
+/// the 1.82 call-signaling no-new-bit discipline). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -539,6 +551,7 @@ mod tests {
             "identities.verify",
             "messages.sendStory",
             "stories.setDisabled",
+            "stories.markViewed",
         ];
         let mutating = [
             "messages.sendText",
@@ -585,6 +598,7 @@ mod tests {
             "identities.verify",
             "messages.sendStory",
             "stories.setDisabled",
+            "stories.markViewed",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

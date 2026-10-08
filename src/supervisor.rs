@@ -37,12 +37,13 @@ use crate::service::{
     SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
     StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
     StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StoriesDisabled, StoriesGetDisabledParams, StoriesSetDisabledParams, StorySendRecipientResult,
-    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_limit_error, blocked_conversations_result, identity_from_engine,
-    pinned_conversations_result, sticker_pack_syncs_result, store_get_group_with_requesting,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSetDisabledParams,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
+    identity_from_engine, pinned_conversations_result, sticker_pack_syncs_result,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2085,6 +2086,35 @@ impl RuntimeSupervisor {
             })
         })
         .await
+    }
+
+    /// stories.markViewed (contract revision 1.85, §4.70): the story-anchored
+    /// viewed receipt — the `messages.markViewed` receipt class verbatim
+    /// (best-effort, `{status: sent|unknown}`, any upstream failure
+    /// degrades and nothing retries) with the §4.29 row selection replaced
+    /// by the story anchor frame. One mutating `sendViewedReceipt` call
+    /// upstream (the author is a single recipient, one timestamp per frame —
+    /// there is no fan-out: a story receipt names exactly one story).
+    pub async fn send_story_viewed(
+        &self,
+        params: StoriesMarkViewedParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let frame = {
+            let service = self.service.lock().await;
+            service.prepare_story_mark_viewed(&params)?
+        };
+        match engine
+            .call("sendViewedReceipt", frame, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            // Receipt-class degradation: the pin-family discipline — a
+            // definite upstream error, transport trouble, or an unknown
+            // outcome only degrades the answer; nothing is ever retried
+            // (AGENTS.md).
+            Err(_) => Ok("unknown"),
+        }
     }
 
     /// Send one attachment (optionally with a caption) — implementation-plan
@@ -8393,6 +8423,106 @@ mod tests {
                 .count(),
             1,
             "an unknown sendStory outcome is never retried"
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// stories.markViewed (contract 1.85, §4.70) in engine mode: the frame is
+    /// exactly the engine's `sendViewedReceipt` params — resolved signal
+    /// account, the trimmed author as the single recipient, one timestamp —
+    /// the receipt-class answer is `sent`, a crash in flight degrades to
+    /// `unknown` without a retry, an explicit restart lands a fresh engine
+    /// and the next receipt sends again, and the raw store account id never
+    /// rides any frame.
+    #[tokio::test]
+    async fn stories_mark_viewed_routes_sendviewedreceipt_in_engine_mode() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.mode = crate::engine::SignalCliMode::KtEngine;
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        let viewed = |author: &str, sent_at: u64| crate::service::StoriesMarkViewedParams {
+            account_id: account.id.clone(),
+            story_author: author.to_string(),
+            story_sent_at: sent_at,
+        };
+
+        let sent = supervisor
+            .send_story_viewed(viewed("  +15555550101  ", 1727000000000))
+            .await
+            .unwrap();
+        assert_eq!(sent, "sent");
+
+        // Crash with the mutating receipt in flight: the receipt may or may
+        // not have reached the server — `unknown`, never retried.
+        let crash = supervisor
+            .send_story_viewed(viewed("+15555550101", 425))
+            .await
+            .unwrap();
+        assert_eq!(crash, "unknown");
+        supervisor.start().await.unwrap();
+        let recovered = supervisor
+            .send_story_viewed(viewed("+15555550101", 1727000000001))
+            .await
+            .unwrap();
+        assert_eq!(recovered, "sent");
+
+        // The dispatch log pins the frame shapes: resolved signal account,
+        // the trimmed author as the single recipient, exactly one timestamp
+        // per receipt, the crash sentinel dispatched exactly once (no
+        // retry), and the raw account id never rides any frame.
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatches");
+        let dispatches: Vec<serde_json::Value> = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let receipts: Vec<&serde_json::Value> = dispatches
+            .iter()
+            .filter(|params| params.get("recipient").is_some())
+            .collect();
+        assert_eq!(receipts.len(), 3, "one receipt + the crash + the recovery");
+        for dispatch in &receipts {
+            assert_eq!(dispatch["account"], "+15555550100");
+            assert!(
+                dispatch.get("accountId").is_none(),
+                "the store account id never rides the frame"
+            );
+            assert_eq!(dispatch["timestamps"].as_array().unwrap().len(), 1);
+        }
+        assert_eq!(receipts[0]["recipient"], "+15555550101");
+        assert_eq!(
+            receipts[0]["timestamps"],
+            serde_json::json!([1727000000000u64])
+        );
+        assert_eq!(receipts[1]["timestamps"], serde_json::json!([425]));
+        assert_eq!(
+            receipts[2]["timestamps"],
+            serde_json::json!([1727000000001u64])
         );
         supervisor.shutdown().await.unwrap();
     }

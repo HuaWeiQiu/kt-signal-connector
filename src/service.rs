@@ -11,8 +11,8 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
-    ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, SignalCliMode,
-    truncate_utf8_bytes,
+    ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, ReceiptKind,
+    SignalCliMode, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -691,6 +691,27 @@ pub enum HostSideEvent {
         sender_name: Option<String>,
         timestamp: Option<u64>,
         story: Value,
+    },
+    /// Own-story view receipts (contract 1.85, §4.70): the VIEWED receipt
+    /// timestamps that hit no outgoing row. The ReceiptMessage proto carries
+    /// no story bit (engine compat §3 projects `{timestamp[], when,
+    /// isDelivery, isRead, isViewed}`), and the connector's own stories are
+    /// rowless (§4.67), so the split is local: timestamps that hit an
+    /// outgoing row are the §4.29 receipts and keep folding to `read`, the
+    /// leftovers — the receipts the old pipeline silently evaporated — ride
+    /// this transient event, with the desktop's own story timeline as the
+    /// authoritative join (`signalStoryApplyView` applies an exact
+    /// (self, sentAt) match and no-ops otherwise). Transient like
+    /// `story.received`: nothing persists, nothing self-heals; the
+    /// stories-disabled gate does not apply (it gates incoming story
+    /// material, not receipts about the account's own stories).
+    StoryViewed {
+        account_id: String,
+        viewer: Option<String>,
+        viewer_aci: Option<String>,
+        viewer_name: Option<String>,
+        sent_timestamps: Vec<u64>,
+        viewed_at: u64,
     },
 }
 
@@ -3308,6 +3329,55 @@ impl ConnectorService {
         Ok(())
     }
 
+    /// stories.markViewed (contract revision 1.85, §4.70): the send leg of
+    /// the story viewed-receipt chain. The row-based `messages.markViewed`
+    /// selection (§4.29) can never address a story — stories land in no
+    /// conversation row (§4.67), so its group selection is always empty —
+    /// and this face replaces that selection with the story anchor: the
+    /// caller names the author and the story's own Signal timestamp, and the
+    /// frame is exactly the engine's `sendViewedReceipt` params (engine
+    /// compat §3: `{account, recipient (single author), timestamps[]}`, one
+    /// timestamp per frame — the official desktop's story-read flow sends
+    /// the same single-timestamp VIEWED receipt to the author, the desktop
+    /// matrix's declared-gap record (kt-desktop signal-official-parity-matrix
+    /// 2026-10-08 Stories 批 2) names this face as the missing uplink leg). The upstream face
+    /// is the pinned upstream's own method (it exists on every mode — the
+    /// JVM/native faces dispatch it like messages.markViewed does), so this
+    /// prepare is mode-independent: validation (the story-author bound
+    /// mirrors the story recipients' per-entry bound; a zero sentAt is the
+    /// officially meaningless marker — the desktop's story sanitize rejects
+    /// it, so the connector refuses the frame too) then account resolution.
+    /// The result shape and the receipt-class degradation live in the
+    /// supervisor (`{status: sent|unknown}`, failures degrade, nothing
+    /// retries).
+    pub fn prepare_story_mark_viewed(
+        &self,
+        params: &StoriesMarkViewedParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        let author = params.story_author.trim();
+        if author.is_empty() || author.chars().count() > MAX_OPAQUE_ID_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "storyAuthor must contain between 1 and 128 characters",
+                false,
+            )));
+        }
+        if params.story_sent_at == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "storySentAt must be a positive Signal timestamp",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "recipient": author,
+            "timestamps": [params.story_sent_at],
+        }))
+    }
+
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
     /// opens with contract 1.74, §4.65): entries resolve through the pinned
     /// `getUserStatus --username` face on the JVM/native faces
@@ -5452,6 +5522,77 @@ impl ConnectorService {
                 story: message.clone(),
             }]);
         }
+        // Story view receipts (contract 1.85, §4.70). A VIEWED receipt is
+        // intercepted before the conversation ladder because its story half
+        // addresses no conversation at all: the viewer may never have
+        // exchanged a direct message with the account, and the old ladder
+        // dropped the whole envelope there. The wire carries no story bit
+        // (the ReceiptMessage proto has none), so the split is local: the
+        // timestamps are tried against the viewer conversation's outgoing
+        // rows first — the §4.29 fold, Viewed still upgrades rows to `read` —
+        // and the timestamps that hit no row are the story-anchored
+        // candidates (own stories are the rowless sends, §4.67). The
+        // desktop's own story timeline is the authoritative join, so the
+        // event claims candidacy, not identity: a stale or deleted-row
+        // timestamp finds no (self, sentAt) match desktop-side and no-ops.
+        // A receipt with no resolvable source has neither a conversation to
+        // fold against nor a viewer the desktop could record — the whole
+        // envelope drops (宁缺勿错), exactly the pre-1.85 fate. The
+        // stories-disabled gate does not apply: it gates incoming story
+        // material, and a view receipt is about the account's own stories.
+        if let ControlReceive::Receipt {
+            kind: ReceiptKind::Viewed,
+            timestamps,
+            when,
+        } = &control
+        {
+            let Some(peer) = receive.source.as_deref().filter(|s| !s.is_empty()) else {
+                return Ok(Vec::new());
+            };
+            let when = when.unwrap_or_else(crate::link::now_ms);
+            let mut events = Vec::new();
+            let mut unmatched = timestamps.clone();
+            if let Ok(Some(conversation)) =
+                self.store.conversation_by_peer(&account.id, "direct", peer)
+            {
+                let moved = self.store.upgrade_outgoing_receipts(
+                    &account.id,
+                    &conversation.id,
+                    timestamps,
+                    ReceiptKind::Viewed,
+                    when,
+                )?;
+                for record in &moved {
+                    events.push(HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id.clone(),
+                        message_id: record.id.clone(),
+                        status: record.status,
+                        delivered_at: record.delivered_at,
+                        read_at: record.read_at,
+                    });
+                }
+                // A timestamp whose row exists (any status — moved or already
+                // read) is a message receipt, never a story candidate: the
+                // replayed-viewed face must not leak onto the story event.
+                let hits = self.store.existing_outgoing_sent_at(
+                    &account.id,
+                    &conversation.id,
+                    timestamps,
+                )?;
+                unmatched.retain(|timestamp| !hits.contains(timestamp));
+            }
+            if !unmatched.is_empty() {
+                events.push(HostSideEvent::StoryViewed {
+                    account_id: account.id.clone(),
+                    viewer: receive.source.clone(),
+                    viewer_aci: receive.source_uuid.clone(),
+                    viewer_name: receive.peer_name.clone(),
+                    sent_timestamps: unmatched,
+                    viewed_at: when,
+                });
+            }
+            return Ok(events);
+        }
         // Resolve the conversation: group id, or peer (incoming source /
         // outgoing destination). Control receives address existing
         // conversations only — they never create one.
@@ -7567,6 +7708,18 @@ pub struct StoriesSetDisabledParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoriesGetDisabledParams {
     pub account_id: String,
+}
+
+/// `stories.markViewed` params (contract revision 1.85, §4.70): the story
+/// anchor — the author's address plus the story's own Signal timestamp. The
+/// receipt carries exactly that pair upstream; there is no conversation and
+/// no messageId on this face (stories are rowless, §4.67).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoriesMarkViewedParams {
+    pub account_id: String,
+    pub story_author: String,
+    pub story_sent_at: u64,
 }
 
 /// The stories faces' shared result (contract revision 1.76, §4.67): the
@@ -14941,6 +15094,246 @@ mod tests {
             error,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
+    }
+
+    /// stories.markViewed (contract 1.85, §4.70): validation runs entirely
+    /// before the account ladder — an empty or oversized storyAuthor and the
+    /// meaningless zero storySentAt answer INVALID_REQUEST — and the frame is
+    /// exactly the engine's `sendViewedReceipt` params with the resolved
+    /// signal account, the author as the single recipient, and the one-
+    /// timestamp array. Mode-independent: the upstream face is the pinned
+    /// upstream's own method, so no capability seam exists to answer.
+    #[test]
+    fn stories_mark_viewed_preparation_gates_then_frames() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let gate = |params: &StoriesMarkViewedParams| {
+            matches!(
+                service.prepare_story_mark_viewed(params),
+                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
+            )
+        };
+        let params = |author: &str, sent_at: u64, account_id: &str| StoriesMarkViewedParams {
+            account_id: account_id.to_string(),
+            story_author: author.to_string(),
+            story_sent_at: sent_at,
+        };
+
+        assert!(
+            gate(&params("", 1727000000000, &account.id)),
+            "empty author"
+        );
+        assert!(
+            gate(&params("   ", 1727000000000, &account.id)),
+            "blank author"
+        );
+        assert!(
+            gate(&params(
+                &"k".repeat(MAX_OPAQUE_ID_BYTES + 1),
+                1727000000000,
+                &account.id
+            )),
+            "oversized author"
+        );
+        assert!(gate(&params("+15555550101", 0, &account.id)), "zero sentAt");
+
+        // Unknown account after the parameter gates.
+        let error = service
+            .prepare_story_mark_viewed(&params("+15555550101", 1727000000000, "acct-absent"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+
+        // The frame: resolved signal account, the author as the single
+        // recipient, exactly one timestamp — never the store account id.
+        assert_eq!(
+            service
+                .prepare_story_mark_viewed(&params(
+                    "22222222-2222-2222-2222-222222222222",
+                    1727000000000,
+                    &account.id
+                ))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "recipient": "22222222-2222-2222-2222-222222222222",
+                "timestamps": [1727000000000u64],
+            })
+        );
+        // The author address is trimmed whitespace-wise only.
+        assert_eq!(
+            service
+                .prepare_story_mark_viewed(&params("  +15555550101  ", 1727000000001, &account.id))
+                .unwrap()["recipient"],
+            json!("+15555550101")
+        );
+    }
+
+    /// Story view receipts (contract 1.85, §4.70): a VIEWED receipt splits
+    /// at the local row face — timestamps that hit outgoing rows keep the
+    /// §4.29 fold (one statusChanged per real transition, read tier), the
+    /// leftovers ride exactly one transient StoryViewed carrying the viewer
+    /// identity and the contract 1.32 arrival stamp; a replayed viewed
+    /// receipt (row already read) leaks nothing onto the story event; a
+    /// receipt from a conversation-less viewer forwards whole; a READ
+    /// receipt never grows a story leg; the stories-disabled gate does not
+    /// apply; and a source-less envelope drops entirely. Nothing persists.
+    #[test]
+    fn story_viewed_receipt_splits_from_the_read_fold() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+
+        let viewed = |source: Option<&str>, timestamps: Vec<u64>| {
+            let mut receive = control_receive_named(
+                "+15555550100",
+                source.unwrap_or("+15555550101"),
+                "Peer",
+                ControlReceive::Receipt {
+                    kind: ReceiptKind::Viewed,
+                    timestamps,
+                    when: Some(1234),
+                },
+            );
+            receive.source_uuid = Some("22222222-2222-2222-2222-222222222222".into());
+            if source.is_none() {
+                // A truly anonymous envelope: no source, no aci, no name.
+                receive.source = None;
+                receive.source_uuid = None;
+                receive.peer_name = None;
+            }
+            receive
+        };
+
+        // Mixed receipt: 400 hits the outgoing row (folds to read), 1727... is
+        // the own story's timestamp (rowless) and rides the story event.
+        let events = service
+            .ingest_receive(
+                viewed(Some("+15555550101"), vec![400, 1727000000000]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::MessageStatusChanged {
+                status: "read",
+                read_at: Some(1234),
+                ..
+            }
+        ));
+        let HostSideEvent::StoryViewed {
+            account_id: event_account,
+            viewer,
+            viewer_aci,
+            viewer_name,
+            sent_timestamps,
+            viewed_at,
+        } = &events[1]
+        else {
+            panic!("expected a StoryViewed event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(viewer.as_deref(), Some("+15555550101"));
+        assert_eq!(
+            viewer_aci.as_deref(),
+            Some("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(viewer_name.as_deref(), Some("Peer"));
+        assert_eq!(sent_timestamps, &[1727000000000u64][..]);
+        assert_eq!(*viewed_at, 1234);
+
+        // The replayed viewed receipt: the row exists (already read — the
+        // upgrade moves nothing) and must not leak onto the story event.
+        let events = service
+            .ingest_receive(
+                viewed(Some("+15555550101"), vec![400]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "a replayed message receipt stays silent: {events:?}"
+        );
+
+        // A conversation-less viewer (never exchanged a direct message): the
+        // whole receipt is story candidates — the pre-1.85 pipeline dropped
+        // this envelope on the conversation ladder.
+        let events = service
+            .ingest_receive(
+                viewed(Some("+15555550199"), vec![1727000000001, 1727000000002]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryViewed {
+            sent_timestamps, ..
+        } = &events[0]
+        else {
+            panic!("expected a StoryViewed event: {events:?}");
+        };
+        assert_eq!(sent_timestamps, &[1727000000001u64, 1727000000002u64][..]);
+
+        // A READ receipt with unmatched timestamps never grows a story leg.
+        let mut read = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::Receipt {
+                kind: ReceiptKind::Read,
+                timestamps: vec![1727000000003],
+                when: Some(1234),
+            },
+        );
+        read.source_uuid = Some("22222222-2222-2222-2222-222222222222".into());
+        let events = service
+            .ingest_receive(read, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "read receipts keep the silent skip: {events:?}"
+        );
+
+        // The stories-disabled gate does not apply: the toggle governs
+        // incoming story material, not receipts about the account's own
+        // stories.
+        service
+            .store_ref()
+            .set_stories_disabled(&account.id, true)
+            .unwrap();
+        let events = service
+            .ingest_receive(
+                viewed(Some("+15555550199"), vec![1727000000004]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "the viewed leg is ungated: {events:?}");
+        service
+            .store_ref()
+            .set_stories_disabled(&account.id, false)
+            .unwrap();
+
+        // No resolvable source: neither a conversation to fold against nor a
+        // viewer the desktop could record — the whole envelope drops.
+        let events = service
+            .ingest_receive(
+                viewed(None, vec![1727000000005]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "a source-less receipt drops: {events:?}");
+
+        // Nothing persisted: the story timestamps created no row and the
+        // split wrote no story state.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert_eq!(listed.items.len(), 1, "only the seeded outgoing row");
     }
 
     /// The stories-disabled gate (contract 1.76, §4.67): a story envelope
