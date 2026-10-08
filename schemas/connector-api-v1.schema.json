@@ -114,6 +114,11 @@
             "backups.uploadStatus",
             "calls.sendSignal",
             "calls.getState",
+            "calls.linkPresentation",
+            "calls.createLinkAuth",
+            "calls.groupProof",
+            "calls.groupMembers",
+            "calls.endorsementsPublicKey",
             "messages.sendStory",
             "stories.setDisabled",
             "stories.getDisabled",
@@ -957,6 +962,61 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/callsGetStateParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.linkPresentation" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsLinkPresentationParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.createLinkAuth" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsCreateLinkAuthParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.groupProof" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsGroupProofParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.groupMembers" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsGroupMembersParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.endorsementsPublicKey" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsEndorsementsPublicKeyParams" }
             }
           }
         },
@@ -1980,6 +2040,78 @@
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
+    },
+    "callsLinkPresentationParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "rootKey"],
+      "description": "Produce the day's call-link auth credential presentation (contract revision 1.88, §4.73, capability call-signaling widened in place — no new capability bit; kt-engine only, the KT-extension mode seam; engine a3ae39b, engine jsonrpc-compat §3 calls row + §5 block). Pure material passthrough: the connector gates the shapes and resolves the account, then forwards {account, rootKey} to the engine verbatim and passes the engine's result through untouched — zero logic, zero parsing, zero logging (the credential/presentation bytes cross this process exactly once, engine → host; the connector caches nothing, persists nothing, logs nothing — the engine keeps the per-account credential cache, the relay-api-v2 §5 credentials-never-ride-host-HTTP ruling). rootKey is the RingRTC CallLinkRootKey: standard base64 decoding to exactly 16 bytes (V0) or 21 bytes (V1); the maxLength 28 is the padded-base64 wire bound of the widest legal form. A shape violation answers INVALID_REQUEST before any upstream call (the engine re-gates fail-closed); an unregistered account or an engine-side refusal degrades per the structured ladder: CALL_CREDENTIALS_FAILED (retryable=false — server rejection, zkgroup redemption/presentation verification failure, the day's credential absent; error.data.status carries the server HTTP status verbatim when the server gave one), CALL_CREDENTIALS_UNAVAILABLE (retryable=true — network/transport). Result {presentation}: the CallLinkAuthCredentialPresentation bincode bytes, standard base64 (the desktop/calling RingRTC binding consumes the decoded bytes). Read lane, non-mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "rootKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 28,
+          "description": "The call-link root key: standard (padded) base64 decoding to exactly 16 bytes (V0) or 21 bytes (V1) — the RingRTC CallLinkRootKey two-version lengths; zkgroup derives from the first 16-byte CRN. Gated locally before any upstream call; the material is never parsed, logged, or stored."
+        }
+      }
+    },
+    "callsCreateLinkAuthParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "rootKey", "roomId"],
+      "description": "Run the call-link create-auth two-shot inside one RPC (contract revision 1.88, §4.73, capability call-signaling; kt-engine only; engine a3ae39b, engine jsonrpc-compat §3 calls row + §5 block). Pure material passthrough: the connector gates both shapes and forwards {account, rootKey, roomId} verbatim; the engine runs POST v1/call-link/create-auth → credential redemption → presentation + public params and passes both byte strings back. The server-side POST is credential issuance with no user-visible state change, so the face stays read-only (no write lane, no SEND_OUTCOME_UNKNOWN). rootKey gated exactly as on calls.linkPresentation; roomId is the RingRTC derive_room_id output: standard base64 decoding to exactly 32 bytes (the HKDF-SHA256 fixed-length output; the official callers derive it from the root key, never invent it). Error ladder identical to calls.linkPresentation (CALL_CREDENTIALS_FAILED with data.status?, CALL_CREDENTIALS_UNAVAILABLE, local INVALID_REQUEST shape gates). Result {presentation, callLinkPublicParams}: the CreateCallLinkCredentialPresentation and CallLinkPublicParams bincode bytes, each standard base64 (the official createCallLink credential segment's two materials). Read lane, non-mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "rootKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 28,
+          "description": "The call-link root key: standard base64 decoding to exactly 16 (V0) or 21 (V1) bytes; same gate as calls.linkPresentation."
+        },
+        "roomId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 44,
+          "description": "The derived room id: standard base64 decoding to exactly 32 bytes — the RingRTC derive_room_id HKDF-SHA256 fixed output. Generated by the RingRTC side (rootKey.generate/derive_room_id); the connector never derives and never stores it."
+        }
+      }
+    },
+    "callsGroupProofParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "groupId"],
+      "description": "Fetch the day's group membership proof token (contract revision 1.88, §4.73, capability call-signaling; kt-engine only; engine a3ae39b, engine jsonrpc-compat §3 calls row + §5 block). Pure material passthrough: the connector gates the group shape and forwards {account, groupId} verbatim; the engine redeems the day's AuthCredentialWithPni, presents it against the group's public params, and reads GET v2/groups/token on the storage-service host — the ExternalGroupCredential token comes back as a plain string (RingRTC setMembershipProof consumes its UTF-8 bytes). groupId is the same 32-byte group master key the listGroups/terminateGroup faces address: standard base64 decoding to exactly 32 bytes. Error ladder identical to calls.linkPresentation: local INVALID_REQUEST shape gates, CALL_CREDENTIALS_FAILED (retryable=false; server rejection, non-membership, proto decode failure, the day's credential absent; data.status? verbatim), CALL_CREDENTIALS_UNAVAILABLE (retryable=true). Result {proof}: the token string. Read lane, non-mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "groupId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 44,
+          "description": "The group master key: standard base64 decoding to exactly 32 bytes — the same reference listGroups addresses."
+        }
+      }
+    },
+    "callsGroupMembersParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "groupId"],
+      "description": "Fetch the group's member cipher-text material (contract revision 1.88, §4.73, capability call-signaling; kt-engine only; engine a3ae39b, engine jsonrpc-compat §3 calls row + §5 block). Pure material passthrough: the calls.groupProof gate and forwarding discipline verbatim; the engine reads the group state (GET v1/groups/ + its own decryption) and encrypts every member's ACI into a UuidCiphertext — the RingRTC GroupMemberInfo material for group-call endorsements. groupId gated exactly as on calls.groupProof. Error ladder identical: local INVALID_REQUEST shape gates, CALL_CREDENTIALS_FAILED (retryable=false, data.status?), CALL_CREDENTIALS_UNAVAILABLE (retryable=true). Result {members: [{uuid, userIdCipherText}]} in server group-state member order — uuid is the member's ACI string, userIdCipherText the UuidCiphertext bincode bytes standard base64 (the plaintext identities never leave the engine; the connector neither parses nor logs the material). Read lane, non-mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "groupId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 44,
+          "description": "The group master key: standard base64 decoding to exactly 32 bytes — the same reference listGroups addresses."
+        }
+      }
+    },
+    "callsEndorsementsPublicKeyParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Derive the endorsement public key (contract revision 1.88, §4.73, capability call-signaling; kt-engine only; engine a3ae39b, engine jsonrpc-compat §3 calls row + §5 block). The one account-less material face (the getStickerPackManifest anonymous-face discipline): no fields, no account, no network — the engine derives the EndorsementPublicKey from its pinned legacy ServerPublicParams (the same constant every engine instance holds) and the bytes pass through. The kt-engine mode seam is the whole local gate: a stock signal-cli carries no such method; past the seam the face answers from the running engine like every other material face (RUNTIME_NOT_RUNNING when the engine is down). Result {endorsementPublicKey}: the EndorsementPublicKey bincode bytes, standard base64 (the RingRTC getCallLinkCall endorsementPublicKey slot's input). Read lane, non-mutating.",
+      "properties": {}
     },
     "conversationsGetPinnedParams": {
       "type": "object",
@@ -3213,6 +3345,8 @@
             "USERNAME_RESERVATION_GONE",
             "USERNAME_RATE_LIMITED",
             "USERNAME_SERVER_FAILED",
+            "CALL_CREDENTIALS_FAILED",
+            "CALL_CREDENTIALS_UNAVAILABLE",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",
@@ -3239,7 +3373,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

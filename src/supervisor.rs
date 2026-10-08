@@ -3557,6 +3557,117 @@ impl RuntimeSupervisor {
         Ok(serde_json::to_value(state).unwrap_or(Value::Null))
     }
 
+    /// calls.linkPresentation (contract revision 1.88, §4.73, capability
+    /// call-signaling widened in place): pure engine material passthrough —
+    /// the shape gate + account resolution ride the service prepare under
+    /// the service lock, then the engine's KT-extension method answers the
+    /// presentation bytes, forwarded verbatim. The connector parses nothing,
+    /// logs nothing, caches nothing: the credential bytes cross this process
+    /// exactly once, engine → host (the engine compat §5 zero-persistence
+    /// discipline mirrored at the pipe). Read-only engine class: a timeout
+    /// answers UPSTREAM_TIMEOUT (retryable), never the mutating unknown
+    /// outcome. kt-engine only (the KT-extension mode seam, the §4.69
+    /// ladder).
+    pub async fn calls_link_presentation(
+        &self,
+        account_id: &str,
+        root_key: &str,
+    ) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_calls_link_presentation(account_id, root_key, self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("calls.linkPresentation", params, CallClass::ReadOnly)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// calls.createLinkAuth (contract revision 1.88, §4.73): the create-auth
+    /// two-shot passthrough — the same discipline as `calls_link_presentation`
+    /// with the roomId gate added. The engine runs both shots (the
+    /// create-auth POST → redeem → present + public params) inside the one
+    /// RPC; the server-side POST is credential issuance with no user-visible
+    /// state change, so the face stays read-only.
+    pub async fn calls_create_link_auth(
+        &self,
+        account_id: &str,
+        root_key: &str,
+        room_id: &str,
+    ) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_calls_create_link_auth(
+                account_id,
+                root_key,
+                room_id,
+                self.config.mode,
+            )?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("calls.createLinkAuth", params, CallClass::ReadOnly)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// calls.groupProof (contract revision 1.88, §4.73): the membership
+    /// proof passthrough — `calls_link_presentation`'s discipline with the
+    /// 32-byte group master key gate (the engine's decode_group_id shape).
+    pub async fn calls_group_proof(
+        &self,
+        account_id: &str,
+        group_id: &str,
+    ) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_calls_group_proof(account_id, group_id, self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("calls.groupProof", params, CallClass::ReadOnly)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// calls.groupMembers (contract revision 1.88, §4.73): the member
+    /// cipher-text material passthrough — the `calls_group_proof` discipline
+    /// verbatim against the engine's groupMembers face; the ACI-keyed
+    /// material never touches a connector log or store.
+    pub async fn calls_group_members(
+        &self,
+        account_id: &str,
+        group_id: &str,
+    ) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_calls_group_members(account_id, group_id, self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("calls.groupMembers", params, CallClass::ReadOnly)
+            .await
+            .map_err(ServiceError::from)
+    }
+
+    /// calls.endorsementsPublicKey (contract revision 1.88, §4.73): the
+    /// constant-derivation passthrough — no account, no material input, no
+    /// network; the engine derives from its pinned legacy ServerPublicParams
+    /// and the bytes pass through. The mode seam is the whole gate (the
+    /// face is a KT-extension method a stock signal-cli does not carry).
+    pub async fn calls_endorsements_public_key(&self) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_calls_endorsements_public_key(self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("calls.endorsementsPublicKey", params, CallClass::ReadOnly)
+            .await
+            .map_err(ServiceError::from)
+    }
+
     /// Best-effort "Delete for everyone" for one own sent message
     /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
     /// upstream `remoteDelete` call without it — the same shape as

@@ -2058,6 +2058,15 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // the text face landed but the avatar upload chain failed; the engine's
     // data object carries {retryable, textSaved} verbatim (contract 1.50).
     "PROFILE_UPLOAD_FAILED",
+    // §4.73 call-link credential material faces (contract 1.88, engine
+    // a3ae39b, P4c slice 1 — the registration the engine's compat §3 calls
+    // rows assign to this connector batch): FAILED is the server-rejection /
+    // zkgroup-verification / day-credential-absent family with the engine's
+    // `data.status?` honest HTTP pass-through (retryable=false — the same
+    // material fails the same way); UNAVAILABLE is the network/transport
+    // family (retryable=true — a later attempt may reach the server).
+    "CALL_CREDENTIALS_FAILED",
+    "CALL_CREDENTIALS_UNAVAILABLE",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.

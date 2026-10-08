@@ -134,6 +134,21 @@ pub const MAX_CALL_SIGNAL_PAYLOAD_CHARS: usize = 3 * 1024 * 1024;
 /// The `calls.getState` projection note (contract revision 1.50, §4.48):
 /// one honest sentence about where the call state machine actually lives.
 pub const CALL_STATE_PROJECTION_NOTE: &str = "connector-pipe";
+/// Call-link credential material bounds (contract revision 1.88, §4.73):
+/// the caller-supplied base64 byte budgets mirrored from the engine's own
+/// fail-closed parameter gates (engine a3ae39b, RingRTC v2.72.1 shapes) —
+/// rootKey decodes to exactly 16 bytes (V0) or 21 bytes (V1), whose padded
+/// standard-base64 encodings are 24 and 28 characters (28 is the wire
+/// bound); roomId decodes to exactly 32 bytes (the RingRTC derive_room_id
+/// HKDF output) = 44 characters; groupId is the same 32-byte master key the
+/// listGroups/terminateGroup faces address = 44 characters. The connector
+/// enforces the decode + exact byte length before any upstream call so a
+/// shape violation answers INVALID_REQUEST locally (the engine re-gates
+/// fail-closed); the material bytes themselves are never parsed, logged,
+/// or stored here.
+pub const CALL_LINK_ROOT_KEY_B64_MAX_CHARS: usize = 28;
+pub const CALL_LINK_ROOM_ID_B64_CHARS: usize = 44;
+pub const CALL_GROUP_MASTER_KEY_B64_CHARS: usize = 44;
 /// contacts.setLocalAlias bound (contract revision 1.10): the alias is a
 /// short display name, not a free-form profile field — 128 bytes matches the
 /// peerKey/opaqueId bound and keeps the upstream `updateContact` payload
@@ -341,6 +356,21 @@ impl ServiceError {
                     return ApiError::with_data(
                         "PROFILE_UPLOAD_FAILED",
                         "the profile avatar upload failed after the text face was saved",
+                        data,
+                    );
+                }
+                // §4.73 call-link credential faces (contract 1.88, engine
+                // a3ae39b): FAILED carries the engine's `data.status?` — the
+                // honest HTTP status pass-through, a promised contract face
+                // riding verbatim like the PROFILE_UPLOAD_FAILED facts above
+                // (the engine sends an empty object when the server gave no
+                // status, which passes through as the same empty object).
+                if code == "CALL_CREDENTIALS_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "CALL_CREDENTIALS_FAILED",
+                        "the call-link credential material could not be produced",
                         data,
                     );
                 }
@@ -554,6 +584,23 @@ impl ServiceError {
                     "USERNAME_SERVER_FAILED" => ApiError::new(
                         "USERNAME_SERVER_FAILED",
                         "the username server request failed",
+                        true,
+                    ),
+                    // §4.73 call-link credential faces (contract 1.88, engine
+                    // a3ae39b compat §3 calls rows): FAILED is the
+                    // server-rejection/zkgroup-verification family —
+                    // deterministic (the same material fails the same way),
+                    // `data.status?` rides verbatim via the pre-match arm
+                    // above. UNAVAILABLE is the network/transport family —
+                    // may succeed on a later attempt.
+                    "CALL_CREDENTIALS_FAILED" => ApiError::new(
+                        "CALL_CREDENTIALS_FAILED",
+                        "the call-link credential material could not be produced",
+                        false,
+                    ),
+                    "CALL_CREDENTIALS_UNAVAILABLE" => ApiError::new(
+                        "CALL_CREDENTIALS_UNAVAILABLE",
+                        "the call-link credential server is unreachable",
                         true,
                     ),
                     "REPORT_SPAM_FAILED" => {
@@ -4013,6 +4060,179 @@ impl ConnectorService {
         validate_opaque_id(account_id, "accountId")?;
         self.resolve_account(account_id)?;
         Ok(CallStateRegistry::default())
+    }
+
+    /// The call-link material shape gate (contract revision 1.88, §4.73):
+    /// the engine's own fail-closed parameter gates mirrored onto the caller
+    /// strings — trim, canonical padded standard base64, exact decoded byte
+    /// length. Answering locally keeps every shape violation an
+    /// INVALID_REQUEST retryable=false before any upstream call (an engine
+    /// -32603 would degrade to the generic retryable upstream error, the
+    /// wrong face for a caller mistake). The material itself is never
+    /// parsed, logged, or stored — the decoded bytes are dropped here and
+    /// the caller's string forwards verbatim.
+    fn gate_call_material_b64(
+        value: &str,
+        label: &str,
+        max_chars: usize,
+        lengths: &[usize],
+    ) -> Result<(), ServiceError> {
+        if value.is_empty() || value.chars().count() > max_chars {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                format!("{label} must contain between 1 and {max_chars} characters"),
+                false,
+            )));
+        }
+        let mut bytes = Vec::new();
+        match base64_decode_to_vec(value.trim(), &mut bytes) {
+            Ok(()) if lengths.contains(&bytes.len()) => Ok(()),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                format!(
+                    "{label} must be standard base64 decoding to exactly {} bytes",
+                    lengths
+                        .iter()
+                        .map(|len| len.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" or ")
+                ),
+                false,
+            ))),
+        }
+    }
+
+    /// calls.linkPresentation (contract revision 1.88, §4.73, capability
+    /// call-signaling widened in place): pure material passthrough — resolve
+    /// the account, gate the rootKey shape (16/21 B, the RingRTC
+    /// CallLinkRootKey two-version lengths), and forward `{account,
+    /// rootKey}` to the engine verbatim. The presentation bytes come back
+    /// through untouched; the connector caches nothing and logs nothing.
+    pub fn prepare_calls_link_presentation(
+        &self,
+        account_id: &str,
+        root_key: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        Self::gate_call_material_b64(
+            root_key,
+            "rootKey",
+            CALL_LINK_ROOT_KEY_B64_MAX_CHARS,
+            &[16, 21],
+        )?;
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({
+                "account": account.signal_account,
+                "rootKey": root_key,
+            })),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "call-link material requires the kt-engine mode",
+                false,
+            ))),
+        }
+    }
+
+    /// calls.createLinkAuth (contract revision 1.88, §4.73): the two-shot
+    /// create-auth material passthrough — the rootKey gate plus the roomId
+    /// gate (32 B, the RingRTC derive_room_id fixed output), forwarding
+    /// `{account, rootKey, roomId}` verbatim. The server-side create-auth
+    /// POST is credential issuance with no user-visible state change, so the
+    /// face stays a read (the engine runs both shots inside one RPC).
+    pub fn prepare_calls_create_link_auth(
+        &self,
+        account_id: &str,
+        root_key: &str,
+        room_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        Self::gate_call_material_b64(
+            root_key,
+            "rootKey",
+            CALL_LINK_ROOT_KEY_B64_MAX_CHARS,
+            &[16, 21],
+        )?;
+        Self::gate_call_material_b64(room_id, "roomId", CALL_LINK_ROOM_ID_B64_CHARS, &[32])?;
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({
+                "account": account.signal_account,
+                "rootKey": root_key,
+                "roomId": room_id,
+            })),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "call-link material requires the kt-engine mode",
+                false,
+            ))),
+        }
+    }
+
+    /// calls.groupProof / calls.groupMembers (contract revision 1.88,
+    /// §4.73): the group material passthrough pair — the groupId gate is the
+    /// same 32-byte master key shape the listGroups/terminateGroup faces
+    /// address (the engine's decode_group_id gate), forwarding `{account,
+    /// groupId}` verbatim to the two engine faces.
+    fn prepare_calls_group_material(
+        &self,
+        account_id: &str,
+        group_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        Self::gate_call_material_b64(group_id, "groupId", CALL_GROUP_MASTER_KEY_B64_CHARS, &[32])?;
+        let account = self.resolve_account(account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({
+                "account": account.signal_account,
+                "groupId": group_id,
+            })),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "call-link material requires the kt-engine mode",
+                false,
+            ))),
+        }
+    }
+
+    pub fn prepare_calls_group_proof(
+        &self,
+        account_id: &str,
+        group_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        self.prepare_calls_group_material(account_id, group_id, mode)
+    }
+
+    pub fn prepare_calls_group_members(
+        &self,
+        account_id: &str,
+        group_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        self.prepare_calls_group_material(account_id, group_id, mode)
+    }
+
+    /// calls.endorsementsPublicKey (contract revision 1.88, §4.73): the
+    /// constant-derivation face — no account (the getStickerPackManifest
+    /// anonymous-face discipline), no material input, no network. The only
+    /// gate is the engine-mode seam: the face is a KT-extension method a
+    /// stock signal-cli does not carry.
+    pub fn prepare_calls_endorsements_public_key(
+        &self,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        match mode {
+            SignalCliMode::KtEngine => Ok(json!({})),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "call-link material requires the kt-engine mode",
+                false,
+            ))),
+        }
     }
 
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
@@ -8302,6 +8522,45 @@ pub struct CallsSendSignalParams {
 pub struct CallsGetStateParams {
     pub account_id: String,
 }
+
+/// Call-link credential material params (contract revision 1.88, §4.73):
+/// the pure material passthrough faces — the caller carries the RingRTC
+/// root key (16/21 B base64), the derived room id (32 B base64), and/or the
+/// group master key (32 B base64); the connector gates the shapes and
+/// forwards verbatim. `calls.endorsementsPublicKey` takes no fields at all
+/// (the constant-derivation face).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsLinkPresentationParams {
+    pub account_id: String,
+    pub root_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsCreateLinkAuthParams {
+    pub account_id: String,
+    pub root_key: String,
+    pub room_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsGroupProofParams {
+    pub account_id: String,
+    pub group_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsGroupMembersParams {
+    pub account_id: String,
+    pub group_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsEndorsementsPublicKeyParams {}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -14869,6 +15128,215 @@ mod tests {
                 "{broken}"
             );
         }
+    }
+
+    /// Call-link credential material (contract revision 1.88, §4.73): the
+    /// b64 shape gates mirror the engine's own fail-closed parameter gates
+    /// (rootKey 16/21 B, roomId/groupId 32 B — trim + canonical padded
+    /// standard base64 + exact decoded length), every violation answers
+    /// INVALID_REQUEST retryable=false before any upstream traffic, and the
+    /// happy path forwards the resolved number plus the caller's material
+    /// verbatim under the kt-engine mode seam. Shape precedes resolution,
+    /// resolution precedes the seam (the §4.67 ladder precedent).
+    #[test]
+    fn prepare_call_material_gates_shapes_and_forwards_verbatim() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let root_key_16 = base64_encode(&[0x11; 16]);
+        let root_key_21 = base64_encode(&[0x11; 21]);
+        let room_id = base64_encode(&[0x22; 32]);
+        let group_id = base64_encode(&[0x33; 32]);
+
+        // Happy paths: the resolved number + the caller's material, verbatim.
+        let upstream = service
+            .prepare_calls_link_presentation(&account.id, &root_key_16, SignalCliMode::KtEngine)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["rootKey"], root_key_16);
+
+        let upstream = service
+            .prepare_calls_create_link_auth(
+                &account.id,
+                &root_key_21,
+                &room_id,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap();
+        assert_eq!(upstream["rootKey"], root_key_21);
+        assert_eq!(upstream["roomId"], room_id);
+
+        for prepare in [
+            service.prepare_calls_group_proof(&account.id, &group_id, SignalCliMode::KtEngine),
+            service.prepare_calls_group_members(&account.id, &group_id, SignalCliMode::KtEngine),
+        ] {
+            let upstream = prepare.unwrap();
+            assert_eq!(upstream["account"], "+15555550100");
+            assert_eq!(upstream["groupId"], group_id);
+        }
+
+        let upstream = service
+            .prepare_calls_endorsements_public_key(SignalCliMode::KtEngine)
+            .unwrap();
+        assert_eq!(upstream, json!({}));
+
+        // The rootKey gate: both legal lengths pass; every illegal decoded
+        // length, a non-canonical encoding, and non-base64 text refuse.
+        for legal in [&root_key_16, &root_key_21] {
+            service
+                .prepare_calls_link_presentation(&account.id, legal, SignalCliMode::KtEngine)
+                .unwrap();
+        }
+        for illegal in [
+            "",
+            "not-b64!!",
+            "eA",
+            &base64_encode(&[0x11; 0]),
+            &base64_encode(&[0x11; 15]),
+            &base64_encode(&[0x11; 17]),
+            &base64_encode(&[0x11; 20]),
+            &base64_encode(&[0x11; 22]),
+            &base64_encode(&[0x11; 32]),
+            // 29 chars of alphabet-legal text: inside no padded-quad shape.
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ] {
+            let error = service
+                .prepare_calls_link_presentation(&account.id, illegal, SignalCliMode::KtEngine)
+                .unwrap_err();
+            let api = error.into_api();
+            assert_eq!(api.code, "INVALID_REQUEST", "{illegal}");
+            assert!(!api.retryable, "{illegal}");
+        }
+
+        // The roomId/groupId gate: exactly 32 bytes, both faces.
+        for illegal in [
+            "",
+            &base64_encode(&[0x22; 16]),
+            &base64_encode(&[0x22; 31]),
+            &base64_encode(&[0x22; 33]),
+            "not-b64!!",
+        ] {
+            for error in [
+                service
+                    .prepare_calls_create_link_auth(
+                        &account.id,
+                        &root_key_16,
+                        illegal,
+                        SignalCliMode::KtEngine,
+                    )
+                    .unwrap_err()
+                    .into_api(),
+                service
+                    .prepare_calls_group_proof(&account.id, illegal, SignalCliMode::KtEngine)
+                    .unwrap_err()
+                    .into_api(),
+                service
+                    .prepare_calls_group_members(&account.id, illegal, SignalCliMode::KtEngine)
+                    .unwrap_err()
+                    .into_api(),
+            ] {
+                assert_eq!(error.code, "INVALID_REQUEST", "{illegal}");
+                assert!(!error.retryable, "{illegal}");
+            }
+        }
+
+        // The ladder order: shape wins over resolution, resolution wins over
+        // everything else (observed with the seam passing, kt-engine mode).
+        let error = service
+            .prepare_calls_link_presentation(
+                "kt-acct-missing",
+                "not-b64!!",
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "INVALID_REQUEST");
+        let error = service
+            .prepare_calls_link_presentation(
+                "kt-acct-missing",
+                &root_key_16,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
+
+        // The mode seam: JVM mode answers CAPABILITY_UNAVAILABLE on every
+        // face ( endorsements included — the stock signal-cli carries none
+        // of the five), only after shape and resolution pass.
+        let error = service
+            .prepare_calls_link_presentation(&account.id, &root_key_16, SignalCliMode::Jvm)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+        assert!(!error.retryable);
+        let error = service
+            .prepare_calls_create_link_auth(&account.id, &root_key_16, &room_id, SignalCliMode::Jvm)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+        let error = service
+            .prepare_calls_group_proof(&account.id, &group_id, SignalCliMode::Jvm)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+        let error = service
+            .prepare_calls_group_members(&account.id, &group_id, SignalCliMode::Jvm)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+        let error = service
+            .prepare_calls_endorsements_public_key(SignalCliMode::Jvm)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
+    }
+
+    /// §4.73 (contract 1.88): the two new code positions map to themselves
+    /// with the contract-fixed faces — CALL_CREDENTIALS_FAILED
+    /// retryable=false with the engine's data.status pass-through riding
+    /// verbatim (the promised face; the empty no-status object passes as the
+    /// same empty object), CALL_CREDENTIALS_UNAVAILABLE retryable=true and
+    /// content-free (nothing promised, nothing rides).
+    #[test]
+    fn call_credential_codes_map_with_their_contract_faces() {
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "CALL_CREDENTIALS_FAILED",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(api.code, "CALL_CREDENTIALS_FAILED");
+        assert!(!api.retryable);
+        assert!(api.data.is_none(), "no data, no face: {api:?}");
+
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "CALL_CREDENTIALS_FAILED",
+            data: Some(json!({ "status": 409 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "CALL_CREDENTIALS_FAILED");
+        assert!(!api.retryable, "the status face stays deterministic");
+        assert_eq!(api.data, Some(json!({ "status": 409 })));
+
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "CALL_CREDENTIALS_FAILED",
+            data: Some(json!({})),
+        })
+        .into_api();
+        assert_eq!(api.code, "CALL_CREDENTIALS_FAILED");
+        assert_eq!(api.data, Some(json!({})), "the no-status object rides");
+        assert!(!api.retryable);
+
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "CALL_CREDENTIALS_UNAVAILABLE",
+            data: Some(json!({ "detail": "unpromised" })),
+        })
+        .into_api();
+        assert_eq!(api.code, "CALL_CREDENTIALS_UNAVAILABLE");
+        assert!(api.retryable);
+        assert!(
+            api.data.is_none(),
+            "the transport family never leaks unpromised data: {api:?}"
+        );
     }
 
     /// Call signaling (contract revision 1.53, §4.49): the sendSignal shape

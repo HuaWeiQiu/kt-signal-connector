@@ -30,23 +30,25 @@ use crate::service::{
     BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
     BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
-    BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsGetStateParams,
-    CallsSendSignalParams, ContactsListParams, ContactsSetLocalAliasParams, ContactsSyncParams,
-    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, GroupsApproveJoinRequestsParams, GroupsGetParams,
-    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
-    HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessageRequestParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsCreateLinkAuthParams,
+    CallsEndorsementsPublicKeyParams, CallsGetStateParams, CallsGroupMembersParams,
+    CallsGroupProofParams, CallsLinkPresentationParams, CallsSendSignalParams, ContactsListParams,
+    ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams,
+    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
+    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetTextParams,
+    MessageRequestParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
+    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
+    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
+    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
+    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSetDisabledParams, UsernameLookupParams,
 };
@@ -2013,6 +2015,90 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid calls.getState params", false),
             ),
         },
+        // Call-link credential material passthrough (contract revision 1.88,
+        // §4.73): all five arms are the params-gate shape — the b64 byte-budget
+        // gates, account resolution, and the kt-engine mode seam ride the
+        // service prepare; the engine's result passes through untouched and
+        // the two credential error codes map through the structured whitelist
+        // (CALL_CREDENTIALS_FAILED with its data.status? face,
+        // CALL_CREDENTIALS_UNAVAILABLE retryable). endorsementsPublicKey is
+        // the account-less face: empty params, the default group's engine.
+        "calls.linkPresentation" => {
+            match serde_json::from_value::<CallsLinkPresentationParams>(request.params) {
+                Ok(params) => match runtime.calls_link_presentation(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid calls.linkPresentation params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "calls.createLinkAuth" => {
+            match serde_json::from_value::<CallsCreateLinkAuthParams>(request.params) {
+                Ok(params) => match runtime.calls_create_link_auth(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid calls.createLinkAuth params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "calls.groupProof" => {
+            match serde_json::from_value::<CallsGroupProofParams>(request.params) {
+                Ok(params) => match runtime.calls_group_proof(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid calls.groupProof params", false),
+                ),
+            }
+        }
+        "calls.groupMembers" => {
+            match serde_json::from_value::<CallsGroupMembersParams>(request.params) {
+                Ok(params) => match runtime.calls_group_members(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid calls.groupMembers params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "calls.endorsementsPublicKey" => {
+            match serde_json::from_value::<CallsEndorsementsPublicKeyParams>(request.params) {
+                Ok(_) => match runtime.calls_endorsements_public_key().await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid calls.endorsementsPublicKey params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "conversations.getPinned" => {
             match serde_json::from_value::<ConversationsGetPinnedParams>(request.params) {
                 Ok(params) => match runtime.get_pinned_conversations(params).await {

@@ -365,6 +365,24 @@ pub const METHODS: &[MethodRow] = &[
     // call-signaling precedent).
     ("stories.downloadAttachment", Lane::Send, true, "send"),
     ("stories.openAttachment", Lane::Read, false, "read"),
+    // Call-link credential material faces (contract revision 1.88, §4.73):
+    // pure engine passthrough — the material in, the credential bytes out,
+    // zero logic, zero parsing, zero logging (the engine a3ae39b batch owns
+    // the whole zkgroup chain; the credential/presentation bytes are never
+    // logged or persisted anywhere). Every face is a bounded read: no local
+    // state changes, no message send — the conversations.getAvatar class
+    // (network possible inside one engine call, read lane, non-mutating).
+    // createLinkAuth's server-side POST is credential issuance with no
+    // user-visible state change; endorsementsPublicKey is a constant
+    // derivation, no account at all. Advertised through the existing
+    // `call-signaling` tag, widened in place (the 1.82 precedent — the
+    // faces are the signaling pipeline's own material supply). kt-engine
+    // only (KT-extension methods a stock signal-cli does not carry).
+    ("calls.linkPresentation", Lane::Read, false, "read"),
+    ("calls.createLinkAuth", Lane::Read, false, "read"),
+    ("calls.groupProof", Lane::Read, false, "read"),
+    ("calls.groupMembers", Lane::Read, false, "read"),
+    ("calls.endorsementsPublicKey", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -443,9 +461,13 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
 /// the row-level serverGuid persistence); `call-signaling` (contract
-/// revision 1.51, widened in place by 1.82) marks the §4.49 call signaling
-/// faces (`calls.sendSignal` — the 1:1 and, since 1.82, the group-addressed
-/// route — plus the `call.incoming` and `call.groupIncoming` events);
+/// revision 1.51, widened in place by 1.82 and by 1.88) marks the §4.49
+/// call signaling faces (`calls.sendSignal` — the 1:1 and, since 1.82, the
+/// group-addressed route — plus the `call.incoming` and `call.groupIncoming`
+/// events) and, since 1.88, the §4.73 call-link credential material faces
+/// (`calls.linkPresentation` / `calls.createLinkAuth` / `calls.groupProof` /
+/// `calls.groupMembers` / `calls.endorsementsPublicKey` — the signaling
+/// pipeline's own material supply, the same no-new-bit discipline);
 /// `group-terminate` (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
@@ -549,6 +571,11 @@ mod tests {
             "identities.get",
             "stories.getDisabled",
             "stories.openAttachment",
+            "calls.linkPresentation",
+            "calls.createLinkAuth",
+            "calls.groupProof",
+            "calls.groupMembers",
+            "calls.endorsementsPublicKey",
         ];
         let send_lane = [
             "messages.sendText",

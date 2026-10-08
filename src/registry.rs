@@ -1029,6 +1029,60 @@ impl ProxyGroupRuntime {
         slot.supervisor.call_state(params.account_id).await
     }
 
+    /// calls.linkPresentation / calls.createLinkAuth / calls.groupProof /
+    /// calls.groupMembers (contract 1.88, §4.73): account-addressed engine
+    /// material passthrough, routed to the owning group's supervisor like
+    /// every account-scoped face — the credential cache and the zkgroup
+    /// chain live in that group's engine process.
+    pub async fn calls_link_presentation(
+        &self,
+        params: crate::service::CallsLinkPresentationParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .calls_link_presentation(&params.account_id, &params.root_key)
+            .await
+    }
+
+    pub async fn calls_create_link_auth(
+        &self,
+        params: crate::service::CallsCreateLinkAuthParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .calls_create_link_auth(&params.account_id, &params.root_key, &params.room_id)
+            .await
+    }
+
+    pub async fn calls_group_proof(
+        &self,
+        params: crate::service::CallsGroupProofParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .calls_group_proof(&params.account_id, &params.group_id)
+            .await
+    }
+
+    pub async fn calls_group_members(
+        &self,
+        params: crate::service::CallsGroupMembersParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .calls_group_members(&params.account_id, &params.group_id)
+            .await
+    }
+
+    /// calls.endorsementsPublicKey (contract 1.88, §4.73): the one
+    /// account-less material face — the constant derivation is per-engine
+    /// but identical everywhere, so the default group's engine serves (the
+    /// getStickerPackManifest anonymous-face posture).
+    pub async fn calls_endorsements_public_key(&self) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.default_slot()?;
+        slot.supervisor.calls_endorsements_public_key().await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

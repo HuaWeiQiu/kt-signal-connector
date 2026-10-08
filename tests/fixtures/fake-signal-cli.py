@@ -1961,6 +1961,126 @@ for line in sys.stdin:
                         result["bytesTotal"] = max(int(parts[2]), 0)
                     elif parts[0] == "failed":
                         result["errorCode"] = parts[2]
+    elif method in (
+        "calls.linkPresentation",
+        "calls.createLinkAuth",
+        "calls.groupProof",
+        "calls.groupMembers",
+        "calls.endorsementsPublicKey",
+    ):
+        # §4.73 call-link credential material faces (contract 1.88, engine
+        # a3ae39b): the negotiated wire mirror of the engine's five
+        # KT-extension methods — the account-scoped four gate the account
+        # (engine-state registry, else -32603) and their material shapes
+        # fail-closed -32603 (rootKey standard b64 16/21 B, roomId/groupId
+        # 32 B — the engine's own parameter gates), endorsementsPublicKey
+        # takes no fields and never fails here. The structured ladder steers
+        # from markers the driving test writes:
+        # `.fixture-call-cred-failed` answers CALL_CREDENTIALS_FAILED —
+        # "status <N>" content carries error.data.status (the honest HTTP
+        # pass-through), anything else answers data {} (the engine's
+        # no-status form); `.fixture-call-cred-unavailable` answers
+        # CALL_CREDENTIALS_UNAVAILABLE. Happy paths answer the fake shape
+        # stubs (fixed placeholder bytes/proof/members — stub bytes are NOT
+        # valid zk material, they only pin the contract shape, the engine
+        # fake discipline): presentation/params are the standard base64 of
+        # fixed byte strings, proof is a fixed token, members one entry.
+        def _call_cred_error():
+            failed_marker = SIGNAL_DATA_DIR / ".fixture-call-cred-failed"
+            if failed_marker.exists():
+                text = failed_marker.read_text().strip()
+                data = {}
+                if text.startswith("status "):
+                    try:
+                        data["status"] = max(int(text.split()[1]), 0)
+                    except (ValueError, IndexError):
+                        pass
+                return {"code": -1, "message": "CALL_CREDENTIALS_FAILED", "data": data}
+            if (SIGNAL_DATA_DIR / ".fixture-call-cred-unavailable").exists():
+                return {"code": -1, "message": "CALL_CREDENTIALS_UNAVAILABLE"}
+            return None
+
+        def _b64_fixed(tag):
+            return base64.b64encode(bytes([0xF0 ^ tag]) * 16).decode()
+
+        if method != "calls.endorsementsPublicKey":
+            cred_account = None
+            try:
+                state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+                for entry in state.get("accounts") or []:
+                    if entry.get("number") == params.get("account"):
+                        cred_account = entry["dir"]
+                        break
+            except (OSError, ValueError, KeyError, AttributeError):
+                cred_account = None
+            if cred_account is None:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32603, "message": "account is not registered"},
+                }
+                emit_json(response)
+                continue
+
+            def _decode_exact(value, lengths):
+                try:
+                    raw = base64.b64decode(value.strip(), validate=True)
+                except Exception:
+                    return False
+                return len(raw) in lengths
+
+            if method in ("calls.linkPresentation", "calls.createLinkAuth"):
+                if not _decode_exact(params.get("rootKey") or "", (16, 21)):
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32603, "message": "Internal error"},
+                    }
+                    emit_json(response)
+                    continue
+            if method == "calls.createLinkAuth" and not _decode_exact(
+                params.get("roomId") or "", (32,)
+            ):
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32603, "message": "Internal error"},
+                }
+                emit_json(response)
+                continue
+            if method in ("calls.groupProof", "calls.groupMembers") and not _decode_exact(
+                params.get("groupId") or "", (32,)
+            ):
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32603, "message": "Internal error"},
+                }
+                emit_json(response)
+                continue
+
+        cred_error = _call_cred_error()
+        if cred_error is not None:
+            response = {"jsonrpc": "2.0", "id": request_id, "error": cred_error}
+            emit_json(response)
+            continue
+        result = {
+            "calls.linkPresentation": {"presentation": _b64_fixed(1)},
+            "calls.createLinkAuth": {
+                "presentation": _b64_fixed(2),
+                "callLinkPublicParams": _b64_fixed(3),
+            },
+            "calls.groupProof": {"proof": "fixture-group-proof-token"},
+            "calls.groupMembers": {
+                "members": [
+                    {
+                        "uuid": "ae45f0d7-9c15-4e0a-9bf5-6cb610e1f2a3",
+                        "userIdCipherText": _b64_fixed(4),
+                    }
+                ]
+            },
+            "calls.endorsementsPublicKey": {"endorsementPublicKey": _b64_fixed(5)},
+        }[method]
     elif method == "getUserStatus":
         if AUTH_FAILED_MARKER.exists():
             # Contract 1.21: the account holder unlinked this device. The

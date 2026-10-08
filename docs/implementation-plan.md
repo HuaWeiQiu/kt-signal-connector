@@ -5,7 +5,42 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.87 (2026-10-09; the cloud-backup upload passthrough
+- Contract revision: 1.88 (2026-10-09; the call-link credential material
+  passthrough batch (§4.73): the five `calls.*` engine material faces
+  (engine a3ae39b, P4c slice 1 — engine `jsonrpc-compat.md` §3 calls rows +
+  §5 block, the registration note naming this connector batch for the two
+  new code positions) land their connector pipe —
+  `calls.linkPresentation` {accountId, rootKey(16/21B b64)} →
+  {presentation}, `calls.createLinkAuth` {accountId, rootKey, roomId(32B
+  b64)} → {presentation, callLinkPublicParams}, `calls.groupProof`
+  {accountId, groupId(32B b64)} → {proof},
+  `calls.groupMembers` {accountId, groupId} → {members:
+  [{uuid, userIdCipherText}]}, `calls.endorsementsPublicKey` {} →
+  {endorsementPublicKey}. Pure passthrough: zero logic, zero parsing, zero
+  logging — shape gate (the engine's own fail-closed b64 byte-budget gates
+  mirrored onto the caller strings, answering INVALID_REQUEST locally
+  before any upstream call) → engine method direct map → result bytes
+  passthrough; the credential/presentation bytes cross the process exactly
+  once, engine → host, and are never parsed, logged, or persisted (the
+  relay-api-v2 §5 credentials-never-ride-host-HTTP ruling; the engine keeps
+  the per-account credential cache). All five faces read lane,
+  non-mutating (network possible inside one engine call, the
+  conversations.getAvatar class; createLinkAuth's server-side POST is
+  credential issuance with no user-visible state change);
+  endorsementsPublicKey is the account-less face (the
+  getStickerPackManifest anonymous-face discipline, the default group's
+  engine). Two new code positions whitelist-registered:
+  CALL_CREDENTIALS_FAILED (retryable=false — server rejection,
+  zkgroup verification failure, the day's credential absent;
+  error.data.status? = the server HTTP status's honest pass-through, the
+  empty no-status object riding as itself) and CALL_CREDENTIALS_UNAVAILABLE
+  (retryable=true — network/transport). The capability set does not grow:
+  `call-signaling` widens in place (the §4.49/1.82 no-new-bit precedent —
+  the faces are the signaling pipeline's own material supply); kt-engine
+  only (KT-extension methods a stock signal-cli does not carry, the §4.69
+  mode seam). Engine-side architecture ruling citable from engine compat
+  §5: the credentials never transit the host's HTTP plane
+  — previously 1.87 (2026-10-09; the cloud-backup upload passthrough
   batch (§4.72): the engine's upload half (engine cloud-backup-contract §6,
   v2 2026-10-08 — the five rulings and the measured pins; engine
   `jsonrpc-compat.md` §3 per-method rows) lands its connector pipe —
@@ -5465,6 +5500,125 @@ wire, and the status states. The schema diff is the method enum, the two
 dispatch arms, the two params defs, the two error codes, and the `data`
 description's third family sentence; the schema-consistency scans cover the
 method set, the error-code set, and the unchanged bounds pairs.
+
+### 4.73 Call-link credential material passthrough: `calls.linkPresentation`, `calls.createLinkAuth`, `calls.groupProof`, `calls.groupMembers`, `calls.endorsementsPublicKey` (contract revision 1.88, 2026-10-09)
+
+The engine's call-link credential material face (engine a3ae39b, P4c
+slice 1 — the engine-side method rows in engine `docs/jsonrpc-compat.md`
+§3 calls family and the architecture block at §5, whose
+credentials-never-ride-host-HTTP ruling the connector cites as the
+authoritative shape) lands its connector pipe: five faces, pure
+passthrough — zero logic, zero parsing, zero logging. The engine owns the
+whole zkgroup chain (the per-account double-family credential cache with
+the official groupCredentialFetcher window cadence, the redemptions, the
+presentations, the group-state reads); the connector is the pipe between
+the engine's materials and the desktop + calling sidecar's RingRTC
+consumer.
+
+- **Shape gate → engine method direct map → result passthrough**: each
+  face gates its material shapes locally (the engine's own fail-closed
+  parameter gates mirrored onto the caller strings — trim, canonical
+  padded standard base64, exact decoded byte length: rootKey 16 B (V0) or
+  21 B (V1), the RingRTC `CallLinkRootKey` two-version lengths whose
+  widest padded encoding is 28 characters; roomId 32 B, the RingRTC
+  `derive_room_id` HKDF-SHA256 fixed output (44 characters); groupId 32 B,
+  the same group master key the listGroups/terminateGroup faces address
+  (44 characters)), answering INVALID_REQUEST retryable=false before any
+  upstream call — an engine -32603 would degrade to the generic retryable
+  upstream error, the wrong face for a caller mistake. Past the gate the
+  connector resolves the account (ACCOUNT_NOT_FOUND before the seam) and
+  forwards `{account, ...material}` verbatim; the engine's result bytes
+  pass through untouched. The decoded material bytes are dropped at the
+  gate (the caller's string forwards — the engine re-gates fail-closed
+  anyway); nothing is parsed, logged, or persisted anywhere on the pipe.
+- **The five faces**:
+  `calls.linkPresentation` {accountId, rootKey} → `{presentation}` — the
+  day's CallLinkAuthCredentialPresentation bincode bytes, standard base64
+  (the official zkgroup.preload presentation chain; the desktop/calling
+  RingRTC binding consumes the decoded bytes);
+  `calls.createLinkAuth` {accountId, rootKey, roomId} →
+  `{presentation, callLinkPublicParams}` — the create-auth two-shot inside
+  one RPC (POST v1/call-link/create-auth → redemption → presentation +
+  public params, the official createCallLink credential segment's two
+  materials);
+  `calls.groupProof` {accountId, groupId} → `{proof}` — the
+  ExternalGroupCredential token string (GET v2/groups/token on the
+  storage-service host; RingRTC `setMembershipProof` consumes its UTF-8
+  bytes);
+  `calls.groupMembers` {accountId, groupId} → `{members:
+  [{uuid, userIdCipherText}]}` — the group state's members with each ACI
+  encrypted into its UuidCiphertext (server group-state order; the
+  plaintext identities never leave the engine);
+  `calls.endorsementsPublicKey` {} → `{endorsementPublicKey}` — the
+  constant derivation from the engine's pinned legacy ServerPublicParams;
+  the one account-less face (the getStickerPackManifest anonymous-face
+  discipline), served by the default group's engine.
+- **Lane/class**: all five faces read lane, non-mutating — network
+  possible inside one bounded engine call (the conversations.getAvatar
+  class); createLinkAuth's server-side POST is credential issuance with no
+  user-visible state change, so no write lane and no SEND_OUTCOME_UNKNOWN
+  exists on any of the five (a timeout answers UPSTREAM_TIMEOUT,
+  retryable). The engine call class is read-only throughout.
+- **Error ladder**: the two new code positions whitelist-registered in
+  `ENGINE_STRUCTURED_ERROR_CODES` (the registration the engine's compat
+  rows assign to this batch): CALL_CREDENTIALS_FAILED (retryable=false —
+  server rejection, zkgroup redemption/presentation verification failure,
+  response shape violation, the day's credential absent;
+  `error.data.status?` carries the server HTTP status verbatim when the
+  server gave one — a promised contract face riding like the
+  PROFILE_UPLOAD_FAILED facts, with the engine's empty no-status object
+  passing through as itself) and CALL_CREDENTIALS_UNAVAILABLE
+  (retryable=true — the network/transport family, content-free). Shape
+  gates answer INVALID_REQUEST locally; an engine account that is unknown
+  to the engine degrades per the generic ladder (-32603 → UPSTREAM_ERROR),
+  RUNTIME_NOT_RUNNING when the engine is down.
+- **Capability/mode**: the capability set does not grow — all five ride
+  `call-signaling`, widened in place (the §4.49/1.82 no-new-bit precedent:
+  the faces are the signaling pipeline's own material supply). kt-engine
+  only (CAPABILITY_UNAVAILABLE on the JVM/native faces — KT-extension
+  methods a stock signal-cli does not carry, the §4.69 mode seam; the
+  ladder order is shape → resolution → seam, the §4.67 precedent). The
+  schema grows the five method enum entries, the five dispatch arms, the
+  five params defs (the b64 fixed-length fields' descriptions pinning the
+  byte budgets), the two error codes, and the `data` description's fourth
+  family sentence; no schema store version change.
+- **Deliberately out of this batch** (recorded, not worked around): the
+  relay frame assembly and the RingRTC consumption (kt-signal-calling,
+  slice 3+); rootKey generation, roomId derivation, and adminPasskey
+  generation stay RingRTC-side (the engine only receives finished bytes);
+  group-call connection/SFU/media faces (out of the engine's boundary
+  too); any credential caching connector-side (the engine's cache is the
+  single one); call-state registration (the connector stays the honest
+  `connector-pipe` registry, §4.49).
+- **Fixture**: `fake-signal-cli.py` mirrors the negotiated wire face —
+  the account-scoped four gate the account and their material shapes
+  fail-closed -32603 (the engine's own gates), endorsementsPublicKey
+  answers unconditionally; `.fixture-call-cred-failed` answers
+  CALL_CREDENTIALS_FAILED (`status <N>` content carrying data.status,
+  anything else the empty no-status object) and
+  `.fixture-call-cred-unavailable` answers CALL_CREDENTIALS_UNAVAILABLE;
+  the happy paths answer fixed shape stubs (placeholder bytes, proof, one
+  member — stub bytes are NOT valid zk material, they pin the contract
+  shape, the engine fake discipline). Real-device zkgroup material (a
+  registered account producing verifiable presentations/proofs end to
+  end) is the engine batch's own acceptance, not this batch's.
+
+Tests: the unit chain pins the whitelist sets (`methods.rs` — the five
+rows in the read array, non-mutating), the shape-gate ladder with the
+verbatim forwarding and the mode seam (`service.rs` — both legal rootKey
+lengths, every illegal decoded length and non-canonical encoding, the
+roomId/groupId 32-byte gate, shape-before-resolution-before-seam), and
+the two-code mapping with the status pass-through faces (`service.rs` —
+data.status riding verbatim, the empty no-status object riding, the
+unavailable family content-free; the allowlist totality loop covers both
+codes mechanically). The fixture chain (`tests/call_credentials.rs`) pins
+the five happy pass-throughs byte-for-byte against the stub shapes, the
+two-code ladder across the wire, the local INVALID_REQUEST shape answers
+(an engine -32603 would have surfaced as the generic upstream error, so
+the code is the connector's own voice), the ladder order, and the mode
+seam. The schema-consistency scans cover the method set, the error-code
+set, and the five new bounds pairs (rootKey ×2 = 28, roomId = 44, groupId
+×2 = 44).
 
 ## 5. signal-cli Boundary
 

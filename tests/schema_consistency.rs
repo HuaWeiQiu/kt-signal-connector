@@ -34,6 +34,7 @@ use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
+    CALL_GROUP_MASTER_KEY_B64_CHARS, CALL_LINK_ROOM_ID_B64_CHARS, CALL_LINK_ROOT_KEY_B64_MAX_CHARS,
     GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES, GROUP_NAME_MAX_BYTES,
     IDENTITY_SAFETY_NUMBER_MAX_CHARS, MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES,
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES,
@@ -790,6 +791,38 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/storyOpenAttachmentParams/properties/attachmentId",
             "maxLength",
             MAX_ATTACHMENT_ID_BYTES as u64,
+        ),
+        // Call-link credential material faces (contract 1.88, §4.73): the
+        // padded-base64 wire bounds of the engine's fixed byte shapes —
+        // rootKey's widest legal form is the 21-byte V1 (28 chars; the 16-byte
+        // V0 is 24), roomId and groupId are 32-byte fixed (44 chars). The
+        // exact decoded byte length is the prepare ladder's own gate (trim +
+        // canonical decode + 16/21 or 32), pinned by unit tests; the schema
+        // maxLength only bounds absurd input alongside the constant.
+        (
+            "/$defs/callsLinkPresentationParams/properties/rootKey",
+            "maxLength",
+            CALL_LINK_ROOT_KEY_B64_MAX_CHARS as u64,
+        ),
+        (
+            "/$defs/callsCreateLinkAuthParams/properties/rootKey",
+            "maxLength",
+            CALL_LINK_ROOT_KEY_B64_MAX_CHARS as u64,
+        ),
+        (
+            "/$defs/callsCreateLinkAuthParams/properties/roomId",
+            "maxLength",
+            CALL_LINK_ROOM_ID_B64_CHARS as u64,
+        ),
+        (
+            "/$defs/callsGroupProofParams/properties/groupId",
+            "maxLength",
+            CALL_GROUP_MASTER_KEY_B64_CHARS as u64,
+        ),
+        (
+            "/$defs/callsGroupMembersParams/properties/groupId",
+            "maxLength",
+            CALL_GROUP_MASTER_KEY_B64_CHARS as u64,
         ),
     ];
     assert!(!pairs.is_empty());
