@@ -374,6 +374,20 @@ impl ServiceError {
                         data,
                     );
                 }
+                // Contract 1.89: GROUP_AVATAR_UPLOAD_FAILED carries the
+                // engine's partial-success data object ({retryable,
+                // textSaved}) verbatim — the PROFILE_UPLOAD_FAILED channel
+                // above, group-faced: the group change landed, the avatar
+                // upload chain failed.
+                if code == "GROUP_AVATAR_UPLOAD_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "GROUP_AVATAR_UPLOAD_FAILED",
+                        "the group avatar upload failed after the group change was saved",
+                        data,
+                    );
+                }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
                         "STICKER_PACK_KEY_INVALID",
@@ -612,6 +626,14 @@ impl ServiceError {
                     "PROFILE_UPLOAD_FAILED" => ApiError::new(
                         "PROFILE_UPLOAD_FAILED",
                         "the profile avatar upload failed after the text face was saved",
+                        true,
+                    ),
+                    // The group-faced sibling (contract 1.89): same
+                    // no-data fallback shape, retryable=true per the
+                    // partial-success family.
+                    "GROUP_AVATAR_UPLOAD_FAILED" => ApiError::new(
+                        "GROUP_AVATAR_UPLOAD_FAILED",
+                        "the group avatar upload failed after the group change was saved",
                         true,
                     ),
                     _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
@@ -2459,9 +2481,23 @@ impl ConnectorService {
     /// change broadcast. The conversation id must resolve to a kind='group'
     /// row (direct answers INVALID_REQUEST before any upstream call); the
     /// member addresses forward verbatim — resolving and rejecting unknown
-    /// addresses is upstream work. The kt-engine face has no updateGroup
+    /// addresses is upstream work. The `avatar` tri-state (contract 1.89, the
+    /// `accounts.setProfile` shape verbatim) rides the same ladder: absent =
+    /// keep (no key), explicit null = remove (`avatar: null` upstream), a
+    /// validated data URI = replace (the URI verbatim — the connector never
+    /// decodes image bytes beyond the budget check); the Remove and Replace
+    /// forms count as the change set's avatar member, so a lone avatar call
+    /// is a real change. The kt-engine face has no updateGroup
     /// method and answers CAPABILITY_UNAVAILABLE (retryable=false) after the
-    /// local validation completed — engine-batch debt, honest by design.
+    /// local validation completed — engine-batch debt, honest by design. The
+    /// JVM/native face takes a group avatar as a local file path and the
+    /// connector has no host-file upload channel (§6.7: the media face is
+    /// download-only), so an avatar-carrying call answers
+    /// CAPABILITY_UNAVAILABLE there too — the §4.68 snapshot-import
+    /// downgrade precedent: no temporary file is written and no URI is
+    /// passed through to become an upstream protocol error. The byte face is
+    /// the parallel engine batch's arrival; the payload side (the tri-state
+    /// riding the changes vec) needs no further connector change.
     /// Zero local writes: group state converges through the receive
     /// projection.
     pub fn prepare_groups_update(
@@ -2609,6 +2645,25 @@ impl ConnectorService {
             validate_emoji(emoji)?;
             changes.push(("memberLabelEmoji", json!(emoji)));
         }
+        // The avatar tri-state (contract 1.89): the accounts.setProfile
+        // three states, carried by the dedicated `GroupAvatarUpdate` type
+        // because serde's `Option<Value>` folds an explicit null into
+        // "absent" at the option layer — here the three states are distinct
+        // on the real deserialization path. The value rides the changes vec
+        // verbatim (the omission discipline: a keep adds no key, an explicit
+        // null forwards null), and the Remove/Replace forms count as the
+        // change set's avatar member — a lone avatar call is a real change,
+        // not an empty set. A non-string, non-null avatar type fails at
+        // params deserialization (the §4.45 discipline); the data-URI shape
+        // gate answers INVALID_REQUEST here in both modes, ahead of both
+        // mode gates.
+        match &params.avatar {
+            GroupAvatarUpdate::Keep => {}
+            GroupAvatarUpdate::Remove => changes.push(("avatar", Value::Null)),
+            GroupAvatarUpdate::Replace(data_uri) => {
+                changes.push(("avatar", json!(validate_avatar_data_uri(data_uri)?)));
+            }
+        }
         if changes.is_empty() {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
@@ -2633,6 +2688,24 @@ impl ConnectorService {
                 false,
             ))),
             _ => {
+                // Contract 1.89: no JVM/native group-avatar byte face — the
+                // bound signal-cli takes a group avatar as a local file path
+                // and the connector has no host-file upload channel (§6.7:
+                // the media face is download-only), so materializing the
+                // data URI into a temporary file is out of bounds and
+                // forwarding the URI would only become an upstream protocol
+                // error (an explicit null would read as the builder's
+                // "no change" — a silent no-op for a remove request). The
+                // structured refusal (the §4.68 snapshot-import downgrade
+                // shape) precedes the payload build; the byte face arrives
+                // with the parallel engine batch.
+                if !matches!(params.avatar, GroupAvatarUpdate::Keep) {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "CAPABILITY_UNAVAILABLE",
+                        "the bound signal-cli face takes a group avatar as a local file path; the connector has no host-file upload channel",
+                        false,
+                    )));
+                }
                 let mut upstream = json!({
                     "account": account.signal_account,
                     "groupId": conversation.peer_key,
@@ -7525,6 +7598,40 @@ pub enum AvatarUpdate {
     Replace(String),
 }
 
+/// The `groups.update` avatar tri-state on the wire (contract revision 1.89,
+/// §4.44): the `AvatarUpdate` three states, carried by a dedicated type with
+/// a hand-written `Deserialize` because serde's `Option<Value>` folds an
+/// explicit JSON null into `None` at the option layer — the same fold makes
+/// the setProfile face's explicit-null arm unreachable on the real
+/// deserialization path (recorded boundary, the 1.46 shape kept as-is). A
+/// missing key takes the `Default` (`Keep`); an explicit null deserializes
+/// through `Value` (which does not fold null) into `Remove`; a string
+/// becomes `Replace` and any other JSON type is a custom deserialization
+/// error — the host's blanket params-shape `INVALID_REQUEST`, the §4.45
+/// "everything else fails at params deserialization" discipline.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum GroupAvatarUpdate {
+    #[default]
+    Keep,
+    Remove,
+    Replace(String),
+}
+
+impl<'de> serde::Deserialize<'de> for GroupAvatarUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match Value::deserialize(deserializer)? {
+            Value::Null => Ok(GroupAvatarUpdate::Remove),
+            Value::String(data_uri) => Ok(GroupAvatarUpdate::Replace(data_uri)),
+            _ => Err(serde::de::Error::custom(
+                "avatar must be a data:image/*;base64, data URI, null, or absent",
+            )),
+        }
+    }
+}
+
 /// Target of an outgoing text send: either an existing conversation, or a peer
 /// (kind + peer_key) for which a conversation is resolved/created on demand.
 #[derive(Clone, Debug)]
@@ -8742,7 +8849,11 @@ pub struct GroupsGetParams {
 /// key is "no change" upstream, an all-absent change set is refused by the
 /// service (`resetLink: false` counts as absent). Member arrays carry the
 /// §4.39 roster bounds; the schema mirrors every bound this struct's
-/// deserialization plus the service checks enforce.
+/// deserialization plus the service checks enforce. `avatar` is the 1.89
+/// tri-state [`GroupAvatarUpdate`]: a dedicated deserializer keeps absent
+/// and explicit null distinct on the real wire path (an `Option<Value>`
+/// field would fold the null into absence — the setProfile shape's
+/// recorded boundary).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GroupsUpdateParams {
@@ -8763,6 +8874,8 @@ pub struct GroupsUpdateParams {
     pub permission_send_messages: Option<String>,
     pub member_label: Option<String>,
     pub member_label_emoji: Option<String>,
+    #[serde(default)]
+    pub avatar: GroupAvatarUpdate,
     pub operation_id: Option<String>,
 }
 
@@ -10311,6 +10424,49 @@ mod tests {
         })
         .into_api();
         assert_eq!(api.code, "STICKER_PACK_FETCH_FAILED");
+        assert!(api.data.is_none());
+    }
+
+    /// The group-faced partial-success sibling (contract 1.89): the
+    /// engine's {retryable, textSaved} data object rides verbatim and
+    /// drives the retryable bit (retryable=true per the family), and a
+    /// data-less older-engine face maps to the fixed retryable=true face
+    /// with no data member — the PROFILE_UPLOAD_FAILED channel verbatim.
+    #[test]
+    fn group_avatar_upload_failed_carries_engine_data_verbatim() {
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_AVATAR_UPLOAD_FAILED",
+            data: Some(json!({ "retryable": true, "textSaved": true })),
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_AVATAR_UPLOAD_FAILED");
+        assert!(api.retryable);
+        assert_eq!(
+            api.data,
+            Some(json!({ "retryable": true, "textSaved": true }))
+        );
+
+        // textSaved=false keeps the payload (the desktop's plain-error
+        // branch reads it) — retryable re-read from the data object.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_AVATAR_UPLOAD_FAILED",
+            data: Some(json!({ "retryable": true, "textSaved": false })),
+        })
+        .into_api();
+        assert_eq!(
+            api.data,
+            Some(json!({ "retryable": true, "textSaved": false }))
+        );
+
+        // A data-less older-engine face: the fixed retryable=true face, no
+        // data member.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_AVATAR_UPLOAD_FAILED",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_AVATAR_UPLOAD_FAILED");
+        assert!(api.retryable);
         assert!(api.data.is_none());
     }
 
@@ -19022,6 +19178,7 @@ mod tests {
             permission_send_messages: None,
             member_label: None,
             member_label_emoji: None,
+            avatar: GroupAvatarUpdate::Keep,
             operation_id: None,
         };
 
@@ -19292,6 +19449,7 @@ mod tests {
             permission_send_messages: None,
             member_label: None,
             member_label_emoji: None,
+            avatar: GroupAvatarUpdate::Keep,
             operation_id: None,
         };
         let error = service
@@ -19319,6 +19477,206 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+    }
+
+    /// The groups.update avatar tri-state (contract 1.89): the wire
+    /// deserialization keeps the three states distinct (the dedicated
+    /// `GroupAvatarUpdate` — an explicit null is `Remove`, never folded into
+    /// absence); the data-URI shape refusals answer INVALID_REQUEST in both
+    /// modes before any gate; a lone explicit-null or lone data-URI call is
+    /// a real change (it reaches the CAPABILITY_UNAVAILABLE downgrade, not
+    /// the empty-set INVALID_REQUEST); a keep adds no avatar key upstream;
+    /// and the kt-engine face keeps its updateGroup-debt answer untouched.
+    /// Zero local writes on every branch.
+    #[test]
+    fn groups_update_avatar_tri_state_shapes_and_engine_downgrade() {
+        use crate::engine::SignalCliMode;
+        // The wire deserialization: absent → Keep, explicit null → Remove,
+        // string → Replace, any other JSON type → the params-shape
+        // INVALID_REQUEST (the host's blanket refusal).
+        let deserialized = |value: Value| {
+            serde_json::from_value::<GroupsUpdateParams>(json!({
+                "accountId": "a", "conversationId": "c", "avatar": value
+            }))
+        };
+        let kept: GroupsUpdateParams =
+            serde_json::from_value(json!({ "accountId": "a", "conversationId": "c" })).unwrap();
+        assert_eq!(kept.avatar, GroupAvatarUpdate::Keep);
+        assert_eq!(
+            deserialized(json!(null)).unwrap().avatar,
+            GroupAvatarUpdate::Remove
+        );
+        assert_eq!(
+            deserialized(json!("data:image/png;base64,YQ=="))
+                .unwrap()
+                .avatar,
+            GroupAvatarUpdate::Replace("data:image/png;base64,YQ==".into())
+        );
+        assert!(deserialized(json!(7)).is_err());
+        assert!(deserialized(json!(["data:image/png;base64,YQ=="])).is_err());
+
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let base = |avatar: GroupAvatarUpdate| GroupsUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            group_name: None,
+            group_description: None,
+            add_members: None,
+            remove_members: None,
+            promote_admins: None,
+            demote_admins: None,
+            ban_members: None,
+            unban_members: None,
+            link_state: None,
+            reset_link: None,
+            permission_add_member: None,
+            permission_edit_details: None,
+            permission_send_messages: None,
+            member_label: None,
+            member_label_emoji: None,
+            avatar,
+            operation_id: None,
+        };
+        // The data-URI shape refusals: a non-image family, a non-canonical
+        // base64 payload, and a decode beyond the 10 MiB budget —
+        // INVALID_REQUEST in both modes, ahead of both gates (the fourth
+        // shape refusal, a non-string avatar, answered at the params
+        // deserialization above).
+        let over_budget = format!(
+            "data:image/png;base64,{}",
+            "QUJD".repeat(MAX_AVATAR_BYTES / 3 + 1)
+        );
+        for shape in [
+            "data:text/html;base64,YQ==",
+            "data:image/png;base64,YQ",
+            over_budget.as_str(),
+        ] {
+            for mode in [SignalCliMode::Jvm, SignalCliMode::KtEngine] {
+                let error = service
+                    .prepare_groups_update(&base(GroupAvatarUpdate::Replace(shape.into())), mode)
+                    .unwrap_err();
+                assert!(
+                    matches!(error, ServiceError::Api(ref api)
+                        if api.code == "INVALID_REQUEST" && !api.retryable),
+                    "shape {shape} must refuse INVALID_REQUEST in mode {mode:?}"
+                );
+            }
+        }
+
+        // The exact 10 MiB decoded budget passes the shape gate, so a lone
+        // replace call rides the ladder into the JVM/native byte-face
+        // refusal — CAPABILITY_UNAVAILABLE (retryable=false), the §4.68
+        // snapshot-import downgrade shape, not the engine-face message.
+        let at_bound = format!(
+            "data:image/png;base64,{}",
+            "QUJD".repeat(MAX_AVATAR_BYTES / 3)
+        );
+        let error = service
+            .prepare_groups_update(
+                &base(GroupAvatarUpdate::Replace(at_bound)),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        match &error {
+            ServiceError::Api(api) => {
+                assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
+                assert!(!api.retryable);
+                assert!(
+                    api.message.contains("local file path"),
+                    "the JVM/native refusal names the byte-face gap: {api}"
+                );
+            }
+            _ => panic!("expected an Api refusal, got {error:?}"),
+        }
+
+        // A lone explicit-null call answers the same downgrade — the
+        // refusal (not the empty-set INVALID_REQUEST) proves the Remove form
+        // counts as the change set's avatar member.
+        let error = service
+            .prepare_groups_update(&base(GroupAvatarUpdate::Remove), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+
+        // The avatar member rides beside a text change and the refusal
+        // still precedes any payload: no temporary file is ever written on
+        // the JVM/native face.
+        let error = service
+            .prepare_groups_update(
+                &GroupsUpdateParams {
+                    group_name: Some("New Name".into()),
+                    avatar: GroupAvatarUpdate::Replace("data:image/png;base64,YQ==".into()),
+                    ..base(GroupAvatarUpdate::Keep)
+                },
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+
+        // The kt-engine face keeps its updateGroup-debt answer verbatim —
+        // the engine batch removes that gate, not this one — and an
+        // avatar-carrying call answers the same debt (no separate
+        // kt-engine avatar message is invented here). Both calls carry a
+        // real change (a name; the avatar alone) so the empty-set refusal
+        // never masks the gate.
+        let named_change = GroupsUpdateParams {
+            group_name: Some("New Name".into()),
+            ..base(GroupAvatarUpdate::Keep)
+        };
+        for params in [
+            named_change,
+            base(GroupAvatarUpdate::Replace(
+                "data:image/png;base64,YQ==".into(),
+            )),
+        ] {
+            let error = service
+                .prepare_groups_update(&params, SignalCliMode::KtEngine)
+                .unwrap_err();
+            match &error {
+                ServiceError::Api(api) => {
+                    assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
+                    assert!(!api.retryable);
+                    assert!(
+                        api.message.contains("updateGroup"),
+                        "the kt-engine face answers the updateGroup debt: {api}"
+                    );
+                }
+                _ => panic!("expected an Api refusal, got {error:?}"),
+            }
+        }
+
+        // A keep (the key absent) is no avatar change at all: a call with no
+        // other change is the §4.44 empty set, refused before the gates.
+        let error = service
+            .prepare_groups_update(&base(GroupAvatarUpdate::Keep), SignalCliMode::Jvm)
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "INVALID_REQUEST"
+                    && api.message.contains("at least one group change")));
+
+        // A keep beside a text change keeps the §4.44 payload exactly as it
+        // was: the omission discipline — the avatar key does not exist
+        // upstream.
+        let upstream = service
+            .prepare_groups_update(
+                &GroupsUpdateParams {
+                    group_name: Some("New Name".into()),
+                    ..base(GroupAvatarUpdate::Keep)
+                },
+                SignalCliMode::Jvm,
+            )
+            .unwrap();
+        assert!(upstream.get("avatar").is_none());
+        assert_eq!(upstream["name"], "New Name");
     }
 
     /// groups.quit resolves the group and answers the bare upstream payload;

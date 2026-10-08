@@ -2058,6 +2058,12 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // the text face landed but the avatar upload chain failed; the engine's
     // data object carries {retryable, textSaved} verbatim (contract 1.50).
     "PROFILE_UPLOAD_FAILED",
+    // §4.44 group-avatar upload partial-success face (contract 1.89, the
+    // parallel engine group-avatar byte-face batch): the group change landed
+    // but the avatar upload chain failed; the engine's data object carries
+    // {retryable, textSaved} verbatim — the PROFILE_UPLOAD_FAILED shape,
+    // group-faced.
+    "GROUP_AVATAR_UPLOAD_FAILED",
     // §4.73 call-link credential material faces (contract 1.88, engine
     // a3ae39b, P4c slice 1 — the registration the engine's compat §3 calls
     // rows assign to this connector batch): FAILED is the server-rejection /

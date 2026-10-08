@@ -84,7 +84,9 @@ pub struct ApiError {
     /// Contract 1.50: optional engine-supplied error facts, pass-through only.
     /// Carried today by `PROFILE_UPLOAD_FAILED` (`{retryable, textSaved}` —
     /// the engine's honest "the text face landed, the avatar upload failed"
-    /// partial-success report), `GROUP_TERMINATE_FAILED`/`REPORT_SPAM_*`
+    /// partial-success report; since contract 1.89 the group-faced
+    /// `GROUP_AVATAR_UPLOAD_FAILED` carries the same shape),
+    /// `GROUP_TERMINATE_FAILED`/`REPORT_SPAM_*`
     /// HTTP status echoes, and the promised `{detail}` face of the
     /// message-carrying cloud-backup families (since 1.83 the restore four,
     /// since 1.87 the upload three — engine cloud-backup-contract §2/§6.2).

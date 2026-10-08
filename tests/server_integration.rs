@@ -5736,6 +5736,46 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
 
+    // Contract 1.89: the avatar tri-state. A malformed data URI answers the
+    // shape ladder (INVALID_REQUEST); a well-formed one — and an explicit
+    // null — rides past it into the JVM/native byte-face refusal
+    // (CAPABILITY_UNAVAILABLE, retryable=false): the bound signal-cli takes
+    // a group avatar as a local file path, the connector writes no temporary
+    // files, and the call never reaches updateGroup.
+    let bad_avatar = request(
+        &mut client,
+        "update-avatar-bad",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "avatar": "data:text/html;base64,YQ=="
+        }),
+    )
+    .await;
+    assert_eq!(bad_avatar["error"]["code"], "INVALID_REQUEST");
+    for (request_id, avatar) in [
+        ("update-avatar-replace", json!("data:image/png;base64,YQ==")),
+        ("update-avatar-remove", Value::Null),
+    ] {
+        let refused = request(
+            &mut client,
+            request_id,
+            "groups.update",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "avatar": avatar
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"], "CAPABILITY_UNAVAILABLE",
+            "{request_id}"
+        );
+        assert_eq!(refused["error"]["retryable"], false, "{request_id}");
+    }
+
     // The full change set: every family lands on its upstream key verbatim,
     // the connector-facing names are the caller's, the upstream names are
     // the wire's.

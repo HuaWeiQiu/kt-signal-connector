@@ -5,7 +5,31 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.88 (2026-10-09; the call-link credential material
+- Contract revision: 1.89 (2026-10-09; the groups.update group-avatar passthrough batch
+  (§4.44): the `avatar` tri-state joins the params face — the `accounts.setProfile` shape
+  verbatim (§4.45): absent = keep, explicit null = remove, a `data:image/*;base64,` data URI
+  (canonical base64, decoded 1..=10 MiB — the engine's stated avatar budget) = replace; the
+  Remove and Replace forms count as the change set's avatar member (a lone avatar call is a
+  real change, not an empty set), the value rides the upstream payload verbatim (an absent
+  avatar adds no key, an explicit null forwards `avatar: null` — the §4.44 omission
+  discipline), and the connector never decodes image bytes beyond the budget check. The
+  three states ride a dedicated deserialization type (`GroupAvatarUpdate`) because serde's
+  `Option<Value>` — the setProfile face's shape — folds an explicit null into absence on the
+  real wire path, a recorded boundary of the 1.46 shape that this face keeps reachable end
+  to end. Honest
+  degradation, the §4.68 snapshot-import shape: no bound engine serves the group-avatar byte
+  face today — the JVM/native face takes a local avatar file path (the connector has no
+  host-file upload channel, §6.7; no temporary file is ever written and no URI is forwarded
+  into an upstream protocol error) and answers CAPABILITY_UNAVAILABLE (retryable=false)
+  after the full local ladder, while the kt-engine face keeps its updateGroup-debt answer
+  (the parallel engine batch owns the byte face and the gate removal — the payload side
+  needs no further connector change when it lands). Error face:
+  GROUP_AVATAR_UPLOAD_FAILED joins the structured-error allowlist verbatim — the
+  PROFILE_UPLOAD_FAILED channel (§4.49) group-faced: the engine's partial-success data
+  object {retryable, textSaved} rides verbatim with retryable=true (the group change landed,
+  the avatar upload chain failed); the STORAGE_* family semantics are unchanged. No new
+  capability (the face stays under `group-management`), no method/event/store change
+  — previously 1.88 (2026-10-09; the call-link credential material
   passthrough batch (§4.73): the five `calls.*` engine material faces
   (engine a3ae39b, P4c slice 1 — engine `jsonrpc-compat.md` §3 calls rows +
   §5 block, the registration note naming this connector batch for the two
@@ -2816,9 +2840,10 @@ kt-engine gap honestly; the engine batch (separate repository) owns the method p
   `memberLabel`, `memberLabelEmoji`. The connector's `linkState` value
   `enabled-without-approval` maps to the upstream choice `enabled` (the upstream spellings are
   `enabled` / `enabled-with-approval` / `disabled`); permission values pass through verbatim.
-  Group avatar is deliberately absent: upstream takes a local file path, the connector has no
-  host-file upload channel (the media face is download-only, §6.7), and inventing a temporary
-  file boundary is out of budget — recorded projection difference.
+  The group avatar was deliberately absent at 1.45 — upstream takes a local file path, the
+  connector has no host-file upload channel (the media face is download-only, §6.7), and
+  inventing a temporary file boundary was out of budget; contract 1.89 reverses that ruling
+  with the tri-state `avatar` parameter (the four 1.89 bullets below).
 - Bounds and empty-set semantics: member arrays carry at most 1001 entries (the official
   GroupsV2 ceiling, `MAX_GROUP_MEMBERS`), each entry 1–128 chars (the roster address cap);
   `groupName`/`memberLabel` are 1–256 bytes, `groupDescription` up to 4096 bytes,
@@ -2829,6 +2854,43 @@ kt-engine gap honestly; the engine batch (separate repository) owns the method p
   host omits the key instead. Payload shape is otherwise the host's: member addresses pass
   through verbatim and the upstream resolves/rejects them (the `contacts.setLocalAlias`
   recipient discipline).
+- Contract 1.89 — the `avatar` tri-state parameter (the §4.45 `accounts.setProfile` shape
+  verbatim, reversing the 1.45 deliberate absence): params `avatar?` with three states —
+  absent = keep the current group avatar, explicit `null` = remove, a
+  `data:image/*;base64,` data URI = replace. The Remove and Replace forms count as the change
+  set's avatar member (a lone avatar call is a real change, not an empty set), and the value
+  rides the upstream payload verbatim: an absent avatar adds no key, an explicit null
+  forwards `avatar: null`, a data URI forwards the validated string unchanged — the §4.44
+  omission discipline. The three states are carried by a dedicated deserialization type
+  (`GroupAvatarUpdate`): serde's `Option<Value>` — the setProfile face's shape — folds an
+  explicit JSON null into "absent" at the option layer, which leaves that face's
+  explicit-null arm unreachable on the real wire path (recorded boundary — the 1.46 shape
+  stays as-is; this face keeps the null reachable end to end). The connector never decodes
+  image bytes beyond the budget check and never persists them; the byte face is the engine's
+  to interpret.
+- Contract 1.89 — the avatar validation ladder: the tri-state rides the deterministic
+  pre-upstream ladder in both modes (`data:image/` prefix + `;base64,` marker + non-empty
+  subtype, canonical padded base64, decoded 1..=10 MiB — `MAX_AVATAR_BYTES`, the engine's
+  stated avatar budget), answering `INVALID_REQUEST` ahead of both mode gates so hosts get
+  deterministic param errors first (the §4.44 mode-gate-behind-shape discipline).
+- Contract 1.89 — the honest degradation: no bound engine serves the group-avatar byte face
+  today. The JVM/native face takes a group avatar as a local file path; the connector has no
+  host-file upload channel (§6.7), writing the data URI to a temporary file is out of bounds
+  (zero local writes), and forwarding the URI would only become an upstream protocol error —
+  so an avatar-carrying call answers `CAPABILITY_UNAVAILABLE` (`retryable=false`) after the
+  full local ladder, the §4.68 snapshot-import downgrade shape. The kt-engine face keeps its
+  `updateGroup`-debt answer verbatim (both the debt and the gate removal belong to the
+  parallel engine batch — the payload side above needs no further connector change when the
+  byte face lands).
+- Contract 1.89 — the error face: `GROUP_AVATAR_UPLOAD_FAILED` joins the structured-error
+  allowlist verbatim (the schema error enum included — the consistency gate proves both
+  sides total) as the group-faced sibling of the §4.49 `PROFILE_UPLOAD_FAILED` channel: when
+  the engine accepts the byte face but the avatar upload chain fails after the group change
+  landed, its partial-success data object `{retryable, textSaved}` rides the host frame
+  verbatim with `retryable=true` (the §4.49 `with_data` re-read). A data-less older-engine
+  face maps to the fixed retryable=true content-free form. The `STORAGE_*` family semantics
+  are unchanged. No new capability (the face stays under `group-management`), no new method,
+  event, or store schema.
 - Engine modes: JVM/native dispatch `updateGroup` directly. The kt-engine face has no
   `updateGroup`/`quitGroup` outbound method (engine methods.rs audit, desktop plan §1.2), so in
   engine mode both methods answer `CAPABILITY_UNAVAILABLE` (`retryable=false`) after local
