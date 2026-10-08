@@ -1766,6 +1766,15 @@ for line in sys.stdin:
         # the four message-carrying families additionally carry data.detail
         # (the engine's CloudRestoreError::rpc_code table; the three state
         # families answer content-free).
+        #
+        # §4.69 consumption batch (contract 1.84): the happy path also runs
+        # the background chain the connector's consumption watcher watches —
+        # after a short delay it either writes the NDJSON product
+        # `history-import-cloud.ndjson` into the account directory and clears
+        # the cloud-status snapshot (the engine's success-clear discipline),
+        # or — steered by markers — stalls forever (`.fixture-cloud-restore-stall`,
+        # the driving test owns the status face) or flips the snapshot to the
+        # failed phase (`.fixture-cloud-restore-fails-later`).
         cloud_error = None
         error_marker = SIGNAL_DATA_DIR / ".fixture-cloud-restore-error"
         if (SIGNAL_DATA_DIR / ".fixture-cloud-restore-running").exists():
@@ -1780,9 +1789,24 @@ for line in sys.stdin:
                 "DECRYPT": "BACKUP_DECRYPT_FAILED",
                 "EXPORT": "BACKUP_EXPORT_FAILED",
             }.get(sentinel)
-        if cloud_error is None:
-            result = {"status": "started"}
-        else:
+        cloud_account_dir = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    cloud_account_dir = SIGNAL_DATA_DIR / entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            cloud_account_dir = None
+        if cloud_account_dir is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        if cloud_error is not None:
             response = {"jsonrpc": "2.0", "id": request_id, "error": {"code": -1, "message": cloud_error}}
             if cloud_error in (
                 "BACKUP_TRANSPORT_FAILED",
@@ -1793,6 +1817,35 @@ for line in sys.stdin:
                 response["error"]["data"] = {"detail": f"fixture {cloud_error}"}
             emit_json(response)
             continue
+
+        def run_cloud_restore_task(account_dir=cloud_account_dir):
+            time.sleep(0.2)
+            status_marker = SIGNAL_DATA_DIR / ".fixture-cloud-status"
+            if (SIGNAL_DATA_DIR / ".fixture-cloud-restore-stall").exists():
+                return
+            if (SIGNAL_DATA_DIR / ".fixture-cloud-restore-fails-later").exists():
+                status_marker.write_text("failed 4096 BACKUP_DOWNLOAD_FAILED")
+                return
+            recipient = (
+                '{"type":"recipient","id":2,"kind":"contact","name":"Cloud Import",'
+                '"aci":"' + IMPORT_ALICE_ACI + '","e164":"' + IMPORT_ALICE_E164 + '"}'
+            )
+            chat = '{"type":"chat","id":20,"recipientId":2}'
+            incoming = (
+                '{"type":"message","chatId":20,"authorId":2,"dateSent":5000,'
+                '"direction":"incoming","text":"cloud archived hello"}'
+            )
+            outgoing = (
+                '{"type":"message","chatId":20,"authorId":2,"dateSent":6000,'
+                '"direction":"outgoing","text":"cloud archived reply"}'
+            )
+            (account_dir / "history-import-cloud.ndjson").write_text(
+                recipient + "\n" + chat + "\n" + incoming + "\n" + outgoing + "\n"
+            )
+            status_marker.unlink(missing_ok=True)
+
+        threading.Thread(target=run_cloud_restore_task, daemon=True).start()
+        result = {"status": "started"}
     elif method == "backups.cloudStatus":
         # §4.69 cloud-status face (contract 1.83): the progress snapshot is
         # engine-process memory; the fixture mirrors the three negotiated

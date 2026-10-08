@@ -9564,16 +9564,19 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// Contract revision 1.83 (§4.69): the cloud-backup restore passthrough round
-/// trip in kt-engine mode (the engine-only face, the §4.68 spawn posture). The
-/// handshake advertises both faces with no new feature tag (the restore rides
-/// `history-import`); the start face answers {"status": "started"} and
-/// forwards the structured seven-family ladder verbatim — the three state
-/// families content-free, the transport family with its data.detail, the
-/// contract-fixed retryability on every family; the status face mirrors the
-/// three negotiated states with an absent bytesTotal staying an absent key.
-/// The fixture mirrors the negotiated wire face only: these pins cover the
-/// connector's routing and error fidelity, never real engine restore behavior.
+/// Contract revisions 1.83 + 1.84 (§4.69): the cloud-backup restore round
+/// trip in kt-engine mode (the engine-only face, the §4.68 spawn posture).
+/// The handshake advertises both faces with no new feature tag (the restore
+/// rides `history-import`); the start face answers {"status": "started"}
+/// (spawning the consumption watcher — the seeded registry lets its watch
+/// resolve the cloud archive) and forwards the structured seven-family
+/// ladder verbatim — the three state families content-free, the transport
+/// family with its data.detail, the contract-fixed retryability on every
+/// family; the status face mirrors the three negotiated states with an
+/// absent bytesTotal staying an absent key. The fixture mirrors the
+/// negotiated wire face: these pins cover the connector's routing,
+/// consumption arming, and error fidelity, never real engine restore
+/// behavior.
 #[tokio::test]
 async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
     let temp = TempDir::new().unwrap();
@@ -9654,7 +9657,18 @@ async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
     assert_eq!(absent["result"], json!({ "present": false }), "{absent}");
 
     // The definite acceptance; the whole chain stays in the engine's
-    // background, so the answer is the bare started status.
+    // background, so the answer is the bare started status. The start face
+    // now spawns the consumption watcher (contract 1.84), so the fixture's
+    // engine face needs the registry the watcher resolves the cloud archive
+    // through — the same seeding the supervisor tests lay out.
+    let signal_data = temp.path().join("signal-data");
+    let account_dir = signal_data.join("accounts").join("lk-abc");
+    fs::create_dir_all(&account_dir).unwrap();
+    fs::write(
+        signal_data.join("engine-state.json"),
+        r#"{"version":2,"accounts":[{"number":"+15555550100","dir":"accounts/lk-abc"}]}"#,
+    )
+    .unwrap();
     let accepted = request(
         &mut client,
         "cloud-restore-start",
@@ -9672,8 +9686,6 @@ async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
     // content-free with their deterministic retryability, the transport
     // family carries the engine's data.detail, and the re-entry gate answers
     // its own code (the fixture marker plays the engine's atomic gate).
-    let signal_data = temp.path().join("signal-data");
-    fs::create_dir_all(&signal_data).unwrap();
     let error_marker = signal_data.join(".fixture-cloud-restore-error");
     let running_marker = signal_data.join(".fixture-cloud-restore-running");
     for (sentinel, code, retryable, detail) in [

@@ -4165,18 +4165,23 @@ impl RuntimeSupervisor {
     }
 
     /// backups.restoreFromCloud (contract revision 1.83, §4.69): forward the
-    /// cloud-restore start to the engine — pure passthrough, the account
-    /// resolution and engine-mode gate ride the §4.68 ladder (kt-engine only,
-    /// capability `history-import` — no new bit), and the engine runs the
-    /// whole chain (credentials 404-bootstrap → zkgroup → chat gRPC → CDN →
-    /// decrypt → NDJSON) in its own background. The Mutating engine call
-    /// answers SEND_OUTCOME_UNKNOWN on an indeterminate outcome and never
-    /// retries — the terminal state is observed through `backups.cloudStatus`
-    /// (the engine keeps the failed phase until the next start overwrites).
-    /// Deliberately no consumption watcher in this batch: the produced
-    /// `history-import-cloud.ndjson` joins the §4.38 import pass in the
-    /// follow-up batch (recorded, not worked around).
-    pub async fn restore_from_cloud(&self, account_id: &str) -> Result<Value, ServiceError> {
+    /// cloud-restore start to the engine — the account resolution and
+    /// engine-mode gate ride the §4.68 ladder (kt-engine only, capability
+    /// `history-import` — no new bit), and the engine runs the whole chain
+    /// (credentials 404-bootstrap → zkgroup → chat gRPC → CDN → decrypt →
+    /// NDJSON) in its own background. The Mutating engine call answers
+    /// SEND_OUTCOME_UNKNOWN on an indeterminate outcome and never retries —
+    /// the terminal state is observed through `backups.cloudStatus` (the
+    /// engine keeps the failed phase until the next start overwrites). On a
+    /// definite start — and on an unknown outcome, which may actually have
+    /// started — the consumption watcher spawns (contract revision 1.84,
+    /// [`Self::spawn_cloud_restore_watcher`]): the produced
+    /// `history-import-cloud.ndjson` is driven through the §4.38 import pass
+    /// and rendered through `history.importStatus`.
+    pub async fn restore_from_cloud(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
             service.prepare_cloud_restore_account(account_id, self.config.mode)?
@@ -4188,6 +4193,7 @@ impl RuntimeSupervisor {
         {
             Ok(value) => {
                 if value.get("status").and_then(Value::as_str) == Some("started") {
+                    self.spawn_cloud_restore_watcher(account_id);
                     Ok(json!({ "status": "started" }))
                 } else {
                     Err(ServiceError::Api(ApiError::new(
@@ -4197,11 +4203,17 @@ impl RuntimeSupervisor {
                     )))
                 }
             }
-            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
-                "SEND_OUTCOME_UNKNOWN",
-                "backups.restoreFromCloud outcome is unknown; poll backups.cloudStatus",
-                false,
-            ))),
+            Err(EngineError::UnknownOutcome) => {
+                // The start may actually have taken: the watcher still spawns
+                // so a restore that is running is observed to its terminal
+                // state (the §4.68 unknown-outcome posture).
+                self.spawn_cloud_restore_watcher(account_id);
+                Err(ServiceError::Api(ApiError::new(
+                    "SEND_OUTCOME_UNKNOWN",
+                    "backups.restoreFromCloud outcome is unknown; poll backups.cloudStatus",
+                    false,
+                )))
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -4346,6 +4358,160 @@ impl RuntimeSupervisor {
                     // Read-only: every error flavor reads as "not yet
                     // terminal" — keep polling within the ceiling.
                     Err(_) => continue,
+                }
+            }
+        });
+    }
+
+    /// The §4.69 consumption watcher (contract revision 1.84): follow a
+    /// started cloud restore and drive the produced
+    /// `history-import-cloud.ndjson` through the §4.38 import pass — the
+    /// §4.68 watcher pattern on the cloud artifact. The engine's progress
+    /// snapshot cannot certify success (`{present: false}` is the same
+    /// answer a never-started or restarted engine gives — a success leaves
+    /// no trace), so the completion face is the artifact's disk freshness
+    /// face: the `(mtime, len)` identity captured at spawn, and only a face
+    /// that CHANGES during the watch is the engine's fresh write — a stale
+    /// archive from a previous restore is never imported. `cloudStatus`
+    /// rides the loop for the failure face (`phase: "failed"`, the
+    /// engine's terminal snapshot), with the §4.68 cadence bounding the
+    /// watch: ~3 s polls, a 60-minute ceiling (the watched chain includes
+    /// the whole CDN download). The artifact-face check precedes the status
+    /// check each tick — the engine writes the file strictly before an
+    /// export failure maps onto the failed phase, so a landed artifact is
+    /// consumed before a late failure observation could clobber a completed
+    /// ledger row.
+    fn spawn_cloud_restore_watcher(self: &Arc<Self>, account_id: &str) {
+        let supervisor = Arc::clone(self);
+        let account = account_id.to_string();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            // The freshness baseline, captured before the first sleep: the
+            // restore chain cannot have landed its artifact in the moments
+            // between the started answer and here, so this face is exactly
+            // the stale world the fresh write must differ from. An
+            // unresolvable account or a missing registry entry exits
+            // quietly — no ledger row was ever claimed, no face promised an
+            // import.
+            let Ok(signal_account) = supervisor
+                .service
+                .lock()
+                .await
+                .prepare_backups_account(&account)
+            else {
+                return;
+            };
+            let Some(archive) = crate::history_import::cloud_archive_path(
+                &supervisor.config.data_dir,
+                &signal_account,
+            ) else {
+                tracing::warn!(
+                    account_id = %account,
+                    "cloud restore watcher found no engine registry entry"
+                );
+                return;
+            };
+            let baseline = cloud_archive_face(&archive);
+            // A fresh face observed while the group slot is busy: keep
+            // polling while it persists (the §4.68 completed-seen posture),
+            // so a link-time pass holding the slot only delays the claim,
+            // never fakes a failure — and never lands one at the ceiling
+            // either.
+            let mut fresh_seen = false;
+            loop {
+                if started.elapsed() >= CLOUD_RESTORE_CEILING {
+                    // Last-chance disk check: a slow restore whose artifact
+                    // landed between ticks still consumes.
+                    let landed = if cloud_archive_face(&archive) != baseline
+                        && crate::history_import::archive_ready(&archive)
+                    {
+                        claim_and_run_history_import(
+                            Arc::clone(&supervisor.history_import_running),
+                            Arc::clone(&supervisor.history_import_holder),
+                            Arc::clone(&supervisor.store),
+                            HistoryImportJob {
+                                account_id: account.clone(),
+                                signal_account: signal_account.clone(),
+                                archive: archive.clone(),
+                            },
+                        )
+                        .await
+                    } else {
+                        false
+                    };
+                    if !landed && !fresh_seen {
+                        land_import_engine_failure(&supervisor.store, &account);
+                    }
+                    tracing::warn!(
+                        account_id = %account,
+                        "cloud restore watcher hit its ceiling"
+                    );
+                    return;
+                }
+                sleep(CLOUD_RESTORE_POLL).await;
+                // A deleted account has no ledger row to land and nothing
+                // left to observe — exit quietly (the §4.68 posture).
+                if supervisor
+                    .service
+                    .lock()
+                    .await
+                    .prepare_backups_account(&account)
+                    .is_err()
+                {
+                    return;
+                }
+                // ① The artifact face first: a face off the baseline is the
+                // engine's definite success signal.
+                if cloud_archive_face(&archive) != baseline {
+                    if !crate::history_import::archive_ready(&archive) {
+                        // Present but empty: not a produced archive (the
+                        // §4.38 ready discipline). Keep watching.
+                        continue;
+                    }
+                    fresh_seen = true;
+                    let claimed = claim_and_run_history_import(
+                        Arc::clone(&supervisor.history_import_running),
+                        Arc::clone(&supervisor.history_import_holder),
+                        Arc::clone(&supervisor.store),
+                        HistoryImportJob {
+                            account_id: account.clone(),
+                            signal_account: signal_account.clone(),
+                            archive: archive.clone(),
+                        },
+                    )
+                    .await;
+                    if claimed {
+                        return;
+                    }
+                    // Slot busy: the next tick retries while the fresh face
+                    // persists.
+                    continue;
+                }
+                // ② The failure face: a failed phase is the engine's
+                // terminal snapshot (it persists until the next start) —
+                // land the honest failed ledger row and stop; retry is
+                // re-invoking backups.restoreFromCloud, so
+                // `history.importRetry` answers NO_ARCHIVE (the §4.68
+                // official-Retry semantics). Every other answer —
+                // downloading, present:false, a down engine, an unknown
+                // read — is "not yet terminal": keep polling within the
+                // ceiling.
+                let engine = match supervisor.running_engine().await {
+                    Ok(engine) => engine,
+                    Err(_) => continue,
+                };
+                let status = engine
+                    .call(
+                        "backups.cloudStatus",
+                        json!({ "account": signal_account.clone() }),
+                        CallClass::ReadOnly,
+                    )
+                    .await;
+                if let Ok(status) = status
+                    && status.get("phase").and_then(Value::as_str) == Some("failed")
+                {
+                    land_import_engine_failure(&supervisor.store, &account);
+                    return;
                 }
             }
         });
@@ -5129,6 +5295,24 @@ async fn run_history_import(store: &Arc<Store>, job: &HistoryImportJob) {
 /// The §4.68 consumption-watcher cadence: ~3 s polls, a 30-minute ceiling.
 const IMPORT_SNAPSHOT_POLL: Duration = Duration::from_secs(3);
 const IMPORT_SNAPSHOT_CEILING: Duration = Duration::from_secs(30 * 60);
+
+/// The §4.69 consumption-watcher cadence (contract revision 1.84): the
+/// §4.68 watcher's ~3 s polls. The ceiling rides wider than the §4.68
+/// import ceiling because the watched chain is the engine's whole restore —
+/// credentials, the CDN download of the entire backup, decrypt, export.
+const CLOUD_RESTORE_POLL: Duration = Duration::from_secs(3);
+const CLOUD_RESTORE_CEILING: Duration = Duration::from_secs(60 * 60);
+
+/// The cloud archive's freshness face: `(modified, len)`, `None` when the
+/// file is absent. Equality with the face captured at watcher spawn means
+/// "the artifact did not change during the watch" — only a changed face is
+/// the engine's fresh write (the write is whole and strictly post-success,
+/// engine `src/service/cloud_backup.rs`), so a stale archive from a
+/// previous restore is never imported a second time.
+fn cloud_archive_face(path: &Path) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
 
 /// Land the watcher's honest failure row: an engine-side task failure, the
 /// expired-idle escape, or the ceiling. `begin` upserts the row (an account
@@ -6061,8 +6245,9 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RuntimeSupervisor, cloud_status_from_engine, compose_contact_display_name,
-        compose_import_progress, group_extra_json, is_receive_fatal_stderr,
+        RuntimeSupervisor, cloud_archive_face, cloud_status_from_engine,
+        compose_contact_display_name, compose_import_progress, group_extra_json,
+        is_receive_fatal_stderr,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -6165,6 +6350,34 @@ mod tests {
             assert_eq!(error.code, "UPSTREAM_PROTOCOL_ERROR", "{junk}");
             assert!(error.retryable, "{junk}");
         }
+    }
+
+    /// The cloud-archive freshness face (contract revision 1.84): absent is
+    /// `None`, present is the `(mtime, len)` identity, and a rewrite with
+    /// different bytes presents a different face — the watcher's stale-file
+    /// guard.
+    #[test]
+    fn cloud_archive_face_tracks_presence_and_rewrite() {
+        let temp = TempDir::new().unwrap();
+        let archive = temp.path().join("history-import-cloud.ndjson");
+        assert_eq!(cloud_archive_face(&archive), None, "absent is None");
+
+        std::fs::write(&archive, b"first").unwrap();
+        let first = cloud_archive_face(&archive).expect("present file has a face");
+        assert_eq!(first.1, 5, "the face carries the byte length");
+        assert_eq!(
+            cloud_archive_face(&archive),
+            Some(first),
+            "stable when untouched"
+        );
+
+        // A fresh engine write (different bytes) must present a different
+        // face — this is the only definite success signal, because the
+        // engine's snapshot clears on success and `{present: false}` is the
+        // same answer a never-started or restarted engine gives.
+        std::fs::write(&archive, b"second write").unwrap();
+        let second = cloud_archive_face(&archive).expect("rewritten file has a face");
+        assert_ne!(first, second, "a rewrite changes the face");
     }
 
     /// Every test store is encrypted (Phase 3); secondary observer connections

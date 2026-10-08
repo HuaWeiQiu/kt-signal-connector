@@ -5,7 +5,44 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.83 (2026-10-08; the cloud-backup restore passthrough
+- Contract revision: 1.84 (2026-10-08; the cloud-restore consumption batch
+  (§4.69 记档): the restore's NDJSON product joins the §4.38 import pass —
+  exactly the batch 1.83 deliberately left out. The engine writes
+  `history-import-cloud.ndjson` whole into the registry-recorded account
+  directory (the transfer archive's own directory) strictly after its whole
+  chain succeeds, so the consumption watcher the start face now spawns (on a
+  definite `started`, and on SEND_OUTCOME_UNKNOWN which may actually have
+  started — the §4.68 watcher posture) reads completion from the artifact's
+  disk freshness face, not from `cloudStatus`: the engine's snapshot clears
+  on success, making `{present: false}` the same answer a never-started or
+  restarted engine gives, while the `(mtime, len)` face captured at spawn
+  changes only when the engine writes fresh — a stale archive from a
+  previous restore is never imported, and a re-restore's rewrite re-arms
+  the import (its rows dedupe onto the same identities, surfacing in the
+  honest `skippedMessages` counter). `cloudStatus` rides the watcher loop
+  for the failure face only: a `failed` phase (the engine's terminal
+  snapshot) lands the honest engine-class failed ledger row so
+  `history.importStatus` renders it and `history.importRetry` answers
+  NO_ARCHIVE — retry is re-invoking `backups.restoreFromCloud`, the §4.68
+  official-Retry semantics. The artifact-face check precedes the status
+  check each tick (the engine writes the file strictly before an export
+  failure maps onto the failed phase, so a landed artifact is consumed
+  before a late failure observation could clobber a completed ledger row);
+  the watch bounds at the §4.68 cadence (~3 s polls) under a 60-minute
+  ceiling (the watched chain includes the whole CDN download), whose escape
+  makes one last-chance disk check before landing the failed row. Status
+  face: the §4.38 `history.importStatus` composition reused as-is — no new
+  keys, the ledger row, the masked face, and the retention convergence are
+  the §4.38/§4.68 faces unchanged (the same import pass consumed the
+  artifact, so a second status key would fork one store truth into two
+  faces the desktop must join). No wire change, no schema store version
+  change, no capability change (both faces already ride `history-import`);
+  recorded recovery hole: a connector restart mid-restore loses the watcher
+  and the archive sits unconsumed until the next explicit
+  `backups.restoreFromCloud` — the §4.38 link-time sweep stays
+  transfer-archive-scoped on purpose, because one per-account ledger row
+  cannot mark which artifact a completed row consumed)
+  — previously 1.83 (2026-10-08; the cloud-backup restore passthrough
   batch (§4.69): the engine-side cloud restore (engine cloud-backup-contract
   §2, worktree feat/cloud-restore 9090ec5) lands its connector pipe — two
   faces, no local state, no consumption wiring. `backups.restoreFromCloud`
@@ -4881,6 +4918,78 @@ background task; the faces only start it and observe it.
   desktop settings-page backup entry (the engine contract's third follow-up).
   Until the consumption batch lands, a successful restore's archive sits
   engine-side unconsumed — the faces never claim otherwise.
+- **The consumption batch lands** (contract revision 1.84, 2026-10-08; the
+  engine NDJSON truth re-read, not assumed: engine
+  `src/service/cloud_backup.rs` writes the product as
+  `<engine data-dir>/accounts/<registry dir>/history-import-cloud.ndjson` —
+  the transfer archive's own directory under a distinct file name — with a
+  single `fs::write` that runs strictly after `restore_from_cloud` returns
+  `Ok`, and the spawn wrapper clears the progress snapshot only after that
+  write returns; so file presence is post-success by construction, a failed
+  write surfaces the export-failure phase, and a crash mid-write can leave
+  only the partial file the §4.38 tolerant parse already survives):
+  `backups.restoreFromCloud` now spawns the consumption watcher on a
+  definite `started` and on SEND_OUTCOME_UNKNOWN (which may actually have
+  started — the §4.68 posture), closing restore → 落消息.
+  - **Completion face — the artifact's freshness, not the snapshot**: the
+    engine's success leaves no trace (`{present: false}` = never started /
+    succeeded / restarted, the §4.69 contract), so `cloudStatus` cannot
+    certify success. The watcher captures the cloud archive's `(mtime, len)`
+    face before its first sleep — the restore chain cannot have landed its
+    artifact in that window, so the captured face is exactly the stale world
+    — and treats a changed face as the engine's fresh write: the definite
+    success signal. A stale archive from a previous restore (identical face)
+    is therefore never imported by a new watcher, and a re-restore's rewrite
+    (a fresh mtime) re-arms the import — its rows dedupe onto the same
+    identities with the duplicates surfacing in the honest `skippedMessages`
+    counter (the importer's own §4.38 unit pin). An empty file is not a
+    produced archive (the §4.38 `archive_ready` discipline).
+  - **Failure face**: `cloudStatus` rides the loop for `phase: "failed"` —
+    the engine's terminal snapshot — landing the honest engine-class failed
+    ledger row (`land_import_engine_failure`, the §4.68 helper unchanged) so
+    `history.importStatus` renders the failure and `history.importRetry`
+    answers NO_ARCHIVE: retry is re-invoking `backups.restoreFromCloud` (the
+    official Retry semantics; the retry face's `on_disk` re-arm deliberately
+    still probes only the transfer archive — a cloud-failed row must not
+    re-arm onto a consumption path nothing watches). The artifact-face
+    check precedes the status check each tick: the engine writes the file
+    strictly before an export failure maps onto the failed phase, so a
+    landed artifact is consumed before a late failure observation could
+    clobber a completed ledger row.
+  - **Bounds and escapes**: the §4.68 cadence (~3 s polls) under a
+    60-minute ceiling (the watched chain includes the whole CDN download).
+    The ceiling escape makes one last-chance disk check (a slow restore
+    whose artifact landed between ticks still consumes) before landing the
+    failed row, and never lands one when a fresh face was seen but the
+    group slot stayed busy (a live pass holds the ledger — the §4.68
+    completed-seen posture). A deleted account exits quietly; a missing
+    registry entry exits quietly (no row was ever claimed, no face promised
+    an import).
+  - **Status face — reuse,裁定 recorded**: the §4.38 `history.importStatus`
+    composition is reused as-is, zero new keys and zero face edits: the
+    watcher constructs the same `HistoryImportJob` (the archive path being
+    the only difference) through `claim_and_run_history_import`, bypassing
+    the link-time probe's completed/attempts gates on purpose (an explicit
+    user request — the §4.68 precedent), so the ledger row, the masked
+    status face, the 1.53 `processing` holder attribution, and the
+    retention convergence are the §4.38/§4.68 faces unchanged. A new cloud
+    status key was rejected: the same import pass consumes the artifact, so
+    a second key would fork one store truth into two faces the desktop must
+    join. During the restore itself (before the import claims) the face
+    keeps answering its link-time semantics — the same accepted window
+    §4.68 has between the engine task and the import claim; the desktop's
+    restore-phase truth is `backups.cloudStatus`.
+  - **Boundary discipline (the 838 记档口径 continued)**: neither face
+    claims landed rows before they land — `cloudStatus` is untouched (the
+    engine's restore truth only) and `history.importStatus` moves only when
+    the import pass actually writes; the media tier stays a second-phase
+    item and cross-account restore stays out of the face (the engine
+    contract's own boundaries). Recorded recovery hole: a connector restart
+    mid-restore loses the watcher and the archive sits unconsumed until the
+    next explicit restore — the §4.38 link-time sweep stays
+    transfer-archive-scoped on purpose (one per-account ledger row cannot
+    mark which artifact a completed row consumed; a cloud-aware sweep would
+    either re-import under a completed row or need a store change).
 
 Tests: the fixture gains `backups.restoreFromCloud`/`backups.cloudStatus`
 arms mirroring the negotiated wire face only — marker files steer the
@@ -4899,6 +5008,24 @@ families plus the re-entry gate across the wire, and the three status
 states. These pins cover the connector's routing and error fidelity, never
 real engine restore behavior — the real-device restore chain is the engine
 batch's own acceptance, not this batch's.
+
+Tests (contract revision 1.84): the fixture's `backups.restoreFromCloud`
+happy path now runs the background chain (a short delay, then either the
+NDJSON product write plus the success-clear, a stall marker holding the
+phase, or a failed-phase flip). `tests/backup_cloud_restore.rs` grows four
+consumption pins: the happy chain (started → watcher → fresh artifact →
+the §4.38 pass lands imported=2 with the transfer artifact never present —
+the counters prove the cloud file was the source — and `cloudStatus` riding
+cleared beside a completed ledger row), the failed phase (an honest
+engine-class failed row, `history.importStatus` rendering it,
+`history.importRetry` answering NO_ARCHIVE), the stale-archive guard (a
+planted previous archive plus a stalled downloading phase ticks the watcher
+twice with the ledger untouched), and the re-restore (the rewrite's fresh
+face re-arms the import; the second run completes with the deduped
+counters — imported 0, the two duplicates surfacing in `skippedMessages`,
+the importer's own §4.38 counter semantics). The unit chain pins the
+freshness face itself (absent → `None`, stable while untouched, changed on
+rewrite).
 
 ## 5. signal-cli Boundary
 

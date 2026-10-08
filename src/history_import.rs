@@ -48,6 +48,15 @@ use crate::store::{
 
 /// The engine's export artifact inside the account store directory.
 pub const ARCHIVE_FILE_NAME: &str = "history-import.ndjson";
+/// The engine's cloud-restore export artifact (contract revision 1.84, the
+/// §4.69 consumption batch): the same NDJSON frame family as the transfer
+/// archive, streamed into the same account directory — the engine writes it
+/// whole, and only after its whole restore chain (credentials → CDN download
+/// → decrypt) has succeeded, so file presence plus a changed freshness face
+/// is the definite success signal (the engine's progress snapshot clears on
+/// success, making `{present: false}` the same answer a never-started or
+/// restarted engine gives — engine `src/service/cloud_backup.rs`).
+pub const CLOUD_ARCHIVE_FILE_NAME: &str = "history-import-cloud.ndjson";
 /// The engine's account registry (compat §1: `{version: 2, accounts: [{number, dir}]}`).
 pub const ENGINE_REGISTRY_FILE: &str = "engine-state.json";
 /// Per-line budget (§4.38 bounded discipline): a longer line is skip-counted,
@@ -121,6 +130,12 @@ pub fn engine_account_dir(data_dir: &Path, signal_account: &str) -> Option<PathB
 /// The archive file path for one signal account, when the registry names it.
 pub fn archive_path(data_dir: &Path, signal_account: &str) -> Option<PathBuf> {
     engine_account_dir(data_dir, signal_account).map(|dir| dir.join(ARCHIVE_FILE_NAME))
+}
+
+/// The cloud-restore archive path for one signal account: the same registry
+/// directory the transfer archive lands in, under the cloud file name.
+pub fn cloud_archive_path(data_dir: &Path, signal_account: &str) -> Option<PathBuf> {
+    engine_account_dir(data_dir, signal_account).map(|dir| dir.join(CLOUD_ARCHIVE_FILE_NAME))
 }
 
 /// The presence signal the engine contract defines (§4.38): a non-empty
