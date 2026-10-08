@@ -333,6 +333,23 @@ pub const METHODS: &[MethodRow] = &[
     // every mode), so no capability seam. Advertised through the existing
     // `stories` tag (widened in place, the 1.82 call-signaling precedent).
     ("stories.markViewed", Lane::Send, true, "send"),
+    // Story-anchored attachment byte faces (contract revision 1.86, §4.71):
+    // the story byte channel — stories land in no conversation row (§4.67),
+    // so the row-anchored `attachments.download` can never address one and
+    // the caller supplies the pointer face its story event carried.
+    // downloadAttachment is mutating send-lane local work (it lands a file
+    // in the governed media directory) — the 1.57/1.61 download class
+    // verbatim: reaction-class write-lane mutex and delete drain barrier,
+    // every download/verify failure terminal, never auto-retried. The chain
+    // is pure connector (transit-CDN GET + the §4.38 step-3 crypto), zero
+    // engine involvement — mode-independent by construction. openAttachment
+    // is the messages.attachments.open class verbatim (read lane, handle
+    // mint over the already-landed file, no engine touch); chunk read and
+    // close ride the existing handle faces unchanged. Advertised through
+    // the existing `stories` tag (widened in place, the 1.82
+    // call-signaling precedent).
+    ("stories.downloadAttachment", Lane::Send, true, "send"),
+    ("stories.openAttachment", Lane::Read, false, "read"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -436,7 +453,11 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `story.received` event), widened in place by revision 1.85 (the
 /// `stories.markViewed` story-anchored viewed receipt — the send leg of the
 /// story viewed-receipt chain — plus the transient `story.viewed` event;
-/// the 1.82 call-signaling no-new-bit discipline). They never
+/// the 1.82 call-signaling no-new-bit discipline) and by revision 1.86 (the
+/// `stories.downloadAttachment` / `stories.openAttachment` story-anchored
+/// attachment byte faces — the caller-supplied pointer channel with its
+/// fail-closed shape gate, plus the handle mint over the landed file; the
+/// same no-new-bit discipline). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -507,6 +528,7 @@ mod tests {
             "username.lookup",
             "identities.get",
             "stories.getDisabled",
+            "stories.openAttachment",
         ];
         let send_lane = [
             "messages.sendText",
@@ -552,6 +574,7 @@ mod tests {
             "messages.sendStory",
             "stories.setDisabled",
             "stories.markViewed",
+            "stories.downloadAttachment",
         ];
         let mutating = [
             "messages.sendText",
@@ -599,6 +622,7 @@ mod tests {
             "messages.sendStory",
             "stories.setDisabled",
             "stories.markViewed",
+            "stories.downloadAttachment",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

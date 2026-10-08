@@ -608,6 +608,29 @@ impl ProxyGroupRuntime {
         slot.supervisor.attachment_download(params).await
     }
 
+    /// stories.downloadAttachment (contract revision 1.86, §4.71): the
+    /// caller-supplied pointer face and the destination directory live with
+    /// the account's group, so the chain routes through the owning
+    /// supervisor like every other mutating face.
+    pub async fn story_attachment_download(
+        &self,
+        params: crate::service::StoryAttachmentDownloadParams,
+    ) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.story_attachment_download(params).await
+    }
+
+    /// stories.openAttachment (contract revision 1.86, §4.71): the handle
+    /// mints against the account's per-account handle budget, so the open
+    /// routes through the owning supervisor like every read.
+    pub async fn story_open_attachment(
+        &self,
+        params: crate::service::StoryOpenAttachmentParams,
+    ) -> Result<crate::service::MediaOpenView, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.story_open_attachment(params).await
+    }
+
     pub async fn list_messages(
         &self,
         account_id: String,

@@ -31,17 +31,18 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
+use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
     GROUP_DESCRIPTION_MAX_BYTES, GROUP_MEMBER_LABEL_MAX_BYTES, GROUP_NAME_MAX_BYTES,
     IDENTITY_SAFETY_NUMBER_MAX_CHARS, MARK_RECEIPT_MESSAGE_IDS_LIMIT, MAX_ALIAS_BYTES,
     MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_CONTENT_TYPE_BYTES, MAX_ATTACHMENT_FILENAME_BYTES,
     MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES,
-    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_OPAQUE_ID_BYTES,
-    MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES,
-    MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
-    MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_TEXT_BYTES,
-    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_LOCATOR_FIELD_CHARS, MAX_LOCATOR_HASH_CHARS,
+    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
+    MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS,
+    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS,
+    MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
     STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
     USERNAME_MAX_WIRE_CHARS,
 };
@@ -748,6 +749,47 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/backupsImportSnapshotParams/properties/snapshotDir",
             "maxLength",
             MAX_SNAPSHOT_DIR_BYTES as u64,
+        ),
+        // Story-anchored attachment byte faces (contract 1.86, §4.71): the
+        // caller-supplied pointer's landing id rides the attachmentId bound;
+        // the declared size's ceiling is the transit chain's own constant;
+        // and the §4.54 locator-ingest caps mirror onto the caller-supplied
+        // strings (the cdnNumber/uploadTimestamp/type bounds are structural
+        // u32/u64 serde gates, no constants).
+        (
+            "/$defs/storyAttachmentPointerParams/properties/id",
+            "maxLength",
+            MAX_ATTACHMENT_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/storyAttachmentPointerParams/properties/size",
+            "maximum",
+            MAX_PLAINTEXT_BYTES,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/key",
+            "maxLength",
+            MAX_LOCATOR_FIELD_CHARS as u64,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/cdnKey",
+            "maxLength",
+            MAX_LOCATOR_FIELD_CHARS as u64,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/digest",
+            "maxLength",
+            MAX_LOCATOR_FIELD_CHARS as u64,
+        ),
+        (
+            "/$defs/storyLocatorParams/properties/plaintextHash",
+            "maxLength",
+            MAX_LOCATOR_HASH_CHARS as u64,
+        ),
+        (
+            "/$defs/storyOpenAttachmentParams/properties/attachmentId",
+            "maxLength",
+            MAX_ATTACHMENT_ID_BYTES as u64,
         ),
     ];
     assert!(!pairs.is_empty());

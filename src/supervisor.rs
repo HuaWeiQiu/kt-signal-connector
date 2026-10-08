@@ -826,6 +826,40 @@ impl RuntimeSupervisor {
         .await
     }
 
+    /// stories.downloadAttachment (contract revision 1.86, §4.71): the
+    /// story-anchored face onto the same chain as
+    /// [`Self::attachment_download`] — the prepare half gates the
+    /// caller-supplied pointer's wire shape (the §4.54 ingest caps mirrored)
+    /// and stages the landing, the network and crypto halves are the 1.57
+    /// machine unchanged with the `TransitFace::build` crypto-shape decode
+    /// still ahead of any network traffic. Mutating, send lane behind the
+    /// reaction-class write-lane mutex and delete barrier; every
+    /// download/verify failure terminal; idempotent on an already-present
+    /// file.
+    pub async fn story_attachment_download(
+        &self,
+        params: crate::service::StoryAttachmentDownloadParams,
+    ) -> Result<Value, ServiceError> {
+        self.run_attachment_download_chain(|service| {
+            service.prepare_story_attachment_download(&params)
+        })
+        .await
+    }
+
+    /// stories.openAttachment (contract revision 1.86, §4.71): the handle
+    /// mint over an already-landed story attachment — the
+    /// [`Self::open_media`] machine without the row addressing (stories
+    /// land in no conversation row). Read lane, no engine touch.
+    pub async fn story_open_attachment(
+        &self,
+        params: crate::service::StoryOpenAttachmentParams,
+    ) -> Result<MediaOpenView, ServiceError> {
+        self.service
+            .lock()
+            .await
+            .open_story_attachment_handle(&params.account_id, &params.attachment_id)
+    }
+
     /// The shared download chain: the deterministic prepare half runs inside
     /// the service lock, the streaming network half runs on the supervisor
     /// (§4.38 step 3 machine verbatim).

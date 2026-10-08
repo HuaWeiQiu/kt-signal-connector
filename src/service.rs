@@ -163,6 +163,15 @@ pub const MAX_ATTACHMENT_ID_BYTES: usize = 128;
 /// messageId, clientRequestId, operationId, peerKey, peerTitle, query,
 /// groupKey — the schema's opaqueId family and its inline 128 peers).
 pub const MAX_OPAQUE_ID_BYTES: usize = 128;
+/// The caller-supplied transit-pointer string caps (contract revision 1.86,
+/// §4.71): the §4.54 locator-ingest caps mirrored onto the
+/// `stories.downloadAttachment` params — key/cdnKey/digest ≤ 512 characters,
+/// plaintextHash ≤ 128 characters (a SHA-256 hex face is 64; the slack only
+/// bounds absurd input). The crypto-shape decode (base64 lengths, hex
+/// alphabet, the 64-byte key set) stays in the shared chain's
+/// `TransitFace::build` — also before any network traffic.
+pub const MAX_LOCATOR_FIELD_CHARS: usize = 512;
+pub const MAX_LOCATOR_HASH_CHARS: usize = 128;
 /// backups.importSnapshot's snapshotDir bound (contract revision 1.78,
 /// §4.68): the caller-chosen official snapshot directory path, 1..4096 bytes
 /// and absolute. The connector never dereferences the path — the engine is
@@ -5041,6 +5050,160 @@ impl ConnectorService {
         Ok(face)
     }
 
+    /// stories.downloadAttachment (contract revision 1.86, §4.71) — the
+    /// local half of the story-anchored download chain. Stories land in no
+    /// conversation row (§4.67), so the row-anchored addressing of
+    /// `prepare_attachment_download` cannot resolve one; the caller supplies
+    /// the pointer face its story event carried and this layer gates every
+    /// field fail-closed before any network traffic: the media capability,
+    /// then the shape gates (the landing-id sanitizeId-parity gate, the
+    /// declared size 1..=MAX_PLAINTEXT_BYTES — the transit chain's own
+    /// ceiling — and the §4.54 ingest caps mirrored onto the
+    /// caller-supplied strings: key/cdnKey/digest ≤ 512 chars,
+    /// plaintextHash ≤ 128 chars, uploadTimestamp ≥ 1 when present), and
+    /// the account ladder last (the stories.markViewed ordering: parameter
+    /// gates before the account ladder). The crypto-shape decode stays in
+    /// the shared chain's `TransitFace::build` — also pre-network — so the
+    /// pointer is never partially re-validated here. Nothing is invented:
+    /// an absent locator field stays absent, and no pointer material is
+    /// ever logged (the failure family is content-free by construction).
+    pub fn prepare_story_attachment_download(
+        &self,
+        params: &StoryAttachmentDownloadParams,
+    ) -> Result<PreparedHistoryDownload, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(&params.account_id, "accountId")?;
+        let sanitized_id = sanitize_attachment_id(&params.attachment.id)?;
+        let size = params.attachment.size;
+        if size == 0 || size > crate::history_attachment::MAX_PLAINTEXT_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachment size must be between 1 and 104857600 bytes",
+                false,
+            )));
+        }
+        let locator = &params.attachment.locator;
+        if locator.key.is_empty() || locator.key.len() > MAX_LOCATOR_FIELD_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "locator key must contain between 1 and 512 characters",
+                false,
+            )));
+        }
+        if locator.cdn_key.is_empty() || locator.cdn_key.len() > MAX_LOCATOR_FIELD_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "locator cdnKey must contain between 1 and 512 characters",
+                false,
+            )));
+        }
+        if let Some(digest) = locator.digest.as_deref()
+            && (digest.is_empty() || digest.len() > MAX_LOCATOR_FIELD_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "locator digest must contain between 1 and 512 characters",
+                false,
+            )));
+        }
+        if let Some(hash) = locator.plaintext_hash.as_deref()
+            && (hash.is_empty() || hash.len() > MAX_LOCATOR_HASH_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "locator plaintextHash must contain between 1 and 128 characters",
+                false,
+            )));
+        }
+        if locator.upload_timestamp.is_some_and(|at| at == 0) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "locator uploadTimestamp must be a positive timestamp",
+                false,
+            )));
+        }
+        // The account ladder: unknown accounts answer ACCOUNT_NOT_FOUND
+        // before staging, the account-scoped discipline every story face
+        // keeps (the download lands a file for this account's consumer; no
+        // upstream frame exists to carry any id).
+        self.resolve_account(&params.account_id)?;
+        let stored = crate::store::HistoryAttachmentLocator {
+            key: Some(locator.key.clone()),
+            cdn_key: Some(locator.cdn_key.clone()),
+            cdn_number: Some(locator.cdn_number),
+            upload_timestamp: locator.upload_timestamp,
+            digest: locator.digest.clone(),
+            plaintext_hash: locator.plaintext_hash.clone(),
+        };
+        let write_dir = media.write_dir()?;
+        let target = write_dir.join(&sanitized_id);
+        if let Ok(metadata) = std::fs::metadata(&target)
+            && metadata.is_file()
+        {
+            // Idempotent dedup, the 1.57/1.61 posture verbatim: the bytes
+            // already landed (an earlier call for the same story
+            // attachment). The measured size is the honest answer; the CDN
+            // is never re-asked.
+            let size_bytes = metadata.len();
+            return Ok(PreparedHistoryDownload::AlreadyPresent { size_bytes });
+        }
+        let temp_path = write_dir.join(format!(".{}.{}.tmp", sanitized_id, random_id()));
+        let plaintext_path = write_dir.join(format!(".{}.{}.dec", sanitized_id, random_id()));
+        Ok(PreparedHistoryDownload::Ready {
+            locator: stored,
+            descriptor_size: Some(size),
+            target,
+            temp_path,
+            plaintext_path,
+        })
+    }
+
+    /// stories.openAttachment (contract revision 1.86, §4.71) — the handle
+    /// mint over an already-landed story attachment: the
+    /// `messages.attachments.open` machine without the row addressing
+    /// stories do not have. Same capability gate, id gate, sanitize gate,
+    /// and the same not-available answer (UPSTREAM_ERROR retryable=true —
+    /// not-downloaded and governor-deleted stay deliberately
+    /// indistinguishable, ADR 0002). Chunk read and close ride the existing
+    /// handle faces unchanged.
+    pub fn open_story_attachment_handle(
+        &self,
+        account_id: &str,
+        attachment_id: &str,
+    ) -> Result<MediaOpenView, ServiceError> {
+        let Some(media) = self.media.as_ref() else {
+            return Err(media_capability_error());
+        };
+        validate_opaque_id(account_id, "accountId")?;
+        if attachment_id.is_empty() || attachment_id.len() > MAX_ATTACHMENT_ID_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "attachmentId must contain between 1 and 128 bytes",
+                false,
+            )));
+        }
+        let sanitized_id = sanitize_attachment_id(attachment_id)?;
+        self.resolve_account(account_id)?;
+        let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
+            return Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "attachment is not available in the signal-cli data directory",
+                true,
+            )));
+        };
+        let media_handle = media
+            .handles
+            .open(account_id, "", "", attachment_id, path, size_bytes)
+            .map_err(map_media_handle_error)?;
+        Ok(MediaOpenView {
+            media_handle,
+            size_bytes,
+            chunk_bytes: MEDIA_CHUNK_BYTES,
+        })
+    }
+
     /// messages.attachments.readChunk (ADR 0002): deliver exactly one bounded
     /// chunk of one live handle at a strictly sequential offset. The handle
     /// table validates origin, TTL, and offset; this layer base64-encodes the
@@ -7163,6 +7326,64 @@ pub struct AttachmentDownloadParams {
 /// attachments.download result: the `HistoryAttachmentDownloadView` shape
 /// verbatim — afterwards `messages.attachments.open` resolves the bytes.
 pub type AttachmentDownloadView = HistoryAttachmentDownloadView;
+
+/// stories.downloadAttachment params (contract revision 1.86, §4.71): the
+/// account plus the caller-supplied attachment pointer face the story event
+/// carried. Stories land in no conversation row (§4.67), so there is no
+/// row-anchored addressing to resolve — the caller states what it holds and
+/// the face gates every field fail-closed before any network traffic.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoryAttachmentDownloadParams {
+    pub account_id: String,
+    pub attachment: StoryAttachmentPointerParams,
+}
+
+/// The caller-supplied pointer carrier: the descriptor id (the landing file
+/// name, exactly what the story event's attachment projection carried),
+/// the declared plaintext size (the transit chain's decrypt-trim input),
+/// and the locator. `deny_unknown_fields` mirrors every params struct: a
+/// pointer passed with rendering fields (contentType, filename, ...) is a
+/// shape error, not a silent strip.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoryAttachmentPointerParams {
+    pub id: String,
+    pub size: u64,
+    pub locator: StoryAttachmentLocatorParams,
+}
+
+/// The caller-supplied transit pointer: the fields the transit GET needs
+/// are required at the params gate (missing key/cdnKey/cdnNumber is a
+/// params-shape INVALID_REQUEST before anything else runs); the integrity
+/// faces stay optional because either one of digest/plaintextHash satisfies
+/// the official `hasIntegrityCheck` gate (both verify when both ride — the
+/// §4.38 two-layer ruling); uploadTimestamp is accepted for pointer-faithful
+/// round-trips and never read (the official transit GET does not use it).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoryAttachmentLocatorParams {
+    pub key: String,
+    pub cdn_key: String,
+    pub cdn_number: u32,
+    #[serde(default)]
+    pub upload_timestamp: Option<u64>,
+    #[serde(default)]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub plaintext_hash: Option<String>,
+}
+
+/// stories.openAttachment params (contract revision 1.86, §4.71): the
+/// account plus the attachment id the story event carried — the handle mint
+/// over an already-landed file, the `messages.attachments.open` shape
+/// without the row addressing stories do not have.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoryOpenAttachmentParams {
+    pub account_id: String,
+    pub attachment_id: String,
+}
 
 /// The staged download the service hands its supervisor: either the file
 /// already exists (idempotent dedup — the honest measured size comes back),
@@ -15172,6 +15393,261 @@ mod tests {
                 .unwrap()["recipient"],
             json!("+15555550101")
         );
+    }
+
+    /// One caller-shaped story attachment pointer, mutated per case — the
+    /// attachment object the story event's projection round-trips into.
+    fn story_pointer_params(
+        id: &str,
+        size: u64,
+        mutate: impl FnOnce(&mut Value),
+    ) -> StoryAttachmentPointerParams {
+        let mut value = json!({
+            "id": id,
+            "size": size,
+            "locator": {
+                "key": base64_encode(&[0x21_u8; 64]),
+                "cdnKey": "story-cdn-key",
+                "cdnNumber": 0,
+            },
+        });
+        mutate(&mut value);
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// stories.downloadAttachment (contract 1.86, §4.71): the fail-closed
+    /// shape gate answers every caller-supplied pointer mistake before any
+    /// staging — the media capability first, then the landing-id sanitize
+    /// gate, the 1..=100 MiB size bound, the §4.54 ingest caps mirrored onto
+    /// the locator strings, and the account ladder last (the
+    /// stories.markViewed ordering: parameter gates before the account
+    /// ladder). A well-shaped pointer stages Ready with the locator carried
+    /// verbatim and the size as the decrypt-trim input.
+    #[test]
+    fn stories_download_attachment_shape_gate_answers_before_staging() {
+        // The media capability gate precedes everything (the media-face
+        // ordering: without the launcher opt-in the answer is deterministic
+        // and first).
+        let (_bare_temp, bare) = service();
+        let error = bare
+            .prepare_story_attachment_download(&StoryAttachmentDownloadParams {
+                account_id: "acct".into(),
+                attachment: story_pointer_params("att", 32, |value| {
+                    value["locator"]["digest"] = json!(base64_encode(&[7_u8; 32]));
+                }),
+            })
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CAPABILITY_UNAVAILABLE");
+
+        let (_temp, service) = media_service();
+        fn pointer(mutate: impl FnOnce(&mut Value)) -> StoryAttachmentDownloadParams {
+            StoryAttachmentDownloadParams {
+                account_id: "acct".into(),
+                attachment: story_pointer_params(
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    2048,
+                    mutate,
+                ),
+            }
+        }
+        let gate = |params: &StoryAttachmentDownloadParams| match service
+            .prepare_story_attachment_download(params)
+        {
+            Err(ServiceError::Api(api)) if api.code == "INVALID_REQUEST" => (),
+            other => panic!("expected the INVALID_REQUEST gate, got {other:?}"),
+        };
+        // Landing-id shapes (the sanitizeId-parity gate).
+        gate(&pointer(|value| value["id"] = json!("")));
+        gate(&pointer(|value| {
+            value["id"] = json!("a".repeat(MAX_ATTACHMENT_ID_BYTES + 1));
+        }));
+        gate(&pointer(|value| value["id"] = json!("../escape")));
+        gate(&pointer(|value| value["id"] = json!("..")));
+        // Size bounds: the transit chain's own ceiling, answered here.
+        gate(&pointer(|value| value["size"] = json!(0)));
+        gate(&pointer(|value| {
+            value["size"] = json!(crate::history_attachment::MAX_PLAINTEXT_BYTES + 1);
+        }));
+        // The §4.54 locator-ingest caps mirrored onto the caller strings.
+        gate(&pointer(|value| value["locator"]["key"] = json!("")));
+        gate(&pointer(|value| {
+            value["locator"]["key"] = json!("k".repeat(MAX_LOCATOR_FIELD_CHARS + 1));
+        }));
+        gate(&pointer(|value| value["locator"]["cdnKey"] = json!("")));
+        gate(&pointer(|value| {
+            value["locator"]["cdnKey"] = json!("c".repeat(MAX_LOCATOR_FIELD_CHARS + 1));
+        }));
+        gate(&pointer(|value| {
+            value["locator"]["digest"] = json!("d".repeat(MAX_LOCATOR_FIELD_CHARS + 1));
+        }));
+        gate(&pointer(|value| {
+            value["locator"]["plaintextHash"] = json!("h".repeat(MAX_LOCATOR_HASH_CHARS + 1));
+        }));
+        gate(&pointer(|value| {
+            value["locator"]["uploadTimestamp"] = json!(0)
+        }));
+
+        // Unknown account after the parameter gates.
+        let unknown = pointer(|_| ());
+        let error = service
+            .prepare_story_attachment_download(&unknown)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+
+        // The happy shape: the locator rides verbatim (never re-shaped, no
+        // field invented), the declared size is the decrypt-trim input, the
+        // landing name is the sanitized id.
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let params = StoryAttachmentDownloadParams {
+            account_id: account.id.clone(),
+            attachment: story_pointer_params("aaaaaaaa bbbb cccc", 2048, |value| {
+                value["locator"]["cdnNumber"] = json!(2);
+                value["locator"]["uploadTimestamp"] = json!(1_700_000_000_000_u64);
+                value["locator"]["digest"] = json!(base64_encode(&[7_u8; 32]));
+                value["locator"]["plaintextHash"] = json!("a".repeat(64));
+            }),
+        };
+        let PreparedHistoryDownload::Ready {
+            locator,
+            descriptor_size,
+            target,
+            ..
+        } = service.prepare_story_attachment_download(&params).unwrap()
+        else {
+            panic!("a fresh pointer stages Ready");
+        };
+        assert_eq!(
+            locator.key.as_deref(),
+            Some(base64_encode(&[0x21_u8; 64]).as_str())
+        );
+        assert_eq!(locator.cdn_key.as_deref(), Some("story-cdn-key"));
+        assert_eq!(locator.cdn_number, Some(2));
+        assert_eq!(locator.upload_timestamp, Some(1_700_000_000_000));
+        assert!(locator.digest.is_some());
+        assert!(locator.plaintext_hash.is_some());
+        assert_eq!(descriptor_size, Some(2048));
+        assert!(
+            target
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("aaaaaaaa_bbbb_cccc")
+        );
+    }
+
+    /// stories.downloadAttachment: an already-landed file answers the
+    /// measured size and stages no chain (the 1.57/1.61 idempotent-dedup
+    /// posture verbatim — the CDN is never re-asked).
+    #[test]
+    fn stories_download_attachment_dedup_answers_measured_size() {
+        let (temp, service) = media_service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let landed = temp.path().join("signal-data/attachments/story-bytes");
+        std::fs::write(&landed, [0xAB_u8; 1234]).unwrap();
+        let params = StoryAttachmentDownloadParams {
+            account_id: account.id,
+            attachment: story_pointer_params("story-bytes", 1234, |value| {
+                value["locator"]["digest"] = json!(base64_encode(&[7_u8; 32]));
+            }),
+        };
+        let PreparedHistoryDownload::AlreadyPresent { size_bytes } =
+            service.prepare_story_attachment_download(&params).unwrap()
+        else {
+            panic!("a landed file answers the dedup arm");
+        };
+        assert_eq!(size_bytes, 1234);
+    }
+
+    /// stories.openAttachment (contract 1.86, §4.71): the handle mint
+    /// mirrors messages.attachments.open without the row addressing — the
+    /// media capability, the id shape, and the account ladder gate it; a
+    /// not-downloaded file answers the not-available UPSTREAM_ERROR
+    /// (retryable, deliberately indistinguishable from governor-deleted);
+    /// a landed file opens and reads back through the sequential chunk face.
+    #[test]
+    fn stories_open_attachment_mints_and_reads() {
+        let error = {
+            let (_bare_temp, bare) = service();
+            bare.open_story_attachment_handle("acct", "att")
+                .unwrap_err()
+                .into_api()
+                .code
+        };
+        assert_eq!(error, "CAPABILITY_UNAVAILABLE");
+
+        let (temp, service) = media_service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        // Id shapes.
+        for bad in ["", "../escape"] {
+            let error = service
+                .open_story_attachment_handle(&account.id, bad)
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "id {bad:?}");
+        }
+        // Unknown account.
+        let error = service
+            .open_story_attachment_handle("acct-absent", "story-bytes")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+        // Not-downloaded: the not-available answer, retryable like every
+        // local attachment read.
+        let error = service
+            .open_story_attachment_handle(&account.id, "story-bytes")
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "UPSTREAM_ERROR");
+        assert!(error.retryable);
+
+        // Landed: the handle reads the exact bytes back through the
+        // sequential chunk face and reports EOF.
+        let plaintext: Vec<u8> = (0..=255_u8).collect();
+        std::fs::write(
+            temp.path().join("signal-data/attachments/story-bytes"),
+            &plaintext,
+        )
+        .unwrap();
+        let view = service
+            .open_story_attachment_handle(&account.id, "story-bytes")
+            .unwrap();
+        assert_eq!(view.size_bytes, 256);
+        assert_eq!(view.chunk_bytes, MEDIA_CHUNK_BYTES);
+        let mut offset = 0_u64;
+        let mut assembled = Vec::new();
+        loop {
+            let chunk = service
+                .read_media_chunk(&view.media_handle, offset)
+                .unwrap();
+            offset += chunk.size_bytes;
+            let mut decoded = Vec::new();
+            base64_decode_to_vec(&chunk.data_base64, &mut decoded)
+                .expect("the chunk encoding is canonical base64");
+            assembled.extend_from_slice(&decoded);
+            if chunk.eof {
+                break;
+            }
+        }
+        assert_eq!(assembled, plaintext);
+        // A non-sequential offset stays the caller mistake it always was.
+        let error = service
+            .read_media_chunk(&view.media_handle, 0)
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "INVALID_REQUEST");
     }
 
     /// Story view receipts (contract 1.85, §4.70): a VIEWED receipt splits

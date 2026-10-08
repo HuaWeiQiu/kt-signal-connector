@@ -5,7 +5,53 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.85 (2026-10-08; the story view receipt batch
+- Contract revision: 1.86 (2026-10-08; the story-anchored attachment byte
+  faces (§4.71): `stories.downloadAttachment` +
+  `stories.openAttachment` — the byte half of the story surface. Stories
+  land in no conversation row (§4.67), so the row-anchored
+  `attachments.download` (§4.54) can never address one and there is no
+  connector-side story row to resolve against (the connector keeps no
+  story state — the §4.67 discipline). The shape is therefore
+  caller-supplied: the desktop passes the pointer face its
+  `story.received` event carried — `{accountId,
+  attachment: {id, size, locator: {key, cdnKey, cdnNumber,
+  uploadTimestamp?, digest?, plaintextHash?}}}` — and the connector gates
+  every field fail-closed before any network traffic in three layers (the
+  params serde gate: types, required key/cdnKey/cdnNumber,
+  deny_unknown_fields so the whole rendering projection — contentType,
+  filename, width, height, caption, isVoiceNote — is a params error, not
+  a silent strip; the prepare ladder: the §4.54 locator-ingest caps
+  mirrored onto the caller strings (key/cdnKey/digest ≤ 512 chars,
+  plaintextHash ≤ 128 chars, uploadTimestamp ≥ 1 when present), the
+  sanitizeId-parity landing-id gate, the 1..=104857600 size bound; the
+  chain: the §4.38 step-3 `TransitFace::build` crypto-shape decode —
+  base64 64-byte key set, one integrity face present — still ahead of the
+  first byte on the wire). Nothing is invented (an absent pointer field
+  stays absent — a hole answers INVALID_REQUEST, never a guessed
+  download) and nothing is logged (pointer material never crosses an
+  error or a log line; the failure family is content-free by
+  construction). Everything after the gates is the §4.38 step-3 machine
+  verbatim — the same chain history.attachmentDownload and
+  attachments.download run (engine attachv2 pipeline "reuse" means the
+  connector reuses the CDN download mechanism and its crypto; the engine
+  stays metadata-only, E2 keeps projecting pointers, zero engine-repo
+  changes). Result `{sizeBytes: N}`; already-present files answer the
+  measured size without touching the CDN (the 1.57/1.61 idempotent-dedup
+  posture). `stories.openAttachment` is the handle mint over the landed
+  file — the messages.attachments.open machine without the row
+  addressing (read lane, no engine touch); chunk read and release ride
+  messages.attachments.readChunk/closeHandle unchanged (the handle, not
+  the addressing, is the origin authority). Zero new error codes (the
+  INVALID_REQUEST / UPSTREAM_ERROR families verbatim; download/verify
+  failures terminal — never auto-retried, the AGENTS.md red line; local
+  IO retryable). The capability set does not grow: `stories` extends in
+  place (the 1.82 call-signaling precedent); mode-independent — the
+  chain is pure connector, so no capability seam exists to answer.
+  Deliberately out: media-tier story size profiles (the 100 MiB
+  transit ceiling already bounds every caller), story text/preview
+  attachment dispatch (the same face serves them — the pointer is the
+  pointer), and the desktop viewer wiring (its own batch)
+  — previously 1.85 (2026-10-08; the story view receipt batch
   (§4.70): the stories watch receipt lands both legs. Send leg:
   `stories.markViewed` `{accountId, storyAuthor, storySentAt}` →
   `{status: "sent"|"unknown"}` — the `messages.markViewed` receipt class
@@ -5131,6 +5177,105 @@ envelope drops, and nothing persists); and the engine-mode roundtrip
 `unknown` without a retry, the explicit restart and the next receipt
 sending again, and the dispatch log pinning the frame shapes with the
 store account id never riding).
+
+### 4.71 Story-anchored attachment bytes: `stories.downloadAttachment` + `stories.openAttachment` (contract revision 1.86, 2026-10-08)
+
+The byte half of the story surface: the spike's §3-connector finding ② —
+`attachments.download` is row-anchored
+(conversationId + messageId + attachmentIndex, the connector resolving the
+row locally to its stored pointer face) and a story has no row to resolve —
+closes with a caller-supplied pointer face instead of a story-anchored row
+store. The connector keeps no story state (the §4.67 discipline: the
+desktop owns the story timeline, the connector owns the pipe), so the
+desktop passes back what `story.received` delivered and the connector
+re-runs the byte machine it already runs for rows.
+
+- **`stories.downloadAttachment`** `{accountId,
+  attachment: {id, size, locator}}` → `{sizeBytes: N}`. Send lane,
+  account-scoped mutating (it lands a file in the governed media
+  directory; the reaction-class write-lane mutex and delete drain barrier
+  serialize it — the 1.57/1.61 class verbatim). The locator is exactly the
+  face the engine's `project_attachment_pointer` projection shipped on the
+  story event: `{key, cdnKey, cdnNumber, uploadTimestamp?, digest?,
+  plaintextHash?}`; `id` is the attachment id that projection carried and
+  becomes the landing file name (the sanitizeId-parity gate: 1..=128
+  bytes, no path separators, never `.`/`..`); `size` is the declared
+  plaintext size — mandatory, because it is the decrypt-trim input, and a
+  pointer without it is not downloadable (a trim against a guessed size
+  would be the guess). Rendering fields (contentType, filename, width,
+  height, caption, isVoiceNote) never ride the params —
+  deny_unknown_fields turns the whole projection passed verbatim into a
+  params error rather than a silent strip.
+- **The shape gate (fail-closed, three layers, all ahead of any network
+  traffic)**: the params serde gate (types; required key/cdnKey/cdnNumber;
+  unknown keys); the prepare ladder (the §4.54 locator-ingest caps
+  mirrored onto the caller-supplied strings — key/cdnKey/digest ≤ 512
+  characters, plaintextHash ≤ 128 characters, uploadTimestamp ≥ 1 when
+  present — then the id sanitize gate, then the 1..=104857600 size
+  bound); and the chain's `TransitFace::build` crypto-shape decode (the
+  key base64-decodes to exactly the 64-byte AES+HMAC set, cdnNumber
+  present, at least one integrity face — digest or plaintextHash, both
+  verify when both ride). Every layer answers INVALID_REQUEST
+  retryable=false with a content-free message; a hole is never a guessed
+  download, no pointer field is ever invented, and pointer material never
+  enters an error message or a log line.
+- **The chain after the gates is the §4.38 step-3 machine verbatim** —
+  the same `run_attachment_download_chain` history.attachmentDownload and
+  attachments.download run: cdnNumber → cdn base map with the CDN-0
+  fallback, the encodeURIComponent-parity cdnKey path, streamed GET
+  (connect 10 s / total 120 s / no redirects) under hard body bounds, the
+  trailing-MAC HMAC-SHA256 gate then the whole-body SHA-256 digest gate,
+  AES-256-CBC decrypt (IV-prefixed body, PKCS7), the official log-pad
+  trim to the declared size, the plaintextHash face, and the atomic
+  landing where `stories.openAttachment` resolves the file. Download,
+  integrity, and decryption failures answer UPSTREAM_ERROR
+  retryable=false — terminal, never auto-retried (the AGENTS.md
+  unknown-outcome red line; a retry is the caller's fresh call); local
+  filesystem failures keep the retryable UPSTREAM_ERROR face.
+  Already-present files answer the measured size without touching the
+  CDN (idempotent dedup — a repeated viewer open re-answers, the CDN is
+  never re-asked).
+- **`stories.openAttachment`** `{accountId, attachmentId}` →
+  `{mediaHandle, sizeBytes, chunkBytes}`. Read lane, non-mutating, the
+  messages.attachments.open machine without the row addressing: the same
+  capability gate, the same id/sanitize gates, the same governed
+  directory probe, the same process-wide handle table (per-account
+  budget, TTL, sequential chunks), and the same not-available answer —
+  UPSTREAM_ERROR retryable=true, not-downloaded and governor-deleted
+  deliberately indistinguishable (ADR 0002). Chunk read and release ride
+  `messages.attachments.readChunk` / `messages.attachments.closeHandle`
+  unchanged: the handle, not the addressing, is the single-origin
+  authority, so the story bytes need zero new read faces.
+- **Engine boundary**: zero engine-repo changes — the red line holds. The
+  engine stays metadata-only (E2 projects pointers; bytes never download
+  engine-side); the connector's "reuse" of the attachv2 pipeline is the
+  connector reusing its own §4.38 CDN mechanism and credential-free
+  pointer chain, which the pointer face already names. The face is
+  mode-independent by construction (pure connector: store + transit CDN +
+  local crypto) — though its practical audience is kt-engine story
+  desktops, because only the kt-engine face projects story events.
+- **Capability**: the `stories` tag extends in place (the 1.82
+  call-signaling no-new-bit precedent); zero new structured error codes
+  (`ENGINE_STRUCTURED_ERROR_CODES` unchanged). Second-phase items recorded
+  deliberately: media-tier story size profiles (the 100 MiB transit
+  ceiling already bounds every caller; a story-specific profile adds a
+  second truth without a consumer), story text/preview-image dispatch
+  (the face is pointer-shaped, not story-part-shaped — the same face
+  serves a preview image pointer today), and the desktop viewer wiring
+  (`story.received` → its store → this face pair) is the consumer batch's.
+
+Tests: the shape gate ladder (`service.rs` — the media capability first,
+the id/size/locator-cap holes, the account ladder after the parameter
+gates, the happy pointer staging with the locator carried verbatim, the
+idempotent dedup arm, and the story open face's gate ladder with the
+chunk roundtrip); the wire chain (`tests/story_attachment.rs` against a
+local mock CDN — the happy pointer lands the plaintext where the story
+open reads it and the second call never touches the CDN, the params-gate
+and post-parse holes all answer INVALID_REQUEST with zero CDN traffic
+including the whole rendering projection passed verbatim, and a digest
+mismatch is terminal with nothing landed and no temp residue); and the
+schema diff (method enum, dispatch arms, the three param defs, and the
+numeric-bound pairs keyed to the code constants).
 
 ## 5. signal-cli Boundary
 

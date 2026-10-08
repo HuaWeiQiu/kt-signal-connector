@@ -115,7 +115,9 @@
             "messages.sendStory",
             "stories.setDisabled",
             "stories.getDisabled",
-            "stories.markViewed"
+            "stories.markViewed",
+            "stories.downloadAttachment",
+            "stories.openAttachment"
           ]
         },
         "params": {
@@ -975,6 +977,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/storiesMarkViewedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stories.downloadAttachment" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storyAttachmentDownloadParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stories.openAttachment" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storyOpenAttachmentParams" }
             }
           }
         }
@@ -2606,6 +2630,103 @@
           "type": "integer",
           "minimum": 1,
           "description": "The story's own Signal timestamp (the story's protocol identity); the receipt's only timestamp entry."
+        }
+      }
+    },
+    "storyLocatorParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "cdnKey", "cdnNumber"],
+      "description": "The caller-supplied transit pointer face (contract revision 1.86, \u00a74.71): exactly the locator object the story event's attachment projection carried \u2014 never fabricated, never logged. key/cdnKey/cdnNumber are required (a face without them names no downloadable object and answers INVALID_REQUEST at the params gate); digest and plaintextHash are the integrity faces and at least one must ride (the official hasIntegrityCheck gate \u2014 the decode verifies in the download chain, still before any network traffic); uploadTimestamp is accepted for pointer-faithful round-trips and never read (the official transit GET does not use it).",
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "The attachment's 64-byte key set (AES + HMAC), standard base64 \u2014 the §4.54 locator-ingest cap mirrored onto the caller-supplied face."
+        },
+        "cdnKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "The transit CDN object key; percent-encoded into the GET path by the official encodeURIComponent parity rule."
+        },
+        "cdnNumber": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "The transit CDN number; 0 names the default CDN (the official getCheckedCdnUrl fallback)."
+        },
+        "uploadTimestamp": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The upload timestamp the pointer carried, echoed for pointer faithfulness; never read by the download chain."
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Whole-body SHA-256 over the ciphertext including the trailing MAC, standard base64 \u2014 the transit integrity face."
+        },
+        "plaintextHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "SHA-256 over the trimmed plaintext, lowercase hex \u2014 the media-tier integrity face; either this or digest must ride."
+        }
+      }
+    },
+    "storyAttachmentPointerParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "size", "locator"],
+      "description": "The caller-supplied attachment pointer (contract revision 1.86, \u00a74.71): the id (the landing file name \u2014 the story event's attachment id), the declared plaintext size (the transit chain's decrypt-trim input), and the locator. Exactly these three keys \u2014 a pointer passed with its rendering fields (contentType, filename, width, height, caption, isVoiceNote) is a params-shape error, not a silent strip.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The attachment id the story event carried; sanitized to a bare file name (no path separators) before any path join."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 104857600,
+          "description": "The declared plaintext size in bytes \u2014 1..=104857600 (the server's 100 MiB per-attachment ceiling; the transit chain refuses past it before any network traffic). A pointer without a size is not downloadable: the trim input would be a guess."
+        },
+        "locator": {
+          "$ref": "#/$defs/storyLocatorParams"
+        }
+      }
+    },
+    "storyAttachmentDownloadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "attachment"],
+      "description": "Download one story attachment's bytes from the Signal transit CDN (contract revision 1.86, \u00a74.71, capability stories): the story-anchored byte channel. Stories land in no conversation row (contract 1.76, \u00a74.67), so the row-anchored attachments.download can never address one \u2014 the caller supplies the pointer face its story event carried and the connector gates every field fail-closed before any network traffic: the params gate (types, required pointer fields, unknown keys), the prepare ladder (the \u00a74.54 locator-ingest caps mirrored onto the caller strings, the sanitizeId-parity landing-id gate, the 1..=104857600 size bound), and the crypto-shape decode (base64 64-byte key set, one integrity face present) all answer INVALID_REQUEST ahead of the first byte on the wire \u2014 never a guessed download, never an invented pointer field, never a logged pointer. Everything after the gates is the \u00a74.38 step-3 machine verbatim (the same chain history.attachmentDownload and attachments.download run: cdnNumber \u2192 cdn base map with the CDN-0 fallback, encodeURIComponent'd cdnKey path, streamed GET with connect 10 s / total 120 s / no redirects, trailing-MAC HMAC-SHA256 then whole-body SHA-256 digest gates, AES-256-CBC decrypt with the IV-prefixed body and PKCS7, the official log-pad trim, the plaintextHash face). Download, integrity, and decryption failures answer UPSTREAM_ERROR retryable=false \u2014 terminal, never auto-retried; local filesystem failures answer UPSTREAM_ERROR retryable=true. Already-present files answer {sizeBytes} without touching the CDN (idempotent dedup). Result {sizeBytes: N} \u2014 afterwards stories.openAttachment mints the chunk handle (stories have no row for messages.attachments.open). Mode-independent: the chain is pure connector (transit CDN + local crypto), zero engine involvement \u2014 the engine stays metadata-only. Send lane, account-scoped mutating (it lands a file in the governed media directory; the reaction-class write-lane mutex and delete drain barrier serialize it).",
+      "properties": {
+        "accountId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "attachment": {
+          "$ref": "#/$defs/storyAttachmentPointerParams"
+        }
+      }
+    },
+    "storyOpenAttachmentParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "attachmentId"],
+      "description": "Open an already-downloaded story attachment for chunked reading (contract revision 1.86, \u00a74.71, capability stories): the messages.attachments.open machine without the row addressing stories do not have. The attachmentId is the id the story event carried (the download's landing name); the connector resolves the landed file in the governed media directory and mints a short-lived chunk-stream handle. Read the bytes with messages.attachments.readChunk and release with messages.attachments.closeHandle \u2014 both unchanged: the handle, not the addressing, is the origin authority. A file that is not downloaded answers UPSTREAM_ERROR retryable=true (not-downloaded and governor-deleted are deliberately indistinguishable). Read lane, account-scoped non-mutating; the per-account handle budget applies.",
+      "properties": {
+        "accountId": {
+          "$ref": "#/$defs/opaqueId"
+        },
+        "attachmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The attachment id the story event carried \u2014 the name stories.downloadAttachment landed the bytes under."
         }
       }
     },

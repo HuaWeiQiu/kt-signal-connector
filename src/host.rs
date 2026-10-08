@@ -1205,6 +1205,54 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Story-anchored attachment download (contract revision 1.86,
+        // §4.71): the params-gate arm — a caller-supplied pointer with a
+        // missing or wrong-typed required field answers INVALID_REQUEST at
+        // this gate, before any staging or network traffic; the caps ladder
+        // and pointer decode ride the runtime call; success is
+        // {"sizeBytes": N}. The pointer never appears in any error or log.
+        "stories.downloadAttachment" => {
+            match serde_json::from_value::<crate::service::StoryAttachmentDownloadParams>(
+                request.params,
+            ) {
+                Ok(params) => match runtime.story_attachment_download(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.downloadAttachment params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Story-anchored attachment open (contract revision 1.86, §4.71):
+        // the handle mint over an already-landed file — the
+        // messages.attachments.open arm shape without the row addressing.
+        "stories.openAttachment" => {
+            match serde_json::from_value::<crate::service::StoryOpenAttachmentParams>(
+                request.params,
+            ) {
+                Ok(params) => match runtime.story_open_attachment(params).await {
+                    Ok(view) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(view).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.openAttachment params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "backups.export" => match serde_json::from_value::<BackupsExportParams>(request.params) {
             Ok(params) => match runtime.export_local_backup(&params.account_id).await {
                 Ok(result) => HostResponse::success(request_id, result),
