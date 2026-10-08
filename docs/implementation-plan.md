@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.89 (2026-10-09; the groups.update group-avatar passthrough batch
+- Contract revision: 1.90 (2026-10-09; the setProfile avatar tri-state repair (§4.45): the
+  explicit-null remove arm was unreachable on the real wire path — serde's `Option<Value>`
+  folds a JSON null into absence at the option layer, so the service ladder's
+  `Some(Value::Null)` arm was dead code and every explicit-null call silently kept the
+  avatar (the 1.46 shape's recorded boundary, surfaced by the 1.89 batch's dedicated-type
+  work). The face now shares the 1.89 tri-state deserializer type (renamed
+  `GroupAvatarUpdate` → `AvatarUpdate`, one canonical type, two consumers): absent = keep
+  (the `#[default]`), explicit null = remove (`avatar: null` forwards as a present-null
+  key), data URI = replace — the validation ladder is unchanged (non-image family /
+  non-canonical base64 / over-budget decode answer INVALID_REQUEST in the service before
+  any upstream call; a non-string non-null payload now fails at params deserialization,
+  the §4.45 discipline). Tests upgraded to pin the wire line: the integration null assert
+  distinguishes a present-null key from a dropped key, a keep case pins the absent face,
+  and the unit deserializer pin covers keep / remove / non-string at the type level. No
+  engine-behavior change is implied for engines that never saw a real remove (the arm was
+  dead); the schema's setProfile `avatar` widens to `["string","null"]` the same revision —
+  previously 1.89 (2026-10-09; the groups.update group-avatar passthrough batch
   (§4.44): the `avatar` tri-state joins the params face — the `accounts.setProfile` shape
   verbatim (§4.45): absent = keep, explicit null = remove, a `data:image/*;base64,` data URI
   (canonical base64, decoded 1..=10 MiB — the engine's stated avatar budget) = replace; the
@@ -2862,10 +2878,11 @@ kt-engine gap honestly; the engine batch (separate repository) owns the method p
   rides the upstream payload verbatim: an absent avatar adds no key, an explicit null
   forwards `avatar: null`, a data URI forwards the validated string unchanged — the §4.44
   omission discipline. The three states are carried by a dedicated deserialization type
-  (`GroupAvatarUpdate`): serde's `Option<Value>` — the setProfile face's shape — folds an
+  (`AvatarUpdate` since 1.90, shared with the repaired setProfile face): serde's
+  `Option<Value>` — the setProfile face's 1.46 shape — folds an
   explicit JSON null into "absent" at the option layer, which leaves that face's
-  explicit-null arm unreachable on the real wire path (recorded boundary — the 1.46 shape
-  stays as-is; this face keeps the null reachable end to end). The connector never decodes
+  explicit-null arm unreachable on the real wire path (the 1.46 shape
+  stayed as-is until 1.90; this face has kept the null reachable end to end). The connector never decodes
   image bytes beyond the budget check and never persists them; the byte face is the engine's
   to interpret.
 - Contract 1.89 — the avatar validation ladder: the tri-state rides the deterministic
@@ -3002,7 +3019,10 @@ declared swap boundary the §4.32–§4.34 engine-extension family records.
   bytes — the official bio `maxByteCount: 512`), `emoji` (≤ 32 bytes, one emoji — the repo-wide
   emoji label bound), and `avatar` with three states: absent = keep the current avatar, data URI
   (`data:image/*;base64,` + canonical base64, decoded ≤ 10 MiB — the engine's stated avatar
-  budget, AvatarHelper-scale) = replace, explicit `null` = remove. The text face is a full
+  budget, AvatarHelper-scale) = replace, explicit `null` = remove (the remove arm rides the
+  dedicated tri-state deserializer shared with §4.44 since 1.90 — the 1.46 `Option<Value>`
+  shape folded JSON null into absence, leaving the arm unreachable on the real wire path).
+  The text face is a full
   write exactly like the official updateProfile (every upstream write carries the complete
   encrypted profile): a key the caller omits is cleared upstream, so the desktop always sends
   the full text face it wants. Result `{"status": "saved"}`. Send lane, account-scoped

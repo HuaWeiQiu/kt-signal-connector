@@ -2646,21 +2646,21 @@ impl ConnectorService {
             changes.push(("memberLabelEmoji", json!(emoji)));
         }
         // The avatar tri-state (contract 1.89): the accounts.setProfile
-        // three states, carried by the dedicated `GroupAvatarUpdate` type
-        // because serde's `Option<Value>` folds an explicit null into
-        // "absent" at the option layer — here the three states are distinct
-        // on the real deserialization path. The value rides the changes vec
-        // verbatim (the omission discipline: a keep adds no key, an explicit
-        // null forwards null), and the Remove/Replace forms count as the
-        // change set's avatar member — a lone avatar call is a real change,
-        // not an empty set. A non-string, non-null avatar type fails at
-        // params deserialization (the §4.45 discipline); the data-URI shape
-        // gate answers INVALID_REQUEST here in both modes, ahead of both
-        // mode gates.
+        // three states, carried by the dedicated `AvatarUpdate` type (shared
+        // with setProfile since 1.90) because serde's `Option<Value>` folds
+        // an explicit null into "absent" at the option layer — here the
+        // three states are distinct on the real deserialization path. The
+        // value rides the changes vec verbatim (the omission discipline: a
+        // keep adds no key, an explicit null forwards null), and the
+        // Remove/Replace forms count as the change set's avatar member — a
+        // lone avatar call is a real change, not an empty set. A non-string,
+        // non-null avatar type fails at params deserialization (the §4.45
+        // discipline); the data-URI shape gate answers INVALID_REQUEST here
+        // in both modes, ahead of both mode gates.
         match &params.avatar {
-            GroupAvatarUpdate::Keep => {}
-            GroupAvatarUpdate::Remove => changes.push(("avatar", Value::Null)),
-            GroupAvatarUpdate::Replace(data_uri) => {
+            AvatarUpdate::Keep => {}
+            AvatarUpdate::Remove => changes.push(("avatar", Value::Null)),
+            AvatarUpdate::Replace(data_uri) => {
                 changes.push(("avatar", json!(validate_avatar_data_uri(data_uri)?)));
             }
         }
@@ -2699,7 +2699,7 @@ impl ConnectorService {
                 // structured refusal (the §4.68 snapshot-import downgrade
                 // shape) precedes the payload build; the byte face arrives
                 // with the parallel engine batch.
-                if !matches!(params.avatar, GroupAvatarUpdate::Keep) {
+                if !matches!(params.avatar, AvatarUpdate::Keep) {
                     return Err(ServiceError::Api(ApiError::new(
                         "CAPABILITY_UNAVAILABLE",
                         "the bound signal-cli face takes a group avatar as a local file path; the connector has no host-file upload channel",
@@ -3213,18 +3213,10 @@ impl ConnectorService {
             )));
         }
         let avatar = match &params.avatar {
-            None => AvatarUpdate::Keep,
-            Some(Value::Null) => AvatarUpdate::Remove,
-            Some(Value::String(data_uri)) => {
+            AvatarUpdate::Replace(data_uri) => {
                 AvatarUpdate::Replace(validate_avatar_data_uri(data_uri)?)
             }
-            Some(_) => {
-                return Err(ServiceError::Api(ApiError::new(
-                    "INVALID_REQUEST",
-                    "avatar must be a data:image/*;base64, data URI, null, or absent",
-                    false,
-                )));
-            }
+            keep_or_remove => keep_or_remove.clone(),
         };
         let account = self.resolve_account(&params.account_id)?;
         let mut upstream = json!({
@@ -7585,46 +7577,35 @@ impl Default for CallStateRegistry {
     }
 }
 
-/// `accounts.setProfile` avatar tri-state (contract revision 1.46, §4.45):
-/// `Keep` (key absent) forwards no avatar key, `Remove` (explicit null)
-/// forwards `avatar: null`, `Replace` (a data URI) forwards the validated
-/// string. The distinction survives params deserialization via
-/// `Option<Value>` — a plain `Option<String>` would erase the absent/null
-/// line the engine's avatar semantics are built on.
-#[derive(Clone, Debug, PartialEq)]
-pub enum AvatarUpdate {
-    Keep,
-    Remove,
-    Replace(String),
-}
-
-/// The `groups.update` avatar tri-state on the wire (contract revision 1.89,
-/// §4.44): the `AvatarUpdate` three states, carried by a dedicated type with
-/// a hand-written `Deserialize` because serde's `Option<Value>` folds an
-/// explicit JSON null into `None` at the option layer — the same fold makes
-/// the setProfile face's explicit-null arm unreachable on the real
-/// deserialization path (recorded boundary, the 1.46 shape kept as-is). A
-/// missing key takes the `Default` (`Keep`); an explicit null deserializes
-/// through `Value` (which does not fold null) into `Remove`; a string
-/// becomes `Replace` and any other JSON type is a custom deserialization
-/// error — the host's blanket params-shape `INVALID_REQUEST`, the §4.45
-/// "everything else fails at params deserialization" discipline.
+/// The avatar tri-state shared by `groups.update` (§4.44, revision 1.89)
+/// and `accounts.setProfile` (§4.45, revision 1.90): `Keep` (key absent)
+/// forwards no avatar key, `Remove` (explicit null) forwards `avatar: null`,
+/// `Replace` (a data URI) forwards the validated string. A dedicated
+/// deserializer keeps absent and explicit null distinct on the real wire
+/// path — serde's `Option<Value>` folds an explicit JSON null into `None`
+/// at the option layer, which left the 1.46 setProfile remove arm
+/// unreachable until this type replaced that shape. A missing key takes the
+/// `Default` (`Keep`); an explicit null deserializes through `Value` (which
+/// does not fold null) into `Remove`; a string becomes `Replace` and any
+/// other JSON type is a custom deserialization error — the host's blanket
+/// params-shape `INVALID_REQUEST`, the §4.45 "everything else fails at
+/// params deserialization" discipline.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub enum GroupAvatarUpdate {
+pub enum AvatarUpdate {
     #[default]
     Keep,
     Remove,
     Replace(String),
 }
 
-impl<'de> serde::Deserialize<'de> for GroupAvatarUpdate {
+impl<'de> serde::Deserialize<'de> for AvatarUpdate {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         match Value::deserialize(deserializer)? {
-            Value::Null => Ok(GroupAvatarUpdate::Remove),
-            Value::String(data_uri) => Ok(GroupAvatarUpdate::Replace(data_uri)),
+            Value::Null => Ok(AvatarUpdate::Remove),
+            Value::String(data_uri) => Ok(AvatarUpdate::Replace(data_uri)),
             _ => Err(serde::de::Error::custom(
                 "avatar must be a data:image/*;base64, data URI, null, or absent",
             )),
@@ -8286,8 +8267,10 @@ pub struct AccountsUpdateConfigurationParams {
 /// `accounts.setProfile` params (contract revision 1.46, §4.45): the text
 /// face is a full write upstream (an omitted key clears the field), so only
 /// `givenName` is meaningful to omit-guard — the optional text keys pass
-/// through as-is. `avatar` is the tri-state [`AvatarUpdate`]: captured as
-/// `Option<Value>` because absent and explicit null must stay distinct.
+/// through as-is. `avatar` is the tri-state [`AvatarUpdate`] (shared with
+/// `groups.update`, 1.90): a dedicated deserializer keeps absent and
+/// explicit null distinct on the real wire path — the 1.46 `Option<Value>`
+/// shape folded JSON null into absence, leaving the remove arm unreachable.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountsSetProfileParams {
@@ -8296,7 +8279,8 @@ pub struct AccountsSetProfileParams {
     pub family_name: Option<String>,
     pub about: Option<String>,
     pub emoji: Option<String>,
-    pub avatar: Option<Value>,
+    #[serde(default)]
+    pub avatar: AvatarUpdate,
 }
 
 /// `accounts.setExpireTimer` params (contract revision 1.46, §4.45):
@@ -8850,10 +8834,10 @@ pub struct GroupsGetParams {
 /// service (`resetLink: false` counts as absent). Member arrays carry the
 /// §4.39 roster bounds; the schema mirrors every bound this struct's
 /// deserialization plus the service checks enforce. `avatar` is the 1.89
-/// tri-state [`GroupAvatarUpdate`]: a dedicated deserializer keeps absent
-/// and explicit null distinct on the real wire path (an `Option<Value>`
-/// field would fold the null into absence — the setProfile shape's
-/// recorded boundary).
+/// tri-state [`AvatarUpdate`]: a dedicated deserializer keeps absent and
+/// explicit null distinct on the real wire path where an `Option<Value>`
+/// field would fold the null into absence (the shared setProfile repair is
+/// 1.90).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GroupsUpdateParams {
@@ -8875,7 +8859,7 @@ pub struct GroupsUpdateParams {
     pub member_label: Option<String>,
     pub member_label_emoji: Option<String>,
     #[serde(default)]
-    pub avatar: GroupAvatarUpdate,
+    pub avatar: AvatarUpdate,
     pub operation_id: Option<String>,
 }
 
@@ -14744,9 +14728,10 @@ mod tests {
 
     /// Profile bounds (contract revision 1.46, §4.45): the official desktop
     /// editor budgets (name components 128 bytes, bio 512, emoji 32), the
-    /// avatar tri-state keeps absent/null/string distinct on the wire, and
-    /// the data-URI gate refuses non-image families, non-canonical base64 and
-    /// over-budget payloads before any upstream call.
+    /// avatar tri-state rides the dedicated deserializer so absent/null/
+    /// string stay distinct on the real wire path (1.90), and the data-URI
+    /// gate refuses non-image families, non-canonical base64 and over-budget
+    /// payloads before any upstream call.
     #[test]
     fn prepare_account_profile_validates_bounds_and_avatar_tri_state() {
         let (_temp, mut service) = service();
@@ -14755,7 +14740,7 @@ mod tests {
                       family_name: Option<&str>,
                       about: Option<&str>,
                       emoji: Option<&str>,
-                      avatar: Option<Value>| AccountsSetProfileParams {
+                      avatar: AvatarUpdate| AccountsSetProfileParams {
             account_id: account.id.clone(),
             given_name: given_name.to_string(),
             family_name: family_name.map(str::to_string),
@@ -14768,7 +14753,7 @@ mod tests {
         // full write — absent keys are the caller's clear instruction, the
         // connector adds nothing).
         let upstream = service
-            .prepare_accounts_set_profile(&params("Li", None, None, None, None))
+            .prepare_accounts_set_profile(&params("Li", None, None, None, AvatarUpdate::Keep))
             .unwrap();
         assert_eq!(upstream["account"], "+15555550100");
         assert_eq!(upstream["givenName"], "Li");
@@ -14783,7 +14768,7 @@ mod tests {
                 Some(""),
                 Some("hello"),
                 Some("🎉"),
-                Some(Value::Null),
+                AvatarUpdate::Remove,
             ))
             .unwrap();
         assert_eq!(upstream["familyName"], "");
@@ -14798,53 +14783,72 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(json!("data:image/png;base64,YQ==")),
+                AvatarUpdate::Replace("data:image/png;base64,YQ==".to_string()),
             ))
             .unwrap();
         assert_eq!(upstream["avatar"], "data:image/png;base64,YQ==");
 
         // Text bounds: the official editor budgets, enforced deterministically.
         for (request_id, profile) in [
-            ("empty-given-name", params("", None, None, None, None)),
+            (
+                "empty-given-name",
+                params("", None, None, None, AvatarUpdate::Keep),
+            ),
             (
                 "given-name-over-128-bytes",
-                params(&"A".repeat(129), None, None, None, None),
+                params(&"A".repeat(129), None, None, None, AvatarUpdate::Keep),
             ),
             (
                 "family-name-over-128-bytes",
-                params("Li", Some(&"A".repeat(129)), None, None, None),
+                params("Li", Some(&"A".repeat(129)), None, None, AvatarUpdate::Keep),
             ),
             (
                 "about-over-512-bytes",
-                params("Li", None, Some(&"A".repeat(513)), None, None),
+                params("Li", None, Some(&"A".repeat(513)), None, AvatarUpdate::Keep),
             ),
             (
                 "emoji-over-32-bytes",
-                params("Li", None, None, Some(&"A".repeat(33)), None),
+                params("Li", None, None, Some(&"A".repeat(33)), AvatarUpdate::Keep),
             ),
         ] {
             let error = service.prepare_accounts_set_profile(&profile).unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{request_id}");
         }
 
-        // Avatar gate: non-string, non-image family, missing base64 marker,
-        // empty payload, non-canonical payload, over-budget decode.
+        // Avatar gate (validation-level arms): non-image family, missing
+        // base64 marker, empty payload, non-canonical payload, over-budget
+        // decode. The non-string arm moved to the deserializer pin below.
         for avatar in [
-            json!(7),
-            json!("data:text/html;base64,YQ=="),
-            json!("data:image/png,YQ=="),
-            json!("data:image/png;base64,"),
-            json!("data:image/png;base64,YQ"),
-            json!(format!(
-                "data:image/png;base64,{}",
-                "QUJD".repeat(MAX_AVATAR_BYTES / 3 + 1)
-            )),
+            "data:text/html;base64,YQ==",
+            "data:image/png,YQ==",
+            "data:image/png;base64,",
+            "data:image/png;base64,YQ",
         ] {
             let error = service
-                .prepare_accounts_set_profile(&params("Li", None, None, None, Some(avatar)))
+                .prepare_accounts_set_profile(&params(
+                    "Li",
+                    None,
+                    None,
+                    None,
+                    AvatarUpdate::Replace(avatar.to_string()),
+                ))
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST");
         }
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "QUJD".repeat(MAX_AVATAR_BYTES / 3 + 1)
+        );
+        let error = service
+            .prepare_accounts_set_profile(&params(
+                "Li",
+                None,
+                None,
+                None,
+                AvatarUpdate::Replace(oversized),
+            ))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
 
         // The exact 10 MiB decoded budget passes; unknown account errors first-class.
         let at_bound = format!(
@@ -14856,13 +14860,52 @@ mod tests {
             MAX_AVATAR_BYTES - MAX_AVATAR_BYTES % 3
         );
         let upstream = service
-            .prepare_accounts_set_profile(&params("Li", None, None, None, Some(json!(at_bound))))
+            .prepare_accounts_set_profile(&params(
+                "Li",
+                None,
+                None,
+                None,
+                AvatarUpdate::Replace(at_bound),
+            ))
             .unwrap();
         assert!(
             upstream["avatar"]
                 .as_str()
                 .unwrap()
                 .starts_with("data:image/png;base64,")
+        );
+
+        // Tri-state deserializer pin (1.90): absent keeps (the #[default]),
+        // an explicit JSON null removes, a non-string payload fails at
+        // params deserialization — the wire line the 1.46 `Option<Value>`
+        // shape erased (its unit-level `Some(Value::Null)` constructions
+        // never exercised real deserialization).
+        assert_eq!(
+            serde_json::from_value::<AccountsSetProfileParams>(json!({
+                "accountId": account.id.clone(),
+                "givenName": "Li"
+            }))
+            .unwrap()
+            .avatar,
+            AvatarUpdate::Keep
+        );
+        assert_eq!(
+            serde_json::from_value::<AccountsSetProfileParams>(json!({
+                "accountId": account.id.clone(),
+                "givenName": "Li",
+                "avatar": null
+            }))
+            .unwrap()
+            .avatar,
+            AvatarUpdate::Remove
+        );
+        assert!(
+            serde_json::from_value::<AccountsSetProfileParams>(json!({
+                "accountId": account.id.clone(),
+                "givenName": "Li",
+                "avatar": 7
+            }))
+            .is_err()
         );
 
         let error = service
@@ -19178,7 +19221,7 @@ mod tests {
             permission_send_messages: None,
             member_label: None,
             member_label_emoji: None,
-            avatar: GroupAvatarUpdate::Keep,
+            avatar: AvatarUpdate::Keep,
             operation_id: None,
         };
 
@@ -19449,7 +19492,7 @@ mod tests {
             permission_send_messages: None,
             member_label: None,
             member_label_emoji: None,
-            avatar: GroupAvatarUpdate::Keep,
+            avatar: AvatarUpdate::Keep,
             operation_id: None,
         };
         let error = service
@@ -19481,7 +19524,7 @@ mod tests {
 
     /// The groups.update avatar tri-state (contract 1.89): the wire
     /// deserialization keeps the three states distinct (the dedicated
-    /// `GroupAvatarUpdate` — an explicit null is `Remove`, never folded into
+    /// `AvatarUpdate` — an explicit null is `Remove`, never folded into
     /// absence); the data-URI shape refusals answer INVALID_REQUEST in both
     /// modes before any gate; a lone explicit-null or lone data-URI call is
     /// a real change (it reaches the CAPABILITY_UNAVAILABLE downgrade, not
@@ -19501,16 +19544,16 @@ mod tests {
         };
         let kept: GroupsUpdateParams =
             serde_json::from_value(json!({ "accountId": "a", "conversationId": "c" })).unwrap();
-        assert_eq!(kept.avatar, GroupAvatarUpdate::Keep);
+        assert_eq!(kept.avatar, AvatarUpdate::Keep);
         assert_eq!(
             deserialized(json!(null)).unwrap().avatar,
-            GroupAvatarUpdate::Remove
+            AvatarUpdate::Remove
         );
         assert_eq!(
             deserialized(json!("data:image/png;base64,YQ=="))
                 .unwrap()
                 .avatar,
-            GroupAvatarUpdate::Replace("data:image/png;base64,YQ==".into())
+            AvatarUpdate::Replace("data:image/png;base64,YQ==".into())
         );
         assert!(deserialized(json!(7)).is_err());
         assert!(deserialized(json!(["data:image/png;base64,YQ=="])).is_err());
@@ -19524,7 +19567,7 @@ mod tests {
             .store_ref()
             .ensure_conversation(&account.id, "group", "group-id-1", "group")
             .unwrap();
-        let base = |avatar: GroupAvatarUpdate| GroupsUpdateParams {
+        let base = |avatar: AvatarUpdate| GroupsUpdateParams {
             account_id: account.id.clone(),
             conversation_id: group.id.clone(),
             group_name: None,
@@ -19561,7 +19604,7 @@ mod tests {
         ] {
             for mode in [SignalCliMode::Jvm, SignalCliMode::KtEngine] {
                 let error = service
-                    .prepare_groups_update(&base(GroupAvatarUpdate::Replace(shape.into())), mode)
+                    .prepare_groups_update(&base(AvatarUpdate::Replace(shape.into())), mode)
                     .unwrap_err();
                 assert!(
                     matches!(error, ServiceError::Api(ref api)
@@ -19580,10 +19623,7 @@ mod tests {
             "QUJD".repeat(MAX_AVATAR_BYTES / 3)
         );
         let error = service
-            .prepare_groups_update(
-                &base(GroupAvatarUpdate::Replace(at_bound)),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_update(&base(AvatarUpdate::Replace(at_bound)), SignalCliMode::Jvm)
             .unwrap_err();
         match &error {
             ServiceError::Api(api) => {
@@ -19601,7 +19641,7 @@ mod tests {
         // refusal (not the empty-set INVALID_REQUEST) proves the Remove form
         // counts as the change set's avatar member.
         let error = service
-            .prepare_groups_update(&base(GroupAvatarUpdate::Remove), SignalCliMode::Jvm)
+            .prepare_groups_update(&base(AvatarUpdate::Remove), SignalCliMode::Jvm)
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
@@ -19613,8 +19653,8 @@ mod tests {
             .prepare_groups_update(
                 &GroupsUpdateParams {
                     group_name: Some("New Name".into()),
-                    avatar: GroupAvatarUpdate::Replace("data:image/png;base64,YQ==".into()),
-                    ..base(GroupAvatarUpdate::Keep)
+                    avatar: AvatarUpdate::Replace("data:image/png;base64,YQ==".into()),
+                    ..base(AvatarUpdate::Keep)
                 },
                 SignalCliMode::Jvm,
             )
@@ -19630,13 +19670,11 @@ mod tests {
         // never masks the gate.
         let named_change = GroupsUpdateParams {
             group_name: Some("New Name".into()),
-            ..base(GroupAvatarUpdate::Keep)
+            ..base(AvatarUpdate::Keep)
         };
         for params in [
             named_change,
-            base(GroupAvatarUpdate::Replace(
-                "data:image/png;base64,YQ==".into(),
-            )),
+            base(AvatarUpdate::Replace("data:image/png;base64,YQ==".into())),
         ] {
             let error = service
                 .prepare_groups_update(&params, SignalCliMode::KtEngine)
@@ -19657,7 +19695,7 @@ mod tests {
         // A keep (the key absent) is no avatar change at all: a call with no
         // other change is the §4.44 empty set, refused before the gates.
         let error = service
-            .prepare_groups_update(&base(GroupAvatarUpdate::Keep), SignalCliMode::Jvm)
+            .prepare_groups_update(&base(AvatarUpdate::Keep), SignalCliMode::Jvm)
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "INVALID_REQUEST"
@@ -19670,7 +19708,7 @@ mod tests {
             .prepare_groups_update(
                 &GroupsUpdateParams {
                     group_name: Some("New Name".into()),
-                    ..base(GroupAvatarUpdate::Keep)
+                    ..base(AvatarUpdate::Keep)
                 },
                 SignalCliMode::Jvm,
             )

@@ -6780,7 +6780,32 @@ async fn account_settings_and_blocked_faces_round_trip() {
         .collect();
     assert_eq!(profile_calls.len(), 2);
     assert_eq!(profile_calls[1]["familyName"], "");
-    assert!(profile_calls[1]["avatar"].is_null());
+    assert!(
+        profile_calls[1].get("avatar").is_some_and(Value::is_null),
+        "explicit null forwards a present avatar:null key, not a dropped key"
+    );
+
+    // Keep face: a profile call without the avatar key forwards no avatar
+    // key — absence and explicit null are distinct wire states (1.90 pin;
+    // the 1.46 Option<Value> shape folded null into absence, so this line
+    // never had a real witness before).
+    let kept = request(
+        &mut client,
+        "profile-keep",
+        "accounts.setProfile",
+        json!({
+            "accountId": account_id,
+            "givenName": "Li"
+        }),
+    )
+    .await;
+    assert_eq!(kept["result"]["status"], "saved");
+    let profile_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| params.get("givenName").is_some())
+        .collect();
+    assert_eq!(profile_calls.len(), 3);
+    assert!(profile_calls[2].get("avatar").is_none());
 
     // Profile fail-closed ladder: empty/over-bound text, non-image avatar,
     // non-canonical payload, over-budget decode, non-string avatar.

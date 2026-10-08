@@ -1186,9 +1186,9 @@
           "description": "Optional single bio emoji; omitted (or null) clears it upstream \u2014 official full-write semantics."
         },
         "avatar": {
-          "type": "string",
+          "type": ["string", "null"],
           "maxLength": 13981080,
-          "description": "Three states: absent = keep the current avatar; a data:image/*;base64, data URI whose decoded size is 1..10485760 bytes (10 MiB, the engine's stated avatar budget, AvatarHelper-scale) = replace; explicit null = remove. The maxLength is the padded-base64 encoding of the ceiling plus a fixed prefix margin — the connector enforces the decoded budget itself and answers INVALID_REQUEST before any upstream call."
+          "description": "Three states: absent = keep the current avatar; a data:image/*;base64, data URI whose decoded size is 1..10485760 bytes (10 MiB, the engine's stated avatar budget, AvatarHelper-scale) = replace; explicit null = remove (reachable since contract 1.90 — the 1.46 Option<Value> shape folded JSON null into absence, and the schema widened to null the same revision). The maxLength is the padded-base64 encoding of the ceiling plus a fixed prefix margin — the connector enforces the decoded budget itself and answers INVALID_REQUEST before any upstream call."
         }
       }
     },
