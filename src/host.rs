@@ -2547,6 +2547,29 @@ where
             )
             .await
         }
+        HostSideEvent::CallGroupIncoming {
+            account_id,
+            sender,
+            payload,
+            urgency,
+            destination_device_id,
+        } => {
+            // Contract 1.82, §4.49.2: envelope-level opaque signaling with no
+            // conversation semantics — no conversationId key exists to emit,
+            // and the destination device rides only when the engine
+            // projected one (absent stays absent, the story.received
+            // discipline).
+            let mut data = json!({
+                "accountId": account_id,
+                "sender": sender,
+                "payload": payload,
+                "urgency": urgency,
+            });
+            if let Some(device_id) = destination_device_id {
+                data["destinationDeviceId"] = json!(device_id);
+            }
+            send_shared(writer, &HostEvent::new("call.groupIncoming", data)).await
+        }
         HostSideEvent::StoryReceived {
             account_id,
             sender,

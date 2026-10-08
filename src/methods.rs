@@ -385,9 +385,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
 /// the row-level serverGuid persistence); `call-signaling` (contract
-/// revision 1.51) marks the §4.49 call signaling faces
-/// (`calls.sendSignal` plus the `call.incoming` event); `group-terminate`
-/// (contract revision 1.52) marks the §4.50 termination face
+/// revision 1.51, widened in place by 1.82) marks the §4.49 call signaling
+/// faces (`calls.sendSignal` — the 1:1 and, since 1.82, the group-addressed
+/// route — plus the `call.incoming` and `call.groupIncoming` events);
+/// `group-terminate` (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
 /// `attachment-download` (contract revision 1.61) marks the §4.54 live

@@ -5,7 +5,34 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.81 (2026-10-08; the history-import non-text expansion
+- Contract revision: 1.82 (2026-10-08; the group-signaling batch (§4.49.2):
+  the call signaling pipe grows the group leg in both directions. Inbound,
+  the v1.51 「解析失败即丢」 discipline is revised for the envelope-level
+  opaque face: opaque signaling whose (account, direct, sender) ladder
+  resolves to nothing — the group-signaling shape, since the `CallMessage`
+  proto carries no group identity and a group frame resolves only its
+  sender — forwards as the new transient `call.groupIncoming` event carrying
+  exactly the envelope's projectable fields (`accountId`, `sender`,
+  `payload` = the opaque bytes, `urgency`, `destinationDeviceId` when the
+  engine projected one) and deliberately no `conversationId`; resolved 1:1
+  frames keep `call.incoming` byte-identical and the legacy frame families
+  still drop (no group leg). Outbound, `calls.sendSignal` routes by the
+  conversation kind with no new parameter: a group conversation forwards as
+  the engine group face `{account, group, data, urgency}` — the sender-key
+  fan-out over the engine's `send_message_to_group`, the official
+  `#handleSendCallMessageToGroup` → `sendContentMessageToGroup` landing
+  mirrored as a pass-through — and refuses the payload-less legacy family
+  locally (official group signaling is opaque-only); direct keeps the
+  1:1 face verbatim. Capability `call-signaling` widened in place (no new
+  bit); the schema grows the event enum, the event def, and the sendSignal
+  descriptions. The engine group arm is the in-flight engine batch of the
+  same wave — the current engine face fails closed on the group shape and
+  the connector surfaces that verbatim as `UPSTREAM_ERROR` until it lands
+  (recorded, not worked around); `call.groupRingUpdate` stays out of this
+  batch (RingUpdate is derived inside the RingRTC layer, which the connector
+  neither runs nor parses — it lands with the ring batch; the relay v2 §3
+  alignment note names it)) —
+  previously 1.81 (2026-10-08; the history-import non-text expansion
   batch (§4.38): the engine NDJSON archive's seven backup5 row types now
   land — frame-level `adhocCall` call records and the ChatItem
   `payment`/`giftBadge`/`viewOnce`/`storyReply`/`poll`/`adminDeleted`
@@ -3180,6 +3207,95 @@ send face to them.
   upstream shape asserted on the fixture send log, urgency pass-through both faces),
   a payload-less offer refusal, and an illegal urgency refusal; the unit gate covers
   the same face split, the `legacy` projection, and the urgency enum.
+
+#### 4.49.2 Group signaling: the call.groupIncoming event + the calls.sendSignal group route (contract revision 1.82, 2026-10-08)
+
+The P4b group-call batch (blueprint `kt-signal-calling/docs/group-call-surface.md`
+§3.2 — the 810 调研 with its 风险① judgment — and the relay contract v2 draft
+`kt-signal-calling/docs/relay-api-v2.md` §3, which pins this event as the shell's
+translation source). Official anchors (Signal-Desktop `v8.31.0-alpha.1`, AGPL —
+behavior and line anchors only, zero source copied): outbound group signaling is
+`#handleSendCallMessageToGroup` (`calling.preload.ts:3338-3407`) landing in the
+sender-key fan-out `sendContentMessageToGroup`
+(`sendCallingMessage.preload.ts:99-118`); inbound signaling rides the same
+`Content.callMessage` envelope whose `CallMessage` proto carries **no group
+identity** — RingRTC self-routes the opaque bytes by the group identity embedded
+inside them, so at the envelope level a group frame resolves to nothing but its
+sender.
+
+- Why the inbound discipline had to move (the blueprint's 风险①): the 1:1 face's
+  「(account, kind, peer) ladder resolution failure → silent drop」 (§4.49) is
+  fatal for group signaling — a group frame resolves only its sender, and that
+  sender's direct conversation usually does not exist, so every group frame died
+  on the ladder and group signaling inbound was a total loss. The revision is the
+  blueprint's 方案 A: **envelope-level opaque signaling that addresses nothing
+  local forwards as the new transient `call.groupIncoming` event** with shape
+  `{accountId, sender, payload, urgency, destinationDeviceId?}` — deliberately no
+  `conversationId` (honest: the envelope carries none, and inventing one is the
+  lie only the resolved 1:1 face can afford), `payload` the opaque base64 under
+  the same 3 MiB-char receive budget, `sender` the envelope source the ladder
+  resolved (E.164 on a contacts hit, ACI otherwise), `urgency` the projected
+  wake-up bit, `destinationDeviceId` present only when the engine projected one.
+  Resolved 1:1 frames keep `call.incoming` byte-identical (the P2/P3 consumers
+  are untouched); the legacy frame families (offer/answer/ice/busy/hangup) keep
+  the silent drop when unresolvable — the proto gives them no group leg, there is
+  nothing honest to forward; a face missing its opaque material routes nothing
+  (宁缺勿错). Transient like `call.incoming`: no row, nothing persists, a missed
+  delivery is not self-healed (the RingRTC layer re-signals). The shell
+  translates the event into the relay v2 `call.groupSignal` inbound frame
+  `{conversationKey, sender, opaqueB64, urgency}` (relay-api-v2.md §2) and never
+  parses the bytes — the desktop-shell discipline is unchanged.
+- The send face: `calls.sendSignal` routes by the resolved conversation kind, no
+  new parameter (the connector already holds the kind). A **group conversation**
+  forwards as the engine group face `{account, group: <master key>, data,
+  urgency?}` — `group` is the row's peer key, the same standard-base64 master key
+  `listGroups` addresses, and the landing is the engine's
+  `send_message_to_group` sender-key fan-out, the official counterpart mirrored
+  as a pass-through. A **direct conversation** keeps the current
+  `{account, recipient, data|legacy}` verbatim. The payload-less legacy family
+  refuses `INVALID_REQUEST` locally on the group route before any upstream call
+  (official group signaling rides the opaque envelope exclusively — no precedent
+  for group-addressed bare frames, fail-closed). `callId` and `type` gate but
+  never travel (unchanged — the RingRTC payload carries its own identity), and
+  `urgency` rides through exactly as on the 1:1 face. Send lane,
+  account-scoped mutating unchanged: the group fan-out rides the same
+  write-lane mutex, so its fan-out latency is the §4.49 known-limitation class —
+  recorded here as the batch's latency characteristic. `overrideRecipients` (the
+  official fourth parameter, the partial-send face) has no connector face and
+  the engine group arm refuses it fail-closed — nothing to gate connector-side,
+  recorded honestly.
+- Capability: no new bit — `call-signaling` widened in place (the §4.49.1
+  discipline: a face extension of the same pipe). Schema: the event enum grows
+  `call.groupIncoming` with its def (required `accountId`/`sender`/`payload`/
+  `urgency`, optional `destinationDeviceId`), the `call.incoming` description
+  notes the revised unresolvable routing, and the `calls.sendSignal`
+  main/`conversationId`/`type` descriptions record the kind-split route. No
+  method enum, params-shape, or error-code change.
+- Engine compatibility (recorded, not worked around — cross-repo boundary): the
+  current engine `sendCallMessage` face is 1:1-only and fails closed on the
+  group shape (`docs/jsonrpc-compat.md` §3); the group arm (`group`/`recipient`
+  mutual exclusion over `send_message_to_group`) is the in-flight engine batch
+  of the same P4b wave. Until it lands, a group `calls.sendSignal` surfaces the
+  engine's refusal verbatim as `UPSTREAM_ERROR` — the connector invents no
+  success. The local fixture mirrors the negotiated wire face (group+recipient
+  mutual exclusion, `{timestamp}` on success) so the connector tests pin the
+  route, not the engine's interim refusal.
+- Alignment points left open: `call.groupRingUpdate` is named by relay-api-v2.md
+  §3 as this event's ring-batch counterpart and is deliberately absent here —
+  `RingUpdate` is derived inside the RingRTC layer from the opaque bytes plus
+  local state, which the connector neither runs nor parses; it lands with the
+  batch that owns that derivation. The relay v2 protocol-version gate and the
+  `call.config`/`groupControl` frame family are calling-repo faces.
+- Tests: the unit gate covers the group send route (upstream `{account, group,
+  data}`, `urgency` pass-through, no `recipient`, no traveling `callId`), the
+  group legacy refusal, the group modern-face busy-with-payload pass-through,
+  and the unresolvable-opaque routing (`sender`/`payload`/`urgency`/
+  `destinationDeviceId` carried, no row persisted; legacy and malformed faces
+  drop; a source-less face drops); the integration drill extends the signaling
+  round trip with a group send (the send log asserts the group face and the
+  absence of a `recipient` key) and an unresolvable opaque envelope (the
+  `call.groupIncoming` event arrives with no `conversationId` key and no
+  `call.incoming` fires).
 
 ### 4.50 Group termination: groups.terminate (contract revision 1.52, 2026-10-06)
 

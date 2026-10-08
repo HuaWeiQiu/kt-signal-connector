@@ -1212,6 +1212,20 @@ for line in sys.stdin:
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # Contract 1.82 group arm (the negotiated engine face): `group` and
+        # `recipient` are mutually exclusive — a malformed envelope answers
+        # the engine's -32603 parameter face and is never dispatched.
+        if bool(params.get("group")) == bool(params.get("recipient")):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "sendCallMessage requires exactly one of group, recipient",
+                },
+            }
+            emit_json(response)
+            continue
         if params.get("data") == "[fixture-call-crash]":
             os._exit(33)
         result = {"timestamp": 1727000000000}

@@ -8974,9 +8974,9 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
         .unwrap()
         .to_string();
 
-    // Stage a group envelope so the 1:1-only refusal has a real local group
-    // row to address (the runtime marker delivers it like every injected
-    // envelope; the group message materializes the group row).
+    // Stage a group envelope so the group route (1.82) has a real local
+    // group row to address (the runtime marker delivers it like every
+    // injected envelope; the group message materializes the group row).
     let signal_data = temp.path().join("signal-data");
     fs::create_dir_all(&signal_data).unwrap();
     fs::write(
@@ -9270,22 +9270,65 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
         call_lines()
     );
 
-    // The 1:1-only face: a group conversation fails closed locally — the
-    // staged group row is real local state.
-    let rejected = request(
+    // The group route (1.82): the conversation kind decides — the group
+    // conversation forwards the engine group face {account, group, data,
+    // urgency}, no recipient key ever, and the payload-less legacy family
+    // refuses locally (the send log stays at exactly one group row).
+    let group_signaled = request(
         &mut client,
-        "signal-group",
+        "call-group-offer",
         "calls.sendSignal",
         json!({
             "accountId": account_id,
             "conversationId": group_id,
             "type": "offer",
             "callId": 7,
-            "payload": "eA=="
+            "payload": "Z3JvdXAtc2lnbmFsaW5n",
+            "urgency": "handleImmediately"
         }),
     )
     .await;
-    assert_eq!(rejected["error"]["code"], "INVALID_REQUEST", "{rejected}");
+    assert_eq!(
+        group_signaled["result"]["sentAt"], 1727000000000u64,
+        "{group_signaled}"
+    );
+    let group_rows: Vec<Value> = call_lines()
+        .into_iter()
+        .filter(|params| params.get("group").is_some())
+        .collect();
+    assert_eq!(group_rows.len(), 1, "{group_rows:?}");
+    assert_eq!(group_rows[0]["account"], "+15555550100");
+    assert_eq!(group_rows[0]["group"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(group_rows[0]["data"], "Z3JvdXAtc2lnbmFsaW5n");
+    assert_eq!(group_rows[0]["urgency"], "handleImmediately");
+    assert!(
+        group_rows[0].get("recipient").is_none(),
+        "the group face carries no recipient key: {group_rows:?}"
+    );
+    let group_legacy = request(
+        &mut client,
+        "call-group-legacy",
+        "calls.sendSignal",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "type": "busy",
+            "callId": 7
+        }),
+    )
+    .await;
+    assert_eq!(
+        group_legacy["error"]["code"], "INVALID_REQUEST",
+        "{group_legacy}"
+    );
+    assert_eq!(
+        call_lines()
+            .into_iter()
+            .filter(|params| params.get("group").is_some())
+            .count(),
+        1,
+        "the local legacy refusal never reaches upstream"
+    );
 
     // Crash with the mutating signaling in flight (fixture sentinel,
     // os._exit(33)): SEND_OUTCOME_UNKNOWN, never retried across the restart.
@@ -9416,6 +9459,85 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     assert_eq!(
         incoming[1]["payload"]["iceUpdate"][0]["opaque"],
         "aW5ib3VuZC1pY2U="
+    );
+
+    // The group-incoming route (1.82): an opaque envelope from a sender with
+    // no local conversation forwards conversation-less instead of dying on
+    // the ladder — exactly one call.groupIncoming and never a call.incoming.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [{
+            "source": "+15555550107",
+            "timestamp": 1727000003000u64,
+            "callMessage": {
+                "opaque": "Z3JvdXAtb3BhcXVl",
+                "urgency": "handleImmediately",
+                "destinationDeviceId": 2
+            }
+        }] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut group_incoming: Vec<Value> = Vec::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = send_request_frame(
+            &mut client,
+            &format!("group-incoming-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        loop {
+            let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+                serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+            })
+            .await
+            {
+                Ok(frame) => frame,
+                Err(_) => panic!(
+                    "the call.groupIncoming poll drain stalled over \
+                     {HARNESS_REQUEST_TIMEOUT:?} with {group_incoming:?}:\n{}",
+                    dump_connector_crash_scene()
+                ),
+            };
+            match frame.get("event").and_then(Value::as_str) {
+                Some("call.groupIncoming") => group_incoming.push(frame["data"].clone()),
+                Some("call.incoming") => {
+                    panic!("an unresolvable opaque frame must not fire call.incoming: {frame}")
+                }
+                _ => {}
+            }
+            if frame.get("requestId").and_then(Value::as_str)
+                == Some(format!("group-incoming-poll-{attempt}").as_str())
+            {
+                break;
+            }
+        }
+        if !group_incoming.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        group_incoming.len(),
+        1,
+        "the unresolvable opaque frame must arrive conversation-less: {group_incoming:?} \
+         (marker still present: {})",
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json")
+            .exists()
+    );
+    assert_eq!(group_incoming[0]["accountId"], account_id);
+    assert_eq!(group_incoming[0]["sender"], "+15555550107");
+    assert_eq!(group_incoming[0]["payload"], "Z3JvdXAtb3BhcXVl");
+    assert_eq!(group_incoming[0]["urgency"], "handleImmediately");
+    assert_eq!(group_incoming[0]["destinationDeviceId"], 2);
+    assert!(
+        group_incoming[0].get("conversationId").is_none(),
+        "the group face carries no conversationId: {group_incoming:?}"
     );
 
     // No row was created by the signaling envelopes.

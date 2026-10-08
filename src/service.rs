@@ -587,6 +587,23 @@ pub enum HostSideEvent {
         signal_type: &'static str,
         payload: Value,
     },
+    /// Envelope-level opaque signaling whose conversation ladder resolved to
+    /// nothing (contract 1.82, §4.49.2): the group-signaling shape. The
+    /// `CallMessage` proto carries no group identity, so the envelope names
+    /// only the sender and the RingRTC payload self-routes by its embedded
+    /// identity — the connector forwards exactly the projectable envelope
+    /// fields (sender, opaque bytes, urgency, destination device) and
+    /// deliberately no conversationId: it does not know the conversation,
+    /// and inventing one would be the lie the 1:1 face can afford because
+    /// its ladder resolved. Transient like `call.incoming`; nothing
+    /// persists and nothing self-heals (the RingRTC layer re-signals).
+    CallGroupIncoming {
+        account_id: String,
+        sender: String,
+        payload: String,
+        urgency: String,
+        destination_device_id: Option<u64>,
+    },
     /// Inbound story (contract 1.76, §4.67): the engine's envelope-level
     /// `storyMessage` projection forwarded as a transient event — the
     /// connector keeps no story row and no timeline state, so a missed
@@ -3556,8 +3573,12 @@ impl ConnectorService {
     /// opaque material) and may omit the payload — the connector then routes
     /// the engine's `legacy` face instead of inventing bytes. `urgency` (1.53)
     /// is the pass-through wake-up bit (`droppable` | `handleImmediately`).
-    /// Group shapes answer INVALID_REQUEST here (the upstream 1:1 face is
-    /// contact-only — its official fail-closed).
+    /// The conversation kind decides the route (contract 1.82, §4.49.2):
+    /// a direct conversation keeps the `recipient` face verbatim; a group
+    /// conversation routes the engine group face — `{account, group: the
+    /// master key, data, urgency}` sender-key fan-out — and refuses the
+    /// payload-less legacy family locally (official group signaling is
+    /// opaque-only).
     pub fn prepare_calls_send_signal(
         &self,
         account_id: &str,
@@ -3629,10 +3650,41 @@ impl ConnectorService {
         };
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        // The group addressing arm (contract 1.82, §4.49.2): a group
+        // conversation routes the engine's group face — the sender-key
+        // fan-out (`send_message_to_group`), the official
+        // #handleSendCallMessageToGroup → sendContentMessageToGroup landing
+        // mirrored as a pass-through. The conversation kind decides the
+        // route, no new parameter: the connector already holds the kind.
+        // The legacy bare-frame family has no group leg (official group
+        // signaling rides the opaque envelope exclusively), so a payload-less
+        // busy/hangup refuses locally before any upstream call; callId and
+        // type gate but never travel (the RingRTC payload carries its own
+        // identity), and `urgency` rides through as on the 1:1 face.
+        if conversation.kind == "group" {
+            if legacy_face {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "group call signaling is opaque-only — the legacy bare frames have no group face",
+                    false,
+                )));
+            }
+            let mut upstream = json!({
+                "account": account.signal_account,
+                "group": conversation.peer_key,
+            });
+            if let Some(data) = payload {
+                upstream["data"] = json!(data);
+            }
+            if !urgency_value.is_null() {
+                upstream["urgency"] = urgency_value;
+            }
+            return Ok(upstream);
+        }
         if conversation.kind != "direct" {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "call signaling is 1:1 only — group conversations are not addressable",
+                "call signaling addresses direct or group conversations only",
                 false,
             )));
         }
@@ -5326,11 +5378,22 @@ impl ConnectorService {
             return Ok(Vec::new());
         };
         let Some(conversation) = conversation else {
-            // The engine's groupUpdated projection addresses a group master
-            // key (2026-10-06 engine batch): a group nothing local resolves is
-            // warn-only dropped — better to converge late than to invent a
-            // row (宁缺勿错). Every other control family keeps its silent
-            // skip discipline.
+            // Contract 1.82 (§4.49.2): envelope-level opaque signaling that
+            // addresses nothing local is the group-signaling shape — the
+            // CallMessage proto carries no group identity, so a group frame
+            // resolves only its sender and that sender's direct conversation
+            // usually does not exist. It forwards as the conversation-less
+            // `call.groupIncoming` instead of dying on the ladder; the
+            // RingRTC payload self-routes by its embedded identity. Every
+            // other unresolvable control family keeps its silent skip
+            // discipline (宁缺勿错), and the groupUpdated projection keeps
+            // its warn-only drop (better to converge late than to invent a
+            // row).
+            if let Some(event) =
+                group_incoming_face(&control, &account.id, receive.source.as_deref())
+            {
+                return Ok(vec![event]);
+            }
             if matches!(control, ControlReceive::GroupTimerUpdate { .. }) {
                 tracing::warn!(
                     account_id = %account.id,
@@ -5646,9 +5709,10 @@ impl ConnectorService {
             // Call signaling (contract 1.51, §4.49): no row, no local state
             // — the signaling payload forwards as the transient
             // `call.incoming` event addressed by the conversation it routed
-            // to; unresolvable conversations drop silently like every other
-            // control face (the caller has no conversation with this
-            // account, or the row predates the link).
+            // to (1:1 semantics unchanged by 1.82). The unresolvable ladder
+            // arm upstream already split off the envelope-level opaque face
+            // as `call.groupIncoming` (§4.49.2); what reaches here resolved,
+            // so the addressed conversationId is the ladder's honest answer.
             ControlReceive::Call {
                 call_id,
                 signal_type,
@@ -7896,6 +7960,50 @@ pub struct PresenceSetTypingMessageParams {
     pub conversation_id: String,
     pub stop: Option<bool>,
     pub operation_id: Option<String>,
+}
+
+/// The conversation-less group face of one unresolvable call control
+/// (contract 1.82, §4.49.2): only the opaque frame family qualifies — the
+/// official group signaling is opaque-only (`Content.callMessage` envelope,
+/// sender-key fan-out; the legacy bare frames have no group leg), so an
+/// unresolvable offer/answer/ice/busy/hangup keeps its silent skip. The
+/// event carries the envelope's projectable fields only — the sender the
+/// ladder resolved, the opaque bytes, the urgency (the projection defaults
+/// a missing one to the official droppable), the destination device when
+/// the engine projected one — and never a conversationId. A face missing
+/// its opaque material routes nothing (宁缺勿错).
+fn group_incoming_face(
+    control: &ControlReceive,
+    account_id: &str,
+    sender: Option<&str>,
+) -> Option<HostSideEvent> {
+    let ControlReceive::Call {
+        signal_type,
+        payload,
+        ..
+    } = control
+    else {
+        return None;
+    };
+    if *signal_type != "opaque" {
+        return None;
+    }
+    let sender = sender.map(str::trim).filter(|sender| !sender.is_empty())?;
+    let data = payload.get("opaque").and_then(Value::as_str)?;
+    if data.is_empty() {
+        return None;
+    }
+    Some(HostSideEvent::CallGroupIncoming {
+        account_id: account_id.to_string(),
+        sender: sender.to_string(),
+        payload: data.to_string(),
+        urgency: payload
+            .get("urgency")
+            .and_then(Value::as_str)
+            .unwrap_or("droppable")
+            .to_string(),
+        destination_device_id: payload.get("destinationDeviceId").and_then(Value::as_u64),
+    })
 }
 
 /// Upstream addressing for one resolved conversation (pinned 0.14.7 JSON-RPC
@@ -14176,15 +14284,60 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
 
-        // The 1:1-only face: a group conversation fails closed locally.
+        // The group addressing arm (1.82): the conversation kind decides the
+        // route — the group conversation forwards the engine group face (the
+        // master key as `group`, the payload as `data`), no `recipient`, and
+        // callId/type gate but never travel; `urgency` rides through.
         let group = service
             .store_ref()
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
-        let error = service
+        let group_offer = service
             .prepare_calls_send_signal(&account.id, &group.id, "offer", 7, Some("eA=="), None)
+            .unwrap();
+        assert_eq!(group_offer["account"], "+15555550100");
+        assert_eq!(group_offer["group"], "Z3JvdXAtaWQ=");
+        assert_eq!(group_offer["data"], "eA==");
+        assert!(
+            group_offer.get("recipient").is_none(),
+            "the group face has no recipient key"
+        );
+        assert!(
+            group_offer.get("callId").is_none() && group_offer.get("type").is_none(),
+            "callId and type gate but never travel"
+        );
+        let group_urgent = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &group.id,
+                "ice",
+                u32::MAX,
+                Some("aWNl"),
+                Some("handleImmediately"),
+            )
+            .unwrap();
+        assert_eq!(group_urgent["group"], "Z3JvdXAtaWQ=");
+        assert_eq!(group_urgent["urgency"], "handleImmediately");
+        // The legacy bare-frame family has no group leg: a payload-less
+        // busy/hangup refuses locally before any upstream shape, while a
+        // busy carrying a payload keeps the modern data route verbatim (the
+        // connector never inspects content, so an explicit payload forwards).
+        let error = service
+            .prepare_calls_send_signal(&account.id, &group.id, "busy", 7, None, None)
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_calls_send_signal(&account.id, &group.id, "hangup", 9, None, None)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let group_modern_busy = service
+            .prepare_calls_send_signal(&account.id, &group.id, "busy", 7, Some("eA=="), None)
+            .unwrap();
+        assert_eq!(group_modern_busy["data"], "eA==");
+        assert!(
+            group_modern_busy.get("legacy").is_none(),
+            "a payload on a legacy type keeps the modern data route"
+        );
 
         // The state face: the honest empty registry, idempotent across
         // repeats, and an unknown account still refuses.
@@ -14255,6 +14408,147 @@ mod tests {
         assert_eq!(payload["offer"]["opaque"], "c2Rw");
 
         // Nothing persisted: no row, no store write, nothing to self-heal.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(listed.items.is_empty(), "no row may be created");
+    }
+
+    /// The group-incoming route (contract 1.82, §4.49.2): envelope-level
+    /// opaque signaling whose ladder resolves to nothing forwards as exactly
+    /// one transient CallGroupIncoming event — the projectable envelope
+    /// fields verbatim, no conversationId anywhere, no row. The legacy
+    /// families (no group leg), a malformed opaque face, and a source-less
+    /// face keep the silent skip.
+    #[test]
+    fn unresolved_opaque_signaling_routes_group_incoming() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let receive = |source: Option<&str>, control: crate::engine::ControlReceive| {
+            crate::engine::NormalizedReceive {
+                timestamp: Some(1727000000000),
+                content_kind: "control",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".to_string()),
+                source: source.map(str::to_string),
+                source_uuid: None,
+                peer_name: None,
+                group_id: None,
+                text: None,
+                text_bytes: None,
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                control: Some(control),
+                expire_seconds: None,
+                expire_start_at: None,
+                server_guid: None,
+            }
+        };
+        let opaque = |payload: Value| crate::engine::ControlReceive::Call {
+            call_id: 0,
+            signal_type: "opaque",
+            payload,
+        };
+
+        // A group frame from a sender with no direct conversation: exactly
+        // one conversation-less event carrying the envelope's projectable
+        // fields; a null destination device stays an absent key.
+        let events = service
+            .ingest_receive(
+                receive(
+                    Some("+15555550109"),
+                    opaque(json!({
+                        "opaque": "Z3JvdXAtc2lnbmFsaW5n",
+                        "urgency": "handleImmediately",
+                        "destinationDeviceId": Value::Null,
+                    })),
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallGroupIncoming {
+            account_id,
+            sender,
+            payload,
+            urgency,
+            destination_device_id,
+        } = &events[0]
+        else {
+            panic!("expected a CallGroupIncoming event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(sender, "+15555550109");
+        assert_eq!(payload, "Z3JvdXAtc2lnbmFsaW5n");
+        assert_eq!(urgency, "handleImmediately");
+        assert!(destination_device_id.is_none(), "null stays absent");
+
+        // destinationDeviceId rides only when the engine projected one; a
+        // missing urgency reads as the official droppable default.
+        let events = service
+            .ingest_receive(
+                receive(
+                    Some("+15555550109"),
+                    opaque(json!({
+                        "opaque": "Z3JvdXAtc2lnbmFsaW5n",
+                        "destinationDeviceId": 3,
+                    })),
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let HostSideEvent::CallGroupIncoming {
+            urgency,
+            destination_device_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected a CallGroupIncoming event: {events:?}");
+        };
+        assert_eq!(urgency, "droppable");
+        assert_eq!(*destination_device_id, Some(3));
+
+        // The silent-skip faces: an unresolvable legacy offer (no group leg),
+        // a malformed opaque face (no material), and a source-less opaque
+        // frame (no sender to name).
+        for (label, control) in [
+            (
+                "legacy-unresolved",
+                crate::engine::ControlReceive::Call {
+                    call_id: 7,
+                    signal_type: "offer",
+                    payload: json!({ "offer": { "id": 7 } }),
+                },
+            ),
+            ("opaque-blank", opaque(json!({ "urgency": "droppable" }))),
+        ] {
+            let events = service
+                .ingest_receive(
+                    receive(Some("+15555550109"), control),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap();
+            assert!(events.is_empty(), "{label}: {events:?}");
+        }
+        let events = service
+            .ingest_receive(
+                receive(
+                    None,
+                    opaque(json!({ "opaque": "Z3JvdXA=", "urgency": "droppable" })),
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "no sender, no event: {events:?}");
+
+        // Nothing persisted anywhere: the group face is as rowless as the
+        // 1:1 face.
         let listed = service
             .store_ref()
             .list_messages(&account.id, &conversation.id, 50, None)

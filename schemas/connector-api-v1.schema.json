@@ -1855,19 +1855,19 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId", "type", "callId"],
-      "description": "Forward one outbound call-signaling frame (contract revision 1.55, §4.49, capability call-signaling): the connector shape-gates the envelope — type against the RingRTC 1:1 frame-family enum, callId a positive integer (u32 face, the legacy frames' id address space), payload mandatory (non-empty, ≤ 3,145,728 chars, the coarse envelope of the same budget the receive face enforces) for the modern faces offer/answer/ice and optional (absent) for the legacy busy/hangup family — the official proto bare frames CallMessage{busy{id}} / CallMessage{hangup{...}} carry no opaque field (RingRTC 2.72.1 emits them opaque-less, verified in the P1 device experiment), so a payload-less busy/hangup routes the engine sendCallMessage legacy face instead of inventing bytes — resolves the local conversation row (CONVERSATION_NOT_FOUND before any upstream call; direct conversations only, the upstream sendCallMessage face is contact-only and a group shape fails closed) and forwards the signaling payload byte-for-byte as the engine's {account, recipient, data|legacy} upstream face. urgency (1.55) is the optional pass-through wake-up bit forwarded to the engine's CallMessage{opaque{urgency}} (absent = the engine's droppable default). The connector never parses, validates, or logs the signaling content: the engine owns the transport face (Content.callMessage=3, official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) and the desktop + calling sidecar's RingRTC state machine parses the frames. Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. The result {sentAt} is the engine's envelope timestamp — a send ack, not call state.",
+      "description": "Forward one outbound call-signaling frame (contract revision 1.82, \u00a74.49, capability call-signaling): the connector shape-gates the envelope \u2014 type against the RingRTC 1:1 frame-family enum, callId a positive integer (u32 face, the legacy frames' id address space), payload mandatory (non-empty, \u2264 3,145,728 chars, the coarse envelope of the same budget the receive face enforces) for the modern faces offer/answer/ice and optional (absent) for the legacy busy/hangup family \u2014 the official proto bare frames CallMessage{busy{id}} / CallMessage{hangup{...}} carry no opaque field (RingRTC 2.72.1 emits them opaque-less, verified in the P1 device experiment), so a payload-less busy/hangup routes the engine sendCallMessage legacy face instead of inventing bytes \u2014 resolves the local conversation row (CONVERSATION_NOT_FOUND before any upstream call) and routes by the conversation kind (1.82, no new parameter \u2014 the connector already holds the kind): a direct conversation forwards byte-for-byte as the engine's {account, recipient, data|legacy} 1:1 face; a group conversation routes the engine group face {account, group (the master key, the same reference listGroups addresses), data, urgency} \u2014 the sender-key fan-out (send_message_to_group), the official #handleSendCallMessageToGroup \u2192 sendContentMessageToGroup landing mirrored as a pass-through \u2014 and refuses the payload-less legacy family locally (official group signaling rides the opaque envelope exclusively; callId and type gate but never travel). urgency (1.55) is the optional pass-through wake-up bit forwarded to the engine's CallMessage{opaque{urgency}} (absent = the engine's droppable default). The connector never parses, validates, or logs the signaling content: the engine owns the transport face (Content.callMessage=3, official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) and the desktop + calling sidecar's RingRTC state machine parses the frames. Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply (the group fan-out's latency rides the same lane \u2014 a known, recorded characteristic); an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. The result {sentAt} is the engine's envelope timestamp \u2014 a send ack, not call state.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": {
           "type": "string",
           "minLength": 1,
           "maxLength": 256,
-          "description": "The direct conversation the signaling addresses; resolved against the account before any upstream call."
+          "description": "The conversation the signaling addresses; resolved against the account before any upstream call. The kind decides the route (1.82): direct keeps the 1:1 recipient face, group routes the engine sender-key fan-out face."
         },
         "type": {
           "type": "string",
           "enum": ["offer", "answer", "ice", "busy", "hangup"],
-          "description": "The RingRTC 1:1 frame family the frame carries. offer/answer/ice demand payload (the RingRTC-serialized opaque material); busy/hangup may omit it (the legacy bare-frame family, engine-built from the callId). Gated for the route decision and the desktop-side logging/routing honesty; the payload itself is self-describing."
+          "description": "The RingRTC 1:1 frame family the frame carries. offer/answer/ice demand payload (the RingRTC-serialized opaque material); busy/hangup may omit it (the legacy bare-frame family, engine-built from the callId) on a direct conversation \u2014 on a group conversation the payload-less legacy family refuses locally (group signaling is opaque-only). Gated for the route decision and the desktop-side logging/routing honesty; the payload itself is self-describing."
         },
         "callId": {
           "type": "integer",
@@ -2578,6 +2578,7 @@
             "message.viewOnceOpened",
             "message.expired",
             "call.incoming",
+            "call.groupIncoming",
             "story.received"
           ]
         },
@@ -2750,7 +2751,7 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["accountId", "conversationId", "callId", "type", "payload"],
-                "description": "Inbound call signaling (contract 1.51, §4.49, capability call-signaling): the engine's callMessage envelope face (official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) forwarded as a transient event — nothing persists, so a missed delivery is not self-healed (the RingRTC layer re-signals; the connector keeps no call state to reconcile). type is the projected frame family (opaque when only the modern opaque payload rides); payload is the bounded signaling material verbatim — the connector neither parses nor logs it. Delivered to a conversation the connector already resolves; unresolvable signaling drops silently.",
+                "description": "Inbound call signaling (contract 1.51, §4.49, capability call-signaling): the engine's callMessage envelope face (official Signal-Desktop RingRTC behavior aligned, AGPL zero-copy) forwarded as a transient event — nothing persists, so a missed delivery is not self-healed (the RingRTC layer re-signals; the connector keeps no call state to reconcile). type is the projected frame family (opaque when only the modern opaque payload rides); payload is the bounded signaling material verbatim — the connector neither parses nor logs it. Delivered to a conversation the connector already resolves (1:1 semantics unchanged by 1.82); signaling whose ladder resolves to nothing no longer drops — an opaque frame forwards as the conversation-less call.groupIncoming (§4.49.2), and the legacy frame families still drop silently (no group leg).",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -2768,6 +2769,48 @@
                   "payload": {
                     "type": "object",
                     "description": "The engine's projected signaling face verbatim: {opaque, urgency, destinationDeviceId} on the modern face, the projected frame under its own key (offer/answer/busy/hangup) or {iceUpdate: [...]} on the legacy faces. The connector never parses the RingRTC content."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "call.groupIncoming" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "sender", "payload", "urgency"],
+                "description": "Envelope-level opaque call signaling whose conversation ladder resolved to nothing (contract 1.82, \u00a74.49.2, capability call-signaling): the group-signaling shape. The CallMessage proto carries no group identity, so a group frame resolves only its sender and that sender's direct conversation usually does not exist \u2014 the v1.51 discipline dropped such frames silently, which killed group signaling inbound; this event forwards them instead. The connector emits exactly the envelope's projectable fields and deliberately no conversationId (it does not know the conversation and refuses to invent one); the RingRTC payload inside self-routes by its embedded identity, so the desktop + calling sidecar consume the bytes without the connector or the shell classifying them (the shell never parses signaling bytes \u2014 discipline unchanged). A 1:1 frame whose sender resolves keeps the call.incoming semantics byte-identical; the legacy frame families (offer/answer/ice/busy/hangup) have no group leg and still drop silently when unresolvable. Transient: nothing persists, a missed delivery is not self-healed (the RingRTC layer re-signals).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "sender": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The envelope's sender as the upstream resolved it (E.164 on a contacts hit, ACI otherwise) \u2014 the only identity the envelope carries."
+                  },
+                  "payload": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 3145728,
+                    "description": "The opaque signaling bytes (base64, the same 3 MiB-char receive-face budget), forwarded verbatim \u2014 never parsed, classified, or logged by the connector."
+                  },
+                  "urgency": {
+                    "type": "string",
+                    "enum": ["droppable", "handleImmediately"],
+                    "description": "The opaque envelope's wake-up bit as the engine projected it (a missing proto urgency projects droppable)."
+                  },
+                  "destinationDeviceId": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 4294967295,
+                    "description": "The envelope's destination device when the engine projected one; the key is absent otherwise (never null)."
                   }
                 }
               }
