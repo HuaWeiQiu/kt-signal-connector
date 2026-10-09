@@ -353,6 +353,18 @@ pub const METHODS: &[MethodRow] = &[
     // every mode), so no capability seam. Advertised through the existing
     // `stories` tag (widened in place, the 1.82 call-signaling precedent).
     ("stories.markViewed", Lane::Send, true, "send"),
+    // Story reaction send (contract 1.94, §4.77): mutating send-lane
+    // upstream traffic, the messages.sendReaction send class verbatim
+    // (confirmed `sent`, indeterminate `unknown`, a definite error
+    // propagates, nothing retries), with the row-addressed ladder replaced
+    // by the story anchor (storyAuthor + storySentAt) the caller's story
+    // timeline owns. The upstream face is the pinned upstream's own
+    // `sendReaction --story`; the kt-engine face has no story-reaction send
+    // and answers CAPABILITY_UNAVAILABLE after local validation (the §4.53
+    // engine-gap precedent). Rowless: no local write, no event. Advertised
+    // through the existing `stories` tag (widened in place, the 1.82
+    // call-signaling precedent).
+    ("stories.sendReaction", Lane::Send, true, "send"),
     // Story-anchored attachment byte faces (contract revision 1.86, §4.71):
     // the story byte channel — stories land in no conversation row (§4.67),
     // so the row-anchored `attachments.download` can never address one and
@@ -506,7 +518,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// `stories.downloadAttachment` / `stories.openAttachment` story-anchored
 /// attachment byte faces — the caller-supplied pointer channel with its
 /// fail-closed shape gate, plus the handle mint over the landed file; the
-/// same no-new-bit discipline). They never
+/// same no-new-bit discipline) and by revision 1.94 (the
+/// `stories.sendReaction` story-anchored reaction send plus the `viewedAt`
+/// projection key on message rows and `message.statusChanged`; the same
+/// no-new-bit discipline). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -632,6 +647,7 @@ mod tests {
             "messages.sendStory",
             "stories.setDisabled",
             "stories.markViewed",
+            "stories.sendReaction",
             "stories.downloadAttachment",
         ];
         let mutating = [
@@ -681,6 +697,7 @@ mod tests {
             "messages.sendStory",
             "stories.setDisabled",
             "stories.markViewed",
+            "stories.sendReaction",
             "stories.downloadAttachment",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

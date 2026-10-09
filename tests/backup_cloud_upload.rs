@@ -120,6 +120,7 @@ fn seed_direct_history(store: &Store, account_id: &str) {
         edits: Vec::new(),
         delivered_at: None,
         read_at: None,
+        viewed_at: None,
         sticker: None,
         expire_seconds: None,
         expire_start_at: None,

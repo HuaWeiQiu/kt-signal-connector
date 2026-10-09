@@ -756,6 +756,18 @@ fn schema_numeric_bounds_match_code_constants() {
             "maxLength",
             MAX_OPAQUE_ID_BYTES as u64,
         ),
+        // Story reaction send (contract 1.94, §4.77): same story-author
+        // bound, and the reaction emoji rides the shared 32-byte cap.
+        (
+            "/$defs/storiesSendReactionParams/properties/storyAuthor",
+            "maxLength",
+            MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        (
+            "/$defs/storiesSendReactionParams/properties/emoji",
+            "maxLength",
+            MAX_EMOJI_BYTES as u64,
+        ),
         // Official-desktop snapshot import (contract 1.78, §4.68): the
         // caller-chosen directory path is shape-gated by the connector
         // (absolute, 1..4096 bytes) before any engine traffic — the connector

@@ -50,7 +50,7 @@ use crate::service::{
     MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
     SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSetDisabledParams, UsernameLookupParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1691,6 +1691,26 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Story reaction send (contract 1.94, §4.77): the stories.markViewed
+        // dispatch shape — params shape errors answer INVALID_REQUEST, the
+        // answer is {status: sent|unknown}; a definite upstream error
+        // propagates (send class, not receipt class).
+        "stories.sendReaction" => {
+            match serde_json::from_value::<StoriesSendReactionParams>(request.params) {
+                Ok(params) => match runtime.send_story_reaction(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.sendReaction params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "messages.retryText" => {
             match serde_json::from_value::<MessagesRetryTextParams>(request.params) {
                 Ok(params) => {
@@ -2729,9 +2749,11 @@ where
             status,
             delivered_at,
             read_at,
+            viewed_at,
         } => {
             // Contract 1.32: receipt stamps ride only when the transition
-            // wrote them — absent keys keep the host merge total.
+            // wrote them — absent keys keep the host merge total. Contract
+            // 1.94: the viewed stamp (§4.77) follows the same discipline.
             let mut payload = json!({
                 "accountId": account_id,
                 "messageId": message_id,
@@ -2742,6 +2764,9 @@ where
             }
             if let Some(at) = read_at {
                 payload["readAt"] = json!(at);
+            }
+            if let Some(at) = viewed_at {
+                payload["viewedAt"] = json!(at);
             }
             send_shared(writer, &HostEvent::new("message.statusChanged", payload)).await
         }
