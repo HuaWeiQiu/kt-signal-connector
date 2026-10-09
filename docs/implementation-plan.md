@@ -5,7 +5,28 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.90 (2026-10-09; the setProfile avatar tri-state repair (§4.45): the
+- Contract revision: 1.91 (2026-10-09; the story link-preview url/title metadata batch (§4.74):
+  the §4.71 second-phase item "story text/preview-image dispatch" lands its metadata half —
+  `messages.sendStory` grows two independently optional keys, `previewUrl` (present ⇒ non-empty,
+  ≤2048 chars, `https://`-prefix — the official `isValidLink` https-only posture, unlike the
+  §5.10 message link-preview face which admits both schemes) and `previewTitle` (present ⇒
+  non-empty, ≤1024 UTF-8 bytes, the §5.10 title budget); every violation answers the
+  deterministic INVALID_REQUEST retryable=false ahead of the account ladder and the mode seam —
+  a violating value is never silently dropped and never forwarded; past the gates both ride the
+  engine frame verbatim as the camelCase keys beside the byte-identical `previewImage` pointer
+  key (the parallel engine batch composes the proto `Preview{url,title,image}` and the
+  `project_story_message` `preview.url`/`preview.title` projection). Receive/verify half: the
+  story receive chain was audited hop by hop and is a verbatim pipe with no key whitelist
+  anywhere — engine envelope `storyMessage` → `bounded_story_material` (whole-object clone,
+  serialized-size bound only) → `ControlReceive::Story` → the transient `story.received`
+  event's `story` object — so the new sub-keys reach the desktop naturally; regression tests
+  pin `preview.url`/`preview.title` (plus an unnamed key proving the no-whitelist posture) at
+  the engine normalization, the service event, and the host wire frame, and the supervisor wire
+  chain pins the camelCase keys on the full-option sendStory dispatch (lean frame stays
+  key-free). No new method/event/error code/capability (`stories` widened in place, the 1.82
+  no-new-bit precedent); no store version change; schema grows the two params properties
+  (maxLength pairs keyed to the new constants, the url `pattern` pinning the https prefix) and
+  the method description — previously 1.90 (2026-10-09; the setProfile avatar tri-state repair (§4.45): the
   explicit-null remove arm was unreachable on the real wire path — serde's `Option<Value>`
   folds a JSON null into absence at the option layer, so the service ladder's
   `Some(Value::Null)` arm was dead code and every explicit-null call silently kept the
@@ -5424,10 +5445,12 @@ re-runs the byte machine it already runs for rows.
   (`ENGINE_STRUCTURED_ERROR_CODES` unchanged). Second-phase items recorded
   deliberately: media-tier story size profiles (the 100 MiB transit
   ceiling already bounds every caller; a story-specific profile adds a
-  second truth without a consumer), story text/preview-image dispatch
-  (the face is pointer-shaped, not story-part-shaped — the same face
-  serves a preview image pointer today), and the desktop viewer wiring
-  (`story.received` → its store → this face pair) is the consumer batch's.
+  second truth without a consumer — still recorded, unworked), and the
+  desktop viewer wiring (`story.received` → its store → this face pair) is
+  the consumer batch's. The story text/preview-image dispatch item landed
+  with contract 1.91 (§4.74): the pointer face is unchanged — the
+  url/title metadata surface joined the send face and the receive
+  projection carries the engine's `textAttachment.preview` verbatim.
 
 Tests: the shape gate ladder (`service.rs` — the media capability first,
 the id/size/locator-cap holes, the account ladder after the parameter
@@ -5701,6 +5724,78 @@ the code is the connector's own voice), the ladder order, and the mode
 seam. The schema-consistency scans cover the method set, the error-code
 set, and the five new bounds pairs (rootKey ×2 = 28, roomId = 44, groupId
 ×2 = 44).
+
+### 4.74 Story link-preview metadata: `messages.sendStory` `previewUrl`/`previewTitle` + the receive projection's verbatim preview (contract revision 1.91, 2026-10-09)
+
+The §4.71 second-phase item "story text/preview-image dispatch" lands its
+metadata half: a story's link preview is no longer pointer-only. The
+caller names the url and title on the send face, and the receive
+projection — audited, not widened — already carries whatever the engine
+projects under `textAttachment.preview` verbatim. The official anchors:
+the story textAttachment's preview mirrors the message link preview
+(signal-desktop `ts/protobuf/SignalProto.ts` TextAttachment.preview, AGPL
+read-only anchor), and the official `isValidLink` gate is https-only for
+the url face — the connector mirrors it fail-closed on the send side.
+
+- **`messages.sendStory` grows two independently optional keys** (every
+  existing key byte-identical, `previewImage` behavior unchanged):
+  `previewUrl` — when present it must be non-empty, at most 2048
+  characters (the §5.10 url budget mirrored), and start with `https://`
+  (the official `isValidLink` posture; `http://` answers INVALID_REQUEST,
+  unlike the §5.10 message link-preview face which still admits both
+  schemes upstream); `previewTitle` — when present it must be non-empty
+  and at most 1024 UTF-8 bytes (the §5.10 title budget mirrored). Either
+  key may ride alone; absence (or null) means the key is never sent — no
+  empty-string placeholder reaches the engine frame. Every violation
+  answers the deterministic INVALID_REQUEST retryable=false ahead of the
+  account ladder and the mode seam (the §4.67 validation-first order): a
+  violating value is never silently dropped and never forwarded. Past the
+  gates both values ride the engine frame verbatim as the camelCase keys
+  `previewUrl`/`previewTitle` beside the existing `previewImage` pointer
+  key — the parallel engine batch composes the proto
+  `Preview{url,title,image}` and owns the `project_story_message`
+  `preview.url`/`preview.title` projection (Some-non-empty only, absent
+  key otherwise); this repository forwards what the contract pins.
+- **Receive/verify: the chain was already a verbatim pipe — pinned, not
+  widened.** The story receive chain is a passthrough at every hop: the
+  engine envelope's `storyMessage` object is bounded (serialized ≤ 3 MiB,
+  `bounded_story_material` — a whole-object clone, the only guard) but
+  never reshaped (src/engine.rs), rides `ControlReceive::Story` → the
+  transient `HostSideEvent::StoryReceived` after the stories-disabled
+  gate (src/service.rs), and forwards as the `story.received` event's
+  `story` object byte-for-byte (src/host.rs). There is no key whitelist
+  to widen anywhere on the chain, so the engine-side 1.91 sub-keys reach
+  the desktop naturally. Regression tests pin the new sub-keys — plus an
+  unnamed sibling key proving the no-whitelist posture — at three points
+  (the engine normalization, the service event, the host wire frame), so
+  a future reshape cannot strip them silently.
+- **Boundary**: zero engine-repo changes on this side (the engine's own
+  batch owns `sendStory`'s new params and the projection keys); the
+  JVM/native seam still answers CAPABILITY_UNAVAILABLE after validation
+  (the §4.67 mode seam); no new method, event, error code, or capability
+  (`stories` widened in place, the 1.82 no-new-bit precedent); no store
+  version change. The schema grows the two `messagesSendStoryParams`
+  properties (maxLength pairs keyed to the new
+  `MAX_STORY_PREVIEW_URL_CHARS`/`MAX_STORY_PREVIEW_TITLE_BYTES`
+  constants, the url `pattern` `^https://` pinning the prefix) and the
+  method description's metadata sentence.
+
+Tests: the unit gate ladder with the verbatim ride and the independent
+absence arms (`service.rs` — the happy keys composed with the unchanged
+`previewImage`, non-https/empty/over-cap url holes, empty/over-cap
+multibyte title holes, gate-before-account ordering, the mode seam after
+the gates, url-alone/title-alone frames carrying no sibling key); the
+engine-side verbatim normalization pin (`engine.rs` — preview url/title
+plus an unnamed key all ride the story control); the service event pin
+(`service.rs` — `StoryReceived` carries the preview metadata verbatim);
+the host wire pin (`host.rs` — the `story.received` frame carries
+`story.textAttachment.preview.url`/`.title` byte-for-byte, absent
+identities stay absent); the supervisor wire chain (`supervisor.rs` — the
+full-option sendStory dispatch through the fake engine carries the
+camelCase keys, the lean frame stays free of them, and the pre-existing
+lean/full assertions keep `previewImage` behavior pinned); and the schema
+diff (the two maxLength pairs + the `pattern` in
+`tests/schema_consistency.rs`).
 
 ## 5. signal-cli Boundary
 

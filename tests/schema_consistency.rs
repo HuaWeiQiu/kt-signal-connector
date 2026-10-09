@@ -43,7 +43,8 @@ use kt_signal_connector::service::{
     MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
     MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS,
     MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS,
-    MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    MAX_STORY_PREVIEW_TITLE_BYTES, MAX_STORY_PREVIEW_URL_CHARS, MAX_TEXT_BYTES,
+    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
     STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
     USERNAME_MAX_WIRE_CHARS,
 };
@@ -731,6 +732,20 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesSendStoryParams/properties/recipients/items",
             "maxLength",
             MAX_OPAQUE_ID_BYTES as u64,
+        ),
+        // Story link-preview metadata (contract 1.91, §4.74): the url/title
+        // budgets mirror the prepare-ladder constants; the url's
+        // `pattern` (^https://) is the official isValidLink posture and is
+        // structural (no constant to pair).
+        (
+            "/$defs/messagesSendStoryParams/properties/previewUrl",
+            "maxLength",
+            MAX_STORY_PREVIEW_URL_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendStoryParams/properties/previewTitle",
+            "maxLength",
+            MAX_STORY_PREVIEW_TITLE_BYTES as u64,
         ),
         // Story viewed receipt (contract 1.85, §4.70): the story-author
         // bound mirrors the story recipients' per-entry bound (the receipt's

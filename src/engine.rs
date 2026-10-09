@@ -5415,6 +5415,48 @@ mod tests {
         assert!(plain.rich.is_none() || !plain.rich.as_ref().unwrap().is_group_update);
     }
 
+    /// Story preview metadata rides verbatim (contract 1.91, §4.74): the
+    /// engine's `textAttachment.preview` projection — the 1.91
+    /// `url`/`title` keys and any key projected after them — forwards into
+    /// the story control receive untouched. The bounded story material is a
+    /// whole-object clone, never a reshape: this pin fails if a future
+    /// projection or bound starts whitelisting keys.
+    #[test]
+    fn story_preview_metadata_routes_verbatim() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "storyMessage": {
+                    "textAttachment": {
+                        "text": "story body",
+                        "preview": {
+                            "url": "https://example.com/a",
+                            "title": "Example",
+                            "someLaterKey": {"rides": true},
+                        },
+                    },
+                    "allowsReplies": true,
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.content_kind, "storyMessage");
+        assert_eq!(normalized.direction, "incoming");
+        let Some(ControlReceive::Story { message }) = normalized.control else {
+            panic!("expected a story control");
+        };
+        let preview = &message["textAttachment"]["preview"];
+        assert_eq!(preview["url"], json!("https://example.com/a"));
+        assert_eq!(preview["title"], json!("Example"));
+        // No whitelist: keys the 1.91 contract never named ride the same
+        // object — the face is a bounded clone, not a reshape.
+        assert_eq!(preview["someLaterKey"], json!({ "rides": true }));
+        assert_eq!(message["textAttachment"]["text"], "story body");
+        assert_eq!(message["allowsReplies"], true);
+    }
+
     /// Story replies (contract 1.76, §4.67): `dataMessage.storyReply`
     /// parses onto the rich payload as {authorAci, sentTimestamp}; a
     /// degraded face (missing timestamp, blank author) drops the key and

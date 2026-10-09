@@ -2708,7 +2708,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "message", "recipients"],
-      "description": "Post one story (contract revision 1.76, §4.67, capability stories) through the engine's sendStory face (engine compat §3). There is no clientRequestId and no conversation addressing: a story lands in no conversation row, so there is no pending settlement — the synchronous result is {timestamp, results: [{recipientNumber, success: {timestamp}}]} and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN without retry. recipients is the caller-computed expansion (1..1001 entries, each 1..128 chars): the desktop owns v1 list storage — the official desktop expands My story from its own connections minus exclusions and custom lists from its own member tables (ts/util/sendStoryMessage.preload.ts:87-116) — so the connector neither re-expands nor filters. distributionListId is the official isStoryDistributionId face mirrored fail-closed: absent means the official My story zero UUID (00000000-0000-0000-0000-000000000000), any other value must be a strict 36-char UUID and passes through lowercased (normalizeStoryDistributionId); anything else is the officially unreachable shape and answers INVALID_REQUEST. textStyle is the official TextDisplayStyle vocabulary (DEFAULT = the key omitted on the engine frame); bodyRanges ride the §4.62 write face verbatim (64-entry cap, unknown style fails closed). previewImage is a data URI within the avatar frame budget. JVM/native modes answer CAPABILITY_UNAVAILABLE (retryable=false): the pinned signal-cli has no story send face. Send lane, account-scoped mutating.",
+      "description": "Post one story (contract revision 1.76, §4.67; the link-preview metadata keys joined with 1.91, §4.74, capability stories) through the engine's sendStory face (engine compat §3). There is no clientRequestId and no conversation addressing: a story lands in no conversation row, so there is no pending settlement — the synchronous result is {timestamp, results: [{recipientNumber, success: {timestamp}}]} and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN without retry. recipients is the caller-computed expansion (1..1001 entries, each 1..128 chars): the desktop owns v1 list storage — the official desktop expands My story from its own connections minus exclusions and custom lists from its own member tables (ts/util/sendStoryMessage.preload.ts:87-116) — so the connector neither re-expands nor filters. distributionListId is the official isStoryDistributionId face mirrored fail-closed: absent means the official My story zero UUID (00000000-0000-0000-0000-000000000000), any other value must be a strict 36-char UUID and passes through lowercased (normalizeStoryDistributionId); anything else is the officially unreachable shape and answers INVALID_REQUEST. textStyle is the official TextDisplayStyle vocabulary (DEFAULT = the key omitted on the engine frame); bodyRanges ride the §4.62 write face verbatim (64-entry cap, unknown style fails closed). previewImage is a data URI within the avatar frame budget. previewUrl/previewTitle (1.91, §4.74) are independently optional link-preview metadata: each, when present, must be non-empty and within its budget (url 2048 chars, title 1024 UTF-8 bytes) and the url must start https:// (the official isValidLink posture — unlike the messages.sendText link preview both schemes are not admitted here); violations answer the deterministic INVALID_REQUEST before the account ladder, and past the gates both ride the engine frame verbatim as the camelCase keys beside the unchanged previewImage pointer key (the engine composes the proto Preview{url,title,image}). On the receive half the engine-projected textAttachment.preview{url,title} rides the story.received event verbatim (the projection is a bounded clone, never a reshape — no whitelist to widen, pinned by the 1.91 regression tests). JVM/native modes answer CAPABILITY_UNAVAILABLE (retryable=false): the pinned signal-cli has no story send face. Send lane, account-scoped mutating.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "message": {
@@ -2767,6 +2767,19 @@
           "minLength": 1,
           "maxLength": 13981080,
           "description": "Optional story preview as a data URI within the avatar frame budget."
+        },
+        "previewUrl": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^https://",
+          "description": "Optional story link-preview url (contract revision 1.91, §4.74): non-empty, at most 2048 characters, https-only (the official isValidLink posture — http:// answers INVALID_REQUEST). Independently optional of previewTitle; past the gate the value rides the engine frame verbatim."
+        },
+        "previewTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Optional story link-preview title (contract revision 1.91, §4.74): non-empty, at most 1024 UTF-8 bytes. Independently optional of previewUrl; past the gate the value rides the engine frame verbatim."
         }
       }
     },

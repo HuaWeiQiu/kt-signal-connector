@@ -3520,4 +3520,67 @@ mod tests {
         mac.update(API_VERSION.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
+
+    /// The `story.received` wire frame (contract 1.91, §4.74): the story
+    /// object rides the event payload verbatim — the engine-projected
+    /// `textAttachment.preview.url`/`.title` reach the desktop byte-for-byte
+    /// (and a key the contract never named rides the same way), while the
+    /// absent-optional identity discipline keeps masked sources absent.
+    #[tokio::test]
+    async fn story_received_event_rides_the_story_projection_verbatim() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::StoryReceived {
+                account_id: "acct-1".into(),
+                sender: Some("+15555550101".into()),
+                sender_aci: Some("22222222-2222-2222-2222-222222222222".into()),
+                sender_name: None,
+                timestamp: Some(1727000002000u64),
+                story: json!({
+                    "textAttachment": {
+                        "text": "story body",
+                        "preview": {
+                            "url": "https://example.com/a",
+                            "title": "Example",
+                            "someLaterKey": {"rides": true},
+                        },
+                    },
+                    "allowsReplies": true,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let line = timeout(Duration::from_millis(500), async {
+            Framed::new(&mut server, LinesCodec::new()).next().await
+        })
+        .await
+        .expect("the event frame must flush")
+        .unwrap()
+        .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "story.received");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        let story = &frame["data"]["story"];
+        assert_eq!(
+            story["textAttachment"]["preview"]["url"],
+            json!("https://example.com/a")
+        );
+        assert_eq!(
+            story["textAttachment"]["preview"]["title"],
+            json!("Example")
+        );
+        assert_eq!(
+            story["textAttachment"]["preview"]["someLaterKey"],
+            json!({ "rides": true })
+        );
+        // The absent-optional discipline: a missing identity stays absent.
+        assert!(frame["data"].get("senderName").is_none());
+        assert_eq!(frame["data"]["timestamp"], 1727000002000u64);
+    }
 }

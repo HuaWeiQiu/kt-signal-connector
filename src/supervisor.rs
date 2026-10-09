@@ -8754,6 +8754,10 @@ mod tests {
                 }]
             }),
             preview_image: full.then(|| "data:image/png;base64,AAAA".to_string()),
+            // Contract 1.91 (§4.74): the link-preview metadata rides the
+            // full-option dispatch; the lean shape stays key-free.
+            preview_url: full.then(|| "https://example.com/story".to_string()),
+            preview_title: full.then(|| "Example".to_string()),
         };
 
         // The default-shape send projects the lean frame and the fake's
@@ -8823,6 +8827,9 @@ mod tests {
         assert!(lean.get("textStyle").is_none());
         assert!(lean.get("bodyRanges").is_none());
         assert!(lean.get("previewImage").is_none());
+        // Contract 1.91 (§4.74): the metadata keys are absent-optional.
+        assert!(lean.get("previewUrl").is_none());
+        assert!(lean.get("previewTitle").is_none());
         assert_eq!(lean["allowsReplies"], false);
         let full = story_dispatches
             .iter()
@@ -8838,6 +8845,9 @@ mod tests {
         assert_eq!(full["bodyRanges"][0]["start"], 0);
         assert_eq!(full["bodyRanges"][0]["length"], 6);
         assert!(full.get("previewImage").is_some());
+        // The metadata keys ride the engine frame verbatim (camelCase).
+        assert_eq!(full["previewUrl"], "https://example.com/story");
+        assert_eq!(full["previewTitle"], "Example");
         assert_eq!(
             story_dispatches
                 .iter()

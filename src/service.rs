@@ -224,6 +224,18 @@ pub const MAX_STORY_RECIPIENTS: usize = 1001;
 /// 8-4-4-4-12 hex, the official `isStoryDistributionId` face — is enforced
 /// connector-side and answers INVALID_REQUEST.
 pub const MAX_STORY_DISTRIBUTION_ID_CHARS: usize = 36;
+/// Story link-preview url bound (contract revision 1.91, §4.74): 2048
+/// characters (the §5.10 message link-preview url budget's mirror on the
+/// story face, counted as chars like the sibling story string gates). The
+/// grammar above the length — a non-empty `https://` url, the official
+/// `isValidLink` https-only posture — is enforced connector-side and answers
+/// INVALID_REQUEST.
+pub const MAX_STORY_PREVIEW_URL_CHARS: usize = 2048;
+/// Story link-preview title bound (contract revision 1.91, §4.74): the same
+/// 1024-byte budget the §5.10 message link-preview title rides, mirrored
+/// onto the `messages.sendStory` `previewTitle` key (non-empty when
+/// present).
+pub const MAX_STORY_PREVIEW_TITLE_BYTES: usize = 1024;
 /// The official My-story id (contract revision 1.76, §4.67): the zero UUID,
 /// `MY_STORY_ID` in the official desktop (ts/types/Stories.std.ts:114-115,
 /// AGPL read-only anchor). An absent `distributionListId` means this id; any
@@ -3392,6 +3404,18 @@ impl ConnectorService {
     /// row (stories live outside every conversation), so there is no pending
     /// settlement and no clientRequestId.
     ///
+    /// The link-preview metadata keys (contract revision 1.91, §4.74):
+    /// `previewUrl`/`previewTitle` are independently optional — each, when
+    /// present, must be non-empty, within its budget (the §5.10 url/title
+    /// budgets mirrored), and the url must start `https://` (the official
+    /// `isValidLink` posture; unlike the message-preview face both schemes
+    /// are not admitted here) — else the deterministic INVALID_REQUEST
+    /// answers before the account ladder, the value is never dropped
+    /// silently and never forwarded. Past the gates both ride the engine
+    /// frame verbatim (the camelCase keys, alongside the unchanged
+    /// `previewImage` pointer key); the engine composes the proto
+    /// `Preview{url,title,image}`.
+    ///
     /// Semantics (official-behavior anchors, AGPL read-only): the recipients
     /// array is the caller-computed expansion — the desktop owns v1 list
     /// storage (the official desktop expands MY_STORY from its own
@@ -3468,6 +3492,30 @@ impl ConnectorService {
                 false,
             )));
         }
+        // Contract 1.91 (§4.74): the link-preview metadata keys, gated with
+        // the §4.67 discipline — every hole answers before the account
+        // ladder, nothing is dropped silently, nothing is forwarded past the
+        // gate. The keys are independent: either may ride alone.
+        if let Some(url) = params.preview_url.as_deref()
+            && (url.is_empty()
+                || url.chars().count() > MAX_STORY_PREVIEW_URL_CHARS
+                || !url.starts_with("https://"))
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "previewUrl must be a non-empty https url within 2048 characters",
+                false,
+            )));
+        }
+        if let Some(title) = params.preview_title.as_deref()
+            && (title.is_empty() || title.len() > MAX_STORY_PREVIEW_TITLE_BYTES)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "previewTitle must contain between 1 and 1024 bytes",
+                false,
+            )));
+        }
         let account = self.resolve_account(&params.account_id)?;
         match mode {
             SignalCliMode::KtEngine => {
@@ -3497,6 +3545,12 @@ impl ConnectorService {
                 }
                 if let Some(preview) = params.preview_image.as_deref() {
                     frame["previewImage"] = json!(preview);
+                }
+                if let Some(url) = params.preview_url.as_deref() {
+                    frame["previewUrl"] = json!(url);
+                }
+                if let Some(title) = params.preview_title.as_deref() {
+                    frame["previewTitle"] = json!(title);
                 }
                 Ok(frame)
             }
@@ -8334,16 +8388,20 @@ pub struct UsernameLookupParams {
     pub usernames: Vec<String>,
 }
 
-/// `messages.sendStory` params (contract revision 1.76, §4.67): the story
-/// text plus the caller-computed recipient expansion. There is no
-/// `clientRequestId` and no conversation addressing: a story lands in no
-/// conversation row, so there is no pending row to dedupe or settle (the
-/// result is synchronous; the sender's own timeline converges through the
-/// desktop's own bookkeeping of the returned timestamp, the official
-/// sendStory job shape). `distributionListId` is optional — absent means the
-/// official MY_STORY id; any other valid UUID passes through as a
-/// desktop-owned custom list (the desktop holds v1 list storage, members
-/// ride `recipients` explicitly).
+/// `messages.sendStory` params (contract revision 1.76, §4.67; the
+/// link-preview metadata keys joined with 1.91, §4.74): the story text plus
+/// the caller-computed recipient expansion. There is no `clientRequestId`
+/// and no conversation addressing: a story lands in no conversation row, so
+/// there is no pending row to dedupe or settle (the result is synchronous;
+/// the sender's own timeline converges through the desktop's own
+/// bookkeeping of the returned timestamp, the official sendStory job
+/// shape). `distributionListId` is optional — absent means the official
+/// MY_STORY id; any other valid UUID passes through as a desktop-owned
+/// custom list (the desktop holds v1 list storage, members ride
+/// `recipients` explicitly). `previewUrl`/`previewTitle` are independently
+/// optional link-preview metadata: each validates fail-closed (the §4.74
+/// ladder) and rides the engine frame verbatim; absent means the key is
+/// never sent.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendStoryParams {
@@ -8356,6 +8414,8 @@ pub struct MessagesSendStoryParams {
     pub text_style: Option<String>,
     pub body_ranges: Option<Vec<SendTextStyleParams>>,
     pub preview_image: Option<String>,
+    pub preview_url: Option<String>,
+    pub preview_title: Option<String>,
 }
 
 /// `stories.setDisabled` params (contract revision 1.76, §4.67): the
@@ -16035,6 +16095,8 @@ mod tests {
                 }]
             }),
             preview_image: full.then(|| "data:image/png;base64,AAAA".to_string()),
+            preview_url: None,
+            preview_title: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
@@ -16178,6 +16240,174 @@ mod tests {
                 .unwrap()["distributionListId"],
             json!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         );
+    }
+
+    /// messages.sendStory link-preview metadata (contract 1.91, §4.74): the
+    /// two optional keys gate independently ahead of the account ladder —
+    /// non-https/empty/over-cap `previewUrl` and empty/over-cap
+    /// `previewTitle` answer INVALID_REQUEST — and past the gates each rides
+    /// the engine frame verbatim alone or composed with the unchanged
+    /// `previewImage` pointer key, while absence carries no key at all.
+    #[test]
+    fn send_story_preview_metadata_gates_then_rides_the_frame() {
+        use crate::engine::SignalCliMode;
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let params = |preview_url: Option<String>,
+                      preview_title: Option<String>,
+                      account_id: &str| MessagesSendStoryParams {
+            account_id: account_id.to_string(),
+            message: "story body".to_string(),
+            recipients: vec!["+15555550101".into()],
+            distribution_list_id: None,
+            allows_replies: false,
+            text_style: None,
+            body_ranges: None,
+            preview_image: Some("data:image/png;base64,AAAA".to_string()),
+            preview_url,
+            preview_title,
+        };
+        let gate = |params: &MessagesSendStoryParams| {
+            matches!(
+                service.prepare_send_story(params, SignalCliMode::KtEngine),
+                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
+            )
+        };
+
+        // The url gate: https-only (the official isValidLink posture), then
+        // non-empty, then the 2048-char budget — every hole ahead of the
+        // account ladder (the unknown account id proves the ordering).
+        assert!(
+            gate(&params(
+                Some("http://example.com/a".into()),
+                None,
+                "acct-absent"
+            )),
+            "non-https preview url"
+        );
+        assert!(
+            gate(&params(Some(String::new()), None, "acct-absent")),
+            "empty preview url"
+        );
+        assert!(
+            gate(&params(
+                Some(format!(
+                    "https://example.com/{}",
+                    "a".repeat(MAX_STORY_PREVIEW_URL_CHARS)
+                )),
+                None,
+                "acct-absent"
+            )),
+            "over-cap preview url"
+        );
+        // The title gate: non-empty, then the 1024-byte budget (multibyte
+        // content counts its bytes).
+        assert!(
+            gate(&params(None, Some(String::new()), "acct-absent")),
+            "empty preview title"
+        );
+        assert!(
+            gate(&params(
+                None,
+                Some("标".repeat(MAX_STORY_PREVIEW_TITLE_BYTES / 3 + 1)),
+                "acct-absent"
+            )),
+            "over-cap preview title (multibyte bytes, not chars)"
+        );
+        // The gate order: a valid-shape url/title on an unknown account
+        // answers the account error, not a shape error.
+        let error = service
+            .prepare_send_story(
+                &params(
+                    Some("https://example.com/a".into()),
+                    Some("Example".into()),
+                    "acct-absent",
+                ),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+
+        // The mode seam answers after the gates on a fully valid frame.
+        let error = service
+            .prepare_send_story(
+                &params(
+                    Some("https://example.com/a".into()),
+                    Some("Example".into()),
+                    &account.id,
+                ),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+
+        // Both keys ride verbatim, composed with the unchanged previewImage.
+        assert_eq!(
+            service
+                .prepare_send_story(
+                    &params(
+                        Some("https://example.com/a".into()),
+                        Some("Example".into()),
+                        &account.id,
+                    ),
+                    SignalCliMode::KtEngine,
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "message": "story body",
+                "recipients": ["+15555550101"],
+                "allowsReplies": false,
+                "previewImage": "data:image/png;base64,AAAA",
+                "previewUrl": "https://example.com/a",
+                "previewTitle": "Example",
+            })
+        );
+
+        // Independent optionality: the url alone (no title key), the title
+        // alone (no url key) — absence never sends an empty placeholder.
+        let url_only = service
+            .prepare_send_story(
+                &params(Some("https://example.com/a".into()), None, &account.id),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap();
+        assert_eq!(url_only["previewUrl"], json!("https://example.com/a"));
+        assert!(url_only.get("previewTitle").is_none());
+        let title_only = service
+            .prepare_send_story(
+                &params(None, Some("Example".into()), &account.id),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap();
+        assert_eq!(title_only["previewTitle"], json!("Example"));
+        assert!(title_only.get("previewUrl").is_none());
+
+        // Absent and explicit-null are the same no-key state: serde folds a
+        // JSON null into None at the option layer, so neither form ever
+        // reaches the gates or the engine frame.
+        let with_nulls: MessagesSendStoryParams = serde_json::from_value(json!({
+            "accountId": account.id,
+            "message": "story body",
+            "recipients": ["+15555550101"],
+            "previewUrl": null,
+            "previewTitle": null,
+        }))
+        .unwrap();
+        assert!(with_nulls.preview_url.is_none());
+        assert!(with_nulls.preview_title.is_none());
+        let null_frame = service
+            .prepare_send_story(&with_nulls, SignalCliMode::KtEngine)
+            .unwrap();
+        assert!(null_frame.get("previewUrl").is_none());
+        assert!(null_frame.get("previewTitle").is_none());
     }
 
     /// stories.setDisabled / stories.getDisabled (contract 1.76, §4.67):
@@ -16858,6 +17088,74 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 50, None)
             .unwrap();
         assert_eq!(listed.items.len(), 1, "no second reply row");
+    }
+
+    /// The story receive projection is a verbatim pipe (contract 1.91,
+    /// §4.74): the engine-side `textAttachment.preview` metadata —
+    /// `preview.url`/`preview.title` and any key the engine projects after
+    /// them — rides the transient StoryReceived event untouched. The chain
+    /// has no key whitelist at any hop (engine normalization → control
+    /// receive → service event), so the new sub-keys reach the host frame
+    /// builder naturally; this pin fails if a future reshape strips them.
+    #[test]
+    fn story_receive_projection_carries_preview_metadata_verbatim() {
+        let (_temp, mut service) = service();
+        let (_account, _conversation) = linked_account_and_conversation(&mut service);
+        let receive = crate::engine::NormalizedReceive {
+            timestamp: Some(1727000002000),
+            content_kind: "storyMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            peer_name: Some("Peer".into()),
+            group_id: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            control: Some(crate::engine::ControlReceive::Story {
+                message: json!({
+                    "textAttachment": {
+                        "text": "story body",
+                        "preview": {
+                            "url": "https://example.com/a",
+                            "title": "Example",
+                            "someLaterKey": {"rides": true},
+                        },
+                    },
+                    "allowsReplies": true,
+                }),
+            }),
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+        };
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryReceived { story, .. } = &events[0] else {
+            panic!("expected a StoryReceived event: {events:?}");
+        };
+        assert_eq!(
+            story["textAttachment"]["preview"]["url"],
+            json!("https://example.com/a")
+        );
+        assert_eq!(
+            story["textAttachment"]["preview"]["title"],
+            json!("Example")
+        );
+        // No whitelist: a key the 1.91 contract never named still rides —
+        // the projection is a pipe, not a reshape.
+        assert_eq!(
+            story["textAttachment"]["preview"]["someLaterKey"],
+            json!({ "rides": true })
+        );
     }
 
     /// The §4.35 sticker-quote face: the quote resolves through the same
