@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
     ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, ReceiptKind,
-    SignalCliMode, truncate_utf8_bytes,
+    SignalCliMode, timer_change_material, timer_change_rich, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -6524,24 +6524,147 @@ impl ConnectorService {
             }
             ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds,
+                editor,
             } => {
                 // The engine's groupUpdated projection (2026-10-06 engine
                 // batch): the group timer changed upstream — this group's own
-                // edit or a member's — and the conversation mirror converges
-                // exactly like the §4.41 direct timer-notice path (0 = off;
-                // the setter stores 0 literally, never NULL). The notification
-                // is state convergence, not chat content: no message row, no
-                // system row — the group timer change rides the change event,
-                // and the notice-row presentation stays a later desktop
-                // decision (the §4.44 dated note records it). A same-value
-                // event changes nothing (the setter is idempotent); the
-                // summary still re-pushes so a lagging window converges.
+                // edit or a member's. The mirror converges exactly like the
+                // §4.41 direct timer-notice path (0 = off; the setter stores 0
+                // literally, never NULL) and lands BEFORE the row so the
+                // summary the change event carries already states the new
+                // value. Contract 1.92 (§4.75) adds the row half: the official
+                // client renders a group timer change as a timer-notice system
+                // row in the group timeline, so the connector lands the same
+                // row a live §4.41 timer change does — the §4.41 material, the
+                // §4.41 rich marker, and the envelope author as the row's
+                // attribution face. Same-value events still land the row (the
+                // official row narrates the change envelope, and a member
+                // re-setting the same value is a real change upstream — the
+                // group revision advanced); the summary still re-pushes so a
+                // lagging window converges.
                 self.store.set_conversation_expire_timer(
                     &account.id,
                     &conversation.id,
                     u64::from(expire_timer_seconds),
                 )?;
-                let mut events = Vec::new();
+                // The row needs the protocol timestamp — part of the row
+                // identity (a locally invented one would turn a replay into a
+                // second row). The projection always stamps the envelope; a
+                // stamp-less shape keeps the mirror above and lands no row.
+                let Some(sent_at) = receive.timestamp.filter(|at| *at > 0) else {
+                    let summary = self
+                        .store
+                        .conversation_summary(&account.id, &conversation.id)?;
+                    return Ok(summary
+                        .map(HostSideEvent::ConversationChanged)
+                        .into_iter()
+                        .collect());
+                };
+                // Attribution ladder (the §4.75 author face): the editor ACI →
+                // the recorded ACI→peer-key mapping first (the §4.37 identity
+                // table), so an editor the envelopes already introduced joins
+                // the desktop roster by its number form; an unmapped ACI rides
+                // raw (the desktop roster joins it by uuid); no editor at all
+                // leaves the row unattributed — the official unknown-member
+                // branch, never a guessed identity.
+                let author_address = match editor.as_deref().map(str::trim) {
+                    Some(aci) if !aci.is_empty() => {
+                        let mapped = self
+                            .store
+                            .peer_keys_for_aci(&account.id, aci)?
+                            .into_iter()
+                            .next();
+                        Some(mapped.unwrap_or_else(|| aci.to_string()))
+                    }
+                    _ => None,
+                };
+                let sender_id = author_address.unwrap_or_else(|| {
+                    // The unattributed form keeps a stable conversation-scoped
+                    // sender (the group row's legacy sender face) so replay
+                    // dedup stays exact without inventing an author.
+                    stable_hash_id(&[&account.id, "group", peer_key])
+                });
+                let legacy_sender_id = stable_hash_id(&[&account.id, "group", peer_key]);
+                if self
+                    .store
+                    .message_by_signal_identity(
+                        &account.id,
+                        &conversation.id,
+                        "system",
+                        sent_at,
+                        &sender_id,
+                        &legacy_sender_id,
+                    )?
+                    .is_some()
+                {
+                    return Ok(Vec::new());
+                }
+                let message_id = stable_hash_id(&[
+                    "signal-message-v2",
+                    &account.id,
+                    &conversation.id,
+                    "system",
+                    &sent_at.to_string(),
+                    &sender_id,
+                ]);
+                let rich = timer_change_rich();
+                // The §4.41 material rides the row verbatim (the announced
+                // value inside the text); the byte count mirrors the generic
+                // text-column shape a live timer-notice row lands with.
+                let text = timer_change_material(Some(u64::from(expire_timer_seconds)));
+                let text_bytes = text
+                    .as_ref()
+                    .map(|text| text.len().min(u32::MAX as usize) as u32);
+                let message = MessageRecord {
+                    id: message_id,
+                    account_id: account.id.clone(),
+                    conversation_id: conversation.id.clone(),
+                    direction: "system",
+                    sender_id,
+                    // The notice row carries no author-name copy (the
+                    // §4.41 material-vs-copy split; the desktop joins its
+                    // roster from the sender face above).
+                    sender_name: None,
+                    mentions_self: false,
+                    sent_at,
+                    received_at: Some(now_ms()),
+                    text,
+                    text_bytes,
+                    text_truncated: false,
+                    text_retrievable: true,
+                    status: "system",
+                    client_request_id: None,
+                    quote_message_id: None,
+                    quote_snapshot: None,
+                    attachments: Vec::new(),
+                    rich: Some(rich),
+                    edited_at: None,
+                    reactions: Vec::new(),
+                    edits: Vec::new(),
+                    delivered_at: None,
+                    read_at: None,
+                    admin_deleted: false,
+                    sticker: None,
+                    // A timer notice records the announced value in the text
+                    // and the conversation state only (§4.41) — the notice row
+                    // itself never sweeps.
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    server_guid: receive.server_guid,
+                };
+                let preview = message
+                    .text
+                    .as_deref()
+                    .map(|text| text.chars().take(120).collect::<String>());
+                let inserted =
+                    self.store
+                        .insert_message(&message, None, preview.as_deref(), false)?;
+                if !inserted {
+                    return Ok(Vec::new());
+                }
+                let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
+                    message,
+                ))];
                 if let Some(summary) = self
                     .store
                     .conversation_summary(&account.id, &conversation.id)?
@@ -20950,13 +21073,16 @@ mod tests {
         );
     }
 
-    /// The engine's groupUpdated projection (2026-10-06 engine batch) is
-    /// state convergence, not chat content: the mirror lands with the
-    /// conversation.changed summary carrying the new timer (0 = off included),
-    /// no message row and no system row exists, and a same-value event changes
-    /// nothing but still re-pushes the summary so a lagging window converges.
+    /// The engine's groupUpdated projection (2026-10-06 engine batch; row half
+    /// contract 1.92 §4.75): the mirror lands with the conversation.changed
+    /// summary carrying the new timer (0 = off included) and the official
+    /// timer-notice system row lands beside it — the §4.41 material and rich
+    /// marker, no expire columns (the notice row never sweeps), the
+    /// conversation-scoped unattributed sender when the envelope named no
+    /// editor. A same-value event is a real upstream change envelope (the
+    /// group revision advanced): the row lands for it too.
     #[test]
-    fn ingest_group_timer_update_mirrors_state_without_a_row() {
+    fn ingest_group_timer_update_mirrors_state_and_lands_the_notice_row() {
         let (_temp, mut service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -20989,16 +21115,39 @@ mod tests {
             expire_start_at: None,
             control: Some(ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds: 3600,
+                editor: None,
             }),
         };
         let events = service
             .ingest_receive(group_timer.clone(), crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the timer notification lands as the official notice row");
+        assert_eq!(upserted.conversation_id, conversation.id);
+        assert_eq!(upserted.direction, "system");
+        assert_eq!(upserted.status, "system");
+        assert_eq!(
+            upserted.text.as_deref(),
+            Some("已更新消息定时消失：3600 秒"),
+            "the row text is the §4.41 material verbatim"
+        );
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
-            "a timer notification is not a message row"
+            upserted
+                .rich
+                .as_ref()
+                .is_some_and(|rich| rich.is_expiration_update),
+            "the row carries the §4.41 rich marker"
+        );
+        assert_eq!(upserted.expire_seconds, None, "the notice row never sweeps");
+        assert_eq!(
+            upserted.sender_id,
+            stable_hash_id(&[&account.id, "group", "group-id-1"]),
+            "an editor-less envelope keeps the unattributed conversation-scoped sender"
         );
         let changed = events
             .iter()
@@ -21020,12 +21169,14 @@ mod tests {
         );
 
         // The off form stores 0 literally (the §4.41 setter discipline), never
-        // NULL, and the summary reports the off state.
+        // NULL, and lands the close-form notice row.
         let events = service
             .ingest_receive(
                 NormalizedReceive {
+                    timestamp: Some(1727000001000),
                     control: Some(ControlReceive::GroupTimerUpdate {
                         expire_timer_seconds: 0,
+                        editor: None,
                     }),
                     ..group_timer.clone()
                 },
@@ -21040,6 +21191,14 @@ mod tests {
             })
             .expect("the off form notifies too");
         assert_eq!(changed.expire_timer_seconds, Some(0));
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the off form lands the close-form row");
+        assert_eq!(upserted.text.as_deref(), Some("已更新消息定时消失：已关闭"));
         assert_eq!(
             service
                 .store_ref()
@@ -21050,23 +21209,140 @@ mod tests {
             Some(0)
         );
 
-        // A same-value event changes nothing but still re-pushes the summary.
+        // A same-value event is a real upstream change envelope: the row lands
+        // for it too (the official timeline narrates the change, not the diff).
+        let same_value = NormalizedReceive {
+            timestamp: Some(1727000002000),
+            control: Some(ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds: 0,
+                editor: None,
+            }),
+            ..group_timer
+        };
+        let events = service
+            .ingest_receive(same_value.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
+            "the same-value envelope still lands its notice row"
+        );
+
+        // A replayed envelope (same identity tuple) dedupes through the row
+        // identity and converges nothing a second time.
+        let replay = service
+            .ingest_receive(same_value, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            replay.is_empty(),
+            "a replayed timer envelope dedupes through the row identity"
+        );
+    }
+
+    /// The §4.75 attribution ladder: the editor ACI resolves through the
+    /// recorded ACI→peer-key mapping first (the §4.37 identity table) so the
+    /// row's sender face joins the desktop roster by its number form; an
+    /// unmapped ACI rides raw (the desktop roster joins it by uuid); a
+    /// stamp-less envelope keeps the mirror and lands no row (the row identity
+    /// has no locally inventable half).
+    #[test]
+    fn ingest_group_timer_update_attributes_the_editor() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let aci = "11111111-2222-4333-8444-555555555555";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, aci, "+15555550101")
+            .unwrap();
+
+        let receive = |editor: Option<&str>, timestamp: u64| NormalizedReceive {
+            timestamp: Some(timestamp),
+            content_kind: "control",
+            direction: "control",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: None,
+            source_uuid: None,
+            server_guid: None,
+            peer_name: None,
+            group_id: Some("group-id-1".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: Some(ControlReceive::GroupTimerUpdate {
+                expire_timer_seconds: 60,
+                editor: editor.map(str::to_string),
+            }),
+        };
+
+        // The recorded mapping resolves the editor to its number-keyed peer.
+        let events = service
+            .ingest_receive(
+                receive(Some(aci), 1727000000000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the attributed envelope lands its row");
+        assert_eq!(upserted.conversation_id, conversation.id);
+        assert_eq!(upserted.sender_id, "+15555550101");
+
+        // An unmapped ACI rides raw — the desktop roster joins it by uuid.
+        let events = service
+            .ingest_receive(
+                receive(Some("99999999-8888-4333-8444-555555555555"), 1727000001000),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the raw-ACI envelope lands its row");
+        assert_eq!(upserted.sender_id, "99999999-8888-4333-8444-555555555555");
+
+        // A stamp-less envelope keeps the mirror and lands no row.
         let events = service
             .ingest_receive(
                 NormalizedReceive {
-                    control: Some(ControlReceive::GroupTimerUpdate {
-                        expire_timer_seconds: 0,
-                    }),
-                    ..group_timer
+                    timestamp: None,
+                    ..receive(Some(aci), 0)
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap();
         assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
+            "a stamp-less envelope has no row identity to land"
+        );
+        assert!(
             events
                 .iter()
                 .any(|event| matches!(event, HostSideEvent::ConversationChanged(_))),
-            "the same-value event still re-pushes the summary"
+            "the mirror still converges"
         );
     }
 
@@ -21103,6 +21379,7 @@ mod tests {
                     expire_start_at: None,
                     control: Some(ControlReceive::GroupTimerUpdate {
                         expire_timer_seconds: 3600,
+                        editor: None,
                     }),
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
