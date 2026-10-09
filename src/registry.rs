@@ -1210,6 +1210,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.send_story_viewed(params).await
     }
 
+    /// Story-anchored reaction routing (contract 1.94, §4.77): the owning
+    /// group's supervisor sends the story frame over its own engine,
+    /// send-class semantics end to end.
+    pub async fn send_story_reaction(
+        &self,
+        params: crate::service::StoriesSendReactionParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_story_reaction(params).await
+    }
+
     /// View-once open sync routing (contract revision 1.38): the owning
     /// group's supervisor forwards the bare passthrough; receipt-class
     /// semantics end to end.

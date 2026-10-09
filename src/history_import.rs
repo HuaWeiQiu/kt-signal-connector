@@ -735,6 +735,7 @@ impl<'a> Importer<'a> {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             // The admin-deleted tombstone (contract 1.33 wire face; contract
             // 1.81 §4.38 import): the face marks the row the way a live
             // inbound adminDelete does — the additive flag beside an intact
@@ -846,6 +847,7 @@ impl<'a> Importer<'a> {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             // A timer notice never sweeps (§4.41): the columns stay NULL.
@@ -946,6 +948,7 @@ impl<'a> Importer<'a> {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             // The notice row never sweeps (§4.41 parity): the columns stay
@@ -2613,6 +2616,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,

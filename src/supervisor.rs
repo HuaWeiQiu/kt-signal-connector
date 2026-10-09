@@ -37,13 +37,13 @@ use crate::service::{
     SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
     StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
     StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSetDisabledParams,
-    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
-    UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
-    identity_from_engine, pinned_conversations_result, sticker_pack_syncs_result,
-    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
+    UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult, account_limit_error,
+    blocked_conversations_result, identity_from_engine, pinned_conversations_result,
+    sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -2182,6 +2182,31 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// stories.sendReaction (contract 1.94, §4.77): the story-anchored
+    /// reaction send — the `messages.sendReaction` send class verbatim
+    /// (confirmed `sent`, an indeterminate outcome `unknown`, a definite
+    /// error propagates, nothing retries) with the story anchor frame in
+    /// place of the row-addressed one. No local write and no event: a story
+    /// reaction has no row to pill on (stories are rowless, §4.67).
+    pub async fn send_story_reaction(
+        &self,
+        params: StoriesSendReactionParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let frame = {
+            let service = self.service.lock().await;
+            service.prepare_story_send_reaction(&params, self.config.mode)?
+        };
+        match engine
+            .call("sendReaction", frame, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Send one attachment (optionally with a caption) — implementation-plan
     /// §4.12. Identical settlement path to `send_text`: local prepare under
     /// the service lock, upstream mutating `send` call, pending row settled
@@ -3929,10 +3954,14 @@ impl RuntimeSupervisor {
 
     /// Shared mark-read/mark-viewed body: prepare (selection + author
     /// grouping) under the service lock, one mutating engine call per author
-    /// group without it. Zero groups is the trivial `sent` no-op; the
-    /// per-author params are exactly the engine contract
-    /// `{account, recipient, timestamps}` — recipient is the single author,
-    /// timestamps ascend (the engine chunks 100 per envelope).
+    /// group without it. markViewed first-stamps the selected rows' local
+    /// `viewed_at` (§4.77) before any fan-out — the stamp is the request's
+    /// own local effect, not a receipt consequence, so it lands even when
+    /// the group list is empty and survives an upstream failure. Zero groups
+    /// is the trivial `sent` no-op; the per-author params are exactly the
+    /// engine contract `{account, recipient, timestamps}` — recipient is the
+    /// single author, timestamps ascend (the engine chunks 100 per
+    /// envelope).
     async fn send_receipt(
         &self,
         account_id: String,
@@ -3943,12 +3972,16 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let prepared = {
             let service = self.service.lock().await;
-            match method {
+            let prepared = match method {
                 "sendReadReceipt" => {
                     service.prepare_mark_read(&account_id, &conversation_id, message_ids)?
                 }
                 _ => service.prepare_mark_viewed(&account_id, &conversation_id, message_ids)?,
+            };
+            if method == "sendViewedReceipt" {
+                service.complete_mark_viewed(&prepared)?;
             }
+            prepared
         };
         if prepared.groups.is_empty() {
             return Ok("sent");
@@ -6959,6 +6992,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -7437,7 +7471,7 @@ mod tests {
         config.shutdown_grace = Duration::from_millis(100);
         let supervisor = Arc::new(RuntimeSupervisor::new(
             config,
-            store,
+            store.clone(),
             DEFAULT_PROXY_GROUP_ID.to_string(),
             None,
         ));
@@ -8073,6 +8107,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: Some(60),
@@ -8979,6 +9014,322 @@ mod tests {
             receipts[2]["timestamps"],
             serde_json::json!([1727000000001u64])
         );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// stories.sendReaction (contract 1.94, §4.77) in JVM mode: the frame is
+    /// the pinned upstream's story-reaction shape — `sendReaction` with the
+    /// author as targetAuthor and single recipient, the story timestamp as
+    /// targetTimestamp, `story: true` — the send-class answer is `sent`, a
+    /// crash in flight answers `unknown` without a retry, an explicit
+    /// restart lands a fresh engine and the next reaction sends again, and
+    /// the raw store account id never rides any frame.
+    #[tokio::test]
+    async fn stories_send_reaction_routes_story_frame_and_degrades_unknown() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        let reaction = |author: &str, sent_at: u64, emoji: &str, remove: bool| {
+            crate::service::StoriesSendReactionParams {
+                account_id: account.id.clone(),
+                story_author: author.to_string(),
+                story_sent_at: sent_at,
+                emoji: emoji.to_string(),
+                remove,
+                operation_id: None,
+            }
+        };
+
+        let sent = supervisor
+            .send_story_reaction(reaction("  +15555550101  ", 1727000000000, "👍", false))
+            .await
+            .unwrap();
+        assert_eq!(sent, "sent");
+
+        // Crash with the mutating call in flight (the fixture's reaction
+        // sentinel 423): the reaction may or may not have reached the
+        // server — `unknown`, never retried.
+        let crash = supervisor
+            .send_story_reaction(reaction("+15555550101", 423, "👍", false))
+            .await
+            .unwrap();
+        assert_eq!(crash, "unknown");
+        supervisor.start().await.unwrap();
+        let recovered = supervisor
+            .send_story_reaction(reaction("+15555550101", 1727000000001, "🎉", true))
+            .await
+            .unwrap();
+        assert_eq!(recovered, "sent");
+
+        // The dispatch log pins the frame shapes: resolved signal account,
+        // the trimmed author as targetAuthor and the single recipient, the
+        // story timestamp as targetTimestamp, `story: true`, the crash
+        // sentinel dispatched exactly once (no retry), and the raw account
+        // id never rides any frame.
+        let send_log = std::fs::read_to_string(
+            temp.path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl"),
+        )
+        .expect("fixture must log the dispatches");
+        let dispatches: Vec<serde_json::Value> = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let reactions: Vec<&serde_json::Value> = dispatches
+            .iter()
+            .filter(|params| params.get("emoji").is_some())
+            .collect();
+        assert_eq!(
+            reactions.len(),
+            3,
+            "one reaction + the crash + the recovery"
+        );
+        for dispatch in &reactions {
+            assert_eq!(dispatch["account"], "+15555550100");
+            assert!(
+                dispatch.get("accountId").is_none(),
+                "the store account id never rides the frame"
+            );
+            assert_eq!(dispatch["story"], true);
+            assert_eq!(dispatch["targetAuthor"], "+15555550101");
+            assert_eq!(dispatch["recipient"], serde_json::json!(["+15555550101"]));
+        }
+        assert_eq!(reactions[0]["emoji"], "👍");
+        assert_eq!(reactions[0]["remove"], false);
+        assert_eq!(
+            reactions[0]["targetTimestamp"],
+            serde_json::json!(1727000000000u64)
+        );
+        assert_eq!(reactions[1]["targetTimestamp"], serde_json::json!(423));
+        assert_eq!(reactions[2]["emoji"], "🎉");
+        assert_eq!(reactions[2]["remove"], true);
+        assert_eq!(
+            reactions[2]["targetTimestamp"],
+            serde_json::json!(1727000000001u64)
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// stories.sendReaction on the kt-engine face: the engine-gap answer is
+    /// CAPABILITY_UNAVAILABLE (not retryable) after local validation — the
+    /// §4.53 precedent — and no frame ever leaves the process.
+    #[tokio::test]
+    async fn stories_send_reaction_answers_capability_unavailable_on_kt_engine() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.mode = crate::engine::SignalCliMode::KtEngine;
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+
+        let error = supervisor
+            .send_story_reaction(crate::service::StoriesSendReactionParams {
+                account_id: account.id.clone(),
+                story_author: "+15555550101".into(),
+                story_sent_at: 1727000000000,
+                emoji: "👍".into(),
+                remove: false,
+                operation_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::service::ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable
+        ));
+        assert!(
+            !temp
+                .path()
+                .join("signal-data")
+                .join(".fixture-send-log.jsonl")
+                .exists(),
+            "no frame ever leaves the process"
+        );
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// messages.markViewed (contract 1.94, §4.77) end to end in JVM mode:
+    /// the selected incoming rows take their local `viewed_at` stamp while
+    /// the upstream receipt still confirms `sent`, a group conversation
+    /// stamps with an empty fan-out, and messages.markRead never stamps.
+    #[tokio::test]
+    async fn mark_viewed_stamps_locally_and_mark_read_does_not() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store.clone(),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let group = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Group")
+            .unwrap();
+        let seed = |id: &str, sent_at: u64, conversation_id: &str| {
+            let record = crate::store::MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation_id.to_string(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("voice note".into()),
+                text_bytes: Some(10),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            assert!(
+                store
+                    .insert_message(&record, None, Some("voice note"), true)
+                    .unwrap()
+            );
+        };
+        seed("m1", 10, &conversation.id);
+        seed("m2", 20, &conversation.id);
+        seed("m3", 30, &conversation.id);
+        seed("g1", 50, &group.id);
+        let viewed_at = |conversation_id: &str, id: &str| {
+            store
+                .message_by_id(&account.id, conversation_id, id)
+                .unwrap()
+                .unwrap()
+                .viewed_at
+        };
+
+        // markRead first: the receipt fans out and confirms, and no row
+        // takes any local stamp.
+        let read_status = supervisor
+            .send_read_receipt(
+                account.id.clone(),
+                conversation.id.clone(),
+                Some(vec!["m1".into()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_status, "sent");
+        assert_eq!(viewed_at(&conversation.id, "m1"), None);
+
+        // markViewed with an explicit selection: the upstream receipt
+        // confirms `sent` and the selected row is stamped locally.
+        let viewed_status = supervisor
+            .send_viewed_receipt(
+                account.id.clone(),
+                conversation.id.clone(),
+                Some(vec!["m1".into()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(viewed_status, "sent");
+        let first_stamp = viewed_at(&conversation.id, "m1");
+        assert!(first_stamp.is_some(), "the selected row is stamped");
+        assert_eq!(viewed_at(&conversation.id, "m2"), None);
+
+        // The default selection covers the rest; the first stamp never
+        // moves.
+        let viewed_all = supervisor
+            .send_viewed_receipt(account.id.clone(), conversation.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(viewed_all, "sent");
+        assert!(viewed_at(&conversation.id, "m2").is_some());
+        assert!(viewed_at(&conversation.id, "m3").is_some());
+        assert_eq!(viewed_at(&conversation.id, "m1"), first_stamp);
+
+        // A group conversation's fan-out is empty — the answer is the
+        // trivial `sent` — and the local stamp still lands.
+        let group_status = supervisor
+            .send_viewed_receipt(account.id.clone(), group.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(group_status, "sent");
+        assert!(viewed_at(&group.id, "g1").is_some());
         supervisor.shutdown().await.unwrap();
     }
 }

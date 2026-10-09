@@ -13,7 +13,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -919,6 +919,14 @@ pub struct MessageRecord {
     /// (contract 1.32). Same first-stamp-wins discipline as `delivered_at`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_at: Option<u64>,
+    /// The viewed face (contract 1.94, §4.77): on outgoing rows, the receipt
+    /// envelope timestamp of the first peer VIEWED receipt that hit the row
+    /// (the official `sendState.isViewed`); on incoming rows, the connector
+    /// wall-clock ms the host's `messages.markViewed` first selected the row
+    /// (the official `readStatus === Viewed` — this device played it). Absent
+    /// on rows never viewed and on every pre-1.94 row (never backfilled).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewed_at: Option<u64>,
     /// Group admin-delete tombstone (contract 1.33): an inbound adminDelete
     /// envelope marked this row "deleted by admin". The body stays for the
     /// audit window and retention prunes the row normally. Absent (false) on
@@ -967,6 +975,17 @@ pub struct MessageEditEntry {
 /// Inbound quote snapshot stored on the quoted-by message row (same wire
 /// shape the engine normalization produces).
 pub type MessageQuoteSnapshot = crate::engine::NormalizedQuote;
+
+/// The outcome of `upgrade_outgoing_receipts` (contract 1.94, §4.77): rows
+/// whose status actually moved, plus — for a VIEWED receipt only — rows that
+/// were already `read` but had never been viewed-stamped and took their
+/// first `viewed_at` now. A row appears in at most one face; a replayed
+/// receipt that changes nothing appears in neither.
+#[derive(Debug, Default)]
+pub struct UpgradedReceipts {
+    pub moved: Vec<MessageRecord>,
+    pub viewed_confirmed: Vec<MessageRecord>,
+}
 
 /// One attachment descriptor (metadata only, §4.13; same wire shape the
 /// engine normalization produces — inbound and outbound sends alike).
@@ -2133,7 +2152,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -2218,7 +2237,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -2228,7 +2247,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -2313,7 +2332,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -2353,7 +2372,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -2373,7 +2392,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -2401,7 +2420,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -2650,7 +2669,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2688,7 +2707,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2781,7 +2800,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -2856,7 +2875,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2929,7 +2948,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -2972,7 +2991,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -3088,7 +3107,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -3803,7 +3822,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.viewed_at
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -3885,7 +3904,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -3941,14 +3960,20 @@ impl Store {
     }
 
     /// Upgrade earlier outgoing rows on an inbound peer receipt (delivery /
-    /// read). The status ladder is monotonic — `pending|sent` → `delivered` →
-    /// `read` — and a receipt never downgrades a row (`read` over
-    /// `delivered`), never touches terminal or non-outgoing rows. `when` is
-    /// the receipt's arrival instant (envelope timestamp, contract 1.32) and
-    /// stamps `delivered_at` / `read_at` on the rows the receipt actually
+    /// read / viewed). The status ladder is monotonic — `pending|sent` →
+    /// `delivered` → `read` — and a receipt never downgrades a row (`read`
+    /// over `delivered`), never touches terminal or non-outgoing rows. `when`
+    /// is the receipt's arrival instant (envelope timestamp, contract 1.32)
+    /// and stamps `delivered_at` / `read_at` on the rows the receipt actually
     /// moves — first stamp wins, a replayed or later receipt never re-stamps.
-    /// Returns the rows whose status actually moved, so the service emits one
-    /// `message.statusChanged` per real transition.
+    /// A VIEWED receipt (contract 1.94, §4.77) rides the same ladder to
+    /// `read` and additionally first-stamps `viewed_at` on every hit row in
+    /// the read-upgrade eligibility set (`pending|sent|delivered|read`;
+    /// failed rows never take the stamp): rows the receipt moves carry the
+    /// stamp inside `moved`, rows already `read` that take their first stamp
+    /// surface as `viewed_confirmed`, and a pure replay (already read,
+    /// already stamped) produces neither. The two faces let the service emit
+    /// one `message.statusChanged` per real transition, viewed included.
     pub fn upgrade_outgoing_receipts(
         &self,
         account_id: &str,
@@ -3956,25 +3981,27 @@ impl Store {
         target_sent_at: &[u64],
         receipt: crate::engine::ReceiptKind,
         when: u64,
-    ) -> Result<Vec<MessageRecord>, StoreError> {
+    ) -> Result<UpgradedReceipts, StoreError> {
         if target_sent_at.is_empty() {
-            return Ok(Vec::new());
+            return Ok(UpgradedReceipts::default());
         }
         // Ranked per row: the target tier only applies when every earlier
         // tier is already past (or the row is still below it).
         let target = receipt.as_str();
+        let stamp_viewed = matches!(receipt, crate::engine::ReceiptKind::Viewed);
         let conn = self.lock_conn()?;
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let mut moved = Vec::new();
+        let mut viewed_confirmed = Vec::new();
         {
             let mut stmt = transaction
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -3997,7 +4024,32 @@ impl Store {
                         ("read", "pending" | "sent" | "delivered") => Some("read"),
                         _ => None,
                     };
+                    // A VIEWED receipt first-stamps `viewed_at` on every hit
+                    // row inside the read-upgrade eligibility set, whether or
+                    // not the status moves this time (§4.77).
+                    let first_view = stamp_viewed
+                        && record.viewed_at.is_none()
+                        && matches!(current, "pending" | "sent" | "delivered" | "read");
                     let Some(next) = next else {
+                        if first_view {
+                            transaction
+                                .execute(
+                                    "UPDATE messages SET viewed_at=?4
+                                     WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
+                                    params![
+                                        account_id,
+                                        conversation_id,
+                                        timestamp as i64,
+                                        when as i64
+                                    ],
+                                )
+                                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                            viewed_confirmed.push(MessageRecord {
+                                viewed_at: Some(when),
+                                server_guid: None,
+                                ..record
+                            });
+                        }
                         continue;
                     };
                     transaction
@@ -4006,14 +4058,17 @@ impl Store {
                                delivered_at=CASE WHEN ?4='delivered'
                                  THEN COALESCE(delivered_at, ?5) ELSE delivered_at END,
                                read_at=CASE WHEN ?4='read'
-                                 THEN COALESCE(read_at, ?5) ELSE read_at END
+                                 THEN COALESCE(read_at, ?5) ELSE read_at END,
+                               viewed_at=CASE WHEN ?6=1
+                                 THEN COALESCE(viewed_at, ?5) ELSE viewed_at END
                              WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3",
                             params![
                                 account_id,
                                 conversation_id,
                                 timestamp as i64,
                                 next,
-                                when as i64
+                                when as i64,
+                                i64::from(first_view)
                             ],
                         )
                         .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -4027,10 +4082,16 @@ impl Store {
                     } else {
                         record.read_at
                     };
+                    let viewed_at = if first_view {
+                        Some(when)
+                    } else {
+                        record.viewed_at
+                    };
                     moved.push(MessageRecord {
                         status: next,
                         delivered_at,
                         read_at,
+                        viewed_at,
                         server_guid: None,
                         ..record
                     });
@@ -4040,7 +4101,46 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        Ok(moved)
+        Ok(UpgradedReceipts {
+            moved,
+            viewed_confirmed,
+        })
+    }
+
+    /// First-stamp `viewed_at` on the given incoming rows (contract 1.94,
+    /// §4.77): `messages.markViewed` marks the rows locally before the
+    /// upstream viewed-receipt fan-out, so the projection carries the played
+    /// instant (the official `readStatus === Viewed`) even when the send
+    /// later fails. First stamp wins — a repeated markViewed never
+    /// re-stamps. Only incoming rows qualify: the outbound viewed face rides
+    /// the receipt ladder (`upgrade_outgoing_receipts`), never this stamp.
+    /// Returns how many rows took their first stamp.
+    pub fn stamp_incoming_viewed(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        row_ids: &[String],
+        when: u64,
+    ) -> Result<u64, StoreError> {
+        if row_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "UPDATE messages SET viewed_at=?4
+                 WHERE account_id=?1 AND conversation_id=?2 AND id=?3
+                   AND direction='incoming' AND viewed_at IS NULL",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut stamped = 0u64;
+        for row_id in row_ids.iter().take(256) {
+            let changes = stmt
+                .execute(params![account_id, conversation_id, row_id, when as i64])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            stamped += changes as u64;
+        }
+        Ok(stamped)
     }
 
     /// The incoming rows of one conversation in receipt order (`sent_at ASC,
@@ -4059,7 +4159,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                  ORDER BY sent_at ASC, id ASC
@@ -4093,7 +4193,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -6048,6 +6148,20 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 21 {
+        // Contract revision 1.94 (§4.77): the viewed face. One additive
+        // nullable column — outgoing rows stamp it from the first peer VIEWED
+        // receipt that hits them (the official sendState.isViewed), incoming
+        // rows stamp it when the host's `messages.markViewed` selects them
+        // (the official readStatus=Viewed). Viewed facts only ever arrive
+        // live, so pre-1.94 rows legitimately carry none and are never
+        // backfilled: whether a past row was played/viewed was never stored,
+        // and inventing it would lie to the desktop's played dot.
+        if !table_has_column(conn, "messages", "viewed_at")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN viewed_at INTEGER", [])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -6527,6 +6641,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         edits: Vec::new(),
         delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
         read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
+        viewed_at: row.get::<_, Option<i64>>(27)?.map(|value| value as u64),
         admin_deleted: row.get::<_, i64>(21)? != 0,
         sticker: row
             .get::<_, Option<String>>(22)?
@@ -6949,6 +7064,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -7016,6 +7132,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -7184,6 +7301,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 admin_deleted: false,
                 sticker: None,
                 expire_seconds: None,
@@ -7384,6 +7502,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -7502,6 +7621,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -7932,6 +8052,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -8038,6 +8159,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -8200,6 +8322,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -8300,6 +8423,7 @@ mod tests {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    viewed_at: None,
                     sticker: None,
                     expire_seconds: None,
                     expire_start_at: None,
@@ -8432,6 +8556,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -8617,6 +8742,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -8730,6 +8856,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -8840,6 +8967,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -8937,6 +9065,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9040,6 +9169,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9111,6 +9241,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9187,6 +9318,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9247,6 +9379,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9331,6 +9464,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -9411,6 +9545,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9465,6 +9600,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -9560,6 +9696,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -9658,6 +9795,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -9758,6 +9896,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -10359,6 +10498,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -10434,6 +10574,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -10529,6 +10670,7 @@ mod tests {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    viewed_at: None,
                     sticker: None,
                     expire_seconds: None,
                     expire_start_at: None,
@@ -10681,6 +10823,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -10757,6 +10900,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -10828,6 +10972,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -10902,6 +11047,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11328,6 +11474,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11377,6 +11524,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11631,6 +11779,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11773,6 +11922,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -11886,6 +12036,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -11955,6 +12106,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -12543,6 +12695,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -12646,6 +12799,338 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A v20 store upgrades in place (contract 1.94, §4.77): the additive
+    /// `viewed_at` column lands on `messages`, existing rows stay NULL
+    /// (never backfilled — a past viewed state is only known from the
+    /// receipt or the local markViewed that stated it) and the version
+    /// stamp moves to 21.
+    #[test]
+    fn schema_v21_upgrade_adds_viewed_at_column() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '20');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               last_message_preview TEXT,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               unread_mentions INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               expire_timer_seconds INTEGER,
+               mrr_factors_json TEXT,
+               UNIQUE(account_id, kind, peer_key)
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               attachment_locators TEXT,
+               live_attachment_locators TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO messages(id, account_id, conversation_id, direction, sender_id, sent_at, status)
+               VALUES('m-1', 'acc-1', 'conv-1', 'outgoing', 'self', 400, 'read');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "viewed_at").unwrap());
+        let stamped: Option<i64> = store
+            .conn()
+            .query_row("SELECT viewed_at FROM messages WHERE id='m-1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stamped.is_none(), "history rows are never backfilled");
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The VIEWED receipt face (contract 1.94, §4.77): it rides the read
+    /// ladder and first-stamps `viewed_at` on every eligible row it hits —
+    /// moved rows carry the stamp inside `moved`, an already-read unstamped
+    /// row surfaces as `viewed_confirmed`, a pure replay produces neither,
+    /// and a failed row never takes the stamp. Delivery and read receipts
+    /// never stamp `viewed_at`.
+    #[test]
+    fn viewed_receipt_stamps_viewed_at_through_the_ladder() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let record = |id: &str, sent_at: u64, status: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("voice note".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status,
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        };
+        for (id, sent_at, status) in [
+            ("m-400", 400, "sent"),
+            ("m-401", 401, "delivered"),
+            ("m-402", 402, "sent"),
+            ("m-403", 403, "failed"),
+        ] {
+            let row = record(id, sent_at, status);
+            store
+                .insert_message(&row, None, row.text.as_deref(), true)
+                .unwrap();
+        }
+        let upgrade = |sent_at: u64, kind, when: u64| {
+            store
+                .upgrade_outgoing_receipts(&account.id, &conversation.id, &[sent_at], kind, when)
+                .unwrap()
+        };
+        let stored = |id: &str| {
+            store
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+                .unwrap()
+        };
+
+        // A read receipt moves and never stamps viewed_at.
+        let upgraded = upgrade(400, crate::engine::ReceiptKind::Read, 1000);
+        assert_eq!(upgraded.moved.len(), 1);
+        assert!(upgraded.viewed_confirmed.is_empty());
+        assert_eq!(upgraded.moved[0].status, "read");
+        assert_eq!(upgraded.moved[0].viewed_at, None);
+        assert_eq!(stored("m-400").viewed_at, None);
+
+        // A delivery receipt that moves nothing stamps nothing either.
+        let upgraded = upgrade(401, crate::engine::ReceiptKind::Delivered, 1001);
+        assert!(upgraded.moved.is_empty());
+        assert!(upgraded.viewed_confirmed.is_empty());
+        assert_eq!(stored("m-401").viewed_at, None);
+
+        // m-402 reaches read through a plain read receipt first.
+        let upgraded = upgrade(402, crate::engine::ReceiptKind::Read, 1002);
+        assert_eq!(upgraded.moved.len(), 1);
+        assert_eq!(stored("m-402").status, "read");
+        assert_eq!(stored("m-402").read_at, Some(1002));
+
+        // VIEWED on the already-read unstamped row: no status move, the
+        // first viewed stamp surfaces as viewed_confirmed.
+        let upgraded = upgrade(402, crate::engine::ReceiptKind::Viewed, 2000);
+        assert!(upgraded.moved.is_empty());
+        assert_eq!(upgraded.viewed_confirmed.len(), 1);
+        let confirmed = &upgraded.viewed_confirmed[0];
+        assert_eq!(confirmed.status, "read");
+        assert_eq!(confirmed.read_at, Some(1002));
+        assert_eq!(confirmed.viewed_at, Some(2000));
+        assert_eq!(stored("m-402").viewed_at, Some(2000));
+
+        // A pure replay (already read, already stamped) produces neither
+        // face and never re-stamps.
+        let upgraded = upgrade(402, crate::engine::ReceiptKind::Viewed, 3000);
+        assert!(upgraded.moved.is_empty());
+        assert!(upgraded.viewed_confirmed.is_empty());
+        assert_eq!(stored("m-402").viewed_at, Some(2000), "first stamp wins");
+
+        // A failed row never takes the stamp.
+        let upgraded = upgrade(403, crate::engine::ReceiptKind::Viewed, 2001);
+        assert!(upgraded.moved.is_empty());
+        assert!(upgraded.viewed_confirmed.is_empty());
+        assert_eq!(stored("m-403").viewed_at, None);
+
+        // VIEWED on a delivered row rides the ladder to read and stamps
+        // inside the moved face.
+        let upgraded = upgrade(401, crate::engine::ReceiptKind::Viewed, 2002);
+        assert_eq!(upgraded.moved.len(), 1);
+        assert!(upgraded.viewed_confirmed.is_empty());
+        let moved = &upgraded.moved[0];
+        assert_eq!(moved.status, "read");
+        assert_eq!(moved.read_at, Some(2002));
+        assert_eq!(moved.viewed_at, Some(2002));
+        assert_eq!(stored("m-401").viewed_at, Some(2002));
+
+        // And a late VIEWED on the row the plain read receipt moved earlier
+        // confirms its viewed stamp too.
+        let upgraded = upgrade(400, crate::engine::ReceiptKind::Viewed, 2003);
+        assert!(upgraded.moved.is_empty());
+        assert_eq!(upgraded.viewed_confirmed.len(), 1);
+        assert_eq!(stored("m-400").viewed_at, Some(2003));
+    }
+
+    /// `stamp_incoming_viewed` (contract 1.94, §4.77): the local
+    /// markViewed half — first stamp wins, only incoming rows qualify, the
+    /// selection is exactly the given ids.
+    #[test]
+    fn stamp_incoming_viewed_first_stamp_wins_and_stays_incoming_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction,
+            sender_id: if direction == "incoming" {
+                "peer".into()
+            } else {
+                "self".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("voice note".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        };
+        for (id, sent_at, direction) in [
+            ("m-in-1", 500, "incoming"),
+            ("m-in-2", 501, "incoming"),
+            ("m-in-3", 502, "incoming"),
+            ("m-out", 503, "outgoing"),
+        ] {
+            let row = record(id, sent_at, direction);
+            store
+                .insert_message(&row, None, row.text.as_deref(), true)
+                .unwrap();
+        }
+        let stored = |id: &str| {
+            store
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+                .unwrap()
+        };
+
+        // The selection stamps exactly its incoming rows; the outgoing row
+        // in the list is skipped, the unselected incoming row stays NULL.
+        let stamped = store
+            .stamp_incoming_viewed(
+                &account.id,
+                &conversation.id,
+                &[
+                    "m-in-1".to_string(),
+                    "m-in-2".to_string(),
+                    "m-out".to_string(),
+                ],
+                5000,
+            )
+            .unwrap();
+        assert_eq!(stamped, 2);
+        assert_eq!(stored("m-in-1").viewed_at, Some(5000));
+        assert_eq!(stored("m-in-2").viewed_at, Some(5000));
+        assert_eq!(stored("m-in-3").viewed_at, None);
+        assert_eq!(stored("m-out").viewed_at, None);
+
+        // First stamp wins: a repeated stamp is a no-op.
+        let restamped = store
+            .stamp_incoming_viewed(&account.id, &conversation.id, &["m-in-1".to_string()], 6000)
+            .unwrap();
+        assert_eq!(restamped, 0);
+        assert_eq!(stored("m-in-1").viewed_at, Some(5000));
+
+        // An empty selection is the trivial no-op.
+        let noop = store
+            .stamp_incoming_viewed(&account.id, &conversation.id, &[], 6000)
+            .unwrap();
+        assert_eq!(noop, 0);
     }
 
     /// The official `isConversationAccepted` factor weights on the material

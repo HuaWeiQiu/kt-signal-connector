@@ -5,7 +5,16 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.93 (2026-10-09; the adjacent visual-media probe batch (§4.76): the
+- Contract revision: 1.94 (2026-10-10; the viewed-state projection + story-reaction batch
+  (§4.77): the desktop's voice-note PlayedDot and story AnimatedEmoji surfaces gain their
+  connector truth — `viewedAt` joins the message-row projection and the
+  `message.statusChanged` event with the official `isVoiceMessagePlayed` semantics on both
+  directions (incoming: the local `messages.markViewed` first-stamp; outgoing: the first
+  peer VIEWED receipt's envelope timestamp, folded through the §4.70 split so a replayed
+  receipt still emits nothing), and `stories.sendReaction` lands the pinned upstream's own
+  `sendReaction --story` face behind the story anchor, kt-engine answering
+  CAPABILITY_UNAVAILABLE until its engine batch arrives — previously 1.93 (2026-10-09; the
+  adjacent visual-media probe batch (§4.76): the
   desktop lightbox's cross-message navigation gains its history face — `messages.adjacentMedia`
   (read lane, the `message-adjacent-media` capability) projects the official
   `getOlder/NewerMessagesByConversation` probe with `requireVisualMediaAttachments`
@@ -1974,7 +1983,11 @@ surface through the existing error mapping — a declared swap boundary, not a s
   Result follows the reaction precedent: `{"status": "sent"}` / `{"status": "unknown"}` — a
   receipt send failure never fails the request, and unknown outcomes are never retried
   (AGENTS.md). Zero eligible rows is a trivial `{"status": "sent"}` no-op. Handshake
-  `capabilities` gains `send-receipts`.
+  `capabilities` gains `send-receipts`. (Revision 1.94, §4.77: `messages.markViewed`
+  additionally first-stamps the selected incoming rows' local `viewedAt` before the
+  fan-out — the played marker is the request's own local effect, lands even when the group
+  list is empty, and survives an upstream failure; `messages.markRead` keeps its
+  no-local-write discipline unchanged.)
 - Auto delivery receipts: for every incoming envelope the connector best-effort calls the engine
   `sendDeliveryReceipt` (author, [sent_at]) after the row lands — official receiving-client
   behavior, no user setting, no retry, fully silent (failures change nothing).
@@ -5368,10 +5381,14 @@ lives.
 - **Receive leg (`story.viewed`)**: a VIEWED receipt is intercepted in the
   control-receive ingest before the conversation ladder. With a
   resolvable source: an existing direct conversation first runs the §4.29
-  `upgrade_outgoing_receipts` unchanged (message viewed receipts keep the
-  one statusChanged-per-real-transition fold on the read tier), then the
+  `upgrade_outgoing_receipts` fold (message viewed receipts keep the
+  one statusChanged-per-real-transition discipline on the read tier —
+  revision 1.94 §4.77 extends that fold to also first-stamp the hit rows'
+  `viewedAt`, so an already-read row emits a stamp-only event instead of
+  silence), then the
   timestamps whose outgoing rows exist — decided by the hit rows, not the
-  moved rows, so a replayed viewed receipt (its row already read) leaks
+  moved rows, so a replayed viewed receipt (its row already read and
+  already viewed-stamped) leaks
   nothing onto the story face — are consumed, and the leftovers ride
   exactly one transient event `story.viewed`
   `{accountId, sentTimestamps, viewedAt, viewer?, viewerAci?, viewerName?}`
@@ -5956,6 +5973,89 @@ chunk to reach the next media row); the service unit (`service.rs` — the
 account/conversation ladder rungs, the probe answering the media row while the
 conversation's unread badge stays put, and the vanished-anchor INVALID_REQUEST rung); and
 the read-lane registration pin (`methods.rs`).
+
+### 4.77 Viewed-state projection (`viewedAt`) + story-anchored reaction send `stories.sendReaction` (contract revision 1.94, 2026-10-10)
+
+Two desktop surfaces needed connector truth the contract did not carry. The voice-note
+PlayedDot (the official `isVoiceMessagePlayed`: incoming `readStatus === Viewed`,
+outgoing `sendState.isViewed` — Signal-Desktop `ts/util/isVoiceMessagePlayed.std.ts`,
+read-only behavior reference) had no projected key: the VIEWED receipt was already routed
+(pinned signal-cli 0.14.8 `JsonReceiptMessage {when, isDelivery, isRead, isViewed}`,
+engine `ReceiptKind::Viewed`) but only folded onto the read tier, and
+`messages.markViewed` fanned the upstream receipt out without remembering anything
+locally. The story AnimatedEmoji send had no face at all: `messages.sendReaction`'s
+row-addressed ladder can never target a story (rowless, §4.67).
+
+- **Row projection `viewedAt`** (store schema 20 → 21, additive nullable column, never
+  backfilled): on outgoing rows, the receipt envelope timestamp of the first peer VIEWED
+  receipt that hit the row (the official `sendState.isViewed`); on incoming rows, the
+  connector wall-clock ms the host's `messages.markViewed` first selected the row (the
+  official `readStatus === Viewed` — this device played it). First stamp wins on both
+  faces; the key stays absent on rows never viewed and on every pre-1.94 row.
+- **Outgoing face**: `upgrade_outgoing_receipts` now answers
+  `{moved, viewed_confirmed}`. A VIEWED receipt rides the read ladder unchanged and
+  additionally first-stamps every hit row in the read-upgrade eligibility set
+  (`pending|sent|delivered|read` — failed rows never take the stamp): moved rows carry
+  the stamp on their `message.statusChanged` (the event data gains the optional
+  `viewedAt`), an already-read unstamped row emits the same event with the status kept
+  `read` (the stamp-only transition, the row's existing stamps re-carried), and a pure
+  replay (already read, already stamped) emits nothing — the §4.70 story split's
+  hit-test keeps its "row exists ⇒ message receipt" rule, so the stamp-only event never
+  leaks a story candidate. Delivery and read receipts never stamp.
+- **Incoming face**: `messages.markViewed` first-stamps the selected incoming rows at
+  `now_ms()` before the upstream fan-out — the official local-first discipline, so the
+  played marker is the request's own local effect: it lands even when the author group
+  list is empty (group conversations stamp without any upstream receipt), survives an
+  upstream failure (a receipt-class `unknown` never un-plays a row), and never
+  re-stamps. `messages.markRead` keeps its no-local-write discipline (the desktop owns
+  its read state, §4.29).
+- **`stories.sendReaction`** `{accountId, storyAuthor, storySentAt, emoji, remove?,
+  operationId?}` → `{status: "sent"|"unknown"}`. Send lane, account-scoped mutating; the
+  `messages.sendReaction` send class verbatim — a definite upstream error propagates,
+  `unknown` is never retried. The story anchor comes verbatim from the caller (the
+  desktop's story timeline owns both halves); the frame is the pinned upstream's own
+  story-reaction face (pinned signal-cli 0.14.8 `sendReaction --story`, "React to a story
+  instead of a normal message"; engine-side `Manager.sendMessageReaction(..., isStory)`):
+  `{account, emoji, remove, targetAuthor, targetTimestamp, recipient: [storyAuthor],
+  story: true}` — the official client delivers a story reaction as a direct message to
+  the story's author. Nothing is written locally and no event is emitted (a story
+  reaction has no row to pill on). v1 addresses author-direct reactions only: a
+  group-story reaction needs the group context the `story.received` projection does not
+  carry, so there is nothing to address a group frame with — a recorded boundary, not an
+  invented one.
+- **Mode seam**: JVM/native dispatch the frame as-is. The kt-engine face's `sendReaction`
+  has no story half and silently ignores unknown params (it would mis-send a plain
+  reaction), so it answers CAPABILITY_UNAVAILABLE (retryable=false) after the same local
+  validation — the §4.53 engine-gap precedent, closing when the engine's own batch lands.
+  The capability set does not grow: the `stories` tag extends in place (the 1.82
+  call-signaling precedent).
+- **Recorded upstream limits** (verified against the pinned 0.14.8 distribution before
+  anything was exposed): the own-device viewed sync has no projection source — the
+  pinned `JsonSyncMessage` maps `Sync$Read` to `readMessages` but never projects
+  `MessageEnvelope$Sync$Viewed`, and the connector consumes neither, so a voice note
+  played on a linked second device does not stamp `viewedAt` here (documented, not
+  fabricated); the kt-engine story-reaction debt above is the second. Both close when
+  their upstreams grow the face.
+
+Tests: the store units (schema v21 lands the column without backfilling; the VIEWED fold
+across the ladder — read/delivery receipts never stamp, a moved row stamps inside
+`moved`, the already-read row surfaces in `viewed_confirmed`, a pure replay emits
+neither, a failed row never stamps, first stamp wins; `stamp_incoming_viewed` stamps
+exactly the selected incoming rows, skips outgoing rows in the list, and a restamp is a
+no-op); the service units (the markViewed local half — explicit/default selection,
+group-conversation stamping with an empty fan-out, first stamp wins, markRead stamps
+nothing; the VIEWED event projection — moved rows carry `viewedAt`, the already-read
+confirmation keeps `read` and re-carries the row's stamps, the replay stays silent, and
+the stamps persist on the row projection; the `stories.sendReaction` gates — author
+bounds, zero storySentAt, the emoji shape, an oversized accountId, an unknown account —
+then the JVM/native frame shape with `story: true` and the trimmed author, `remove`
+verbatim, and the kt-engine CAPABILITY_UNAVAILABLE after validation); and the supervisor
+roundtrips (JVM mode — `sent`, the 423 crash sentinel answering `unknown` without a
+retry, the explicit restart and the next reaction sending again, the dispatch log
+pinning `story: true` with the store account id never riding; kt-engine —
+CAPABILITY_UNAVAILABLE with no frame leaving the process; the markViewed end-to-end —
+the upstream receipt confirming `sent` while the rows stamp locally, the group
+conversation's trivial `sent` still stamping, and markRead stamping nothing).
 
 ## 5. signal-cli Boundary
 

@@ -124,6 +124,7 @@
             "stories.setDisabled",
             "stories.getDisabled",
             "stories.markViewed",
+            "stories.sendReaction",
             "stories.downloadAttachment",
             "stories.openAttachment"
           ]
@@ -1078,6 +1079,17 @@
         },
         {
           "if": {
+            "properties": { "method": { "const": "stories.sendReaction" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storiesSendReactionParams" }
+            }
+          }
+        },
+        {
+          "if": {
             "properties": { "method": { "const": "stories.downloadAttachment" } },
             "required": ["method"]
           },
@@ -1577,7 +1589,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "conversationId"],
-      "description": "Send the upstream viewed receipt (contract revision 1.34): identical addressing, selection bounds, per-author fan-out, and {status: sent|unknown} aggregation as messages.markRead, with the engine sendViewedReceipt upstream face.",
+      "description": "Send the upstream viewed receipt (contract revision 1.34): identical addressing, selection bounds, per-author fan-out, and {status: sent|unknown} aggregation as messages.markRead, with the engine sendViewedReceipt upstream face. The selected incoming rows also take their first local viewedAt stamp (contract 1.94, §4.77 — the official readStatus === Viewed: this device played it) before the fan-out; the stamp is the request's own local effect, lands even when the group list is empty (group conversations stamp without an upstream receipt), survives an upstream failure, and never re-stamps.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -2850,6 +2862,38 @@
         }
       }
     },
+    "storiesSendReactionParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "storyAuthor", "storySentAt", "emoji"],
+      "description": "Send or remove a reaction to one story (contract 1.94, §4.77, capability stories): the story-anchored reaction send. messages.sendReaction's row-addressed ladder can never target a story (stories land in no conversation row, contract 1.76 §4.67); this face takes the story anchor verbatim from the caller — storyAuthor is the author's address (phone number or UUID-shaped ACI) and storySentAt is the story's own Signal timestamp (a zero timestamp is the officially meaningless marker and answers INVALID_REQUEST), both owned by the desktop's story timeline. The upstream frame is the pinned signal-cli's own story-reaction face (sendReaction --story, pinned 0.14.8): {account, emoji, remove, targetAuthor, targetTimestamp, recipient: [storyAuthor], story: true} — the official client delivers a story reaction as a direct message to the story's author. Nothing is written locally and no event is emitted (a story reaction has no row to pill on). The kt-engine face has no story-reaction send and answers CAPABILITY_UNAVAILABLE (not retryable) after local validation. v1 addresses author-direct reactions only: a group-story reaction needs the group context the story.received projection does not carry. The result is {status: 'sent'} when the upstream confirmed, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. remove=true removes a previously sent story reaction (upstream best effort). Send lane, account-scoped mutating.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "storyAuthor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The story author's address (phone number or ACI UUID); the frame's targetAuthor and single recipient."
+        },
+        "storySentAt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The story's own Signal timestamp (the story's protocol identity); the frame's targetTimestamp."
+        },
+        "emoji": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "The reaction; a single unicode grapheme cluster of at most 32 UTF-8 bytes, mirroring the pinned signal-cli requirement."
+        },
+        "remove": {
+          "type": "boolean",
+          "default": false,
+          "description": "True removes a previously sent story reaction; the emoji must still identify the reaction to remove."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "storyLocatorParams": {
       "type": "object",
       "additionalProperties": false,
@@ -3096,6 +3140,10 @@
                   "readAt": {
                     "type": "integer",
                     "description": "Contract 1.32: connector wall-clock ms the read/viewed receipt that triggered this event stamped the row. Absent on transitions that did not stamp it."
+                  },
+                  "viewedAt": {
+                    "type": "integer",
+                    "description": "Contract 1.94 (§4.77): the receipt envelope timestamp of the first peer VIEWED receipt that hit the row (the official sendState.isViewed — a voice/video note the peer actually played). Rides only on transitions a VIEWED receipt caused: the receipt's status move (status read), or its first viewed stamp on an already-read row (status read, the row's existing stamps re-carried); a pure replay (already read, already stamped) emits nothing. Absent on transitions that did not stamp it."
                   }
                 }
               }

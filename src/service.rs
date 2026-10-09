@@ -794,6 +794,12 @@ pub enum HostSideEvent {
         /// never clears an existing stamp with a no-op).
         delivered_at: Option<u64>,
         read_at: Option<u64>,
+        /// Contract 1.94 (§4.77): the viewed stamp carried on the transition
+        /// that wrote it — the VIEWED receipt's envelope timestamp on
+        /// outgoing rows (the official `sendState.isViewed`). Same
+        /// first-stamp-wins, absent-means-no-op discipline as the other
+        /// stamps.
+        viewed_at: Option<u64>,
     },
     /// Ephemeral typing indicator (contract 1.15): never persisted, rate
     /// limited per account+peer before it reaches the host lane.
@@ -2169,6 +2175,7 @@ impl ConnectorService {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: Some(sticker),
             expire_seconds: None,
@@ -2296,6 +2303,7 @@ impl ConnectorService {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: None,
             expire_seconds: None,
@@ -3655,6 +3663,71 @@ impl ConnectorService {
             "recipient": author,
             "timestamps": [params.story_sent_at],
         }))
+    }
+
+    /// stories.sendReaction (contract 1.94, §4.77): the story-anchored
+    /// reaction send. A story lands in no conversation row (§4.67), so the
+    /// message-addressed `messages.sendReaction` ladder can never target
+    /// one; this face takes the story anchor (author + the story's own
+    /// Signal timestamp) verbatim from the caller — the desktop's story
+    /// timeline is the authoritative source of both — and builds the pinned
+    /// upstream's own story-reaction frame: `sendReaction` with
+    /// `targetAuthor`/`targetTimestamp` naming the story, `recipient` the
+    /// author (the official client delivers a story reaction as a direct
+    /// message to the author), and the upstream's own `story: true` marker
+    /// (the pinned signal-cli 0.14.8 `sendReaction --story` face: "React to
+    /// a story instead of a normal message"). Nothing is written locally
+    /// and no event is emitted — a story reaction has no row to pill on.
+    /// The kt-engine face has no story-reaction send and answers
+    /// CAPABILITY_UNAVAILABLE (retryable=false) after local validation, the
+    /// §4.53 engine-gap precedent. The send-class settlement
+    /// (`{status: sent|unknown}`, a definite error propagates, nothing
+    /// retries) lives in the supervisor. v1 addresses author-direct
+    /// reactions only: a group-story reaction needs the group context the
+    /// story.received projection does not carry, so there is nothing to
+    /// address a group frame with (记档边界, not invented).
+    pub fn prepare_story_send_reaction(
+        &self,
+        params: &StoriesSendReactionParams,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        let author = params.story_author.trim();
+        if author.is_empty() || author.chars().count() > MAX_OPAQUE_ID_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "storyAuthor must contain between 1 and 128 characters",
+                false,
+            )));
+        }
+        if params.story_sent_at == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "storySentAt must be a positive Signal timestamp",
+                false,
+            )));
+        }
+        validate_emoji(&params.emoji)?;
+        let account = self.resolve_account(&params.account_id)?;
+        match mode {
+            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "the kt-engine face has no story reaction send yet",
+                false,
+            ))),
+            _ => Ok(json!({
+                "account": account.signal_account,
+                "emoji": params.emoji,
+                "remove": params.remove,
+                "targetAuthor": author,
+                "targetTimestamp": params.story_sent_at,
+                "recipient": [author],
+                "story": true,
+            })),
+        }
     }
 
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
@@ -5060,7 +5133,11 @@ impl ConnectorService {
     }
 
     /// messages.markViewed: identical addressing, selection, and grouping,
-    /// upstream `sendViewedReceipt`.
+    /// upstream `sendViewedReceipt`. Unlike markRead, the viewed face also
+    /// has a local projection (contract 1.94, §4.77): the selected incoming
+    /// rows take their first `viewed_at` stamp via `complete_mark_viewed`
+    /// before the upstream fan-out — the official local-first discipline, so
+    /// the played marker survives an upstream failure and needs no retry.
     pub fn prepare_mark_viewed(
         &self,
         account_id: &str,
@@ -5068,6 +5145,23 @@ impl ConnectorService {
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
         self.prepare_receipt(account_id, conversation_id, message_ids)
+    }
+
+    /// The local half of messages.markViewed (contract 1.94, §4.77):
+    /// first-stamp `viewed_at` on the selected incoming rows at the
+    /// connector's own clock — the official `readStatus === Viewed` is this
+    /// device's "played it" marker, so it lands locally whether or not the
+    /// upstream receipt fan-out later succeeds, and it never re-stamps. The
+    /// stamp covers the whole selection, including the group-conversation
+    /// case whose fan-out skips (an empty group list still played locally).
+    pub fn complete_mark_viewed(&self, prepared: &PreparedReceipts) -> Result<(), ServiceError> {
+        self.store.stamp_incoming_viewed(
+            &prepared.account_id,
+            &prepared.conversation_id,
+            &prepared.row_ids,
+            now_ms(),
+        )?;
+        Ok(())
     }
 
     /// messages.sendViewOnceOpen (contract revision 1.38, §4.36): bounds and
@@ -5237,6 +5331,10 @@ impl ConnectorService {
                 MARK_RECEIPT_MESSAGE_IDS_LIMIT as u32,
             )?,
         };
+        // The selected rows' local ids ride along so a later
+        // `complete_mark_viewed` first-stamps exactly this selection (§4.77),
+        // independent of the upstream fan-out's shape.
+        let row_ids = rows.iter().map(|row| row.id.clone()).collect();
         let groups = if conversation.kind == "direct" {
             // Rows arrive in receipt order (`sent_at ASC, id ASC`) from both
             // store paths, so per-author timestamps stay ascending; same-
@@ -5264,6 +5362,7 @@ impl ConnectorService {
             conversation_id: conversation.id,
             account_signal: account.signal_account,
             groups,
+            row_ids,
         })
     }
 
@@ -6019,6 +6118,7 @@ impl ConnectorService {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             admin_deleted: false,
             sticker: receive.sticker,
             // A timer notice records the announced value in the text and the
@@ -6191,20 +6291,24 @@ impl ConnectorService {
             if let Ok(Some(conversation)) =
                 self.store.conversation_by_peer(&account.id, "direct", peer)
             {
-                let moved = self.store.upgrade_outgoing_receipts(
+                let upgraded = self.store.upgrade_outgoing_receipts(
                     &account.id,
                     &conversation.id,
                     timestamps,
                     ReceiptKind::Viewed,
                     when,
                 )?;
-                for record in &moved {
+                for record in upgraded.moved.iter().chain(&upgraded.viewed_confirmed) {
+                    // The §4.77 viewed face rides the same event: moved rows
+                    // carry their new status plus the first viewed stamp;
+                    // already-read rows keep `read` and carry the stamp only.
                     events.push(HostSideEvent::MessageStatusChanged {
                         account_id: record.account_id.clone(),
                         message_id: record.id.clone(),
                         status: record.status,
                         delivered_at: record.delivered_at,
                         read_at: record.read_at,
+                        viewed_at: record.viewed_at,
                     });
                 }
                 // A timestamp whose row exists (any status — moved or already
@@ -6333,6 +6437,7 @@ impl ConnectorService {
                         status: record.status,
                         delivered_at: None,
                         read_at: None,
+                        viewed_at: None,
                     }]),
                     _ => Ok(Vec::new()),
                 }
@@ -6435,13 +6540,16 @@ impl ConnectorService {
                 // receipt moves, and each status event carries the stamp it
                 // just wrote.
                 let when = when.unwrap_or_else(crate::link::now_ms);
-                let moved = self.store.upgrade_outgoing_receipts(
-                    &account.id,
-                    &conversation.id,
-                    &timestamps,
-                    kind,
-                    when,
-                )?;
+                let moved = self
+                    .store
+                    .upgrade_outgoing_receipts(
+                        &account.id,
+                        &conversation.id,
+                        &timestamps,
+                        kind,
+                        when,
+                    )?
+                    .moved;
                 Ok(moved
                     .into_iter()
                     .map(|record| HostSideEvent::MessageStatusChanged {
@@ -6450,6 +6558,7 @@ impl ConnectorService {
                         status: record.status,
                         delivered_at: record.delivered_at,
                         read_at: record.read_at,
+                        viewed_at: record.viewed_at,
                     })
                     .collect())
             }
@@ -6661,6 +6770,7 @@ impl ConnectorService {
                     edits: Vec::new(),
                     delivered_at: None,
                     read_at: None,
+                    viewed_at: None,
                     admin_deleted: false,
                     sticker: None,
                     // A timer notice records the announced value in the text
@@ -7454,13 +7564,16 @@ pub struct ReceiptGroup {
 /// resolved account plus the per-author fan-out. An empty group list is the
 /// trivial no-op the supervisor answers `{"status":"sent"}` for; the
 /// supervisor calls the engine once per group and never fails the request on
-/// a receipt-call failure.
+/// a receipt-call failure. `row_ids` are the selected incoming rows' local
+/// ids (selection order), so `messages.markViewed` can first-stamp their
+/// local `viewed_at` (contract 1.94, §4.77) before the upstream fan-out.
 #[derive(Debug)]
 pub struct PreparedReceipts {
     pub account_id: String,
     pub conversation_id: String,
     pub account_signal: String,
     pub groups: Vec<ReceiptGroup>,
+    pub row_ids: Vec<String>,
 }
 
 /// The `messages.markViewOnceOpened` prepare result (contract revision 1.38,
@@ -8654,6 +8767,25 @@ pub struct StoriesMarkViewedParams {
     pub story_sent_at: u64,
 }
 
+/// `stories.sendReaction` params (contract 1.94, §4.77): the story anchor —
+/// the author's address plus the story's own Signal timestamp — and the
+/// reaction itself. `remove` (default false) lifts the own reaction instead
+/// of placing it. Stories are rowless (§4.67), so there is no conversation
+/// or messageId on this face; the desktop's story timeline supplies the
+/// anchor. `operationId` rides the standard mutating-call envelope and is
+/// validated when present.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoriesSendReactionParams {
+    pub account_id: String,
+    pub story_author: String,
+    pub story_sent_at: u64,
+    pub emoji: String,
+    #[serde(default)]
+    pub remove: bool,
+    pub operation_id: Option<String>,
+}
+
 /// The stories faces' shared result (contract revision 1.76, §4.67): the
 /// stored truth, so a toggle write-back and a poll read one shape.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -9513,6 +9645,7 @@ fn status_changed_event(record: &MessageRecord) -> HostSideEvent {
         status: record.status,
         delivered_at: record.delivered_at,
         read_at: record.read_at,
+        viewed_at: record.viewed_at,
     }
 }
 
@@ -10183,6 +10316,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -14383,6 +14517,7 @@ mod tests {
             edits: Vec::new(),
             delivered_at: None,
             read_at: None,
+            viewed_at: None,
             sticker: None,
             expire_seconds: None,
             expire_start_at: None,
@@ -16835,6 +16970,144 @@ mod tests {
         );
     }
 
+    /// stories.sendReaction (contract 1.94, §4.77): validation runs
+    /// entirely before the account ladder — author bounds, the meaningless
+    /// zero storySentAt, the emoji shape — then the JVM/native frame is the
+    /// pinned upstream's story-reaction shape (`story: true`, the author as
+    /// targetAuthor and single recipient), and the kt-engine face answers
+    /// CAPABILITY_UNAVAILABLE (not retryable) after the same local
+    /// validation.
+    #[test]
+    fn stories_send_reaction_preparation_gates_then_frames() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let params =
+            |author: &str, sent_at: u64, emoji: &str, account_id: &str| StoriesSendReactionParams {
+                account_id: account_id.to_string(),
+                story_author: author.to_string(),
+                story_sent_at: sent_at,
+                emoji: emoji.to_string(),
+                remove: false,
+                operation_id: None,
+            };
+        let gate = |params: &StoriesSendReactionParams| {
+            matches!(
+                service.prepare_story_send_reaction(params, SignalCliMode::Jvm),
+                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
+            )
+        };
+
+        assert!(
+            gate(&params("", 1727000000000, "👍", &account.id)),
+            "empty author"
+        );
+        assert!(
+            gate(&params("   ", 1727000000000, "👍", &account.id)),
+            "blank author"
+        );
+        assert!(
+            gate(&params(
+                &"k".repeat(MAX_OPAQUE_ID_BYTES + 1),
+                1727000000000,
+                "👍",
+                &account.id
+            )),
+            "oversized author"
+        );
+        assert!(
+            gate(&params("+15555550101", 0, "👍", &account.id)),
+            "zero sentAt"
+        );
+        assert!(
+            gate(&params("+15555550101", 1727000000000, "", &account.id)),
+            "empty emoji"
+        );
+        assert!(
+            gate(&params("+15555550101", 1727000000000, "👍🎉", &account.id)),
+            "multi-grapheme emoji"
+        );
+        assert!(
+            gate(&params(
+                "+15555550101",
+                1727000000000,
+                "👍",
+                &"k".repeat(129)
+            )),
+            "oversized accountId"
+        );
+
+        // Unknown account after the parameter gates.
+        let error = service
+            .prepare_story_send_reaction(
+                &params("+15555550101", 1727000000000, "👍", "acct-absent"),
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+
+        // The JVM/native frame: the pinned upstream's story-reaction shape —
+        // the trimmed author as targetAuthor and the single recipient, the
+        // story timestamp as targetTimestamp, `story: true`, the resolved
+        // signal account, never the store account id.
+        assert_eq!(
+            service
+                .prepare_story_send_reaction(
+                    &params("  +15555550101  ", 1727000000000, "👍", &account.id),
+                    SignalCliMode::Jvm,
+                )
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "emoji": "👍",
+                "remove": false,
+                "targetAuthor": "+15555550101",
+                "targetTimestamp": 1727000000000u64,
+                "recipient": ["+15555550101"],
+                "story": true,
+            })
+        );
+        // remove=true rides the frame verbatim.
+        let mut removing = params("+15555550101", 1727000000000, "👍", &account.id);
+        removing.remove = true;
+        assert_eq!(
+            service
+                .prepare_story_send_reaction(&removing, SignalCliMode::Native)
+                .unwrap()["remove"],
+            json!(true)
+        );
+
+        // The kt-engine face has no story-reaction send: CAPABILITY_UNAVAILABLE
+        // after the same local validation (the §4.53 engine-gap precedent),
+        // and the validation gates still run first.
+        let error = service
+            .prepare_story_send_reaction(
+                &params("+15555550101", 1727000000000, "👍", &account.id),
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable
+        ));
+        assert!(
+            matches!(
+                service.prepare_story_send_reaction(
+                    &params("+15555550101", 0, "👍", &account.id),
+                    SignalCliMode::KtEngine,
+                ),
+                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
+            ),
+            "parameter gates precede the capability answer"
+        );
+    }
+
     /// One caller-shaped story attachment pointer, mutated per case — the
     /// attachment object the story event's projection round-trips into.
     fn story_pointer_params(
@@ -18245,6 +18518,7 @@ mod tests {
                 edits: Vec::new(),
                 delivered_at: None,
                 read_at: None,
+                viewed_at: None,
                 sticker: None,
                 expire_seconds: None,
                 expire_start_at: None,
@@ -18318,6 +18592,266 @@ mod tests {
             .prepare_mark_viewed(&account.id, &empty_conversation.id, None)
             .unwrap();
         assert!(empty.groups.is_empty());
+    }
+
+    /// Contract 1.94 (§4.77): the local half of `messages.markViewed` —
+    /// `complete_mark_viewed` first-stamps `viewed_at` on exactly the
+    /// selected incoming rows, the default selection covers every incoming
+    /// row, an explicit id list narrows it, a group conversation stamps
+    /// even though its fan-out is empty, and a replay never re-stamps.
+    #[test]
+    fn mark_viewed_stamps_the_selected_incoming_rows_locally() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let seed = |service: &ConnectorService, id: &str, sent_at: u64, conv: &str| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conv.to_string(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        let stored = |service: &ConnectorService, conv: &str, id: &str| {
+            service
+                .store_ref()
+                .message_by_id(&account.id, conv, id)
+                .unwrap()
+                .unwrap()
+        };
+        seed(&service, "m1", 10, &conversation.id);
+        seed(&service, "m2", 20, &conversation.id);
+        seed(&service, "m3", 30, &conversation.id);
+
+        // An explicit selection stamps exactly its rows.
+        let explicit = service
+            .prepare_mark_viewed(&account.id, &conversation.id, Some(vec!["m2".into()]))
+            .unwrap();
+        service.complete_mark_viewed(&explicit).unwrap();
+        let stamped_at = stored(&service, &conversation.id, "m2").viewed_at;
+        assert!(stamped_at.is_some(), "the selected row is stamped");
+        assert_eq!(stored(&service, &conversation.id, "m1").viewed_at, None);
+        assert_eq!(stored(&service, &conversation.id, "m3").viewed_at, None);
+
+        // The default selection covers the rest; a restamp keeps the first
+        // stamp.
+        let all = service
+            .prepare_mark_viewed(&account.id, &conversation.id, None)
+            .unwrap();
+        service.complete_mark_viewed(&all).unwrap();
+        assert!(stored(&service, &conversation.id, "m1").viewed_at.is_some());
+        assert!(stored(&service, &conversation.id, "m3").viewed_at.is_some());
+        assert_eq!(
+            stored(&service, &conversation.id, "m2").viewed_at,
+            stamped_at,
+            "first stamp wins"
+        );
+
+        // A group conversation's fan-out is empty, but the local stamp is
+        // the request's own effect and lands anyway.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Group")
+            .unwrap();
+        seed(&service, "g1", 50, &group.id);
+        let group_viewed = service
+            .prepare_mark_viewed(&account.id, &group.id, None)
+            .unwrap();
+        assert!(group_viewed.groups.is_empty());
+        service.complete_mark_viewed(&group_viewed).unwrap();
+        assert!(stored(&service, &group.id, "g1").viewed_at.is_some());
+
+        // markRead has no local stamp: the desktop owns its read state.
+        let read = service
+            .prepare_mark_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert!(!read.groups.is_empty());
+        let before = stored(&service, &conversation.id, "m1").read_at;
+        assert_eq!(before, None, "markRead never stamps rows locally");
+    }
+
+    /// Contract 1.94 (§4.77) outgoing face: a VIEWED receipt rides the read
+    /// ladder and projects `viewedAt` — the row it moves carries the stamp
+    /// on its `message.statusChanged`, an already-read row answers a
+    /// stamp-only event, a pure replay stays silent, and the stamps persist
+    /// on the row projection.
+    #[test]
+    fn viewed_receipt_projects_viewed_at_on_events_and_rows() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        seed_outgoing_sent(&mut service, &account.id, &conversation.id, 400);
+        // A second sent row, seeded directly (seed_outgoing_sent's fixed
+        // clientRequestId makes it a one-shot per conversation).
+        let second = MessageRecord {
+            id: "m-401".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "outgoing",
+            sender_id: account.id.clone(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 401,
+            received_at: None,
+            text: Some("voice note".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        };
+        assert!(
+            service
+                .store_ref()
+                .insert_message(&second, None, Some("voice note"), true)
+                .unwrap()
+        );
+
+        let viewed = |timestamps: Vec<u64>, when: u64| {
+            control_receive(
+                "+15555550100",
+                "+15555550101",
+                ControlReceive::Receipt {
+                    kind: ReceiptKind::Viewed,
+                    timestamps,
+                    when: Some(when),
+                },
+            )
+        };
+
+        // The receipt moves the sent row to read and stamps both timelines.
+        let events = service
+            .ingest_receive(viewed(vec![400], 1234), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::MessageStatusChanged {
+                status: "read",
+                read_at: Some(1234),
+                viewed_at: Some(1234),
+                ..
+            }
+        ));
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 400)
+            .unwrap();
+        assert_eq!(row.viewed_at, Some(1234));
+
+        // A pure replay (already read, already stamped) stays silent.
+        assert!(
+            service
+                .ingest_receive(viewed(vec![400], 9999), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 400)
+            .unwrap();
+        assert_eq!(row.viewed_at, Some(1234), "first stamp wins");
+
+        // Row 401 reaches read through a plain READ receipt first — no
+        // viewed stamp anywhere.
+        let read = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::Receipt {
+                kind: ReceiptKind::Read,
+                timestamps: vec![401],
+                when: Some(2000),
+            },
+        );
+        let events = service
+            .ingest_receive(read, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::MessageStatusChanged {
+                status: "read",
+                read_at: Some(2000),
+                viewed_at: None,
+                ..
+            }
+        ));
+
+        // The late VIEWED keeps the status and confirms the first viewed
+        // stamp on the same event shape.
+        let events = service
+            .ingest_receive(viewed(vec![401], 3000), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::MessageStatusChanged {
+                status: "read",
+                read_at: Some(2000),
+                viewed_at: Some(3000),
+                ..
+            }
+        ));
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|row| row.sent_at == 401)
+            .unwrap();
+        assert_eq!(row.read_at, Some(2000));
+        assert_eq!(row.viewed_at, Some(3000));
     }
 
     /// Contract 1.34 outbound mentions: more than 64 entries are capped, an
