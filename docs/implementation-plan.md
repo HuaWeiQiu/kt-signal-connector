@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.92 (2026-10-09; the group timer-change timeline row batch (§4.75): the
+- Contract revision: 1.93 (2026-10-09; the adjacent visual-media probe batch (§4.76): the
+  desktop lightbox's cross-message navigation gains its history face — `messages.adjacentMedia`
+  (read lane, the `message-adjacent-media` capability) projects the official
+  `getOlder/NewerMessagesByConversation` probe with `requireVisualMediaAttachments`
+  (Signal-Desktop `ts/state/ducks/lightbox.preload.ts` `showLightboxForAdjacentMessage`,
+  `ts/sql/Server.node.ts` `getAdjacentMessagesByConversation`) onto the connector store: an
+  anchor message id the caller already holds resolves to its stored `sent_at` (a vanished
+  anchor answers INVALID_REQUEST retryable=false, never silently re-anchored), a bounded
+  keyset scan walks the probe direction until `limit` (1..=20) media-bearing rows accumulate
+  or the range exhausts, and the strip predicate keeps exactly the desktop lightbox's own
+  bar — at least one `image/*`/`video/*` attachment, view-once rows always excluded, story
+  rows impossible by construction (a story never lands in the messages table, §4.67). The
+  result is `{items: MessageRecord[]}` adjacency-first in the `messages.list` stored shape
+  (reactions and edits attached the same way); an empty array is the honest no-more-media
+  answer. Store-only read with deliberately no unread-clearing side effect — probing the
+  lightbox's neighbors is not viewing the thread — previously 1.92 (2026-10-09; the
+  group timer-change timeline row batch (§4.75): the
   2026-10-06 dated note's open presentation-policy boundary closes — a group disappearing-timer
   change (the engine's `groupUpdated {groupId, revision, expireTimerSeconds, editor?}`
   projection) now lands the official presentation face beside the mirror: the §4.41
@@ -5878,6 +5894,68 @@ the mapped ACI resolving to its number-keyed peer, the unmapped ACI riding raw, 
 stamp-less envelope keeping the mirror without a row); the engine projection pin
 (`engine.rs` — the editor rides the `GroupTimerUpdate` control, hostile and overlong editor
 forms read as absence); and the unknown-group drop test (warn-only, no row invented).
+
+### 4.76 Adjacent visual-media probe: `messages.adjacentMedia` + the `message-adjacent-media` capability (contract revision 1.93, 2026-10-09)
+
+The desktop lightbox's cross-message navigation (the KT desktop L4 parity item) needed a
+history face the contract did not have: the official client opens the lightbox with
+`getConversationRangeCenteredOnMessage` for its has-prev/has-next boundary and steps across
+message boundaries with `getOlder/NewerMessagesByConversation` under
+`requireVisualMediaAttachments` (Signal-Desktop `ts/state/ducks/lightbox.preload.ts`
+`showLightbox`/`showLightboxForAdjacentMessage`, SQL in `ts/sql/Server.node.ts`
+`getAdjacentMessagesByConversation` — predicate `hasVisualMediaAttachments IS 1 AND
+isViewOnce IS 0`, keyset on `(received_at, sent_at)`, anchor excluded via
+`requireDifferentMessage`). `messages.list` only pages a window backwards from a cursor; it
+cannot answer "the next media-bearing row after this anchor" and carries a
+thread-viewing side effect the probe must not have. This revision lands the probe as a
+first-class read-lane method instead of stretching the paging face.
+
+- **Method**: `messages.adjacentMedia` (read lane; advertised through the new
+  `message-adjacent-media` capability tag). Params `{accountId, conversationId,
+  anchorMessageId, direction, limit}`; result `{items: MessageRecord[]}` in the
+  `messages.list` stored shape (host projection, reactions and edits attached the same
+  way), ordered adjacency-first — the row closest to the anchor first, so `limit: 1` is
+  exactly the official single-step probe and larger limits stay meaningful for strip
+  preloading.
+- **Anchor semantics**: the anchor is a message id the caller already holds (the current
+  lightbox item's message). It resolves to its stored `sent_at`; a vanished anchor answers
+  INVALID_REQUEST retryable=false through the store's `InvalidCursor` rung — the official
+  probe anchors on a live row too, and a silent re-anchor would invent a position the
+  caller never asked from. The anchor row itself is never returned (the official
+  `requireDifferentMessage` posture), and the scan's `(sent_at, id)` keyset tiebreak matches
+  the `messages.list` ordering so the two faces never disagree about adjacency.
+- **Strip predicate**: a row matches when at least one attachment carries an `image/*` or
+  `video/*` content type — the desktop lightbox strip's own bar
+  (`signalAttachment.ts`) — and view-once rows are always excluded (the §4.37 boundary:
+  tap-to-view media never joins a navigation strip; both `viewOnce` and
+  `view_once_invalid` rich forms count). Story rows need no predicate: a story never lands
+  in the messages table at all (§4.67), so the probe cannot leak one. The filter runs in
+  Rust over bounded keyset chunks (`ADJACENT_MEDIA_SCAN_CHUNK` = 128) because the store has
+  no JSON1 dependency to push it into SQL; the scan stops as soon as `limit` matches
+  accumulate or the range exhausts, so a sparse conversation never scans more than one
+  chunk past the last match.
+- **Bounds and lanes**: `limit` is clamped 1..=`MAX_ADJACENT_MEDIA_LIMIT` (20) at the host
+  gate; the account/conversation ladder is the same deterministic rung order as
+  `messages.list` (AccountNotFound, then ConversationNotFound). Store-only read: no
+  upstream traffic, no engine involvement (the JVM/native seam has no mode for this — the
+  probe is a pure local-database answer), and deliberately **no** unread-clearing side
+  effect — `messages.list` clears the badge because it is the thread view; probing the
+  lightbox's neighbors is not viewing the thread, so the badge stays put.
+- **Boundary**: zero schema shape change beyond the new method arm and params definition;
+  no store version change; no new error code (INVALID_REQUEST covers the param gate and
+  the vanished anchor); no event. An empty `items` array is the honest
+  no-more-media-in-this-direction answer — the desktop maps it to the official
+  `UnableToLoadAttachment` toast at the boundary, never to a fabricated item.
+
+Tests: the store units (`store.rs` — both directions from a mid-timeline anchor over a
+mixed strip (image/video match; text, audio, pdf, and untyped attachments skip; view-once
+image excluded; another conversation's media invisible; limit truncation; the empty
+range; a missing anchor raising `InvalidCursor`), the `(sent_at, id)` tiebreak walking
+same-timestamp rows in the probe direction, and a scan crossing more than one bounded
+chunk to reach the next media row); the service unit (`service.rs` — the
+account/conversation ladder rungs, the probe answering the media row while the
+conversation's unread badge stays put, and the vanished-anchor INVALID_REQUEST rung); and
+the read-lane registration pin (`methods.rs`).
 
 ## 5. signal-cli Boundary
 

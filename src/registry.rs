@@ -644,6 +644,26 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    pub async fn list_adjacent_media(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        anchor_message_id: String,
+        direction: crate::store::AdjacentMediaDirection,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor
+            .list_adjacent_media(
+                account_id,
+                conversation_id,
+                anchor_message_id,
+                direction,
+                limit,
+            )
+            .await
+    }
+
     pub async fn search_messages(
         &self,
         account_id: String,

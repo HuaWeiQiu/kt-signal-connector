@@ -41,8 +41,8 @@ use crate::service::{
     StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
     UsernameLookupParams, UsernameLookupResult, account_limit_error, blocked_conversations_result,
     identity_from_engine, pinned_conversations_result, sticker_pack_syncs_result,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
     validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -1894,6 +1894,29 @@ impl RuntimeSupervisor {
                 &conversation_id,
                 limit,
                 before.as_deref(),
+            )
+        })
+        .await
+    }
+
+    pub async fn list_adjacent_media(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        anchor_message_id: String,
+        direction: crate::store::AdjacentMediaDirection,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>, ServiceError> {
+        // Store-only read: the service lock guards in-memory state only.
+        let store = Arc::clone(&self.store);
+        blocking_service(move || {
+            store_adjacent_media(
+                &store,
+                &account_id,
+                &conversation_id,
+                &anchor_message_id,
+                direction,
+                limit,
             )
         })
         .await

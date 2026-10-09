@@ -40,19 +40,19 @@ use crate::service::{
     GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
     HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
     IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessageRequestParams, MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesEditParams, MessagesListParams,
-    MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams,
-    MessagesRemoteDeleteParams, MessagesReportSpamParams, MessagesRetryTextParams,
-    MessagesSearchParams, MessagesSendAdminDeleteParams, MessagesSendAttachmentParams,
-    MessagesSendPinMessageParams, MessagesSendReactionParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
-    MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
+    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSetDisabledParams, UsernameLookupParams,
 };
-use crate::store::MAX_PAGE_LIMIT;
+use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1482,6 +1482,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid messages.list params", false),
             ),
         },
+        // Adjacent visual-media probe (contract revision 1.93, §4.76): the
+        // same params-gate shape as messages.list — the account/conversation
+        // ladder, the anchor resolution, and the store-only scan ride the
+        // runtime call; the result is the adjacency-ordered media-bearing
+        // rows in the messages.list stored shape.
+        "messages.adjacentMedia" => {
+            match serde_json::from_value::<MessagesAdjacentMediaParams>(request.params) {
+                Ok(params) if (1..=MAX_ADJACENT_MEDIA_LIMIT).contains(&params.limit) => {
+                    match runtime
+                        .list_adjacent_media(
+                            params.account_id,
+                            params.conversation_id,
+                            params.anchor_message_id,
+                            params.direction.into(),
+                            params.limit,
+                        )
+                        .await
+                    {
+                        Ok(items) => {
+                            HostResponse::success(request_id, serde_json::json!({ "items": items }))
+                        }
+                        Err(error) => HostResponse::failure(request_id, error.into_api()),
+                    }
+                }
+                Ok(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "limit must be between 1 and 20", false),
+                ),
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.adjacentMedia params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "messages.getText" => {
             match serde_json::from_value::<MessageGetTextParams>(request.params) {
                 Ok(params) => match runtime

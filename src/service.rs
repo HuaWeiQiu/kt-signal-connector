@@ -23,8 +23,8 @@ use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
 use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::store::{
-    AccountDeletePlan, AccountRow, AccountSummary, ContactSummary, ConversationRow,
-    ConversationSummary, MessageRecord, Page, Store, StoreError, SyncedContact,
+    AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, ContactSummary,
+    ConversationRow, ConversationSummary, MessageRecord, Page, Store, StoreError, SyncedContact,
 };
 
 /// Bounds below are the code-side enforcement of the host-facing schema
@@ -1487,6 +1487,24 @@ impl ConnectorService {
         before: Option<&str>,
     ) -> Result<Page<MessageRecord>, ServiceError> {
         store_list_messages(&self.store, account_id, conversation_id, limit, before)
+    }
+
+    pub fn list_adjacent_media(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        anchor_message_id: &str,
+        direction: AdjacentMediaDirection,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>, ServiceError> {
+        store_adjacent_media(
+            &self.store,
+            account_id,
+            conversation_id,
+            anchor_message_id,
+            direction,
+            limit,
+        )
     }
 
     pub fn search_messages(
@@ -7219,6 +7237,44 @@ pub(crate) fn store_list_messages(
     Ok(page)
 }
 
+/// messages.adjacentMedia (contract 1.93, §4.76): the store-only adjacent
+/// visual-media probe behind the read lane. Same account/conversation
+/// ladder as `store_list_messages`, but deliberately without the unread
+/// side effect — probing the lightbox's neighbors is not viewing the
+/// thread, so the local badge stays put. A missing anchor maps through the
+/// store's `InvalidCursor` to a deterministic INVALID_REQUEST
+/// (retryable=false): the caller probes from a row it already holds.
+pub(crate) fn store_adjacent_media(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    anchor_message_id: &str,
+    direction: AdjacentMediaDirection,
+    limit: u32,
+) -> Result<Vec<MessageRecord>, ServiceError> {
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if store
+        .conversation_by_id(account_id, conversation_id)?
+        .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    let items = store
+        .list_adjacent_media(
+            account_id,
+            conversation_id,
+            anchor_message_id,
+            direction,
+            limit,
+        )?
+        .into_iter()
+        .map(project_message_for_host)
+        .collect();
+    Ok(items)
+}
+
 pub(crate) fn store_search_messages(
     store: &Store,
     account_id: &str,
@@ -8094,6 +8150,35 @@ pub struct MessagesListParams {
     pub account_id: String,
     pub conversation_id: String,
     pub before: Option<String>,
+    pub limit: u32,
+}
+
+/// messages.adjacentMedia direction (contract 1.93, §4.76): `older` probes
+/// toward the conversation's past, `newer` toward its present — the two
+/// arms of the official `getOlder/NewerMessagesByConversation` probe.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MessagesAdjacentMediaDirection {
+    Older,
+    Newer,
+}
+
+impl From<MessagesAdjacentMediaDirection> for AdjacentMediaDirection {
+    fn from(direction: MessagesAdjacentMediaDirection) -> Self {
+        match direction {
+            MessagesAdjacentMediaDirection::Older => AdjacentMediaDirection::Older,
+            MessagesAdjacentMediaDirection::Newer => AdjacentMediaDirection::Newer,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagesAdjacentMediaParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub anchor_message_id: String,
+    pub direction: MessagesAdjacentMediaDirection,
     pub limit: u32,
 }
 
@@ -10104,6 +10189,103 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
         }
+    }
+
+    #[test]
+    fn adjacent_media_probe_ladders_and_keeps_the_unread_badge() {
+        let (_temp, service) = service();
+        let account = service
+            .store_ref()
+            .upsert_account_from_signal("+15555550100", Some(1), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        // Unknown account and unknown conversation both fail their
+        // deterministic ladder rung before any scan runs.
+        let no_account = service.list_adjacent_media(
+            "no-such-account",
+            &conversation.id,
+            "m-anchor",
+            crate::store::AdjacentMediaDirection::Older,
+            1,
+        );
+        assert!(matches!(
+            no_account,
+            Err(ServiceError::Store(StoreError::AccountNotFound))
+        ));
+        let no_conversation = service.list_adjacent_media(
+            &account.id,
+            "no-such-conversation",
+            "m-anchor",
+            crate::store::AdjacentMediaDirection::Older,
+            1,
+        );
+        assert!(matches!(
+            no_conversation,
+            Err(ServiceError::Store(StoreError::ConversationNotFound))
+        ));
+        // A media row plus an unread badge on the conversation: the probe
+        // answers the row and the badge stays put — probing the lightbox's
+        // neighbors is not viewing the thread (the messages.list clear is
+        // deliberately not mirrored).
+        let mut media = expire_record_fixture(&account.id, &conversation.id, "m-media");
+        media.sent_at = 5;
+        media.attachments = vec![NormalizedAttachment {
+            id: "a-media".into(),
+            content_type: Some("image/jpeg".into()),
+            filename: None,
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            locator: None,
+        }];
+        service
+            .store_ref()
+            .insert_message(&media, None, None, true)
+            .unwrap();
+        let anchor = expire_record_fixture(&account.id, &conversation.id, "m-anchor");
+        service
+            .store_ref()
+            .insert_message(&anchor, None, None, true)
+            .unwrap();
+        let before = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .map(|summary| summary.unread_count);
+        let items = service
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-anchor",
+                crate::store::AdjacentMediaDirection::Older,
+                1,
+            )
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "m-media");
+        let after = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .map(|summary| summary.unread_count);
+        assert_eq!(before, after, "the probe never clears the unread badge");
+        assert!(after.unwrap_or(0) > 0, "the badge was live to begin with");
+        // A vanished anchor maps to the deterministic invalid-cursor rung.
+        let gone = service.list_adjacent_media(
+            &account.id,
+            &conversation.id,
+            "m-gone",
+            crate::store::AdjacentMediaDirection::Newer,
+            1,
+        );
+        assert!(matches!(
+            gone,
+            Err(ServiceError::Store(StoreError::InvalidCursor))
+        ));
     }
 
     #[test]

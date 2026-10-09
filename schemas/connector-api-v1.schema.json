@@ -63,6 +63,7 @@
             "identities.verify",
             "conversations.setExpireTimer",
             "messages.list",
+            "messages.adjacentMedia",
             "messages.search",
             "messages.getText",
             "messages.sendText",
@@ -435,6 +436,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.adjacentMedia" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesAdjacentMediaParams" }
             }
           }
         },
@@ -1280,6 +1292,19 @@
         "conversationId": { "$ref": "#/$defs/opaqueId" },
         "before": { "type": "string", "maxLength": 256 },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "messagesAdjacentMediaParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "anchorMessageId", "direction", "limit"],
+      "description": "Contract 1.93 (§4.76): the adjacent visual-media probe behind the desktop lightbox's cross-message navigation — the official getOlder/NewerMessagesByConversation probe with requireVisualMediaAttachments (Signal-Desktop ts/state/ducks/lightbox.preload.ts showLightboxForAdjacentMessage, Server.node.ts getAdjacentMessagesByConversation) projected onto the connector's store. The anchor is a message id the caller already holds (the current lightbox item's message); it resolves to its stored sent_at or the call answers INVALID_REQUEST retryable=false — a vanished anchor is never silently re-anchored. direction 'older' walks toward the conversation's past, 'newer' toward its present; the anchor row itself is never returned (the official requireDifferentMessage posture). The result is {items: MessageRecord[]} ordered adjacency-first (the row closest to the anchor first), each row carrying at least one attachment with an image/* or video/* content type — the desktop lightbox strip's own predicate — with view-once rows always excluded (the §4.37 boundary: tap-to-view media never joins a navigation strip); story rows need no predicate because a story never lands in the messages table at all (§4.67). Rows come in the messages.list stored shape (reactions and edits attached the same way), read in bounded keyset chunks until limit matches accumulate or the range exhausts — an empty items array is the honest 'no more media in this direction' answer. Store-only read: no upstream traffic, and deliberately no unread-clearing side effect (probing the lightbox's neighbors is not viewing the thread). Advertised through the message-adjacent-media capability tag.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "anchorMessageId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "direction": { "enum": ["older", "newer"] },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
       }
     },
     "messagesSearchParams": {
