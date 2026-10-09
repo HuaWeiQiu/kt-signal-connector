@@ -887,11 +887,16 @@ pub enum ControlReceive {
     /// @ 216a4c7): a decrypted group change carrying the expiration-timer
     /// action, envelope-replaced before it ever reaches the connector. The
     /// service layer mirrors `expireTimerSeconds` into the conversation row
-    /// (0 = off) and converges through `conversation.changed`; no message row
-    /// exists for the notification — the group timer change rides the change
-    /// event, and the notice-row presentation is a later desktop decision.
+    /// (0 = off), lands the official timer-notice system row (contract 1.92
+    /// §4.75 — the row the official client shows, the §4.41 direct-face
+    /// identity), and converges through `conversation.changed`. `editor` is
+    /// the change author's ACI as the engine decrypted it — the attribution
+    /// material the desktop joins its group roster against; absent (the
+    /// projection could not name one) keeps the row unattributed, never
+    /// invented.
     GroupTimerUpdate {
         expire_timer_seconds: u32,
+        editor: Option<String>,
     },
     /// Call signaling (contract 1.51, §4.49): the engine's `callMessage`
     /// envelope projection — the official Content.callMessage=3 face. The
@@ -979,6 +984,11 @@ pub(crate) const MAX_CONTACT_ENTRIES: usize = 8;
 /// resulting `groupName` truncates to the same 64-char budget the envelope's
 /// `sourceName` peer-name material uses before it rides the rich payload.
 const GROUP_UPDATE_TITLE_MIRROR_CHARS: usize = 64;
+/// `groupUpdated.editor` bound (contract 1.92, §4.75): the change author's
+/// ACI is a 36-char UUID string; the cap is the same coarse guard the peer
+/// identity material rides — a hostile overlong shape reads as absent (the
+/// row lands unattributed), never truncated into a fake id.
+const GROUP_UPDATED_EDITOR_MAX_BYTES: usize = 64;
 /// Call-signaling bounds (contract 1.50, §4.48): the engine's legacy-frame
 /// projection (`offer`/`answer`/`iceUpdate`/`busy`/`hangup` id fields) and
 /// the bounded opaque payloads the connector forwards without parsing. The
@@ -2849,12 +2859,16 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
     }
     // The engine's `groupUpdated` projection (2026-10-06 engine batch): a
     // decrypted group expiration-timer change envelope-replaced before it
-    // reaches the connector — the notification carries no message row of its
-    // own. It routes as a control receive addressed by the group master key;
-    // the missing-`expireTimerSeconds`/non-u32 shapes fail closed (the
-    // projection guarantees the key, so its absence is a protocol error, not
-    // an unknown-timer state). `groupId` absence routes warn-only drop at the
-    // service layer like every unresolvable group reference.
+    // reaches the connector. It routes as a control receive addressed by the
+    // group master key; the missing-`expireTimerSeconds`/non-u32 shapes fail
+    // closed (the projection guarantees the key, so its absence is a protocol
+    // error, not an unknown-timer state). `editor` — the change author's ACI
+    // (contract 1.92 §4.75 row attribution material) — rides when the
+    // projection named one: trimmed, bounded to the ACI form the engine
+    // emits, and treated as absent when the shape is hostile (宁缺勿错, the
+    // row lands unattributed, never mis-attributed). `groupId` absence routes
+    // warn-only drop at the service layer like every unresolvable group
+    // reference.
     if let Some(update) = envelope.get("groupUpdated").and_then(Value::as_object) {
         let expire_timer_seconds = update
             .get("expireTimerSeconds")
@@ -2864,12 +2878,19 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             .get("groupId")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let editor = update
+            .get("editor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|aci| !aci.is_empty() && aci.len() <= GROUP_UPDATED_EDITOR_MAX_BYTES)
+            .map(str::to_string);
         return Some(ControlRouting {
             direction: "incoming",
             source: None,
             group_id,
             control: ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds,
+                editor,
             },
         });
     }
@@ -3007,8 +3028,15 @@ fn timer_change_text(seconds: Option<u64>) -> Option<NormalizedText> {
     normalized_text(&text)
 }
 
+/// The string form of the timer-notice material, for a service-layer row
+/// assembly that fills its own text columns (the bounded triple stays the
+/// engine receive face's shape).
+pub(crate) fn timer_change_material(seconds: Option<u64>) -> Option<String> {
+    timer_change_text(seconds).map(|text| text.value)
+}
+
 /// The rich marker a timer-notice row carries (its only rich content).
-fn timer_change_rich() -> NormalizedRich {
+pub(crate) fn timer_change_rich() -> NormalizedRich {
     NormalizedRich {
         is_expiration_update: true,
         ..Default::default()
@@ -4825,16 +4853,25 @@ mod tests {
             },
         }))
         .expect("groupUpdated routes");
+        let ControlReceive::GroupTimerUpdate { editor, .. } = &control else {
+            panic!("the projection routes the timer control");
+        };
+        assert_eq!(
+            editor.as_deref(),
+            Some("9d7762bb-1fb5-4cfd-9b15-aef4f8ef9c14")
+        );
         assert!(matches!(
             control,
             ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds: 3600,
+                ..
             }
         ));
         assert_eq!(group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
         assert_eq!(direction, "incoming");
 
-        // 0 = off rides verbatim (the projection guarantees the key).
+        // 0 = off rides verbatim (the projection guarantees the key); the
+        // envelope named no editor here, so the attribution stays absent.
         let (control, _, _) = routing(json!({
             "timestamp": 1727000000000u64,
             "groupUpdated": {
@@ -4844,12 +4881,49 @@ mod tests {
             },
         }))
         .expect("the off form routes");
+        let ControlReceive::GroupTimerUpdate { editor, .. } = &control else {
+            panic!("the off form routes the timer control");
+        };
+        assert!(editor.is_none(), "no editor on the envelope stays absent");
         assert!(matches!(
             control,
             ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds: 0,
+                ..
             }
         ));
+
+        // A hostile editor shape (overlong, whitespace-only) reads as absent —
+        // the attribution material never truncates into a fake id and never
+        // blocks the row.
+        let (control, _, _) = routing(json!({
+            "timestamp": 1727000000000u64,
+            "groupUpdated": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "revision": 6,
+                "expireTimerSeconds": 60,
+                "editor": " ".repeat(80),
+            },
+        }))
+        .expect("a hostile editor still routes the value");
+        let ControlReceive::GroupTimerUpdate { editor, .. } = control else {
+            panic!("the hostile-editor form routes the timer control");
+        };
+        assert!(editor.is_none(), "a hostile editor reads as absent");
+        let (control, _, _) = routing(json!({
+            "timestamp": 1727000000000u64,
+            "groupUpdated": {
+                "groupId": "ZmFrZS1ncm91cC0x",
+                "revision": 6,
+                "expireTimerSeconds": 60,
+                "editor": "e".repeat(80),
+            },
+        }))
+        .expect("an overlong editor still routes the value");
+        let ControlReceive::GroupTimerUpdate { editor, .. } = control else {
+            panic!("the overlong-editor form routes the timer control");
+        };
+        assert!(editor.is_none(), "an overlong editor reads as absent");
 
         // Shapes the projection never produces drop (fail closed): the key is
         // guaranteed present, so its absence is a protocol error, and no timer
@@ -4884,6 +4958,7 @@ mod tests {
             control,
             ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds: 60,
+                ..
             }
         ));
         assert!(group_id.is_none());

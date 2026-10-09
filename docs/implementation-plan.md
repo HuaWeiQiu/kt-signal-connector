@@ -5,7 +5,26 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.91 (2026-10-09; the story link-preview url/title metadata batch (§4.74):
+- Contract revision: 1.92 (2026-10-09; the group timer-change timeline row batch (§4.75): the
+  2026-10-06 dated note's open presentation-policy boundary closes — a group disappearing-timer
+  change (the engine's `groupUpdated {groupId, revision, expireTimerSeconds, editor?}`
+  projection) now lands the official presentation face beside the mirror: the §4.41
+  timer-notice system row in the group timeline (the §4.41 material carrying the announced
+  value verbatim, the §4.41 rich marker, system direction/status, no expire columns — the
+  notice row never sweeps). The row's sender face follows the §4.75 attribution ladder: the
+  editor ACI resolves through the recorded ACI→peer-key mapping first (the §4.37 identity
+  table — the desktop roster joins the number form), an unmapped ACI rides raw (joined by
+  uuid), and an editor-less envelope keeps the conversation-scoped unattributed sender (the
+  official unknown-member branch, never a guessed identity); `sender_id` carries the raw
+  address un-hashed so the desktop's roster join and actor resolution work. A same-value event
+  still lands its row (the official row narrates the change envelope and the group revision
+  advanced); a replayed envelope (same identity tuple) dedupes through the row identity; a
+  stamp-less envelope keeps the mirror and lands no row. Zero schema shape change (the row
+  reuses the §4.41 row fields; the receive description sentence is corrected the same
+  revision); no store version change. Recorded seam, untouched: the JVM/native dataMessage
+  timer-notice path (signal-cli's native `isExpirationUpdate`) keeps landing its sender as
+  the bounded legacy hash — joining that sender to the roster is the pre-existing §4.41 gap,
+  not this batch's — previously 1.91 (2026-10-09; the story link-preview url/title metadata batch (§4.74):
   the §4.71 second-phase item "story text/preview-image dispatch" lands its metadata half —
   `messages.sendStory` grows two independently optional keys, `previewUrl` (present ⇒ non-empty,
   ≤2048 chars, `https://`-prefix — the official `isValidLink` https-only posture, unlike the
@@ -3008,6 +3027,13 @@ kt-engine gap honestly; the engine batch (separate repository) owns the method p
 > kt-engine end-to-end (`kt_engine_mode_serves_group_expire_timer_and_group_updated`)
 > exercises the full ladder: no INVALID_REQUEST → SEND_LOG verbatim → projection inject →
 > conversation.changed with the new timer.
+>
+> 2026-10-09 supersession (contract 1.92, §4.75): the "no message row and no system row
+> lands" posture above and the open presentation-policy boundary it recorded are overturned —
+> the row half landed (the §4.41 timer-notice row, attributed through the very wire field
+> this note's last sentence anticipated: `editor` drives the row's sender face, resolved
+> through the recorded ACI→peer-key mapping at landing time). The mirror behavior this note
+> describes is unchanged and predates the row.
 
 ### 4.45 Account settings writes + blocked read: accounts.updateConfiguration, accounts.setProfile, accounts.setExpireTimer, conversations.getBlocked (contract revision 1.46, 2026-10-05)
 
@@ -5796,6 +5822,62 @@ camelCase keys, the lean frame stays free of them, and the pre-existing
 lean/full assertions keep `previewImage` behavior pinned); and the schema
 diff (the two maxLength pairs + the `pattern` in
 `tests/schema_consistency.rs`).
+
+### 4.75 Group timer-change timeline row: the `groupUpdated` receive face lands the official notice row (contract revision 1.92, 2026-10-09)
+
+The 2026-10-06 engine batch (recorded in the §4.44 dated note, whose posture this section
+overturns) left the group timer change's presentation an open boundary: the mirror converged
+(`conversations.expire_timer_seconds`, the refreshed summary riding `conversation.changed`)
+but no row landed, so the group timeline had nothing to render. The official client renders
+a group timer change as the same timer-notice system row a direct-conversation change lands
+(§4.41); this revision lands that row beside the mirror, and the desktop batch of the same
+date retires its compensating toast with it.
+
+- **Row shape**: exactly the §4.41 row (src/service.rs). The §4.41 material rides `text`
+  verbatim with its byte count — "已更新消息定时消失：{N} 秒", the close form
+  "已更新消息定时消失：已关闭" for 0 — the §4.41 rich marker (`is_expiration_update`) is
+  the row's only rich content, `direction`/`status` are `system`, the row carries no expire
+  columns (a notice row never sweeps), the host preview is the 120-char face every system
+  row takes, and `increment_unread` stays false (the official notice narrates in-timeline
+  without badge pressure).
+- **Attribution ladder** (the row's sender face): the projection's `editor` — the change
+  author's ACI, bounded to 64 bytes at the engine seam (`GROUP_UPDATED_EDITOR_MAX_BYTES`; a
+  hostile or overlong value reads as absence, never truncated into a fake id) — resolves
+  through the recorded ACI→peer-key mapping first (the §4.37 identity table), so an editor
+  the envelopes already introduced joins the desktop roster by its number form; an unmapped
+  ACI rides raw (the roster joins it by uuid); no editor at all keeps the
+  conversation-scoped unattributed sender (the stable hash form the pre-row era used) — the
+  official unknown-member branch, never a guessed identity. `sender_id` carries the chosen
+  address un-hashed: the desktop resolves the actor from its roster join (the official
+  `fromMember` posture), and that join keys on the raw address.
+- **Identity, dedup, guards**: the row identity is `(system, sent_at, sender_id)` with the
+  legacy-sender twin admitted (`message_by_signal_identity`), so the protocol timestamp is
+  load-bearing — a stamp-less or zero-stamped envelope keeps the mirror and lands no row (a
+  locally invented stamp would turn a replay into a second row). A same-value event still
+  lands its row: the official row narrates the change envelope, not the diff, and a member
+  re-setting the same value is a real change upstream (the group revision advanced); the
+  summary still re-pushes so a lagging window converges. A replayed envelope (same identity
+  tuple) dedupes through the row identity and converges nothing a second time.
+- **Ordering**: the mirror lands before the row, so the `conversation.changed` summary the
+  same ingest emits already states the new timer; the events ride
+  `[message.upserted, conversation.changed]`.
+- **Boundary**: zero schema shape change (the row reuses the §4.41 fields; the schema's
+  receive description sentence is corrected the same revision — the 2026-10-06
+  state-convergence-only posture is superseded); no new method, event, error code, or
+  capability; no store version change. Recorded seam, untouched: the JVM/native dataMessage
+  timer-notice path (signal-cli's native `isExpirationUpdate`) already landed rows before
+  this batch and keeps its sender as the bounded legacy hash — joining that sender to the
+  roster is the pre-existing §4.41 gap, deliberately not this batch's scope.
+
+Tests: the mirror+row unit (`service.rs` — the row's conversation/direction/status, the
+material verbatim for the 3600 form and the close form, the rich marker, no expire columns,
+the unattributed sender hash for the editor-less envelope, the summary carrying the new
+timer, the off form storing 0 literally, the same-value envelope landing its row, and the
+replayed envelope deduping to an empty event list); the attribution unit (`service.rs` —
+the mapped ACI resolving to its number-keyed peer, the unmapped ACI riding raw, the
+stamp-less envelope keeping the mirror without a row); the engine projection pin
+(`engine.rs` — the editor rides the `GroupTimerUpdate` control, hostile and overlong editor
+forms read as absence); and the unknown-group drop test (warn-only, no row invented).
 
 ## 5. signal-cli Boundary
 
