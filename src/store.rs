@@ -238,6 +238,16 @@ const SEARCH_MESSAGE_CURSOR_PREFIX: &str = "s1:";
 /// signal-cli may still replay an envelope, and a resend may still arrive.
 const RETENTION_SAFETY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 pub const MAX_PAGE_LIMIT: u32 = 200;
+/// Adjacent visual-media probe (contract 1.93, §4.76): at most this many
+/// media-bearing rows per call. The desktop lightbox probes one row per
+/// navigation step like the official `limit: 1`; the wider bound exists so a
+/// future strip prefetch never pages unbounded.
+pub const MAX_ADJACENT_MEDIA_LIMIT: u32 = 20;
+/// One keyset chunk of the adjacent-media scan: rows are inspected in
+/// bounded reads until enough media-bearing rows match (or the range is
+/// exhausted), so a media-sparse conversation never loads its whole history
+/// into memory at once.
+const ADJACENT_MEDIA_SCAN_CHUNK: i64 = 128;
 /// Contract 1.32 edit-history bounds: at most this many prior-body snapshots
 /// are kept per message (oldest pruned) and one snapshot body is at most this
 /// many bytes (UTF-8-safe truncation, the same budget as the host text
@@ -1053,6 +1063,14 @@ pub struct Page<T: Serialize> {
     pub items: Vec<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// Direction of the adjacent visual-media probe (contract 1.93, §4.76):
+/// `Older` walks toward the conversation's past, `Newer` toward its present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdjacentMediaDirection {
+    Older,
+    Newer,
 }
 
 #[derive(Clone, Debug)]
@@ -2149,6 +2167,107 @@ impl Store {
         self.attach_reactions(account_id, &mut items)?;
         self.attach_edits(account_id, &mut items)?;
         Ok(Page { items, next_cursor })
+    }
+
+    /// Adjacent visual-media probe (contract 1.93, §4.76): the messages next
+    /// to an anchor in one direction that carry at least one visual-media
+    /// attachment — an `image/*` or `video/*` content type, the desktop
+    /// lightbox strip's own predicate — with view-once rows always excluded
+    /// (the §4.37 boundary: a tap-to-view row never joins a navigation
+    /// strip). Ordered adjacency-first: the row closest to the anchor comes
+    /// first, and the anchor itself is never returned (the official
+    /// requireDifferentMessage posture). Rows are inspected in bounded
+    /// keyset chunks until `limit` matches accumulate or the range is
+    /// exhausted, so a media-sparse conversation never loads its whole
+    /// history at once; a missing anchor answers `InvalidCursor` (the
+    /// caller probes from a row it already holds — a vanished anchor is a
+    /// programming error, never silently re-anchored). Story rows need no
+    /// predicate: a story never lands in this table at all (§4.67). The
+    /// result carries the same stored shape as `messages.list`, reactions
+    /// and edits attached the same way, so every read face agrees.
+    pub fn list_adjacent_media(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        anchor_message_id: &str,
+        direction: AdjacentMediaDirection,
+        limit: u32,
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        let limit = limit.clamp(1, MAX_ADJACENT_MEDIA_LIMIT);
+        let anchor_sent_at: i64 = self
+            .lock_conn()?
+            .query_row(
+                "SELECT sent_at FROM messages
+                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
+                params![anchor_message_id, account_id, conversation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .ok_or(StoreError::InvalidCursor)?;
+        let mut matches: Vec<MessageRecord> = Vec::new();
+        let mut cursor_sent_at = anchor_sent_at;
+        let mut cursor_id = anchor_message_id.to_string();
+        // The scan walks the keyset in the probe direction one bounded chunk
+        // at a time; only the retained (sent_at, id) pair moves, never the
+        // anchor, so matched rows can never be re-read by a later chunk.
+        while (matches.len() as u32) < limit {
+            let chunk = {
+                let conn = self.lock_conn()?;
+                let sql = match direction {
+                    AdjacentMediaDirection::Older => {
+                        "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                                body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                         FROM messages
+                         WHERE account_id=?1 AND conversation_id=?2
+                           AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
+                         ORDER BY sent_at DESC, id DESC
+                         LIMIT ?5"
+                    }
+                    AdjacentMediaDirection::Newer => {
+                        "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                                body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
+                         FROM messages
+                         WHERE account_id=?1 AND conversation_id=?2
+                           AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
+                         ORDER BY sent_at ASC, id ASC
+                         LIMIT ?5"
+                    }
+                };
+                let mut stmt = conn
+                    .prepare(sql)
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                let rows = stmt
+                    .query_map(
+                        params![
+                            account_id,
+                            conversation_id,
+                            cursor_sent_at,
+                            cursor_id,
+                            ADJACENT_MEDIA_SCAN_CHUNK
+                        ],
+                        message_record_from_row,
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?
+            };
+            let exhausted = chunk.len() < ADJACENT_MEDIA_SCAN_CHUNK as usize;
+            if let Some(last) = chunk.last() {
+                cursor_sent_at = last.sent_at as i64;
+                cursor_id = last.id.clone();
+            }
+            matches.extend(chunk.into_iter().filter(message_has_visual_media));
+            if exhausted {
+                break;
+            }
+        }
+        matches.truncate(limit as usize);
+        self.attach_reactions(account_id, &mut matches)?;
+        self.attach_edits(account_id, &mut matches)?;
+        Ok(matches)
     }
 
     /// Account-wide substring search over stored message bodies (contract
@@ -6337,6 +6456,32 @@ fn history_stage_recipient_from_row(row: &Row<'_>) -> rusqlite::Result<HistorySt
     })
 }
 
+/// The adjacent-media probe's row predicate (contract 1.93, §4.76): at
+/// least one attachment with an `image/*` or `video/*` content type, and
+/// never a view-once row (the marker and its invalid twin both exclude —
+/// the §4.37 boundary keeps tap-to-view media out of every navigation
+/// strip). Voice notes are audio, not visual; an attachment without a
+/// content type cannot be classified and is honestly skipped.
+fn message_has_visual_media(record: &MessageRecord) -> bool {
+    let view_once = record
+        .rich
+        .as_ref()
+        .map(|rich| rich.view_once || rich.view_once_invalid)
+        .unwrap_or(false);
+    if view_once {
+        return false;
+    }
+    record.attachments.iter().any(|attachment| {
+        attachment
+            .content_type
+            .as_deref()
+            .map(|content_type| {
+                content_type.starts_with("image/") || content_type.starts_with("video/")
+            })
+            .unwrap_or(false)
+    })
+}
+
 fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
     let text: Option<String> = row.get(7)?;
     let text_bytes = row
@@ -6978,6 +7123,335 @@ mod tests {
         let plain_wire = serde_json::to_value(&plain).unwrap();
         assert!(plain_wire.get("previews").is_none());
         assert!(plain_wire.get("viewOnce").is_none());
+    }
+
+    /// Contract 1.93 (§4.76): the adjacent visual-media probe walks the
+    /// keyset in the probe direction, adjacency-first with the anchor itself
+    /// never returned; only rows with an image/* or video/* attachment match
+    /// (audio/file/unclassified honestly skip), view-once rows never join,
+    /// and a media message in another conversation stays invisible.
+    #[test]
+    fn list_adjacent_media_walks_both_directions_with_the_strip_predicate() {
+        use crate::engine::{NormalizedAttachment, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let other = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "other")
+            .unwrap();
+        let attachment = |id: &str, content_type: Option<&str>| NormalizedAttachment {
+            id: id.into(),
+            content_type: content_type.map(str::to_string),
+            filename: None,
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            locator: None,
+        };
+        let row = |id: &str,
+                   sent_at: u64,
+                   attachments: Vec<NormalizedAttachment>,
+                   rich: Option<NormalizedRich>|
+         -> MessageRecord {
+            MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: None,
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: false,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments,
+                rich,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                admin_deleted: false,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                server_guid: None,
+            }
+        };
+        let insert = |message: &MessageRecord| {
+            store.insert_message(message, None, None, false).unwrap();
+        };
+        // Timeline (sent_at order): 10 image, 20 text-only, 30 audio,
+        // 40 video, 50 anchor text, 60 pdf, 70 view-once image, 80 image.
+        insert(&row(
+            "m-image-10",
+            10,
+            vec![attachment("a10", Some("image/jpeg"))],
+            None,
+        ));
+        insert(&row("m-text-20", 20, vec![], None));
+        insert(&row(
+            "m-audio-30",
+            30,
+            vec![attachment("a30", Some("audio/aac"))],
+            None,
+        ));
+        insert(&row(
+            "m-video-40",
+            40,
+            vec![attachment("a40", Some("video/mp4"))],
+            None,
+        ));
+        insert(&row("m-anchor-50", 50, vec![], None));
+        insert(&row(
+            "m-pdf-60",
+            60,
+            vec![attachment("a60", Some("application/pdf"))],
+            None,
+        ));
+        insert(&row(
+            "m-viewonce-70",
+            70,
+            vec![attachment("a70", Some("image/png"))],
+            Some(NormalizedRich {
+                view_once: true,
+                ..NormalizedRich::default()
+            }),
+        ));
+        insert(&row(
+            "m-image-80",
+            80,
+            vec![attachment("a80", Some("image/png"))],
+            None,
+        ));
+        // An unclassifiable attachment (no content type) never matches.
+        insert(&row(
+            "m-mystery-90",
+            90,
+            vec![attachment("a90", None)],
+            None,
+        ));
+        // Media in another conversation is invisible to the probe.
+        let mut cross = row(
+            "m-cross-15",
+            15,
+            vec![attachment("a15", Some("image/gif"))],
+            None,
+        );
+        cross.conversation_id = other.id.clone();
+        insert(&cross);
+
+        let older = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-anchor-50",
+                AdjacentMediaDirection::Older,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            older.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-video-40", "m-image-10"],
+            "adjacency-first, non-media rows and the cross-conversation row skipped"
+        );
+        let newer = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-anchor-50",
+                AdjacentMediaDirection::Newer,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            newer.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-image-80"],
+            "pdf, view-once, and unclassified attachments never join the strip"
+        );
+        // The anchor itself is never returned even when it carries media
+        // (and the view-once row between is skipped, not matched).
+        let anchored = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-image-80",
+                AdjacentMediaDirection::Older,
+                1,
+            )
+            .unwrap();
+        assert_eq!(anchored.len(), 1);
+        assert_eq!(anchored[0].id, "m-video-40");
+        // limit truncates after full matches, not scanned rows.
+        let limited = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-anchor-50",
+                AdjacentMediaDirection::Older,
+                1,
+            )
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "m-video-40");
+        // Ranges without media answer an empty vec, never an error.
+        let empty = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-image-10",
+                AdjacentMediaDirection::Older,
+                20,
+            )
+            .unwrap();
+        assert!(empty.is_empty());
+        // A vanished anchor is a deterministic InvalidCursor, never a silent
+        // re-anchor.
+        let missing = store.list_adjacent_media(
+            &account.id,
+            &conversation.id,
+            "m-gone",
+            AdjacentMediaDirection::Older,
+            20,
+        );
+        assert!(matches!(missing, Err(StoreError::InvalidCursor)));
+    }
+
+    /// Contract 1.93 (§4.76): rows sharing the anchor's sent_at order by id
+    /// (the keyset tiebreak), and the scan crosses chunk boundaries — a
+    /// media-bearing row further than one bounded chunk of non-media rows is
+    /// still found without loading the whole range at once.
+    #[test]
+    fn list_adjacent_media_tiebreaks_by_id_and_crosses_scan_chunks() {
+        use crate::engine::NormalizedAttachment;
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let attachment = |id: &str| NormalizedAttachment {
+            id: id.into(),
+            content_type: Some("image/jpeg".to_string()),
+            filename: None,
+            size: Some(1024),
+            width: None,
+            height: None,
+            is_voice_note: false,
+            locator: None,
+        };
+        let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "peer".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            text_retrievable: false,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: if media {
+                vec![attachment(id)]
+            } else {
+                Vec::new()
+            },
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            admin_deleted: false,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            server_guid: None,
+        };
+        // Same sent_at as the anchor: id below the anchor is older, id above
+        // is newer — the tiebreak matches list_messages' keyset order.
+        store
+            .insert_message(&row("m-tie-a", 50, true), None, None, false)
+            .unwrap();
+        store
+            .insert_message(&row("m-tie-z", 50, true), None, None, false)
+            .unwrap();
+        store
+            .insert_message(&row("m-tie-m", 50, false), None, None, false)
+            .unwrap();
+        let older = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-tie-m",
+                AdjacentMediaDirection::Older,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            older.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-tie-a"]
+        );
+        let newer = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-tie-m",
+                AdjacentMediaDirection::Newer,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            newer.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-tie-z"]
+        );
+
+        // More than one bounded scan chunk (128) of non-media rows between
+        // the anchor and the next media row: the scan crosses chunks.
+        for index in 0..(ADJACENT_MEDIA_SCAN_CHUNK as u64 + 10) {
+            let id = format!("m-fill-{index:04}");
+            store
+                .insert_message(&row(&id, 100 + index, false), None, None, false)
+                .unwrap();
+        }
+        store
+            .insert_message(&row("m-far-media", 1_000, true), None, None, false)
+            .unwrap();
+        let found = store
+            .list_adjacent_media(
+                &account.id,
+                &conversation.id,
+                "m-tie-z",
+                AdjacentMediaDirection::Newer,
+                20,
+            )
+            .unwrap();
+        assert_eq!(
+            found.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["m-far-media"]
+        );
     }
 
     /// Contract 1.34: the receipt selection queries — absent-`messageIds`

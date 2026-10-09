@@ -53,6 +53,11 @@ pub const METHODS: &[MethodRow] = &[
     // `avatar-fetch`.
     ("conversations.getAvatar", Lane::Read, false, "read"),
     ("messages.list", Lane::Read, false, "read"),
+    // Adjacent visual-media probe (contract 1.93, §4.76): a bounded
+    // store-only read over one conversation's media-bearing rows — no
+    // upstream traffic, no mutation; advertised through
+    // `message-adjacent-media`.
+    ("messages.adjacentMedia", Lane::Read, false, "read"),
     ("messages.getText", Lane::Read, false, "read"),
     // Account-wide store search (contract 1.30): a bounded read over the
     // local database only — no upstream traffic, no mutation.
@@ -472,7 +477,10 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
 /// `attachment-download` (contract revision 1.61) marks the §4.54 live
-/// attachment download face (`attachments.download`); `username` (contract
+/// attachment download face (`attachments.download`); `message-adjacent-media`
+/// (contract revision 1.93) marks the §4.76 adjacent visual-media probe
+/// (`messages.adjacentMedia` — the store-only read behind the desktop
+/// lightbox's cross-message navigation); `username` (contract
 /// revision 1.59) marks the §4.55 username faces (`accounts.setUsername`,
 /// `accounts.getUsername`, `username.lookup`); `message-requests`
 /// (contract revision 1.63) marks the §4.56 message-request response faces
@@ -525,6 +533,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-join-approve",
     "group-invite-revoke",
     "attachment-download",
+    "message-adjacent-media",
     "username",
     "message-requests",
     "safety-number",
@@ -545,6 +554,7 @@ mod tests {
             "conversations.getBlocked",
             "conversations.getAvatar",
             "messages.list",
+            "messages.adjacentMedia",
             "messages.getText",
             "messages.search",
             "messages.attachments.open",
