@@ -900,13 +900,12 @@ impl RuntimeSupervisor {
 
         // Stream the body. The service lock is released for the network half
         // (the media chain answers stay serialized at dispatch; the temp
-        // names are unique so two chains cannot collide).
-        let client = reqwest::Client::builder()
-            .connect_timeout(crate::history_attachment::CONNECT_TIMEOUT)
-            .timeout(crate::history_attachment::TOTAL_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| ServiceError::Io)?;
+        // names are unique so two chains cannot collide). The launcher's
+        // SOCKS route from the process environment (contract revision 1.98,
+        // §4.38 step 3) rides this client too: the CDN GET shares the exact
+        // route the engine's own transport takes.
+        let env_proxy = std::env::var(crate::doctor::SOCKS_PROXY_ENV).ok();
+        let client = attachment_download_client(env_proxy.as_deref())?;
         let response = client.get(&url).send().await.map_err(|_| {
             map_download_failure(crate::history_attachment::DownloadFailure::Network)
         })?;
@@ -5490,6 +5489,29 @@ fn map_download_failure(failure: crate::history_attachment::DownloadFailure) -> 
     ServiceError::Api(ApiError::new(code, text, retryable))
 }
 
+/// The §4.38 step-3 CDN download client: the same connect/total budgets and
+/// no-redirect posture the chain has always used, plus the launcher's SOCKS
+/// route when the caller passes the `KT_SIGNAL_SOCKS_PROXY` environment
+/// value (injected, so both branches stay testable without mutating process
+/// state). The value parses through the doctor's tolerant parse — the
+/// canonical `host:port`, a `socks5(h)://` prefix normalized away — and
+/// rides the client as `socks5h://` (remote DNS), the same `ALL_PROXY`
+/// mapping the engine child gets, so a walled or DNS-poisoned network still
+/// reaches the transit CDN over the route the engine's own transport takes.
+/// A missing or malformed value builds the direct client: byte-for-byte the
+/// behavior before the route existed.
+fn attachment_download_client(proxy: Option<&str>) -> Result<reqwest::Client, ServiceError> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(crate::history_attachment::CONNECT_TIMEOUT)
+        .timeout(crate::history_attachment::TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(proxy) = proxy.and_then(crate::doctor::parse_socks_proxy_env) {
+        let socks_url = format!("socks5h://{}:{}", proxy.host, proxy.port);
+        builder = builder.proxy(reqwest::Proxy::all(&socks_url).map_err(|_| ServiceError::Io)?);
+    }
+    builder.build().map_err(|_| ServiceError::Io)
+}
+
 /// Best-effort temp cleanup; the download dir stays governed, so a leftover
 /// temp only wastes its own bytes.
 fn cleanup_temp(path: &std::path::Path) {
@@ -6621,9 +6643,9 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RuntimeSupervisor, cloud_archive_face, cloud_status_from_engine,
-        compose_contact_display_name, compose_import_progress, group_extra_json,
-        is_receive_fatal_stderr, upload_status_from_engine,
+        RuntimeSupervisor, attachment_download_client, cloud_archive_face,
+        cloud_status_from_engine, compose_contact_display_name, compose_import_progress,
+        group_extra_json, is_receive_fatal_stderr, upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -9107,5 +9129,44 @@ mod tests {
         assert_eq!(group_status, "sent");
         assert!(viewed_at(&group.id, "g1").is_some());
         supervisor.shutdown().await.unwrap();
+    }
+
+    /// §4.38 step 3 (contract revision 1.98), direct branch: no environment
+    /// value builds the same client the chain has always used — the budgets
+    /// and the no-redirect posture, and no proxy layer.
+    #[test]
+    fn download_client_without_an_env_value_builds_the_direct_route() {
+        assert!(attachment_download_client(None).is_ok());
+    }
+
+    /// The environment value parses through the doctor's tolerant parse, so
+    /// a malformed value reads as unconfigured everywhere else too: the
+    /// direct route, never a half-configured client.
+    #[test]
+    fn download_client_treats_a_malformed_env_value_as_unconfigured() {
+        assert!(attachment_download_client(Some("not a proxy")).is_ok());
+        assert!(attachment_download_client(Some("host-without-port")).is_ok());
+    }
+
+    /// The SOCKS branch, proven against the real transport: a loopback proxy
+    /// port with no listener refuses the SOCKS handshake immediately, so the
+    /// GET fails fast offline — a client that silently ignored the route
+    /// would attempt the real DNS/TLS path instead (the doctor's
+    /// `socks_refused` proof, mirrored for the CDN client). Both canonical
+    /// `host:port` and the tolerated `socks5h://` prefix wire the route.
+    #[tokio::test]
+    async fn download_client_wires_the_socks_route_into_the_transport() {
+        for value in ["127.0.0.1:1", "socks5h://127.0.0.1:1"] {
+            let client = attachment_download_client(Some(value)).expect("client builds");
+            let error = client
+                .get("https://chat.signal.org/")
+                .send()
+                .await
+                .expect_err("nothing listens on the loopback socks port");
+            assert!(
+                error.is_connect(),
+                "the refusal must be the proxy hop, got: {error}"
+            );
+        }
     }
 }

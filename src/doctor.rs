@@ -58,8 +58,9 @@ const DOCTOR_ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// The launcher-injected SOCKS proxy environment variable (`host:port`) —
 /// the same variable the engine child inherits and maps onto
 /// `ALL_PROXY=socks5h://…`. The service-plane probes reuse it so the probe
-/// validates exactly the route real traffic takes.
-const SOCKS_PROXY_ENV: &str = "KT_SIGNAL_SOCKS_PROXY";
+/// validates exactly the route real traffic takes, and so does the
+/// supervisor's CDN attachment-download client (§4.38 step 3).
+pub(crate) const SOCKS_PROXY_ENV: &str = "KT_SIGNAL_SOCKS_PROXY";
 
 /// Fixed service-plane probe targets (revision 1.97): HTTPS-only,
 /// compile-time constants. They never enter logs and the report never
@@ -768,15 +769,15 @@ async fn service_face_for(proxy: Option<SocksProxy>) -> ServiceFace {
 }
 
 /// The launcher's proxy from the process environment, or `None`. The value
-/// never leaves this module — the report carries `proxyConfigured` and
+/// never reaches the report — the report carries `proxyConfigured` and
 /// classification literals only.
-fn env_socks_proxy() -> Option<SocksProxy> {
+pub(crate) fn env_socks_proxy() -> Option<SocksProxy> {
     parse_socks_proxy_env(&std::env::var(SOCKS_PROXY_ENV).ok()?)
 }
 
 /// The canonical variable form is `host:port`; an explicit `socks5(h)://`
 /// scheme prefix is tolerated and normalized. Anything else is unconfigured.
-fn parse_socks_proxy_env(raw: &str) -> Option<SocksProxy> {
+pub(crate) fn parse_socks_proxy_env(raw: &str) -> Option<SocksProxy> {
     let bare = raw
         .strip_prefix("socks5h://")
         .or_else(|| raw.strip_prefix("socks5://"))
