@@ -294,6 +294,17 @@ impl RuntimeSupervisor {
         &self.service
     }
 
+    /// Whether the media-download capability is genuinely armed for this
+    /// group: the media table exists — the launcher passed `--media-ingest`
+    /// AND the shared handle table arrived — which is the exact gate every
+    /// media method answers before anything else. The registry reads it for
+    /// the handshake `attachment-download` advertisement (contract revision
+    /// 1.98): an unarmed group must not advertise a tag whose faces answer
+    /// `CAPABILITY_UNAVAILABLE` for every call.
+    pub(crate) fn media_ingest_armed(&self) -> bool {
+        self.media.is_some()
+    }
+
     /// Spawn the receive-liveness watchdog (idempotent). Detects a silently dead
     /// receive path — signal-cli stays alive but its server WebSocket is gone —
     /// via stderr error lines and periodic read-only pings, then restarts the engine.

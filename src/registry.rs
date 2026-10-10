@@ -189,6 +189,18 @@ impl ProxyGroupRuntime {
         self.groups.iter().map(|slot| slot.id.as_str()).collect()
     }
 
+    /// Whether the media-download capability is genuinely armed process-wide.
+    /// Every group receives the registry's single effective media-ingest
+    /// decision (the kt-engine downgrade included) and the same handle table,
+    /// so the first group's media table answers for the whole runtime — the
+    /// handshake `attachment-download` advertisement gate (contract revision
+    /// 1.98) and the exact gate the media methods themselves answer: a
+    /// runtime without the table omits the tag instead of advertising a face
+    /// that fails for every call.
+    pub fn media_ingest_armed(&self) -> bool {
+        self.groups[0].supervisor.media_ingest_armed()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<RegistryEvent> {
         self.events.subscribe()
     }

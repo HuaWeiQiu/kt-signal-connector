@@ -4497,6 +4497,17 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         );
     }
 
+    // Contract revision 1.98: this harness spawns `serve` without
+    // `--media-ingest` (and the registry's kt-engine downgrade holds anyway),
+    // so the attachment-download tag must stay absent — the honest
+    // unavailable advertisement, not a capability every call would fail.
+    assert!(
+        !capabilities
+            .iter()
+            .any(|value| value.as_str() == Some("attachment-download")),
+        "an unarmed runtime must not advertise attachment-download: {capabilities:?}"
+    );
+
     let started = request(&mut client, "start", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
     let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;

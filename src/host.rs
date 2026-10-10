@@ -520,7 +520,7 @@ where
             json!({
                 "sessionId": random_identifier(),
                 "apiVersion": API_VERSION,
-                "capabilities": advertised_capabilities(),
+                "capabilities": advertised_capabilities(runtime.media_ingest_armed()),
             }),
         ),
     )
@@ -3457,6 +3457,18 @@ mod tests {
                 .iter()
                 .any(|value| value == "messages.sendText")
         );
+        // Contract revision 1.98: this default runtime carries no armed
+        // media table, so the attachment-download tag stays absent — the
+        // desktop takes the honest metadata-only path instead of calling a
+        // face that answers CAPABILITY_UNAVAILABLE for every download.
+        assert!(
+            !handshake["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "attachment-download"),
+            "an unarmed runtime must not advertise attachment-download"
+        );
 
         client
             .send(
@@ -3491,6 +3503,102 @@ mod tests {
 
         drop(client);
         assert!(server.await.unwrap().is_ok());
+    }
+
+    /// The handshake round trip with the advertised `capabilities` returned —
+    /// the attachment-download gate test runs it against two runtimes.
+    async fn handshake_capabilities(
+        secret_bytes: [u8; 32],
+        runtime: Arc<ProxyGroupRuntime>,
+    ) -> Vec<String> {
+        let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
+        let (server_stream, client_stream) = duplex(64 * 1024);
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let challenge: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
+        let client_nonce = hex::encode([9_u8; 32]);
+        let proof = client_proof(&secret_bytes, server_nonce, &client_nonce);
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": "handshake-1",
+                    "method": "handshake",
+                    "params": { "clientNonce": client_nonce, "proof": proof }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let handshake: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let capabilities = handshake["result"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().expect("capability tag").to_string())
+            .collect();
+        drop(client);
+        assert!(server.await.unwrap().is_ok());
+        capabilities
+    }
+
+    /// Contract revision 1.98: `attachment-download` is the one handshake
+    /// tag the runtime state gates. The unarmed default runtime — the
+    /// packaged shape: no `--media-ingest`, the registry's kt-engine
+    /// downgrade included — omits the tag while every real method stays
+    /// advertised; a runtime assembled with the armed media table (the exact
+    /// gate the media methods answer) advertises the pre-1.98 payload
+    /// unchanged.
+    #[tokio::test]
+    async fn handshake_gates_the_attachment_download_tag_on_media_ingest() {
+        let unarmed = handshake_capabilities([7_u8; 32], test_runtime()).await;
+        assert!(
+            !unarmed
+                .iter()
+                .any(|capability| capability == "attachment-download"),
+            "an unarmed runtime must not advertise attachment-download"
+        );
+        assert!(
+            unarmed
+                .iter()
+                .any(|capability| capability == "messages.sendText"),
+            "the method table stays advertised either way"
+        );
+
+        let temp = TempDir::new().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
+        // Leak TempDir for unit test lifetime; path stays valid for process.
+        std::mem::forget(temp);
+        let mut config = SignalCliConfig::new(
+            PathBuf::from("unused-signal-cli"),
+            PathBuf::from("/tmp/unused-signal-data"),
+        );
+        config.media_ingest = true;
+        let armed_supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            Arc::new(store),
+            crate::DEFAULT_PROXY_GROUP_ID.to_string(),
+            Some(Arc::new(crate::media::MediaHandleTable::new())),
+        ));
+        let armed_runtime = ProxyGroupRuntime::new(vec![crate::registry::ProxyGroupSlot::new(
+            crate::DEFAULT_PROXY_GROUP_ID.to_string(),
+            armed_supervisor,
+        )]);
+        let armed = handshake_capabilities([8_u8; 32], armed_runtime).await;
+        assert!(
+            armed
+                .iter()
+                .any(|capability| capability == "attachment-download"),
+            "an armed runtime advertises attachment-download"
+        );
     }
 
     /// The host frame limit carries the attachment contract (revision 1.13):

@@ -170,9 +170,11 @@ pub const METHODS: &[MethodRow] = &[
     // addressed by attachmentIndex. Mutating (it lands a file in the
     // governed media directory), send lane behind the reaction-class
     // write-lane mutex and delete barrier — the 1.57 class verbatim.
-    // Advertised through the new `attachment-download` tag (the §4.38
+    // Advertised through the `attachment-download` tag (the §4.38
     // faces keep their no-new-bit discipline; this one widens the audience
-    // beyond the history-import desktops).
+    // beyond the history-import desktops) — the one advertisement gated on
+    // runtime state since contract 1.98: the handshake omits the tag unless
+    // the media table is armed.
     ("attachments.download", Lane::Send, true, "send"),
     // Disappearing-message timer set (contract revision 1.42, §4.41):
     // mutating, send-lane upstream traffic — the reaction class verbatim,
@@ -452,6 +454,15 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
     names
 };
 
+/// The §4.54 live attachment-download tag — the one feature capability the
+/// handshake advertisement gates on runtime state (contract revision 1.98):
+/// media download is real only when the launcher armed media ingest and the
+/// group's media table exists, so a runtime without it must not advertise
+/// the tag. A desktop that sees it absent renders attachment pills
+/// metadata-only — the honest unavailable path — instead of calling a face
+/// that answers `CAPABILITY_UNAVAILABLE` for every download.
+pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
+
 /// Feature capability tags that ride the handshake `capabilities` array
 /// beyond the method-name list (contract revision 1.34): `send-receipts`
 /// marks the outbound receipt face — `messages.markRead` /
@@ -547,6 +558,15 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// its tag so an old connector answers a clean capability gap instead of
 /// `METHOD_NOT_ALLOWED`.
 /// `METHOD_NOT_ALLOWED`.
+///
+/// Contract revision 1.98: `attachment-download` is the one tag whose
+/// advertisement is conditional — [`crate::advertised_capabilities`] filters
+/// it out unless the runtime's media ingest is armed, because the media
+/// faces behind it answer `CAPABILITY_UNAVAILABLE` for every call otherwise
+/// (the launcher flag alone is not the truth: the registry's kt-engine
+/// downgrade decides, and the handshake must not advertise a capability the
+/// runtime cannot serve). The constant stays in this table so the tag
+/// inherits the table-order advertisement when the gate is open.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",
     "send-sticker",
@@ -567,7 +587,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-terminate",
     "group-join-approve",
     "group-invite-revoke",
-    "attachment-download",
+    ATTACHMENT_DOWNLOAD_CAPABILITY,
     "message-adjacent-media",
     "username",
     "message-requests",
@@ -749,14 +769,14 @@ mod tests {
     fn capabilities_and_metrics_labels_derive_from_the_table() {
         // The advertised method list is exactly the table; the handshake
         // payload appends the feature tags after it (contract revision 1.34:
-        // `send-receipts`).
+        // `send-receipts`). An armed runtime advertises the full table.
         assert_eq!(crate::PHASE2_CAPABILITIES, METHOD_NAMES.as_slice());
         assert_eq!(
-            crate::advertised_capabilities()[..METHOD_NAMES.len()],
+            crate::advertised_capabilities(true)[..METHOD_NAMES.len()],
             METHOD_NAMES[..]
         );
         assert_eq!(
-            &crate::advertised_capabilities()[METHOD_NAMES.len()..],
+            &crate::advertised_capabilities(true)[METHOD_NAMES.len()..],
             FEATURE_CAPABILITIES
         );
         let names: Vec<_> = METHODS.iter().map(|row| row.0).collect();
@@ -771,5 +791,32 @@ mod tests {
             );
         }
         assert_eq!(metrics_class("anything.else"), "unknown");
+    }
+
+    /// Contract revision 1.98: the `attachment-download` tag is the one
+    /// advertisement the runtime state gates. Without the armed media table
+    /// the tag is absent — every other feature tag keeps its table position —
+    /// and with it armed the payload is the full pre-1.98 advertisement.
+    #[test]
+    fn attachment_download_capability_tracks_the_media_ingest_gate() {
+        let unarmed = crate::advertised_capabilities(false);
+        assert!(
+            !unarmed.contains(&ATTACHMENT_DOWNLOAD_CAPABILITY),
+            "an unarmed runtime must not advertise attachment-download: {unarmed:?}"
+        );
+        let armed = crate::advertised_capabilities(true);
+        assert!(
+            armed.contains(&ATTACHMENT_DOWNLOAD_CAPABILITY),
+            "an armed runtime advertises attachment-download: {armed:?}"
+        );
+        // The gate only removes the one tag; the rest of the table — method
+        // names first, then the remaining feature tags in table order — is
+        // byte-identical between the two payloads.
+        let without_tag: Vec<_> = armed
+            .iter()
+            .copied()
+            .filter(|capability| *capability != ATTACHMENT_DOWNLOAD_CAPABILITY)
+            .collect();
+        assert_eq!(unarmed, without_tag);
     }
 }
