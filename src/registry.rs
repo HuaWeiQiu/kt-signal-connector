@@ -862,6 +862,25 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_sticker_pack_sync(params).await
     }
 
+    /// Chat-folder sync (contract 1.95, §4.78): account state — the folders
+    /// live in the account's storage session, so both faces route through the
+    /// account's owning engine (the §4.34 sync-face class; kt-engine only).
+    pub async fn chat_folders_list(
+        &self,
+        params: crate::service::ChatFoldersListParams,
+    ) -> Result<crate::service::ChatFolderSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.chat_folders_list(params).await
+    }
+
+    pub async fn chat_folders_set_records(
+        &self,
+        params: crate::service::ChatFoldersSetRecordsParams,
+    ) -> Result<crate::service::ChatFolderSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.chat_folders_set_records(params).await
+    }
+
     /// Account settings writes (contract 1.46, §4.45): account-record state —
     /// the writes live in the account's storage session, so all three route
     /// through the account's owning engine like every other mutating face.

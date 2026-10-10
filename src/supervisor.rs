@@ -22,28 +22,30 @@ use crate::service::{
     AccountUsername, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
     AttachmentSendTarget, AvatarDownload, BlockedConversations, CallsSendSignalParams,
-    ConnectorService, ContactsSyncOutcome, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
-    GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails, GroupsApproveJoinRequestsParams,
-    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    ChatFolderSyncs, ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService,
+    ContactsSyncOutcome, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams,
+    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
+    GroupsApproveJoinRequestsParams, GroupsQuitParams, GroupsRevokeInvitesParams,
+    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent,
+    IdentitiesGetParams, IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome,
+    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MessageRequestOutcome,
+    MessageRequestParams, MessagesReportSpamParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
+    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
+    SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
+    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
+    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
     StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
     UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult, account_limit_error,
-    blocked_conversations_result, identity_from_engine, pinned_conversations_result,
-    sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    blocked_conversations_result, chat_folder_syncs_result, identity_from_engine,
+    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -3013,6 +3015,69 @@ impl RuntimeSupervisor {
             Ok(result) => Ok(sticker_pack_syncs_result(
                 result
                     .get("packs")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// chatFolders.list (contract revision 1.95, §4.78): gates, resolution,
+    /// and the kt-engine mode seam under the service lock (the §4.73 ladder —
+    /// the seam answers before any engine starts), then the read-only engine
+    /// call; the folder list projects straight from the engine result with
+    /// the KT entry cap, record bodies verbatim.
+    pub async fn chat_folders_list(
+        &self,
+        params: ChatFoldersListParams,
+    ) -> Result<ChatFolderSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_chat_folders_list(&params.account_id, self.config.mode)?
+        };
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("chatFolders.list", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(chat_folder_syncs_result(
+            result
+                .get("folders")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
+    }
+
+    /// chatFolders.setRecords (contract revision 1.95, §4.78): bounds under
+    /// the service lock, then the mutating engine call — reaction-class
+    /// discipline: an unknown outcome answers SEND_OUTCOME_UNKNOWN and is
+    /// never retried; the success result is the post-write cloud state read
+    /// back, not a local echo. kt-engine only (the §4.73 mode seam).
+    pub async fn chat_folders_set_records(
+        &self,
+        params: ChatFoldersSetRecordsParams,
+    ) -> Result<ChatFolderSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_chat_folders_set_records(
+                &params.account_id,
+                params.records.as_deref().unwrap_or(&[]),
+                params.remove_ids.as_deref().unwrap_or(&[]),
+                self.config.mode,
+            )?
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call("chatFolders.setRecords", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => Ok(chat_folder_syncs_result(
+                result
+                    .get("folders")
                     .and_then(Value::as_array)
                     .ok_or(ServiceError::Engine(EngineError::Protocol))?,
             )),

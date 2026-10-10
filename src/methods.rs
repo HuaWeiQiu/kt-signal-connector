@@ -400,6 +400,16 @@ pub const METHODS: &[MethodRow] = &[
     ("calls.groupProof", Lane::Read, false, "read"),
     ("calls.groupMembers", Lane::Read, false, "read"),
     ("calls.endorsementsPublicKey", Lane::Read, false, "read"),
+    // Chat-folder sync (contract 1.95, §4.78): chatFolders.list is a bounded
+    // cloud-backed read of the account's ChatFolderRecord set;
+    // chatFolders.setRecords is the mutating storage-service write —
+    // reaction-class write-lane mutex and delete barrier, no local
+    // persistence on either side (records cross verbatim; the connector
+    // neither interprets nor re-keys them). kt-engine only (KT-extension
+    // methods a stock signal-cli does not carry, the §4.73 mode seam);
+    // advertised through `chat-folders`.
+    ("chatFolders.list", Lane::Read, false, "read"),
+    ("chatFolders.setRecords", Lane::Send, true, "send"),
 ];
 
 fn spec(method: &str) -> Option<&'static MethodRow> {
@@ -521,7 +531,12 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// same no-new-bit discipline) and by revision 1.94 (the
 /// `stories.sendReaction` story-anchored reaction send plus the `viewedAt`
 /// projection key on message rows and `message.statusChanged`; the same
-/// no-new-bit discipline). They never
+/// no-new-bit discipline), and `chat-folders` (contract revision 1.95)
+/// marks the §4.78 chat-folder sync faces (`chatFolders.list` read over the
+/// account's ChatFolderRecord set plus the `chatFolders.setRecords`
+/// storage-service write — one capability for the read and write halves,
+/// the 1.36/1.37 sync-face discipline; kt-engine only, the §4.73 mode
+/// seam). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -553,6 +568,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "message-requests",
     "safety-number",
     "stories",
+    "chat-folders",
 ];
 
 #[cfg(test)]
@@ -601,6 +617,7 @@ mod tests {
             "calls.groupProof",
             "calls.groupMembers",
             "calls.endorsementsPublicKey",
+            "chatFolders.list",
         ];
         let send_lane = [
             "messages.sendText",
@@ -649,6 +666,7 @@ mod tests {
             "stories.markViewed",
             "stories.sendReaction",
             "stories.downloadAttachment",
+            "chatFolders.setRecords",
         ];
         let mutating = [
             "messages.sendText",
@@ -699,6 +717,7 @@ mod tests {
             "stories.markViewed",
             "stories.sendReaction",
             "stories.downloadAttachment",
+            "chatFolders.setRecords",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

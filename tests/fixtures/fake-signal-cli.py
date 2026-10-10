@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 import zlib
 
 
@@ -71,6 +72,46 @@ PACK_SYNC_STATE = [
 BLOCKED_STATE = [
     {"conversationId": "+15555550103", "kind": "contact"},
     {"conversationId": "bGVnYWN5LWdyb3VwLTE=", "kind": "legacyGroup"},
+]
+# Contract 1.95 chat-folder sync fixture state: the Storage Service
+# ChatFolderRecordJson projection in storage order — the full 11-key record
+# face the engine projects (id/name/position/booleans/folderType/both
+# recipient arrays/deletedAtTimestampMs, the tombstone key always present,
+# 0 = live); chatFolders.setRecords mutates it in place so a read-back after
+# a write observes the write.
+CHAT_FOLDER_STATE = [
+    {
+        "id": "0d6d50f5-7f9e-4a1b-9c2d-3e4f5a6b7c8d",
+        "name": "All chats",
+        "position": 0,
+        "showOnlyUnread": False,
+        "showMutedChats": True,
+        "includeAllIndividualChats": True,
+        "includeAllGroupChats": True,
+        "folderType": "ALL",
+        "includedConversationIds": [],
+        "excludedConversationIds": [],
+        "deletedAtTimestampMs": 0,
+    },
+    {
+        "id": "1a2b3c4d-5e6f-4a1b-8c9d-0e1f2a3b4c5d",
+        "name": "Work",
+        "position": 1,
+        "showOnlyUnread": True,
+        "showMutedChats": False,
+        "includeAllIndividualChats": False,
+        "includeAllGroupChats": False,
+        "folderType": "CUSTOM",
+        "includedConversationIds": [
+            {"conversationId": "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "kind": "contact"},
+            {"conversationId": "ZmFrZS1ncm91cC0x", "kind": "group"},
+            {"conversationId": "bGVnYWN5LWdyb3VwLTE=", "kind": "legacyGroup"},
+        ],
+        "excludedConversationIds": [
+            {"conversationId": "7f19e1c7-2d3e-4f6a-9b0c-1d2e3f4a5b6c", "kind": "contact"}
+        ],
+        "deletedAtTimestampMs": 0,
+    },
 ]
 # Contract 1.48 §4.47 avatar fixture: a tiny PNG magic payload — the engine
 # sniffs the MIME from the magic bytes and answers a data URI plus the
@@ -850,6 +891,156 @@ for line in sys.stdin:
             )
         PACK_SYNC_STATE[:] = packs
         result = {"packs": list(PACK_SYNC_STATE)}
+    elif method == "chatFolders.list":
+        # Contract 1.95 chat-folder sync read: the storage-order record
+        # projection as a fixture constant (one ALL folder + one CUSTOM
+        # folder with the three-kind recipient arrays). Account gate mirrors
+        # the engine (-32603 on an unregistered account). Markers the driving
+        # test writes steer the structured storage ladder:
+        # `.fixture-chat-folder-read-failed` answers STORAGE_READ_FAILED,
+        # `.fixture-chat-folder-unavailable` answers STORAGE_UNAVAILABLE.
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-chat-folder-read-failed").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_READ_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-chat-folder-unavailable").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        result = {"folders": list(CHAT_FOLDER_STATE)}
+    elif method == "chatFolders.setRecords":
+        # Contract 1.95 chat-folder sync write: record the exact upstream
+        # params (tests assert the resolved account and the verbatim
+        # records/removeIds contract), apply the official upload semantics —
+        # upsert by id in place, removeIds out of the set — and answer the
+        # post-write cloud state. Account gate mirrors the engine (-32603 on
+        # an unregistered account); the structured ladder steers from
+        # markers: `.fixture-chat-folder-write-failed` answers
+        # STORAGE_WRITE_FAILED, `.fixture-chat-folder-read-failed` answers
+        # STORAGE_READ_FAILED (the engine reads before it writes),
+        # `.fixture-chat-folder-unavailable` answers STORAGE_UNAVAILABLE.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        marker_errors = (
+            (".fixture-chat-folder-write-failed", "STORAGE_WRITE_FAILED"),
+            (".fixture-chat-folder-read-failed", "STORAGE_READ_FAILED"),
+            (".fixture-chat-folder-unavailable", "STORAGE_UNAVAILABLE"),
+        )
+        for marker, code in marker_errors:
+            if (SIGNAL_DATA_DIR / marker).exists():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": code},
+                }
+                emit_json(response)
+                continue
+        # The mutating-crash sentinel (record id magic; exit 31 = the shared
+        # mutating-in-flight crash code, disjoint from every other face by
+        # trigger): the connector must answer SEND_OUTCOME_UNKNOWN and never
+        # retry.
+        if any(
+            isinstance(record, dict)
+            and record.get("id") == "cede0000-0000-4000-8000-000000000031"
+            for record in params.get("records") or []
+        ):
+            os._exit(31)
+        # The engine's strict record grammar (parse_folder): every record
+        # must carry the eight required keys with the right shapes — id (uuid
+        # string), name (string), position (u64), the four booleans, and the
+        # folderType word — else the engine answers -32603. Optional: the two
+        # recipient arrays and deletedAtTimestampMs.
+        def _folder_shape_ok(record):
+            if not isinstance(record, dict):
+                return False
+            try:
+                uuid.UUID(str(record.get("id")))
+            except (ValueError, AttributeError, TypeError):
+                return False
+            if not isinstance(record.get("name"), str):
+                return False
+            if not isinstance(record.get("position"), int) or isinstance(
+                record.get("position"), bool
+            ):
+                return False
+            for key in (
+                "showOnlyUnread",
+                "showMutedChats",
+                "includeAllIndividualChats",
+                "includeAllGroupChats",
+            ):
+                if not isinstance(record.get(key), bool):
+                    return False
+            if record.get("folderType") not in ("UNKNOWN", "ALL", "CUSTOM"):
+                return False
+            return True
+
+        records = params.get("records") or []
+        if any(not _folder_shape_ok(record) for record in records):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        with WRITE_LOCK:
+            folders = [
+                entry
+                for entry in CHAT_FOLDER_STATE
+                if entry["id"] not in set(params.get("removeIds") or [])
+            ]
+            for record in params.get("records") or []:
+                record = json.loads(json.dumps(record))
+                for index, entry in enumerate(folders):
+                    if entry["id"] == record["id"]:
+                        folders[index] = record
+                        break
+                else:
+                    folders.append(record)
+            CHAT_FOLDER_STATE[:] = folders
+        result = {"folders": list(CHAT_FOLDER_STATE)}
     elif method == "setAccountConfiguration":
         # Contract 1.46 §4.45 account settings write: record the exact
         # upstream params (tests assert only the provided keys appear — the
