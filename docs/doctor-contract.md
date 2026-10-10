@@ -11,8 +11,8 @@ in one Control-lane call.
   any other params answer `INVALID_REQUEST` (retryable=false). No new error
   codes, no new capability token: the method rides the handshake's method-list
   advertisement like every other `runtime.*` face.
-- Available in every engine mode (`jvm` / `native` / `kt-engine`); the engine
-  faces degrade honestly where the mode's engine does not carry them.
+- Available for the single kt-engine runtime; the engine faces degrade
+  honestly where the engine does not carry a probe.
 - Advertised through the standard method enumeration; a caller that does not
   know the method simply never calls it.
 
@@ -39,7 +39,7 @@ may have moved on. Nothing in the answer is a lease or a reservation.
   "connector": { "version", "apiVersion", "pid" },
   "groups": [ {
     "groupId",
-    "engine":   { "mode", "state", "pid"?, "rssBytes"?, "resourcePressure",
+    "engine":   { "state", "pid"?, "rssBytes"?, "resourcePressure",
                   "reachable", "unreachableReason"?,
                   "version"?:            { "present", "face"?|, "reason"? },
                   "protocolCapabilities"?: { "present", "face"?|, "reason"? } },
@@ -58,8 +58,8 @@ absent (not null) when the value does not apply.
 
 ## Engine face
 
-`engine` mirrors the supervisor's status view (`mode` is the launcher-selected
-engine kind, `state` the live lifecycle state, `pid`/`rssBytes` present only
+`engine` mirrors the supervisor's status view (`state` the live lifecycle
+state, `pid`/`rssBytes` present only
 for a live process). `reachable` is the doctor's own probe result: whether the
 engine answered a read call during this diagnostic.
 

@@ -996,7 +996,6 @@ impl RuntimeSupervisor {
         let slot = self.engine.lock().await;
         let live = slot.as_ref().filter(|engine| !engine.is_terminal());
         crate::doctor::DoctorGroupFace {
-            mode: self.config.mode,
             data_dir: self.config.data_dir.clone(),
             status: slot
                 .as_ref()

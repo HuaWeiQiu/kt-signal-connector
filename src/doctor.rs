@@ -36,14 +36,11 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::ValueEnum;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::datalock::LOCK_FILE_NAME;
-use crate::engine::{
-    CallClass, EngineError, EngineHandle, EngineState, EngineStatus, SignalCliMode,
-};
+use crate::engine::{CallClass, EngineError, EngineHandle, EngineState, EngineStatus};
 use crate::registry::ProxyGroupRuntime;
 
 /// Bounded engine-call budget for the two doctor probes (`version`,
@@ -100,9 +97,6 @@ pub struct GroupReport {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineFace {
-    /// Launcher-selected engine kind, derived from the clap value name so the
-    /// label follows the enum verbatim (`jvm` / `native` / `kt-engine`).
-    pub mode: String,
     pub state: EngineState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
@@ -223,7 +217,6 @@ pub struct ErrorFamilyCount {
 /// (`RuntimeSupervisor::doctor_face`): the launcher-config identity plus the
 /// supervised engine status and a live engine handle when one exists.
 pub(crate) struct DoctorGroupFace {
-    pub mode: SignalCliMode,
     pub data_dir: std::path::PathBuf,
     pub status: EngineStatus,
     pub engine: Option<EngineHandle>,
@@ -237,7 +230,7 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
         let face = supervisor.doctor_face().await;
         let data_dir = probe_data_dir(&face.data_dir);
         let lock = probe_lock(&face.data_dir);
-        let engine = engine_face(&face.mode, &face.status, face.engine.as_ref()).await;
+        let engine = engine_face(&face.status, face.engine.as_ref()).await;
         groups.push(GroupReport {
             group_id: group_id.to_string(),
             engine,
@@ -265,11 +258,7 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
 /// `engine.protocolCapabilities`) under the bounded diagnostic budget. A
 /// non-running engine marks `unreachable` with the state classification and
 /// answers both probes `present: false` with that same reason.
-async fn engine_face(
-    mode: &SignalCliMode,
-    status: &EngineStatus,
-    engine: Option<&EngineHandle>,
-) -> EngineFace {
+async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> EngineFace {
     let reachable = status.state == EngineState::Running && engine.is_some();
     // A Running status with no live handle is a mid-transition race, not a
     // start failure; it gets its own honest classification.
@@ -306,10 +295,6 @@ async fn engine_face(
         )
     };
     EngineFace {
-        mode: mode
-            .to_possible_value()
-            .map(|value| value.get_name().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
         state: status.state,
         pid: status.pid,
         rss_bytes: status.rss_bytes,
@@ -707,7 +692,6 @@ mod tests {
             groups: vec![GroupReport {
                 group_id: "default".into(),
                 engine: EngineFace {
-                    mode: "kt-engine".into(),
                     state: EngineState::Faulted,
                     pid: None,
                     rss_bytes: None,
@@ -764,7 +748,6 @@ mod tests {
         let group = &value["groups"][0];
         assert_eq!(group["groupId"], json!("default"));
         let engine = &group["engine"];
-        assert_eq!(engine["mode"], json!("kt-engine"));
         assert_eq!(engine["state"], json!("faulted"));
         assert_eq!(engine["reachable"], json!(false));
         assert_eq!(
@@ -830,7 +813,7 @@ mod tests {
             EngineState::Exited,
             EngineState::Faulted,
         ] {
-            let face = engine_face(&SignalCliMode::Jvm, &stopped_status(state), None).await;
+            let face = engine_face(&stopped_status(state), None).await;
             assert!(!face.reachable, "{state:?} is not reachable");
             assert_eq!(face.unreachable_reason, Some(unreachable_reason(state)));
             let version = face.version.expect("version face always present");
@@ -844,9 +827,8 @@ mod tests {
         }
     }
 
-    /// A reachable engine's method faces: answers pass through verbatim,
-    /// engine failures degrade to the honest failure classes, and the mode
-    /// label follows the clap value name.
+    /// A reachable engine's method faces: answers pass through verbatim and
+    /// engine failures degrade to the honest failure classes.
     #[tokio::test]
     async fn engine_method_faces_answer_and_degrade_verbatim() {
         let status = EngineStatus {
@@ -856,9 +838,8 @@ mod tests {
             resource_pressure: false,
         };
         // No engine handle despite Running status: the honest unreachable.
-        let face = engine_face(&SignalCliMode::KtEngine, &status, None).await;
+        let face = engine_face(&status, None).await;
         assert!(!face.reachable);
-        assert_eq!(face.mode, "kt-engine");
         assert_eq!(
             face.unreachable_reason,
             Some("the engine is transitioning: the live handle vanished mid-probe")
