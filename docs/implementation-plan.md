@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.98 (2026-10-11; the honest media-download advertisement + CDN SOCKS route
+- Contract revision: 1.99 (2026-10-11; the send-chain transport error classification batch
+  (§4.80): the engine's send face folds transport-layer failures into the plain internal_error
+  JSON-RPC face (`code: -32603`) whose `message` embeds the cause class, so every rate limit,
+  proof challenge, and server outage reached the desktop as the generic retryable
+  `UPSTREAM_ERROR` family. The connector now classifies the three fixed anchor literals the
+  engine contract pins verbatim — `(RateLimitExceeded)` (the upstream 429/413 rate-limit
+  family), `(ProofRequiredException)` (the 428 proof-challenge family), and
+  `(ServerUnavailableException)` (the 5xx server-unavailable family) — at the same single
+  observation point that reads the raw upstream error body (§4.17's authorization matcher
+  keeps head-of-line precedence and its match set untouched, so the `AccountUnauthorized` →
+  `ACCOUNT_UNLINKED` recovery chain cannot regress), mapping them onto the new host codes
+  `SEND_RATE_LIMITED` / `SEND_PROOF_REQUIRED` / `SEND_SERVER_UNAVAILABLE` with
+  `retryable: false / false / true` — the flag is display-side only; a mutating send is still
+  never auto-retried, and an unknown send outcome keeps §6.4's never-resend posture. The
+  classifier is a standalone pure function, deliberately not a widening of the fragile
+  prefix/suffix authorization route; an error message carrying no anchor keeps the generic
+  upstream answer byte-for-byte) — previously 1.98 (2026-10-11; the honest media-download advertisement + CDN SOCKS route
   batch (§4.38 step 3, §4.54): two truths the handshake and the transport now carry about the
   same face family. Advertisement: the handshake `attachment-download` capability is the one
   conditional member of the `capabilities` array — it rides only when the runtime's media ingest
@@ -1625,7 +1641,10 @@ Connector behavior, all inside the existing process/watchdog boundary (no new IP
   family) deliberately does NOT match (starts "The user ") so a bad contact
   can never flip the account state. Covered by the
   `.fixture-unregistered-user-status` marker and two engine unit tests plus
-  a `supervisor_watchdog` integration test.
+  a `supervisor_watchdog` integration test. Boundary note (contract 1.99,
+  §4.80): this matcher's match set is frozen — the send-chain transport
+  anchors classify in a standalone pure function
+  (`upstream_error_send_class`) and deliberately do not extend it.
 - attribution: because `send`-family failures arrive without a caller context, the engine
   attaches the owning account (from the request params' `account` field) to the failure and
   emits a new internal `AccountUnauthorized { account }` event; requests with no account
@@ -6337,6 +6356,58 @@ non-empty-params INVALID_REQUEST gate;
 the proxy environment removed answers `proxyConfigured: false` and both probes
 `not_configured` with no `status`/`latencyMs`, over the wire); plus the schema method
 enumeration and the handshake advertisement.
+
+### 4.80 Send-chain transport error classification: `SEND_RATE_LIMITED` / `SEND_PROOF_REQUIRED` / `SEND_SERVER_UNAVAILABLE` (contract revision 1.99, 2026-10-11)
+
+The engine's send face folds transport-layer failures into the plain internal_error JSON-RPC
+face (`code: -32603`) whose `message` embeds the cause class, so every rate limit, proof
+challenge, and server outage reached the desktop as the generic retryable `UPSTREAM_ERROR`
+family — indistinguishable from noise, and labeled retryable even though a retry cannot fix
+a per-account rate limit. The connector now classifies the three fixed anchor literals the
+engine contract pins verbatim (the JSON-RPC code stays -32603; only the classification
+changes) at the single observation point that reads the raw upstream error body — the same
+place §4.17's authorization classification lives:
+
+- `(RateLimitExceeded)` — the upstream 429/413 rate-limit family → `SEND_RATE_LIMITED`
+  (`retryable: false`)
+- `(ProofRequiredException)` — the 428 proof-challenge family → `SEND_PROOF_REQUIRED`
+  (`retryable: false`)
+- `(ServerUnavailableException)` — the 5xx server-unavailable family →
+  `SEND_SERVER_UNAVAILABLE` (`retryable: true`)
+
+Contract faces:
+
+- the `retryable` flag is display-side only: a mutating send is still never auto-retried by
+  the connector, and an unknown send outcome keeps §6.4's never-resend posture. A per-send
+  rate limit or proof challenge is an answer the caller re-drives; only server unavailability
+  may succeed on a later attempt.
+- the classification carries no event: a transport failure never touches account state, and
+  no store row changes — the wire error is the whole surface.
+- the authorization matcher keeps head-of-line precedence and its match set untouched: the
+  §4.17 `AccountUnauthorized` → `ACCOUNT_UNLINKED` chain cannot regress. The transport
+  classifier is a standalone pure function (`upstream_error_send_class`), deliberately not a
+  widening of the fragile prefix/suffix authorization route — the anchors are parenthesized
+  exception names embedded in the message text, so a substring match cannot pick up
+  incidental content, and an error message carrying no anchor keeps the generic upstream
+  answer byte-for-byte.
+- the three codes enter the schema error-code enum; the structured-code allowlist ladder is
+  untouched (the two cannot collide: an embedded anchor in a longer message vs. an exact
+  allowlist literal).
+
+Tests: the classifier units (`send_chain_classifier_maps_the_three_transport_anchors` — the
+three anchors embedded in realistic engine messages plus the bare-literal shape;
+`send_chain_classifier_answers_none_outside_the_anchor_contract` — the None ladder: no error
+object, missing or non-string `message`, an anchor only in the `code` slot, near-miss
+literals without the parenthesized exception name, ordinary engine errors, and the §4.17
+authorization signatures;
+`upstream_match_set_stays_clear_of_send_anchors` — the red line: the authorization matcher
+answers false on all three anchor messages;
+`send_chain_anchor_errors_classify_without_account_events` — the wire shape through the
+engine line handler, each anchor to its variant, no event;
+`authorization_classification_precedes_send_chain_anchors` — head-of-line precedence); the
+service-layer mapping unit (`send_chain_transport_errors_map_to_send_error_codes` — the
+three host codes with their contract-fixed retryability and no invented data object); and
+the schema error-code enumeration (`tests/schema_consistency.rs`).
 
 ## 5. signal-cli Boundary
 
