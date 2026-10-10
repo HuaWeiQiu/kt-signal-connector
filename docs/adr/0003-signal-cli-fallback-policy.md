@@ -30,10 +30,22 @@
    - 产品明确要求某类账号跑 signal-cli 模式。
    届时升级策略 = 跟随上游最新 + 月度滚动（0.14.x 线内无 breaking、account
    数据目录通用、换 tarball 即可，JRE≥25 已满足），并补capability 达标验证。
-4. **对照结论失真时的权威序**：官方 Signal-Desktop 源码行为 > Signal-Server
+4. **「兜底」定性修正（2026-10-10 补充，owner 质询成立）**：signal-cli 回退是
+   **冷兜底，非热兜底**——引擎账号存储 = presage-store-sqlite（Rust/SQLite），
+   signal-cli = 自有 Java 格式（`accounts.json` + 号码目录），互不兼容；切换 =
+   手机重新扫码链接 + 本地历史不可携（backup5 链只在引擎侧）。且双模式的
+   connector 契约面已系统性分叉（getUsername JVM 缺/stories reaction 引擎缺/
+   chatFolders kt-engine only/textStyle 曾缺等），每批功能需双轨测试——这是
+   持续税，不是保险。故：**JVM/native 运行时模式自即日起冻结维护**——不再为
+   其适配任何新面，仅保留既有缝的「诚实拒绝」测试锁；engine-gap 的权威答案
+   一律是「等引擎批」而非「切 JVM」。真正的引擎故障回退 = 引擎二进制版本
+   回滚，不是切 signal-cli。**移除 JVM/native 运行时模式代码**（dispatch arms/
+   双轨测试/打包链）另立清理批，待 owner 拍板后排期。
+5. **对照结论失真时的权威序**：官方 Signal-Desktop 源码行为 > Signal-Server
    实际行为 > signal-cli 行为。signal-cli 对照结论与本仓「钉定版无此面」类
    记录在每次引擎 vendor 升级窗口逐项重审（见桌面 matrix 权威注 2026-10-10
-   三次订正段）。
+   三次订正段）。signal-cli 的「参考实现」角色由只读源码 checkout
+   （`.references/signal-cli`）承担，与运行时模式无关、不依赖其存活。
 
 ## 后果
 
