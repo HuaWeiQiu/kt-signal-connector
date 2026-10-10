@@ -40,6 +40,7 @@
             "runtime.status",
             "runtime.start",
             "runtime.stop",
+            "runtime.doctor",
             "accounts.list",
             "accounts.deleteLocalData",
             "accounts.setExpireTimer",
@@ -151,7 +152,7 @@
           "if": {
             "properties": {
               "method": {
-                "enum": ["runtime.status", "runtime.start", "runtime.stop", "accounts.list"]
+                "enum": ["runtime.status", "runtime.start", "runtime.stop", "runtime.doctor", "accounts.list"]
               }
             },
             "required": ["method"]

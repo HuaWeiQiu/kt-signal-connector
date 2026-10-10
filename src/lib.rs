@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod backup_export;
 pub mod datalock;
+pub mod doctor;
 pub mod engine;
 pub mod groups;
 pub mod history_attachment;

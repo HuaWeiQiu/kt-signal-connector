@@ -340,6 +340,17 @@ impl ProxyGroupRuntime {
         }
     }
 
+    /// The read-only `runtime.doctor` face (§4.79): every group's supervisor
+    /// with its opaque id, in launcher order. Read-only by contract — the
+    /// doctor module owns the whole probe and never mutates runtime state.
+    pub(crate) fn doctor_supervisors(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Arc<RuntimeSupervisor>)> {
+        self.groups
+            .iter()
+            .map(|slot| (slot.id.as_str(), &slot.supervisor))
+    }
+
     /// Start every group's engine (R7). Success reports the per-group states;
     /// RUNTIME_START_FAILED only when no group engine started.
     pub async fn start(&self) -> Result<RuntimeStatusResult, StartFailure> {
