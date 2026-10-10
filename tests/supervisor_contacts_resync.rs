@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use tempfile::TempDir;
@@ -115,7 +115,6 @@ async fn engine_mode_resync_materializes_the_self_skeleton_too() {
     };
     let store = test_store(temp.path());
     let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
-    config.mode = SignalCliMode::KtEngine;
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     let supervisor = Arc::new(RuntimeSupervisor::new(

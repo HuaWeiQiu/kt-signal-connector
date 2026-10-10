@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
     ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, ReceiptKind,
-    SignalCliMode, timer_change_material, timer_change_rich, truncate_utf8_bytes,
+    timer_change_material, timer_change_rich, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -2446,27 +2446,22 @@ impl ConnectorService {
 
     /// conversations.setExpireTimer (contract revision 1.42, §4.41; group
     /// route re-cut by contract revision 1.45, §4.44; kt-engine gate lifted
-    /// by the 2026-10-06 dated note): bounds, resolution, and the mode-shaped
-    /// upstream payload under the service lock. A direct conversation routes
-    /// per mode — the engine face's `setExpirationTimer` takes `recipient`
-    /// (a single string) + `expirationInSeconds`; the signal-cli face's
-    /// `updateContact` takes `recipient` + `expiration` (int seconds) —
-    /// same-value no-ops and broadcast semantics stay upstream. A group
-    /// conversation routes the timer change through the group-management
-    /// write it always traveled by upstream: `updateGroup {account, groupId,
-    /// expiration}` (the §4.41 group refusal is overturned) — in every mode
-    /// since the engine batch landed `updateGroup {expiration}` (engine main
-    /// @ 216a4c7, compat §3/§5 registration block), so the former kt-engine
-    /// INVALID_REQUEST debt is retired and all three faces share one group
-    /// payload. Returns the upstream method name, the payload, and the
-    /// resolved timer value the success path mirrors into the conversation
-    /// row.
+    /// by the 2026-10-06 dated note): bounds, resolution, and the upstream
+    /// payload under the service lock. A direct conversation routes to the
+    /// engine's `setExpirationTimer` — `recipient` (a single string) +
+    /// `expirationInSeconds`. A group conversation routes the timer change
+    /// through the group-management write it always traveled by upstream:
+    /// `updateGroup {account, groupId, expiration}` (the §4.41 group refusal
+    /// is overturned) — since the engine batch landed `updateGroup
+    /// {expiration}` (engine main @ 216a4c7, compat §3/§5 registration
+    /// block), all faces share one group payload. Returns the upstream
+    /// method name, the payload, and the resolved timer value the success
+    /// path mirrors into the conversation row.
     pub fn prepare_conversations_set_expire_timer(
         &self,
         account_id: &str,
         conversation_id: &str,
         expire_seconds: u32,
-        mode: SignalCliMode,
     ) -> Result<(&'static str, Value, u64), ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         if conversation_id.is_empty()
@@ -2498,60 +2493,35 @@ impl ConnectorService {
                 u64::from(expire_seconds),
             ));
         }
-        let (method, upstream) = match mode {
-            SignalCliMode::KtEngine => (
-                "setExpirationTimer",
-                json!({
-                    "account": account.signal_account,
-                    "recipient": conversation.peer_key,
-                    "expirationInSeconds": expire_seconds,
-                }),
-            ),
-            _ => (
-                "updateContact",
-                json!({
-                    "account": account.signal_account,
-                    "recipient": conversation.peer_key,
-                    "expiration": expire_seconds,
-                }),
-            ),
-        };
-        Ok((method, upstream, u64::from(expire_seconds)))
+        Ok((
+            "setExpirationTimer",
+            json!({
+                "account": account.signal_account,
+                "recipient": conversation.peer_key,
+                "expirationInSeconds": expire_seconds,
+            }),
+            u64::from(expire_seconds),
+        ))
     }
 
     /// groups.update (contract revision 1.45, §4.44, capability
     /// group-management): the full local validation + resolution ladder, then
-    /// the mode-shaped upstream `updateGroup` payload under the service lock.
-    /// Field bounds mirror the schema; the change keys are individually
-    /// optional, at least one must be present (`resetLink: false` counts as
-    /// absent), and explicit empty member arrays are refused — upstream reads
-    /// absence as "no change" and an empty set would commit a no-delta group
-    /// change broadcast. The conversation id must resolve to a kind='group'
-    /// row (direct answers INVALID_REQUEST before any upstream call); the
-    /// member addresses forward verbatim — resolving and rejecting unknown
-    /// addresses is upstream work. The `avatar` tri-state (contract 1.89, the
-    /// `accounts.setProfile` shape verbatim) rides the same ladder: absent =
-    /// keep (no key), explicit null = remove (`avatar: null` upstream), a
-    /// validated data URI = replace (the URI verbatim — the connector never
-    /// decodes image bytes beyond the budget check); the Remove and Replace
-    /// forms count as the change set's avatar member, so a lone avatar call
-    /// is a real change. The kt-engine face has no updateGroup
-    /// method and answers CAPABILITY_UNAVAILABLE (retryable=false) after the
-    /// local validation completed — engine-batch debt, honest by design. The
-    /// JVM/native face takes a group avatar as a local file path and the
-    /// connector has no host-file upload channel (§6.7: the media face is
-    /// download-only), so an avatar-carrying call answers
-    /// CAPABILITY_UNAVAILABLE there too — the §4.68 snapshot-import
-    /// downgrade precedent: no temporary file is written and no URI is
-    /// passed through to become an upstream protocol error. The byte face is
-    /// the parallel engine batch's arrival; the payload side (the tri-state
-    /// riding the changes vec) needs no further connector change.
-    /// Zero local writes: group state converges through the receive
-    /// projection.
+    /// the honest refusal. Field bounds mirror the schema; the change keys are
+    /// individually optional, at least one must be present (`resetLink: false`
+    /// counts as absent), and explicit empty member arrays are refused —
+    /// upstream reads absence as "no change" and an empty set would commit a
+    /// no-delta group change broadcast. The conversation id must resolve to a
+    /// kind='group' row (direct answers INVALID_REQUEST before any upstream
+    /// call). The engine face has no updateGroup method and answers
+    /// CAPABILITY_UNAVAILABLE (retryable=false) after the local validation
+    /// completed — engine-batch debt, honest by design (ADR 0003: the removed
+    /// signal-cli fallback face took `updateGroup` directly, but its removal
+    /// is not a capability regression; the answer was already the kt-engine
+    /// behavior). Zero local writes: group state converges through the
+    /// receive projection.
     pub fn prepare_groups_update(
         &self,
         params: &GroupsUpdateParams,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         validate_opaque_id(&params.conversation_id, "conversationId")?;
@@ -2703,8 +2673,8 @@ impl ConnectorService {
         // Remove/Replace forms count as the change set's avatar member — a
         // lone avatar call is a real change, not an empty set. A non-string,
         // non-null avatar type fails at params deserialization (the §4.45
-        // discipline); the data-URI shape gate answers INVALID_REQUEST here
-        // in both modes, ahead of both mode gates.
+        // discipline); the data-URI shape gate answers INVALID_REQUEST here,
+        // ahead of the capability seam.
         match &params.avatar {
             AvatarUpdate::Keep => {}
             AvatarUpdate::Remove => changes.push(("avatar", Value::Null)),
@@ -2719,7 +2689,10 @@ impl ConnectorService {
                 false,
             )));
         }
-        let account = self.resolve_account(&params.account_id)?;
+        // The account row resolves first (the shared ladder's wire order —
+        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND) even though the
+        // tail is the structured refusal.
+        self.resolve_account(&params.account_id)?;
         let conversation =
             self.resolve_conversation(&params.account_id, &params.conversation_id)?;
         if conversation.kind != "group" {
@@ -2729,60 +2702,30 @@ impl ConnectorService {
                 false,
             )));
         }
-        match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no updateGroup method yet",
-                false,
-            ))),
-            _ => {
-                // Contract 1.89: no JVM/native group-avatar byte face — the
-                // bound signal-cli takes a group avatar as a local file path
-                // and the connector has no host-file upload channel (§6.7:
-                // the media face is download-only), so materializing the
-                // data URI into a temporary file is out of bounds and
-                // forwarding the URI would only become an upstream protocol
-                // error (an explicit null would read as the builder's
-                // "no change" — a silent no-op for a remove request). The
-                // structured refusal (the §4.68 snapshot-import downgrade
-                // shape) precedes the payload build; the byte face arrives
-                // with the parallel engine batch.
-                if !matches!(params.avatar, AvatarUpdate::Keep) {
-                    return Err(ServiceError::Api(ApiError::new(
-                        "CAPABILITY_UNAVAILABLE",
-                        "the bound signal-cli face takes a group avatar as a local file path; the connector has no host-file upload channel",
-                        false,
-                    )));
-                }
-                let mut upstream = json!({
-                    "account": account.signal_account,
-                    "groupId": conversation.peer_key,
-                });
-                if let Some(object) = upstream.as_object_mut() {
-                    for (key, value) in changes {
-                        object.insert(key.to_string(), value);
-                    }
-                }
-                Ok(upstream)
-            }
-        }
+        // Engine-batch debt (the contract 1.89 payload side is already
+        // validated above and rides unchanged when the engine's updateGroup
+        // face lands): the honest structured refusal after the full local
+        // ladder, never a disguised no-op.
+        Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "the kt-engine face has no updateGroup method yet",
+            false,
+        )))
     }
 
     /// groups.quit (contract revision 1.45, §4.44, capability
-    /// group-management): resolution ladder then the upstream `quitGroup
-    /// {account, groupId}` payload. The upstream --delete local-data flag and
+    /// group-management): resolution ladder then the honest refusal. The
+    /// upstream `quitGroup {account, groupId}` payload shape is what the
+    /// engine batch will consume. The upstream --delete local-data flag and
     /// the --admin last-admin handoff list are deliberately not exposed: the
     /// official client keeps the conversation as a non-member after leaving,
     /// and a last-admin quit without a handoff answers the upstream user
-    /// error verbatim (UPSTREAM_ERROR family). The kt-engine face has no
+    /// error verbatim (UPSTREAM_ERROR family). The engine face has no
     /// quitGroup method and answers CAPABILITY_UNAVAILABLE after local
-    /// validation. The local conversation row is kept — non-member state is
-    /// upstream convergence, like groups.update.
-    pub fn prepare_groups_quit(
-        &self,
-        params: &GroupsQuitParams,
-        mode: SignalCliMode,
-    ) -> Result<Value, ServiceError> {
+    /// validation — engine-batch debt, honest by design. The local
+    /// conversation row is kept — non-member state is upstream convergence,
+    /// like groups.update.
+    pub fn prepare_groups_quit(&self, params: &GroupsQuitParams) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         validate_opaque_id(&params.conversation_id, "conversationId")?;
         if params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS {
@@ -2795,7 +2738,7 @@ impl ConnectorService {
         if let Some(operation_id) = params.operation_id.as_deref() {
             validate_opaque_id(operation_id, "operationId")?;
         }
-        let account = self.resolve_account(&params.account_id)?;
+        self.resolve_account(&params.account_id)?;
         let conversation =
             self.resolve_conversation(&params.account_id, &params.conversation_id)?;
         if conversation.kind != "group" {
@@ -2805,17 +2748,11 @@ impl ConnectorService {
                 false,
             )));
         }
-        match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no quitGroup method yet",
-                false,
-            ))),
-            _ => Ok(json!({
-                "account": account.signal_account,
-                "groupId": conversation.peer_key,
-            })),
-        }
+        Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "the kt-engine face has no quitGroup method yet",
+            false,
+        )))
     }
 
     /// groups.terminate (contract revision 1.52, §4.50, capability
@@ -2865,16 +2802,11 @@ impl ConnectorService {
 
     /// groups.approveJoinRequests (contract revision 1.58, §4.53, capability
     /// group-join-approve): the local validation + resolution ladder, then
-    /// the candidate payload the supervisor folds against the engine's own
-    /// requesting-members read. `prepare` owns every fail-closed gate that
-    /// needs no engine call: member-array bounds (the §4.44 discipline — an
-    /// empty array carries no change upstream, so it is refused by shape),
-    /// the group-row resolution (direct answers INVALID_REQUEST before any
-    /// upstream call), and the audit id shape. The candidate list is passed
-    /// through to the supervisor verbatim — the intersection with the live
-    /// requesting set is upstream-state work and lives there; duplicates
-    /// collapse so the upstream set semantics (JSON sets) can never be
-    /// surprised by repeated entries. The kt-engine face has no
+    /// the honest refusal. `prepare` owns every fail-closed gate that needs
+    /// no engine call: member-array bounds (the §4.44 discipline — an empty
+    /// array carries no change upstream, so it is refused by shape), the
+    /// group-row resolution (direct answers INVALID_REQUEST before any
+    /// upstream call), and the audit id shape. The engine face has no
     /// updateGroup member-family method (the engine's updateGroup takes the
     /// expiration family only — its compat §5 batch boundary) and answers
     /// CAPABILITY_UNAVAILABLE (retryable=false) after the local validation
@@ -2884,7 +2816,6 @@ impl ConnectorService {
     pub fn prepare_groups_approve_join_requests(
         &self,
         params: &GroupsApproveJoinRequestsParams,
-        mode: SignalCliMode,
     ) -> Result<(String, Vec<String>, bool), ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         validate_opaque_id(&params.conversation_id, "conversationId")?;
@@ -2917,10 +2848,8 @@ impl ConnectorService {
             )));
         }
         // The account row resolves first (the shared ladder's wire order —
-        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND); the payload
-        // itself needs only the group peer key, the supervisor re-resolves
-        // the account number for the upstream call.
-        let _account = self.resolve_account(&params.account_id)?;
+        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND).
+        self.resolve_account(&params.account_id)?;
         let conversation =
             self.resolve_conversation(&params.account_id, &params.conversation_id)?;
         if conversation.kind != "group" {
@@ -2930,36 +2859,25 @@ impl ConnectorService {
                 false,
             )));
         }
-        match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no updateGroup member-family method yet",
-                false,
-            ))),
-            _ => {
-                let mut members = params.members.clone();
-                members.sort();
-                members.dedup();
-                Ok((conversation.peer_key, members, params.approve))
-            }
-        }
+        Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "the kt-engine face has no updateGroup member-family method yet",
+            false,
+        )))
     }
 
     /// groups.revokeInvites (contract revision 1.64, §4.57, capability
     /// group-invite-revoke): the local validation + resolution ladder, then
-    /// the candidate payload the supervisor folds against the engine's own
-    /// pending-members read. The `prepare_groups_approve_join_requests`
-    /// ladder verbatim — bounds, resolution, audit id, duplicate collapse —
-    /// minus the approve bit. The kt-engine face has no updateGroup
-    /// member-family method (the same compat §5 batch boundary the §4.53
-    /// approval recorded) and answers CAPABILITY_UNAVAILABLE
-    /// (retryable=false) after the local validation completed — honest by
-    /// design: answering the fold instead would disguise "the engine cannot
-    /// revoke" as "nobody is pending".
+    /// the honest refusal. The `prepare_groups_approve_join_requests`
+    /// ladder verbatim — bounds, resolution, audit id — minus the approve
+    /// bit. The engine face has no updateGroup member-family method (the
+    /// same compat §5 batch boundary the §4.53 approval recorded) and
+    /// answers CAPABILITY_UNAVAILABLE (retryable=false) after the local
+    /// validation completed — honest by design: answering the fold instead
+    /// would disguise "the engine cannot revoke" as "nobody is pending".
     pub fn prepare_groups_revoke_invites(
         &self,
         params: &GroupsRevokeInvitesParams,
-        mode: SignalCliMode,
     ) -> Result<(String, Vec<String>), ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         validate_opaque_id(&params.conversation_id, "conversationId")?;
@@ -2992,10 +2910,8 @@ impl ConnectorService {
             )));
         }
         // The account row resolves first (the shared ladder's wire order —
-        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND); the payload
-        // itself needs only the group peer key, the supervisor re-resolves
-        // the account number for the upstream call.
-        let _account = self.resolve_account(&params.account_id)?;
+        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND).
+        self.resolve_account(&params.account_id)?;
         let conversation =
             self.resolve_conversation(&params.account_id, &params.conversation_id)?;
         if conversation.kind != "group" {
@@ -3005,19 +2921,11 @@ impl ConnectorService {
                 false,
             )));
         }
-        match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no updateGroup member-family method yet",
-                false,
-            ))),
-            _ => {
-                let mut members = params.members.clone();
-                members.sort();
-                members.dedup();
-                Ok((conversation.peer_key, members))
-            }
-        }
+        Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "the kt-engine face has no updateGroup member-family method yet",
+            false,
+        )))
     }
 
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
@@ -3165,20 +3073,14 @@ impl ConnectorService {
         }))
     }
 
-    /// chatFolders.list (contract revision 1.95, §4.78): account bounds,
-    /// resolution, and the kt-engine mode seam — the folders live in the
-    /// account's storage session, the service reads nothing locally (no
-    /// persistence on this face). The engine owns the record grammar, so the
-    /// gate ladder is identity-and-resolution only (the §4.73 material-face
-    /// order: bounds, then resolution, then the seam).
-    pub fn prepare_chat_folders_list(
-        &self,
-        account_id: &str,
-        mode: SignalCliMode,
-    ) -> Result<Value, ServiceError> {
+    /// chatFolders.list (contract revision 1.95, §4.78): account bounds and
+    /// resolution — the folders live in the account's storage session, the
+    /// service reads nothing locally (no persistence on this face). The
+    /// engine owns the record grammar, so the gate ladder is
+    /// identity-and-resolution only.
+    pub fn prepare_chat_folders_list(&self, account_id: &str) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
-        Self::gate_chat_folders_mode(mode)?;
         Ok(json!({ "account": account.signal_account }))
     }
 
@@ -3196,7 +3098,6 @@ impl ConnectorService {
         account_id: &str,
         records: &[Value],
         remove_ids: &[String],
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         if records.len() > MAX_CHAT_FOLDER_BATCH {
@@ -3257,7 +3158,6 @@ impl ConnectorService {
             )));
         }
         let account = self.resolve_account(account_id)?;
-        Self::gate_chat_folders_mode(mode)?;
         let mut upstream = serde_json::Map::new();
         upstream.insert(
             "account".into(),
@@ -3278,21 +3178,6 @@ impl ConnectorService {
             );
         }
         Ok(Value::Object(upstream))
-    }
-
-    /// The §4.78 mode seam: a stock signal-cli carries no chatFolders.* verb
-    /// (KT-extension engine methods), so the JVM/native modes answer
-    /// CAPABILITY_UNAVAILABLE after the local gates — the §4.73
-    /// call-material ladder order.
-    fn gate_chat_folders_mode(mode: SignalCliMode) -> Result<(), ServiceError> {
-        match mode {
-            SignalCliMode::KtEngine => Ok(()),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "chat folders require the kt-engine mode",
-                false,
-            ))),
-        }
     }
 
     /// accounts.updateConfiguration (contract revision 1.46, §4.45):
@@ -3453,25 +3338,21 @@ impl ConnectorService {
 
     /// accounts.setUsername (contract revision 1.59, §4.55; the kt-engine
     /// write face opens with contract 1.75, §4.66): the resolution ladder
-    /// ends at the pinned signal-cli `updateAccount` mutually exclusive
-    /// group — `username` XOR `deleteUsername` (UpdateAccountCommand.java:
-    /// 41-46), both absent being a legitimate attributes-only call the
-    /// connector does not expose (the desktop face is username-shaped). The
-    /// local shape gate mirrors the official desktop grammar
+    /// ends at the mutually exclusive group — `username` XOR
+    /// `deleteUsername`, both absent being a legitimate attributes-only call
+    /// the connector does not expose (the desktop face is username-shaped).
+    /// The local shape gate mirrors the official desktop grammar
     /// (`ts/util/Username.dom.ts`): nickname `[a-zA-Z_][a-zA-Z0-9_]*`,
     /// optional all-digits discriminator `.N` with no `0…` forms beyond
     /// exactly-one-zero, 3..32 characters total — the pinned libsignal
     /// bounds (AccountHelper.java:363-364). A bare nickname (no dot) is
-    /// allowed on both faces: the JVM face routes it to
-    /// `reserveUsernameFromNickname` (the server picks the discriminator);
-    /// the kt-engine face's two-hop orchestration (supervisor side)
-    /// reserves from the bare nickname the same way and the adopted
-    /// candidate wins. Nothing is persisted locally — the write result
-    /// projection is the mirror source.
+    /// allowed: the supervisor's two-hop orchestration reserves from the
+    /// bare nickname and the adopted candidate wins (a bare nickname's
+    /// discriminator is the server's pick). Nothing is persisted locally —
+    /// the write result projection is the mirror source.
     pub fn prepare_accounts_set_username(
         &self,
         params: &AccountsSetUsernameParams,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         let setting = match (params.username.as_deref(), params.delete_username) {
@@ -3503,72 +3384,39 @@ impl ConnectorService {
             validate_username_shape(username)?;
         }
         let account = self.resolve_account(&params.account_id)?;
-        match mode {
-            // kt-engine face (contract 1.75, §4.66): the frame feeds the
-            // supervisor's two-hop orchestration — usernameReserve takes the
-            // same {account, username} frame the JVM updateAccount takes;
-            // the delete hop is usernameDelete {account}.
-            SignalCliMode::KtEngine => Ok(match setting {
-                Some(username) => json!({
-                    "account": account.signal_account,
-                    "username": username,
-                }),
-                None => json!({
-                    "account": account.signal_account,
-                }),
+        // The frame feeds the supervisor's two-hop orchestration —
+        // usernameReserve takes the same {account, username} frame; the
+        // delete hop is usernameDelete {account} (idempotent).
+        Ok(match setting {
+            Some(username) => json!({
+                "account": account.signal_account,
+                "username": username,
             }),
-            _ => Ok(match setting {
-                Some(username) => json!({
-                    "account": account.signal_account,
-                    "username": username,
-                }),
-                None => json!({
-                    "account": account.signal_account,
-                    "deleteUsername": true,
-                }),
+            None => json!({
+                "account": account.signal_account,
             }),
-        }
+        })
     }
 
     /// accounts.getUsername (contract revision 1.59, §4.55; the kt-engine
-    /// read face opens with contract 1.74, §4.65): the pinned signal-cli has
-    /// no JSON-RPC reader for the local account's username —
-    /// `JsonAccountResponse` is a private record inside UpdateAccountCommand
-    /// fed by the write-back only, and no listAccounts/getAccount face
-    /// carries the field — so the JVM/native faces answer
-    /// CAPABILITY_UNAVAILABLE after the standard ladder (honest engine-surface
-    /// debt, display fed by the setUsername write-back mirror instead of a
-    /// live read). The kt-engine face resolves to the engine's `getUsername`
-    /// reader (engine compat §3 username read-face batch:
+    /// read face opened with contract 1.74, §4.65): resolves to the engine's
+    /// `getUsername` reader (engine compat §3 username read-face batch:
     /// AccountRecord.username(33)/usernameLink(35) storage projection, both
-    /// keys absent = unset).
-    pub fn prepare_accounts_get_username(
-        &self,
-        account_id: &str,
-        mode: SignalCliMode,
-    ) -> Result<Value, ServiceError> {
+    /// keys absent = unset — the honest never-set answer, not an error).
+    pub fn prepare_accounts_get_username(&self, account_id: &str) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({
-                "account": account.signal_account,
-            })),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the pinned signal-cli has no username read face; the connector mirrors the setUsername write-back instead",
-                false,
-            ))),
-        }
+        Ok(json!({
+            "account": account.signal_account,
+        }))
     }
 
     /// messages.sendStory (contract revision 1.76, §4.67): validation runs
-    /// entirely before the mode seam — a shape-invalid request answers
-    /// INVALID_REQUEST on every mode, and the JVM/native faces answer the
-    /// honest CAPABILITY_UNAVAILABLE debt only after validation and account
-    /// resolution (the §4.65 username read-face ladder). The kt-engine face
-    /// builds the engine's `sendStory` frame; the story send creates no local
-    /// row (stories live outside every conversation), so there is no pending
-    /// settlement and no clientRequestId.
+    /// entirely up front — a shape-invalid request answers INVALID_REQUEST
+    /// before the account ladder (the §4.65 username read-face ladder). The
+    /// face builds the engine's `sendStory` frame; the story send creates no
+    /// local row (stories live outside every conversation), so there is no
+    /// pending settlement and no clientRequestId.
     ///
     /// The link-preview metadata keys (contract revision 1.91, §4.74):
     /// `previewUrl`/`previewTitle` are independently optional — each, when
@@ -3595,7 +3443,6 @@ impl ConnectorService {
     pub fn prepare_send_story(
         &self,
         params: &MessagesSendStoryParams,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         let message = params.message.trim();
@@ -3683,49 +3530,40 @@ impl ConnectorService {
             )));
         }
         let account = self.resolve_account(&params.account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => {
-                let mut frame = json!({
-                    "account": account.signal_account,
-                    "message": message,
-                    "recipients": params.recipients,
-                    "allowsReplies": params.allows_replies,
-                });
-                if let Some(id) = distribution_list_id {
-                    frame["distributionListId"] = json!(id);
-                }
-                if let Some(style) = text_style {
-                    frame["textStyle"] = json!(style);
-                }
-                if let Some(ranges) = body_ranges {
-                    frame["bodyRanges"] = json!(
-                        ranges
-                            .iter()
-                            .map(|range| json!({
-                                "style": range.style,
-                                "start": range.start,
-                                "length": range.length,
-                            }))
-                            .collect::<Vec<_>>()
-                    );
-                }
-                if let Some(preview) = params.preview_image.as_deref() {
-                    frame["previewImage"] = json!(preview);
-                }
-                if let Some(url) = params.preview_url.as_deref() {
-                    frame["previewUrl"] = json!(url);
-                }
-                if let Some(title) = params.preview_title.as_deref() {
-                    frame["previewTitle"] = json!(title);
-                }
-                Ok(frame)
-            }
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the pinned signal-cli has no story send face; stories require the kt-engine face",
-                false,
-            ))),
+        let mut frame = json!({
+            "account": account.signal_account,
+            "message": message,
+            "recipients": params.recipients,
+            "allowsReplies": params.allows_replies,
+        });
+        if let Some(id) = distribution_list_id {
+            frame["distributionListId"] = json!(id);
         }
+        if let Some(style) = text_style {
+            frame["textStyle"] = json!(style);
+        }
+        if let Some(ranges) = body_ranges {
+            frame["bodyRanges"] = json!(
+                ranges
+                    .iter()
+                    .map(|range| json!({
+                        "style": range.style,
+                        "start": range.start,
+                        "length": range.length,
+                    }))
+                    .collect::<Vec<_>>()
+            );
+        }
+        if let Some(preview) = params.preview_image.as_deref() {
+            frame["previewImage"] = json!(preview);
+        }
+        if let Some(url) = params.preview_url.as_deref() {
+            frame["previewUrl"] = json!(url);
+        }
+        if let Some(title) = params.preview_title.as_deref() {
+            frame["previewTitle"] = json!(title);
+        }
+        Ok(frame)
     }
 
     /// stories.setDisabled / stories.getDisabled (contract revision 1.76,
@@ -3734,8 +3572,8 @@ impl ConnectorService {
     /// `hasStoriesDisabled`, default false). Pure local store faces: the
     /// toggle governs what this connector's own receive path forwards, no
     /// engine frame exists, and the store is the connector's record of
-    /// record — so prepare only validates and pins the account (every
-    /// engine mode answers), and the supervisor performs the write/read on
+    /// record — so prepare only validates and pins the account (the face
+    /// answers locally), and the supervisor performs the write/read on
     /// the same store instance under the blocking pool.
     pub fn prepare_stories_set_disabled(
         &self,
@@ -3767,10 +3605,9 @@ impl ConnectorService {
     /// timestamp per frame — the official desktop's story-read flow sends
     /// the same single-timestamp VIEWED receipt to the author, the desktop
     /// matrix's declared-gap record (kt-desktop signal-official-parity-matrix
-    /// 2026-10-08 Stories 批 2) names this face as the missing uplink leg). The upstream face
-    /// is the pinned upstream's own method (it exists on every mode — the
-    /// JVM/native faces dispatch it like messages.markViewed does), so this
-    /// prepare is mode-independent: validation (the story-author bound
+    /// 2026-10-08 Stories 批 2) names this face as the missing uplink leg).
+    /// The upstream face is the engine's own method, so this prepare is
+    /// uniform: validation (the story-author bound
     /// mirrors the story recipients' per-entry bound; a zero sentAt is the
     /// officially meaningless marker — the desktop's story sanitize rejects
     /// it, so the connector refuses the frame too) then account resolution.
@@ -3810,26 +3647,21 @@ impl ConnectorService {
     /// message-addressed `messages.sendReaction` ladder can never target
     /// one; this face takes the story anchor (author + the story's own
     /// Signal timestamp) verbatim from the caller — the desktop's story
-    /// timeline is the authoritative source of both — and builds the pinned
-    /// upstream's own story-reaction frame: `sendReaction` with
-    /// `targetAuthor`/`targetTimestamp` naming the story, `recipient` the
-    /// author (the official client delivers a story reaction as a direct
-    /// message to the author), and the upstream's own `story: true` marker
-    /// (the pinned signal-cli 0.14.8 `sendReaction --story` face: "React to
-    /// a story instead of a normal message"). Nothing is written locally
-    /// and no event is emitted — a story reaction has no row to pill on.
-    /// The kt-engine face has no story-reaction send and answers
-    /// CAPABILITY_UNAVAILABLE (retryable=false) after local validation, the
-    /// §4.53 engine-gap precedent. The send-class settlement
-    /// (`{status: sent|unknown}`, a definite error propagates, nothing
-    /// retries) lives in the supervisor. v1 addresses author-direct
+    /// timeline is the authoritative source of both. Validation runs fully
+    /// before the honest refusal: the face answers CAPABILITY_UNAVAILABLE
+    /// (retryable=false) after local validation — the §4.53 engine-gap
+    /// precedent (ADR 0003: the removed signal-cli fallback face dispatched
+    /// the pinned `sendReaction --story` frame, but its removal is not a
+    /// capability regression; the kt-engine answer was already this
+    /// refusal). The send-class settlement (`{status: sent|unknown}`, a
+    /// definite error propagates, nothing retries) will live in the
+    /// supervisor when the engine face lands. v1 addresses author-direct
     /// reactions only: a group-story reaction needs the group context the
     /// story.received projection does not carry, so there is nothing to
     /// address a group frame with (记档边界, not invented).
     pub fn prepare_story_send_reaction(
         &self,
         params: &StoriesSendReactionParams,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         if let Some(operation_id) = params.operation_id.as_deref() {
@@ -3851,40 +3683,24 @@ impl ConnectorService {
             )));
         }
         validate_emoji(&params.emoji)?;
-        let account = self.resolve_account(&params.account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "the kt-engine face has no story reaction send yet",
-                false,
-            ))),
-            _ => Ok(json!({
-                "account": account.signal_account,
-                "emoji": params.emoji,
-                "remove": params.remove,
-                "targetAuthor": author,
-                "targetTimestamp": params.story_sent_at,
-                "recipient": [author],
-                "story": true,
-            })),
-        }
+        self.resolve_account(&params.account_id)?;
+        Err(ServiceError::Api(ApiError::new(
+            "CAPABILITY_UNAVAILABLE",
+            "the kt-engine face has no story reaction send yet",
+            false,
+        )))
     }
 
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
-    /// opens with contract 1.74, §4.65): entries resolve through the pinned
-    /// `getUserStatus --username` face on the JVM/native faces
-    /// (`resolveRecipientByUsernameOrLink`, so entries are full usernames or
-    /// username-link URLs, not bare nicknames), through the engine's
-    /// `usernameLookup` on the kt-engine face (same server lookups, engine
-    /// compat §3 read-face batch). Both faces share the frame the batch caps
-    /// bounds — one host frame, entries 1..64 chars: a bound, not the
-    /// upstream grammar, which the link resolution owns. The mode picks only
-    /// the engine method name (supervisor side); the upstream frame is
-    /// identical.
+    /// opened with contract 1.74, §4.65): entries resolve through the
+    /// engine's `usernameLookup` reader (same server lookups, engine compat
+    /// §3 read-face batch). The frame is what the batch caps bounds — one
+    /// host frame, entries 1..64 chars: a bound, not the upstream grammar,
+    /// which the link resolution owns; the upstream frame is identical
+    /// across the historical faces and the method name lives supervisor-side.
     pub fn prepare_username_lookup(
         &self,
         params: &UsernameLookupParams,
-        _mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         if params.usernames.is_empty() || params.usernames.len() > USERNAME_LOOKUP_MAX_ENTRIES {
@@ -3924,15 +3740,12 @@ impl ConnectorService {
     /// verbatim — the connector never dereferences it, the engine is the only
     /// reader — so the shape gate (absolute, 1..4096 bytes) is the connector's
     /// entire local enforcement and fails closed before any engine traffic.
-    /// Same-machine path handoff, the §4.46 artifact run in reverse. The mode
-    /// seam is the tail of the ladder (validation precedes it, the §4.67
-    /// precedent): the face rides the kt-engine-only `history-import`
-    /// capability — no new bit.
+    /// Same-machine path handoff, the §4.46 artifact run in reverse. The face
+    /// rides the kt-engine `history-import` capability — no new bit.
     pub fn prepare_import_snapshot(
         &self,
         account_id: &str,
         snapshot_dir: &str,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         if snapshot_dir.is_empty()
@@ -3946,72 +3759,39 @@ impl ConnectorService {
             )));
         }
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({
-                "account": account.signal_account,
-                "snapshotDir": snapshot_dir,
-            })),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "official snapshot import requires the kt-engine mode",
-                false,
-            ))),
-        }
+        Ok(json!({
+            "account": account.signal_account,
+            "snapshotDir": snapshot_dir,
+        }))
     }
 
     /// backups.restoreFromCloud / backups.cloudStatus (contract revision
-    /// 1.83, §4.69): resolve the account and gate the engine mode. The faces
-    /// are pure passthrough — the connector carries only `{account}` to the
-    /// engine, and the restore's whole chain runs engine-side. The mode seam
-    /// rides the §4.68 ladder (the §4.67 precedent: shape validation precedes
-    /// the seam): the restore's entire output is the history-import NDJSON
-    /// chain, so the face rides the kt-engine-only `history-import`
-    /// capability — no new bit.
-    pub fn prepare_cloud_restore_account(
-        &self,
-        account_id: &str,
-        mode: SignalCliMode,
-    ) -> Result<Value, ServiceError> {
+    /// 1.83, §4.69): resolve the account. The faces are pure passthrough —
+    /// the connector carries only `{account}` to the engine, and the
+    /// restore's whole chain runs engine-side. The restore's entire output
+    /// is the history-import NDJSON chain, so the face rides the kt-engine
+    /// `history-import` capability — no new bit.
+    pub fn prepare_cloud_restore_account(&self, account_id: &str) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({ "account": account.signal_account })),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "cloud restore requires the kt-engine mode",
-                false,
-            ))),
-        }
+        Ok(json!({ "account": account.signal_account }))
     }
 
     /// backups.uploadToCloud / backups.uploadStatus (contract revision 1.87,
-    /// §4.72, engine cloud-backup-contract §6.2): resolve the account and
-    /// gate the engine mode. The faces carry only `{account}` to the engine
-    /// — the connector's own half of the upload chain is the §10.2 artifact
-    /// build (the §4.46 machine verbatim) ahead of the start call, and the
-    /// assembly/upload/refresh chain runs engine-side. The mode seam rides
-    /// the §4.69 ladder (the §4.67 precedent: shape validation precedes the
-    /// seam): the upload faces are KT-extension methods a stock signal-cli
-    /// does not carry, so the face rides the kt-engine-only mode gate while
-    /// the capability advertisement widens `backup-export` in place (the
-    /// upload's entire input is the backup-export artifact chain) — no new
-    /// bit. Returns the resolved signal account (the artifact build needs
-    /// it beside the wire params, the §4.46 export posture).
-    pub fn prepare_cloud_upload_account(
-        &self,
-        account_id: &str,
-        mode: SignalCliMode,
-    ) -> Result<String, ServiceError> {
+    /// §4.72, engine cloud-backup-contract §6.2): resolve the account. The
+    /// faces carry only `{account}` to the engine — the connector's own half
+    /// of the upload chain is the §10.2 artifact build (the §4.46 machine
+    /// verbatim) ahead of the start call, and the assembly/upload/refresh
+    /// chain runs engine-side. The upload faces are KT-extension methods and
+    /// the face rides the kt-engine gate while the capability advertisement
+    /// widens `backup-export` in place (the upload's entire input is the
+    /// backup-export artifact chain) — no new bit. Returns the resolved
+    /// signal account (the artifact build needs it beside the wire params,
+    /// the §4.46 export posture).
+    pub fn prepare_cloud_upload_account(&self, account_id: &str) -> Result<String, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(account.signal_account),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "cloud backup upload requires the kt-engine mode",
-                false,
-            ))),
-        }
+        Ok(account.signal_account)
     }
 
     /// conversations.getAvatar (contract revision 1.48, §4.47): bounds +
@@ -4462,7 +4242,6 @@ impl ConnectorService {
         &self,
         account_id: &str,
         root_key: &str,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         Self::gate_call_material_b64(
@@ -4472,17 +4251,10 @@ impl ConnectorService {
             &[16, 21],
         )?;
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({
-                "account": account.signal_account,
-                "rootKey": root_key,
-            })),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "call-link material requires the kt-engine mode",
-                false,
-            ))),
-        }
+        Ok(json!({
+            "account": account.signal_account,
+            "rootKey": root_key,
+        }))
     }
 
     /// calls.createLinkAuth (contract revision 1.88, §4.73): the two-shot
@@ -4496,7 +4268,6 @@ impl ConnectorService {
         account_id: &str,
         root_key: &str,
         room_id: &str,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         Self::gate_call_material_b64(
@@ -4507,18 +4278,11 @@ impl ConnectorService {
         )?;
         Self::gate_call_material_b64(room_id, "roomId", CALL_LINK_ROOM_ID_B64_CHARS, &[32])?;
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({
-                "account": account.signal_account,
-                "rootKey": root_key,
-                "roomId": room_id,
-            })),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "call-link material requires the kt-engine mode",
-                false,
-            ))),
-        }
+        Ok(json!({
+            "account": account.signal_account,
+            "rootKey": root_key,
+            "roomId": room_id,
+        }))
     }
 
     /// calls.groupProof / calls.groupMembers (contract revision 1.88,
@@ -4530,59 +4294,37 @@ impl ConnectorService {
         &self,
         account_id: &str,
         group_id: &str,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         Self::gate_call_material_b64(group_id, "groupId", CALL_GROUP_MASTER_KEY_B64_CHARS, &[32])?;
         let account = self.resolve_account(account_id)?;
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({
-                "account": account.signal_account,
-                "groupId": group_id,
-            })),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "call-link material requires the kt-engine mode",
-                false,
-            ))),
-        }
+        Ok(json!({
+            "account": account.signal_account,
+            "groupId": group_id,
+        }))
     }
 
     pub fn prepare_calls_group_proof(
         &self,
         account_id: &str,
         group_id: &str,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
-        self.prepare_calls_group_material(account_id, group_id, mode)
+        self.prepare_calls_group_material(account_id, group_id)
     }
 
     pub fn prepare_calls_group_members(
         &self,
         account_id: &str,
         group_id: &str,
-        mode: SignalCliMode,
     ) -> Result<Value, ServiceError> {
-        self.prepare_calls_group_material(account_id, group_id, mode)
+        self.prepare_calls_group_material(account_id, group_id)
     }
 
     /// calls.endorsementsPublicKey (contract revision 1.88, §4.73): the
     /// constant-derivation face — no account (the getStickerPackManifest
-    /// anonymous-face discipline), no material input, no network. The only
-    /// gate is the engine-mode seam: the face is a KT-extension method a
-    /// stock signal-cli does not carry.
-    pub fn prepare_calls_endorsements_public_key(
-        &self,
-        mode: SignalCliMode,
-    ) -> Result<Value, ServiceError> {
-        match mode {
-            SignalCliMode::KtEngine => Ok(json!({})),
-            _ => Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "call-link material requires the kt-engine mode",
-                false,
-            ))),
-        }
+    /// anonymous-face discipline), no material input, no network.
+    pub fn prepare_calls_endorsements_public_key(&self) -> Result<Value, ServiceError> {
+        Ok(json!({}))
     }
 
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
@@ -15374,7 +15116,7 @@ mod tests {
     /// Chat-folder sync bounds (contract revision 1.95, §4.78): the write
     /// ladder — at-least-one-non-empty, the batch caps, the identity-only
     /// record gate, the removeId bounds — and the gate order (shape, then
-    /// resolution, then the mode seam). The records forward verbatim: only
+    /// resolution). The records forward verbatim: only
     /// the non-empty half rides the upstream frame, and the record body the
     /// connector never touches.
     #[test]
@@ -15384,9 +15126,7 @@ mod tests {
         let id = "0d6d50f5-7f9e-4a1b-9c2d-3e4f5a6b7c8d";
 
         // The read: the resolved upstream account rides alone.
-        let params = service
-            .prepare_chat_folders_list(&account.id, SignalCliMode::KtEngine)
-            .unwrap();
+        let params = service.prepare_chat_folders_list(&account.id).unwrap();
         assert_eq!(params["account"], "+15555550100");
 
         // The records half forwards the caller's entries byte-verbatim under
@@ -15406,12 +15146,7 @@ mod tests {
             "deletedAtTimestampMs": 0
         });
         let params = service
-            .prepare_chat_folders_set_records(
-                &account.id,
-                std::slice::from_ref(&record),
-                &[],
-                SignalCliMode::KtEngine,
-            )
+            .prepare_chat_folders_set_records(&account.id, std::slice::from_ref(&record), &[])
             .unwrap();
         assert_eq!(params["account"], "+15555550100");
         assert_eq!(params["records"], json!([record]));
@@ -15422,7 +15157,6 @@ mod tests {
                 &account.id,
                 &[],
                 &["1a2b3c4d-5e6f-4a1b-8c9d-0e1f2a3b4c5d".to_string()],
-                SignalCliMode::KtEngine,
             )
             .unwrap();
         assert_eq!(
@@ -15433,7 +15167,7 @@ mod tests {
 
         // The at-least-one rule: two empty halves fail closed locally.
         let error = service
-            .prepare_chat_folders_set_records(&account.id, &[], &[], SignalCliMode::KtEngine)
+            .prepare_chat_folders_set_records(&account.id, &[], &[])
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
 
@@ -15448,22 +15182,12 @@ mod tests {
             json!({"id": "a".repeat(129)}),
         ] {
             let error = service
-                .prepare_chat_folders_set_records(
-                    &account.id,
-                    std::slice::from_ref(&bad),
-                    &[],
-                    SignalCliMode::KtEngine,
-                )
+                .prepare_chat_folders_set_records(&account.id, std::slice::from_ref(&bad), &[])
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{bad}");
         }
         let error = service
-            .prepare_chat_folders_set_records(
-                &account.id,
-                &[],
-                &[String::new()],
-                SignalCliMode::KtEngine,
-            )
+            .prepare_chat_folders_set_records(&account.id, &[], &[String::new()])
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
 
@@ -15472,52 +15196,24 @@ mod tests {
             .map(|index| json!({"id": format!("{index:032x}")}))
             .collect();
         let error = service
-            .prepare_chat_folders_set_records(&account.id, &big_batch, &[], SignalCliMode::KtEngine)
+            .prepare_chat_folders_set_records(&account.id, &big_batch, &[])
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
         let big_remove: Vec<String> = (0..65).map(|index| format!("{index:032x}")).collect();
         let error = service
-            .prepare_chat_folders_set_records(
-                &account.id,
-                &[],
-                &big_remove,
-                SignalCliMode::KtEngine,
-            )
+            .prepare_chat_folders_set_records(&account.id, &[], &big_remove)
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
 
-        // The gate ladder: shape wins over resolution, resolution wins over
-        // the seam.
+        // The gate ladder: shape wins over resolution.
         let error = service
-            .prepare_chat_folders_set_records(
-                "no-such-account",
-                &[json!({"name": "no id"})],
-                &[],
-                SignalCliMode::KtEngine,
-            )
+            .prepare_chat_folders_set_records("no-such-account", &[json!({"name": "no id"})], &[])
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
         let error = service
-            .prepare_chat_folders_list("no-such-account", SignalCliMode::KtEngine)
+            .prepare_chat_folders_list("no-such-account")
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
-
-        // The mode seam answers after the local gates on both faces.
-        let error = service
-            .prepare_chat_folders_list(&account.id, SignalCliMode::Jvm)
-            .unwrap_err();
-        let api = error.into_api();
-        assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
-        assert!(!api.retryable);
-        let error = service
-            .prepare_chat_folders_set_records(
-                &account.id,
-                &[],
-                &[id.to_string()],
-                SignalCliMode::Jvm,
-            )
-            .unwrap_err();
-        assert_eq!(error.into_api().code, "CAPABILITY_UNAVAILABLE");
     }
 
     /// The chat-folder projection (contract revision 1.95, §4.78): storage
@@ -16225,8 +15921,8 @@ mod tests {
     /// standard base64 + exact decoded length), every violation answers
     /// INVALID_REQUEST retryable=false before any upstream traffic, and the
     /// happy path forwards the resolved number plus the caller's material
-    /// verbatim under the kt-engine mode seam. Shape precedes resolution,
-    /// resolution precedes the seam (the §4.67 ladder precedent).
+    /// verbatim. Shape precedes resolution,
+    /// resolution precedes the forward (the §4.67 ladder precedent).
     #[test]
     fn prepare_call_material_gates_shapes_and_forwards_verbatim() {
         let (_temp, mut service) = service();
@@ -16238,41 +15934,34 @@ mod tests {
 
         // Happy paths: the resolved number + the caller's material, verbatim.
         let upstream = service
-            .prepare_calls_link_presentation(&account.id, &root_key_16, SignalCliMode::KtEngine)
+            .prepare_calls_link_presentation(&account.id, &root_key_16)
             .unwrap();
         assert_eq!(upstream["account"], "+15555550100");
         assert_eq!(upstream["rootKey"], root_key_16);
 
         let upstream = service
-            .prepare_calls_create_link_auth(
-                &account.id,
-                &root_key_21,
-                &room_id,
-                SignalCliMode::KtEngine,
-            )
+            .prepare_calls_create_link_auth(&account.id, &root_key_21, &room_id)
             .unwrap();
         assert_eq!(upstream["rootKey"], root_key_21);
         assert_eq!(upstream["roomId"], room_id);
 
         for prepare in [
-            service.prepare_calls_group_proof(&account.id, &group_id, SignalCliMode::KtEngine),
-            service.prepare_calls_group_members(&account.id, &group_id, SignalCliMode::KtEngine),
+            service.prepare_calls_group_proof(&account.id, &group_id),
+            service.prepare_calls_group_members(&account.id, &group_id),
         ] {
             let upstream = prepare.unwrap();
             assert_eq!(upstream["account"], "+15555550100");
             assert_eq!(upstream["groupId"], group_id);
         }
 
-        let upstream = service
-            .prepare_calls_endorsements_public_key(SignalCliMode::KtEngine)
-            .unwrap();
+        let upstream = service.prepare_calls_endorsements_public_key().unwrap();
         assert_eq!(upstream, json!({}));
 
         // The rootKey gate: both legal lengths pass; every illegal decoded
         // length, a non-canonical encoding, and non-base64 text refuse.
         for legal in [&root_key_16, &root_key_21] {
             service
-                .prepare_calls_link_presentation(&account.id, legal, SignalCliMode::KtEngine)
+                .prepare_calls_link_presentation(&account.id, legal)
                 .unwrap();
         }
         for illegal in [
@@ -16289,7 +15978,7 @@ mod tests {
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         ] {
             let error = service
-                .prepare_calls_link_presentation(&account.id, illegal, SignalCliMode::KtEngine)
+                .prepare_calls_link_presentation(&account.id, illegal)
                 .unwrap_err();
             let api = error.into_api();
             assert_eq!(api.code, "INVALID_REQUEST", "{illegal}");
@@ -16306,20 +15995,15 @@ mod tests {
         ] {
             for error in [
                 service
-                    .prepare_calls_create_link_auth(
-                        &account.id,
-                        &root_key_16,
-                        illegal,
-                        SignalCliMode::KtEngine,
-                    )
+                    .prepare_calls_create_link_auth(&account.id, &root_key_16, illegal)
                     .unwrap_err()
                     .into_api(),
                 service
-                    .prepare_calls_group_proof(&account.id, illegal, SignalCliMode::KtEngine)
+                    .prepare_calls_group_proof(&account.id, illegal)
                     .unwrap_err()
                     .into_api(),
                 service
-                    .prepare_calls_group_members(&account.id, illegal, SignalCliMode::KtEngine)
+                    .prepare_calls_group_members(&account.id, illegal)
                     .unwrap_err()
                     .into_api(),
             ] {
@@ -16329,55 +16013,17 @@ mod tests {
         }
 
         // The ladder order: shape wins over resolution, resolution wins over
-        // everything else (observed with the seam passing, kt-engine mode).
+        // everything else.
         let error = service
-            .prepare_calls_link_presentation(
-                "kt-acct-missing",
-                "not-b64!!",
-                SignalCliMode::KtEngine,
-            )
+            .prepare_calls_link_presentation("kt-acct-missing", "not-b64!!")
             .unwrap_err()
             .into_api();
         assert_eq!(error.code, "INVALID_REQUEST");
         let error = service
-            .prepare_calls_link_presentation(
-                "kt-acct-missing",
-                &root_key_16,
-                SignalCliMode::KtEngine,
-            )
+            .prepare_calls_link_presentation("kt-acct-missing", &root_key_16)
             .unwrap_err()
             .into_api();
         assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
-
-        // The mode seam: JVM mode answers CAPABILITY_UNAVAILABLE on every
-        // face ( endorsements included — the stock signal-cli carries none
-        // of the five), only after shape and resolution pass.
-        let error = service
-            .prepare_calls_link_presentation(&account.id, &root_key_16, SignalCliMode::Jvm)
-            .unwrap_err()
-            .into_api();
-        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-        assert!(!error.retryable);
-        let error = service
-            .prepare_calls_create_link_auth(&account.id, &root_key_16, &room_id, SignalCliMode::Jvm)
-            .unwrap_err()
-            .into_api();
-        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-        let error = service
-            .prepare_calls_group_proof(&account.id, &group_id, SignalCliMode::Jvm)
-            .unwrap_err()
-            .into_api();
-        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-        let error = service
-            .prepare_calls_group_members(&account.id, &group_id, SignalCliMode::Jvm)
-            .unwrap_err()
-            .into_api();
-        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-        let error = service
-            .prepare_calls_endorsements_public_key(SignalCliMode::Jvm)
-            .unwrap_err()
-            .into_api();
-        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
     }
 
     /// §4.73 (contract 1.88): the two new code positions map to themselves
@@ -16897,14 +16543,12 @@ mod tests {
     }
 
     /// messages.sendStory (contract 1.76, §4.67): every parameter gate runs
-    /// before the account ladder, the account ladder before the mode seam
-    /// (the username ordering); the kt-engine frame carries the resolved
-    /// signal account and omits the default-keyed options, the full-option
-    /// frame carries them all (distributionListId lowercased), and the
-    /// JVM/native seam answers the honest CAPABILITY_UNAVAILABLE.
+    /// before the account ladder (the username ordering); the engine frame
+    /// carries the resolved signal account and omits the default-keyed
+    /// options, the full-option frame carries them all (distributionListId
+    /// lowercased).
     #[test]
     fn send_story_preparation_gates_then_frames() {
-        use crate::engine::SignalCliMode;
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -16930,7 +16574,7 @@ mod tests {
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
-                service.prepare_send_story(params, SignalCliMode::KtEngine),
+                service.prepare_send_story(params),
                 Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
             )
         };
@@ -17006,31 +16650,20 @@ mod tests {
             "empty preview image"
         );
 
-        // Unknown account after the parameter gates, before the mode seam.
+        // Unknown account after the parameter gates.
         let error = service
-            .prepare_send_story(&params("x", false, "acct-absent"), SignalCliMode::KtEngine)
+            .prepare_send_story(&params("x", false, "acct-absent"))
             .unwrap_err();
         assert!(matches!(
             error,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
 
-        // The mode seam: JVM/native answers the honest capability debt on a
-        // fully valid frame.
-        let error = service
-            .prepare_send_story(&params("x", false, &account.id), SignalCliMode::Jvm)
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-
-        // The kt-engine lean frame: resolved account, defaults omitted,
+        // The lean frame: resolved account, defaults omitted,
         // allowsReplies always explicit.
         assert_eq!(
             service
-                .prepare_send_story(
-                    &params("story body", false, &account.id),
-                    SignalCliMode::KtEngine
-                )
+                .prepare_send_story(&params("story body", false, &account.id))
                 .unwrap(),
             json!({
                 "account": "+15555550100",
@@ -17044,10 +16677,7 @@ mod tests {
         // lowercased, absent-id normalization is upstream-side.
         assert_eq!(
             service
-                .prepare_send_story(
-                    &params("styled", true, &account.id),
-                    SignalCliMode::KtEngine
-                )
+                .prepare_send_story(&params("styled", true, &account.id))
                 .unwrap(),
             json!({
                 "account": "+15555550100",
@@ -17065,9 +16695,7 @@ mod tests {
         let mut upper = params("x", false, &account.id);
         upper.distribution_list_id = Some("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE".into());
         assert_eq!(
-            service
-                .prepare_send_story(&upper, SignalCliMode::KtEngine)
-                .unwrap()["distributionListId"],
+            service.prepare_send_story(&upper).unwrap()["distributionListId"],
             json!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         );
     }
@@ -17080,7 +16708,6 @@ mod tests {
     /// `previewImage` pointer key, while absence carries no key at all.
     #[test]
     fn send_story_preview_metadata_gates_then_rides_the_frame() {
-        use crate::engine::SignalCliMode;
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -17102,7 +16729,7 @@ mod tests {
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
-                service.prepare_send_story(params, SignalCliMode::KtEngine),
+                service.prepare_send_story(params),
                 Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
             )
         };
@@ -17150,45 +16777,25 @@ mod tests {
         // The gate order: a valid-shape url/title on an unknown account
         // answers the account error, not a shape error.
         let error = service
-            .prepare_send_story(
-                &params(
-                    Some("https://example.com/a".into()),
-                    Some("Example".into()),
-                    "acct-absent",
-                ),
-                SignalCliMode::KtEngine,
-            )
+            .prepare_send_story(&params(
+                Some("https://example.com/a".into()),
+                Some("Example".into()),
+                "acct-absent",
+            ))
             .unwrap_err();
         assert!(matches!(
             error,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
 
-        // The mode seam answers after the gates on a fully valid frame.
-        let error = service
-            .prepare_send_story(
-                &params(
-                    Some("https://example.com/a".into()),
-                    Some("Example".into()),
-                    &account.id,
-                ),
-                SignalCliMode::Jvm,
-            )
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-
         // Both keys ride verbatim, composed with the unchanged previewImage.
         assert_eq!(
             service
-                .prepare_send_story(
-                    &params(
-                        Some("https://example.com/a".into()),
-                        Some("Example".into()),
-                        &account.id,
-                    ),
-                    SignalCliMode::KtEngine,
-                )
+                .prepare_send_story(&params(
+                    Some("https://example.com/a".into()),
+                    Some("Example".into()),
+                    &account.id,
+                ))
                 .unwrap(),
             json!({
                 "account": "+15555550100",
@@ -17204,18 +16811,16 @@ mod tests {
         // Independent optionality: the url alone (no title key), the title
         // alone (no url key) — absence never sends an empty placeholder.
         let url_only = service
-            .prepare_send_story(
-                &params(Some("https://example.com/a".into()), None, &account.id),
-                SignalCliMode::KtEngine,
-            )
+            .prepare_send_story(&params(
+                Some("https://example.com/a".into()),
+                None,
+                &account.id,
+            ))
             .unwrap();
         assert_eq!(url_only["previewUrl"], json!("https://example.com/a"));
         assert!(url_only.get("previewTitle").is_none());
         let title_only = service
-            .prepare_send_story(
-                &params(None, Some("Example".into()), &account.id),
-                SignalCliMode::KtEngine,
-            )
+            .prepare_send_story(&params(None, Some("Example".into()), &account.id))
             .unwrap();
         assert_eq!(title_only["previewTitle"], json!("Example"));
         assert!(title_only.get("previewUrl").is_none());
@@ -17233,15 +16838,13 @@ mod tests {
         .unwrap();
         assert!(with_nulls.preview_url.is_none());
         assert!(with_nulls.preview_title.is_none());
-        let null_frame = service
-            .prepare_send_story(&with_nulls, SignalCliMode::KtEngine)
-            .unwrap();
+        let null_frame = service.prepare_send_story(&with_nulls).unwrap();
         assert!(null_frame.get("previewUrl").is_none());
         assert!(null_frame.get("previewTitle").is_none());
     }
 
     /// stories.setDisabled / stories.getDisabled (contract 1.76, §4.67):
-    /// mode-independent local faces — prepare validates and pins the account
+    /// local faces — prepare validates and pins the account
     /// on both, and the store default is the official enabled.
     #[test]
     fn stories_toggle_preparation_pins_account() {
@@ -17287,8 +16890,8 @@ mod tests {
     /// meaningless zero storySentAt answer INVALID_REQUEST — and the frame is
     /// exactly the engine's `sendViewedReceipt` params with the resolved
     /// signal account, the author as the single recipient, and the one-
-    /// timestamp array. Mode-independent: the upstream face is the pinned
-    /// upstream's own method, so no capability seam exists to answer.
+    /// timestamp array. Uniform: the upstream face is the engine's
+    /// own method, so no capability gate exists to answer.
     #[test]
     fn stories_mark_viewed_preparation_gates_then_frames() {
         let (_temp, service) = service();
@@ -17362,9 +16965,7 @@ mod tests {
 
     /// stories.sendReaction (contract 1.94, §4.77): validation runs
     /// entirely before the account ladder — author bounds, the meaningless
-    /// zero storySentAt, the emoji shape — then the JVM/native frame is the
-    /// pinned upstream's story-reaction shape (`story: true`, the author as
-    /// targetAuthor and single recipient), and the kt-engine face answers
+    /// zero storySentAt, the emoji shape — then the engine-gap face answers
     /// CAPABILITY_UNAVAILABLE (not retryable) after the same local
     /// validation.
     #[test]
@@ -17385,7 +16986,7 @@ mod tests {
             };
         let gate = |params: &StoriesSendReactionParams| {
             matches!(
-                service.prepare_story_send_reaction(params, SignalCliMode::Jvm),
+                service.prepare_story_send_reaction(params),
                 Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
             )
         };
@@ -17431,55 +17032,23 @@ mod tests {
 
         // Unknown account after the parameter gates.
         let error = service
-            .prepare_story_send_reaction(
-                &params("+15555550101", 1727000000000, "👍", "acct-absent"),
-                SignalCliMode::Jvm,
-            )
+            .prepare_story_send_reaction(&params(
+                "+15555550101",
+                1727000000000,
+                "👍",
+                "acct-absent",
+            ))
             .unwrap_err();
         assert!(matches!(
             error,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
 
-        // The JVM/native frame: the pinned upstream's story-reaction shape —
-        // the trimmed author as targetAuthor and the single recipient, the
-        // story timestamp as targetTimestamp, `story: true`, the resolved
-        // signal account, never the store account id.
-        assert_eq!(
-            service
-                .prepare_story_send_reaction(
-                    &params("  +15555550101  ", 1727000000000, "👍", &account.id),
-                    SignalCliMode::Jvm,
-                )
-                .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "emoji": "👍",
-                "remove": false,
-                "targetAuthor": "+15555550101",
-                "targetTimestamp": 1727000000000u64,
-                "recipient": ["+15555550101"],
-                "story": true,
-            })
-        );
-        // remove=true rides the frame verbatim.
-        let mut removing = params("+15555550101", 1727000000000, "👍", &account.id);
-        removing.remove = true;
-        assert_eq!(
-            service
-                .prepare_story_send_reaction(&removing, SignalCliMode::Native)
-                .unwrap()["remove"],
-            json!(true)
-        );
-
-        // The kt-engine face has no story-reaction send: CAPABILITY_UNAVAILABLE
-        // after the same local validation (the §4.53 engine-gap precedent),
-        // and the validation gates still run first.
+        // The engine-gap face: CAPABILITY_UNAVAILABLE after the same local
+        // validation ladder (the §4.53 precedent), and the gates still run
+        // first.
         let error = service
-            .prepare_story_send_reaction(
-                &params("+15555550101", 1727000000000, "👍", &account.id),
-                SignalCliMode::KtEngine,
-            )
+            .prepare_story_send_reaction(&params("+15555550101", 1727000000000, "👍", &account.id))
             .unwrap_err();
         assert!(matches!(
             error,
@@ -17488,10 +17057,12 @@ mod tests {
         ));
         assert!(
             matches!(
-                service.prepare_story_send_reaction(
-                    &params("+15555550101", 0, "👍", &account.id),
-                    SignalCliMode::KtEngine,
-                ),
+                service.prepare_story_send_reaction(&params(
+                    "+15555550101",
+                    0,
+                    "👍",
+                    &account.id
+                )),
                 Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
             ),
             "parameter gates precede the capability answer"
@@ -20470,18 +20041,14 @@ mod tests {
 
     // ---- Contract 1.42 (§4.41); group route re-cut by contract 1.45 (§4.44) ----
 
-    /// The upstream payload follows the caller's engine mode verbatim —
-    /// the engine face's `setExpirationTimer` (seconds) vs the signal-cli
-    /// face's `updateContact` (expiration, int seconds) — after bounds,
-    /// account, and conversation resolution. A direct conversation carries
-    /// the direct route; a group routes `updateGroup {account, groupId,
-    /// expiration}` in every mode since the engine batch landed
-    /// `updateGroup {expiration}` (2026-10-06 dated note; engine main @
-    /// 216a4c7), an unknown conversation answers CONVERSATION_NOT_FOUND, and
-    /// an out-of-face value answers INVALID_REQUEST.
+    /// The upstream payload follows the engine face verbatim — a direct
+    /// conversation carries `setExpirationTimer {expirationInSeconds}`, a
+    /// group routes `updateGroup {account, groupId, expiration}` — after
+    /// bounds, account, and conversation resolution. An unknown conversation
+    /// answers CONVERSATION_NOT_FOUND, and an out-of-face value answers
+    /// INVALID_REQUEST.
     #[test]
-    fn set_expire_timer_preparation_shapes_upstream_by_mode() {
-        use crate::engine::SignalCliMode;
+    fn set_expire_timer_preparation_shapes_upstream_by_conversation_kind() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -20496,18 +20063,13 @@ mod tests {
             .ensure_conversation(&account.id, "group", "group-id-1", "group")
             .unwrap();
 
-        let (engine_method, engine_payload, seconds) = service
-            .prepare_conversations_set_expire_timer(
-                &account.id,
-                &direct.id,
-                86_400,
-                SignalCliMode::KtEngine,
-            )
+        let (direct_method, direct_payload, seconds) = service
+            .prepare_conversations_set_expire_timer(&account.id, &direct.id, 86_400)
             .unwrap();
-        assert_eq!(engine_method, "setExpirationTimer");
+        assert_eq!(direct_method, "setExpirationTimer");
         assert_eq!(seconds, 86_400);
         assert_eq!(
-            engine_payload,
+            direct_payload,
             json!({
                 "account": "+15555550100",
                 "recipient": "+15555550101",
@@ -20515,32 +20077,9 @@ mod tests {
             })
         );
 
-        let (signal_cli, signal_cli_payload, _) = service
-            .prepare_conversations_set_expire_timer(
-                &account.id,
-                &direct.id,
-                604_800,
-                SignalCliMode::Jvm,
-            )
-            .unwrap();
-        assert_eq!(signal_cli, "updateContact");
-        assert_eq!(
-            signal_cli_payload,
-            json!({
-                "account": "+15555550100",
-                "recipient": "+15555550101",
-                "expiration": 604_800,
-            })
-        );
-
-        // Group route (§4.44): the signal-cli JVM face travels by updateGroup.
+        // Group route (§4.44): updateGroup.
         let (group_method, group_payload, group_seconds) = service
-            .prepare_conversations_set_expire_timer(
-                &account.id,
-                &group.id,
-                3600,
-                SignalCliMode::Jvm,
-            )
+            .prepare_conversations_set_expire_timer(&account.id, &group.id, 3600)
             .unwrap();
         assert_eq!(group_method, "updateGroup");
         assert_eq!(group_seconds, 3600);
@@ -20553,48 +20092,8 @@ mod tests {
             })
         );
 
-        // Native shares the JVM face one-to-one (the §4.32-§4.34 swap
-        // boundary): same method, same payload.
-        let (native_method, native_payload, _) = service
-            .prepare_conversations_set_expire_timer(
-                &account.id,
-                &group.id,
-                3600,
-                SignalCliMode::Native,
-            )
-            .unwrap();
-        assert_eq!(native_method, "updateGroup");
-        assert_eq!(native_payload, group_payload);
-
-        // ... and the kt-engine face converges on the same group payload —
-        // the engine-batch gate is lifted (2026-10-06 dated note), the one
-        // updateGroup shape in every mode.
-        let (kt_group_method, kt_group_payload, kt_group_seconds) = service
-            .prepare_conversations_set_expire_timer(
-                &account.id,
-                &group.id,
-                60,
-                SignalCliMode::KtEngine,
-            )
-            .unwrap();
-        assert_eq!(kt_group_method, "updateGroup");
-        assert_eq!(kt_group_seconds, 60);
-        assert_eq!(
-            kt_group_payload,
-            json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-                "expiration": 60,
-            })
-        );
-
         let missing = service
-            .prepare_conversations_set_expire_timer(
-                &account.id,
-                "conv-absent",
-                60,
-                SignalCliMode::KtEngine,
-            )
+            .prepare_conversations_set_expire_timer(&account.id, "conv-absent", 60)
             .unwrap_err();
         assert!(matches!(
             missing,
@@ -20606,7 +20105,6 @@ mod tests {
                 &account.id,
                 &direct.id,
                 MAX_EXPIRE_TIMER_SECONDS + 1,
-                SignalCliMode::KtEngine,
             )
             .unwrap_err();
         assert!(matches!(oversized, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
@@ -20708,15 +20206,12 @@ mod tests {
 
     // ---- Contract 1.45 (§4.44): group management write face ----
 
-    /// Every change family maps to its upstream `updateGroup` key verbatim
-    /// (the connector-facing names are the caller's; the upstream names are
-    /// the wire's), member arrays keep the roster bounds, and the refusal
-    /// ladder answers before any upstream call: empty change sets, explicit
-    /// empty member arrays, oversized strings and rosters, bad enums, direct
-    /// addressing, unknown conversations, a malformed operationId.
+    /// The groups.update refusal ladder answers before any upstream call:
+    /// empty change sets, explicit empty member arrays, oversized strings
+    /// and rosters, bad enums, direct addressing, unknown conversations, a
+    /// malformed operationId.
     #[test]
-    fn groups_update_preparation_maps_change_families_and_refuses_gaps() {
-        use crate::engine::SignalCliMode;
+    fn groups_update_preparation_refuses_the_gaps() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -20752,159 +20247,9 @@ mod tests {
             operation_id: None,
         };
 
-        // One payload per change family, verbatim key mapping.
-        assert_eq!(
-            service
-                .prepare_groups_update(
-                    &GroupsUpdateParams {
-                        group_name: Some("New Name".into()),
-                        ..base(&group.id)
-                    },
-                    SignalCliMode::Jvm
-                )
-                .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-                "name": "New Name",
-            })
-        );
-        assert_eq!(
-            service
-                .prepare_groups_update(
-                    &GroupsUpdateParams {
-                        group_description: Some("A description".into()),
-                        ..base(&group.id)
-                    },
-                    SignalCliMode::Jvm
-                )
-                .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-                "description": "A description",
-            })
-        );
-        for (connector_key, upstream_key, members) in [
-            ("addMembers", "members", vec!["+15555550101"]),
-            ("removeMembers", "removeMembers", vec!["+15555550102"]),
-            ("promoteAdmins", "admins", vec!["+15555550101"]),
-            ("demoteAdmins", "removeAdmins", vec!["+15555550101"]),
-            ("banMembers", "bans", vec!["+15555550102"]),
-            ("unbanMembers", "unbans", vec!["+15555550102"]),
-        ] {
-            let members: Vec<String> = members.into_iter().map(str::to_string).collect();
-            let params = GroupsUpdateParams {
-                add_members: (connector_key == "addMembers").then(|| members.clone()),
-                remove_members: (connector_key == "removeMembers").then(|| members.clone()),
-                promote_admins: (connector_key == "promoteAdmins").then(|| members.clone()),
-                demote_admins: (connector_key == "demoteAdmins").then(|| members.clone()),
-                ban_members: (connector_key == "banMembers").then(|| members.clone()),
-                unban_members: (connector_key == "unbanMembers").then(|| members.clone()),
-                ..base(&group.id)
-            };
-            let mut expected = json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-            });
-            expected[upstream_key] = json!(members);
-            assert_eq!(
-                service
-                    .prepare_groups_update(&params, SignalCliMode::Jvm)
-                    .unwrap(),
-                expected,
-                "family {connector_key} must land on upstream key {upstream_key}"
-            );
-        }
-
-        // Link state: the connector's enabled-without-approval maps to the
-        // upstream "enabled" choice; the other two pass verbatim.
-        for (connector, upstream) in [
-            ("enabled-with-approval", "enabled-with-approval"),
-            ("enabled-without-approval", "enabled"),
-            ("disabled", "disabled"),
-        ] {
-            assert_eq!(
-                service
-                    .prepare_groups_update(
-                        &GroupsUpdateParams {
-                            link_state: Some(connector.into()),
-                            ..base(&group.id)
-                        },
-                        SignalCliMode::Jvm
-                    )
-                    .unwrap(),
-                json!({
-                    "account": "+15555550100",
-                    "groupId": "group-id-1",
-                    "link": upstream,
-                })
-            );
-        }
-        // resetLink: only the true form carries a change.
-        assert_eq!(
-            service
-                .prepare_groups_update(
-                    &GroupsUpdateParams {
-                        reset_link: Some(true),
-                        ..base(&group.id)
-                    },
-                    SignalCliMode::Jvm
-                )
-                .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-                "resetLink": true,
-            })
-        );
-        for (value, key) in [
-            ("every-member", "setPermissionAddMember"),
-            ("only-admins", "setPermissionEditDetails"),
-            ("only-admins", "setPermissionSendMessages"),
-        ] {
-            let params = GroupsUpdateParams {
-                permission_add_member: (key == "setPermissionAddMember").then(|| value.into()),
-                permission_edit_details: (key == "setPermissionEditDetails").then(|| value.into()),
-                permission_send_messages: (key == "setPermissionSendMessages")
-                    .then(|| value.into()),
-                ..base(&group.id)
-            };
-            assert_eq!(
-                service
-                    .prepare_groups_update(&params, SignalCliMode::Jvm)
-                    .unwrap(),
-                json!({
-                    "account": "+15555550100",
-                    "groupId": "group-id-1",
-                    key: value,
-                })
-            );
-        }
-        assert_eq!(
-            service
-                .prepare_groups_update(
-                    &GroupsUpdateParams {
-                        member_label: Some("Builders".into()),
-                        member_label_emoji: Some("🛠️".into()),
-                        ..base(&group.id)
-                    },
-                    SignalCliMode::Jvm
-                )
-                .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-                "memberLabel": "Builders",
-                "memberLabelEmoji": "🛠️",
-            })
-        );
-
         // The refusal ladder — each before any upstream call.
         let refused = |params: GroupsUpdateParams| {
-            let error = service
-                .prepare_groups_update(&params, SignalCliMode::Jvm)
-                .unwrap_err();
+            let error = service.prepare_groups_update(&params).unwrap_err();
             assert!(
                 matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
                 "expected INVALID_REQUEST"
@@ -20970,14 +20315,11 @@ mod tests {
             ..base(&group.id)
         });
         let missing = service
-            .prepare_groups_update(
-                &GroupsUpdateParams {
-                    conversation_id: "conv-absent".into(),
-                    group_name: Some("New Name".into()),
-                    ..base(&group.id)
-                },
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_update(&GroupsUpdateParams {
+                conversation_id: "conv-absent".into(),
+                group_name: Some("New Name".into()),
+                ..base(&group.id)
+            })
             .unwrap_err();
         assert!(matches!(
             missing,
@@ -20991,7 +20333,6 @@ mod tests {
     /// INVALID_REQUEST — the honest degradation, never a silent rewrite.
     #[test]
     fn groups_update_and_quit_refuse_the_engine_face_after_validation() {
-        use crate::engine::SignalCliMode;
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -21022,9 +20363,7 @@ mod tests {
             avatar: AvatarUpdate::Keep,
             operation_id: None,
         };
-        let error = service
-            .prepare_groups_update(&named, SignalCliMode::KtEngine)
-            .unwrap_err();
+        let error = service.prepare_groups_update(&named).unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
         // Validation outranks the capability gate.
@@ -21032,9 +20371,7 @@ mod tests {
             group_name: None,
             ..named
         };
-        let error = service
-            .prepare_groups_update(&invalid, SignalCliMode::KtEngine)
-            .unwrap_err();
+        let error = service.prepare_groups_update(&invalid).unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
         let quit = GroupsQuitParams {
@@ -21042,9 +20379,7 @@ mod tests {
             conversation_id: group.id.clone(),
             operation_id: None,
         };
-        let error = service
-            .prepare_groups_quit(&quit, SignalCliMode::KtEngine)
-            .unwrap_err();
+        let error = service.prepare_groups_quit(&quit).unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
     }
@@ -21052,15 +20387,12 @@ mod tests {
     /// The groups.update avatar tri-state (contract 1.89): the wire
     /// deserialization keeps the three states distinct (the dedicated
     /// `AvatarUpdate` — an explicit null is `Remove`, never folded into
-    /// absence); the data-URI shape refusals answer INVALID_REQUEST in both
-    /// modes before any gate; a lone explicit-null or lone data-URI call is
-    /// a real change (it reaches the CAPABILITY_UNAVAILABLE downgrade, not
-    /// the empty-set INVALID_REQUEST); a keep adds no avatar key upstream;
-    /// and the kt-engine face keeps its updateGroup-debt answer untouched.
-    /// Zero local writes on every branch.
+    /// absence); the data-URI shape refusals answer INVALID_REQUEST before
+    /// any gate; a lone explicit-null or lone data-URI call is a real change
+    /// (it reaches the CAPABILITY_UNAVAILABLE downgrade, not the empty-set
+    /// INVALID_REQUEST). Zero local writes on every branch.
     #[test]
-    fn groups_update_avatar_tri_state_shapes_and_engine_downgrade() {
-        use crate::engine::SignalCliMode;
+    fn groups_update_avatar_tri_state_shapes_and_downgrade() {
         // The wire deserialization: absent → Keep, explicit null → Remove,
         // string → Replace, any other JSON type → the params-shape
         // INVALID_REQUEST (the host's blanket refusal).
@@ -21117,7 +20449,7 @@ mod tests {
         };
         // The data-URI shape refusals: a non-image family, a non-canonical
         // base64 payload, and a decode beyond the 10 MiB budget —
-        // INVALID_REQUEST in both modes, ahead of both gates (the fourth
+        // INVALID_REQUEST, ahead of the capability gate (the fourth
         // shape refusal, a non-string avatar, answered at the params
         // deserialization above).
         let over_budget = format!(
@@ -21129,126 +20461,65 @@ mod tests {
             "data:image/png;base64,YQ",
             over_budget.as_str(),
         ] {
-            for mode in [SignalCliMode::Jvm, SignalCliMode::KtEngine] {
-                let error = service
-                    .prepare_groups_update(&base(AvatarUpdate::Replace(shape.into())), mode)
-                    .unwrap_err();
-                assert!(
-                    matches!(error, ServiceError::Api(ref api)
-                        if api.code == "INVALID_REQUEST" && !api.retryable),
-                    "shape {shape} must refuse INVALID_REQUEST in mode {mode:?}"
-                );
-            }
+            let error = service
+                .prepare_groups_update(&base(AvatarUpdate::Replace(shape.into())))
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::Api(ref api)
+                    if api.code == "INVALID_REQUEST" && !api.retryable),
+                "shape {shape} must refuse INVALID_REQUEST"
+            );
         }
 
         // The exact 10 MiB decoded budget passes the shape gate, so a lone
-        // replace call rides the ladder into the JVM/native byte-face
-        // refusal — CAPABILITY_UNAVAILABLE (retryable=false), the §4.68
-        // snapshot-import downgrade shape, not the engine-face message.
+        // replace call rides the ladder into the capability downgrade —
+        // CAPABILITY_UNAVAILABLE (retryable=false), the updateGroup debt.
         let at_bound = format!(
             "data:image/png;base64,{}",
             "QUJD".repeat(MAX_AVATAR_BYTES / 3)
         );
         let error = service
-            .prepare_groups_update(&base(AvatarUpdate::Replace(at_bound)), SignalCliMode::Jvm)
+            .prepare_groups_update(&base(AvatarUpdate::Replace(at_bound)))
             .unwrap_err();
-        match &error {
-            ServiceError::Api(api) => {
-                assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
-                assert!(!api.retryable);
-                assert!(
-                    api.message.contains("local file path"),
-                    "the JVM/native refusal names the byte-face gap: {api}"
-                );
-            }
-            _ => panic!("expected an Api refusal, got {error:?}"),
-        }
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
 
         // A lone explicit-null call answers the same downgrade — the
         // refusal (not the empty-set INVALID_REQUEST) proves the Remove form
         // counts as the change set's avatar member.
         let error = service
-            .prepare_groups_update(&base(AvatarUpdate::Remove), SignalCliMode::Jvm)
+            .prepare_groups_update(&base(AvatarUpdate::Remove))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
 
         // The avatar member rides beside a text change and the refusal
-        // still precedes any payload: no temporary file is ever written on
-        // the JVM/native face.
+        // still lands after the full validation ladder.
         let error = service
-            .prepare_groups_update(
-                &GroupsUpdateParams {
-                    group_name: Some("New Name".into()),
-                    avatar: AvatarUpdate::Replace("data:image/png;base64,YQ==".into()),
-                    ..base(AvatarUpdate::Keep)
-                },
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_update(&GroupsUpdateParams {
+                group_name: Some("New Name".into()),
+                avatar: AvatarUpdate::Replace("data:image/png;base64,YQ==".into()),
+                ..base(AvatarUpdate::Keep)
+            })
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
 
-        // The kt-engine face keeps its updateGroup-debt answer verbatim —
-        // the engine batch removes that gate, not this one — and an
-        // avatar-carrying call answers the same debt (no separate
-        // kt-engine avatar message is invented here). Both calls carry a
-        // real change (a name; the avatar alone) so the empty-set refusal
-        // never masks the gate.
-        let named_change = GroupsUpdateParams {
-            group_name: Some("New Name".into()),
-            ..base(AvatarUpdate::Keep)
-        };
-        for params in [
-            named_change,
-            base(AvatarUpdate::Replace("data:image/png;base64,YQ==".into())),
-        ] {
-            let error = service
-                .prepare_groups_update(&params, SignalCliMode::KtEngine)
-                .unwrap_err();
-            match &error {
-                ServiceError::Api(api) => {
-                    assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
-                    assert!(!api.retryable);
-                    assert!(
-                        api.message.contains("updateGroup"),
-                        "the kt-engine face answers the updateGroup debt: {api}"
-                    );
-                }
-                _ => panic!("expected an Api refusal, got {error:?}"),
-            }
-        }
-
         // A keep (the key absent) is no avatar change at all: a call with no
         // other change is the §4.44 empty set, refused before the gates.
         let error = service
-            .prepare_groups_update(&base(AvatarUpdate::Keep), SignalCliMode::Jvm)
+            .prepare_groups_update(&base(AvatarUpdate::Keep))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
                 if api.code == "INVALID_REQUEST"
                     && api.message.contains("at least one group change")));
-
-        // A keep beside a text change keeps the §4.44 payload exactly as it
-        // was: the omission discipline — the avatar key does not exist
-        // upstream.
-        let upstream = service
-            .prepare_groups_update(
-                &GroupsUpdateParams {
-                    group_name: Some("New Name".into()),
-                    ..base(AvatarUpdate::Keep)
-                },
-                SignalCliMode::Jvm,
-            )
-            .unwrap();
-        assert!(upstream.get("avatar").is_none());
-        assert_eq!(upstream["name"], "New Name");
     }
 
-    /// groups.quit resolves the group and answers the bare upstream payload;
-    /// direct addressing and unknown conversations answer their ladder steps.
+    /// groups.quit resolves the ladder (direct addressing and unknown
+    /// conversations answer their steps) and the valid group call lands on
+    /// the honest capability refusal.
     #[test]
-    fn groups_quit_preparation_addresses_the_group_and_refuses_non_groups() {
-        use crate::engine::SignalCliMode;
+    fn groups_quit_preparation_resolves_the_ladder_and_refuses_the_face() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -21267,21 +20538,17 @@ mod tests {
             conversation_id,
             operation_id: None,
         };
-        assert_eq!(
-            service
-                .prepare_groups_quit(&quit(group.id.clone()), SignalCliMode::Jvm)
-                .unwrap(),
-            json!({
-                "account": "+15555550100",
-                "groupId": "group-id-1",
-            })
-        );
         let error = service
-            .prepare_groups_quit(&quit(direct.id.clone()), SignalCliMode::Jvm)
+            .prepare_groups_quit(&quit(group.id.clone()))
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api)
+                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        let error = service
+            .prepare_groups_quit(&quit(direct.id.clone()))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let missing = service
-            .prepare_groups_quit(&quit("conv-absent".into()), SignalCliMode::Jvm)
+            .prepare_groups_quit(&quit("conv-absent".into()))
             .unwrap_err();
         assert!(matches!(
             missing,
@@ -21291,12 +20558,12 @@ mod tests {
 
     // ---- Contract 1.59 (§4.55): username faces ----
 
-    /// accounts.setUsername enforces the XOR ladder before the capability
-    /// gate, mirrors the desktop grammar fail-closed, and builds the
-    /// `updateAccount` payload per mode.
+    /// accounts.setUsername enforces the XOR ladder before the frame,
+    /// mirrors the desktop grammar fail-closed, and builds the two-hop
+    /// orchestration frames (reserve {account, username}; the delete hop
+    /// carries the bare account).
     #[test]
-    fn set_username_preparation_enforces_xor_shape_and_mode() {
-        use crate::engine::SignalCliMode;
+    fn set_username_preparation_enforces_xor_shape_and_frames() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -21310,14 +20577,11 @@ mod tests {
 
         // XOR: both present, both absent.
         let error = service
-            .prepare_accounts_set_username(
-                &params(Some("kt_test.01".into()), true),
-                SignalCliMode::Jvm,
-            )
+            .prepare_accounts_set_username(&params(Some("kt_test.01".into()), true))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let error = service
-            .prepare_accounts_set_username(&params(None, false), SignalCliMode::Jvm)
+            .prepare_accounts_set_username(&params(None, false))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
@@ -21333,7 +20597,7 @@ mod tests {
             "kt_test.",    // empty discriminator
         ] {
             let error = service
-                .prepare_accounts_set_username(&params(Some(bad.into()), false), SignalCliMode::Jvm)
+                .prepare_accounts_set_username(&params(Some(bad.into()), false))
                 .unwrap_err();
             assert!(
                 matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
@@ -21342,16 +20606,13 @@ mod tests {
         }
         // Whole-string wire bound (38): the grammar walk never sees it.
         let error = service
-            .prepare_accounts_set_username(&params(Some("a".repeat(39)), false), SignalCliMode::Jvm)
+            .prepare_accounts_set_username(&params(Some("a".repeat(39)), false))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         // Two dots: the split keeps the second dot inside the discriminator —
         // also a grammar face.
         let error = service
-            .prepare_accounts_set_username(
-                &params(Some("kt.te.st.1".into()), false),
-                SignalCliMode::Jvm,
-            )
+            .prepare_accounts_set_username(&params(Some("kt.te.st.1".into()), false))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
@@ -21367,67 +20628,37 @@ mod tests {
             "kt_test.65536".to_string(),
         ] {
             service
-                .prepare_accounts_set_username(
-                    &params(Some(good.clone()), false),
-                    SignalCliMode::Jvm,
-                )
+                .prepare_accounts_set_username(&params(Some(good.clone()), false))
                 .unwrap_or_else(|error| panic!("expected {good} to pass: {error:?}"));
         }
 
-        // KtEngine frames (contract 1.75, §4.66): the two-hop orchestration
-        // takes the same set frame the JVM face builds; the delete frame
-        // carries the bare account (usernameDelete's shape). Validation
-        // outranks the mode seam.
+        // Frames (contract 1.75, §4.66): the reserve hop takes
+        // {account, username}; the delete hop carries the bare account
+        // (usernameDelete's shape). Validation outranks the frame.
         assert_eq!(
             service
-                .prepare_accounts_set_username(
-                    &params(Some("kt_test.01".into()), false),
-                    SignalCliMode::KtEngine,
-                )
+                .prepare_accounts_set_username(&params(Some("kt_test.01".into()), false))
                 .unwrap(),
             json!({"account": "+15555550100", "username": "kt_test.01"})
         );
         assert_eq!(
             service
-                .prepare_accounts_set_username(&params(None, true), SignalCliMode::KtEngine)
+                .prepare_accounts_set_username(&params(None, true))
                 .unwrap(),
             json!({"account": "+15555550100"})
         );
         let error = service
-            .prepare_accounts_set_username(
-                &params(Some("kt_test.00".into()), false),
-                SignalCliMode::KtEngine,
-            )
+            .prepare_accounts_set_username(&params(Some("kt_test.00".into()), false))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
-        // JVM payloads.
-        assert_eq!(
-            service
-                .prepare_accounts_set_username(
-                    &params(Some("kt_test.01".into()), false),
-                    SignalCliMode::Jvm
-                )
-                .unwrap(),
-            json!({"account": "+15555550100", "username": "kt_test.01"})
-        );
-        assert_eq!(
-            service
-                .prepare_accounts_set_username(&params(None, true), SignalCliMode::Jvm)
-                .unwrap(),
-            json!({"account": "+15555550100", "deleteUsername": true})
-        );
-
         // Unknown account answers before everything else.
         let error = service
-            .prepare_accounts_set_username(
-                &AccountsSetUsernameParams {
-                    account_id: "acct-absent".into(),
-                    username: Some("kt_test.01".into()),
-                    delete_username: false,
-                },
-                SignalCliMode::Jvm,
-            )
+            .prepare_accounts_set_username(&AccountsSetUsernameParams {
+                account_id: "acct-absent".into(),
+                username: Some("kt_test.01".into()),
+                delete_username: false,
+            })
             .unwrap_err();
         assert!(matches!(
             error,
@@ -21435,35 +20666,21 @@ mod tests {
         ));
     }
 
-    /// accounts.getUsername: the JVM/native faces answer
-    /// CAPABILITY_UNAVAILABLE after account resolution; the kt-engine face
-    /// resolves the engine frame (contract 1.74, §4.65); unknown accounts
-    /// answer first on every mode.
+    /// accounts.getUsername resolves the engine's getUsername reader frame
+    /// (contract 1.74, §4.65); unknown accounts answer first.
     #[test]
-    fn get_username_preparation_gates_mode_after_resolution() {
-        use crate::engine::SignalCliMode;
+    fn get_username_preparation_resolves_the_reader_frame() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
-        // JVM/native: honest engine-surface debt (the pinned signal-cli has
-        // no username reader).
-        let error = service
-            .prepare_accounts_get_username(&account.id, SignalCliMode::Jvm)
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-        // kt-engine: the engine's getUsername frame.
         assert_eq!(
-            service
-                .prepare_accounts_get_username(&account.id, SignalCliMode::KtEngine)
-                .unwrap(),
+            service.prepare_accounts_get_username(&account.id).unwrap(),
             json!({ "account": "+15555550100" })
         );
-        // Unknown account answers before any mode gate.
         let error = service
-            .prepare_accounts_get_username("acct-absent", SignalCliMode::KtEngine)
+            .prepare_accounts_get_username("acct-absent")
             .unwrap_err();
         assert!(matches!(
             error,
@@ -21471,12 +20688,10 @@ mod tests {
         ));
     }
 
-    /// username.lookup bounds the batch and forwards entries verbatim on
-    /// both engine faces (contract 1.74, §4.65: the frame is mode-shared;
-    /// the mode picks the engine method name supervisor-side).
+    /// username.lookup bounds the batch and forwards entries verbatim
+    /// (contract 1.74, §4.65).
     #[test]
     fn username_lookup_preparation_bounds_batch_and_shares_frame() {
-        use crate::engine::SignalCliMode;
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -21489,42 +20704,30 @@ mod tests {
 
         // Empty and over-cap batches.
         let error = service
-            .prepare_username_lookup(&params(vec![]), SignalCliMode::Jvm)
+            .prepare_username_lookup(&params(vec![]))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let over = vec!["kt.user".to_string(); USERNAME_LOOKUP_MAX_ENTRIES + 1];
-        let error = service
-            .prepare_username_lookup(&params(over), SignalCliMode::Jvm)
-            .unwrap_err();
+        let error = service.prepare_username_lookup(&params(over)).unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         // Entry bound: 65 chars.
         let error = service
-            .prepare_username_lookup(&params(vec!["k".repeat(65)]), SignalCliMode::Jvm)
+            .prepare_username_lookup(&params(vec!["k".repeat(65)]))
             .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
-        // Both faces: entries forwarded verbatim, same frame.
-        let expected = json!({
-            "account": "+15555550100",
-            "usernames": ["kt_test.01", "https://signal.me/#eu"],
-        });
+        // Entries forwarded verbatim.
         assert_eq!(
             service
-                .prepare_username_lookup(
-                    &params(vec!["kt_test.01".into(), "https://signal.me/#eu".into()]),
-                    SignalCliMode::Jvm
-                )
+                .prepare_username_lookup(&params(vec![
+                    "kt_test.01".into(),
+                    "https://signal.me/#eu".into()
+                ]))
                 .unwrap(),
-            expected
-        );
-        assert_eq!(
-            service
-                .prepare_username_lookup(
-                    &params(vec!["kt_test.01".into(), "https://signal.me/#eu".into()]),
-                    SignalCliMode::KtEngine
-                )
-                .unwrap(),
-            expected
+            json!({
+                "account": "+15555550100",
+                "usernames": ["kt_test.01", "https://signal.me/#eu"],
+            })
         );
     }
 
@@ -21572,8 +20775,8 @@ mod tests {
     /// prepare_groups_terminate resolves the group and answers the bare
     /// upstream payload (the pinned 0.14.8 `terminateGroup` dests); the
     /// refusal ladder answers before any upstream call — bad ids, an unknown
-    /// conversation, and direct addressing. No mode gate: the face exists on
-    /// every engine mode's shared jsonRpc surface.
+    /// conversation, and direct addressing. No capability gate: the face
+    /// rides the engine's jsonRpc surface.
     #[test]
     fn groups_terminate_preparation_addresses_the_group_and_refuses_non_groups() {
         let (_temp, service) = service();
@@ -21642,17 +20845,14 @@ mod tests {
 
     // ---- Contract 1.58 (§4.53): group join-request approval face ----
 
-    /// prepare_groups_approve_join_requests validates the candidate set and
-    /// resolves the group row: the happy path answers (peerKey, deduped
-    /// members, approve) with duplicates collapsed and order normalized;
-    /// the refusal ladder answers before any engine call — empty members,
-    /// oversized member arrays, per-entry shape violations, bad ids, an
-    /// unknown conversation, direct addressing, and an over-bound audit id.
-    /// The kt-engine face answers CAPABILITY_UNAVAILABLE after the local
-    /// validation completed (the engine debt precedent — the fold must not
-    /// disguise "cannot approve" as "nobody is requesting").
+    /// groups.approveJoinRequests runs the full refusal ladder — empty
+    /// members, oversized member arrays, per-entry shape violations, bad
+    /// ids, an unknown conversation, direct addressing, and an over-bound
+    /// audit id — and the valid call answers the honest
+    /// CAPABILITY_UNAVAILABLE (the engine debt precedent — the fold must
+    /// not disguise "cannot approve" as "nobody is requesting").
     #[test]
-    fn groups_approve_join_requests_preparation_folds_shape_and_refuses_gaps() {
+    fn groups_approve_join_requests_preparation_refuses_gaps_and_the_face() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -21676,127 +20876,74 @@ mod tests {
             }
         };
 
-        // The happy path: both decision directions and duplicate collapse.
-        assert_eq!(
-            service
-                .prepare_groups_approve_join_requests(
-                    &params(group.id.clone(), vec!["+15555550101".into()], true),
-                    SignalCliMode::Jvm,
-                )
-                .unwrap(),
-            (
-                "group-id-1".to_string(),
-                vec!["+15555550101".to_string()],
-                true
-            )
-        );
-        assert_eq!(
-            service
-                .prepare_groups_approve_join_requests(
-                    &params(
-                        group.id.clone(),
-                        vec![
-                            "+15555550102".into(),
-                            "+15555550101".into(),
-                            "+15555550102".into()
-                        ],
-                        false,
-                    ),
-                    SignalCliMode::Jvm,
-                )
-                .unwrap(),
-            (
-                "group-id-1".to_string(),
-                vec!["+15555550101".to_string(), "+15555550102".to_string()],
-                false
-            )
-        );
-
         // The refusal ladder, each before any engine call.
         let empty = service
-            .prepare_groups_approve_join_requests(
-                &params(group.id.clone(), vec![], true),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_approve_join_requests(&params(group.id.clone(), vec![], true))
             .unwrap_err();
         assert!(matches!(empty, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let direct_addressed = service
-            .prepare_groups_approve_join_requests(
-                &params(direct.id.clone(), vec!["+15555550102".into()], true),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_approve_join_requests(&params(
+                direct.id.clone(),
+                vec!["+15555550102".into()],
+                true,
+            ))
             .unwrap_err();
         assert!(
             matches!(direct_addressed, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
             "a direct conversation is a shape refusal: {direct_addressed:?}"
         );
         let missing = service
-            .prepare_groups_approve_join_requests(
-                &params("conv-absent".into(), vec!["+15555550102".into()], true),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_approve_join_requests(&params(
+                "conv-absent".into(),
+                vec!["+15555550102".into()],
+                true,
+            ))
             .unwrap_err();
         assert!(matches!(
             missing,
             ServiceError::Store(StoreError::ConversationNotFound)
         ));
         let bad_shape = service
-            .prepare_groups_approve_join_requests(
-                &params(group.id.clone(), vec![String::new()], true),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_approve_join_requests(&params(
+                group.id.clone(),
+                vec![String::new()],
+                true,
+            ))
             .unwrap_err();
         assert!(matches!(bad_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let oversized = service
-            .prepare_groups_approve_join_requests(
-                &params(
-                    group.id.clone(),
-                    (0..=MAX_GROUP_MEMBERS)
-                        .map(|index| format!("+15555050{index:03}"))
-                        .collect(),
-                    true,
-                ),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_approve_join_requests(&params(
+                group.id.clone(),
+                (0..=MAX_GROUP_MEMBERS)
+                    .map(|index| format!("+15555050{index:03}"))
+                    .collect(),
+                true,
+            ))
             .unwrap_err();
         assert!(matches!(oversized, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
-        // The kt-engine face: the honest capability gap after local
+        // The valid call: the honest capability gap after local
         // validation (CAPABILITY_UNAVAILABLE, retryable=false).
-        let engine_mode = service
-            .prepare_groups_approve_join_requests(
-                &params(group.id.clone(), vec!["+15555550101".into()], true),
-                SignalCliMode::KtEngine,
-            )
+        let valid = service
+            .prepare_groups_approve_join_requests(&params(
+                group.id.clone(),
+                vec!["+15555550101".into()],
+                true,
+            ))
             .unwrap_err();
         assert!(
-            matches!(engine_mode, ServiceError::Api(ref api) if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable),
-            "the engine debt answers the capability gap: {engine_mode:?}"
-        );
-        // The engine gate sits after local validation: a shape violation
-        // still answers INVALID_REQUEST on the engine face.
-        let engine_mode_shape = service
-            .prepare_groups_approve_join_requests(
-                &params(group.id.clone(), vec![], true),
-                SignalCliMode::KtEngine,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(engine_mode_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST")
+            matches!(valid, ServiceError::Api(ref api) if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable),
+            "the engine debt answers the capability gap: {valid:?}"
         );
     }
 
-    /// prepare_groups_revoke_invites validates the candidate set and
-    /// resolves the group row: the happy path answers (peerKey, deduped
-    /// members) with duplicates collapsed and order normalized; the refusal
-    /// ladder answers before any engine call — empty members, oversized
-    /// member arrays, per-entry shape violations, bad ids, an unknown
-    /// conversation, and direct addressing. The kt-engine face answers
-    /// CAPABILITY_UNAVAILABLE after the local validation completed (the
-    /// engine debt precedent — the fold must not disguise "cannot revoke"
-    /// as "nobody is pending").
+    /// groups.revokeInvites runs the refusal ladder — empty members,
+    /// oversized member arrays, per-entry shape violations, bad ids, an
+    /// unknown conversation, and direct addressing — and the valid call
+    /// answers the honest CAPABILITY_UNAVAILABLE (the engine debt precedent
+    /// — the fold must not disguise "cannot revoke" as "nobody is pending").
     #[test]
-    fn groups_revoke_invites_preparation_folds_shape_and_refuses_gaps() {
+    fn groups_revoke_invites_preparation_refuses_gaps_and_the_face() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -21817,94 +20964,50 @@ mod tests {
             operation_id: None,
         };
 
-        // The happy path: duplicate collapse and order normalization.
-        assert_eq!(
-            service
-                .prepare_groups_revoke_invites(
-                    &params(
-                        group.id.clone(),
-                        vec![
-                            "+15555550102".into(),
-                            "+15555550101".into(),
-                            "+15555550102".into()
-                        ],
-                    ),
-                    SignalCliMode::Jvm,
-                )
-                .unwrap(),
-            (
-                "group-id-1".to_string(),
-                vec!["+15555550101".to_string(), "+15555550102".to_string()]
-            )
-        );
-
         // The refusal ladder, each before any engine call.
         let empty = service
-            .prepare_groups_revoke_invites(&params(group.id.clone(), vec![]), SignalCliMode::Jvm)
+            .prepare_groups_revoke_invites(&params(group.id.clone(), vec![]))
             .unwrap_err();
         assert!(matches!(empty, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let direct_addressed = service
-            .prepare_groups_revoke_invites(
-                &params(direct.id.clone(), vec!["+15555550102".into()]),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_revoke_invites(&params(direct.id.clone(), vec!["+15555550102".into()]))
             .unwrap_err();
         assert!(
             matches!(direct_addressed, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
             "a direct conversation is a shape refusal: {direct_addressed:?}"
         );
         let missing = service
-            .prepare_groups_revoke_invites(
-                &params("conv-absent".into(), vec!["+15555550102".into()]),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_revoke_invites(&params(
+                "conv-absent".into(),
+                vec!["+15555550102".into()],
+            ))
             .unwrap_err();
         assert!(matches!(
             missing,
             ServiceError::Store(StoreError::ConversationNotFound)
         ));
         let bad_shape = service
-            .prepare_groups_revoke_invites(
-                &params(group.id.clone(), vec![String::new()]),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_revoke_invites(&params(group.id.clone(), vec![String::new()]))
             .unwrap_err();
         assert!(matches!(bad_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
         let oversized = service
-            .prepare_groups_revoke_invites(
-                &params(
-                    group.id.clone(),
-                    (0..=MAX_GROUP_MEMBERS)
-                        .map(|index| format!("+15555050{index:03}"))
-                        .collect(),
-                ),
-                SignalCliMode::Jvm,
-            )
+            .prepare_groups_revoke_invites(&params(
+                group.id.clone(),
+                (0..=MAX_GROUP_MEMBERS)
+                    .map(|index| format!("+15555050{index:03}"))
+                    .collect(),
+            ))
             .unwrap_err();
         assert!(matches!(oversized, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
-        // The kt-engine face: the honest capability gap after local
+        // The valid call: the honest capability gap after local
         // validation (CAPABILITY_UNAVAILABLE, retryable=false).
-        let engine_mode = service
-            .prepare_groups_revoke_invites(
-                &params(group.id.clone(), vec!["+15555550101".into()]),
-                SignalCliMode::KtEngine,
-            )
+        let valid = service
+            .prepare_groups_revoke_invites(&params(group.id.clone(), vec!["+15555550101".into()]))
             .unwrap_err();
         assert!(
-            matches!(engine_mode, ServiceError::Api(ref api) if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable),
-            "the engine debt answers the capability gap: {engine_mode:?}"
-        );
-        // The engine gate sits after local validation: a shape violation
-        // still answers INVALID_REQUEST on the engine face.
-        let engine_mode_shape = service
-            .prepare_groups_revoke_invites(
-                &params(group.id.clone(), vec![]),
-                SignalCliMode::KtEngine,
-            )
-            .unwrap_err();
-        assert!(
-            matches!(engine_mode_shape, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST")
+            matches!(valid, ServiceError::Api(ref api) if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable),
+            "the engine debt answers the capability gap: {valid:?}"
         );
     }
 

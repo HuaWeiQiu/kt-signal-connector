@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::store::{MessageRecord, Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -53,9 +53,8 @@ fn seed_engine_registry(data_dir: &Path) {
     .unwrap();
 }
 
-fn cloud_upload_config(fixture: &Path, data_dir: &Path, mode: SignalCliMode) -> SignalCliConfig {
+fn cloud_upload_config(fixture: &Path, data_dir: &Path) -> SignalCliConfig {
     let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
-    config.mode = mode;
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     config
@@ -64,7 +63,6 @@ fn cloud_upload_config(fixture: &Path, data_dir: &Path, mode: SignalCliMode) -> 
 fn cloud_upload_supervisor(
     temp: &TempDir,
     data_dir: &Path,
-    mode: SignalCliMode,
 ) -> (Arc<Store>, Arc<RuntimeSupervisor>, String) {
     seed_engine_registry(data_dir);
     let store = test_store(temp.path());
@@ -76,7 +74,7 @@ fn cloud_upload_supervisor(
         )
         .unwrap();
     let supervisor = Arc::new(RuntimeSupervisor::new(
-        cloud_upload_config(&fixture(), data_dir, mode),
+        cloud_upload_config(&fixture(), data_dir),
         Arc::clone(&store),
         kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
         None,
@@ -148,8 +146,7 @@ fn artifact_path(data_dir: &Path) -> PathBuf {
 async fn cloud_upload_start_builds_artifact_and_accepts() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (store, supervisor, account_id) =
-        cloud_upload_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (store, supervisor, account_id) = cloud_upload_supervisor(&temp, &data_dir);
     seed_direct_history(&store, &account_id);
     supervisor.start().await.unwrap();
 
@@ -181,8 +178,7 @@ async fn cloud_upload_start_builds_artifact_and_accepts() {
 async fn cloud_upload_start_and_eight_family_error_ladder() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (store, supervisor, account_id) =
-        cloud_upload_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (store, supervisor, account_id) = cloud_upload_supervisor(&temp, &data_dir);
     seed_direct_history(&store, &account_id);
     supervisor.start().await.unwrap();
     let error_marker = data_dir.join(".fixture-cloud-upload-error");
@@ -259,8 +255,7 @@ async fn cloud_upload_start_and_eight_family_error_ladder() {
 async fn cloud_upload_status_mirrors_the_negotiated_states() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        cloud_upload_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = cloud_upload_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
     let status_marker = data_dir.join(".fixture-cloud-upload-status");
 
@@ -315,44 +310,17 @@ async fn cloud_upload_status_mirrors_the_negotiated_states() {
     assert_eq!(cleared, json!({ "present": false }));
 }
 
-/// The connector's own gates: the JVM/native mode seam answers
-/// CAPABILITY_UNAVAILABLE on both faces (the upload faces are kt-engine
-/// KT extensions, the §4.69 ladder mirrored), an unknown account answers
-/// ACCOUNT_NOT_FOUND before the seam, and a non-opaque accountId fails
-/// INVALID_REQUEST — all before any engine traffic, so no engine starts.
+/// The connector's own gates: an unknown account answers
+/// ACCOUNT_NOT_FOUND before any engine traffic, and a non-opaque accountId
+/// fails INVALID_REQUEST — validation precedes resolution, and no engine
+/// starts.
 #[tokio::test]
-async fn cloud_upload_gates_mode_account_and_params() {
-    let jvm = TempDir::new().unwrap();
-    let (_store, jvm_supervisor, jvm_account_id) =
-        cloud_upload_supervisor(&jvm, &jvm.path().join("signal-data"), SignalCliMode::Jvm);
-
-    let error = jvm_supervisor
-        .upload_to_cloud(&jvm_account_id)
-        .await
-        .err()
-        .unwrap()
-        .into_api();
-    assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-    assert!(!error.retryable);
-
-    let error = jvm_supervisor
-        .cloud_upload_status(&jvm_account_id)
-        .await
-        .err()
-        .unwrap()
-        .into_api();
-    assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-    assert!(!error.retryable);
-
+async fn cloud_upload_gates_account_and_params() {
     let engine = TempDir::new().unwrap();
-    let (_store, engine_supervisor, _account_id) = cloud_upload_supervisor(
-        &engine,
-        &engine.path().join("signal-data"),
-        SignalCliMode::KtEngine,
-    );
+    let (_store, engine_supervisor, _account_id) =
+        cloud_upload_supervisor(&engine, &engine.path().join("signal-data"));
 
-    // The kt-engine face still resolves the account first: an unknown
-    // account answers the account face, not the capability face.
+    // An unknown account answers the account face before any engine call.
     let error = engine_supervisor
         .upload_to_cloud("kt-acct-missing")
         .await

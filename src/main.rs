@@ -7,7 +7,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use kt_signal_connector::auth::{load_bootstrap_payload, load_bootstrap_payload_from_reader};
 use kt_signal_connector::datalock;
-use kt_signal_connector::engine::{SignalCliMode, SocksProxy};
+use kt_signal_connector::engine::SocksProxy;
 use kt_signal_connector::groups;
 use kt_signal_connector::host::serve;
 use kt_signal_connector::ipc::LocalListener;
@@ -51,43 +51,16 @@ enum CliCommand {
         bootstrap_secret_stdin: bool,
         #[arg(long)]
         parent_pid: Option<u32>,
+        /// Path to the kt engine executable — the connector's signal sidecar
+        /// speaking the pinned JSON-RPC face (ADR 0003: the only engine).
         #[arg(long)]
         signal_cli: PathBuf,
-        /// The signal-cli executable is a GraalVM native binary, not the JVM
-        /// launcher script (env: KT_SIGNAL_CLI_NATIVE=1, the form Desktop
-        /// uses). Native mode skips JAVA_HOME validation and JAVA_OPTS
-        /// injection and passes a configured SOCKS proxy as `-D` argv
-        /// properties instead.
-        #[arg(
-            long,
-            env = "KT_SIGNAL_CLI_NATIVE",
-            num_args = 0..=1,
-            default_value_t = false,
-            default_missing_value = "true",
-            value_parser = clap::builder::BoolishValueParser::new(),
-        )]
-        signal_cli_native: bool,
-        /// Engine kind to launch (env: KT_SIGNAL_CLI_ENGINE): `jvm` (the
-        /// signal-cli launcher script, default), `native` (GraalVM single
-        /// binary; equivalent to --signal-cli-native), or `kt-engine` (KT's
-        /// own sidecar; `--signal-cli` then points at the engine executable).
-        /// Explicit selection only — packaging controls what it ships.
-        /// Conflicts with --signal-cli-native. SOCKS proxy parity holds via
-        /// the KT_SIGNAL_SOCKS_PROXY environment; --media-ingest is
-        /// downgraded to CAPABILITY_UNAVAILABLE in kt-engine mode (plan §5).
-        #[arg(
-            long,
-            env = "KT_SIGNAL_CLI_ENGINE",
-            value_enum,
-            conflicts_with = "signal_cli_native"
-        )]
-        signal_cli_engine: Option<SignalCliMode>,
         #[arg(long)]
         java_home: Option<PathBuf>,
-        /// SOCKS proxy for the signal-cli child as host:port (env:
+        /// SOCKS proxy for the engine child as host:port (env:
         /// KT_SIGNAL_SOCKS_PROXY, preferred so it stays off the connector
-        /// command line). JVM mode forwards it via JAVA_OPTS; native mode
-        /// passes it to the child as `-D` argv properties.
+        /// command line). The connector passes it to the child as `-D` argv
+        /// properties.
         #[arg(long, env = "KT_SIGNAL_SOCKS_PROXY", value_name = "HOST:PORT")]
         socks_proxy: Option<SocksProxy>,
         /// Additional proxy group as ID=HOST:PORT; may be repeated (env:
@@ -95,11 +68,11 @@ enum CliCommand {
         /// `default` group keeps this legacy SOCKS proxy and data directory.
         #[arg(long = "proxy-group", value_name = "ID=HOST:PORT")]
         proxy_group: Vec<String>,
-        /// Media ingest opt-in (ADR 0002): the spawned signal-cli keeps
-        /// inbound attachment downloads (no `--ignore-attachments`) under
-        /// the connector's bounded media governor and chunked handle delivery.
-        /// Without the flag the engine spawns byte-identical to the pre-PoC
-        /// launcher and every media method answers CAPABILITY_UNAVAILABLE.
+        /// Media ingest opt-in (ADR 0002, downgraded per plan §5): the kt
+        /// engine has no attachment ingest, so arming the flag keeps the
+        /// wire contract but downgrades to the pre-1.17 shape —
+        /// `--ignore-attachments` stays on the argv and every media method
+        /// answers CAPABILITY_UNAVAILABLE.
         #[arg(long, default_value_t = false)]
         media_ingest: bool,
         /// Disappearing-message sweep cadence in ms (env:
@@ -133,18 +106,10 @@ enum PackageCommand {
         bundle_id: String,
         #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
         connector_version: String,
-        #[arg(long, default_value = "0.14.7")]
-        signal_cli_version: String,
-        #[arg(long, default_value = "25")]
-        jre_version: String,
         #[arg(long)]
         platform: Option<String>,
         #[arg(long, default_value = "bin/kt-signal-connector")]
         connector_path: String,
-        #[arg(long, default_value = "bin/signal-cli")]
-        signal_cli_path: String,
-        #[arg(long, default_value = "jre/release")]
-        jre_path: String,
         #[arg(long)]
         source_archive_path: Option<String>,
         #[arg(long = "license", value_name = "COMPONENT:SPDX:PATH")]
@@ -232,8 +197,6 @@ struct ServeOptions {
     bootstrap_secret_stdin: bool,
     parent_pid: Option<u32>,
     signal_cli: PathBuf,
-    signal_cli_native: bool,
-    signal_cli_engine: Option<SignalCliMode>,
     java_home: Option<PathBuf>,
     socks_proxy: Option<SocksProxy>,
     proxy_group: Vec<String>,
@@ -269,8 +232,6 @@ async fn main() {
             bootstrap_secret_stdin,
             parent_pid,
             signal_cli,
-            signal_cli_native,
-            signal_cli_engine,
             java_home,
             socks_proxy,
             proxy_group,
@@ -284,8 +245,6 @@ async fn main() {
             bootstrap_secret_stdin,
             parent_pid,
             signal_cli,
-            signal_cli_native,
-            signal_cli_engine,
             java_home,
             socks_proxy,
             proxy_group,
@@ -313,8 +272,6 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         bootstrap_secret_stdin,
         parent_pid,
         signal_cli,
-        signal_cli_native,
-        signal_cli_engine,
         java_home,
         socks_proxy,
         proxy_group,
@@ -334,14 +291,8 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     // launch without leaking any endpoint into diagnostics (ADR 0001 R10).
     // Flag entries come first in launcher order, then environment entries;
     // duplicates across the two sources are rejected rather than merged.
-    // The engine kind resolves from the explicit flag (or the legacy native
-    // flag) before launch configuration is built; capability shaping for
-    // kt-engine (the media-ingest downgrade) happens in `open_group_runtime`.
-    let signal_cli_mode = match signal_cli_engine {
-        Some(mode) => mode,
-        None if signal_cli_native => SignalCliMode::Native,
-        None => SignalCliMode::Jvm,
-    };
+    // Capability shaping for the kt engine (the media-ingest downgrade and
+    // the ignored --java-home) happens in `open_group_runtime`.
     let env_spec = std::env::var("KT_SIGNAL_PROXY_GROUPS").ok();
     let plan = groups::build_group_plan(
         &proxy_group,
@@ -393,7 +344,6 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         &state_dir,
         java_home,
         store_key,
-        signal_cli_mode,
         media_ingest,
         Duration::from_millis(expire_sweep_interval_ms),
     )?;
@@ -417,12 +367,8 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
             bundle_dir,
             bundle_id,
             connector_version,
-            signal_cli_version,
-            jre_version,
             platform,
             connector_path,
-            signal_cli_path,
-            jre_path,
             source_archive_path,
             licenses,
             output,
@@ -431,11 +377,7 @@ fn package_command(command: PackageCommand) -> Result<(), String> {
                 &bundle_dir,
                 bundle_id,
                 connector_version,
-                signal_cli_version,
-                jre_version,
                 &connector_path,
-                &signal_cli_path,
-                &jre_path,
             )
             .map_err(|error| error.to_string())?;
             if let Some(platform) = platform {

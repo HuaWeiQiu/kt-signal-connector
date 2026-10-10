@@ -67,57 +67,17 @@ const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_RECEIVE_ID_CHARS: usize = 128;
 const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
-const SIGNAL_CLI_JAVA_OPTS: &str = "-Xms16m -Xmx384m";
-
-/// How the configured engine executable is launched. Selected explicitly by
-/// the trusted launcher (`serve --signal-cli-engine` / `KT_SIGNAL_CLI_ENGINE`,
-/// or the legacy `--signal-cli-native` flag); never probed from the file.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
-pub enum SignalCliMode {
-    /// The upstream launcher script: a JVM is started and the heap budget and
-    /// SOCKS proxy reach it through the `JAVA_OPTS` environment variable.
-    #[default]
-    Jvm,
-    /// A GraalVM native-image single-file binary (Phase 5): spawned directly
-    /// with identical CLI arguments. There is no JVM, so `JAVA_HOME` is not
-    /// validated or forwarded and no `JAVA_OPTS` are injected; a configured
-    /// SOCKS proxy is passed as leading `-DsocksProxyHost/-DsocksProxyPort`
-    /// argv entries, which the native-image launcher applies as runtime
-    /// system properties (verified against signal-cli 0.14.7 native on
-    /// 2026-08-26: the binary spoke SOCKS5 to a local relay and completed a
-    /// staging provisioning round-trip through it). Note this necessarily
-    /// puts proxy host:port on the child command line; the JVM mode keeps it
-    /// in the environment.
-    Native,
-    /// KT's own `kt-signal-engine` sidecar (separate AGPL-3.0 repository):
-    /// spawned directly with the same argv tail, but the `-D` SOCKS prepend
-    /// is never emitted because the engine's argv parser is fail-closed on
-    /// unknown arguments. Proxy parity holds at the environment level: the
-    /// engine consumes the same `KT_SIGNAL_SOCKS_PROXY` variable this
-    /// process injects (it maps it onto reqwest's `ALL_PROXY`, which covers
-    /// the libsignal-service HTTP and WebSocket transport). Media ingest is
-    /// NOT rejected in this mode: it is downgraded (implementation plan §5) —
-    /// the engine cannot download attachments yet, so a launcher that arms
-    /// ingest gets the pre-1.17 shape instead (`--ignore-attachments` on the
-    /// argv, no media governor) rather than a failed launch, and every media
-    /// method answers CAPABILITY_UNAVAILABLE. `JAVA_HOME` is ignored
-    /// with a warning, like native mode.
-    KtEngine,
-}
 
 #[derive(Clone, Debug)]
 pub struct SignalCliConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
-    pub mode: SignalCliMode,
-    pub java_home: Option<PathBuf>,
-    pub proxy: Option<SocksProxy>,
-    /// Media ingest opt-in (ADR 0002): when false the engine spawns with
-    /// `--ignore-attachments` exactly as before Phase 1.17 and every media
-    /// method answers `CAPABILITY_UNAVAILABLE`; when true the flag is dropped
-    /// so signal-cli downloads inbound attachments into its data directory,
-    /// under the connector's media governor (bounded TTL + quota retention)
-    /// and chunked handle delivery. Launcher input only — never IPC input.
+    /// Media ingest opt-in (ADR 0002). Launcher input only — never IPC
+    /// input. The registry downgrades every opt-in to `false` (§5): the
+    /// engine has no attachment download yet, so an armed ingest keeps
+    /// `--ignore-attachments` on the argv, skips the media governor, and
+    /// every media method answers `CAPABILITY_UNAVAILABLE` instead of
+    /// failing the launch (the dev desktop arms ingest unconditionally).
     pub media_ingest: bool,
     pub line_limit: usize,
     pub request_timeout: Duration,
@@ -145,9 +105,6 @@ impl SignalCliConfig {
         Self {
             executable,
             data_dir,
-            mode: SignalCliMode::Jvm,
-            java_home: None,
-            proxy: None,
             media_ingest: false,
             line_limit: DEFAULT_UPSTREAM_LINE_LIMIT,
             history_cdn_base: None,
@@ -162,12 +119,14 @@ impl SignalCliConfig {
     }
 }
 
-/// Optional SOCKS proxy for the signal-cli child. signal-cli does not read OS
-/// proxy settings in either mode: in JVM mode the proxy is injected into the
-/// launcher via `-DsocksProxyHost/-DsocksProxyPort` inside `JAVA_OPTS`; in
-/// native mode the same properties are passed as leading argv entries, which
-/// the GraalVM native-image launcher applies at runtime (see
-/// [`SignalCliMode::Native`]).
+/// Optional SOCKS proxy for the engine child (the trusted launcher's
+/// per-group plan input, ADR 0001). Proxy parity with the engine holds at
+/// the environment level: the engine consumes the same
+/// `KT_SIGNAL_SOCKS_PROXY` variable this process inherited (it maps it onto
+/// reqwest's `ALL_PROXY`, which covers the libsignal-service HTTP and
+/// WebSocket transport); nothing proxy-shaped is ever placed on the child
+/// command line (the engine's argv parser is fail-closed on unknown
+/// arguments).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SocksProxy {
     pub host: String,
@@ -176,8 +135,7 @@ pub struct SocksProxy {
 
 impl SocksProxy {
     /// Parse `host:port`. The host must be non-empty, at most 253 bytes, and
-    /// free of whitespace and ':' (no IPv6 literals — JAVA_OPTS is
-    /// whitespace-split by the signal-cli launcher script); the port must be
+    /// free of whitespace and ':' (no IPv6 literals); the port must be
     /// 1-65535.
     pub fn parse(value: &str) -> Result<Self, String> {
         let (host, port) = value
@@ -212,52 +170,23 @@ impl std::str::FromStr for SocksProxy {
     }
 }
 
-/// JAVA_OPTS passed to the signal-cli launcher: the documented heap budget
-/// plus the SOCKS proxy flags when a proxy is configured. JVM mode only.
-fn java_opts(proxy: Option<&SocksProxy>) -> String {
-    match proxy {
-        Some(proxy) => format!(
-            "{SIGNAL_CLI_JAVA_OPTS} -DsocksProxyHost={} -DsocksProxyPort={}",
-            proxy.host, proxy.port
-        ),
-        None => SIGNAL_CLI_JAVA_OPTS.to_string(),
-    }
-}
-
-/// signal-cli CLI arguments, identical in every mode except that native mode
-/// prepends the SOCKS proxy as runtime system properties for the GraalVM
-/// native-image launcher. The launcher consumes `-D` entries anywhere on the
-/// command line before the app parses its own arguments; leading position is
-/// convention, not requirement. `media_ingest` (ADR 0002) only decides
-/// whether `--ignore-attachments` is present: with it the rest of the argv —
+/// Engine CLI arguments. `media_ingest` (ADR 0002) only decides whether
+/// `--ignore-attachments` is present: with it the rest of the argv —
 /// including `--ignore-stories` and `--ignore-stickers` — is unchanged, and
 /// without it the argv is byte-identical to the pre-media-POC launcher.
-/// `KtEngine` never receives the `-D` prepend (its argv parser is fail-closed
-/// on unknown arguments); the launcher-level validation rejects a configured
-/// proxy in that mode before any engine is built.
-fn signal_cli_args(
-    mode: SignalCliMode,
-    proxy: Option<&SocksProxy>,
-    data_dir: &Path,
-    media_ingest: bool,
-) -> Vec<std::ffi::OsString> {
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
-    if mode == SignalCliMode::Native
-        && let Some(proxy) = proxy
-    {
-        args.push(format!("-DsocksProxyHost={}", proxy.host).into());
-        args.push(format!("-DsocksProxyPort={}", proxy.port).into());
-    }
-    args.push("--data-dir".into());
-    args.push(data_dir.as_os_str().into());
-    args.push("jsonRpc".into());
+fn signal_cli_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsString> {
     // Explicit: pull server messages as soon as the daemon is up.
-    args.push("--receive-mode".into());
-    args.push("on-start".into());
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--data-dir".into(),
+        data_dir.as_os_str().into(),
+        "jsonRpc".into(),
+        "--receive-mode".into(),
+        "on-start".into(),
+    ];
     // ADR 0002: dropping --ignore-attachments is the entire media opt-in —
-    // signal-cli then downloads inbound attachments into its data directory,
+    // the engine then downloads inbound attachments into its data directory,
     // where the connector's media governor bounds retention. Stories and
-    // stickers stay ignored in every mode; they are not part of the media
+    // stickers stay ignored in every shape; they are not part of the media
     // PoC and would add unbounded surface.
     if !media_ingest {
         args.push("--ignore-attachments".into());
@@ -1166,22 +1095,11 @@ impl EngineHandle {
         if !config.executable.is_absolute()
             || !std::fs::symlink_metadata(&config.executable)
                 .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-            || (config.mode == SignalCliMode::Jvm
-                && config.java_home.as_ref().is_some_and(|java_home| {
-                    !java_home.is_absolute()
-                        || !std::fs::symlink_metadata(java_home).is_ok_and(|metadata| {
-                            metadata.is_dir() && !metadata.file_type().is_symlink()
-                        })
-                        || !java_home.join("release").is_file()
-                }))
             || config.resource_sample_interval < Duration::from_secs(1)
         {
             return Err(EngineError::StartFailed);
         }
         prepare_data_dir(&config.data_dir).map_err(|_| EngineError::StartFailed)?;
-        if !matches!(config.mode, SignalCliMode::Jvm) && config.java_home.is_some() {
-            tracing::warn!("the selected engine mode ignores the configured JAVA_HOME");
-        }
 
         let mut command = Command::new(&config.executable);
         // The engine's stdout is an owned blocking pipe, not tokio's piped
@@ -1193,12 +1111,7 @@ impl EngineHandle {
         let (stdout_reader, stdout_writer) =
             std::io::pipe().map_err(|_| EngineError::StartFailed)?;
         command
-            .args(signal_cli_args(
-                config.mode,
-                config.proxy.as_ref(),
-                &config.data_dir,
-                config.media_ingest,
-            ))
+            .args(signal_cli_args(&config.data_dir, config.media_ingest))
             .stdin(Stdio::piped())
             .stdout(stdout_writer)
             .stderr(Stdio::piped())
@@ -1206,20 +1119,6 @@ impl EngineHandle {
             // environment (Phase 3: keys travel the bootstrap channel only).
             .env_remove(crate::store::STORE_KEY_ENV)
             .kill_on_drop(true);
-        if config.mode == SignalCliMode::Jvm {
-            // Keep the documented text-runtime heap budget authoritative. Java's global
-            // injection variables are removed so a parent shell cannot silently defeat it.
-            // A configured SOCKS proxy is injected here because signal-cli does not read
-            // OS proxy settings; watchdog restarts reuse the same config unchanged.
-            command
-                .env("JAVA_OPTS", java_opts(config.proxy.as_ref()))
-                .env_remove("JAVA_TOOL_OPTIONS")
-                .env_remove("_JAVA_OPTIONS")
-                .env_remove("JDK_JAVA_OPTIONS");
-            if let Some(java_home) = &config.java_home {
-                command.env("JAVA_HOME", java_home);
-            }
-        }
         let mut child = command.spawn().map_err(|_| EngineError::StartFailed)?;
 
         let pid = child.id().ok_or(EngineError::StartFailed)?;
@@ -3694,36 +3593,13 @@ mod tests {
     }
 
     #[test]
-    fn java_opts_only_carry_proxy_flags_when_configured() {
-        assert_eq!(java_opts(None), "-Xms16m -Xmx384m");
-        let proxy = SocksProxy {
-            host: "127.0.0.1".into(),
-            port: 1080,
-        };
-        assert_eq!(
-            java_opts(Some(&proxy)),
-            "-Xms16m -Xmx384m -DsocksProxyHost=127.0.0.1 -DsocksProxyPort=1080"
-        );
-    }
-
-    #[test]
-    fn config_defaults_to_direct_connection() {
+    fn config_defaults_to_opt_out_media_ingest() {
         let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
-        assert_eq!(config.proxy, None);
+        assert!(!config.media_ingest);
     }
 
     #[test]
-    fn config_defaults_to_jvm_mode() {
-        let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
-        assert_eq!(config.mode, SignalCliMode::Jvm);
-    }
-
-    #[test]
-    fn signal_cli_args_match_the_jvm_launcher_shape() {
-        let proxy = SocksProxy {
-            host: "127.0.0.1".into(),
-            port: 1080,
-        };
+    fn signal_cli_args_match_the_launcher_shape() {
         let expected: Vec<std::ffi::OsString> = [
             "--data-dir",
             "/data",
@@ -3737,15 +3613,7 @@ mod tests {
         .into_iter()
         .map(Into::into)
         .collect();
-        // JVM mode: proxy travels in JAVA_OPTS, never on the command line.
-        assert_eq!(
-            signal_cli_args(SignalCliMode::Jvm, Some(&proxy), Path::new("/data"), false),
-            expected
-        );
-        assert_eq!(
-            signal_cli_args(SignalCliMode::Native, None, Path::new("/data"), false),
-            expected
-        );
+        assert_eq!(signal_cli_args(Path::new("/data"), false), expected);
     }
 
     /// Media opt-in (ADR 0002 gate 5): enabling `--media-ingest` changes the
@@ -3753,8 +3621,8 @@ mod tests {
     /// stories and stickers stay ignored and every other byte is unchanged.
     #[test]
     fn media_ingest_only_drops_ignore_attachments_from_the_argv() {
-        let baseline = signal_cli_args(SignalCliMode::Jvm, None, Path::new("/data"), false);
-        let media = signal_cli_args(SignalCliMode::Jvm, None, Path::new("/data"), true);
+        let baseline = signal_cli_args(Path::new("/data"), false);
+        let media = signal_cli_args(Path::new("/data"), true);
         let dropped: Vec<_> = baseline
             .iter()
             .filter(|arg| !media.contains(arg))
@@ -3778,67 +3646,6 @@ mod tests {
         // The config default stays opt-out.
         let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
         assert!(!config.media_ingest);
-    }
-
-    #[test]
-    fn native_mode_prepends_socks_proxy_properties_to_args() {
-        let proxy = SocksProxy {
-            host: "127.0.0.1".into(),
-            port: 1080,
-        };
-        let args = signal_cli_args(
-            SignalCliMode::Native,
-            Some(&proxy),
-            Path::new("/data"),
-            false,
-        );
-        assert_eq!(
-            args[..2],
-            [
-                std::ffi::OsString::from("-DsocksProxyHost=127.0.0.1"),
-                std::ffi::OsString::from("-DsocksProxyPort=1080"),
-            ]
-        );
-        assert_eq!(args[2], "--data-dir");
-    }
-
-    /// kt-engine mode (implementation plan §5): the engine's argv parser is
-    /// fail-closed on unknown arguments, so the `-D` SOCKS prepend of native
-    /// mode is never emitted — even if a proxy somehow reaches this function,
-    /// the tail stays byte-identical to the signal-cli launcher shape. The
-    /// launcher-level validation is what rejects the combination outright.
-    #[test]
-    fn kt_engine_mode_never_prepends_socks_properties_to_args() {
-        let proxy = SocksProxy {
-            host: "127.0.0.1".into(),
-            port: 1080,
-        };
-        let expected: Vec<std::ffi::OsString> = [
-            "--data-dir",
-            "/data",
-            "jsonRpc",
-            "--receive-mode",
-            "on-start",
-            "--ignore-attachments",
-            "--ignore-stories",
-            "--ignore-stickers",
-        ]
-        .into_iter()
-        .map(Into::into)
-        .collect();
-        assert_eq!(
-            signal_cli_args(
-                SignalCliMode::KtEngine,
-                Some(&proxy),
-                Path::new("/data"),
-                false
-            ),
-            expected
-        );
-        assert_eq!(
-            signal_cli_args(SignalCliMode::KtEngine, None, Path::new("/data"), false),
-            expected
-        );
     }
 
     #[test]

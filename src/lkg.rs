@@ -344,19 +344,9 @@ mod tests {
     fn write_bundle(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("connector.bin"), b"connector-v1").unwrap();
-        fs::write(dir.join("signal-cli.bin"), b"signal-v1").unwrap();
-        fs::write(dir.join("jre.bin"), b"jre-v1").unwrap();
-        let manifest = build_local_unsigned_manifest(
-            dir,
-            "bundle-1".into(),
-            "0.1.0".into(),
-            "0.14.7".into(),
-            "25".into(),
-            "connector.bin",
-            "signal-cli.bin",
-            "jre.bin",
-        )
-        .unwrap();
+        let manifest =
+            build_local_unsigned_manifest(dir, "bundle-1".into(), "0.1.0".into(), "connector.bin")
+                .unwrap();
         manifest.save(&dir.join("manifest.json")).unwrap();
     }
 
@@ -373,11 +363,7 @@ mod tests {
             &bundle_b,
             "bundle-2".into(),
             "0.1.1".into(),
-            "0.14.7".into(),
-            "25".into(),
             "connector.bin",
-            "signal-cli.bin",
-            "jre.bin",
         )
         .unwrap();
         manifest.save(&bundle_b.join("manifest.json")).unwrap();
@@ -426,11 +412,7 @@ mod tests {
             &bundle_b,
             "bundle-2".into(),
             "0.1.1".into(),
-            "0.14.7".into(),
-            "25".into(),
             "connector.bin",
-            "signal-cli.bin",
-            "jre.bin",
         )
         .unwrap();
         manifest.save(&bundle_b.join("manifest.json")).unwrap();

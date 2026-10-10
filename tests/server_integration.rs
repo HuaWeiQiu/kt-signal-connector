@@ -2027,58 +2027,7 @@ async fn conversation_summary_and_reactions_carry_author_metadata() {
 }
 
 #[tokio::test]
-async fn socks_proxy_env_is_forwarded_to_the_jvm() {
-    let temp = TempDir::new().unwrap();
-    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let endpoint = temp.path().join("connector.sock");
-    let secret_file = temp.path().join("bootstrap.secret");
-    let secret = [13_u8; 32];
-    write_secret_file(&secret_file, &secret);
-
-    // The fixture exits 91 immediately unless JAVA_OPTS carries exactly the
-    // heap budget plus the SOCKS proxy flags.
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
-    command
-        .arg("serve")
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .arg("--bootstrap-secret-file")
-        .arg(&secret_file)
-        .arg("--signal-cli")
-        .arg(fixture())
-        .arg("--signal-data-dir")
-        .arg(temp.path().join("signal-data"))
-        .arg("--state-dir")
-        .arg(temp.path().join("state"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .env("KT_SIGNAL_SOCKS_PROXY", "127.0.0.1:11080")
-        .env(
-            "KT_FAKE_EXPECT_JAVA_OPTS",
-            "-Xms16m -Xmx384m -DsocksProxyHost=127.0.0.1 -DsocksProxyPort=11080",
-        );
-    let mut connector = command.spawn().unwrap();
-    wait_for_path(&endpoint).await;
-    let stream = UnixStream::connect(&endpoint).await.unwrap();
-    let mut client = Framed::new(stream, LinesCodec::new());
-    authenticate(&mut client, &secret).await;
-
-    let started = request(&mut client, "start", "runtime.start", json!({})).await;
-    assert_eq!(started["result"]["state"], "running");
-    // A proxy-flag mismatch kills the fixture at JVM launch; a live answer
-    // after a settle delay proves the exact JAVA_OPTS reached the child.
-    sleep(Duration::from_millis(200)).await;
-    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
-    assert!(accounts.get("result").is_some());
-
-    drop(client);
-    assert_clean_exit(&mut connector).await;
-}
-
-#[tokio::test]
-async fn native_mode_serves_without_a_jvm_environment() {
+async fn serve_ignores_java_home_and_never_leaks_java_env() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let endpoint = temp.path().join("connector.sock");
@@ -2086,12 +2035,14 @@ async fn native_mode_serves_without_a_jvm_environment() {
     let secret = [14_u8; 32];
     write_secret_file(&secret_file, &secret);
 
-    // Native mode via the environment variable (the form Desktop uses), with
-    // a JAVA_HOME that JVM mode would reject: it must be ignored entirely.
-    // A SOCKS proxy stays configured to prove native+proxy starts; the proxy
-    // reaches a real native binary as `-D` argv properties (the fixture
-    // ignores argv; the argv shape is unit-tested in engine.rs). The fixture
-    // exits 94 immediately if JAVA_OPTS or JAVA_HOME leak into its env.
+    // The launcher-compat `--java-home` flag (Desktop still passes it) points
+    // at a path serve no longer validates: serve must accept and
+    // ignore it. A SOCKS proxy stays configured to prove serve starts with
+    // one: the value is validated at launch, nothing proxy-shaped is placed
+    // on the child command line, and the engine child inherits the same
+    // `KT_SIGNAL_SOCKS_PROXY` environment (engine.rs pins the parse shape).
+    // The fixture exits 94 immediately if JAVA_OPTS or JAVA_HOME leak into
+    // its env.
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
     command
         .arg("serve")
@@ -2111,7 +2062,6 @@ async fn native_mode_serves_without_a_jvm_environment() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_SIGNAL_CLI_NATIVE", "1")
         .env("KT_SIGNAL_SOCKS_PROXY", "127.0.0.1:11080")
         .env("KT_FAKE_EXPECT_NO_JAVA", "1");
     let mut connector = command.spawn().unwrap();
@@ -2123,7 +2073,7 @@ async fn native_mode_serves_without_a_jvm_environment() {
     let started = request(&mut client, "start", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
     // A JAVA_* leak kills the fixture at spawn; a live answer after a settle
-    // delay proves the native spawn path serves requests without a JVM env.
+    // delay proves the serve path answers requests without a JVM env.
     sleep(Duration::from_millis(200)).await;
     let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
     assert!(accounts.get("result").is_some());
@@ -2132,15 +2082,15 @@ async fn native_mode_serves_without_a_jvm_environment() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// conversations.setExpireTimer end to end in kt-engine mode (2026-10-06
-/// group-timer batch; engine main @ 216a4c7): the group form no longer answers
-/// the recorded INVALID_REQUEST gate — it dispatches `updateGroup {account,
-/// groupId, expiration}` verbatim (SEND_LOG), the groupUpdated projection the
-/// engine emits after the change injects through the fixture and converges the
-/// mirror, and `conversation.changed` carries the new timer. Spawned via
-/// `KT_SIGNAL_CLI_ENGINE=kt-engine` with a JAVA_HOME that only Jvm mode
-/// validates: kt-engine ignores it with a warning, and the fixture's no-Java
-/// guard would exit 94 if either JAVA_* variable leaked into the child env.
+/// conversations.setExpireTimer end to end (2026-10-06 group-timer batch;
+/// engine main @ 216a4c7): the group form no longer answers the recorded
+/// INVALID_REQUEST gate — it dispatches `updateGroup {account, groupId,
+/// expiration}` verbatim (SEND_LOG), the groupUpdated projection the engine
+/// emits after the change injects through the fixture and converges the
+/// mirror, and `conversation.changed` carries the new timer. The
+/// launcher-compat `--java-home` points at a path serve does not
+/// validate: serve ignores it, and the fixture's no-Java guard would exit 94 if
+/// either JAVA_* variable leaked into the child env.
 #[tokio::test]
 async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
     let temp = TempDir::new().unwrap();
@@ -2169,7 +2119,6 @@ async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_SIGNAL_CLI_ENGINE", "kt-engine")
         .env("KT_FAKE_EXPECT_NO_JAVA", "1");
     let mut connector = command.spawn().unwrap();
     wait_for_path(&endpoint).await;
@@ -5290,12 +5239,12 @@ async fn sticker_pack_browse_and_pin_sync_round_trip() {
 
 /// conversations.setExpireTimer end to end (contract 1.42, §4.41; group
 /// route re-cut by contract 1.45, §4.44): the direct call lands on the
-/// signal-cli face's `updateContact` with the int-seconds `expiration`, the
-/// success mirrors the timer into the conversation and rides
-/// `conversation.changed`, the result carries the resolved value; a group
-/// conversation routes the same mirror through `updateGroup {account,
-/// groupId, expiration}`; an unknown conversation answers
-/// CONVERSATION_NOT_FOUND.
+/// engine face's `setExpirationTimer` with the seconds-keyed
+/// `expirationInSeconds`, the success mirrors the timer into the
+/// conversation and rides `conversation.changed`, the result carries the
+/// resolved value; a group conversation routes the same mirror through
+/// `updateGroup {account, groupId, expiration}`; an unknown conversation
+/// answers CONVERSATION_NOT_FOUND.
 #[tokio::test]
 async fn conversations_set_expire_timer_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -5407,8 +5356,9 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
         .clone();
     assert_eq!(row["expireTimerSeconds"], 86400);
 
-    // The exact upstream contract landed on the wire: int-seconds
-    // `expiration` with the single-string resolved recipient.
+    // The exact upstream contract landed on the wire: the engine face's
+    // seconds-keyed `expirationInSeconds` with the single-string resolved
+    // recipient.
     let send_log = fs::read_to_string(
         temp.path()
             .join("signal-data")
@@ -5418,11 +5368,11 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
     let timer_call: Value = send_log
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|params| params.get("expiration").is_some())
-        .expect("the timer call must reach updateContact");
+        .find(|params| params.get("expirationInSeconds").is_some())
+        .expect("the timer call must reach setExpirationTimer");
     assert_eq!(timer_call["account"], "+15555550100");
     assert_eq!(timer_call["recipient"], "+15555550102");
-    assert_eq!(timer_call["expiration"], 86400);
+    assert_eq!(timer_call["expirationInSeconds"], 86400);
 
     // A group conversation routes the timer change through the same
     // group-management write it always traveled by upstream (contract 1.45,
@@ -5542,15 +5492,14 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
 }
 
 /// groups.update / groups.quit end to end (contract 1.45, §4.44, capability
-/// group-management): the full change set lands on the upstream `updateGroup`
-/// keys verbatim (including the enabled-without-approval → "enabled" link
-/// mapping), the local refusal ladder answers before any upstream call, and
-/// the receive projection converges the group row — the bodyless UPDATE
-/// envelope lands as a system row carrying `isGroupUpdate` + the resulting
-/// title, and `conversation.changed` mirrors the new title. groups.quit
-/// dispatches `{account, groupId}`, a last-admin quit answers the upstream
-/// user error verbatim (UPSTREAM_ERROR), and the crash-with-in-flight-write
-/// path pins the SEND_OUTCOME_UNKNOWN answer and the no-retry discipline.
+/// group-management): the local refusal ladder answers before any upstream
+/// call, and a fully valid change set (and a quit) rides it into the honest
+/// engine-face refusal — CAPABILITY_UNAVAILABLE (retryable=false), nothing
+/// dispatched (the engine's updateGroup carries the expiration family only;
+/// the change-set/quit methods are engine-batch debt) — while the receive
+/// projection converges the group row independently of the send face: the
+/// bodyless UPDATE envelope lands as a system row carrying `isGroupUpdate` +
+/// the resulting title, and `conversation.changed` mirrors the new title.
 #[tokio::test]
 async fn groups_update_quit_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -5601,9 +5550,8 @@ async fn groups_update_quit_round_trip_and_guards() {
     )
     .await;
 
-    // The link sync materialized the fixture group; a staged envelope also
-    // creates the quit-fail group so the UPSTREAM_ERROR drill has a real
-    // local row to address.
+    // The link sync materialized the fixture group; staged envelopes refresh
+    // it (the UPDATE projection below) and materialize a second group row.
     let extra_receives = temp
         .path()
         .join("signal-data")
@@ -5741,10 +5689,10 @@ async fn groups_update_quit_round_trip_and_guards() {
 
     // Contract 1.89: the avatar tri-state. A malformed data URI answers the
     // shape ladder (INVALID_REQUEST); a well-formed one — and an explicit
-    // null — rides past it into the JVM/native byte-face refusal
-    // (CAPABILITY_UNAVAILABLE, retryable=false): the bound signal-cli takes
-    // a group avatar as a local file path, the connector writes no temporary
-    // files, and the call never reaches updateGroup.
+    // null — ride past it into the engine-face refusal
+    // (CAPABILITY_UNAVAILABLE, retryable=false): every change-set family is
+    // refused until the engine byte face arrives, and the call never reaches
+    // updateGroup.
     let bad_avatar = request(
         &mut client,
         "update-avatar-bad",
@@ -5779,10 +5727,10 @@ async fn groups_update_quit_round_trip_and_guards() {
         assert_eq!(refused["error"]["retryable"], false, "{request_id}");
     }
 
-    // The full change set: every family lands on its upstream key verbatim,
-    // the connector-facing names are the caller's, the upstream names are
-    // the wire's.
-    let updated = request(
+    // A fully valid change set still answers the honest refusal after local
+    // validation — nothing is dispatched and the send log gains no
+    // updateGroup entry.
+    let refused_update = request(
         &mut client,
         "update-all",
         "groups.update",
@@ -5808,33 +5756,22 @@ async fn groups_update_quit_round_trip_and_guards() {
         }),
     )
     .await;
-    assert_eq!(updated["result"]["status"], "sent");
+    assert_eq!(refused_update["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    assert_eq!(refused_update["error"]["retryable"], false);
     let send_log_path = temp
         .path()
         .join("signal-data")
         .join(".fixture-send-log.jsonl");
-    let update_call: Value = fs::read_to_string(&send_log_path)
+    let update_calls: Vec<Value> = fs::read_to_string(&send_log_path)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|params| params.get("name") == Some(&json!("Renamed Fixture")))
-        .expect("the full change set must reach updateGroup");
-    assert_eq!(update_call["account"], "+15555550100");
-    assert_eq!(update_call["groupId"], "ZmFrZS1ncm91cC0x");
-    assert_eq!(update_call["description"], "KT ops group");
-    assert_eq!(update_call["members"], json!(["+15555550102"]));
-    assert_eq!(update_call["removeMembers"], json!(["+15555550102"]));
-    assert_eq!(update_call["admins"], json!(["+15555550101"]));
-    assert_eq!(update_call["removeAdmins"], json!(["+15555550101"]));
-    assert_eq!(update_call["bans"], json!(["+15555550102"]));
-    assert_eq!(update_call["unbans"], json!(["+15555550102"]));
-    assert_eq!(update_call["link"], "enabled");
-    assert_eq!(update_call["resetLink"], true);
-    assert_eq!(update_call["setPermissionAddMember"], "only-admins");
-    assert_eq!(update_call["setPermissionEditDetails"], "every-member");
-    assert_eq!(update_call["setPermissionSendMessages"], "only-admins");
-    assert_eq!(update_call["memberLabel"], "KT");
-    assert_eq!(update_call["memberLabelEmoji"], "🛠️");
+        .filter(|params| params.get("name").is_some() && params.get("groupId").is_some())
+        .collect();
+    assert!(
+        update_calls.is_empty(),
+        "a refused group update never reaches the engine: {update_calls:?}"
+    );
 
     // Flush the staged envelopes through the typing hook (the receive burst
     // rides the request): the UPDATE envelope lands as a system row and the
@@ -5897,10 +5834,9 @@ async fn groups_update_quit_round_trip_and_guards() {
     assert_eq!(update_row["text"], "群聊信息已更新");
     assert_eq!(update_row["groupName"], "Renamed Fixture");
 
-    // groups.quit leaves the fixture group; the quit-fail group (its local
-    // row materialized by the staged timestamp-61 envelope) answers the
-    // upstream user error verbatim — the last-admin quit the connector
-    // forwards faithfully.
+    // groups.quit is the same honest refusal: local validation passes, the
+    // face answers CAPABILITY_UNAVAILABLE, and no quitGroup call is
+    // dispatched.
     let quit = request(
         &mut client,
         "quit-group",
@@ -5912,76 +5848,27 @@ async fn groups_update_quit_round_trip_and_guards() {
         }),
     )
     .await;
-    assert_eq!(quit["result"]["status"], "sent");
-    let quit_call: Value = fs::read_to_string(&send_log_path)
+    assert_eq!(quit["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    assert_eq!(quit["error"]["retryable"], false);
+    let quit_calls: Vec<Value> = fs::read_to_string(&send_log_path)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|params| params.get("groupId").is_some() && params.get("name").is_none())
-        .expect("the quit must reach quitGroup");
-    assert_eq!(quit_call["account"], "+15555550100");
-    assert_eq!(quit_call["groupId"], "ZmFrZS1ncm91cC0x");
-    let listed = request(
-        &mut client,
-        "list-for-quit-fail",
-        "conversations.list",
-        json!({ "accountId": account_id, "limit": 50 }),
-    )
-    .await;
-    let fail_group_conversation = listed["result"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["type"] == "group" && row["id"] != group_conversation)
-        .map(|row| row["id"].as_str().unwrap().to_string())
-        .expect("the staged envelope must materialize the quit-fail group");
-    let quit_upstream_error = request(
-        &mut client,
-        "quit-fail-group",
-        "groups.quit",
-        json!({
-            "accountId": account_id,
-            "conversationId": fail_group_conversation
-        }),
-    )
-    .await;
-    assert_eq!(quit_upstream_error["error"]["code"], "UPSTREAM_ERROR");
-    assert_eq!(quit_upstream_error["error"]["retryable"], true);
-
-    // Crash with the mutating update in flight (fixture magic group name,
-    // os._exit(25)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
-    // call in the recovered log.
-    let crash = request(
-        &mut client,
-        "update-crash",
-        "groups.update",
-        json!({
-            "accountId": account_id,
-            "conversationId": group_conversation,
-            "groupName": "[fixture-crash-group]"
-        }),
-    )
-    .await;
-    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN");
-    wait_for_process_exit(engine_pid).await;
-    let restarted = request(&mut client, "restart-group", "runtime.start", json!({})).await;
-    assert_eq!(restarted["result"]["state"], "running");
-    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
-    assert_ne!(recovered_pid, engine_pid);
-    let crash_calls: Vec<Value> = fs::read_to_string(&send_log_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|params| params.get("name") == Some(&json!("[fixture-crash-group]")))
+        .filter(|params| {
+            // The quitGroup upstream shape is {account, groupId} verbatim;
+            // the typing flush rows also carry `stop` and must not count.
+            params.get("name").is_none()
+                && params.get("stop").is_none()
+                && params.get("groupId").is_some()
+        })
         .collect();
-    assert_eq!(
-        crash_calls.len(),
-        1,
-        "an unknown group-update outcome is never retried: {crash_calls:?}"
+    assert!(
+        quit_calls.is_empty(),
+        "a refused quit never reaches the engine: {quit_calls:?}"
     );
 
     drop(client);
-    wait_for_process_exit(recovered_pid).await;
+    wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
 
@@ -7256,15 +7143,15 @@ async fn safety_number_faces_round_trip_and_gate_the_shape() {
 }
 
 /// Contract revision 1.59: the §4.55 username faces — accounts.setUsername
-/// (the updateAccount write with the upstream write-back projection, the
-/// InvalidUsernameException face via the -1 sentinel, the crash-with-
-/// in-flight-write unknown outcome with no retry), accounts.getUsername
-/// (the honest CAPABILITY_UNAVAILABLE read on the JVM/native faces; the
-/// kt-engine face opened with contract 1.74, §4.65), and
-/// username.lookup (the getUserStatus array projection entry-for-entry,
-/// including the unregistered face and the CDSI rate-limit sentinel).
+/// (the engine's two-hop usernameReserve→usernameConfirm write with the
+/// confirm write-back projection, the structured USERNAME_TAKEN sentinel,
+/// the crash-with-in-flight-write unknown outcome with no retry),
+/// accounts.getUsername (the engine reader opened with contract 1.74,
+/// §4.65), and username.lookup (the usernameLookup array projection
+/// entry-for-entry, including the unregistered face and the CDSI rate-limit
+/// sentinel).
 #[tokio::test]
-async fn username_faces_round_trip_and_gate_the_mode() {
+async fn username_faces_round_trip() {
     let temp = TempDir::new().unwrap();
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let endpoint = temp.path().join("connector.sock");
@@ -7306,9 +7193,10 @@ async fn username_faces_round_trip_and_gate_the_mode() {
             .collect()
     };
 
-    // setUsername round trip: the updateAccount payload rides the resolved
-    // signal account + username; the result projects the upstream write-back
-    // verbatim (username + the generated username link).
+    // setUsername round trip: the two-hop engine face — reserve carries the
+    // resolved account + candidate (no hash yet), confirm lands it with the
+    // reservation hash; the result projects the confirm write-back verbatim
+    // (username + the generated username link).
     let set = request(
         &mut client,
         "username-set",
@@ -7325,9 +7213,16 @@ async fn username_faces_round_trip_and_gate_the_mode() {
         .into_iter()
         .filter(|params| params.get("username").is_some())
         .collect();
-    assert_eq!(set_calls.len(), 1, "{set_calls:?}");
+    assert_eq!(set_calls.len(), 2, "{set_calls:?}");
     assert_eq!(set_calls[0]["account"], "+15555550100");
     assert_eq!(set_calls[0]["username"], "kt_test_agent.07");
+    assert!(set_calls[0].get("usernameHash").is_none());
+    assert_eq!(set_calls[1]["account"], "+15555550100");
+    assert_eq!(set_calls[1]["username"], "kt_test_agent.07");
+    assert_eq!(
+        set_calls[1]["usernameHash"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
 
     // The XOR ladder: both present and both absent answer INVALID_REQUEST
     // before any upstream call.
@@ -7358,13 +7253,13 @@ async fn username_faces_round_trip_and_gate_the_mode() {
                 |params| params.get("username").is_some() || params.get("deleteUsername").is_some()
             )
             .count(),
-        1,
+        2,
         "XOR refusals never dial upstream"
     );
 
-    // The taken-username sentinel rides the upstream -1 user error and
-    // degrades to plain UPSTREAM_ERROR (no new structured code); the
-    // sentinel value itself is grammar-legal so it reaches the upstream.
+    // The taken-username sentinel rides the engine's structured code —
+    // USERNAME_TAKEN, retryable=false — after the reserve hop; the confirm
+    // never fires.
     let taken = request(
         &mut client,
         "username-taken",
@@ -7372,7 +7267,8 @@ async fn username_faces_round_trip_and_gate_the_mode() {
         json!({ "accountId": account_id, "username": "fixture_username_taken.01" }),
     )
     .await;
-    assert_eq!(taken["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(taken["error"]["code"], "USERNAME_TAKEN");
+    assert_eq!(taken["error"]["retryable"], false);
 
     // Local grammar: a malformed username answers INVALID_REQUEST without
     // dialing upstream.
@@ -7389,12 +7285,12 @@ async fn username_faces_round_trip_and_gate_the_mode() {
             .iter()
             .filter(|params| params.get("username").is_some())
             .count(),
-        2,
+        3,
         "the grammar refusal stays local"
     );
 
-    // getUsername: the honest capability debt on the JVM/native faces (the
-    // kt-engine face routes the engine's getUsername reader since 1.74).
+    // getUsername: the engine reader projects the storage truth — after the
+    // set above both keys are present.
     let get = request(
         &mut client,
         "username-get",
@@ -7402,7 +7298,11 @@ async fn username_faces_round_trip_and_gate_the_mode() {
         json!({ "accountId": account_id }),
     )
     .await;
-    assert_eq!(get["error"]["code"], "CAPABILITY_UNAVAILABLE");
+    assert_eq!(get["result"]["username"], "fixture_user.01");
+    assert_eq!(
+        get["result"]["usernameLink"],
+        "https://signal.me/username/fixture-link"
+    );
     let missing = request(
         &mut client,
         "username-get-missing",
@@ -7481,7 +7381,11 @@ async fn username_faces_round_trip_and_gate_the_mode() {
         "an unknown username outcome is never retried"
     );
 
-    // The delete face: the bare upstream payload, an empty result body.
+    // The delete face: the bare usernameDelete {account} payload, an empty
+    // result body.
+    let single_account_frame =
+        |params: &&Value| params.get("account").is_some() && params.as_object().unwrap().len() == 1;
+    let singles_before = send_log().iter().filter(single_account_frame).count();
     let delete = request(
         &mut client,
         "username-delete",
@@ -7490,13 +7394,12 @@ async fn username_faces_round_trip_and_gate_the_mode() {
     )
     .await;
     assert_eq!(delete["result"], json!({}));
-    let delete_calls: Vec<Value> = send_log()
-        .into_iter()
-        .filter(|params| params.get("deleteUsername").is_some())
-        .collect();
-    assert_eq!(delete_calls.len(), 1, "{delete_calls:?}");
-    assert_eq!(delete_calls[0]["account"], "+15555550100");
-    assert_eq!(delete_calls[0]["deleteUsername"], true);
+    let singles_after = send_log().iter().filter(single_account_frame).count();
+    assert_eq!(
+        singles_after,
+        singles_before + 1,
+        "the delete hop dispatches usernameDelete {{account}}"
+    );
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
@@ -8679,9 +8582,6 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
 }
 
 async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 32]) -> Child {
-    let java_home = root.join("jre");
-    fs::create_dir_all(&java_home).unwrap();
-    fs::write(java_home.join("release"), b"JAVA_VERSION=\"test\"\n").unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
     let mut child = command
         .arg("serve")
@@ -8691,7 +8591,7 @@ async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 
         .arg("--signal-cli")
         .arg(fixture())
         .arg("--java-home")
-        .arg(&java_home)
+        .arg(root.join("jre"))
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
         .arg("--state-dir")
@@ -8700,8 +8600,7 @@ async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
-        .env("KT_FAKE_EXPECT_JAVA_HOME", &java_home)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1")
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
@@ -8747,7 +8646,7 @@ fn spawn_connector_with(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
-        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1")
         .env("JAVA_TOOL_OPTIONS", "poison")
         .env("_JAVA_OPTIONS", "poison")
         .env("JDK_JAVA_OPTIONS", "poison");
@@ -9673,7 +9572,6 @@ async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_SIGNAL_CLI_ENGINE", "kt-engine")
         .env("KT_FAKE_EXPECT_NO_JAVA", "1");
     let mut connector = command.spawn().unwrap();
     wait_for_path(&endpoint).await;
@@ -9927,7 +9825,6 @@ async fn cloud_upload_faces_round_trip_in_kt_engine_mode() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .env("KT_SIGNAL_CLI_ENGINE", "kt-engine")
         .env("KT_FAKE_EXPECT_NO_JAVA", "1");
     let mut connector = command.spawn().unwrap();
     wait_for_path(&endpoint).await;
@@ -10468,16 +10365,14 @@ async fn groups_terminate_round_trip_and_guards() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// Contract 1.58 (§4.53): the groups.approveJoinRequests round trip. The
-/// handshake advertises the method plus the `group-join-approve` capability;
-/// the fold narrows the caller's candidates to the engine's own
-/// requesting-members read before the write, so the exact upstream
-/// `updateGroup` member-family payload carries only requesting survivors;
-/// the fail-closed ladder (unknown conversation, direct addressing, shape
-/// violations, the fully-stale fold) answers before any upstream write; the
-/// upstream non-admin refusal forwards verbatim (UPSTREAM_ERROR); the
-/// crash-with-in-flight-write path pins the SEND_OUTCOME_UNKNOWN answer and
-/// the no-retry discipline across the engine restart.
+/// Contract 1.58 (§4.53): the groups.approveJoinRequests face. The handshake
+/// advertises the method plus the `group-join-approve` capability; the
+/// fail-closed ladder (unknown conversation, direct addressing, shape
+/// violations) answers before any upstream write; and a fully valid request
+/// rides into the honest engine-face refusal — the engine's updateGroup
+/// carries the expiration family only (its compat §5 batch boundary), so the
+/// member-family write answers CAPABILITY_UNAVAILABLE (retryable=false) with
+/// nothing dispatched.
 #[tokio::test]
 async fn groups_approve_join_requests_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -10487,19 +10382,7 @@ async fn groups_approve_join_requests_round_trip_and_guards() {
     let secret = [53_u8; 32];
     write_secret_file(&secret_file, &secret);
 
-    // The stub answers one requesting member for the fixture group and for
-    // each sentinel group (the §4.53 verified listGroups read source) —
-    // Alice's number everywhere, so the fold passes the survivors upstream.
-    let mut connector = spawn_connector_with(
-        temp.path(),
-        &endpoint,
-        &secret_file,
-        None,
-        &[(
-            "KT_FAKE_REQUESTING_GROUPS",
-            "ZmFrZS1ncm91cC0x=+15555550101;[fixture-approve-forbidden]=+15555550101;[fixture-approve-crash]=+15555550101",
-        )],
-    );
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
     wait_for_path(&endpoint).await;
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
@@ -10555,86 +10438,6 @@ async fn groups_approve_join_requests_round_trip_and_guards() {
         .find(|row| row["title"] == "Fixture Group")
         .map(|row| row["id"].as_str().unwrap().to_string())
         .expect("the fixture group row must exist");
-
-    // Stage the sentinel groups (the upstream-refusal group and the crash
-    // group) through the runtime injection marker, each also carrying a
-    // requesting member in the stub read so the fold passes them upstream.
-    let signal_data = temp.path().join("signal-data");
-    fs::create_dir_all(&signal_data).unwrap();
-    fs::write(
-        signal_data.join(".fixture-emit-envelopes.json"),
-        json!({ "envelopes": [
-            {
-                "source": "+15555550101",
-                "timestamp": 80,
-                "dataMessage": {
-                    "groupInfo": {
-                        "groupId": "[fixture-approve-forbidden]",
-                        "type": "UPDATE",
-                        "groupName": "forbidden group",
-                        "revision": 3
-                    }
-                }
-            },
-            {
-                "source": "+15555550101",
-                "timestamp": 81,
-                "dataMessage": {
-                    "groupInfo": {
-                        "groupId": "[fixture-approve-crash]",
-                        "type": "UPDATE",
-                        "groupName": "crash group",
-                        "revision": 3
-                    }
-                }
-            }
-        ] })
-        .to_string(),
-    )
-    .unwrap();
-    let mut groups: Vec<(String, String)> = Vec::new();
-    for attempt in 0..200 {
-        sleep(Duration::from_millis(20)).await;
-        let _ = request(
-            &mut client,
-            &format!("approve-poll-{attempt}"),
-            "runtime.status",
-            json!({}),
-        )
-        .await;
-        let listed = request(
-            &mut client,
-            &format!("approve-list-{attempt}"),
-            "conversations.list",
-            json!({ "accountId": account_id, "limit": 50 }),
-        )
-        .await;
-        groups = listed["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|row| row["type"] == "group")
-            .filter_map(|row| {
-                Some((
-                    row["id"].as_str()?.to_string(),
-                    row["title"].as_str()?.to_string(),
-                ))
-            })
-            .collect();
-        let titles: Vec<&str> = groups.iter().map(|(_, name)| name.as_str()).collect();
-        if titles.contains(&"forbidden group") && titles.contains(&"crash group") {
-            break;
-        }
-    }
-    let by_title = |title: &str| {
-        groups
-            .iter()
-            .find(|(_, name)| name == title)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| panic!("the staged {title} row must materialize: {groups:?}"))
-    };
-    let forbidden = by_title("forbidden group");
-    let crash_group = by_title("crash group");
 
     // The refusal ladder, each before any upstream write.
     let unknown = request(
@@ -10713,7 +10516,7 @@ async fn groups_approve_join_requests_round_trip_and_guards() {
         .path()
         .join("signal-data")
         .join(".fixture-send-log.jsonl");
-    let approval_writes = || -> Vec<Value> {
+    let member_writes = || -> Vec<Value> {
         fs::read_to_string(&send_log_path)
             .unwrap()
             .lines()
@@ -10724,130 +10527,35 @@ async fn groups_approve_join_requests_round_trip_and_guards() {
             .collect()
     };
 
-    // The fully-stale fold: the candidates are not requesting (Bob is no
-    // candidate at all, the stranger nobody ever requested) — nothing rides
-    // the arrays and the connector answers before any write.
-    let stale = request(
-        &mut client,
-        "approve-stale",
-        "groups.approveJoinRequests",
-        json!({
-            "accountId": account_id,
-            "conversationId": group_conversation,
-            "members": ["+15555550102", "+15555550999"],
-            "approve": true
-        }),
-    )
-    .await;
-    assert_eq!(
-        stale["error"]["code"], "JOIN_REQUEST_NO_LONGER_PENDING",
-        "{stale}"
-    );
-    assert_eq!(stale["error"]["retryable"], true);
-    assert!(approval_writes().is_empty(), "{:?}", approval_writes());
-
-    // The definite success: only the requesting survivor (Alice) rides the
-    // members array — the stale candidates are gone before the write.
-    let approved = request(
+    // A fully valid request rides past the ladder into the honest refusal:
+    // the member-family updateGroup is the engine's compat §5 batch boundary,
+    // so the face answers CAPABILITY_UNAVAILABLE and nothing is dispatched.
+    let refused = request(
         &mut client,
         "approve-group",
         "groups.approveJoinRequests",
         json!({
             "accountId": account_id,
             "conversationId": group_conversation,
-            "members": ["+15555550101", "+15555550999"],
+            "members": ["+15555550101"],
             "approve": true,
             "operationId": "approve-op-1"
         }),
     )
     .await;
-    assert_eq!(approved["result"]["status"], "sent", "{approved}");
-    let writes = approval_writes();
-    assert_eq!(writes.len(), 1, "{:?}", approval_writes());
-    assert_eq!(writes[0]["account"], "+15555550100");
-    assert_eq!(writes[0]["groupId"], "ZmFrZS1ncm91cC0x");
     assert_eq!(
-        writes[0]["members"],
-        json!(["+15555550101"]),
-        "the fold keeps only the requesting survivor: {writes:?}"
+        refused["error"]["code"], "CAPABILITY_UNAVAILABLE",
+        "{refused}"
     );
-    assert!(writes[0].get("removeMembers").is_none());
-
-    // The refuse direction rides the removeMembers family.
-    let refused_fold = request(
-        &mut client,
-        "refuse-group",
-        "groups.approveJoinRequests",
-        json!({
-            "accountId": account_id,
-            "conversationId": group_conversation,
-            "members": ["+15555550101"],
-            "approve": false
-        }),
-    )
-    .await;
-    assert_eq!(refused_fold["result"]["status"], "sent", "{refused_fold}");
-    let writes = approval_writes();
-    assert_eq!(writes.len(), 2, "{:?}", approval_writes());
-    assert_eq!(
-        writes[1]["removeMembers"],
-        json!(["+15555550101"]),
-        "the refuse direction rides the removeMembers family: {writes:?}"
-    );
-
-    // The upstream non-admin refusal forwards verbatim: the engine's user
-    // error lands as the UPSTREAM_ERROR family (retryable, like every
-    // upstream protocol refusal the connector forwards). The requesting
-    // hook lists Alice for the sentinel group too, so the fold passes her
-    // upstream and the write itself is what the stub refuses.
-    let refused = request(
-        &mut client,
-        "approve-forbidden",
-        "groups.approveJoinRequests",
-        json!({
-            "accountId": account_id,
-            "conversationId": forbidden,
-            "members": ["+15555550101"],
-            "approve": true
-        }),
-    )
-    .await;
-    assert_eq!(refused["error"]["code"], "UPSTREAM_ERROR", "{refused}");
-
-    // Crash with the mutating write in flight (fixture sentinel,
-    // os._exit(36)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
-    // write in the recovered log across the restart.
-    let crash = request(
-        &mut client,
-        "approve-crash",
-        "groups.approveJoinRequests",
-        json!({
-            "accountId": account_id,
-            "conversationId": crash_group,
-            "members": ["+15555550101"],
-            "approve": true
-        }),
-    )
-    .await;
-    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
-    assert_eq!(crash["error"]["retryable"], false);
-    wait_for_process_exit(engine_pid).await;
-    let restarted = request(&mut client, "restart-approve", "runtime.start", json!({})).await;
-    assert_eq!(restarted["result"]["state"], "running");
-    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
-    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
-    let crash_writes: Vec<Value> = approval_writes()
-        .into_iter()
-        .filter(|params| params["groupId"] == "[fixture-approve-crash]")
-        .collect();
-    assert_eq!(
-        crash_writes.len(),
-        1,
-        "an unknown approval outcome is never retried: {crash_writes:?}"
+    assert_eq!(refused["error"]["retryable"], false);
+    assert!(
+        member_writes().is_empty(),
+        "a refused approval never reaches the engine: {:?}",
+        member_writes()
     );
 
     drop(client);
-    wait_for_process_exit(recovered_pid).await;
+    wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
 
@@ -11047,13 +10755,14 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// groups.revokeInvites round trip and guards (contract revision 1.64,
-/// §4.57, capability group-invite-revoke): the fold keeps only pending
-/// survivors in the recorded upstream removeMembers payload, the stale fold
-/// answers INVITE_NO_LONGER_PENDING with zero writes, the refusal ladder
-/// answers before any write, the upstream refusal forwards UPSTREAM_ERROR,
-/// and the in-flight crash answers SEND_OUTCOME_UNKNOWN and is never
-/// retried across the restart.
+/// Contract 1.64 (§4.57): the groups.revokeInvites face. The handshake
+/// advertises the method plus the `group-invite-revoke` capability; the
+/// fail-closed ladder (unknown conversation, direct addressing, shape
+/// violations) answers before any upstream write; and a fully valid request
+/// rides into the honest engine-face refusal — the engine's updateGroup
+/// carries the expiration family only (its compat §5 batch boundary), so the
+/// member-family write answers CAPABILITY_UNAVAILABLE (retryable=false) with
+/// nothing dispatched.
 #[tokio::test]
 async fn groups_revoke_invites_round_trip_and_guards() {
     let temp = TempDir::new().unwrap();
@@ -11063,19 +10772,7 @@ async fn groups_revoke_invites_round_trip_and_guards() {
     let secret = [57_u8; 32];
     write_secret_file(&secret_file, &secret);
 
-    // The stub answers two pending invitees for the fixture group and one
-    // for each sentinel group (the §4.57 verified listGroups read source) —
-    // Alice's number on the sentinels, so the fold passes her upstream.
-    let mut connector = spawn_connector_with(
-        temp.path(),
-        &endpoint,
-        &secret_file,
-        None,
-        &[(
-            "KT_FAKE_PENDING_GROUPS",
-            "ZmFrZS1ncm91cC0x=+15555550101,+15555550102;[fixture-revoke-forbidden]=+15555550101;[fixture-revoke-crash]=+15555550101",
-        )],
-    );
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
     wait_for_path(&endpoint).await;
     let stream = UnixStream::connect(&endpoint).await.unwrap();
     let mut client = Framed::new(stream, LinesCodec::new());
@@ -11131,86 +10828,6 @@ async fn groups_revoke_invites_round_trip_and_guards() {
         .find(|row| row["title"] == "Fixture Group")
         .map(|row| row["id"].as_str().unwrap().to_string())
         .expect("the fixture group row must exist");
-
-    // Stage the sentinel groups (the upstream-refusal group and the crash
-    // group) through the runtime injection marker, each also carrying a
-    // pending member in the stub read so the fold passes them upstream.
-    let signal_data = temp.path().join("signal-data");
-    fs::create_dir_all(&signal_data).unwrap();
-    fs::write(
-        signal_data.join(".fixture-emit-envelopes.json"),
-        json!({ "envelopes": [
-            {
-                "source": "+15555550101",
-                "timestamp": 80,
-                "dataMessage": {
-                    "groupInfo": {
-                        "groupId": "[fixture-revoke-forbidden]",
-                        "type": "UPDATE",
-                        "groupName": "revoke forbidden group",
-                        "revision": 3
-                    }
-                }
-            },
-            {
-                "source": "+15555550101",
-                "timestamp": 81,
-                "dataMessage": {
-                    "groupInfo": {
-                        "groupId": "[fixture-revoke-crash]",
-                        "type": "UPDATE",
-                        "groupName": "revoke crash group",
-                        "revision": 3
-                    }
-                }
-            }
-        ] })
-        .to_string(),
-    )
-    .unwrap();
-    let mut groups: Vec<(String, String)> = Vec::new();
-    for attempt in 0..200 {
-        sleep(Duration::from_millis(20)).await;
-        let _ = request(
-            &mut client,
-            &format!("revoke-poll-{attempt}"),
-            "runtime.status",
-            json!({}),
-        )
-        .await;
-        let listed = request(
-            &mut client,
-            &format!("revoke-list-{attempt}"),
-            "conversations.list",
-            json!({ "accountId": account_id, "limit": 50 }),
-        )
-        .await;
-        groups = listed["result"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|row| row["type"] == "group")
-            .filter_map(|row| {
-                Some((
-                    row["id"].as_str()?.to_string(),
-                    row["title"].as_str()?.to_string(),
-                ))
-            })
-            .collect();
-        let titles: Vec<&str> = groups.iter().map(|(_, name)| name.as_str()).collect();
-        if titles.contains(&"revoke forbidden group") && titles.contains(&"revoke crash group") {
-            break;
-        }
-    }
-    let by_title = |title: &str| {
-        groups
-            .iter()
-            .find(|(_, name)| name == title)
-            .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| panic!("the staged {title} row must materialize: {groups:?}"))
-    };
-    let forbidden = by_title("revoke forbidden group");
-    let crash_group = by_title("revoke crash group");
 
     // The refusal ladder, each before any upstream write.
     let unknown = request(
@@ -11294,104 +10911,33 @@ async fn groups_revoke_invites_round_trip_and_guards() {
             .collect()
     };
 
-    // The fully-stale fold: the candidates are not pending invitees (Alice
-    // rides the fixture read, but this call names Bob — no candidate at all
-    // — and a stranger) — nothing rides the array and the connector answers
-    // before any write.
-    let stale = request(
-        &mut client,
-        "revoke-stale",
-        "groups.revokeInvites",
-        json!({
-            "accountId": account_id,
-            "conversationId": group_conversation,
-            "members": ["+15555550999", "+15555550103"]
-        }),
-    )
-    .await;
-    assert_eq!(
-        stale["error"]["code"], "INVITE_NO_LONGER_PENDING",
-        "{stale}"
-    );
-    assert_eq!(stale["error"]["retryable"], true);
-    assert!(revoke_writes().is_empty(), "{:?}", revoke_writes());
-
-    // The definite success: only the pending survivors ride the
-    // removeMembers array — the stale candidates are gone before the write.
-    let revoked = request(
+    // A fully valid request rides past the ladder into the honest refusal:
+    // the member-family updateGroup is the engine's compat §5 batch boundary,
+    // so the face answers CAPABILITY_UNAVAILABLE and nothing is dispatched.
+    let refused = request(
         &mut client,
         "revoke-group",
         "groups.revokeInvites",
         json!({
             "accountId": account_id,
             "conversationId": group_conversation,
-            "members": ["+15555550101", "+15555550999"],
+            "members": ["+15555550101"],
             "operationId": "revoke-op-1"
         }),
     )
     .await;
-    assert_eq!(revoked["result"]["status"], "sent", "{revoked}");
-    let writes = revoke_writes();
-    assert_eq!(writes.len(), 1, "{:?}", revoke_writes());
-    assert_eq!(writes[0]["account"], "+15555550100");
-    assert_eq!(writes[0]["groupId"], "ZmFrZS1ncm91cC0x");
     assert_eq!(
-        writes[0]["removeMembers"],
-        json!(["+15555550101"]),
-        "the fold keeps only the pending survivor: {writes:?}"
+        refused["error"]["code"], "CAPABILITY_UNAVAILABLE",
+        "{refused}"
     );
-    assert!(writes[0].get("members").is_none());
-
-    // The upstream non-admin refusal forwards verbatim: the engine's user
-    // error lands as the UPSTREAM_ERROR family (retryable, like every
-    // upstream protocol refusal the connector forwards). The pending hook
-    // lists Alice for the sentinel group too, so the fold passes her
-    // upstream and the write itself is what the stub refuses.
-    let refused = request(
-        &mut client,
-        "revoke-forbidden",
-        "groups.revokeInvites",
-        json!({
-            "accountId": account_id,
-            "conversationId": forbidden,
-            "members": ["+15555550101"]
-        }),
-    )
-    .await;
-    assert_eq!(refused["error"]["code"], "UPSTREAM_ERROR", "{refused}");
-
-    // Crash with the mutating write in flight (fixture sentinel,
-    // os._exit(37)): SEND_OUTCOME_UNKNOWN, never retried — exactly one such
-    // write in the recovered log across the restart.
-    let crash = request(
-        &mut client,
-        "revoke-crash",
-        "groups.revokeInvites",
-        json!({
-            "accountId": account_id,
-            "conversationId": crash_group,
-            "members": ["+15555550101"]
-        }),
-    )
-    .await;
-    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
-    assert_eq!(crash["error"]["retryable"], false);
-    wait_for_process_exit(engine_pid).await;
-    let restarted = request(&mut client, "restart-revoke", "runtime.start", json!({})).await;
-    assert_eq!(restarted["result"]["state"], "running");
-    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
-    assert_ne!(recovered_pid, engine_pid, "the engine actually restarted");
-    let crash_writes: Vec<Value> = revoke_writes()
-        .into_iter()
-        .filter(|params| params["groupId"] == "[fixture-revoke-crash]")
-        .collect();
-    assert_eq!(
-        crash_writes.len(),
-        1,
-        "an unknown revoke outcome is never retried: {crash_writes:?}"
+    assert_eq!(refused["error"]["retryable"], false);
+    assert!(
+        revoke_writes().is_empty(),
+        "a refused revoke never reaches the engine: {:?}",
+        revoke_writes()
     );
 
     drop(client);
-    wait_for_process_exit(recovered_pid).await;
+    wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }

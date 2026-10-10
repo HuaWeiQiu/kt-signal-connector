@@ -1379,7 +1379,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         }
         // Cloud-backup restore passthrough (contract revision 1.83, §4.69):
         // both arms are the params-gate shape — the account resolution and the
-        // kt-engine mode seam ride the runtime call; the start face answers
+        // engine dispatch ride the runtime call; the start face answers
         // {"status": "started"} for a definite acceptance and
         // SEND_OUTCOME_UNKNOWN on an indeterminate mutating outcome, the
         // status face mirrors the engine's progress snapshot through the
@@ -1418,7 +1418,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         }
         // Cloud-backup upload passthrough (contract revision 1.87, §4.72):
         // the same params-gate shape as the restore arms — the account
-        // resolution, the kt-engine mode seam, and the §10.2 artifact build
+        // resolution, the engine dispatch, and the §10.2 artifact build
         // ride the runtime call; the start face answers
         // {"status": "started"} for a definite acceptance and
         // SEND_OUTCOME_UNKNOWN on an indeterminate mutating outcome, the
@@ -2076,7 +2076,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         },
         // Call-link credential material passthrough (contract revision 1.88,
         // §4.73): all five arms are the params-gate shape — the b64 byte-budget
-        // gates, account resolution, and the kt-engine mode seam ride the
+        // gates, account resolution, and the engine dispatch ride the
         // service prepare; the engine's result passes through untouched and
         // the two credential error codes map through the structured whitelist
         // (CALL_CREDENTIALS_FAILED with its data.status? face,

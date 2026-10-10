@@ -54,21 +54,16 @@ fn production_package_commands_generate_sign_and_verify_a_complete_bundle() {
     let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
     let temp = TempDir::new().unwrap();
     let bundle = temp.path().join("bundle");
-    for directory in ["bin", "jre", "licenses"] {
+    for directory in ["bin", "licenses"] {
         fs::create_dir_all(bundle.join(directory)).unwrap();
     }
     for (relative, body) in [
         ("bin/kt-signal-connector", b"connector".as_slice()),
-        ("bin/signal-cli", b"signal-cli".as_slice()),
-        ("jre/release", b"JAVA_VERSION=\"25\"\n".as_slice()),
         (
             "licenses/kt-signal-connector.AGPL-3.0-only.txt",
             b"AGPL".as_slice(),
         ),
-        ("licenses/signal-cli.txt", b"GPL".as_slice()),
         ("licenses/libsignal.txt", b"AGPL".as_slice()),
-        ("licenses/jre.txt", b"JRE license".as_slice()),
-        ("licenses/NOTICE.txt", b"NOTICE".as_slice()),
         ("sbom.cdx.json", b"{}".as_slice()),
         ("build-record.json", b"{}".as_slice()),
         ("source.tar.gz", b"corresponding-source".as_slice()),
@@ -89,11 +84,7 @@ fn production_package_commands_generate_sign_and_verify_a_complete_bundle() {
             "--license",
             "kt-signal-connector:AGPL-3.0-only:licenses/kt-signal-connector.AGPL-3.0-only.txt",
             "--license",
-            "signal-cli:GPL-3.0-only:licenses/signal-cli.txt",
-            "--license",
             "libsignal:AGPL-3.0-only:licenses/libsignal.txt",
-            "--license",
-            "jre:NOASSERTION:licenses/jre.txt",
             "--output",
         ])
         .arg(&manifest)
@@ -140,16 +131,8 @@ fn package_stage_and_activate_reject_unsigned_bundles_unless_allowed() {
     let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
     let temp = TempDir::new().unwrap();
     let bundle = temp.path().join("bundle");
-    for directory in ["bin", "jre"] {
-        fs::create_dir_all(bundle.join(directory)).unwrap();
-    }
-    for (relative, body) in [
-        ("bin/kt-signal-connector", b"connector".as_slice()),
-        ("bin/signal-cli", b"signal-cli".as_slice()),
-        ("jre/release", b"JAVA_VERSION=\"25\"\n".as_slice()),
-    ] {
-        fs::write(bundle.join(relative), body).unwrap();
-    }
+    fs::create_dir_all(bundle.join("bin")).unwrap();
+    fs::write(bundle.join("bin/kt-signal-connector"), b"connector").unwrap();
     let manifest = bundle.join("manifest.json");
     let generated = Command::new(binary)
         .args(["package", "manifest", "--bundle-dir"])
@@ -223,16 +206,18 @@ fn serve_requires_exactly_one_bootstrap_secret_source() {
     assert_eq!(conflicting.status.code(), Some(2));
 }
 
+/// Transitional launcher compatibility (ADR 0003): the desktop launcher
+/// still passes `--java-home` on every start, so the flag must stay
+/// accepted until the desktop-side cleanup batch lands.
 #[test]
-fn serve_help_lists_the_native_signal_cli_flag() {
+fn serve_help_keeps_the_java_home_launcher_compat_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
         .args(["serve", "--help"])
         .output()
         .expect("connector binary should run");
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("help should be UTF-8");
-    assert!(stdout.contains("--signal-cli-native"));
-    assert!(stdout.contains("KT_SIGNAL_CLI_NATIVE"));
+    assert!(stdout.contains("--java-home"));
 }
 
 #[test]

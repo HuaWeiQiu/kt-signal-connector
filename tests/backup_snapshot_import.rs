@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use serde_json::json;
@@ -52,9 +52,8 @@ fn seed_engine_registry(data_dir: &Path) {
     .unwrap();
 }
 
-fn snapshot_config(fixture: &Path, data_dir: &Path, mode: SignalCliMode) -> SignalCliConfig {
+fn snapshot_config(fixture: &Path, data_dir: &Path) -> SignalCliConfig {
     let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
-    config.mode = mode;
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     config
@@ -63,7 +62,6 @@ fn snapshot_config(fixture: &Path, data_dir: &Path, mode: SignalCliMode) -> Sign
 fn snapshot_supervisor(
     temp: &TempDir,
     data_dir: &Path,
-    mode: SignalCliMode,
 ) -> (Arc<Store>, Arc<RuntimeSupervisor>, String) {
     seed_engine_registry(data_dir);
     let store = test_store(temp.path());
@@ -75,7 +73,7 @@ fn snapshot_supervisor(
         )
         .unwrap();
     let supervisor = Arc::new(RuntimeSupervisor::new(
-        snapshot_config(&fixture(), data_dir, mode),
+        snapshot_config(&fixture(), data_dir),
         Arc::clone(&store),
         kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
         None,
@@ -113,8 +111,7 @@ async fn wait_for_ledger_state(
 async fn snapshot_import_happy_chain_lands_store_rows() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (store, supervisor, account_id) =
-        snapshot_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (store, supervisor, account_id) = snapshot_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     let started = supervisor
@@ -157,8 +154,7 @@ async fn snapshot_import_happy_chain_lands_store_rows() {
 async fn snapshot_import_structured_codes_pass_through() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        snapshot_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = snapshot_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     for (sentinel, code, retryable) in [
@@ -197,15 +193,12 @@ async fn snapshot_import_structured_codes_pass_through() {
 }
 
 /// The connector's own gates: shape failures (empty, relative, oversized
-/// snapshotDir) fail closed before any engine traffic, and the JVM/native
-/// mode seam answers CAPABILITY_UNAVAILABLE — with validation preceding the
-/// seam, so a shape error is still INVALID_REQUEST under the wrong mode.
+/// snapshotDir) fail closed before any engine traffic.
 #[tokio::test]
-async fn snapshot_import_param_gates_and_mode_seam() {
+async fn snapshot_import_param_gates() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        snapshot_supervisor(&temp, &data_dir, SignalCliMode::Jvm);
+    let (_store, supervisor, account_id) = snapshot_supervisor(&temp, &data_dir);
 
     let dirs: [String; 3] = [
         String::new(),
@@ -222,28 +215,6 @@ async fn snapshot_import_param_gates_and_mode_seam() {
         assert_eq!(error.code, "INVALID_REQUEST", "dir {dir:?}");
         assert!(!error.retryable, "shape refusals are deterministic");
     }
-
-    // A well-formed directory under the wrong mode reaches the seam: the
-    // history-import capability is kt-engine only.
-    let error = supervisor
-        .import_local_snapshot(&account_id, SNAPSHOT_DIR)
-        .await
-        .err()
-        .unwrap()
-        .into_api();
-    assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-    assert!(!error.retryable);
-
-    // The status face carries the same seam (its truth is the engine's task,
-    // there is no store fallback).
-    let error = supervisor
-        .import_snapshot_status(&account_id)
-        .await
-        .err()
-        .unwrap()
-        .into_api();
-    assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-    assert!(!error.retryable);
 }
 
 /// The engine's failed status lands an honest failed ledger row with the
@@ -254,8 +225,7 @@ async fn snapshot_import_param_gates_and_mode_seam() {
 async fn snapshot_import_engine_failure_lands_honest_row() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (store, supervisor, account_id) =
-        snapshot_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (store, supervisor, account_id) = snapshot_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     let started = supervisor

@@ -4,10 +4,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:-"$ROOT/packaging/out/local-bundle"}"
-SIGNAL_CLI_SRC="${SIGNAL_CLI_SRC:-}"
-JRE_MARKER="${JRE_MARKER:-}"
 
-mkdir -p "$OUT/bin" "$OUT/jre" "$OUT/licenses"
+# The output directory is owned by this script: rebuild it from scratch so a
+# stale JVM-era bundle (jre/, bin/signal-cli) can never leak into a manifest.
+case "$OUT" in "$ROOT"|"$ROOT"/|"$ROOT"/packaging|"$ROOT"/packaging/)
+    echo "refusing to use the repo root or packaging/ as the bundle output" >&2
+    exit 2
+    ;;
+esac
+rm -rf "$OUT"
+mkdir -p "$OUT/bin" "$OUT/licenses"
 cd "$ROOT"
 
 cargo build --release
@@ -15,19 +21,16 @@ cp -f "$ROOT/target/release/kt-signal-connector" "$OUT/bin/kt-signal-connector"
 cp -f "$ROOT/LICENSE" "$OUT/licenses/kt-signal-connector.AGPL-3.0-only.txt"
 cp -f "$ROOT/NOTICE" "$OUT/licenses/NOTICE.txt"
 
-if [[ -n "$SIGNAL_CLI_SRC" && -f "$SIGNAL_CLI_SRC" ]]; then
-  cp -f "$SIGNAL_CLI_SRC" "$OUT/bin/signal-cli"
-else
-  # Placeholder artifact so local manifest/LKG flows can be exercised without claiming a
-  # production signal-cli distribution was produced by this script.
-  printf 'signal-cli-placeholder\n' >"$OUT/bin/signal-cli"
-fi
+# The kt engine face embeds libsignal (AGPL-3.0-only) and every manifest must
+# carry the license entry; this local stub is a pointer, not the license text.
+cat >"$OUT/licenses/libsignal.txt" <<'EOF'
+libsignal
+https://github.com/signalapp/libsignal
+SPDX-License-Identifier: AGPL-3.0-only
 
-if [[ -n "$JRE_MARKER" && -f "$JRE_MARKER" ]]; then
-  cp -f "$JRE_MARKER" "$OUT/jre/release"
-else
-  printf 'JAVA_VERSION="placeholder"\n' >"$OUT/jre/release"
-fi
+This bundle embeds libsignal through the kt engine face. The license text and
+the corresponding source ship with the engine distribution; see NOTICE.
+EOF
 
 # Minimal CycloneDX-like SBOM placeholder generated from cargo metadata.
 python3 - <<PY
@@ -74,8 +77,8 @@ EOF
   --bundle-dir "$OUT" \
   --bundle-id "local-$(date -u +%Y%m%d%H%M%S)" \
   --connector-path bin/kt-signal-connector \
-  --signal-cli-path bin/signal-cli \
-  --jre-path jre/release \
+  --license "kt-signal-connector:AGPL-3.0-only:licenses/kt-signal-connector.AGPL-3.0-only.txt" \
+  --license "libsignal:AGPL-3.0-only:licenses/libsignal.txt" \
   --output "$OUT/manifest.json"
 
 "$OUT/bin/kt-signal-connector" package verify \
