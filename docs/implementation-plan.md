@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.96 (2026-10-10; the runtime.doctor read-only diagnostic face (§4.79):
+- Contract revision: 1.97 (2026-10-10; the runtime.doctor Signal service-plane probe (§4.79): the
+  report grows a top-level `service` face — `proxyConfigured` (the launcher's
+  `KT_SIGNAL_SOCKS_PROXY` process environment present and well-formed; per-group proxy plans are
+  deliberately not consulted, a flag-only proxy reads as unconfigured) plus `chat` and `storage`
+  probes, each folding into exactly one fixed classification literal — `not_configured` (no proxy
+  environment, no network attempt at all), `socks_refused` (the SOCKS-routed link refused at or
+  below the proxy hop), `tls_failed` (the link reached the TLS handshake and failed against the
+  vendored Signal production root CA — the only trust anchor, the kt-engine's tls_certs_only
+  attitude), `timeout` (the 3-second connect/overall diagnostic budget), and `http` (the service
+  edge answered; the only classification carrying `status` and `latencyMs`, with chat read
+  healthy at its unauthenticated 401 and storage healthy at any HTTP response) — the probes are
+  two read-only HTTPS GETs to fixed compile-time URLs through a SOCKS5H client built fresh per
+  diagnostic (redirects off, no system/env proxy fallback), and the red-line discipline is
+  unchanged and tightened: the report carries only the fixed literals plus a status code and a
+  latency — never upstream error text, never request content, never a URL, never a proxy
+  endpoint, and the doctor's "never probes the network" rule is now scoped to "never probes
+  beyond the two declared service-plane faces") — previously 1.96 (2026-10-10; the runtime.doctor read-only diagnostic face (§4.79):
   one new Control-lane method answers the whole diagnostic payload in a single call — the
   version chain (the connector's own version/apiVersion/pid, and per group the engine's
   `version` and `engine.protocolCapabilities` answers riding through verbatim, an engine
@@ -6176,7 +6192,7 @@ frame in the log; `chat_folder_faces_gate_the_mode_seam` — JVM answering
 CAPABILITY_UNAVAILABLE on both faces before any engine starts, not one frame logged);
 plus the schema-consistency bound pairs and the server handshake advertisement.
 
-### 4.79 Read-only diagnostic face: `runtime.doctor` (contract revision 1.96, 2026-10-10)
+### 4.79 Read-only diagnostic face: `runtime.doctor` (contract revision 1.97, 2026-10-10)
 
 The desktop's support surface needed one call that answers "what is actually going on
 inside this connector" without being able to change anything by asking: the whole
@@ -6186,7 +6202,7 @@ the method rides the handshake method-list advertisement), and the discipline is
 read-only end to end: the doctor never starts or stops an engine, never breaks, removes,
 or truncates a lock, never writes a byte — every probe reads, and a slice that cannot
 answer degrades honestly while the call still succeeds. The answer is
-`{connector, groups[], network, recentErrors}`; the field-level consumer reference lives
+`{connector, groups[], network, recentErrors, service}`; the field-level consumer reference lives
 in `docs/doctor-contract.md`.
 
 - **Version chain** — `connector` carries the connector's own `version`, `apiVersion`,
@@ -6234,6 +6250,29 @@ in `docs/doctor-contract.md`.
   content.
 - **Network face** — the existing `watchdogRestartsTotal` and `receiveDroppedTotal`
   counters read out as-is; the doctor adds no new network instrumentation.
+- **Signal service-plane face** — `service` answers `proxyConfigured` (the launcher's
+  `KT_SIGNAL_SOCKS_PROXY` process environment present and well-formed; the per-group proxy
+  plans are deliberately not consulted — the probe reflects the process-wide launch
+  environment, so a flag-only proxy reads as unconfigured) and two probes, `chat`
+  (`GET https://chat.signal.org/v1/accounts/whoami`, unauthenticated — the desktop reads the
+  link healthy at the service edge's own 401) and `storage` (`GET https://storage.signal.org/`
+  — any HTTP response is a healthy link). The client is built fresh per diagnostic: HTTPS
+  only, the vendored Signal production root CA as the only trust anchor
+  (`tls_built_in_root_certs(false)` — the kt-engine's tls_certs_only attitude, so the probe
+  validates exactly the TLS reality the engine's own traffic will meet), the launcher proxy
+  as a `socks5h://` route (remote DNS, matching the engine's `ALL_PROXY` mapping), 3 s
+  connect and overall budgets (the same diagnostic bound as the engine probes), redirects
+  off. Every outcome folds into exactly one fixed literal — `http` (the edge answered; the
+  only classification carrying `status` and `latencyMs`), `timeout` (the diagnostic budget
+  exhausted), `socks_refused` (a connect-stage failure inside the SOCKS hop, identified by
+  reqwest's own socks-layer marker in the error's source chain; the residual transport
+  failures fold here rather than inventing a sixth literal), `tls_failed` (the handshake ran
+  against the pinned CA and failed — a trust mismatch is distinct from a dead route), and
+  `not_configured` (no proxy environment — no request is attempted at all). The mapping is a
+  pure function over reqwest's own kind flags (`is_timeout`/`is_connect`) plus the
+  source-chain marker walk, pinned by unit tests with no network dependency. The red line
+  stands: the report carries only the fixed literals plus a status code and a latency —
+  never upstream error text, never request content, never a URL, never a proxy endpoint.
 
 Tests: the doctor units (`doctor_report_structure_matches_the_contract` — the whole
 payload shape against the pinned structs; `engine_unreachable_degrades_honestly` — the
@@ -6245,14 +6284,22 @@ failed-with-reason exclusivity; `lock_face_reports_absence` /
 `recorded_pid_rejects_non_pid_content`; `probes_leave_the_data_directory_untouched` —
 the read-only discipline by snapshot comparison;
 `data_dir_face_reports_status_without_writing`;
-`error_ring_is_bounded_and_aggregates_families`); the integration roundtrip
+`error_ring_is_bounded_and_aggregates_families`; `service_probe_classification_maps_every_literal`
+— the five fixed literals from pure inputs plus a real `http::Response`, the
+`not_configured` face included (no network anywhere);
+`socks_layer_failures_carry_the_socks_marker_through_the_real_chain` — a loopback SOCKS refusal
+classified through reqwest's real error chain;
+`env_proxy_parser_tolerates_the_socks5h_prefix`); the integration roundtrip
 (`tests/runtime_doctor.rs`:
 `doctor_reports_versions_data_dir_lock_errors_and_reachability` — the whole payload over
 a real authenticated socket with the fake engine live: the version chain verbatim, the
 method faces riding the fixture's answers, the connector's own occupancy locks `held`
 with the pid it wrote at acquire, real failed dispatches feeding the ring, and the
-non-empty-params INVALID_REQUEST gate); plus the schema method enumeration and the
-handshake advertisement.
+non-empty-params INVALID_REQUEST gate;
+`doctor_service_face_answers_not_configured_without_proxy_env` — a connector spawned with
+the proxy environment removed answers `proxyConfigured: false` and both probes
+`not_configured` with no `status`/`latencyMs`, over the wire); plus the schema method
+enumeration and the handshake advertisement.
 
 ## 5. signal-cli Boundary
 

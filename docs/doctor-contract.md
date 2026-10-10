@@ -1,6 +1,6 @@
 # `runtime.doctor` — the read-only diagnostic face
 
-Contract revision 1.96, §4.79 of `docs/implementation-plan.md` is the normative
+Contract revision 1.97, §4.79 of `docs/implementation-plan.md` is the normative
 specification; this document is the field-level quick reference for consumers
 (the desktop support surface). The method answers the whole diagnostic payload
 in one Control-lane call.
@@ -27,7 +27,10 @@ The doctor never acts. Concretely:
 - it writes nothing: the data-directory probe is `access(2)` + `statvfs(2)`,
   the lock-file read is capped at 32 bytes, and the engine is asked only
   through its existing read face with a 3-second budget (a wedged engine
-  cannot hold a diagnostic anywhere near the ordinary 15 s request timeout).
+  cannot hold a diagnostic anywhere near the ordinary 15 s request timeout);
+- it makes no network request beyond the two declared service-plane probes
+  below (read-only GETs to fixed compile-time URLs, 3-second budget each,
+  through the launcher's SOCKS proxy environment when present).
 
 The report is a snapshot: by the time the caller reads a field the process
 may have moved on. Nothing in the answer is a lease or a reservation.
@@ -49,7 +52,10 @@ may have moved on. Nothing in the answer is a lease or a reservation.
   "network":      { "watchdogRestartsTotal", "receiveDroppedTotal" },
   "recentErrors": { "window", "recordedTotal",
                     "families": [ { "source", "family", "retryable",
-                                    "count", "lastAtUnixMs" } ] }
+                                    "count", "lastAtUnixMs" } ] },
+  "service":      { "proxyConfigured",
+                    "chat":    { "classification", "status"?, "latencyMs"? },
+                    "storage": { "classification", "status"?, "latencyMs"? } }
 }
 ```
 
@@ -140,9 +146,47 @@ until a Windows test host exists; every other field behaves identically.
 - The ring is in-memory only: it resets with the process and holds no message
   content — codes, kinds, counts, timestamps.
 
+## Service face
+
+`service` is the doctor's only outbound network surface — two read-only HTTPS
+GETs through the launcher's SOCKS proxy environment:
+
+- `proxyConfigured` is whether the process environment carries a well-formed
+  `KT_SIGNAL_SOCKS_PROXY` (`host:port`, the variable the engine child inherits;
+  an explicit `socks5(h)://` prefix is tolerated). Per-group proxy plans are
+  deliberately not consulted: the probe reflects the process-wide launch
+  environment, so a flag-only proxy reads as unconfigured. When false, both
+  probes answer `not_configured` and no request is attempted at all.
+- `chat` is `GET https://chat.signal.org/v1/accounts/whoami` (unauthenticated —
+  read the link healthy at the service edge's own 401); `storage` is
+  `GET https://storage.signal.org/` (any HTTP response is a healthy link).
+- The client is built fresh per diagnostic: HTTPS only, the vendored Signal
+  production root CA as the **only** trust anchor (the kt-engine's
+  tls_certs_only attitude — the probe validates exactly the TLS reality the
+  engine's own traffic meets), the launcher proxy as a `socks5h://` route
+  (remote DNS, matching the engine's `ALL_PROXY` mapping), 3-second connect
+  and overall budgets, redirects off.
+
+Each probe's `classification` is exactly one fixed literal:
+
+| `classification`  | meaning |
+| ----------------- | ------- |
+| `http`            | the service edge answered; the only classification carrying `status` (the HTTP status code) and `latencyMs` |
+| `timeout`         | the 3-second connect or overall budget was exhausted |
+| `socks_refused`   | the SOCKS-routed link was refused at or below the proxy hop (proxy down, proxy refused, upstream refused through the tunnel) |
+| `tls_failed`      | the link reached the TLS handshake and failed against the pinned CA — a trust mismatch, distinct from a dead route |
+| `not_configured`  | no proxy environment — the probe never ran |
+
+The mapping is a pure function over the transport error's own kind flags and a
+source-chain marker walk; it is pinned by unit tests with no network. The red
+line: the report carries only the fixed literals plus a status code and a
+latency — never upstream error text, never request content, never a URL, never
+a proxy endpoint.
+
 ## Network face
 
 `watchdogRestartsTotal` and `receiveDroppedTotal` are the two existing
 counters (`metrics::record_watchdog_restart`,
-`metrics::record_receive_drop`) read out as-is — the doctor adds no new
-network instrumentation.
+`metrics::record_receive_drop`) read out as-is — the network face adds no new
+instrumentation, and the service-plane probes above are the doctor's only
+outbound requests.
