@@ -3,16 +3,15 @@
 #![cfg(unix)]
 
 //! Link-time history import end to end (contract revision 1.39, §4.38): a
-//! kt-engine launch consumes the archive the engine's registry names and the
-//! status face walks pending → completed; the signal-cli modes answer
-//! `unavailable (engine-mode)` instead. The fixture plays the engine, so the
+//! launch consumes the archive the engine's registry names and the status
+//! face walks pending → completed. The fixture plays the engine, so the
 //! "archive" is the NDJSON the engine's S2 export projects.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -61,7 +60,6 @@ fn seed_engine_archive(data_dir: &std::path::Path) {
 
 fn kt_engine_config(fixture: &std::path::Path, data_dir: &std::path::Path) -> SignalCliConfig {
     let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
-    config.mode = SignalCliMode::KtEngine;
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config
@@ -183,39 +181,6 @@ async fn kt_engine_without_archive_reports_pending_inside_the_link_window() {
     let pending = status(&supervisor, &seeded.id).await;
     assert_eq!(pending["state"], "pending");
     assert!(pending.get("reason").is_none());
-}
-
-/// The signal-cli modes have no backup5 capability at all: the face answers
-/// `unavailable (engine-mode)` — even when an archive from an earlier
-/// kt-engine life of the data directory still sits on disk.
-#[tokio::test]
-async fn signal_cli_modes_report_unavailable_engine_mode() {
-    let temp = TempDir::new().unwrap();
-    let signal_data = temp.path().join("signal-data");
-    seed_engine_archive(&signal_data);
-    let seeded = {
-        let seed = test_store(temp.path());
-        seed.upsert_account_from_signal(
-            SIGNAL_ACCOUNT,
-            Some(1),
-            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
-        )
-        .unwrap()
-    };
-    let store = test_store(temp.path());
-    let mut config = SignalCliConfig::new(fixture(), signal_data);
-    config.request_timeout = Duration::from_secs(1);
-    config.shutdown_grace = Duration::from_millis(100);
-    let supervisor = Arc::new(RuntimeSupervisor::new(
-        config,
-        Arc::clone(&store),
-        kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
-        None,
-    ));
-
-    let unavailable = status(&supervisor, &seeded.id).await;
-    assert_eq!(unavailable["state"], "unavailable");
-    assert_eq!(unavailable["reason"], "engine-mode");
 }
 
 /// Unknown accounts answer ACCOUNT_NOT_FOUND through the shared read path.

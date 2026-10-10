@@ -12,22 +12,8 @@ import uuid
 import zlib
 
 
-expected_java_opts = os.environ.get("KT_FAKE_EXPECT_JAVA_OPTS")
-if expected_java_opts is not None:
-    # Phase 4: group engines carry their SOCKS proxy as extra `-D` properties
-    # appended to the documented heap budget, so the expectation is a prefix
-    # match; the memory flags themselves must still lead the value.
-    if not os.environ.get("JAVA_OPTS", "").startswith(expected_java_opts):
-        sys.exit(91)
-    if any(os.environ.get(name) for name in ("JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS")):
-        sys.exit(92)
-
-expected_java_home = os.environ.get("KT_FAKE_EXPECT_JAVA_HOME")
-if expected_java_home is not None and os.environ.get("JAVA_HOME") != expected_java_home:
-    sys.exit(93)
-
-# Native-mode guard: a GraalVM binary has no JVM, so the engine must not set
-# JAVA_OPTS or forward JAVA_HOME to the child at all.
+# No-Java guard: the engine binary is native (GraalVM) with no JVM, so the
+# connector must not set JAVA_OPTS or forward JAVA_HOME to the child at all.
 if os.environ.get("KT_FAKE_EXPECT_NO_JAVA") is not None:
     if os.environ.get("JAVA_OPTS") is not None or os.environ.get("JAVA_HOME") is not None:
         sys.exit(94)

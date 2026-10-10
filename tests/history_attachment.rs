@@ -16,7 +16,7 @@ use aes::Aes256;
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::media::MediaHandleTable;
 use kt_signal_connector::store::{Store, StoreKey};
@@ -167,7 +167,6 @@ fn kt_engine_config(
     cdn_base: Option<String>,
 ) -> SignalCliConfig {
     let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
-    config.mode = SignalCliMode::KtEngine;
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.media_ingest = true;

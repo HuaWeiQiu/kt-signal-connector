@@ -209,6 +209,13 @@ Known gap: long-run soak memory curve not measured (only ~1 min window);
 re-run the SOCKS relay test after every signal-cli/native upgrade
 (`/tmp/kt-native-proxy-probe/socks5_relay.py`).
 
+**Retired (2026-10-10, ADR 0003):** the connector's JVM/native signal-cli
+engine modes are deleted — the kt engine is the only engine and signal-cli is
+no longer on the runtime path. The build chain above
+(`build-signal-cli-native.yml`, `build-signal-cli-native.sh`,
+`trim-native-reachability-metadata.py`) is removed with it; the measurements
+stay as history. Re-productizing signal-cli modes requires an ADR 0003 change.
+
 ## 3. Execution rules
 
 - Order: 0 → 1 → 2 → 3 strictly serial; 4 and 5 independent (both confirmed

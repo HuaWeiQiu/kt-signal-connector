@@ -9,7 +9,7 @@
 //! connector parses nothing, logs nothing, caches nothing. The fixture plays
 //! the engine (the engine fake discipline: stub bytes are NOT valid zk
 //! material, they pin the wire shape), the structured two-code ladder steers
-//! from markers, and the mode seam answers before any engine starts. These
+//! from markers. These
 //! tests pin the connector's routing, gates, and error fidelity, never real
 //! engine credential behavior (the real-device zkgroup chain is the engine
 //! batch's own acceptance).
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use serde_json::json;
@@ -76,7 +76,6 @@ fn seed_engine_registry(data_dir: &Path) {
 fn call_cred_supervisor(
     temp: &TempDir,
     data_dir: &Path,
-    mode: SignalCliMode,
 ) -> (Arc<Store>, Arc<RuntimeSupervisor>, String) {
     seed_engine_registry(data_dir);
     let store = test_store(temp.path());
@@ -88,7 +87,6 @@ fn call_cred_supervisor(
         )
         .unwrap();
     let mut config = SignalCliConfig::new(fixture().to_path_buf(), data_dir.to_path_buf());
-    config.mode = mode;
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -108,8 +106,7 @@ fn call_cred_supervisor(
 async fn call_material_faces_pass_through_happy_shapes() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        call_cred_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = call_cred_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     let root_key_16 = b64(&[0x11; 16]);
@@ -160,8 +157,7 @@ async fn call_material_faces_pass_through_happy_shapes() {
 async fn call_credential_error_ladder_rides_the_wire() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        call_cred_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = call_cred_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
     let root_key = b64(&[0x11; 16]);
     let room_id = b64(&[0x22; 32]);
@@ -219,8 +215,7 @@ async fn call_credential_error_ladder_rides_the_wire() {
 async fn call_material_shape_gates_answer_locally() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        call_cred_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = call_cred_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     for bad in [
@@ -278,54 +273,4 @@ async fn call_material_shape_gates_answer_locally() {
         .unwrap()
         .into_api();
     assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
-}
-
-/// The mode seam: JVM mode answers CAPABILITY_UNAVAILABLE on every face —
-/// before any engine starts (no engine traffic, the §4.69 ladder mirrored).
-#[tokio::test]
-async fn call_material_faces_gate_the_mode_seam() {
-    let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        call_cred_supervisor(&temp, &data_dir, SignalCliMode::Jvm);
-
-    let root_key = b64(&[0x11; 16]);
-    let room_id = b64(&[0x22; 32]);
-    let group_id = b64(&[0x33; 32]);
-
-    for error in [
-        supervisor
-            .calls_link_presentation(&account_id, &root_key)
-            .await
-            .err()
-            .unwrap()
-            .into_api(),
-        supervisor
-            .calls_create_link_auth(&account_id, &root_key, &room_id)
-            .await
-            .err()
-            .unwrap()
-            .into_api(),
-        supervisor
-            .calls_group_proof(&account_id, &group_id)
-            .await
-            .err()
-            .unwrap()
-            .into_api(),
-        supervisor
-            .calls_group_members(&account_id, &group_id)
-            .await
-            .err()
-            .unwrap()
-            .into_api(),
-        supervisor
-            .calls_endorsements_public_key()
-            .await
-            .err()
-            .unwrap()
-            .into_api(),
-    ] {
-        assert_eq!(error.code, "CAPABILITY_UNAVAILABLE");
-        assert!(!error.retryable);
-    }
 }

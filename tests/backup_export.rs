@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::store::{MessageRecord, Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -58,7 +58,6 @@ fn seed_engine_registry(data_dir: &Path) {
 
 fn backup_config(fixture: &Path, data_dir: &Path) -> SignalCliConfig {
     let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
-    config.mode = SignalCliMode::Jvm;
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     config

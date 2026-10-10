@@ -13,8 +13,8 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::engine::{
     CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
-    NormalizedReceive, QueuedReceive, ReceiveIngress, SignalCliConfig, SignalCliMode,
-    event_channel, receive_channel,
+    NormalizedReceive, QueuedReceive, ReceiveIngress, SignalCliConfig, event_channel,
+    receive_channel,
 };
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
@@ -510,7 +510,7 @@ impl RuntimeSupervisor {
     /// skeletons, so an account linked before that revision — or whose
     /// inline link-time sync failed — would otherwise surface conversations
     /// only message by message. It runs in the background (the host
-    /// handshake path never waits on the JVM) and the 60-second cache inside
+    /// handshake path never waits on the engine) and the 60-second cache inside
     /// the sync folds repeat starts into read-only no-ops. One pass per
     /// process start, same discipline as history retention.
     fn spawn_contacts_resync(&self) {
@@ -538,7 +538,7 @@ impl RuntimeSupervisor {
         let service = Arc::clone(&self.service);
         let group_id = self.group_id.clone();
         *slot = Some(tokio::spawn(async move {
-            // Let the fresh JVM settle and any link-time inline sync land
+            // Let the fresh engine settle and any link-time inline sync land
             // first; the 60-second cache then folds the overlap into a no-op.
             sleep(Duration::from_secs(2)).await;
             let accounts = match service.lock().await.list_accounts_in_group(&group_id) {
@@ -572,29 +572,12 @@ impl RuntimeSupervisor {
     // is store-only and never touches the engine.
     // -------------------------------------------------------------------------
 
-    /// History import exists only under kt-engine mode: the signal-cli
-    /// JVM/native face has no backup5 capability at all.
-    fn history_import_capable(&self) -> bool {
-        self.config.mode == SignalCliMode::KtEngine
-    }
-
-    /// Cloud-backup upload (contract revision 1.87, §4.72) exists only under
-    /// kt-engine mode: the engine's upload faces are KT-extension methods a
-    /// stock signal-cli does not carry (the §4.69 seam, mirrored for the
-    /// outbound half).
-    fn cloud_upload_capable(&self) -> bool {
-        self.config.mode == SignalCliMode::KtEngine
-    }
-
     /// Once-per-start sweep: import any group account whose archive exists
     /// but has no completed row — the connector may have restarted between
     /// link and import, or a previous attempt failed. Settles first so the
     /// fresh engine's own startup work lands, then imports one account at a
     /// time (the group's single slot).
     fn spawn_history_import_pass(&self) {
-        if !self.history_import_capable() {
-            return;
-        }
         let store = Arc::clone(&self.store);
         let group_id = self.group_id.clone();
         let data_dir = self.config.data_dir.clone();
@@ -642,15 +625,12 @@ impl RuntimeSupervisor {
         });
     }
 
-    /// After a kt-engine `link.finish`, watch for the archive the engine is
+    /// After a `link.finish`, watch for the archive the engine is
     /// downloading in the background (§4.38): poll every few seconds for at
     /// most [`crate::history_import::LINK_WAIT_MS`], import when the file
     /// appears. A busy group slot retries on the next tick. Best-effort: the
     /// import never fails the link flow.
     fn spawn_history_import_watch(&self, account_id: String) {
-        if !self.history_import_capable() {
-            return;
-        }
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
         let running = Arc::clone(&self.history_import_running);
@@ -718,11 +698,9 @@ impl RuntimeSupervisor {
     pub async fn history_import_status(&self, account_id: String) -> Result<Value, ServiceError> {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
-        let capable = self.history_import_capable();
         let row_account_id = account_id.clone();
         let (mut status, signal_account) = blocking_service(move || {
-            let status =
-                history_import_status_projection(&store, &data_dir, capable, &row_account_id)?;
+            let status = history_import_status_projection(&store, &data_dir, &row_account_id)?;
             let signal_account = if status["state"] == "running" {
                 store
                     .account_by_id(&row_account_id)
@@ -780,11 +758,8 @@ impl RuntimeSupervisor {
     pub async fn history_import_retry(&self, account_id: String) -> Result<Value, ServiceError> {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
-        let capable = self.history_import_capable();
-        blocking_service(move || {
-            history_import_retry_projection(&store, &data_dir, capable, &account_id)
-        })
-        .await
+        blocking_service(move || history_import_retry_projection(&store, &data_dir, &account_id))
+            .await
     }
 
     /// history.attachmentDownload (contract revision 1.57, §4.38 step 3):
@@ -1762,7 +1737,7 @@ impl RuntimeSupervisor {
     ) -> Result<Page<ConversationSummary>, ServiceError> {
         // Best-effort title enrich only when masks remain or a fresh direct
         // row still owes its §4.58 factor probe — and at most every 60s so
-        // poll/UI refresh does not hammer listContacts on the single JVM
+        // poll/UI refresh does not hammer listContacts on the single engine
         // queue.
         let _ = self.enrich_conversation_faces_throttled(&account_id).await;
         // Store-only read: the service lock guards in-memory state only.
@@ -2097,7 +2072,7 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let frame = {
             let service = self.service.lock().await;
-            service.prepare_send_story(&params, self.config.mode)?
+            service.prepare_send_story(&params)?
         };
         match engine.call("sendStory", frame, CallClass::Mutating).await {
             Ok(result) => story_from_engine(&result),
@@ -2112,8 +2087,8 @@ impl RuntimeSupervisor {
 
     /// stories.setDisabled (contract revision 1.76, §4.67): the account's
     /// stories-disabled toggle — the receive-gate mirror of the official
-    /// `getStoriesBlocked` leg. Local store only (no engine frame exists,
-    /// every engine mode answers): validation + account pin under the
+    /// `getStoriesBlocked` leg. Local store only (no engine frame exists):
+    /// validation + account pin under the
     /// service lock, then the meta-KV write on the blocking pool. The
     /// result is the stored truth, not an echo of the request.
     pub async fn set_stories_disabled(
@@ -2197,7 +2172,7 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let frame = {
             let service = self.service.lock().await;
-            service.prepare_story_send_reaction(&params, self.config.mode)?
+            service.prepare_story_send_reaction(&params)?
         };
         match engine
             .call("sendReaction", frame, CallClass::Mutating)
@@ -2578,10 +2553,9 @@ impl RuntimeSupervisor {
     /// definite success the conversation's local mirror row updates and the
     /// refreshed summary rides conversation.changed, so every window sees the
     /// new timer without a re-read; the upstream timer state stays the source
-    /// of truth. The dual route follows the caller's engine mode:
-    /// `setExpirationTimer` (engine face) or `updateContact` (signal-cli
-    /// face) — same-value no-ops are upstream semantics, the passthrough
-    /// never pre-checks.
+    /// of truth. The direct route is the engine's `setExpirationTimer`; a
+    /// group rides `updateGroup` — same-value no-ops are upstream semantics,
+    /// the passthrough never pre-checks.
     pub async fn set_conversation_expire_timer(
         &self,
         params: ConversationsSetExpireTimerParams,
@@ -2593,7 +2567,6 @@ impl RuntimeSupervisor {
                 &params.account_id,
                 &params.conversation_id,
                 params.expire_seconds,
-                self.config.mode,
             )?
         };
         match engine.call(method, upstream, CallClass::Mutating).await {
@@ -2643,7 +2616,7 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let upstream = {
             let service = self.service.lock().await;
-            service.prepare_groups_update(&params, self.config.mode)?
+            service.prepare_groups_update(&params)?
         };
         match engine
             .call("updateGroup", upstream, CallClass::Mutating)
@@ -2668,7 +2641,7 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let upstream = {
             let service = self.service.lock().await;
-            service.prepare_groups_quit(&params, self.config.mode)?
+            service.prepare_groups_quit(&params)?
         };
         match engine
             .call("quitGroup", upstream, CallClass::Mutating)
@@ -2743,7 +2716,7 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let (group_id, members, approve) = {
             let service = self.service.lock().await;
-            service.prepare_groups_approve_join_requests(&params, self.config.mode)?
+            service.prepare_groups_approve_join_requests(&params)?
         };
         let number = self
             .service
@@ -2834,7 +2807,7 @@ impl RuntimeSupervisor {
         let engine = self.running_engine().await?;
         let (group_id, members) = {
             let service = self.service.lock().await;
-            service.prepare_groups_revoke_invites(&params, self.config.mode)?
+            service.prepare_groups_revoke_invites(&params)?
         };
         let number = self
             .service
@@ -3027,18 +3000,17 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// chatFolders.list (contract revision 1.95, §4.78): gates, resolution,
-    /// and the kt-engine mode seam under the service lock (the §4.73 ladder —
-    /// the seam answers before any engine starts), then the read-only engine
-    /// call; the folder list projects straight from the engine result with
-    /// the KT entry cap, record bodies verbatim.
+    /// chatFolders.list (contract revision 1.95, §4.78): bounds and account
+    /// resolution under the service lock, then the read-only engine call;
+    /// the folder list projects straight from the engine result with the KT
+    /// entry cap, record bodies verbatim.
     pub async fn chat_folders_list(
         &self,
         params: ChatFoldersListParams,
     ) -> Result<ChatFolderSyncs, ServiceError> {
         let upstream = {
             let service = self.service.lock().await;
-            service.prepare_chat_folders_list(&params.account_id, self.config.mode)?
+            service.prepare_chat_folders_list(&params.account_id)?
         };
         let engine = self.running_engine().await?;
         let result = engine
@@ -3056,7 +3028,7 @@ impl RuntimeSupervisor {
     /// the service lock, then the mutating engine call — reaction-class
     /// discipline: an unknown outcome answers SEND_OUTCOME_UNKNOWN and is
     /// never retried; the success result is the post-write cloud state read
-    /// back, not a local echo. kt-engine only (the §4.73 mode seam).
+    /// back, not a local echo.
     pub async fn chat_folders_set_records(
         &self,
         params: ChatFoldersSetRecordsParams,
@@ -3067,7 +3039,6 @@ impl RuntimeSupervisor {
                 &params.account_id,
                 params.records.as_deref().unwrap_or(&[]),
                 params.remove_ids.as_deref().unwrap_or(&[]),
-                self.config.mode,
             )?
         };
         let engine = self.running_engine().await?;
@@ -3219,20 +3190,18 @@ impl RuntimeSupervisor {
     }
 
     /// accounts.setUsername (contract revision 1.59, §4.55; the kt-engine
-    /// write face opens with contract 1.75, §4.66): on the JVM/native faces
-    /// the mutating `updateAccount` call with the groups face's
-    /// unknown-outcome discipline (an indeterminate answer is
-    /// SEND_OUTCOME_UNKNOWN and is never retried); on the kt-engine face the
-    /// two-hop orchestration — `usernameReserve` then `usernameConfirm`,
-    /// each a separate mutating call under the same discipline (an
-    /// indeterminate hop stops the chain: the reservation itself carries no
-    /// user-visible effect server-side, and a torn two-hop converges through
-    /// getUsername / the engine's storage sync). The confirmed result
-    /// projects the write-back `{username, usernameLink}` on the set path —
-    /// the adopted candidate wins (a bare nickname's discriminator is the
-    /// server's pick) — and `{username: null}` on the delete path (the
-    /// upstream writes no result body there). Structured engine codes
-    /// (USERNAME_TAKEN / USERNAME_RESERVATION_GONE / USERNAME_RATE_LIMITED /
+    /// write face opened with contract 1.75, §4.66): the two-hop
+    /// orchestration — `usernameReserve` then `usernameConfirm`, each a
+    /// separate mutating call under the groups face's unknown-outcome
+    /// discipline (an indeterminate hop stops the chain: the reservation
+    /// itself carries no user-visible effect server-side, and a torn
+    /// two-hop converges through getUsername / the engine's storage sync).
+    /// The confirmed result projects the write-back `{username,
+    /// usernameLink}` on the set path — the adopted candidate wins (a bare
+    /// nickname's discriminator is the server's pick) — and `{username:
+    /// null}` on the delete path (the upstream writes no result body
+    /// there). Structured engine codes (USERNAME_TAKEN /
+    /// USERNAME_RESERVATION_GONE / USERNAME_RATE_LIMITED /
     /// USERNAME_SERVER_FAILED, and the STORAGE_* honest partial-success
     /// family when the server confirmed but the storage write failed) map
     /// through the connector's allowlist (`into_api`).
@@ -3241,20 +3210,16 @@ impl RuntimeSupervisor {
         params: AccountsSetUsernameParams,
     ) -> Result<AccountUsername, ServiceError> {
         let engine = self.running_engine().await?;
-        let (upstream, account_key, kt_engine) = {
+        let (upstream, account_key) = {
             let service = self.service.lock().await;
-            let upstream = service.prepare_accounts_set_username(&params, self.config.mode)?;
+            let upstream = service.prepare_accounts_set_username(&params)?;
             let account_key = upstream["account"].clone();
-            (
-                upstream,
-                account_key,
-                self.config.mode == crate::engine::SignalCliMode::KtEngine,
-            )
+            (upstream, account_key)
         };
-        match kt_engine {
-            // Delete hop: usernameDelete {account} → {} (idempotent — the
-            // engine deletes server-side and clears the storage record).
-            true if params.delete_username => match engine
+        // Delete hop: usernameDelete {account} → {} (idempotent — the
+        // engine deletes server-side and clears the storage record).
+        if params.delete_username {
+            return match engine
                 .call("usernameDelete", upstream, CallClass::Mutating)
                 .await
             {
@@ -3268,113 +3233,75 @@ impl RuntimeSupervisor {
                     false,
                 ))),
                 Err(error) => Err(error.into()),
-            },
-            // Set path, two hops under the same unknown-outcome discipline:
-            // reserve (candidate + hash, no user-visible server effect)
-            // adopts the candidate, confirm (proof + link) lands it.
-            true => {
-                let reserved = match engine
-                    .call("usernameReserve", upstream, CallClass::Mutating)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(EngineError::UnknownOutcome) => {
-                        return Err(ServiceError::Api(ApiError::new(
-                            "SEND_OUTCOME_UNKNOWN",
-                            "mutating request has an unknown outcome",
-                            false,
-                        )));
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                let confirm = json!({
-                    "account": account_key,
-                    "username": reserved
-                        .get("username")
-                        .and_then(Value::as_str)
-                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
-                    "usernameHash": reserved
-                        .get("usernameHash")
-                        .and_then(Value::as_str)
-                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
-                });
-                match engine
-                    .call("usernameConfirm", confirm, CallClass::Mutating)
-                    .await
-                {
-                    Ok(result) => {
-                        let username = result
-                            .get("username")
-                            .and_then(Value::as_str)
-                            .ok_or(ServiceError::Engine(EngineError::Protocol))?
-                            .to_string();
-                        Ok(AccountUsername {
-                            username: Some(username),
-                            username_link: result
-                                .get("usernameLink")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        })
-                    }
-                    Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
-                        "SEND_OUTCOME_UNKNOWN",
-                        "mutating request has an unknown outcome",
-                        false,
-                    ))),
-                    Err(error) => Err(error.into()),
-                }
-            }
-            false => match engine
-                .call("updateAccount", upstream, CallClass::Mutating)
-                .await
-            {
-                Ok(result) => {
-                    if params.delete_username {
-                        return Ok(AccountUsername {
-                            username: None,
-                            username_link: None,
-                        });
-                    }
-                    let username = result
-                        .get("username")
-                        .and_then(Value::as_str)
-                        .ok_or(ServiceError::Engine(EngineError::Protocol))?
-                        .to_string();
-                    Ok(AccountUsername {
-                        username: Some(username),
-                        username_link: result
-                            .get("usernameLink")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    })
-                }
-                Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+            };
+        }
+        // Set path, two hops under the same unknown-outcome discipline:
+        // reserve (candidate + hash, no user-visible server effect)
+        // adopts the candidate, confirm (proof + link) lands it.
+        let reserved = match engine
+            .call("usernameReserve", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => result,
+            Err(EngineError::UnknownOutcome) => {
+                return Err(ServiceError::Api(ApiError::new(
                     "SEND_OUTCOME_UNKNOWN",
                     "mutating request has an unknown outcome",
                     false,
-                ))),
-                Err(error) => Err(error.into()),
-            },
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let confirm = json!({
+            "account": account_key,
+            "username": reserved
+                .get("username")
+                .and_then(Value::as_str)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            "usernameHash": reserved
+                .get("usernameHash")
+                .and_then(Value::as_str)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        });
+        match engine
+            .call("usernameConfirm", confirm, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => {
+                let username = result
+                    .get("username")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                    .to_string();
+                Ok(AccountUsername {
+                    username: Some(username),
+                    username_link: result
+                        .get("usernameLink")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
         }
     }
 
     /// accounts.getUsername (contract revision 1.59, §4.55; the kt-engine
-    /// read face opens with contract 1.74, §4.65): on the kt-engine face a
-    /// read-only engine `getUsername` call projects the
-    /// `{username?, usernameLink?}` storage truth (both keys absent = unset —
-    /// the honest never-set answer, not an error); on the JVM/native faces
-    /// the ladder answers CAPABILITY_UNAVAILABLE (the pinned signal-cli has
-    /// no local-account username reader — see `prepare_accounts_get_username`).
+    /// read face opened with contract 1.74, §4.65): a read-only engine
+    /// `getUsername` call projects the `{username?, usernameLink?}` storage
+    /// truth (both keys absent = unset — the honest never-set answer, not an
+    /// error).
     pub async fn get_username(
         &self,
         params: AccountsGetUsernameParams,
     ) -> Result<AccountUsername, ServiceError> {
         let upstream = {
             let service = self.service.lock().await;
-            match service.prepare_accounts_get_username(&params.account_id, self.config.mode) {
-                Err(error) => return Err(error),
-                Ok(upstream) => upstream,
-            }
+            service.prepare_accounts_get_username(&params.account_id)?
         };
         let engine = self.running_engine().await?;
         match engine
@@ -3396,26 +3323,23 @@ impl RuntimeSupervisor {
     }
 
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
-    /// opens with contract 1.74, §4.65): resolution under the service lock,
-    /// then the read-only call — `getUserStatus` on the pinned faces,
-    /// `usernameLookup` on the kt-engine face (same server lookups, same
-    /// frame). Both upstream answers are a top-level array; the connector
-    /// projects it entry-for-entry — a missing field is a protocol face, not
-    /// a silently-dropped item.
+    /// opened with contract 1.74, §4.65): resolution under the service lock,
+    /// then the read-only `usernameLookup` engine call (same server
+    /// lookups). The upstream answer
+    /// is a top-level array; the connector projects it entry-for-entry — a
+    /// missing field is a protocol face, not a silently-dropped item.
     pub async fn lookup_usernames(
         &self,
         params: UsernameLookupParams,
     ) -> Result<UsernameLookupResult, ServiceError> {
         let engine = self.running_engine().await?;
-        let (method, upstream) = {
+        let upstream = {
             let service = self.service.lock().await;
-            let upstream = service.prepare_username_lookup(&params, self.config.mode)?;
-            match self.config.mode {
-                SignalCliMode::KtEngine => ("usernameLookup", upstream),
-                _ => ("getUserStatus", upstream),
-            }
+            service.prepare_username_lookup(&params)?
         };
-        let result = engine.call(method, upstream, CallClass::ReadOnly).await?;
+        let result = engine
+            .call("usernameLookup", upstream, CallClass::ReadOnly)
+            .await?;
         let entries = result
             .as_array()
             .ok_or(ServiceError::Engine(EngineError::Protocol))?;
@@ -3474,10 +3398,10 @@ impl RuntimeSupervisor {
 
     /// identities.verify (contract revision 1.68, §4.61, capability
     /// safety-number): resolution under the service lock, then the mutating
-    /// pinned `trust {verifiedSafetyNumber}` call — the reaction-class
+    /// mutating `trust {verifiedSafetyNumber}` call — the reaction-class
     /// discipline verbatim (an indeterminate outcome answers
     /// SEND_OUTCOME_UNKNOWN and is never retried: the trust write may
-    /// already have landed). The pinned face answers an empty result object
+    /// already have landed). The engine answers an empty result object
     /// on success (the command writes no JSON output), so the result is the
     /// plain `{status: "verified"}` confirmation; the upstream mismatch
     /// UserError folds into the plain UPSTREAM_ERROR like every
@@ -3679,7 +3603,7 @@ impl RuntimeSupervisor {
     /// exactly once, engine → host (the engine compat §5 zero-persistence
     /// discipline mirrored at the pipe). Read-only engine class: a timeout
     /// answers UPSTREAM_TIMEOUT (retryable), never the mutating unknown
-    /// outcome. kt-engine only (the KT-extension mode seam, the §4.69
+    /// outcome. The faces are KT-extension engine methods (the §4.69
     /// ladder).
     pub async fn calls_link_presentation(
         &self,
@@ -3688,7 +3612,7 @@ impl RuntimeSupervisor {
     ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_calls_link_presentation(account_id, root_key, self.config.mode)?
+            service.prepare_calls_link_presentation(account_id, root_key)?
         };
         let engine = self.running_engine().await?;
         engine
@@ -3711,12 +3635,7 @@ impl RuntimeSupervisor {
     ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_calls_create_link_auth(
-                account_id,
-                root_key,
-                room_id,
-                self.config.mode,
-            )?
+            service.prepare_calls_create_link_auth(account_id, root_key, room_id)?
         };
         let engine = self.running_engine().await?;
         engine
@@ -3735,7 +3654,7 @@ impl RuntimeSupervisor {
     ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_calls_group_proof(account_id, group_id, self.config.mode)?
+            service.prepare_calls_group_proof(account_id, group_id)?
         };
         let engine = self.running_engine().await?;
         engine
@@ -3755,7 +3674,7 @@ impl RuntimeSupervisor {
     ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_calls_group_members(account_id, group_id, self.config.mode)?
+            service.prepare_calls_group_members(account_id, group_id)?
         };
         let engine = self.running_engine().await?;
         engine
@@ -3767,12 +3686,11 @@ impl RuntimeSupervisor {
     /// calls.endorsementsPublicKey (contract revision 1.88, §4.73): the
     /// constant-derivation passthrough — no account, no material input, no
     /// network; the engine derives from its pinned legacy ServerPublicParams
-    /// and the bytes pass through. The mode seam is the whole gate (the
-    /// face is a KT-extension method a stock signal-cli does not carry).
+    /// and the bytes pass through (a KT-extension engine method).
     pub async fn calls_endorsements_public_key(&self) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_calls_endorsements_public_key(self.config.mode)?
+            service.prepare_calls_endorsements_public_key()?
         };
         let engine = self.running_engine().await?;
         engine
@@ -4372,9 +4290,9 @@ impl RuntimeSupervisor {
 
     /// backups.importSnapshot (contract revision 1.78, §4.68): forward the
     /// caller-chosen official snapshot directory to the engine's import task,
-    /// then arm the consumption watcher. The account resolution and engine-mode
-    /// gate ride the §4.38 faces (kt-engine only, capability `history-import`
-    /// — no new bit); the Mutating engine call answers SEND_OUTCOME_UNKNOWN on
+    /// then arm the consumption watcher. The account resolution rides the
+    /// §4.38 faces (capability `history-import` — no new bit); the Mutating
+    /// engine call answers SEND_OUTCOME_UNKNOWN on
     /// an indeterminate outcome and never retries — the watcher still spawns so
     /// an import that actually started is observed to its terminal state.
     pub async fn import_local_snapshot(
@@ -4384,7 +4302,7 @@ impl RuntimeSupervisor {
     ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_import_snapshot(account_id, snapshot_dir, self.config.mode)?
+            service.prepare_import_snapshot(account_id, snapshot_dir)?
         };
         let engine = self.running_engine().await?;
         match engine
@@ -4420,17 +4338,9 @@ impl RuntimeSupervisor {
     /// is stripped and `accountId` rides in its place (the §4.46 precedent).
     /// Read-only, so an engine that is down or an indeterminate read degrades
     /// to the disk-truth idle projection rather than inventing a task state.
-    /// The mode gate sits first (the exportStatus launcher-capability
-    /// precedent): the face has no store fallback, its whole truth is the
-    /// engine's import task.
+    /// The face has no store fallback, its whole truth is the engine's import
+    /// task.
     pub async fn import_snapshot_status(&self, account_id: &str) -> Result<Value, ServiceError> {
-        if !self.history_import_capable() {
-            return Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "official snapshot import requires the kt-engine mode",
-                false,
-            )));
-        }
         let signal_account = {
             let service = self.service.lock().await;
             service.prepare_backups_account(account_id)?
@@ -4469,9 +4379,9 @@ impl RuntimeSupervisor {
     }
 
     /// backups.restoreFromCloud (contract revision 1.83, §4.69): forward the
-    /// cloud-restore start to the engine — the account resolution and
-    /// engine-mode gate ride the §4.68 ladder (kt-engine only, capability
-    /// `history-import` — no new bit), and the engine runs the whole chain
+    /// cloud-restore start to the engine — the account resolution rides the
+    /// §4.68 ladder (capability `history-import` — no new bit), and the
+    /// engine runs the whole chain
     /// (credentials 404-bootstrap → zkgroup → chat gRPC → CDN → decrypt →
     /// NDJSON) in its own background. The Mutating engine call answers
     /// SEND_OUTCOME_UNKNOWN on an indeterminate outcome and never retries —
@@ -4488,7 +4398,7 @@ impl RuntimeSupervisor {
     ) -> Result<Value, ServiceError> {
         let params = {
             let service = self.service.lock().await;
-            service.prepare_cloud_restore_account(account_id, self.config.mode)?
+            service.prepare_cloud_restore_account(account_id)?
         };
         let engine = self.running_engine().await?;
         match engine
@@ -4527,17 +4437,9 @@ impl RuntimeSupervisor {
     /// is engine-process memory (the transfer.downloadStatus discipline), so
     /// an engine that is down or an indeterminate read answers
     /// `{present: false}` — "not observable" is exactly the post-restart
-    /// truth, not an invented state. The mode gate sits first (the §4.68
-    /// status-face precedent): the face has no store fallback, its whole
-    /// truth is the engine's restore task.
+    /// truth, not an invented state. The face has no store fallback, its
+    /// whole truth is the engine's restore task.
     pub async fn cloud_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
-        if !self.history_import_capable() {
-            return Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "cloud restore requires the kt-engine mode",
-                false,
-            )));
-        }
         let signal_account = {
             let service = self.service.lock().await;
             service.prepare_backups_account(account_id)?
@@ -4592,7 +4494,7 @@ impl RuntimeSupervisor {
     pub async fn upload_to_cloud(&self, account_id: &str) -> Result<Value, ServiceError> {
         let signal_account = {
             let service = self.service.lock().await;
-            service.prepare_cloud_upload_account(account_id, self.config.mode)?
+            service.prepare_cloud_upload_account(account_id)?
         };
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
@@ -4648,13 +4550,6 @@ impl RuntimeSupervisor {
     /// gate sits first (the §4.69 status-face precedent): the face has no
     /// store fallback, its whole truth is the engine's upload task.
     pub async fn cloud_upload_status(&self, account_id: &str) -> Result<Value, ServiceError> {
-        if !self.cloud_upload_capable() {
-            return Err(ServiceError::Api(ApiError::new(
-                "CAPABILITY_UNAVAILABLE",
-                "cloud backup upload requires the kt-engine mode",
-                false,
-            )));
-        }
         let signal_account = {
             let service = self.service.lock().await;
             service.prepare_backups_account(account_id)?
@@ -5142,7 +5037,7 @@ impl RuntimeSupervisor {
     }
 
     /// Pull the contacts/groups signal-cli already synced from the primary
-    /// device into the local cache. Both calls are ReadOnly on the single JVM
+    /// device into the local cache. Both calls are ReadOnly on the single engine
     /// queue, so they cannot starve or corrupt mutating sends. A successful
     /// sync less than 60s old short-circuits to the cached counts.
     pub async fn sync_contacts(
@@ -5905,19 +5800,11 @@ async fn converge_history_retention(store: Arc<Store>) {
 fn history_import_status_projection(
     store: &Arc<Store>,
     data_dir: &Path,
-    capable: bool,
     account_id: &str,
 ) -> Result<Value, ServiceError> {
     let account = store
         .account_by_id(account_id)?
         .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
-    if !capable {
-        return Ok(json!({
-            "accountId": account_id,
-            "state": "unavailable",
-            "reason": "engine-mode",
-        }));
-    }
     if let Some(row) = store.history_import_row(account_id)? {
         return serde_json::to_value(row)
             .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)));
@@ -6015,19 +5902,11 @@ fn compose_import_progress(downloading: Option<Value>, import_pass_active: bool)
 fn history_import_retry_projection(
     store: &Arc<Store>,
     data_dir: &Path,
-    capable: bool,
     account_id: &str,
 ) -> Result<Value, ServiceError> {
     let account = store
         .account_by_id(account_id)?
         .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
-    if !capable {
-        return Err(ServiceError::Api(ApiError::new(
-            "NOT_RETRYABLE",
-            "history import is not available in this engine mode",
-            false,
-        )));
-    }
     let on_disk = crate::history_import::archive_path(data_dir, &account.signal_account)
         .map(|path| crate::history_import::archive_ready(&path))
         .unwrap_or(false);
@@ -7346,10 +7225,11 @@ mod tests {
         );
     }
 
-    /// The §4.39 roster capture (contract revision 1.40): the pinned
-    /// signal-cli member/admin shapes mark admins through both faces, the
-    /// engine-mode shape marks none, address-less entries drop individually,
-    /// and the roster cap holds while memberCount keeps the upstream length.
+    /// The §4.39 roster capture (contract revision 1.40): the historical
+    /// signal-cli member/admin shapes mark admins through both channels, the
+    /// kt-signal-engine shape marks none, address-less entries drop
+    /// individually, and the roster cap holds while memberCount keeps the
+    /// upstream length.
     #[test]
     fn group_extra_json_captures_the_bounded_roster() {
         use super::group_extra_json;
@@ -7387,7 +7267,7 @@ mod tests {
             ]
         );
 
-        // Engine-mode shape (kt-signal-engine listGroups): bare number
+        // Engine shape (kt-signal-engine listGroups): bare number
         // entries, no uuid key, no admin face — the projection difference
         // §4.39 records.
         let engine_group = json!({"id": "aWQ", "name": "g", "isMember": true});
@@ -8268,12 +8148,12 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// The signal-cli face routes the timer through the mutating
-    /// `updateContact` (`expiration`, single-string recipient), mirrors the
-    /// conversation state on the definite success, and rides the refreshed
-    /// summary out on conversation.changed.
+    /// The direct route dispatches the engine's mutating
+    /// `setExpirationTimer` (`expirationInSeconds`, single-string
+    /// recipient), mirrors the conversation state on the definite success,
+    /// and rides the refreshed summary out on conversation.changed.
     #[tokio::test]
-    async fn set_expire_timer_routes_update_contact_and_mirrors_state() {
+    async fn set_expire_timer_routes_set_expiration_timer_and_mirrors_state() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -8310,86 +8190,6 @@ mod tests {
             .set_conversation_expire_timer(crate::service::ConversationsSetExpireTimerParams {
                 account_id: account.id.clone(),
                 conversation_id: conversation.id.clone(),
-                expire_seconds: 86_400,
-            })
-            .await
-            .unwrap();
-        assert_eq!(result.expire_timer_seconds, 86_400);
-
-        let summary = supervisor
-            .service
-            .lock()
-            .await
-            .store_ref()
-            .conversation_summary(&account.id, &conversation.id)
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary.expire_timer_seconds, Some(86_400));
-        let event = timeout(Duration::from_secs(2), host_lane.recv())
-            .await
-            .expect("conversation.changed within timeout")
-            .unwrap();
-        let HostSideEvent::ConversationChanged(changed) = event else {
-            panic!("expected a conversation.changed event");
-        };
-        assert_eq!(changed.expire_timer_seconds, Some(86_400));
-
-        let send_log = std::fs::read_to_string(
-            temp.path()
-                .join("signal-data")
-                .join(".fixture-send-log.jsonl"),
-        )
-        .expect("fixture must log the dispatch");
-        let dispatch: serde_json::Value = send_log
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .find(|params: &serde_json::Value| params["expiration"] == 86_400)
-            .expect("the timer call must reach updateContact");
-        assert_eq!(dispatch["account"], "+15555550100");
-        assert_eq!(dispatch["recipient"], "+15555550101");
-        supervisor.shutdown().await.unwrap();
-    }
-
-    /// The engine face routes the same request through `setExpirationTimer`
-    /// (`expirationInSeconds`), mirroring the identical local state.
-    #[tokio::test]
-    async fn set_expire_timer_routes_set_expiration_timer_in_engine_mode() {
-        let temp = TempDir::new().unwrap();
-        let store =
-            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
-            temp.path().join("signal-data"),
-        );
-        config.mode = crate::engine::SignalCliMode::KtEngine;
-        config.request_timeout = Duration::from_secs(3);
-        config.shutdown_grace = Duration::from_millis(100);
-        let supervisor = Arc::new(RuntimeSupervisor::new(
-            config,
-            store,
-            DEFAULT_PROXY_GROUP_ID.to_string(),
-            None,
-        ));
-        supervisor.start().await.unwrap();
-        let account = supervisor
-            .service
-            .lock()
-            .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
-            .unwrap()
-            .remove(0);
-        let conversation = supervisor
-            .service
-            .lock()
-            .await
-            .store_ref()
-            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
-            .unwrap();
-
-        let result = supervisor
-            .set_conversation_expire_timer(crate::service::ConversationsSetExpireTimerParams {
-                account_id: account.id.clone(),
-                conversation_id: conversation.id.clone(),
                 expire_seconds: 604_800,
             })
             .await
@@ -8418,6 +8218,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(summary.expire_timer_seconds, Some(604_800));
+        let event = timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        let HostSideEvent::ConversationChanged(changed) = event else {
+            panic!("expected a conversation.changed event");
+        };
+        assert_eq!(changed.expire_timer_seconds, Some(604_800));
         supervisor.shutdown().await.unwrap();
     }
 
@@ -8428,7 +8236,7 @@ mod tests {
     /// §4.55 array projection (no `number` key on the engine record). The
     /// dispatch log pins the engine method name and the resolved account.
     #[tokio::test]
-    async fn username_read_faces_route_engine_methods_in_engine_mode() {
+    async fn username_read_faces_route_engine_methods() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -8436,7 +8244,6 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
             temp.path().join("signal-data"),
         );
-        config.mode = crate::engine::SignalCliMode::KtEngine;
         config.request_timeout = Duration::from_secs(3);
         config.shutdown_grace = Duration::from_millis(100);
         let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -8542,7 +8349,7 @@ mod tests {
     /// SEND_OUTCOME_UNKNOWN, is never retried (exactly one reserve dispatch,
     /// no confirm hop), and the next call lands on a fresh engine.
     #[tokio::test]
-    async fn username_write_face_two_hop_delete_and_structured_codes_in_engine_mode() {
+    async fn username_write_face_two_hop_delete_and_structured_codes() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -8550,7 +8357,6 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
             temp.path().join("signal-data"),
         );
-        config.mode = crate::engine::SignalCliMode::KtEngine;
         config.request_timeout = Duration::from_secs(3);
         config.shutdown_grace = Duration::from_millis(100);
         let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -8587,7 +8393,7 @@ mod tests {
         );
 
         // Bare nickname: the adopted candidate wins (the engine picks the
-        // discriminator; the JVM face's reserveUsernameFromNickname twin).
+        // discriminator).
         let bare = supervisor
             .set_username(set_params(Some("kt_agent_bare".into()), false))
             .await
@@ -8803,9 +8609,9 @@ mod tests {
     /// SEND_OUTCOME_UNKNOWN and is never retried (rowless discipline — there
     /// is no pending row, the restart is explicit). The stories-disabled
     /// toggle round-trips through the store from the official default
-    /// (enabled) in the same engine mode — the faces are mode-independent.
+    /// (enabled).
     #[tokio::test]
-    async fn story_faces_route_engine_send_and_local_toggle_in_engine_mode() {
+    async fn story_faces_route_engine_send_and_local_toggle() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -8813,7 +8619,6 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
             temp.path().join("signal-data"),
         );
-        config.mode = crate::engine::SignalCliMode::KtEngine;
         config.request_timeout = Duration::from_secs(3);
         config.shutdown_grace = Duration::from_millis(100);
         let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -8982,7 +8787,7 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// stories.markViewed (contract 1.85, §4.70) in engine mode: the frame is
+    /// stories.markViewed (contract 1.85, §4.70): the frame is
     /// exactly the engine's `sendViewedReceipt` params — resolved signal
     /// account, the trimmed author as the single recipient, one timestamp —
     /// the receipt-class answer is `sent`, a crash in flight degrades to
@@ -8990,7 +8795,7 @@ mod tests {
     /// and the next receipt sends again, and the raw store account id never
     /// rides any frame.
     #[tokio::test]
-    async fn stories_mark_viewed_routes_sendviewedreceipt_in_engine_mode() {
+    async fn stories_mark_viewed_routes_sendviewedreceipt() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -8998,7 +8803,6 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
             temp.path().join("signal-data"),
         );
-        config.mode = crate::engine::SignalCliMode::KtEngine;
         config.request_timeout = Duration::from_secs(3);
         config.shutdown_grace = Duration::from_millis(100);
         let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -9082,126 +8886,11 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// stories.sendReaction (contract 1.94, §4.77) in JVM mode: the frame is
-    /// the pinned upstream's story-reaction shape — `sendReaction` with the
-    /// author as targetAuthor and single recipient, the story timestamp as
-    /// targetTimestamp, `story: true` — the send-class answer is `sent`, a
-    /// crash in flight answers `unknown` without a retry, an explicit
-    /// restart lands a fresh engine and the next reaction sends again, and
-    /// the raw store account id never rides any frame.
-    #[tokio::test]
-    async fn stories_send_reaction_routes_story_frame_and_degrades_unknown() {
-        let temp = TempDir::new().unwrap();
-        let store =
-            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
-            temp.path().join("signal-data"),
-        );
-        config.request_timeout = Duration::from_secs(3);
-        config.shutdown_grace = Duration::from_millis(100);
-        let supervisor = Arc::new(RuntimeSupervisor::new(
-            config,
-            store,
-            DEFAULT_PROXY_GROUP_ID.to_string(),
-            None,
-        ));
-        supervisor.start().await.unwrap();
-        let account = supervisor
-            .service
-            .lock()
-            .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
-            .unwrap()
-            .remove(0);
-
-        let reaction = |author: &str, sent_at: u64, emoji: &str, remove: bool| {
-            crate::service::StoriesSendReactionParams {
-                account_id: account.id.clone(),
-                story_author: author.to_string(),
-                story_sent_at: sent_at,
-                emoji: emoji.to_string(),
-                remove,
-                operation_id: None,
-            }
-        };
-
-        let sent = supervisor
-            .send_story_reaction(reaction("  +15555550101  ", 1727000000000, "👍", false))
-            .await
-            .unwrap();
-        assert_eq!(sent, "sent");
-
-        // Crash with the mutating call in flight (the fixture's reaction
-        // sentinel 423): the reaction may or may not have reached the
-        // server — `unknown`, never retried.
-        let crash = supervisor
-            .send_story_reaction(reaction("+15555550101", 423, "👍", false))
-            .await
-            .unwrap();
-        assert_eq!(crash, "unknown");
-        supervisor.start().await.unwrap();
-        let recovered = supervisor
-            .send_story_reaction(reaction("+15555550101", 1727000000001, "🎉", true))
-            .await
-            .unwrap();
-        assert_eq!(recovered, "sent");
-
-        // The dispatch log pins the frame shapes: resolved signal account,
-        // the trimmed author as targetAuthor and the single recipient, the
-        // story timestamp as targetTimestamp, `story: true`, the crash
-        // sentinel dispatched exactly once (no retry), and the raw account
-        // id never rides any frame.
-        let send_log = std::fs::read_to_string(
-            temp.path()
-                .join("signal-data")
-                .join(".fixture-send-log.jsonl"),
-        )
-        .expect("fixture must log the dispatches");
-        let dispatches: Vec<serde_json::Value> = send_log
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let reactions: Vec<&serde_json::Value> = dispatches
-            .iter()
-            .filter(|params| params.get("emoji").is_some())
-            .collect();
-        assert_eq!(
-            reactions.len(),
-            3,
-            "one reaction + the crash + the recovery"
-        );
-        for dispatch in &reactions {
-            assert_eq!(dispatch["account"], "+15555550100");
-            assert!(
-                dispatch.get("accountId").is_none(),
-                "the store account id never rides the frame"
-            );
-            assert_eq!(dispatch["story"], true);
-            assert_eq!(dispatch["targetAuthor"], "+15555550101");
-            assert_eq!(dispatch["recipient"], serde_json::json!(["+15555550101"]));
-        }
-        assert_eq!(reactions[0]["emoji"], "👍");
-        assert_eq!(reactions[0]["remove"], false);
-        assert_eq!(
-            reactions[0]["targetTimestamp"],
-            serde_json::json!(1727000000000u64)
-        );
-        assert_eq!(reactions[1]["targetTimestamp"], serde_json::json!(423));
-        assert_eq!(reactions[2]["emoji"], "🎉");
-        assert_eq!(reactions[2]["remove"], true);
-        assert_eq!(
-            reactions[2]["targetTimestamp"],
-            serde_json::json!(1727000000001u64)
-        );
-        supervisor.shutdown().await.unwrap();
-    }
-
-    /// stories.sendReaction on the kt-engine face: the engine-gap answer is
+    /// stories.sendReaction: the engine-gap answer is
     /// CAPABILITY_UNAVAILABLE (not retryable) after local validation — the
     /// §4.53 precedent — and no frame ever leaves the process.
     #[tokio::test]
-    async fn stories_send_reaction_answers_capability_unavailable_on_kt_engine() {
+    async fn stories_send_reaction_answers_capability_unavailable() {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
@@ -9209,7 +8898,6 @@ mod tests {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
             temp.path().join("signal-data"),
         );
-        config.mode = crate::engine::SignalCliMode::KtEngine;
         config.request_timeout = Duration::from_secs(3);
         config.shutdown_grace = Duration::from_millis(100);
         let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -9254,7 +8942,7 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// messages.markViewed (contract 1.94, §4.77) end to end in JVM mode:
+    /// messages.markViewed (contract 1.94, §4.77) end to end:
     /// the selected incoming rows take their local `viewed_at` stamp while
     /// the upstream receipt still confirms `sent`, a group conversation
     /// stamps with an empty fan-out, and messages.markRead never stamps.

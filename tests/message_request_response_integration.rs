@@ -68,7 +68,7 @@ fn spawn_connector(root: &Path, endpoint: &Path, secret_file: &Path) -> Child {
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
-        .env("KT_FAKE_EXPECT_JAVA_OPTS", "-Xms16m -Xmx384m")
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1")
         .env("JAVA_TOOL_OPTIONS", "poison")
         .env("_JAVA_OPTIONS", "poison")
         .env("JDK_JAVA_OPTIONS", "poison");

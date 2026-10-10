@@ -478,7 +478,8 @@ both repos.
 - Architecture decision: `docs/adr/0001-jvm-per-proxy-group.md`
 - Contract: `schemas/connector-api-v1.schema.json`, `docs/implementation-plan.md` §4.4
 - Desktop contract: `contracts/signal-host-adapter.md` (**1.5** as of `387400c5`)
-- CI: `.github/workflows/build-signal-cli-native.yml`, `packaging/scripts/build-signal-cli-native.sh`
+- CI: `.github/workflows/ci.yml` (the GraalVM native pipeline this snapshot
+  shipped was retired with the dual-engine deletion — ADR 0003)
 - Desktop smoke: `scripts/signal-smoke-cdp.mjs`
 - Desktop handover (long-form): `docs/plan/signal-handoff-next-owner.md` in
   the desktop worktree — its §6.27 mirrors this file's §3.

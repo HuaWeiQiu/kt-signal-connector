@@ -261,7 +261,7 @@ pub const METHODS: &[MethodRow] = &[
     // process-wide single-slot progress snapshot. Advertised through the
     // existing `backup-export` tag, widened in place (the 1.82
     // call-signaling precedent — the upload's entire input is the
-    // backup-export artifact chain); kt-engine only (the §4.69 mode seam).
+    // backup-export artifact chain); KT-extension, no upstream counterpart.
     ("backups.uploadToCloud", Lane::Send, true, "accounts"),
     ("backups.uploadStatus", Lane::Read, false, "read"),
     // Report spam (contract revision 1.49, §4.48): mutating, send-lane
@@ -338,9 +338,8 @@ pub const METHODS: &[MethodRow] = &[
     // connector's own receive gate — local store only, no engine frame, but
     // still an account-state write, so setDisabled rides the send lane
     // behind the same-account mutex and delete barrier (the setLocalAlias
-    // precedent) and getDisabled is a bounded store read; both are
-    // mode-independent (every engine face answers them). Advertised through
-    // `stories`.
+    // precedent) and getDisabled is a bounded store read; both answer from
+    // the local store alone. Advertised through `stories`.
     ("messages.sendStory", Lane::Send, true, "send"),
     ("stories.setDisabled", Lane::Send, true, "send"),
     ("stories.getDisabled", Lane::Read, false, "read"),
@@ -349,8 +348,8 @@ pub const METHODS: &[MethodRow] = &[
     // the messages.markViewed receipt class verbatim (best-effort, failures
     // degrade to `unknown`, nothing retries), with the §4.29 row selection
     // replaced by the story anchor (storyAuthor + storySentAt). The upstream
-    // face is the pinned upstream's own `sendViewedReceipt` (it exists on
-    // every mode), so no capability seam. Advertised through the existing
+    // face is the engine's own `sendViewedReceipt`, so no capability seam.
+    // Advertised through the existing
     // `stories` tag (widened in place, the 1.82 call-signaling precedent).
     ("stories.markViewed", Lane::Send, true, "send"),
     // Story reaction send (contract 1.94, §4.77): mutating send-lane
@@ -374,7 +373,7 @@ pub const METHODS: &[MethodRow] = &[
     // verbatim: reaction-class write-lane mutex and delete drain barrier,
     // every download/verify failure terminal, never auto-retried. The chain
     // is pure connector (transit-CDN GET + the §4.38 step-3 crypto), zero
-    // engine involvement — mode-independent by construction. openAttachment
+    // engine involvement. openAttachment
     // is the messages.attachments.open class verbatim (read lane, handle
     // mint over the already-landed file, no engine touch); chunk read and
     // close ride the existing handle faces unchanged. Advertised through
@@ -405,9 +404,8 @@ pub const METHODS: &[MethodRow] = &[
     // chatFolders.setRecords is the mutating storage-service write —
     // reaction-class write-lane mutex and delete barrier, no local
     // persistence on either side (records cross verbatim; the connector
-    // neither interprets nor re-keys them). kt-engine only (KT-extension
-    // methods a stock signal-cli does not carry, the §4.73 mode seam);
-    // advertised through `chat-folders`.
+    // neither interprets nor re-keys them). KT-extension, no upstream
+    // counterpart; advertised through `chat-folders`.
     ("chatFolders.list", Lane::Read, false, "read"),
     ("chatFolders.setRecords", Lane::Send, true, "send"),
 ];
@@ -535,8 +533,7 @@ pub const METHOD_NAMES: [&str; METHODS.len()] = {
 /// marks the §4.78 chat-folder sync faces (`chatFolders.list` read over the
 /// account's ChatFolderRecord set plus the `chatFolders.setRecords`
 /// storage-service write — one capability for the read and write halves,
-/// the 1.36/1.37 sync-face discipline; kt-engine only, the §4.73 mode
-/// seam). They never
+/// the 1.36/1.37 sync-face discipline). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of

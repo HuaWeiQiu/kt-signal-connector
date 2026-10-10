@@ -96,8 +96,8 @@ Keep `--load-accounts ≤ 8`: receive-driven account upserts bypass the link
 ceiling (`MAX_ACCOUNTS_PER_ENGINE` gates linking only, by design), and the
 soak models a legal engine.
 
-Real engines: pass `--signal-cli <path>` (plus `--java-home`, `--native` as
-needed) and no load steps — injection is fake-only. The real-account ladder
+Real engines: pass `--signal-cli <path>` to the driver and no load steps —
+injection is fake-only. The real-account ladder
 is a separate supply decision (D4) and does not block baselines.
 
 ## Artifacts

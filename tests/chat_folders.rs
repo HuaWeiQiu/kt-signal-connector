@@ -10,14 +10,14 @@
 //! connector-side). The fixture plays the engine (the stub records pin the
 //! wire shape, never real cloud state), the structured STORAGE ladder steers
 //! from markers, the mutating-crash sentinel pins the unknown-outcome
-//! discipline, and the mode seam answers before any engine starts.
+//! discipline.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::{SignalCliConfig, SignalCliMode};
+use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::service::{ChatFoldersListParams, ChatFoldersSetRecordsParams};
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -49,7 +49,6 @@ fn seed_engine_registry(data_dir: &Path) {
 fn chat_folder_supervisor(
     temp: &TempDir,
     data_dir: &Path,
-    mode: SignalCliMode,
 ) -> (Arc<Store>, Arc<RuntimeSupervisor>, String) {
     seed_engine_registry(data_dir);
     let store = test_store(temp.path());
@@ -61,7 +60,6 @@ fn chat_folder_supervisor(
         )
         .unwrap();
     let mut config = SignalCliConfig::new(fixture().to_path_buf(), data_dir.to_path_buf());
-    config.mode = mode;
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -90,8 +88,7 @@ fn log_lines(data_dir: &Path) -> Vec<Value> {
 async fn chat_folder_faces_pass_through_verbatim() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        chat_folder_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = chat_folder_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     let list = supervisor
@@ -210,8 +207,7 @@ async fn chat_folder_faces_pass_through_verbatim() {
 async fn chat_folder_error_ladder_rides_the_wire() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        chat_folder_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = chat_folder_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
     let marker = |name: &str| data_dir.join(name);
 
@@ -294,8 +290,7 @@ async fn chat_folder_error_ladder_rides_the_wire() {
 async fn chat_folder_gates_answer_locally() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (store, supervisor, account_id) =
-        chat_folder_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (store, supervisor, account_id) = chat_folder_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
     let id = "0d6d50f5-7f9e-4a1b-9c2d-3e4f5a6b7c8d";
 
@@ -451,8 +446,7 @@ async fn chat_folder_gates_answer_locally() {
 async fn chat_folder_crash_answers_unknown_and_never_retries() {
     let temp = TempDir::new().unwrap();
     let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        chat_folder_supervisor(&temp, &data_dir, SignalCliMode::KtEngine);
+    let (_store, supervisor, account_id) = chat_folder_supervisor(&temp, &data_dir);
     supervisor.start().await.unwrap();
 
     let error = supervisor
@@ -495,46 +489,5 @@ async fn chat_folder_crash_answers_unknown_and_never_retries() {
         crash_calls.len(),
         1,
         "an unknown write outcome is never retried: {crash_calls:?}"
-    );
-}
-
-/// The mode seam: JVM mode answers CAPABILITY_UNAVAILABLE on both faces —
-/// before any engine starts (no engine traffic, the §4.73 ladder mirrored).
-#[tokio::test]
-async fn chat_folder_faces_gate_the_mode_seam() {
-    let temp = TempDir::new().unwrap();
-    let data_dir = temp.path().join("signal-data");
-    let (_store, supervisor, account_id) =
-        chat_folder_supervisor(&temp, &data_dir, SignalCliMode::Jvm);
-
-    let list_error = supervisor
-        .chat_folders_list(ChatFoldersListParams {
-            account_id: account_id.clone(),
-        })
-        .await
-        .err()
-        .unwrap()
-        .into_api();
-    assert_eq!(list_error.code, "CAPABILITY_UNAVAILABLE");
-    assert!(!list_error.retryable);
-
-    let write_error = supervisor
-        .chat_folders_set_records(ChatFoldersSetRecordsParams {
-            account_id,
-            records: Some(vec![json!({"id": "0d6d50f5-7f9e-4a1b-9c2d-3e4f5a6b7c8d"})]),
-            remove_ids: None,
-        })
-        .await
-        .err()
-        .unwrap()
-        .into_api();
-    assert_eq!(write_error.code, "CAPABILITY_UNAVAILABLE");
-    assert!(!write_error.retryable);
-
-    // The seam never logged a frame: no engine process existed to receive
-    // one.
-    assert!(
-        !data_dir.join(".fixture-send-log.jsonl").exists(),
-        "the seam must answer before any upstream frame"
     );
 }

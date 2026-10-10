@@ -6191,52 +6191,37 @@ Rules:
   have accepted the device and a retry would claim a second device slot. A definite
   `UPSTREAM_TIMEOUT` stays retryable: the call provably did not take effect.
 - child shutdown is graceful first, then forced after a fixed deadline.
-- signal-cli does not read OS proxy settings. An optional SOCKS proxy reaches the JVM as
-  `-DsocksProxyHost/-DsocksProxyPort` appended to the pinned `JAVA_OPTS`; the launcher passes it via
-  the `KT_SIGNAL_SOCKS_PROXY=host:port` environment variable (preferred, so it stays off the process
-  command line) or `serve --socks-proxy host:port`. An invalid value aborts startup with a clear
-  error. The default is a direct connection, and watchdog restarts reuse the same proxy config.
-  Phase 4 (ADR 0001) generalizes this per proxy group: each group's engine receives its own
-  group's proxy through exactly this mechanism (`KT_SIGNAL_PROXY_GROUPS` / repeated
+- the engine does not read OS proxy settings. An optional SOCKS proxy is configured with the
+  `KT_SIGNAL_SOCKS_PROXY=host:port` environment variable (preferred, so it stays off the process
+  command line) or `serve --socks-proxy host:port`; the value is validated at launch, nothing
+  proxy-shaped is placed on the child command line, and proxy parity holds at the environment
+  level — the engine child inherits the same `KT_SIGNAL_SOCKS_PROXY` variable and maps it onto
+  reqwest's `ALL_PROXY`, which the libsignal-service HTTP and WebSocket transport (a single
+  reqwest client) honors natively. An invalid value aborts startup with a clear error. The
+  default is a direct connection, and watchdog restarts reuse the same proxy config. Phase 4
+  (ADR 0001) generalizes the configuration per proxy group (`KT_SIGNAL_PROXY_GROUPS` / repeated
   `serve --proxy-group`), the legacy global option configures the `default` group, and each
   group's watchdog restarts reuse that group's config unchanged.
-- Phase 5 adds a GraalVM native-image mode, selected explicitly with `serve --signal-cli-native`
-  or `KT_SIGNAL_CLI_NATIVE=1` (explicit flag, not file-type probing: packaging controls what it
-  ships, and a wrong heuristic guess would silently drop the JVM heap budget). The CLI arguments
-  are identical to the JVM launcher shape. Native mode skips `JAVA_HOME` validation/forwarding and
-  `JAVA_OPTS` injection; a configured SOCKS proxy is prepended to argv as
-  `-DsocksProxyHost/-DsocksProxyPort`, which the GraalVM native-image launcher applies as runtime
-  system properties (verified against signal-cli 0.14.7 native: SOCKS5 CONNECT with remote DNS,
-  staging provisioning round-trip through a local relay). The trade-off is that the proxy host:port
-  appears on the child command line; the JVM mode keeps it in the environment. Every other
-  supervision guarantee (absolute-path non-symlink executable check, stdio JSON-RPC, receive-mode,
-  kill-on-drop, watchdog, RSS sampling) is identical across modes.
-- Experimental `kt-engine` mode (2026-10-03): launches KT's own AGPL-3.0 sidecar
-  `kt-signal-engine` (separate repository; the libsignal-based replacement for the signal-cli JVM)
-  in place of signal-cli, selected explicitly with `serve --signal-cli-engine kt-engine` or
-  `KT_SIGNAL_CLI_ENGINE=kt-engine` (explicit selection, never probed: packaging controls what it
-  ships). In this mode `--signal-cli` points at the engine executable. The stdio JSON-RPC surface,
+- the engine (ADR 0003, 2026-10-10 — the only engine; the signal-cli JVM/native runtime modes and
+  their selection flags are deleted) is KT's own AGPL-3.0 sidecar `kt-signal-engine` (separate
+  repository; the libsignal-based replacement for the signal-cli JVM). `--signal-cli` points at
+  the engine executable (flag name kept for launcher compatibility). The stdio JSON-RPC surface,
   the argv tail (`--data-dir <dir> jsonRpc --receive-mode on-start [--ignore-attachments]
-  --ignore-stories --ignore-stickers`), and every supervision guarantee are identical to the
-  signal-cli modes, so the watchdog, unlink detection (§4.17: the engine reproduces the
-  AuthorizationFailed classification surface), and shutdown semantics apply unchanged. Two
-  transport divergences, both deliberate: the JVM/native `-DsocksProxy*` entries are never
-  emitted in this mode because the engine's argv parser is fail-closed on unknown arguments —
-  proxy parity instead holds at the environment level, with the engine consuming the same
-  `KT_SIGNAL_SOCKS_PROXY=host:port` variable this launcher injects and mapping it onto reqwest's
-  `ALL_PROXY`, which the libsignal-service HTTP and WebSocket transport (a single reqwest client)
-  honors natively, so the per-group desktop proxy probe keeps working unchanged; and
-  `--media-ingest` is downgraded instead of refused (2026-10-03): the engine never downloads
-  attachments, so arming ingest in this mode silently keeps the pre-1.17 shape —
-  `--ignore-attachments` stays on the argv, the media governor is not armed, and every media
-  method answers CAPABILITY_UNAVAILABLE — with a launch-time warning, so the dev desktop
-  (which arms ingest unconditionally) still boots instead of failing closed. `JAVA_HOME` is
-  ignored with a warning, and the child environment is inherited
-  except for the store-key override, exactly like the other modes. The engine writes its own
+  --ignore-stories --ignore-stickers`), and every supervision guarantee carry over unchanged, so
+  the watchdog, unlink detection (§4.17: the engine reproduces the AuthorizationFailed
+  classification surface), and shutdown semantics apply unchanged. `--java-home` is accepted and
+  ignored with a warning (the desktop launcher still passes it; the desktop-side cleanup is a
+  separate batch), the engine's argv parser is fail-closed on unknown arguments, and the child
+  environment is inherited except for the store-key override. The engine writes its own
   `engine-state.json` / `engine-send-log.jsonl` / `accounts/lk-<hex>` layout under the group data
-  directory, disjoint from signal-cli's files and the connector's `.kt-signal-connector.lock`.
-  Scope: local smoke and development only — runtime-manifest packaging, licensing metadata, and
-  Desktop integration for the engine bundle are future work.
+  directory, disjoint from the connector's `.kt-signal-connector.lock`. `--media-ingest` is
+  downgraded instead of refused (2026-10-03): the engine never downloads attachments, so arming
+  ingest silently keeps the pre-1.17 shape — `--ignore-attachments` stays on the argv, the media
+  governor is not armed, and every media method answers CAPABILITY_UNAVAILABLE — with a
+  launch-time warning, so the dev desktop (which arms ingest unconditionally) still boots instead
+  of failing closed. Runtime manifests describe the connector bundle only: libsignal rides the
+  engine face, and the former signal-cli/JRE component entries and their packaging chain are
+  gone.
 
 During the local Phase 1 PoC, the trusted launcher supplies absolute executable and data-directory
 paths as process arguments; neither is accepted over host IPC. Phase 3 replaces this bootstrap with

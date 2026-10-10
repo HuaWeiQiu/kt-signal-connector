@@ -34,9 +34,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::DEFAULT_PROXY_GROUP_ID;
-use crate::engine::{
-    EngineError, EngineEvent, EngineState, EngineStatus, SignalCliConfig, SignalCliMode,
-};
+use crate::engine::{EngineError, EngineEvent, EngineState, EngineStatus, SignalCliConfig};
 use crate::groups::{MAX_PROXY_GROUPS, ProxyGroupPlan};
 use crate::protocol::ApiError;
 use crate::service::{
@@ -864,7 +862,7 @@ impl ProxyGroupRuntime {
 
     /// Chat-folder sync (contract 1.95, §4.78): account state — the folders
     /// live in the account's storage session, so both faces route through the
-    /// account's owning engine (the §4.34 sync-face class; kt-engine only).
+    /// account's owning engine (the §4.34 sync-face class).
     pub async fn chat_folders_list(
         &self,
         params: crate::service::ChatFoldersListParams,
@@ -933,11 +931,8 @@ impl ProxyGroupRuntime {
     /// accounts.getUsername (contract 1.59, §4.55; the kt-engine read face
     /// opens with contract 1.74, §4.65): the read routes through the
     /// account's owning engine like every account-scoped read, so
-    /// ACCOUNT_NOT_FOUND keeps its precedence — the supervisor's prepare
-    /// seam then answers the honest CAPABILITY_UNAVAILABLE on the JVM/native
-    /// faces (the pinned signal-cli has no upstream username reader) while
-    /// the kt-engine face rides the engine's `getUsername` storage
-    /// projection.
+    /// ACCOUNT_NOT_FOUND keeps its precedence — the face rides the engine's
+    /// `getUsername` storage projection.
     pub async fn get_username(
         &self,
         params: crate::service::AccountsGetUsernameParams,
@@ -1544,19 +1539,18 @@ impl Drop for ProxyGroupRuntime {
 }
 
 /// kt-engine capability downgrade (implementation plan §5): the engine never
-/// downloads attachments, so a launcher that arms media ingest in this mode is
+/// downloads attachments, so a launcher that arms media ingest is
 /// downgraded to the pre-1.17 shape — `--ignore-attachments` stays on the
 /// argv, the media governor is not armed, and every media method answers
 /// CAPABILITY_UNAVAILABLE — instead of refusing the whole channel (the dev
 /// desktop arms media ingest unconditionally).
-fn effective_media_ingest(mode: SignalCliMode, media_ingest: bool) -> bool {
-    if mode == SignalCliMode::KtEngine && media_ingest {
+fn effective_media_ingest(media_ingest: bool) -> bool {
+    if media_ingest {
         tracing::warn!(
-            "kt-engine mode has no attachment ingest; media methods answer CAPABILITY_UNAVAILABLE"
+            "the kt engine has no attachment ingest; media methods answer CAPABILITY_UNAVAILABLE"
         );
-        return false;
     }
-    media_ingest
+    false
 }
 
 /// Open the shared per-profile store once and assemble one supervised engine
@@ -1574,11 +1568,16 @@ pub fn open_group_runtime(
     state_dir: &Path,
     java_home: Option<PathBuf>,
     store_key: Option<StoreKey>,
-    signal_cli_mode: SignalCliMode,
     media_ingest: bool,
     expire_sweep_interval: Duration,
 ) -> Result<Arc<ProxyGroupRuntime>, crate::store::StoreError> {
-    let media_ingest = effective_media_ingest(signal_cli_mode, media_ingest);
+    // Transitional launcher compatibility: the desktop launcher still passes
+    // `--java-home` on every start (ADR 0003 defers the desktop-side cleanup);
+    // the engine runs without a JVM, so the value is only acknowledged.
+    if java_home.is_some() {
+        tracing::warn!("--java-home is ignored: the kt engine runs without a JVM");
+    }
+    let media_ingest = effective_media_ingest(media_ingest);
     let store = Arc::new(Store::open(state_dir, store_key)?);
     let media_handles = std::sync::Arc::new(crate::media::MediaHandleTable::new());
     // §4.46: one process-wide backup file-handle table for every group —
@@ -1588,9 +1587,6 @@ pub fn open_group_runtime(
     let mut slots = Vec::with_capacity(plan.groups.len());
     for entry in &plan.groups {
         let mut config = SignalCliConfig::new(signal_cli.clone(), entry.data_dir.clone());
-        config.java_home = java_home.clone();
-        config.proxy = entry.proxy.clone();
-        config.mode = signal_cli_mode;
         config.media_ingest = media_ingest;
         config.expire_sweep_interval = expire_sweep_interval;
         let supervisor = Arc::new(RuntimeSupervisor::with_backup_handles(
@@ -1689,16 +1685,12 @@ mod tests {
         assert_eq!(runtime.resolve_link_session("never-started").await, None);
     }
 
-    /// kt-engine media downgrade (plan §5): arming ingest in kt-engine mode
-    /// collapses to the pre-1.17 shape; every other mode keeps the launcher's
-    /// choice untouched.
+    /// kt-engine media downgrade (plan §5): arming ingest collapses to the
+    /// pre-1.17 shape — the engine face has no attachment ingest, whatever
+    /// the launcher asked for.
     #[test]
-    fn kt_engine_downgrades_media_ingest_other_modes_keep_it() {
-        assert!(!effective_media_ingest(SignalCliMode::KtEngine, true));
-        assert!(!effective_media_ingest(SignalCliMode::KtEngine, false));
-        for mode in [SignalCliMode::Jvm, SignalCliMode::Native] {
-            assert!(effective_media_ingest(mode, true));
-            assert!(!effective_media_ingest(mode, false));
-        }
+    fn media_ingest_is_always_downgraded() {
+        assert!(!effective_media_ingest(true));
+        assert!(!effective_media_ingest(false));
     }
 }
