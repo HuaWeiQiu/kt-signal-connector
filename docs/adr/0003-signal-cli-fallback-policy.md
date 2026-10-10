@@ -39,8 +39,11 @@
    持续税，不是保险。故：**JVM/native 运行时模式自即日起冻结维护**——不再为
    其适配任何新面，仅保留既有缝的「诚实拒绝」测试锁；engine-gap 的权威答案
    一律是「等引擎批」而非「切 JVM」。真正的引擎故障回退 = 引擎二进制版本
-   回滚，不是切 signal-cli。**移除 JVM/native 运行时模式代码**（dispatch arms/
-   双轨测试/打包链）另立清理批，待 owner 拍板后排期。
+   回滚，不是切 signal-cli。**移除 JVM/native 运行时模式代码已获 owner 拍板
+   （2026-10-10：不需要，避免维护成本）**——删除 `SignalCliMode::Jvm/Native`
+   两值及全链（CLI 参数/dispatch arms/双轨测试/packaging 打包链），保留
+   `KtEngine`；实施批另开（基于 b-storage-folders 合流后的主线），桌面侧
+   `runtimeResolver` 的 `'jvm'|'native'` 枚举值随后续桌面批收口。
 5. **对照结论失真时的权威序**：官方 Signal-Desktop 源码行为 > Signal-Server
    实际行为 > signal-cli 行为。signal-cli 对照结论与本仓「钉定版无此面」类
    记录在每次引擎 vendor 升级窗口逐项重审（见桌面 matrix 权威注 2026-10-10
