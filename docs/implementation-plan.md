@@ -5,7 +5,26 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.97 (2026-10-10; the runtime.doctor Signal service-plane probe (§4.79): the
+- Contract revision: 1.98 (2026-10-11; the honest media-download advertisement + CDN SOCKS route
+  batch (§4.38 step 3, §4.54): two truths the handshake and the transport now carry about the
+  same face family. Advertisement: the handshake `attachment-download` capability is the one
+  conditional member of the `capabilities` array — it rides only when the runtime's media ingest
+  is genuinely armed (the registry's effective launcher decision, the kt-engine downgrade
+  included, and the exact gate every media method answers: the media table present) — so a
+  connector without it omits the tag and the desktop renders attachment pills metadata-only
+  instead of calling a face that answers `CAPABILITY_UNAVAILABLE` for every download; an armed
+  runtime advertises the pre-1.98 payload byte-for-byte (the method enum and dispatch table are
+  unchanged, and the desktop's `mediaIngest=!app.isPackaged` packaged-default-off posture is a
+  product decision this revision deliberately leaves alone). Transport: the §4.38 step-3 CDN
+  download client — the one machine behind `history.attachmentDownload`, `attachments.download`,
+  and the story byte faces — reads the launcher's `KT_SIGNAL_SOCKS_PROXY` process environment
+  (the doctor's tolerant parse: canonical `host:port`, an explicit `socks5(h)://` prefix
+  normalized; a malformed value reads as unconfigured everywhere else too) and rides the GET as
+  `socks5h://` — remote DNS, the same mapping the engine child gets for `ALL_PROXY` — so the
+  transit-CDN fetch shares the route the engine's own transport takes through walled or
+  DNS-poisoned networks instead of a doomed direct dial to cdn*.signal.org; a missing value
+  builds the previous direct client, and the connect 10 s / total 120 s / no-redirect posture
+  is unchanged) — previously 1.97 (2026-10-10; the runtime.doctor Signal service-plane probe (§4.79): the
   report grows a top-level `service` face — `proxyConfigured` (the launcher's
   `KT_SIGNAL_SOCKS_PROXY` process environment present and well-formed; per-group proxy plans are
   deliberately not consulted, a flag-only proxy reads as unconfigured) plus `chat` and `storage`
@@ -1001,8 +1020,14 @@ Electron Main creates a 256-bit random bootstrap secret. On macOS/Linux it write
 temporary file and the connector reads and deletes that file before accepting a client. On Windows
 Main writes the exact secret to the child process's inherited anonymous stdin pipe and closes it;
 the Windows connector refuses file bootstrap because POSIX mode bits do not prove a private DACL.
-The first frame performs a challenge-response handshake and negotiates API capabilities. The secret
-and endpoint are never logged, and their mutable buffers are zeroized after bootstrap/handshake.
+The first frame performs a challenge-response handshake and negotiates API capabilities. The
+`capabilities` array is every dispatchable method name in table order plus the feature tags; since
+contract 1.98 the `attachment-download` tag is the one conditional member — it rides the array
+only when the runtime's media ingest is armed (the media table present, the exact gate every
+media method answers), so a connector without it never advertises a face that would answer
+`CAPABILITY_UNAVAILABLE` for every download and the desktop takes the honest metadata-only path.
+The secret and endpoint are never logged, and their mutable buffers are zeroized after
+bootstrap/handshake.
 
 The bootstrap payload is two lines (Phase 3 key contract, 2026-08-26): line 1 is the bootstrap
 secret, exactly 64 lowercase hexadecimal characters, unchanged; line 2 is the 32-byte store key,
@@ -2550,7 +2575,15 @@ documented data-directory artifact instead of an RPC surface.
   the tree. Test seam: `history_cdn_base` (launcher-input-only config,
   never set by the production launcher) aims the chain at a local mock CDN
   — the same seam the official desktop carries as its window config cdn
-  values.
+  values. Contract 1.98 transport parity: the download client reads the
+  launcher's `KT_SIGNAL_SOCKS_PROXY` process environment — the doctor's
+  tolerant parse (canonical `host:port`, an explicit `socks5(h)://` prefix
+  normalized; a malformed value reads as unconfigured, everywhere else too)
+  — and rides the GET as `socks5h://` (remote DNS), the same mapping the
+  engine child gets for `ALL_PROXY`, so the transit-CDN fetch shares the
+  route the engine's own transport takes through walled or DNS-poisoned
+  networks; a missing value builds the previous direct client, and the
+  connect 10 s / total 120 s / no-redirect posture is unchanged.
 - Bounded discipline (ADR 0002): the archive is read as a line stream with a hard per-line cap;
   pass 1 stages recipient/chat identity maps into bounded SQLite temp tables (dropped at the
   end), pass 2 streams messages in fixed-size batches (256 rows per transaction, store lock
@@ -4081,7 +4114,11 @@ import rows §4.38 step 3 serves. Two connector halves land together.
   no-new-bit `history-import` discipline, but this face's audience is every
   attachment-pill desktop, not only the history-import ones). A desktop without the tag
   keeps the metadata-only rendering (zero calls); contract 1.61 wire consumers are
-  unaffected.
+  unaffected. Contract 1.98 makes the advertisement honest: the handshake carries the tag
+  only when the runtime's media ingest is armed — the exact gate this face answers
+  (`CAPABILITY_UNAVAILABLE` without it, the registry's kt-engine downgrade included) — so
+  the packaged shape (ingest off) omits the tag instead of inviting a call that fails for
+  every attachment.
 
 ### 4.55 Signal username: `accounts.setUsername`, `accounts.getUsername`, `username.lookup` (contract revision 1.59, 2026-10-06; §4.52→§4.55 renumbered on landing — §4.52-§4.54 claimed by the 1.60/1.58/1.61 batches)
 
