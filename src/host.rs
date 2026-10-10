@@ -32,7 +32,8 @@ use crate::service::{
     BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
     BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsCreateLinkAuthParams,
     CallsEndorsementsPublicKeyParams, CallsGetStateParams, CallsGroupMembersParams,
-    CallsGroupProofParams, CallsLinkPresentationParams, CallsSendSignalParams, ContactsListParams,
+    CallsGroupProofParams, CallsLinkPresentationParams, CallsSendSignalParams,
+    ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
     ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
     ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
@@ -2247,6 +2248,40 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid stickerPacks.setSync params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "chatFolders.list" => {
+            match serde_json::from_value::<ChatFoldersListParams>(request.params) {
+                Ok(params) => match runtime.chat_folders_list(params).await {
+                    Ok(folders) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(folders).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid chatFolders.list params", false),
+                ),
+            }
+        }
+        "chatFolders.setRecords" => {
+            match serde_json::from_value::<ChatFoldersSetRecordsParams>(request.params) {
+                Ok(params) => match runtime.chat_folders_set_records(params).await {
+                    Ok(folders) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(folders).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid chatFolders.setRecords params",
                         false,
                     ),
                 ),

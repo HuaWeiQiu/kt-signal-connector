@@ -88,6 +88,8 @@
             "stickerPacks.getImage",
             "stickerPacks.getSyncs",
             "stickerPacks.setSync",
+            "chatFolders.list",
+            "chatFolders.setRecords",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -426,6 +428,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/stickerPackSetSyncParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "chatFolders.list" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/chatFoldersListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "chatFolders.setRecords" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/chatFoldersSetRecordsParams" }
             }
           }
         },
@@ -2294,6 +2318,52 @@
           "minimum": 0,
           "maximum": 4294967295,
           "description": "Optional cloud ordering position for an installed pack; u32 range. Ignored when installed is false."
+        }
+      }
+    },
+    "chatFoldersListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's chat folders (contract revision 1.95, \u00a74.78, capability chat-folders; kt-engine only): the engine reads the official Storage Service ChatFolderRecord set (manifest CHAT_FOLDER=8 identifiers, storage order) and the result projects {folders: [record...]} \u2014 each record the engine's ChatFolderRecordJson verbatim: {id (uuid string), name, position (u32), showOnlyUnread, showMutedChats, includeAllIndividualChats, includeAllGroupChats, folderType (UNKNOWN|ALL|CUSTOM), includedConversationIds / excludedConversationIds (arrays of {conversationId, kind: contact|group|legacyGroup}), deletedAtTimestampMs (always present; 0 = live, non-0 = tombstone)}. Entries the engine cannot decode drop engine-side (broken entries never break the read); the connector caps the list at 64 entries (KT bound, overflow truncated) and drops entries missing id. A cloud state with no folders (never provisioned / empty manifest) answers {folders: []} \u2014 the empty state is the answer, not an error. Structured engine errors: STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable); the JVM/native modes answer CAPABILITY_UNAVAILABLE (retryable=false) after account resolution \u2014 a stock signal-cli carries no such verb. Read lane, non-mutating; the connector persists nothing \u2014 the cloud record plus the desktop's own cache is the whole story.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "chatFoldersSetRecordsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Write the account's chat-folder records (contract revision 1.95, \u00a74.78, capability chat-folders; kt-engine only): the official storage upload semantics \u2014 records upsert by id (a cloud record with the same id rotates to a fresh 16-byte item id, the official same-entity update; no prior record = insert), a non-zero deletedAtTimestampMs is the tombstone write (the official delete semantic; expired-tombstone cleanup belongs to the caller), removeIds is the official deleteKey face (the identifier leaves the manifest), and a record identical to the cloud state is an idempotent no-write (no PUT, no version bump \u2014 the whole batch replaying is safe). At least one of records / removeIds must be non-empty (INVALID_REQUEST before any upstream call); only the non-empty half rides the upstream frame. Each records entry is the engine's ChatFolderRecordJson (the chatFolders.list description carries the full key face) \u2014 forwarded verbatim: the connector enforces only the identity face (an object carrying a non-empty string id \u2264 128 chars); the record grammar is the engine's definite -32603, never a local re-derivation. The result is the post-write cloud state {folders: [...]} read back \u2014 not a local echo. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: STORAGE_WRITE_FAILED / STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable); JVM/native modes answer CAPABILITY_UNAVAILABLE (retryable=false) after local validation. Zero local persistence.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "records": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "The folder's record id (a uuid string on the official face) \u2014 the upsert key and the identity the projection gate keeps."
+              }
+            },
+            "description": "One ChatFolderRecordJson, forwarded to the engine verbatim (see the chatFolders.list params description for the key face); only the id gate is connector-enforced, the grammar is the engine's."
+          },
+          "description": "The upsert half of the write batch (KT bound 64 entries); optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
+        },
+        "removeIds": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "description": "The official deleteKey half of the write batch (KT bound 64 entries): folder record ids to remove from the manifest; optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
         }
       }
     },

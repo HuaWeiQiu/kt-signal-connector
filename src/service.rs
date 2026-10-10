@@ -82,6 +82,16 @@ pub const IDENTITY_SAFETY_NUMBER_MAX_CHARS: usize = 256;
 /// one response frame stays bounded.
 pub const STICKER_PACK_SYNC_KEY_B64_CHARS: usize = 44;
 pub const MAX_STICKER_PACK_SYNCS: usize = 256;
+/// Chat-folder sync bounds (contract revision 1.95, §4.78): the write batch
+/// (records and removeIds each) and the returned folder list are capped (KT
+/// bound; the official clients declare no explicit cap) so one host frame
+/// stays bounded, and the per-record identity bound keeps one records entry
+/// addressable. The record body beyond `id` is the engine's
+/// ChatFolderRecordJson grammar — the connector never re-derives it, so no
+/// further per-key bound exists on this face.
+pub const MAX_CHAT_FOLDERS: usize = 64;
+pub const MAX_CHAT_FOLDER_BATCH: usize = 64;
+pub const MAX_CHAT_FOLDER_ID_CHARS: usize = 128;
 /// Account settings bounds (contract revision 1.46, §4.45): the profile text
 /// budgets mirror the official desktop ProfileEditor (v8.31
 /// `ts/components/ProfileEditor.dom.tsx`) — both name components maxBytes 128,
@@ -3153,6 +3163,136 @@ impl ConnectorService {
             "installed": installed,
             "position": if installed { position } else { None },
         }))
+    }
+
+    /// chatFolders.list (contract revision 1.95, §4.78): account bounds,
+    /// resolution, and the kt-engine mode seam — the folders live in the
+    /// account's storage session, the service reads nothing locally (no
+    /// persistence on this face). The engine owns the record grammar, so the
+    /// gate ladder is identity-and-resolution only (the §4.73 material-face
+    /// order: bounds, then resolution, then the seam).
+    pub fn prepare_chat_folders_list(
+        &self,
+        account_id: &str,
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Self::gate_chat_folders_mode(mode)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// chatFolders.setRecords (contract revision 1.95, §4.78): the batch
+    /// bounds and the identity gates under the service lock — at least one
+    /// non-empty half (the accounts.updateConfiguration rule), each records
+    /// entry an object carrying a non-empty bounded string `id` (identity
+    /// presence only; the ChatFolderRecordJson grammar stays the engine's,
+    /// never a local re-derivation), each removeId a bounded non-empty
+    /// string. Only the non-empty half rides the upstream frame, mirroring
+    /// the engine's `{records?, removeIds?}` optional-face contract. No
+    /// local row is written: the cloud record is the whole state.
+    pub fn prepare_chat_folders_set_records(
+        &self,
+        account_id: &str,
+        records: &[Value],
+        remove_ids: &[String],
+        mode: SignalCliMode,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if records.len() > MAX_CHAT_FOLDER_BATCH {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "records exceeds the batch bound of 64 entries",
+                false,
+            )));
+        }
+        if remove_ids.len() > MAX_CHAT_FOLDER_BATCH {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "removeIds exceeds the batch bound of 64 entries",
+                false,
+            )));
+        }
+        for entry in records {
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "every records entry must be an object carrying a non-empty string id",
+                        false,
+                    ))
+                })?;
+            if id.chars().count() > MAX_CHAT_FOLDER_ID_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "records entry id exceeds 128 characters",
+                    false,
+                )));
+            }
+        }
+        for id in remove_ids {
+            if id.is_empty() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "removeIds entries must be non-empty",
+                    false,
+                )));
+            }
+            if id.chars().count() > MAX_CHAT_FOLDER_ID_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "removeIds entries must not exceed 128 characters",
+                    false,
+                )));
+            }
+        }
+        if records.is_empty() && remove_ids.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "at least one of records, removeIds is required",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        Self::gate_chat_folders_mode(mode)?;
+        let mut upstream = serde_json::Map::new();
+        upstream.insert(
+            "account".into(),
+            Value::String(account.signal_account.clone()),
+        );
+        if !records.is_empty() {
+            upstream.insert("records".into(), Value::Array(records.to_vec()));
+        }
+        if !remove_ids.is_empty() {
+            upstream.insert(
+                "removeIds".into(),
+                Value::Array(
+                    remove_ids
+                        .iter()
+                        .map(|id| Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        Ok(Value::Object(upstream))
+    }
+
+    /// The §4.78 mode seam: a stock signal-cli carries no chatFolders.* verb
+    /// (KT-extension engine methods), so the JVM/native modes answer
+    /// CAPABILITY_UNAVAILABLE after the local gates — the §4.73
+    /// call-material ladder order.
+    fn gate_chat_folders_mode(mode: SignalCliMode) -> Result<(), ServiceError> {
+        match mode {
+            SignalCliMode::KtEngine => Ok(()),
+            _ => Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                "chat folders require the kt-engine mode",
+                false,
+            ))),
+        }
     }
 
     /// accounts.updateConfiguration (contract revision 1.46, §4.45):
@@ -7815,6 +7955,18 @@ pub struct StickerPackSyncs {
     pub packs: Vec<StickerPackSync>,
 }
 
+/// The §4.78 result shape shared by `chatFolders.list` and
+/// `chatFolders.setRecords`: the engine's ChatFolderRecordJson entries
+/// verbatim, in storage order, capped at [`MAX_CHAT_FOLDERS`]. The record
+/// body is the engine's contract (engine compat §3/§5, the official
+/// fromChatFolderRecord key face) — the connector neither interprets nor
+/// re-keys it, so the entries stay opaque JSON values on this wire.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatFolderSyncs {
+    pub folders: Vec<Value>,
+}
+
 /// One blocked-conversation entry of the §4.45 result: the storage record's
 /// blocked-bit projection, the same shape and kind taxonomy as the §4.33
 /// pinned entry.
@@ -8623,6 +8775,29 @@ pub struct StickerPackSetSyncParams {
     pub pack_key: Option<String>,
     pub installed: bool,
     pub position: Option<u32>,
+}
+
+/// `chatFolders.list` params (contract revision 1.95, §4.78).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChatFoldersListParams {
+    pub account_id: String,
+}
+
+/// `chatFolders.setRecords` params (contract revision 1.95, §4.78): both
+/// write halves are optional and at least one must be non-empty, which the
+/// service enforces (the accounts.updateConfiguration at-least-one rule).
+/// `records` entries are the engine's ChatFolderRecordJson objects — the
+/// connector forwards them verbatim and enforces only the identity face (a
+/// non-empty string `id`), never the record grammar; `removeIds` entries are
+/// the official deleteKey identifiers. Both arrays are capped at
+/// [`MAX_CHAT_FOLDER_BATCH`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChatFoldersSetRecordsParams {
+    pub account_id: String,
+    pub records: Option<Vec<Value>>,
+    pub remove_ids: Option<Vec<String>>,
 }
 
 /// `accounts.updateConfiguration` params (contract revision 1.46, §4.45):
@@ -10098,6 +10273,28 @@ pub(crate) fn sticker_pack_syncs_result(entries: &[Value]) -> StickerPackSyncs {
         })
         .collect();
     StickerPackSyncs { packs }
+}
+
+/// Project the engine's chat-folder record list onto the wire shape with the
+/// KT entry cap (§4.78): order is storage order, entries beyond 64 are
+/// truncated. The record bodies pass through verbatim — the connector adds
+/// no key and strips none (the engine's ChatFolderRecordJson face is the
+/// contract, engine compat §3/§5) — and an entry that is not an object
+/// carrying a string `id` drops rather than half-carries, the §4.34
+/// identity-field discipline.
+pub(crate) fn chat_folder_syncs_result(entries: &[Value]) -> ChatFolderSyncs {
+    let folders = entries
+        .iter()
+        .take(MAX_CHAT_FOLDERS)
+        .filter(|entry| {
+            entry
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        })
+        .cloned()
+        .collect();
+    ChatFolderSyncs { folders }
 }
 
 /// Project the engine's blocked list onto the wire shape with the KT entry
@@ -15172,6 +15369,199 @@ mod tests {
         assert_eq!(result.packs[0].position, None);
         assert_eq!(result.packs[1].pack_id, "b".repeat(32));
         assert_eq!(result.packs[1].deleted_at_timestamp_ms, Some(1727000000000));
+    }
+
+    /// Chat-folder sync bounds (contract revision 1.95, §4.78): the write
+    /// ladder — at-least-one-non-empty, the batch caps, the identity-only
+    /// record gate, the removeId bounds — and the gate order (shape, then
+    /// resolution, then the mode seam). The records forward verbatim: only
+    /// the non-empty half rides the upstream frame, and the record body the
+    /// connector never touches.
+    #[test]
+    fn prepare_chat_folders_gates_and_forward_the_verbatim_batch() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let id = "0d6d50f5-7f9e-4a1b-9c2d-3e4f5a6b7c8d";
+
+        // The read: the resolved upstream account rides alone.
+        let params = service
+            .prepare_chat_folders_list(&account.id, SignalCliMode::KtEngine)
+            .unwrap();
+        assert_eq!(params["account"], "+15555550100");
+
+        // The records half forwards the caller's entries byte-verbatim under
+        // the resolved account; only the non-empty half rides the frame.
+        let record = json!({
+            "id": id,
+            "name": "Work",
+            "position": 1,
+            "showOnlyUnread": true,
+            "showMutedChats": false,
+            "includeAllIndividualChats": false,
+            "includeAllGroupChats": false,
+            "folderType": "CUSTOM",
+            "includedConversationIds": [
+                {"conversationId": "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "kind": "contact"}
+            ],
+            "deletedAtTimestampMs": 0
+        });
+        let params = service
+            .prepare_chat_folders_set_records(
+                &account.id,
+                std::slice::from_ref(&record),
+                &[],
+                SignalCliMode::KtEngine,
+            )
+            .unwrap();
+        assert_eq!(params["account"], "+15555550100");
+        assert_eq!(params["records"], json!([record]));
+        assert!(params.get("removeIds").is_none());
+
+        let params = service
+            .prepare_chat_folders_set_records(
+                &account.id,
+                &[],
+                &["1a2b3c4d-5e6f-4a1b-8c9d-0e1f2a3b4c5d".to_string()],
+                SignalCliMode::KtEngine,
+            )
+            .unwrap();
+        assert_eq!(
+            params["removeIds"],
+            json!(["1a2b3c4d-5e6f-4a1b-8c9d-0e1f2a3b4c5d"])
+        );
+        assert!(params.get("records").is_none());
+
+        // The at-least-one rule: two empty halves fail closed locally.
+        let error = service
+            .prepare_chat_folders_set_records(&account.id, &[], &[], SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The records identity face: non-object, missing id, non-string id,
+        // empty id, and the 129-character id all fail closed before any
+        // upstream call.
+        for bad in [
+            json!("not-an-object"),
+            json!({"name": "no id"}),
+            json!({"id": 7}),
+            json!({"id": ""}),
+            json!({"id": "a".repeat(129)}),
+        ] {
+            let error = service
+                .prepare_chat_folders_set_records(
+                    &account.id,
+                    std::slice::from_ref(&bad),
+                    &[],
+                    SignalCliMode::KtEngine,
+                )
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{bad}");
+        }
+        let error = service
+            .prepare_chat_folders_set_records(
+                &account.id,
+                &[],
+                &[String::new()],
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The batch caps: 65 entries on either half.
+        let big_batch: Vec<Value> = (0..65)
+            .map(|index| json!({"id": format!("{index:032x}")}))
+            .collect();
+        let error = service
+            .prepare_chat_folders_set_records(&account.id, &big_batch, &[], SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let big_remove: Vec<String> = (0..65).map(|index| format!("{index:032x}")).collect();
+        let error = service
+            .prepare_chat_folders_set_records(
+                &account.id,
+                &[],
+                &big_remove,
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The gate ladder: shape wins over resolution, resolution wins over
+        // the seam.
+        let error = service
+            .prepare_chat_folders_set_records(
+                "no-such-account",
+                &[json!({"name": "no id"})],
+                &[],
+                SignalCliMode::KtEngine,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_chat_folders_list("no-such-account", SignalCliMode::KtEngine)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+
+        // The mode seam answers after the local gates on both faces.
+        let error = service
+            .prepare_chat_folders_list(&account.id, SignalCliMode::Jvm)
+            .unwrap_err();
+        let api = error.into_api();
+        assert_eq!(api.code, "CAPABILITY_UNAVAILABLE");
+        assert!(!api.retryable);
+        let error = service
+            .prepare_chat_folders_set_records(
+                &account.id,
+                &[],
+                &[id.to_string()],
+                SignalCliMode::Jvm,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CAPABILITY_UNAVAILABLE");
+    }
+
+    /// The chat-folder projection (contract revision 1.95, §4.78): storage
+    /// order preserved, entries pass through verbatim (no key added or
+    /// stripped), the 64-entry KT cap truncates, and entries missing the
+    /// identity field drop rather than half-carry.
+    #[test]
+    fn chat_folder_syncs_result_caps_and_passes_through() {
+        let entries: Vec<Value> = (0..70)
+            .map(|index| {
+                json!({
+                    "id": format!("{index:032x}"),
+                    "name": format!("folder-{index}"),
+                    "position": index,
+                    "showOnlyUnread": false,
+                    "showMutedChats": true,
+                    "includeAllIndividualChats": true,
+                    "includeAllGroupChats": false,
+                    "folderType": "CUSTOM",
+                    "includedConversationIds": [],
+                    "excludedConversationIds": [],
+                    "deletedAtTimestampMs": 0
+                })
+            })
+            .collect();
+        let result = chat_folder_syncs_result(&entries);
+        assert_eq!(result.folders.len(), MAX_CHAT_FOLDERS);
+        assert_eq!(result.folders[0]["name"], "folder-0");
+        assert_eq!(result.folders[63]["name"], "folder-63");
+        // Verbatim: the caller-facing record keeps every key the engine
+        // projected, in the engine's own values.
+        assert_eq!(result.folders[0], entries[0]);
+
+        // Missing identity drops the entry; everything else passes through
+        // untouched.
+        let mixed = vec![
+            json!({"id": "a".repeat(32), "name": "kept"}),
+            json!({"name": "orphan"}),
+            json!({"id": ""}),
+            json!("not-an-object"),
+        ];
+        let result = chat_folder_syncs_result(&mixed);
+        assert_eq!(result.folders.len(), 1);
+        assert_eq!(result.folders[0]["name"], "kept");
     }
 
     /// Account configuration bounds (contract revision 1.46, §4.45): at

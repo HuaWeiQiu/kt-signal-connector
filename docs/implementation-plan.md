@@ -5,7 +5,20 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.94 (2026-10-10; the viewed-state projection + story-reaction batch
+- Contract revision: 1.95 (2026-10-10; the chat-folder sync passthrough batch (§4.78): the
+  desktop's folder picker gains its connector face — `chatFolders.list` (read lane, the new
+  `chat-folders` capability) and `chatFolders.setRecords` (send lane, account-scoped
+  mutating, the reaction class) forward the kt-engine's own Storage-record folder surface
+  verbatim — `list` answering the manifest in the engine's storage order, `setRecords`
+  answering the post-write manifest, so the caller never needs a second read. A record is
+  the engine's own eleven-key JSON shape passed through untouched: the connector never
+  re-derives folder syntax, never stores a byte of record content (zero new columns, zero
+  new rows — the cloud record is the whole state), gates only the identity face (an object
+  carrying a non-empty ≤128-char `id`, each half ≤64 entries, at least one half non-empty),
+  caps the projection at 64 entries with `id`-less entries dropped, and the kt-engine-only
+  seam answers JVM/native CAPABILITY_UNAVAILABLE after the local gates (stock signal-cli
+  carries no `chatFolders.*` verb) — previously 1.94 (2026-10-10; the viewed-state
+  projection + story-reaction batch
   (§4.77): the desktop's voice-note PlayedDot and story AnimatedEmoji surfaces gain their
   connector truth — `viewedAt` joins the message-row projection and the
   `message.statusChanged` event with the official `isVoiceMessagePlayed` semantics on both
@@ -6056,6 +6069,92 @@ pinning `story: true` with the store account id never riding; kt-engine —
 CAPABILITY_UNAVAILABLE with no frame leaving the process; the markViewed end-to-end —
 the upstream receipt confirming `sent` while the rows stamp locally, the group
 conversation's trivial `sent` still stamping, and markRead stamping nothing).
+
+### 4.78 Chat-folder sync passthrough: `chatFolders.list` + `chatFolders.setRecords` (contract revision 1.95, 2026-10-10)
+
+The desktop's folder picker needed the pinned upstream's chat-folder surface, the
+kt-engine already had both verbs real'd (the engine's `docs/jsonrpc-compat.md` §5
+Storage-record face) — the connector contract simply did not carry them. Both land as
+pure passthrough: a chat folder record is the engine's own shape and the connector never
+re-derives, re-keys, or stores it. The record grammar (verified against the engine's
+storage records, mirrored by the test fixture's strict shape gate): `id` (uuid string),
+`name`, `position` (u32), `showOnlyUnread`, `showMutedChats`,
+`includeAllIndividualChats`, `includeAllGroupChats`, `folderType`
+(`UNKNOWN`|`ALL`|`CUSTOM`), the optional `includedConversationIds` /
+`excludedConversationIds` lists (entries `{conversationId, kind:
+contact|group|legacyGroup}`), and `deletedAtTimestampMs` (u64 — always present on the
+read face, `0` live, non-zero tombstone).
+
+- **`chatFolders.list`** `{accountId}` → `{folders: [...]}` (the `ChatFolderSyncs`
+  struct). Read lane, non-mutating, metrics `read`. The upstream answer's `folders`
+  array rides verbatim (`Vec<Value>`: keys, entry shape, and ordering untouched, in the
+  engine's manifest first-appearance storage order), entries without a usable identity
+  (a string `id`) dropped (the §4.34 discipline), the array capped at
+  `MAX_CHAT_FOLDERS` (64). The engine's no-master-key / unknown-account face answers
+  the honest empty array.
+- **`chatFolders.setRecords`** `{accountId, records?, removeIds?}` → the same
+  `{folders: [...]}` projection — the engine answers with the post-write manifest, so
+  the caller sees the resulting set without a second read. Send lane, account-scoped
+  mutating, metrics `send`, the reaction class: a definite upstream error propagates,
+  an unknown outcome answers SEND_OUTCOME_UNKNOWN (retryable=false) and is never
+  retried. Local gates (all INVALID_REQUEST, retryable=false): at least one half
+  non-empty (the accounts.updateConfiguration rule), each half at most
+  `MAX_CHAT_FOLDER_BATCH` (64), every `records` entry an object carrying a non-empty
+  string `id` of at most `MAX_CHAT_FOLDER_ID_CHARS` (128), every `removeIds` entry a
+  non-empty string of at most 128 chars — the identity face only; the folder grammar
+  stays the engine's audit, never a local re-derivation. The upstream frame carries
+  only the non-empty half (`records` / `removeIds` keys appear as needed), values
+  verbatim.
+- **Zero local footprint**: no record content lands in the connector store — no
+  column, no row, no cache; the cloud record is the whole state. The store's account
+  id never rides the wire (resolved to the upstream `account` at prepare, the §4.33
+  discipline), and the resolved id is the only key the frame adds.
+- **Idempotency is the engine's own documented semantics** (upsert by record `id`, a
+  non-zero `deletedAtTimestampMs` as tombstone, `removeIds` as the official deleteKey
+  face, a same-value rewrite skipping the revision bump): the connector forwards and
+  observes, it does not re-implement — a repeated identical write is the engine's
+  no-bump no-op and the answer is the same manifest either way.
+- **Mode seam — kt-engine only**: stock signal-cli carries no `chatFolders.*` verb, so
+  the JVM/native modes answer CAPABILITY_UNAVAILABLE (retryable=false) after the local
+  gates — the §4.53 engine-gap precedent mirrored in reverse (there the kt-engine
+  lacked the face; here the stock engine does). The ladder order holds (shape gates →
+  resolve_account → mode seam: a bad record with an unknown account still answers the
+  shape, an unknown account with a clean frame answers ACCOUNT_NOT_FOUND before the
+  seam speaks) and the supervisor prepares under the service lock before
+  `running_engine`, so the seam answers before any engine starts. The capability set
+  grows by one: `chat-folders` joins `FEATURE_CAPABILITIES` and the handshake
+  advertisement (the 1.36 `conversation-pin-sync` precedent — a face the stock engine
+  cannot serve is gated on its own capability token).
+- **Error face — transparent, no new codes**: the engine's own errors ride the wire —
+  STORAGE_WRITE_FAILED / STORAGE_READ_FAILED / STORAGE_UNAVAILABLE (already in the
+  allowlist, the schema, and the service mapping, retryable=true — the engine owns the
+  family's final set) and the engine's `-32603` (a stale engine without the verb
+  registered, malformed params) folding to UPSTREAM_ERROR (retryable=true) through the
+  existing `into_api` face.
+
+Tests: the service units (`prepare_chat_folders_gates_and_forward_the_verbatim_batch` —
+the batch caps on both halves, the records identity face and the removeIds bounds, the
+at-least-one rule, the resolved non-empty-half frame with the store account id never
+riding; `chat_folder_syncs_result_caps_and_passes_through` — the 64-entry cap, the
+`id`-less drop, contents byte-equal); the methods classifications (`chatFolders.list`
+in the read lane and the non-mutating set, `chatFolders.setRecords` in the send lane
+and the account-scoped mutating set, the `chat-folders` advertisement); the supervisor
+roundtrips (`tests/chat_folders.rs`: `chat_folder_faces_pass_through_verbatim` — the
+fixture's two eleven-key records (an ALL-type and a CUSTOM carrying all three
+recipient kinds) read byte-faithfully, a records-only write crossing verbatim and
+reading back the post-write manifest with the `removeIds` key absent, a removeIds-only
+write reading back one folder with the `records` key absent;
+`chat_folder_error_ladder_rides_the_wire` — the fixture's failure markers landing
+STORAGE_WRITE_FAILED on the write, STORAGE_READ_FAILED on the read,
+STORAGE_UNAVAILABLE on both; `chat_folder_gates_answer_locally` — the at-least-one
+rule, the non-object / `id`-less / empty-`id` / non-string-`id` entries, the 129-char
+ids on both halves, the 65-entry batches, the shape-over-resolution and
+resolution-over-seam ladder, and the engine-unknown account degrading to
+UPSTREAM_ERROR; `chat_folder_crash_answers_unknown_and_never_retries` — the crash
+sentinel answering SEND_OUTCOME_UNKNOWN (retryable=false) with exactly one dispatch
+frame in the log; `chat_folder_faces_gate_the_mode_seam` — JVM answering
+CAPABILITY_UNAVAILABLE on both faces before any engine starts, not one frame logged);
+plus the schema-consistency bound pairs and the server handshake advertisement.
 
 ## 5. signal-cli Boundary
 
