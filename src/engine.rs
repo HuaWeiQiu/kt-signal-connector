@@ -242,6 +242,21 @@ pub enum EngineError {
     Upstream,
     #[error("signal-cli rejected the device credentials")]
     Unauthorized,
+    /// Contract 1.99 §4.80: the engine's send-chain transport families. The
+    /// engine folds a transport-layer send failure into the plain
+    /// internal_error JSON-RPC face (-32603) whose `message` embeds the cause
+    /// class; these variants surface the family structurally so the host
+    /// sees rate limiting, the proof challenge, and server unavailability as
+    /// distinct codes instead of generic upstream noise. The variants stay
+    /// content-free — the anchor literal is a fixed engine string, never
+    /// user data — and the classification carries no event: a transport
+    /// failure never touches account state.
+    #[error("signal-cli send was rate-limited upstream")]
+    RateLimited,
+    #[error("signal-cli send requires an upstream proof challenge")]
+    ProofRequired,
+    #[error("signal-cli server is unavailable")]
+    ServerUnavailable,
     /// The engine answered a JSON-RPC error object with an upstream error
     /// code (contract 1.36 sticker/pin faces): the code string is carried
     /// structurally so the connector maps engine error codes onto the host
@@ -273,6 +288,9 @@ impl EngineError {
             EngineError::Protocol => "protocol",
             EngineError::Upstream => "upstream",
             EngineError::Unauthorized => "unauthorized",
+            EngineError::RateLimited => "rate_limited",
+            EngineError::ProofRequired => "proof_required",
+            EngineError::ServerUnavailable => "server_unavailable",
             EngineError::UpstreamCode { .. } => "upstream_code",
         }
     }
@@ -1809,6 +1827,16 @@ async fn handle_upstream_line(
                 });
             }
             let _ = request.response.send(Err(EngineError::Unauthorized));
+        } else if let Some(class) = upstream_error_send_class(object.get("error")) {
+            // Contract 1.99 §4.80: the send-chain transport families (rate
+            // limit, proof challenge, server unavailability) surface as
+            // distinct error variants. No event: a transport failure never
+            // touches account state. The arm sits after the authorization
+            // classification and before the structured-code ladder — the
+            // two cannot collide (an embedded anchor in a longer message
+            // vs. an exact allowlist literal), so the order only documents
+            // that the §4.17 recovery chain keeps precedence.
+            let _ = request.response.send(Err(class));
         } else if let Some(code) = upstream_error_code(object.get("error")) {
             // Contract 1.36 faces: the engine answers structured errors with
             // a code field (STICKER_*, STORAGE_*, CONVERSATION_NOT_RESOLVED
@@ -1870,6 +1898,42 @@ fn upstream_error_is_unauthorized(error: Option<&Value>) -> bool {
                 || message.contains("Authorization failed")
                 || (message.starts_with("User ") && message.ends_with(" is not registered."))
         })
+}
+
+/// Contract 1.99 §4.80 send-chain transport anchors: the engine folds a
+/// transport-layer send failure into the plain internal_error JSON-RPC face
+/// (-32603) whose `message` embeds the cause class. These three fixed
+/// literals — supplied by the engine contract verbatim, matched exactly —
+/// classify the family at this single observation point, the same place the
+/// authorization matcher above reads the raw upstream error body.
+/// Deliberately constants beside, not inside, the authorization matcher:
+/// that matcher is a fragile route (strict prefixes/suffixes tuned per
+/// message form) and its match set must not grow to absorb transport
+/// families.
+const ENGINE_SEND_RATE_LIMITED_ANCHOR: &str = "(RateLimitExceeded)";
+const ENGINE_SEND_PROOF_REQUIRED_ANCHOR: &str = "(ProofRequiredException)";
+const ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR: &str = "(ServerUnavailableException)";
+
+/// Classify a send-chain transport error (contract 1.99 §4.80) from the raw
+/// JSON-RPC error body: `Some` variant when the error `message` embeds one
+/// of the three fixed anchors, `None` otherwise. The anchors are
+/// parenthesized exception names the engine emits verbatim, so a substring
+/// match cannot pick up incidental text; a message is only ever classified,
+/// never surfaced. This is a standalone pure function — it shares no match
+/// set with [`upstream_error_is_unauthorized`], whose `AccountUnauthorized`
+/// → `ACCOUNT_UNLINKED` chain keeps head-of-line precedence at the call
+/// site.
+fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
+    let message = error?.get("message").and_then(Value::as_str)?;
+    if message.contains(ENGINE_SEND_RATE_LIMITED_ANCHOR) {
+        Some(EngineError::RateLimited)
+    } else if message.contains(ENGINE_SEND_PROOF_REQUIRED_ANCHOR) {
+        Some(EngineError::ProofRequired)
+    } else if message.contains(ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR) {
+        Some(EngineError::ServerUnavailable)
+    } else {
+        None
+    }
 }
 
 /// Known engine error codes the connector maps onto structured host errors
@@ -4374,6 +4438,218 @@ mod tests {
 
         assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
         assert!(event_rx.try_recv().is_err());
+    }
+
+    /// Contract 1.99 §4.80: the send-chain transport classifier is a pure
+    /// function over the raw JSON-RPC error body — each fixed anchor maps to
+    /// its variant, both embedded in a realistic engine message and as the
+    /// bare literal.
+    #[test]
+    fn send_chain_classifier_maps_the_three_transport_anchors() {
+        let classify = |error: serde_json::Value| upstream_error_send_class(Some(&error));
+        // Realistic engine wire shape: the cause class embedded at the tail
+        // of the internal_error message (-32603).
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Timed out waiting for a response (RateLimitExceeded)"
+            })),
+            Some(EngineError::RateLimited)
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Proof required (ProofRequiredException)"
+            })),
+            Some(EngineError::ProofRequired)
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Bad gateway (ServerUnavailableException)"
+            })),
+            Some(EngineError::ServerUnavailable)
+        );
+        // The bare literal (the whole message IS the anchor) classifies too:
+        // the contract fixes the anchor as a contained literal, not a
+        // trailing suffix.
+        assert_eq!(
+            classify(json!({ "code": -32603, "message": "(RateLimitExceeded)" })),
+            Some(EngineError::RateLimited)
+        );
+    }
+
+    /// Contract 1.99 §4.80: everything outside the anchor contract answers
+    /// `None` and keeps the generic upstream answer — a missing error
+    /// object, a missing or non-string `message`, an anchor only in the
+    /// `code` slot (the classifier reads the message text, exactly like the
+    /// authorization matcher), near-miss literals without the parenthesized
+    /// exception name, and ordinary unrelated errors.
+    #[test]
+    fn send_chain_classifier_answers_none_outside_the_anchor_contract() {
+        let classify = |error: serde_json::Value| upstream_error_send_class(Some(&error));
+        // No error object at all / no message field / a non-string message.
+        assert_eq!(upstream_error_send_class(None), None);
+        assert_eq!(classify(json!({ "code": -32603 })), None);
+        assert_eq!(classify(json!({ "code": -32603, "message": 42 })), None);
+        // An anchor only in the `code` slot is not a classification: the
+        // message is the only classification surface.
+        assert_eq!(
+            classify(json!({
+                "code": "(RateLimitExceeded)",
+                "message": "fixture send failed"
+            })),
+            None
+        );
+        // Near misses: the exception name without its parenthesized anchor
+        // wrapper, or a truncated/wrong name, must not classify.
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "RateLimitExceeded without the wrapper"
+            })),
+            None
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "ProofRequiredException without the wrapper"
+            })),
+            None
+        );
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "ServerUnavailable without the wrapper"
+            })),
+            None
+        );
+        // Ordinary engine errors stay unclassified (the ladder's else arm).
+        assert_eq!(
+            classify(json!({
+                "code": -1,
+                "message": "User input error (UserErrorException)"
+            })),
+            None
+        );
+        // The §4.17 authorization signatures are not send-chain anchors.
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Authorization failed! (AuthorizationFailedException)"
+            })),
+            None
+        );
+    }
+
+    /// Red line (audit conclusion): the §4.17 authorization matcher's match
+    /// set is frozen — a message carrying only a transport anchor never
+    /// trips it, so the AccountUnauthorized → ACCOUNT_UNLINKED chain cannot
+    /// be widened through the send-classification batch.
+    #[test]
+    fn upstream_match_set_stays_clear_of_send_anchors() {
+        for message in [
+            "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
+            "Failed to send message: Proof required (ProofRequiredException)",
+            "Failed to send message: Bad gateway (ServerUnavailableException)",
+        ] {
+            assert!(
+                !upstream_error_is_unauthorized(Some(&json!({ "message": message }))),
+                "authorization matcher must not match {message}"
+            );
+        }
+    }
+
+    /// Contract 1.99 §4.80 wire shape: an upstream send error embedding one
+    /// of the three transport anchors classifies to its EngineError variant
+    /// through the real line handler, with no account event — a transport
+    /// failure never touches account state.
+    #[tokio::test]
+    async fn send_chain_anchor_errors_classify_without_account_events() {
+        for (message, expected) in [
+            (
+                "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
+                EngineError::RateLimited,
+            ),
+            (
+                "Failed to send message: Proof required (ProofRequiredException)",
+                EngineError::ProofRequired,
+            ),
+            (
+                "Failed to send message: Bad gateway (ServerUnavailableException)",
+                EngineError::ServerUnavailable,
+            ),
+        ] {
+            let (events, mut event_rx) = event_channel();
+            let (ingress, _receiver) = receive_channel();
+            let mut pending = HashMap::new();
+            let mut degraded = false;
+            let (response_tx, response_rx) = oneshot::channel();
+            pending.insert(
+                "kt-3".to_string(),
+                PendingRequest {
+                    class: CallClass::Mutating,
+                    account: Some("+15555550100".to_string()),
+                    response: response_tx,
+                },
+            );
+            let line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": "kt-3",
+                "error": { "code": -32603, "message": message }
+            }))
+            .unwrap();
+            handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+            assert_eq!(
+                response_rx.await.unwrap(),
+                Err(expected.clone()),
+                "{message}"
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "{message} must not emit an event"
+            );
+        }
+    }
+
+    /// Head-of-line precedence: a hypothetical message carrying both the
+    /// unlink signature and a transport anchor still classifies Unauthorized
+    /// and emits the account event — the §4.17 recovery chain does not
+    /// regress behind the new classification.
+    #[tokio::test]
+    async fn authorization_classification_precedes_send_chain_anchors() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-4".to_string(),
+            PendingRequest {
+                class: CallClass::ReadOnly,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-4",
+            "error": {
+                "code": -32603,
+                "message": "Authorization failed! (RateLimitExceeded)"
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Unauthorized));
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::AccountUnauthorized { ref account } if account == "+15555550100"
+        ));
     }
 
     /// Structured engine errors (contract 1.36): the real engine carries the

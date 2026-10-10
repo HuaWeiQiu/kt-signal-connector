@@ -666,6 +666,30 @@ impl ServiceError {
                 "device was unlinked by the account holder",
                 false,
             ),
+            // Contract 1.99 §4.80 send-chain transport families: the engine
+            // folds transport-layer send failures into the plain -32603 face
+            // whose message embeds the cause class; the engine.rs classifier
+            // (`upstream_error_send_class`) surfaces the family structurally
+            // and these are the host codes. retryable=false on the rate-limit
+            // and proof-challenge families (the caller re-drives the send —
+            // a mutating send is never auto-retried, the flag is display-side
+            // only); the server-unavailable family may succeed on a later
+            // attempt and reads retryable=true.
+            ServiceError::Engine(EngineError::RateLimited) => ApiError::new(
+                "SEND_RATE_LIMITED",
+                "the upstream rate-limited the send",
+                false,
+            ),
+            ServiceError::Engine(EngineError::ProofRequired) => ApiError::new(
+                "SEND_PROOF_REQUIRED",
+                "the upstream requires a proof challenge before the send",
+                false,
+            ),
+            ServiceError::Engine(EngineError::ServerUnavailable) => ApiError::new(
+                "SEND_SERVER_UNAVAILABLE",
+                "the upstream server is unavailable",
+                true,
+            ),
             ServiceError::Engine(EngineError::Backpressure) => {
                 ApiError::new("INTERNAL_ERROR", "signal-cli request queue is full", true)
             }
@@ -10569,6 +10593,30 @@ mod tests {
         let api = ServiceError::Engine(EngineError::Unauthorized).into_api();
         assert_eq!(api.code, "ACCOUNT_UNLINKED");
         assert!(!api.retryable);
+    }
+
+    /// Send-chain transport families (contract 1.99, §4.80): the three
+    /// engine classes map onto their host codes with the contract-fixed
+    /// retryability — the server-unavailable family may succeed on a later
+    /// attempt, while the rate-limit and proof-challenge faces are
+    /// per-attempt answers the caller re-drives (a mutating send is never
+    /// auto-retried; the flag is display-side only).
+    #[test]
+    fn send_chain_transport_errors_map_to_send_error_codes() {
+        for (error, code, retryable) in [
+            (EngineError::RateLimited, "SEND_RATE_LIMITED", false),
+            (EngineError::ProofRequired, "SEND_PROOF_REQUIRED", false),
+            (
+                EngineError::ServerUnavailable,
+                "SEND_SERVER_UNAVAILABLE",
+                true,
+            ),
+        ] {
+            let api = ServiceError::Engine(error).into_api();
+            assert_eq!(api.code, code);
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert!(api.data.is_none(), "{code} carries no data object");
+        }
     }
 
     /// Structured engine error mapping (contract 1.36, §4.32/§4.33): each
