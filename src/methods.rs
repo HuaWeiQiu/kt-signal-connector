@@ -408,11 +408,12 @@ pub const METHODS: &[MethodRow] = &[
     // counterpart; advertised through `chat-folders`.
     ("chatFolders.list", Lane::Read, false, "read"),
     ("chatFolders.setRecords", Lane::Send, true, "send"),
-    // Read-only runtime diagnostic face (contract 1.96, §4.79): one payload
+    // Read-only runtime diagnostic face (contract 1.97, §4.79): one payload
     // answering the whole chain — connector/engine versions plus the
     // engine's self-certification baseline, per-group data-dir and
-    // occupancy-lock status, the bounded recent-error ring, and the reused
-    // connectivity surfaces. Control lane like runtime.status; never
+    // occupancy-lock status, the bounded recent-error ring, the reused
+    // connectivity surfaces, and the declared Signal service-plane probes.
+    // Control lane like runtime.status; never
     // mutating; the implementation is entirely in `doctor`.
     ("runtime.doctor", Lane::Control, false, "control"),
 ];

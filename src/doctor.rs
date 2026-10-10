@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The read-only `runtime.doctor` diagnostic face (contract revision 1.96,
+//! The read-only `runtime.doctor` diagnostic face (contract revision 1.97,
 //! implementation-plan §4.79; the Signal runtime-environment plan's
 //! diagnostics layer 3). One call answers the whole chain in one payload:
 //!
@@ -20,15 +20,22 @@
 //!   warnings), aggregated into counts;
 //! - network reachability, reused from the existing connectivity surfaces:
 //!   the per-group engine status plus the process-wide watchdog/receive-drop
-//!   counters. The doctor never probes the network itself.
+//!   counters — no new instrumentation there;
+//! - the Signal service plane (revision 1.97): the doctor's ONLY declared
+//!   network probes — two read-only HTTPS GETs (chat, storage) through the
+//!   launcher's SOCKS proxy environment, each folding into one fixed
+//!   classification literal. The report never carries error text, request
+//!   content, a URL, or a proxy endpoint.
 //!
 //! Read-only discipline (pinned by tests): the doctor never starts or stops
 //! an engine, never cleans or deletes a lock, never writes anything
 //! anywhere. The only lock interaction is a non-blocking exclusive `flock`
 //! probe that is unlocked immediately — kernel state only, no file byte or
-//! directory entry changes. Data-directory paths are reported to the
-//! authenticated host on purpose (the launcher passed them at spawn, so the
-//! peer already knows them); they never enter logs (AGENTS.md discipline).
+//! directory entry changes. The service-plane probes are read-only GETs
+//! under the same 3-second diagnostic budget. Data-directory paths are
+//! reported to the authenticated host on purpose (the launcher passed them
+//! at spawn, so the peer already knows them); they never enter logs
+//! (AGENTS.md discipline).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -40,13 +47,26 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::datalock::LOCK_FILE_NAME;
-use crate::engine::{CallClass, EngineError, EngineHandle, EngineState, EngineStatus};
+use crate::engine::{CallClass, EngineError, EngineHandle, EngineState, EngineStatus, SocksProxy};
 use crate::registry::ProxyGroupRuntime;
 
 /// Bounded engine-call budget for the two doctor probes (`version`,
 /// `engine.protocolCapabilities`): a diagnostic must not sit on a wedged
 /// engine anywhere near the ordinary 15 s request timeout.
 const DOCTOR_ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The launcher-injected SOCKS proxy environment variable (`host:port`) —
+/// the same variable the engine child inherits and maps onto
+/// `ALL_PROXY=socks5h://…`. The service-plane probes reuse it so the probe
+/// validates exactly the route real traffic takes.
+const SOCKS_PROXY_ENV: &str = "KT_SIGNAL_SOCKS_PROXY";
+
+/// Fixed service-plane probe targets (revision 1.97): HTTPS-only,
+/// compile-time constants. They never enter logs and the report never
+/// carries them — only the classification literal (plus a status code and a
+/// latency for `http`) leaves this module.
+const CHAT_SERVICE_PROBE_URL: &str = "https://chat.signal.org/v1/accounts/whoami";
+const STORAGE_SERVICE_PROBE_URL: &str = "https://storage.signal.org/";
 
 /// The bounded recent-error window (`recentErrors.window`).
 const ERROR_RING_CAPACITY: usize = 64;
@@ -64,6 +84,7 @@ pub struct DoctorReport {
     pub groups: Vec<GroupReport>,
     pub network: NetworkFace,
     pub recent_errors: ErrorRingReport,
+    pub service: ServiceFace,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -83,6 +104,40 @@ pub struct NetworkFace {
     /// Existing metric (`metrics::record_receive_drop`): receives dropped
     /// because the persistence queue stayed saturated.
     pub receive_dropped_total: u64,
+}
+
+/// The Signal service-plane face (contract revision 1.97): the doctor's only
+/// declared network probes. Everything here is a fixed literal or a number —
+/// no error text, no URL, no proxy endpoint ever enters the report.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceFace {
+    /// The launcher's `KT_SIGNAL_SOCKS_PROXY` process environment was
+    /// present and well-formed. False ⇒ both probes answer `not_configured`
+    /// and no network attempt happens. Per-group proxy plans are deliberately
+    /// not consulted: the probe reflects the process-wide launch environment.
+    pub proxy_configured: bool,
+    /// `GET https://chat.signal.org/v1/accounts/whoami` (unauthenticated;
+    /// the desktop reads the link healthy at the edge's own 401).
+    pub chat: ServiceProbe,
+    /// `GET https://storage.signal.org/` (any HTTP response is healthy).
+    pub storage: ServiceProbe,
+}
+
+/// One service-plane probe's outcome, folded into exactly one fixed
+/// classification literal. `status`/`latencyMs` ride only with `http`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceProbe {
+    /// `http` (the edge answered) | `timeout` | `socks_refused` |
+    /// `tls_failed` | `not_configured` — never anything else.
+    pub classification: &'static str,
+    /// Only with `http`: the HTTP status code the edge answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Only with `http`: the whole-probe wall time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -250,6 +305,7 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
             receive_dropped_total: crate::metrics::receive_dropped_total(),
         },
         recent_errors: error_ring_snapshot(),
+        service: service_face().await,
     }
 }
 
@@ -663,6 +719,165 @@ pub fn error_ring_snapshot() -> ErrorRingReport {
     }
 }
 
+// -------------------------------------------------------- service plane ----
+
+/// Assemble the service-plane face. No proxy environment ⇒ both probes
+/// answer `not_configured` and nothing touches the network — the only
+/// not-probing path is the declared unconfigured one.
+async fn service_face() -> ServiceFace {
+    service_face_for(env_socks_proxy()).await
+}
+
+async fn service_face_for(proxy: Option<SocksProxy>) -> ServiceFace {
+    let Some(proxy) = proxy else {
+        let probe = ServiceProbe {
+            classification: "not_configured",
+            status: None,
+            latency_ms: None,
+        };
+        return ServiceFace {
+            proxy_configured: false,
+            chat: probe.clone(),
+            storage: probe,
+        };
+    };
+    // A build failure here is a connector defect (static CA bytes, static
+    // settings) or a broken TLS backend: both faces fold to the TLS-layer
+    // literal rather than inventing a sixth one. No request is sent.
+    let Some(client) = service_client(&proxy) else {
+        let probe = ServiceProbe {
+            classification: "tls_failed",
+            status: None,
+            latency_ms: None,
+        };
+        return ServiceFace {
+            proxy_configured: true,
+            chat: probe.clone(),
+            storage: probe,
+        };
+    };
+    let (chat, storage) = tokio::join!(
+        probe_service_face(&client, CHAT_SERVICE_PROBE_URL),
+        probe_service_face(&client, STORAGE_SERVICE_PROBE_URL),
+    );
+    ServiceFace {
+        proxy_configured: true,
+        chat,
+        storage,
+    }
+}
+
+/// The launcher's proxy from the process environment, or `None`. The value
+/// never leaves this module — the report carries `proxyConfigured` and
+/// classification literals only.
+fn env_socks_proxy() -> Option<SocksProxy> {
+    parse_socks_proxy_env(&std::env::var(SOCKS_PROXY_ENV).ok()?)
+}
+
+/// The canonical variable form is `host:port`; an explicit `socks5(h)://`
+/// scheme prefix is tolerated and normalized. Anything else is unconfigured.
+fn parse_socks_proxy_env(raw: &str) -> Option<SocksProxy> {
+    let bare = raw
+        .strip_prefix("socks5h://")
+        .or_else(|| raw.strip_prefix("socks5://"))
+        .unwrap_or(raw);
+    SocksProxy::parse(bare).ok()
+}
+
+/// The service-plane HTTPS client: the vendored Signal production root CA as
+/// the ONLY trust anchor (the kt-engine's tls_certs_only attitude — the probe
+/// validates exactly the TLS reality the engine's own traffic meets), the
+/// launcher proxy as the only `socks5h://` route (remote DNS, matching the
+/// engine's `ALL_PROXY` mapping), connect+overall budgets at the doctor's
+/// 3-second diagnostic bound, redirects off. Built fresh per diagnostic — a
+/// wedged connection pool is never reused across calls.
+fn service_client(proxy: &SocksProxy) -> Option<reqwest::Client> {
+    let certificate =
+        reqwest::Certificate::from_pem(include_bytes!("../vendor/certs/production-root-ca.pem"))
+            .ok()?;
+    let socks_url = format!("socks5h://{}:{}", proxy.host, proxy.port);
+    reqwest::Client::builder()
+        .add_root_certificate(certificate)
+        .tls_built_in_root_certs(false)
+        .proxy(reqwest::Proxy::all(&socks_url).ok()?)
+        .connect_timeout(DOCTOR_ENGINE_CALL_TIMEOUT)
+        .timeout(DOCTOR_ENGINE_CALL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("kt-signal-connector/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()
+}
+
+/// One read-only GET probe: the wall time is measured around the whole call
+/// but reported only with the `http` classification.
+async fn probe_service_face(client: &reqwest::Client, url: &'static str) -> ServiceProbe {
+    let started = std::time::Instant::now();
+    let outcome = client.get(url).send().await;
+    let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    service_outcome_probe(outcome, latency_ms)
+}
+
+/// The pure outcome half, split from the transport call so the unit suite
+/// pins every literal without any network.
+fn service_outcome_probe(
+    outcome: Result<reqwest::Response, reqwest::Error>,
+    latency_ms: u64,
+) -> ServiceProbe {
+    match outcome {
+        Ok(response) => ServiceProbe {
+            classification: "http",
+            status: Some(response.status().as_u16()),
+            latency_ms: Some(latency_ms),
+        },
+        Err(error) => ServiceProbe {
+            classification: service_failure_literal(&error),
+            status: None,
+            latency_ms: None,
+        },
+    }
+}
+
+/// The pure classification half: fold the transport failure's primitive
+/// discriminators into exactly one fixed report literal. `socks_marker` is
+/// reqwest's own SOCKS-layer marker found in the error's source chain (see
+/// `error_chain_names_socks`).
+fn classify_failure(is_timeout: bool, is_connect: bool, socks_marker: bool) -> &'static str {
+    if is_timeout {
+        return "timeout";
+    }
+    if !is_connect || socks_marker {
+        return "socks_refused";
+    }
+    "tls_failed"
+}
+
+/// The reqwest adapter onto the pure classifier. A residual failure that is
+/// neither a timeout nor a TLS-layer event folds to `socks_refused`: with the
+/// SOCKS route as the only configured path, a non-timeout transport failure
+/// is the link refusing us — no sixth literal is invented.
+fn service_failure_literal(error: &reqwest::Error) -> &'static str {
+    classify_failure(
+        error.is_timeout(),
+        error.is_connect(),
+        error_chain_names_socks(error),
+    )
+}
+
+/// Whether the error's source chain carries reqwest's own SOCKS-layer marker
+/// ("error connecting to socks proxy" / "error resolving for socks proxy" —
+/// reqwest-owned static strings, never upstream content). Distinguishes a
+/// failure inside the proxy hop from one above it (the TLS handshake).
+fn error_chain_names_socks(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = error.source();
+    while let Some(current) = source {
+        if current.to_string().contains("socks") {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,6 +950,19 @@ mod tests {
                     last_at_unix_ms: 1,
                 }],
             },
+            service: ServiceFace {
+                proxy_configured: true,
+                chat: ServiceProbe {
+                    classification: "http",
+                    status: Some(401),
+                    latency_ms: Some(123),
+                },
+                storage: ServiceProbe {
+                    classification: "socks_refused",
+                    status: None,
+                    latency_ms: None,
+                },
+            },
         };
         let value = serde_json::to_value(&report).expect("serialize");
         let connector = value.get("connector").expect("connector face");
@@ -800,6 +1028,23 @@ mod tests {
         let network = &value["network"];
         assert!(network["watchdogRestartsTotal"].is_u64());
         assert!(network["receiveDroppedTotal"].is_u64());
+
+        let service = &value["service"];
+        assert_eq!(service["proxyConfigured"], json!(true));
+        assert_eq!(service["chat"]["classification"], json!("http"));
+        assert_eq!(service["chat"]["status"], json!(401));
+        assert_eq!(service["chat"]["latencyMs"], json!(123));
+        assert_eq!(service["storage"]["classification"], json!("socks_refused"));
+        assert_eq!(
+            service["storage"]["status"],
+            Value::Null,
+            "status rides only with the http classification"
+        );
+        assert_eq!(
+            service["storage"]["latencyMs"],
+            Value::Null,
+            "latencyMs rides only with the http classification"
+        );
     }
 
     /// Engine-unreachable degradation: a non-running engine marks
@@ -1066,5 +1311,104 @@ mod tests {
         let mut sorted = counts.clone();
         sorted.sort_unstable_by(|left, right| right.cmp(left));
         assert_eq!(counts, sorted);
+    }
+
+    // ----------------------------------------------------- service plane --
+
+    /// The five fixed classification literals, mapped from pure inputs — no
+    /// network anywhere. `http` rides the real `http::Response` conversion
+    /// path; the failure literals come from the pure classifier truth table;
+    /// `not_configured` is the unconfigured face. Each failure probe must
+    /// omit `status`/`latencyMs` on the wire.
+    #[tokio::test]
+    async fn service_probe_classification_maps_every_literal() {
+        let unauthorized = reqwest::Response::from(
+            http::Response::builder()
+                .status(401)
+                .body("")
+                .expect("response"),
+        );
+        let http = service_outcome_probe(Ok(unauthorized), 42);
+        assert_eq!(http.classification, "http");
+        assert_eq!(http.status, Some(401));
+        assert_eq!(http.latency_ms, Some(42));
+
+        for (is_timeout, is_connect, socks_marker, expected) in [
+            (true, true, false, "timeout"),
+            (false, true, true, "socks_refused"),
+            // Residual transport failures fold to the refused literal — no
+            // sixth literal is invented.
+            (false, false, false, "socks_refused"),
+            (false, true, false, "tls_failed"),
+        ] {
+            assert_eq!(
+                classify_failure(is_timeout, is_connect, socks_marker),
+                expected,
+                "classifier truth table"
+            );
+        }
+
+        let not_configured = service_face_for(None).await;
+        assert!(!not_configured.proxy_configured);
+        let value = serde_json::to_value(&not_configured).expect("serialize");
+        assert_eq!(value["proxyConfigured"], json!(false));
+        for probe in ["chat", "storage"] {
+            assert_eq!(value[probe]["classification"], json!("not_configured"));
+            assert_eq!(value[probe].get("status"), None);
+            assert_eq!(value[probe].get("latencyMs"), None);
+        }
+    }
+
+    /// The SOCKS-layer marker survives reqwest's real error chain: a loopback
+    /// SOCKS refusal (nothing listens on the port) classifies
+    /// `socks_refused` — offline by construction, the refusal is immediate.
+    #[tokio::test]
+    async fn socks_layer_failures_carry_the_socks_marker_through_the_real_chain() {
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:1").expect("proxy url"))
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(500))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("client");
+        let error = client
+            .get("https://chat.signal.org/")
+            .send()
+            .await
+            .expect_err("loopback socks connect must fail");
+        assert_eq!(service_failure_literal(&error), "socks_refused");
+        // The marker walk itself is what found the layer.
+        assert!(error_chain_names_socks(&error));
+    }
+
+    /// The launcher variable is `host:port`; an explicit `socks5(h)://` prefix
+    /// is tolerated and normalized. Anything else reads as unconfigured.
+    #[test]
+    fn env_proxy_parser_tolerates_the_socks5h_prefix() {
+        assert_eq!(
+            parse_socks_proxy_env("127.0.0.1:1080"),
+            Some(SocksProxy {
+                host: "127.0.0.1".into(),
+                port: 1080,
+            })
+        );
+        assert_eq!(
+            parse_socks_proxy_env("socks5h://relay.example.com:7890"),
+            Some(SocksProxy {
+                host: "relay.example.com".into(),
+                port: 7890,
+            })
+        );
+        assert_eq!(
+            parse_socks_proxy_env("socks5://127.0.0.1:1080"),
+            parse_socks_proxy_env("127.0.0.1:1080")
+        );
+        for raw in ["", ":", "127.0.0.1", "http://127.0.0.1:1080", "::1:1080"] {
+            assert_eq!(
+                parse_socks_proxy_env(raw),
+                None,
+                "malformed proxy values read as unconfigured: {raw:?}"
+            );
+        }
     }
 }

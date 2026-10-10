@@ -937,7 +937,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 false,
             ),
         ),
-        // Read-only diagnostic face (contract revision 1.96, §4.79): one
+        // Read-only diagnostic face (contract revision 1.97, §4.79): one
         // payload covering the version chain, data-dir and lock status, the
         // recent error families, and the reused connectivity surfaces. The
         // whole implementation lives in `doctor`; the dispatch stays one arm.

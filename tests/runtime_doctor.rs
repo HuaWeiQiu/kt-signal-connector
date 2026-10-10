@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! End-to-end coverage for the read-only `runtime.doctor` face (contract
-//! revision 1.96, §4.79): the whole payload over a real authenticated socket
+//! revision 1.97, §4.79): the whole payload over a real authenticated socket
 //! against the fake engine — the version chain (both engine faces ride the
 //! fake's own answers through verbatim; the fake echoes any method it does
 //! not know, so both arrive `present`, and the unit suite pins the honest
 //! `absent`-with-reason side), the data-dir and lock faces (the connector
-//! holds its own occupancy locks, so `held` with its own pid), and the
-//! recent-error ring fed by real failed dispatches. The unit suite in
+//! holds its own occupancy locks, so `held` with its own pid), the
+//! recent-error ring fed by real failed dispatches, and the Signal
+//! service-plane face (field presence in the whole-payload answer; the
+//! `not_configured` path over the wire with the proxy environment removed).
+//! The unit suite in
 //! `src/doctor.rs` pins the pure halves — structure, unreachable
-//! degradation, the three lock forms, and the read-only discipline.
+//! degradation, the three lock forms, the read-only discipline, and the
+//! service-probe classification literals.
 
 #![cfg(unix)]
 
@@ -40,6 +44,16 @@ fn fixture() -> PathBuf {
 }
 
 fn spawn_connector(root: &Path, endpoint: &Path) -> Child {
+    spawn_connector_inner(root, endpoint, false)
+}
+
+/// A connector booted without the launcher's proxy environment: the doctor's
+/// service-plane face must answer `not_configured` without any attempt.
+fn spawn_connector_without_proxy_env(root: &Path, endpoint: &Path) -> Child {
+    spawn_connector_inner(root, endpoint, true)
+}
+
+fn spawn_connector_inner(root: &Path, endpoint: &Path, remove_proxy_env: bool) -> Child {
     let secret_file = root.join("bootstrap.secret");
     let secret = [7_u8; 32];
     fs::write(
@@ -48,7 +62,11 @@ fn spawn_connector(root: &Path, endpoint: &Path) -> Child {
     )
     .unwrap();
     fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o600)).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    if remove_proxy_env {
+        command.env_remove("KT_SIGNAL_SOCKS_PROXY");
+    }
+    command
         .arg("serve")
         .arg("--endpoint")
         .arg(endpoint)
@@ -290,6 +308,74 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
     let network = &result["network"];
     assert!(network["watchdogRestartsTotal"].is_u64());
     assert!(network["receiveDroppedTotal"].is_u64());
+
+    // The service-plane face (revision 1.97): fixed classification literals
+    // only; `status`/`latencyMs` ride exclusively with `http`. The
+    // environment here is whatever the test host exported, so only the
+    // contract shape is pinned, not a specific classification.
+    let service = &result["service"];
+    assert!(service["proxyConfigured"].is_boolean());
+    let literals = [
+        "not_configured",
+        "socks_refused",
+        "tls_failed",
+        "http",
+        "timeout",
+    ];
+    for probe in ["chat", "storage"] {
+        let classification = service[probe]["classification"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            literals.contains(&classification),
+            "{probe} classification must be a contract literal, got {classification:?}"
+        );
+        if classification == "http" {
+            assert!(service[probe]["status"].is_u64());
+            assert!(service[probe]["latencyMs"].is_u64());
+        } else {
+            assert_eq!(
+                service[probe].get("status"),
+                None,
+                "{probe}: status rides only with http"
+            );
+            assert_eq!(
+                service[probe].get("latencyMs"),
+                None,
+                "{probe}: latencyMs rides only with http"
+            );
+        }
+    }
+
+    drop(client);
+    let _ = connector.kill().await;
+}
+
+/// The unconfigured service-plane path over the wire: a connector booted
+/// without the launcher proxy environment answers `proxyConfigured: false`
+/// and both probes `not_configured`, with no `status`/`latencyMs` anywhere —
+/// the only path where the doctor deliberately never touches the network.
+#[tokio::test]
+async fn doctor_service_face_answers_not_configured_without_proxy_env() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret = [7_u8; 32];
+    let mut connector = spawn_connector_without_proxy_env(temp.path(), &endpoint);
+    wait_for_path(&endpoint).await;
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let report = request(&mut client, "doctor-service", "runtime.doctor", json!({})).await;
+    let service = &report["result"]["service"];
+    assert_eq!(service["proxyConfigured"], json!(false));
+    for probe in ["chat", "storage"] {
+        assert_eq!(service[probe]["classification"], json!("not_configured"));
+        assert_eq!(service[probe].get("status"), None);
+        assert_eq!(service[probe].get("latencyMs"), None);
+    }
 
     drop(client);
     let _ = connector.kill().await;

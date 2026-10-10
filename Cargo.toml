@@ -19,6 +19,7 @@ hmac = "0.12"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-webpki-roots",
+    "socks",
     "stream",
 ] }
 rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
@@ -51,6 +52,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Constructing a `reqwest::Response` from an `http::Response` lets the doctor
+# unit suite pin the service-probe `http` classification without any network.
+http = "1"
 tempfile = "3"
 wiremock = "0.6"
 
