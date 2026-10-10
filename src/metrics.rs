@@ -110,6 +110,18 @@ pub fn record_watchdog_restart() {
     WATCHDOG_RESTARTS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Process-lifetime watchdog restart count, for the `runtime.doctor`
+/// network face (§4.79) — the existing metric, read back.
+pub fn watchdog_restarts_total() -> u64 {
+    WATCHDOG_RESTARTS.load(Ordering::Relaxed)
+}
+
+/// Process-lifetime degraded-receive drop count, for the `runtime.doctor`
+/// network face (§4.79) — the existing metric, read back.
+pub fn receive_dropped_total() -> u64 {
+    RECEIVE_DROPPED.load(Ordering::Relaxed)
+}
+
 /// Current number of admitted-but-unfinished host requests.
 pub fn set_host_pending(depth: usize) {
     HOST_PENDING_REQUESTS.store(depth as u64, Ordering::Relaxed);

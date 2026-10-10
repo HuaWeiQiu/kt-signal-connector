@@ -5,7 +5,27 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.95 (2026-10-10; the chat-folder sync passthrough batch (§4.78): the
+- Contract revision: 1.96 (2026-10-10; the runtime.doctor read-only diagnostic face (§4.79):
+  one new Control-lane method answers the whole diagnostic payload in a single call — the
+  version chain (the connector's own version/apiVersion/pid, and per group the engine's
+  `version` and `engine.protocolCapabilities` answers riding through verbatim, an engine
+  that did not answer honestly `present:false` with a static reason instead of an invented
+  value), the data-dir face (path/exists/writable/freeBytes/totalBytes from an
+  access+statvfs probe that writes nothing), the lock face (the
+  `.kt-signal-connector.lock` occupancy classified none/held/stale/released — `held`
+  carrying the kernel's liveness guarantee plus the acquire-time pid, probed by a kernel
+  flock taken and dropped, never broken or removed), a bounded recent-error ring (the
+  newest 64 host dispatch errors and engine protocol warnings aggregated by family,
+  count-descending, in-memory and content-free), and the network face (the existing
+  watchdog-restart and receive-drop counters read out as-is) — the discipline is read-only
+  end to end: the doctor never starts or stops an engine, never writes a byte, never
+  breaks a lock, the engine is probed only through its existing read face under a
+  3-second budget, and an unreachable, exited, faulted, or mid-transition engine degrades
+  its slice of the report honestly while the call still succeeds (params `{}` only —
+  anything else answers INVALID_REQUEST retryable=false; no new error codes, no new
+  capability token — the method rides the handshake method-list advertisement; the
+  field-level consumer reference lives in `docs/doctor-contract.md`) — previously 1.95
+  (2026-10-10; the chat-folder sync passthrough batch (§4.78): the
   desktop's folder picker gains its connector face — `chatFolders.list` (read lane, the new
   `chat-folders` capability) and `chatFolders.setRecords` (send lane, account-scoped
   mutating, the reaction class) forward the kt-engine's own Storage-record folder surface
@@ -6155,6 +6175,84 @@ sentinel answering SEND_OUTCOME_UNKNOWN (retryable=false) with exactly one dispa
 frame in the log; `chat_folder_faces_gate_the_mode_seam` — JVM answering
 CAPABILITY_UNAVAILABLE on both faces before any engine starts, not one frame logged);
 plus the schema-consistency bound pairs and the server handshake advertisement.
+
+### 4.79 Read-only diagnostic face: `runtime.doctor` (contract revision 1.96, 2026-10-10)
+
+The desktop's support surface needed one call that answers "what is actually going on
+inside this connector" without being able to change anything by asking: the whole
+diagnostic payload rides one Control-lane method with `{}` params exactly (anything else
+answers INVALID_REQUEST, retryable=false — no new error codes, no new capability token,
+the method rides the handshake method-list advertisement), and the discipline is
+read-only end to end: the doctor never starts or stops an engine, never breaks, removes,
+or truncates a lock, never writes a byte — every probe reads, and a slice that cannot
+answer degrades honestly while the call still succeeds. The answer is
+`{connector, groups[], network, recentErrors}`; the field-level consumer reference lives
+in `docs/doctor-contract.md`.
+
+- **Version chain** — `connector` carries the connector's own `version`, `apiVersion`,
+  and `pid`; each group's `engine` carries the launcher-selected `mode` (the clap value
+  name, so the label follows the enum verbatim), the live `state`/`pid`/`rssBytes`/
+  `resourcePressure` status view, the doctor's own `reachable` probe result, and the two
+  engine method faces: `version` and `engine.protocolCapabilities`. A face is mutually
+  exclusive by construction — `present: true` with the engine's own answer riding
+  through **verbatim** (never re-derived, re-keyed, or normalized; the kt-engine
+  self-certification face keeps its upstream spelling, `profiles_v2` included), or
+  `present: false` with a static, content-free `reason` — never a value the connector
+  invented.
+- **Honest degradation** — an engine that is not running answers `reachable: false` and
+  both faces absent with the state's static reason (stopped: not started since connector
+  boot or stopped by runtime.stop; exited: the process ended on its own; faulted: it
+  crashed or failed to start, the watchdog may restart it); a running engine whose live
+  handle vanished mid-probe answers the transitioning reason; a probe that exhausts the
+  engine-call budget (3 s — a wedged engine must not hold a diagnostic anywhere near the
+  ordinary 15 s request timeout), hits engine backpressure, or watches the engine exit
+  mid-probe answers `the engine stopped answering mid-probe`; an engine error answers
+  the per-method error-class reason (for the self-certification face: a stock signal-cli
+  engine does not carry the kt-engine face). A diagnostic never fails as a whole because
+  one engine face could not answer.
+- **Data-dir face** — `path`/`exists`/`writable`/`freeBytes`/`totalBytes` from a probe
+  that writes nothing: `stat`, `access(2)` `W_OK` for the directory's own writability
+  (Windows falls back to the read-only attribute — best effort there, pending a Windows
+  test host), and `statvfs(2)` for the free/total pair (absent when the directory does
+  not exist). The path rides to the authenticated host on purpose — the launcher passed
+  it at spawn, so the peer already knows it — and never enters logs.
+- **Lock face** — the `.kt-signal-connector.lock` occupancy classified
+  `none`/`held`/`stale`/`released`: `present` is the file's existence, `held` the kernel
+  flock probe (open read-only, `LOCK_EX|LOCK_NB`, unlock immediately — a `held` verdict
+  means someone else holds it, and the doctor never waits for, breaks, or removes a
+  lock), `pid` the decimal pid the connector wrote into the file at acquire time
+  (absent for pre-face files or corrupted content), `holderAlive` true by kernel
+  guarantee under `held`, else the recorded pid's liveness when known, `stale` a
+  dead-pid remnant, and `released` the designed post-release remnant (the lock file is
+  deliberately never deleted, so this is the normal state after a clean connector exit).
+- **Recent-error ring** — `recentErrors` answers with the fixed `window` (64), the
+  process-lifetime `recordedTotal`, and the newest-64 aggregation by family,
+  count-descending: `source: "host"` families are structured dispatch error codes with
+  their retryability, `source: "protocol"` families are engine protocol warning kinds,
+  `lastAtUnixMs` the newest event's unix-millisecond stamp. The ring is in-memory only
+  and content-free by construction — codes, kinds, counts, timestamps, never message
+  content.
+- **Network face** — the existing `watchdogRestartsTotal` and `receiveDroppedTotal`
+  counters read out as-is; the doctor adds no new network instrumentation.
+
+Tests: the doctor units (`doctor_report_structure_matches_the_contract` — the whole
+payload shape against the pinned structs; `engine_unreachable_degrades_honestly` — the
+stopped/exited/faulted reasons and the transitioning case;
+`engine_method_faces_answer_and_degrade_verbatim` — the answered-verbatim vs
+failed-with-reason exclusivity; `lock_face_reports_absence` /
+`lock_face_reports_a_live_held_lock` / `lock_face_reports_a_stale_dead_pid_lock` /
+`lock_face_reports_a_released_lock_without_a_dead_pid` — the four classifications;
+`recorded_pid_rejects_non_pid_content`; `probes_leave_the_data_directory_untouched` —
+the read-only discipline by snapshot comparison;
+`data_dir_face_reports_status_without_writing`;
+`error_ring_is_bounded_and_aggregates_families`); the integration roundtrip
+(`tests/runtime_doctor.rs`:
+`doctor_reports_versions_data_dir_lock_errors_and_reachability` — the whole payload over
+a real authenticated socket with the fake engine live: the version chain verbatim, the
+method faces riding the fixture's answers, the connector's own occupancy locks `held`
+with the pid it wrote at acquire, real failed dispatches feeding the ring, and the
+non-empty-params INVALID_REQUEST gate); plus the schema method enumeration and the
+handshake advertisement.
 
 ## 5. signal-cli Boundary
 

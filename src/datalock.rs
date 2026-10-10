@@ -29,8 +29,11 @@ use crate::groups::ProxyGroupPlan;
 
 /// The lock file placed inside every occupied data directory. The leading
 /// dot keeps it out of signal-cli's way; the name is distinct enough that
-/// it can never collide with signal-cli's own files.
-const LOCK_FILE_NAME: &str = ".kt-signal-connector.lock";
+/// it can never collide with signal-cli's own files. The connector's own
+/// pid is written into the file at acquire time so the read-only
+/// `runtime.doctor` face (§4.79) can report the holder identity; the kernel
+/// lock, never the file content, stays the occupancy truth.
+pub(crate) const LOCK_FILE_NAME: &str = ".kt-signal-connector.lock";
 
 /// An acquired data-directory occupancy lock. The held file handle *is* the
 /// lock: dropping the guard releases it, and any process exit (clean or
@@ -69,6 +72,13 @@ impl DataDirLock {
             std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
         }
         lock_exclusive(&handle).map_err(|error| occupied_error(group_id, error))?;
+        // Record the holder pid for the doctor's lock face (§4.79). The file
+        // is this connector's own lock artifact, written once at acquire;
+        // a write failure is non-fatal (the kernel lock is already held, so
+        // occupancy is unaffected and the doctor reports an unknown pid).
+        let pid_note = format!("{}", std::process::id());
+        let _ = handle.set_len(0);
+        let _ = std::io::Write::write_all(&mut &handle, pid_note.as_bytes());
         Ok(Self { handle })
     }
 }

@@ -649,6 +649,11 @@ where
                     let method_class = metrics::method_class(&method);
                     let result_class = metrics::result_class(response.error.as_ref());
                     metrics::record_request(method_class, result_class, elapsed);
+                    // The doctor's recent-error ring (§4.79): every host
+                    // dispatch failure lands its wire error code as a family.
+                    if let Some(error) = response.error.as_ref() {
+                        crate::doctor::record_host_error(error.code, error.retryable);
+                    }
                     log_dispatch(
                         method_class,
                         result_class,
@@ -712,10 +717,13 @@ where
                                     "groupId": group_id
                                 }),
                             ),
-                            RegistryEvent::ProtocolWarning { kind } => HostEvent::new(
-                                "runtime.protocolWarning",
-                                json!({ "kind": kind }),
-                            ),
+                            RegistryEvent::ProtocolWarning { kind } => {
+                                crate::doctor::record_protocol_warning(kind);
+                                HostEvent::new(
+                                    "runtime.protocolWarning",
+                                    json!({ "kind": kind }),
+                                )
+                            }
                             RegistryEvent::StorageChanged { state } => HostEvent::new(
                                 "runtime.storageChanged",
                                 json!({ "state": state }),
@@ -922,6 +930,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             Err(failure) => HostResponse::failure(request_id, map_stop_failure(failure)),
         },
         "runtime.status" | "runtime.start" | "runtime.stop" => HostResponse::failure(
+            request_id,
+            ApiError::new(
+                "INVALID_REQUEST",
+                "this method requires empty params",
+                false,
+            ),
+        ),
+        // Read-only diagnostic face (contract revision 1.96, §4.79): one
+        // payload covering the version chain, data-dir and lock status, the
+        // recent error families, and the reused connectivity surfaces. The
+        // whole implementation lives in `doctor`; the dispatch stays one arm.
+        "runtime.doctor" if empty_params(&request.params) => HostResponse::success(
+            request_id,
+            serde_json::to_value(crate::doctor::collect(runtime).await).unwrap_or(Value::Null),
+        ),
+        "runtime.doctor" => HostResponse::failure(
             request_id,
             ApiError::new(
                 "INVALID_REQUEST",

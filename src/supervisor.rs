@@ -1012,6 +1012,30 @@ impl RuntimeSupervisor {
             })
     }
 
+    /// The read-only per-group snapshot the `runtime.doctor` face (§4.79)
+    /// consumes: the launcher-config identity plus the supervised engine
+    /// status and a live engine handle when one exists. Read-only by
+    /// contract — it never starts, stops, or writes anything; the doctor's
+    /// engine method probes ride the handle's read-only call path.
+    pub(crate) async fn doctor_face(&self) -> crate::doctor::DoctorGroupFace {
+        let slot = self.engine.lock().await;
+        let live = slot.as_ref().filter(|engine| !engine.is_terminal());
+        crate::doctor::DoctorGroupFace {
+            mode: self.config.mode,
+            data_dir: self.config.data_dir.clone(),
+            status: slot
+                .as_ref()
+                .map(EngineHandle::status)
+                .unwrap_or(EngineStatus {
+                    state: EngineState::Stopped,
+                    pid: None,
+                    rss_bytes: None,
+                    resource_pressure: false,
+                }),
+            engine: live.cloned(),
+        }
+    }
+
     pub async fn start(&self) -> Result<EngineStatus, EngineError> {
         let mut slot = self.engine.lock().await;
         if let Some(engine) = slot.as_ref()
