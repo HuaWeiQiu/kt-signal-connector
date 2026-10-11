@@ -713,6 +713,17 @@ impl ServiceError {
                 "the upstream server is unavailable",
                 true,
             ),
+            // Contract 1.114 §4.95: the identity gate joins the anchor-
+            // classified send-chain face. The recipient's identity key changed
+            // without confirmation — the same cause official desktop refuses
+            // the send for — and only confirming the safety number unblocks
+            // it, so re-driving an unchanged send is refused again:
+            // retryable=false.
+            ServiceError::Engine(EngineError::IdentityUnverified) => ApiError::new(
+                "SEND_IDENTITY_UNVERIFIED",
+                "the send was rejected: the recipient identity is unverified",
+                false,
+            ),
             ServiceError::Engine(EngineError::Backpressure) => {
                 ApiError::new("INTERNAL_ERROR", "signal-cli request queue is full", true)
             }
@@ -12055,12 +12066,13 @@ mod tests {
         assert!(!api.retryable);
     }
 
-    /// Send-chain transport families (contract 1.99, §4.80): the three
-    /// engine classes map onto their host codes with the contract-fixed
-    /// retryability — the server-unavailable family may succeed on a later
-    /// attempt, while the rate-limit and proof-challenge faces are
-    /// per-attempt answers the caller re-drives (a mutating send is never
-    /// auto-retried; the flag is display-side only).
+    /// Send-chain transport families (contract 1.99, §4.80) joined by the
+    /// identity gate (contract 1.114, §4.95): the engine classes map onto
+    /// their host codes with the contract-fixed retryability — the
+    /// server-unavailable family may succeed on a later attempt, while the
+    /// rate-limit, proof-challenge, and identity-trust faces are per-attempt
+    /// answers the caller re-drives (a mutating send is never auto-retried;
+    /// the flag is display-side only).
     #[test]
     fn send_chain_transport_errors_map_to_send_error_codes() {
         for (error, code, retryable) in [
@@ -12070,6 +12082,11 @@ mod tests {
                 EngineError::ServerUnavailable,
                 "SEND_SERVER_UNAVAILABLE",
                 true,
+            ),
+            (
+                EngineError::IdentityUnverified,
+                "SEND_IDENTITY_UNVERIFIED",
+                false,
             ),
         ] {
             let api = ServiceError::Engine(error).into_api();

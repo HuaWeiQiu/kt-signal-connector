@@ -259,6 +259,18 @@ pub enum EngineError {
     ProofRequired,
     #[error("signal-cli server is unavailable")]
     ServerUnavailable,
+    /// Contract 1.114 §4.95: the identity-trust gate family. The engine (P9)
+    /// refuses a send when the recipient's identity key changed without
+    /// confirmation — the same cause official desktop refuses the send for —
+    /// and folds it into the plain internal_error face (-32603) whose
+    /// `message` embeds the `(UntrustedIdentityException)` anchor, the same
+    /// observation shape as the §4.80 transport families. It surfaces
+    /// structurally so the host sees the safety-number gate as its own code
+    /// instead of generic upstream noise. The variant stays content-free and
+    /// the classification carries no event: a per-recipient trust refusal
+    /// never touches account state.
+    #[error("signal-cli send was rejected: recipient identity is unverified")]
+    IdentityUnverified,
     /// The engine answered a JSON-RPC error object with an upstream error
     /// code (contract 1.36 sticker/pin faces): the code string is carried
     /// structurally so the connector maps engine error codes onto the host
@@ -293,6 +305,7 @@ impl EngineError {
             EngineError::RateLimited => "rate_limited",
             EngineError::ProofRequired => "proof_required",
             EngineError::ServerUnavailable => "server_unavailable",
+            EngineError::IdentityUnverified => "identity_unverified",
             EngineError::UpstreamCode { .. } => "upstream_code",
         }
     }
@@ -2511,29 +2524,30 @@ fn upstream_error_is_credential_invalid(error: Option<&Value>) -> bool {
         .is_some_and(|message| message.contains(ENGINE_CREDENTIALS_401_BODY_ANCHOR))
 }
 
-/// Contract 1.99 §4.80 send-chain transport anchors: the engine folds a
-/// transport-layer send failure into the plain internal_error JSON-RPC face
-/// (-32603) whose `message` embeds the cause class. These three fixed
-/// literals — supplied by the engine contract verbatim, matched exactly —
-/// classify the family at this single observation point, the same place the
-/// authorization matcher above reads the raw upstream error body.
-/// Deliberately constants beside, not inside, the authorization matcher:
-/// that matcher is a fragile route (strict prefixes/suffixes tuned per
-/// message form) and its match set must not grow to absorb transport
-/// families.
+/// Contract 1.99 §4.80 send-chain transport anchors (joined by the 1.114
+/// §4.95 identity anchor): the engine folds a transport-layer send failure
+/// into the plain internal_error JSON-RPC face (-32603) whose `message`
+/// embeds the cause class. These fixed literals — supplied by the engine
+/// contract verbatim, matched exactly — classify the family at this single
+/// observation point, the same place the authorization matcher above reads
+/// the raw upstream error body. Deliberately constants beside, not inside,
+/// the authorization matcher: that matcher is a fragile route (strict
+/// prefixes/suffixes tuned per message form) and its match set must not grow
+/// to absorb transport families.
 const ENGINE_SEND_RATE_LIMITED_ANCHOR: &str = "(RateLimitExceeded)";
 const ENGINE_SEND_PROOF_REQUIRED_ANCHOR: &str = "(ProofRequiredException)";
 const ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR: &str = "(ServerUnavailableException)";
+const ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR: &str = "(UntrustedIdentityException)";
 
-/// Classify a send-chain transport error (contract 1.99 §4.80) from the raw
-/// JSON-RPC error body: `Some` variant when the error `message` embeds one
-/// of the three fixed anchors, `None` otherwise. The anchors are
-/// parenthesized exception names the engine emits verbatim, so a substring
-/// match cannot pick up incidental text; a message is only ever classified,
-/// never surfaced. This is a standalone pure function — it shares no match
-/// set with [`upstream_error_is_unauthorized`], whose `AccountUnauthorized`
-/// → `ACCOUNT_UNLINKED` chain keeps head-of-line precedence at the call
-/// site.
+/// Classify a send-chain error (contract 1.99 §4.80, joined by the 1.114
+/// §4.95 identity gate) from the raw JSON-RPC error body: `Some` variant when
+/// the error `message` embeds one of the fixed anchors, `None` otherwise. The
+/// anchors are parenthesized exception names the engine emits verbatim, so a
+/// substring match cannot pick up incidental text; a message is only ever
+/// classified, never surfaced. This is a standalone pure function — it shares
+/// no match set with [`upstream_error_is_unauthorized`], whose
+/// `AccountUnauthorized` → `ACCOUNT_UNLINKED` chain keeps head-of-line
+/// precedence at the call site.
 fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
     let message = error?.get("message").and_then(Value::as_str)?;
     if message.contains(ENGINE_SEND_RATE_LIMITED_ANCHOR) {
@@ -2542,6 +2556,8 @@ fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
         Some(EngineError::ProofRequired)
     } else if message.contains(ENGINE_SEND_SERVER_UNAVAILABLE_ANCHOR) {
         Some(EngineError::ServerUnavailable)
+    } else if message.contains(ENGINE_SEND_IDENTITY_UNVERIFIED_ANCHOR) {
+        Some(EngineError::IdentityUnverified)
     } else {
         None
     }
@@ -5960,6 +5976,49 @@ mod tests {
         assert_eq!(
             classify(json!({ "code": -32603, "message": "(RateLimitExceeded)" })),
             Some(EngineError::RateLimited)
+        );
+    }
+
+    /// Contract 1.114 §4.95: the identity gate joins the send-chain
+    /// classifier as the fourth anchor — the engine's exact P9 wire literal
+    /// classifies, the bare anchor literal classifies, and the gate never
+    /// fires on identity wording without the parenthesized exception name.
+    #[test]
+    fn send_chain_classifier_maps_the_identity_anchor() {
+        let classify = |error: serde_json::Value| upstream_error_send_class(Some(&error));
+        // Realistic engine wire shape (P9, methods.rs IDENTITY_UNVERIFIED_MESSAGE).
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Identity unverified. (UntrustedIdentityException)"
+            })),
+            Some(EngineError::IdentityUnverified)
+        );
+        // The bare literal classifies: contained literal, not a trailing
+        // suffix.
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "(UntrustedIdentityException)"
+            })),
+            Some(EngineError::IdentityUnverified)
+        );
+        // Identity wording without the parenthesized anchor is not a
+        // classification.
+        assert_eq!(
+            classify(json!({
+                "code": -32603,
+                "message": "Failed to send message: Identity unverified."
+            })),
+            None
+        );
+        // The anchor only in the `code` slot is not a classification.
+        assert_eq!(
+            classify(json!({
+                "code": "(UntrustedIdentityException)",
+                "message": "fixture send failed"
+            })),
+            None
         );
     }
 

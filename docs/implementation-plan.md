@@ -5,7 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.113 (2026-10-11; the accountUnbound whitelist (§4.94):
+- Contract revision: 1.114 (2026-10-11; the identity gate gets a code
+  (§4.95): the engine's send path refuses a send when the recipient's
+  identity key changed without confirmation — official desktop's
+  safety-number gate — and folds the refusal into the plain `-32603` face
+  whose message embeds the fixed `(UntrustedIdentityException)` anchor.
+  The §4.80 send-chain classifier knew three anchors, so a safety-number
+  refusal answered the generic `UPSTREAM_ERROR` face: indistinguishable from
+  noise, retryable=true, with no way for the desktop to say what unblocks
+  the send. The classifier gains the fourth anchor and a content-free
+  `IdentityUnverified` variant; the service mapping answers
+  `SEND_IDENTITY_UNVERIFIED` with retryable=false (confirming the safety
+  number is the only unblock); the schema error-code enum gains the code;
+  the `ENGINE_STRUCTURED_ERROR_CODES` allowlist is deliberately untouched —
+  the code travels the anchor-classification face, not the structured-code
+  face. Tests 656 → 657 (lib 497 → 498), all green) —
+  previously 1.113 (2026-10-11; the accountUnbound whitelist (§4.94):
   the engine's unbound stop-ring (B4) already pushed a single `accountUnbound`
   notification when the server's 401 credential rejection halted the receive
   loop — wire-additive, deliberately unconsumed. That left the account's death
@@ -7704,6 +7719,44 @@ attributed event, no warning) and
 `malformed_account_unbound_notifications_stay_unattributed` (missing
 `params`, missing, non-string and empty `account` each yield only the
 warning). Gates: 654 → 656 (lib 495 → 497), all green.
+
+### 4.95 SEND_IDENTITY_UNVERIFIED: the identity gate gets a code (contract revision 1.114, 2026-10-11)
+
+The engine's send path carries an identity-trust gate (P9): when the
+recipient's identity key changed without confirmation, the send is refused —
+the same cause official desktop refuses a send for — and the refusal folds
+into the plain internal_error JSON-RPC face (`-32603`) whose `message` embeds
+the fixed anchor `(UntrustedIdentityException)` (the exact wire literal
+`Failed to send message: Identity unverified.
+(UntrustedIdentityException)`). Before this revision the connector's
+send-chain anchor classifier (§4.80) knew three anchors — rate limit, proof
+challenge, server unavailability — so a safety-number refusal answered the
+generic `UPSTREAM_ERROR` face: indistinguishable from noise, retryable=true,
+and the desktop had no way to tell the user what actually unblocks the send
+(confirm the safety number).
+
+**The fourth anchor.** `upstream_error_send_class` gains the
+`(UntrustedIdentityException)` anchor and a content-free
+`EngineError::IdentityUnverified` variant — the same discipline as the three
+transport siblings: fixed engine literal matched exactly, a message is only
+ever classified never surfaced, no event (a per-recipient trust refusal never
+touches account state), and the anchor classifier stays a standalone pure
+function sharing no match set with the authorization matcher. The service
+mapping answers `SEND_IDENTITY_UNVERIFIED` with retryable=false — confirming
+the safety number is the only unblock, so re-driving an unchanged send is
+refused again (the flag is display-side only; a mutating send is never
+auto-retried). The schema error-code enum gains the code; the
+`ENGINE_STRUCTURED_ERROR_CODES` allowlist is deliberately untouched — this
+code travels the anchor-classification face, not the structured-code face,
+so the two cannot collide (an embedded anchor in a longer message vs. an
+exact allowlist literal).
+
+Tests: `send_chain_classifier_maps_the_identity_anchor` (the exact engine
+literal and the bare anchor classify; identity wording without the
+parenthesized anchor and an anchor in the `code` slot do not), and the
+§4.80 mapping table row (`SEND_IDENTITY_UNVERIFIED`, retryable=false, no
+data object); `tests/schema_consistency.rs` covers the enum-set equality
+automatically. Gates: 656 → 657 (lib 497 → 498), all green.
 
 ## 5. signal-cli Boundary
 
