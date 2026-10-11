@@ -51,8 +51,8 @@ pub const PHASE2_CAPABILITIES: &[&str] = &methods::METHOD_NAMES;
 /// revision 1.37: `sticker-pack-sync`; contract revision 1.38: `view-once`).
 ///
 /// Contract revision 1.98: `attachment-download` joins the payload only when
-/// `media_ingest` is armed — the registry's effective launcher decision (the
-/// kt-engine downgrade included) and the exact gate every media method
+/// `media_ingest` is armed — the effective launcher decision (passed through
+/// verbatim since 1.121, §4.102) and the exact gate every media method
 /// answers. A runtime without the media table omits the tag, so the desktop
 /// takes the honest metadata-only path instead of calling a face that
 /// answers `CAPABILITY_UNAVAILABLE` for every download; with the table

@@ -4038,11 +4038,11 @@ mod tests {
 
     /// Contract revision 1.98: `attachment-download` is the one handshake
     /// tag the runtime state gates. The unarmed default runtime — the
-    /// packaged shape: no `--media-ingest`, the registry's kt-engine
-    /// downgrade included — omits the tag while every real method stays
-    /// advertised; a runtime assembled with the armed media table (the exact
-    /// gate the media methods answer) advertises the pre-1.98 payload
-    /// unchanged.
+    /// packaged shape: no `--media-ingest` (the launcher decision is the
+    /// whole decision, the §4.102 pass-through) — omits the tag while every
+    /// real method stays advertised; a runtime assembled with the armed media
+    /// table (the exact gate the media methods answer) advertises the
+    /// pre-1.98 payload unchanged.
     #[tokio::test]
     async fn handshake_gates_the_attachment_download_tag_on_media_ingest() {
         let unarmed = handshake_capabilities([7_u8; 32], test_runtime()).await;

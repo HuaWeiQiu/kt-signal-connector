@@ -4498,9 +4498,10 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
     }
 
     // Contract revision 1.98: this harness spawns `serve` without
-    // `--media-ingest` (and the registry's kt-engine downgrade holds anyway),
-    // so the attachment-download tag must stay absent — the honest
-    // unavailable advertisement, not a capability every call would fail.
+    // `--media-ingest` (the launcher decision is the whole decision since
+    // 1.121, §4.102), so the attachment-download tag must stay absent — the
+    // honest unavailable advertisement, not a capability every call would
+    // fail.
     assert!(
         !capabilities
             .iter()

@@ -68,10 +68,11 @@ enum CliCommand {
         /// `default` group keeps this legacy SOCKS proxy and data directory.
         #[arg(long = "proxy-group", value_name = "ID=HOST:PORT")]
         proxy_group: Vec<String>,
-        /// Media ingest opt-in (ADR 0002, downgraded per plan §5): the kt
-        /// engine has no attachment ingest, so arming the flag keeps the
-        /// wire contract but downgrades to the pre-1.17 shape —
-        /// `--ignore-attachments` stays on the argv and every media method
+        /// Media ingest opt-in (ADR 0002; the launcher decision is the whole
+        /// decision since contract 1.121, §4.102): arming the flag drops
+        /// `--ignore-attachments` from the child argv, arms the media
+        /// governor, and advertises `attachment-download` (the §4.54 locator
+        /// chain serves bytes on demand); without it every media method
         /// answers CAPABILITY_UNAVAILABLE.
         #[arg(long, default_value_t = false)]
         media_ingest: bool,
@@ -291,8 +292,8 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     // launch without leaking any endpoint into diagnostics (ADR 0001 R10).
     // Flag entries come first in launcher order, then environment entries;
     // duplicates across the two sources are rejected rather than merged.
-    // Capability shaping for the kt engine (the media-ingest downgrade and
-    // the ignored --java-home) happens in `open_group_runtime`.
+    // Capability shaping for the kt engine (the media-ingest pass-through
+    // and the ignored --java-home) happens in `open_group_runtime`.
     let env_spec = std::env::var("KT_SIGNAL_PROXY_GROUPS").ok();
     let plan = groups::build_group_plan(
         &proxy_group,

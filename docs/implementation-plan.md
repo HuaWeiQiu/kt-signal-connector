@@ -5,7 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.120 (2026-10-12; the account-settings write face
+- Contract revision: 1.121 (2026-10-12; the media-ingest gate flips to
+  pass-through (§4.102): the registry's `effective_media_ingest` — the
+  kt-engine era's forced downgrade that kept `--ignore-attachments` on
+  the argv and answered every media method CAPABILITY_UNAVAILABLE
+  however the launcher decided — now passes the launcher's
+  `--media-ingest` decision through verbatim. Main-path policy flip,
+  not a new execution surface: every media face, the governor, and the
+  1.98 advertisement gate are unchanged; what changes is the decision's
+  owner. The §5 launch bullet and the §6.7 media-limitation red line
+  are struck through in place with pointers; invariants held —
+  locator-less legacy rows stay permanently non-downloadable
+  (INVALID_REQUEST before any network, honest copy), pointer material
+  never logs, queues stay bounded. No new method/error/tag; no store
+  move. Tests 663 held (lib 505 held; one unit flips in place), all
+  green) —
+  previously 1.120 (2026-10-12; the account-settings write face
   gains the linkPreviews bit (§4.101): the engine's 窗D B6 批1 landed
   `setAccountConfiguration`'s optional linkPreviews write (the official
   AccountRecord field 11) plus the five-boolean getConfiguration read
@@ -8218,6 +8233,72 @@ the integration gains the forwarded pair (the mixed write carries
 linkage block. Gates: 663 held (lib 505 held — assertions extend the
 two existing tests in place), all green.
 
+### 4.102 The media-ingest gate flips to pass-through (contract revision 1.121, 2026-10-12)
+
+The registry's `effective_media_ingest` — since the kt-engine era a
+forced downgrade that kept `--ignore-attachments` on the argv, skipped
+the media governor, and answered every media method
+`CAPABILITY_UNAVAILABLE` however the launcher decided — now passes the
+launcher's `--media-ingest` decision through verbatim. This is a
+main-path policy flip, not a new execution surface: every media face
+(chunked streaming triple, `history.attachmentDownload`,
+`attachments.download`), the media governor, and the 1.98
+advertisement gate are exactly as they were; what changes is who owns
+the decision. The driving scenario is cross-device sync: the account's
+own linked devices push media-bearing state, the engine projects the
+receive locator face (the 1.61 closure — `locator` keys ride the
+attachment pointer projection), and an armed runtime ingests media
+honestly instead of silently degrading to metadata-only.
+
+**取代理由（the decision chain）.** The downgrade was recorded 2026-10-03
+when the kt-engine had no attachment ingest at all: arming ingest would
+have advertised a face that failed for every call, and the dev desktop
+arms ingest unconditionally, so the downgrade kept it booting (the two
+superseded red lines — the §5 launch bullet and the §6.7
+media-limitation paragraph — are struck through in place above with
+pointers here). Three facts retire the premise: (1) the engine ships
+the receive locator projection, so rows land with downloadable
+material; (2) the bounded-download chain passed its acceptance gates
+(1.17 chunked channel, 1.57 history chain, 1.61 live chain, the
+quota+TTL governor bounding retention); (3) the 1.98 handshake gate
+already ties the `attachment-download` advertisement to this same
+effective decision, so a pass-through cannot advertise a face the
+runtime cannot serve — the honesty the downgrade provided is now
+provided by the advertisement gate itself.
+
+**Invariants held across the flip.** Locator-less legacy rows stay
+permanently non-downloadable: the locator ladder answers
+`INVALID_REQUEST` before any network traffic (never a guessed
+download), the honest copy — an old row is indistinguishable from a
+pointer-less one and both refuse identically. Pointer material never
+logs: the download chain's diagnostics stay content-free (the §4.38
+discipline, unchanged). Queues stay bounded: the media governor's
+quota+TTL retention arms exactly when ingest arms (the §10.2-era
+bounds); the dev desktop's unconditional arming now gets the real
+bounded machine instead of the silent no-op.
+
+**The wire.** No new method, error code, or capability; no store move.
+The unarmed shape (the packaged default) is byte-identical to before —
+same argv, same CAPABILITY_UNAVAILABLE answers, same tag-less
+handshake. The armed shape changes argv (the flag drops) and
+advertisement (the tag rides), which is the flip's entire point.
+
+Tests: the registry unit flips (`media_ingest_passes_through`: true
+passes through, false stays off); the armed-advertisement handshake
+test and the unarmed harness assertion already pin both advertisement
+sides and stay green unchanged. Stale downgrade wording swept from the
+launcher docs, the config field, the capability tables, and both §5/§6.7
+red lines (struck through, pointered here).
+
+真机回归（local real-process regression, this commit）: release build
+served as the regression binary; `serve --media-ingest` against the
+fake engine answered `handshake.capabilities` containing
+`attachment-download` (armed) while the same binary without the flag
+omitted it (unarmed), and `messages.attachments.open` answered
+`CAPABILITY_UNAVAILABLE` only on the unarmed side — the flip's two
+observable faces end to end. Gated behind the full local gate suite
+(fmt + clippy -D warnings + cargo test + release build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -8276,12 +8357,16 @@ Rules:
   separate batch), the engine's argv parser is fail-closed on unknown arguments, and the child
   environment is inherited except for the store-key override. The engine writes its own
   `engine-state.json` / `engine-send-log.jsonl` / `accounts/lk-<hex>` layout under the group data
-  directory, disjoint from the connector's `.kt-signal-connector.lock`. `--media-ingest` is
+  directory, disjoint from the connector's `.kt-signal-connector.lock`. ~~`--media-ingest` is
   downgraded instead of refused (2026-10-03): the engine never downloads attachments, so arming
   ingest silently keeps the pre-1.17 shape — `--ignore-attachments` stays on the argv, the media
   governor is not armed, and every media method answers CAPABILITY_UNAVAILABLE — with a
   launch-time warning, so the dev desktop (which arms ingest unconditionally) still boots instead
-  of failing closed. Runtime manifests describe the connector bundle only: libsignal rides the
+  of failing closed.~~ **已由 `effective_media_ingest` 直通取代（契约 1.121, §4.102，本
+  commit）**：launch 决策逐字直通——armed ingest 从 argv 摘掉 `--ignore-attachments`、武装
+  media governor、握手按同一有效决策广告 `attachment-download`；取代理由与决策链见 §4.102
+  （引擎 1.61 闭合后 receive 已投影 locator 面，§4.54 下载链按需取字节，降级的历史前提不再
+  成立）。Runtime manifests describe the connector bundle only: libsignal rides the
   engine face, and the former signal-cli/JRE component entries and their packaging chain are
   gone.
 
@@ -8555,9 +8640,14 @@ Phase 1 runs signal-cli with attachments, stories, and stickers ignored. Current
 non-ignored incoming attachments before it emits the receive notification, and `getAttachment`
 returns an already-downloaded file as full Base64. That is not an acceptable large-media boundary.
 
-Media remains disabled until a dedicated PoC proves bounded disk-pressure behavior and streams a
+Media remains ~~disabled until a dedicated PoC proves bounded disk-pressure behavior and streams a
 canonical, already-downloaded file through a short-lived handle without Base64 or arbitrary path
-exposure. Failure to prove the limit leaves the media capability disabled.
+exposure. Failure to prove the limit leaves the media capability disabled.~~ **已由
+`effective_media_ingest` 直通取代（契约 1.121, §4.102，本 commit）**——the bounded-download PoC
+passed its acceptance gates (the 1.17 chunked channel, the 1.57/1.61 transit-CDN chains, the
+quota+TTL media governor) and the launcher's `--media-ingest` decision now passes through
+verbatim; this paragraph is the historical metadata-only red line the flip retires, kept for the
+decision chain (取代理由与决策链见 §4.102).
 
 Contract revision 1.15 (2026-09-23) narrows this boundary without lifting it: incoming envelopes
 now contribute bounded attachment **metadata only** (§4.13) — descriptors are stored on the
@@ -8571,7 +8661,8 @@ channel's gating.)
 That PoC is now designed: `docs/adr/0002-media-ingest-poc.md` (2026-09-23) defines the
 opt-in `--media-ingest` spawn flag, a quota+TTL media governor, and chunked handle
 delivery (`messages.attachments.open` / `readChunk` / `closeHandle`, contract revision
-1.17). Until that PoC passes its acceptance gates, this boundary stands.
+1.17). ~~Until that PoC passes its acceptance gates, this boundary stands.~~（该门已过、
+红线已由契约 1.121 §4.102 的直通取代——同段上方指针。）
 
 ## 7. Data and Resource Limits
 

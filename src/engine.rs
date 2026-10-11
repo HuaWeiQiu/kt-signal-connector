@@ -75,11 +75,11 @@ pub struct SignalCliConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
     /// Media ingest opt-in (ADR 0002). Launcher input only — never IPC
-    /// input. The registry downgrades every opt-in to `false` (§5): the
-    /// engine has no attachment download yet, so an armed ingest keeps
-    /// `--ignore-attachments` on the argv, skips the media governor, and
-    /// every media method answers `CAPABILITY_UNAVAILABLE` instead of
-    /// failing the launch (the dev desktop arms ingest unconditionally).
+    /// input. Since contract 1.121 (§4.102) the decision passes through
+    /// verbatim: armed ingest drops `--ignore-attachments` from the argv and
+    /// arms the media governor (the §4.54 locator chain serves the bytes on
+    /// demand); unarmed keeps the pre-ingest shape and every media method
+    /// answers `CAPABILITY_UNAVAILABLE`.
     pub media_ingest: bool,
     pub line_limit: usize,
     pub request_timeout: Duration,

@@ -620,10 +620,11 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// Contract revision 1.98: `attachment-download` is the one tag whose
 /// advertisement is conditional — [`crate::advertised_capabilities`] filters
 /// it out unless the runtime's media ingest is armed, because the media
-/// faces behind it answer `CAPABILITY_UNAVAILABLE` for every call otherwise
-/// (the launcher flag alone is not the truth: the registry's kt-engine
-/// downgrade decides, and the handshake must not advertise a capability the
-/// runtime cannot serve). The constant stays in this table so the tag
+/// faces behind it answer `CAPABILITY_UNAVAILABLE` for every call otherwise.
+/// Since contract 1.121 (§4.102) the effective decision is the launcher's
+/// own: the registry passes `--media-ingest` through verbatim, so the flag
+/// alone is the whole truth and the handshake advertises exactly the faces
+/// the runtime can serve. The constant stays in this table so the tag
 /// inherits the table-order advertisement when the gate is open.
 pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-receipts",

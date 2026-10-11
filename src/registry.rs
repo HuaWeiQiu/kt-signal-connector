@@ -191,12 +191,12 @@ impl ProxyGroupRuntime {
 
     /// Whether the media-download capability is genuinely armed process-wide.
     /// Every group receives the registry's single effective media-ingest
-    /// decision (the kt-engine downgrade included) and the same handle table,
-    /// so the first group's media table answers for the whole runtime — the
-    /// handshake `attachment-download` advertisement gate (contract revision
-    /// 1.98) and the exact gate the media methods themselves answer: a
-    /// runtime without the table omits the tag instead of advertising a face
-    /// that fails for every call.
+    /// decision (the launcher's, passed through verbatim since 1.121 —
+    /// §4.102) and the same handle table, so the first group's media table
+    /// answers for the whole runtime — the handshake `attachment-download`
+    /// advertisement gate (contract revision 1.98) and the exact gate the
+    /// media methods themselves answer: a runtime without the table omits the
+    /// tag instead of advertising a face that fails for every call.
     pub fn media_ingest_armed(&self) -> bool {
         self.groups[0].supervisor.media_ingest_armed()
     }
@@ -1704,19 +1704,20 @@ impl Drop for ProxyGroupRuntime {
     }
 }
 
-/// kt-engine capability downgrade (implementation plan §5): the engine never
-/// downloads attachments, so a launcher that arms media ingest is
-/// downgraded to the pre-1.17 shape — `--ignore-attachments` stays on the
-/// argv, the media governor is not armed, and every media method answers
-/// CAPABILITY_UNAVAILABLE — instead of refusing the whole channel (the dev
-/// desktop arms media ingest unconditionally).
+/// The launcher's media-ingest decision, passed through verbatim (contract
+/// revision 1.121, §4.102): the kt-engine era's forced downgrade — arming
+/// ingest kept the pre-1.17 shape whatever the launcher decided — is
+/// retired. The engine projects the receive locator face (the 1.61
+/// closure), so an armed runtime ingests media honestly: the argv drops
+/// `--ignore-attachments`, the media governor bounds retention, receive rows
+/// land with locator material, and the §4.54 download chain serves bytes on
+/// demand. The 1.98 advertisement stays truthful because the handshake tag
+/// keys on this same effective decision. The invariants that survive the
+/// flip: locator-less legacy rows stay permanently non-downloadable
+/// (`INVALID_REQUEST` before any network, the honest copy), pointer material
+/// never logs, and every queue stays bounded.
 fn effective_media_ingest(media_ingest: bool) -> bool {
-    if media_ingest {
-        tracing::warn!(
-            "the kt engine has no attachment ingest; media methods answer CAPABILITY_UNAVAILABLE"
-        );
-    }
-    false
+    media_ingest
 }
 
 /// Open the shared per-profile store once and assemble one supervised engine
@@ -1851,12 +1852,13 @@ mod tests {
         assert_eq!(runtime.resolve_link_session("never-started").await, None);
     }
 
-    /// kt-engine media downgrade (plan §5): arming ingest collapses to the
-    /// pre-1.17 shape — the engine face has no attachment ingest, whatever
-    /// the launcher asked for.
+    /// The effective media-ingest decision is the launcher's decision
+    /// (contract 1.121, §4.102): the kt-engine downgrade is retired — an
+    /// armed launcher arms the media path (argv, governor, advertisement)
+    /// and an unarmed one keeps the honest CAPABILITY_UNAVAILABLE answer.
     #[test]
-    fn media_ingest_is_always_downgraded() {
-        assert!(!effective_media_ingest(true));
+    fn media_ingest_passes_through() {
+        assert!(effective_media_ingest(true));
         assert!(!effective_media_ingest(false));
     }
 }
