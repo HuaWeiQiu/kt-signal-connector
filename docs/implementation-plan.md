@@ -5,7 +5,19 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.110 (2026-10-11; the early-arrival edit/remoteDelete buffer (§4.91):
+- Contract revision: 1.111 (2026-10-11; the startup sweep (§4.92): a 'pending' outgoing
+  row is a send whose completion never landed — the process died between the insert and
+  the engine answer — and nothing can ever complete it again, because the only writers of
+  that transition lived in the process that died; the desktop saw a spinner that outlived
+  its process, in the one state with no retry affordance. `Store::open` now runs one
+  point UPDATE after the migrations, before any runtime/host/CLI consumer:
+  pending → failed. The honesty is ownership, not time — one instance owns one store (the
+  ADR 0002 kernel lock), so an orphaned pending row's completion can never arrive after
+  open; failed is both the truthful state and the useful one (the desktop's retry action
+  and the guarded rearm apply). Idempotent by construction: a re-armed row orphaned by
+  another crash sweeps back on the next open. 'unknown' keeps its distinct contract
+  state; no wire change. Tests 652 → 653 (lib 493 → 494), all green) —
+  previously 1.110 (2026-10-11; the early-arrival edit/remoteDelete buffer (§4.91):
   the control plane's never-create discipline gave an edit or remoteDelete whose original
   row had not landed yet exactly one fate — a silent drop — and the engine's cold-start
   receive race makes that a real convergence loss (the row lands later with yesterday's
@@ -7548,6 +7560,48 @@ landing first at the shared timestamp is never the target, author A's own
 row converges); `early_control_buffer_stays_bounded_and_expires` (the
 capacity eviction at 513, the backdated TTL sweep at the next touch).
 Gates: 648 → 652 (lib 489 → 493), all green.
+
+### 4.92 Startup sweep: stale pending sends land failed (contract revision 1.111, 2026-10-11)
+
+A 'pending' outgoing row is a send whose completion never landed: the row
+inserts before the engine call and `complete_outgoing_send` rewrites it
+afterwards, so a process death in between leaves the row pending forever —
+and nothing in the store can ever complete it again, because the only
+writers of that transition live inside the process that just died. The
+desktop's view of that row is a spinner that outlived its process; the
+retry affordance (`messages.retryText`, the guarded failed→pending rearm,
+§4.35) does not apply to pending, so the row is stuck in the one state with
+no user escape hatch.
+
+**The sweep.** `Store::open` runs one bounded statement after the schema
+migrations, before any runtime, host lane, or CLI command sees the store:
+`UPDATE messages SET status='failed' WHERE status='pending'`. The honesty
+argument is ownership, not time: one connector instance owns one store (the
+data-dir kernel lock at startup enforces that, ADR 0002), so no completion
+for an orphaned pending row can ever arrive after the open — the state is
+known-dead, not probably-dead. The failure state is the truthful answer AND
+the useful one: the desktop renders the failed send with its retry action,
+and the retry re-arm is the same guarded transition any other failure
+rides. Rows in any other status are untouched: 'unknown' is a distinct
+contract state (§4.x receipt vocabulary) with its own presentation, and the
+delivered/read ladder is monotone above the sweep's reach.
+
+**Idempotence is the semantics.** A reopen of an already-swept store finds
+nothing pending and sweeps nothing; a re-armed row whose retry dispatch
+itself died (another crash before completion) sweeps back to failed on the
+next open — a pending row observed at open is by definition orphaned, so
+the sweep cannot lie twice. The cost is one point UPDATE per open on the
+status column (the receipt-ladder index covers it); a store with nothing
+pending pays a single no-op scan.
+
+No wire change: the method/event/error enums are untouched, no new
+capability, and `tests/schema_consistency.rs` stays green unchanged.
+
+Tests: `startup_sweep_migrates_stale_pending_sends_to_failed` (the reopen
+sweeps exactly the stale pending row, the sent/failed rows untouched, the
+swept row rearms through the guarded retry face, the re-armed row sweeps
+back on the next orphaned open). Gates: 652 → 653 (lib 493 → 494), all
+green.
 
 ## 5. signal-cli Boundary
 

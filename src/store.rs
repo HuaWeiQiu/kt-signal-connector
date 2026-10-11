@@ -1176,6 +1176,29 @@ impl Store {
         // opening DDL valid against every schema version from v0 up.
         conn.execute_batch(POST_MIGRATION_SCHEMA_DDL)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The startup sweep (contract revision 1.111, §4.92): a 'pending'
+        // outgoing row is a send whose completion never landed — the process
+        // died between the insert and the engine answer. No completion can
+        // ever arrive after the process that owned it is gone (one instance
+        // owns one store, the kernel lock at startup enforces that), so the
+        // honest state is 'failed': the desktop gets its retry affordance
+        // (`messages.retryText`, the guarded failed→pending rearm) instead
+        // of a spinner that outlived its process. Runs before any runtime,
+        // host lane, or CLI command sees the store, and never touches rows
+        // in any other status ('unknown' is a distinct contract state, the
+        // receipt ladder is monotone above it).
+        let swept = conn
+            .execute(
+                "UPDATE messages SET status='failed' WHERE status='pending'",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                "startup sweep migrated stale pending sends to failed"
+            );
+        }
         Ok(Self {
             path,
             conn: Mutex::new(conn),
@@ -9734,6 +9757,101 @@ mod tests {
         assert!(
             !replay.1,
             "the replayed delete never re-reports a transition"
+        );
+    }
+
+    /// Contract 1.111 (§4.92): the startup sweep — a 'pending' outgoing row
+    /// is a send whose completion never landed (the process died between the
+    /// insert and the engine answer), so the next open migrates it to
+    /// 'failed' where the desktop's retry affordance applies; rows in any
+    /// other status are untouched, and a reopen of an already-swept store
+    /// sweeps nothing.
+    #[test]
+    fn startup_sweep_migrates_stale_pending_sends_to_failed() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let row = |store: &Store, id: &str, status: &'static str| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "outgoing",
+                sender_id: account.id.clone(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at: 100,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status,
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            store.insert_message(&message, None, None, false).unwrap();
+        };
+        row(&store, "stale-pending", "pending");
+        row(&store, "sent-ok", "sent");
+        row(&store, "failed-already", "failed");
+        drop(store);
+
+        // The reopen sweeps exactly the stale pending row.
+        let reopened = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let status_of = |id: &str| {
+            reopened
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        assert_eq!(status_of("stale-pending"), "failed");
+        assert_eq!(status_of("sent-ok"), "sent");
+        assert_eq!(status_of("failed-already"), "failed");
+
+        // The swept row carries the desktop's retry affordance: the guarded
+        // failed→pending rearm works on it like any failure.
+        let (record, changed) = reopened
+            .rearm_failed_message("stale-pending")
+            .unwrap()
+            .expect("the swept row rearms");
+        assert!(changed);
+        assert_eq!(record.status, "pending");
+
+        // A reopen of the already-swept store applies the same honesty to the
+        // re-armed row: a 'pending' row observed at open is by definition
+        // orphaned (its dispatch lives inside the process that just died), so
+        // the sweep takes it back to 'failed' — the retry affordance simply
+        // re-arms again, and no spinner can outlive its process twice.
+        drop(reopened);
+        let third = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert_eq!(
+            third
+                .message_by_id(&account.id, &conversation.id, "stale-pending")
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
         );
     }
 
