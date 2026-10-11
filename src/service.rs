@@ -507,6 +507,23 @@ impl ServiceError {
                         data,
                     );
                 }
+                // §4.104 group migration (contract 1.123, engine B8): the
+                // same honest HTTP pass-through channel, migration-faced —
+                // the server refused the GV1→GV2 migration (the engine sends
+                // an empty object when the server gave no status, the
+                // self-credential face included). Deterministic:
+                // retryable=false — the same group state refuses the same
+                // way, and a 409 race unblocks only after re-reading the
+                // group state.
+                if code == "GROUP_MIGRATION_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "GROUP_MIGRATION_FAILED",
+                        "the group migration was rejected by the Signal server",
+                        data,
+                    );
+                }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
                         "STICKER_PACK_KEY_INVALID",
@@ -752,6 +769,15 @@ impl ServiceError {
                         "DEVICES_UNAVAILABLE",
                         "the Signal server is unreachable",
                         true,
+                    ),
+                    // §4.104 group migration (contract 1.123, engine B8): the
+                    // data-less fallback for the server-rejection family (and
+                    // the schema-consistency scanner's code-side anchor).
+                    // Deterministic: retryable=false.
+                    "GROUP_MIGRATION_FAILED" => ApiError::new(
+                        "GROUP_MIGRATION_FAILED",
+                        "the group migration was rejected by the Signal server",
+                        false,
                     ),
                     "REPORT_SPAM_FAILED" => {
                         ApiError::new("REPORT_SPAM_FAILED", "the report was rejected", false)
@@ -3425,6 +3451,94 @@ impl ConnectorService {
             "the kt-engine face has no updateGroup member-family method yet",
             false,
         )))
+    }
+
+    /// groups.migrate (contract revision 1.123, §4.104, capability
+    /// group-management): the local shape ladder, then the upstream frame.
+    /// The legacy group id is addressed directly — no local conversation row
+    /// is resolved (the desktop owns the GV1 roster it hands over; the
+    /// migrated group converges through contacts.sync like every group row).
+    /// The id gate mirrors the engine's shape face (standard base64, non-empty
+    /// — the engine pins no 16-byte length, the HKDF derivation primitive is
+    /// defined over arbitrary bytes); the member bounds are the §4.44
+    /// discipline verbatim (non-empty, 1-1001 entries of 1-128 characters);
+    /// title/expiration carry the optional change set; the avatar data URI is
+    /// validated locally (the same `validate_avatar_data_uri` gate the
+    /// §4.45 setProfile face runs) so a malformed URI answers
+    /// INVALID_REQUEST before any upstream call instead of folding into the
+    /// generic upstream family.
+    pub fn prepare_groups_migrate(
+        &self,
+        params: &GroupsMigrateParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        {
+            let mut decoded = Vec::new();
+            let decoded_ok =
+                base64_decode_to_vec(&params.group_id, &mut decoded).is_ok() && !decoded.is_empty();
+            if !decoded_ok {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "groupId must be the legacy group id in standard base64",
+                    false,
+                )));
+            }
+        }
+        if let Some(title) = params.title.as_deref()
+            && (title.is_empty() || title.len() > GROUP_NAME_MAX_BYTES)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "title must contain between 1 and 256 bytes",
+                false,
+            )));
+        }
+        if params.members.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "the migration must carry the V1 member roster; an empty array is a shape error",
+                false,
+            )));
+        }
+        if params.members.len() > MAX_GROUP_MEMBERS
+            || params.members.iter().any(|member| {
+                member.is_empty() || member.chars().count() > MAX_GROUP_MEMBER_ID_CHARS
+            })
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "members carries at most 1001 entries of 1-128 characters",
+                false,
+            )));
+        }
+        let avatar = match &params.avatar {
+            AvatarUpdate::Replace(data_uri) => {
+                AvatarUpdate::Replace(validate_avatar_data_uri(data_uri)?)
+            }
+            keep_or_remove => keep_or_remove.clone(),
+        };
+        let account = self.resolve_account(&params.account_id)?;
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "groupId": params.group_id,
+        });
+        if let Some(title) = params.title.as_deref() {
+            upstream["title"] = json!(title);
+        }
+        if let Some(expiration) = params.expiration {
+            upstream["expiration"] = json!(expiration);
+        }
+        match avatar {
+            AvatarUpdate::Keep => {}
+            AvatarUpdate::Remove => {
+                upstream["avatar"] = Value::Null;
+            }
+            AvatarUpdate::Replace(data_uri) => {
+                upstream["avatar"] = json!(data_uri);
+            }
+        }
+        upstream["members"] = json!(params.members);
+        Ok(upstream)
     }
 
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
@@ -11364,6 +11478,43 @@ pub struct GroupsRevokeInvitesParams {
     pub operation_id: Option<String>,
 }
 
+/// groups.migrate params (contract revision 1.123, §4.104, capability
+/// group-management): the legacy GV1 group id as the caller holds it —
+/// standard base64 of the 16-byte legacy id (the engine decodes it; a
+/// non-base64 or empty string is a local `INVALID_REQUEST`) — plus the
+/// migration change set. `title` is optional (absent = the official
+/// inherit-from-local-GV1-state posture; the headless engine migrates an
+/// empty title — the compat §5 boundary), `expiration` the optional timer
+/// seconds, `avatar` the tri-state update (absent = keep, null = remove, a
+/// data URI = replace), and `members` the required non-empty V1 roster the
+/// migration carries upstream (the official migrate always ships the member
+/// list).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsMigrateParams {
+    pub account_id: String,
+    pub group_id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub expiration: Option<u32>,
+    #[serde(default)]
+    pub avatar: AvatarUpdate,
+    pub members: Vec<String>,
+}
+
+/// The groups.migrate result (contract revision 1.123, §4.104): the new GV2
+/// master key (standard base64 — the id every other group face addresses)
+/// and the fresh group revision. The engine's already-migrated fallback (the
+/// official hasV1GroupBeenMigrated semantic — the put lost its race to a
+/// concurrent migration) presents as the same honest answer.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsMigrateResult {
+    pub group_id: String,
+    pub revision: u32,
+}
+
 /// `groups.generateInviteLinkPassword` params (contract revision 1.117,
 /// §4.98): none — the password is account-less CSPRNG material (the official
 /// `generateGroupInviteLinkPassword`), so the host face takes an empty
@@ -12518,6 +12669,28 @@ pub(crate) fn device_list_from_engine(result: &Value) -> Result<DeviceList, Serv
     Ok(DeviceList { devices: projected })
 }
 
+/// Parse the engine's `migrateGroup` result (contract revision 1.123,
+/// §4.104): `{groupId, revision}` — the new GV2 master key (standard base64)
+/// and the fresh revision. A missing or non-string groupId, or a missing or
+/// non-numeric revision, is a protocol defect, not an empty answer.
+pub(crate) fn group_migrate_result_from_engine(
+    result: &Value,
+) -> Result<GroupsMigrateResult, ServiceError> {
+    let group_id = result
+        .get("groupId")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let revision = result
+        .get("revision")
+        .and_then(Value::as_u64)
+        .and_then(|revision| u32::try_from(revision).ok())
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(GroupsMigrateResult {
+        group_id: group_id.to_string(),
+        revision,
+    })
+}
+
 /// Project the engine's `listIdentities` answer onto the wire shape (contract
 /// revision 1.68, §4.61): the pinned upstream writes one JSON array of
 /// `JsonIdentity` records (ListIdentitiesCommand.java:68-84); the read is
@@ -13221,6 +13394,79 @@ mod tests {
         let capped = device_list_from_engine(&json!({ "devices": over })).unwrap();
         assert_eq!(capped.devices.len(), MAX_DEVICE_LIST_ENTRIES);
         assert_eq!(capped.devices[31].device_id, 32);
+    }
+
+    /// §4.104 migrate prepare (contract 1.123): the local shape ladder —
+    /// the legacy id's base64 gate, the non-empty title bound, the roster
+    /// bounds — and the upstream frame (optional keys absent stay absent,
+    /// the avatar tri-state rides). The result parse answers the engine's
+    /// {groupId, revision}; a protocol-shaped defect answers Protocol.
+    #[test]
+    fn group_migrate_prepare_ladder_and_result_parse() {
+        let (_temp, mut service) = service();
+        let (account, _direct) = linked_account_and_conversation(&mut service);
+        let params = |group_id: &str, members: Vec<String>| GroupsMigrateParams {
+            account_id: account.id.clone(),
+            group_id: group_id.to_string(),
+            title: None,
+            expiration: None,
+            avatar: AvatarUpdate::Keep,
+            members,
+        };
+
+        let upstream = service
+            .prepare_groups_migrate(&params(
+                "MTIzNDU2Nzg5MGFiY2RlZg==",
+                vec!["+15555550101".into()],
+            ))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["groupId"], "MTIzNDU2Nzg5MGFiY2RlZg==");
+        assert!(upstream.get("title").is_none());
+        assert!(upstream.get("expiration").is_none());
+        assert!(upstream.get("avatar").is_none());
+        assert_eq!(upstream["members"], json!(["+15555550101"]));
+
+        let error = service
+            .prepare_groups_migrate(&params("not base64!!", vec!["+15555550101".into()]))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_migrate(&params("", vec!["+15555550101".into()]))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_migrate(&params("MTIzNDU2Nzg5MGFiY2RlZg==", vec![]))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_migrate(&params(
+                "MTIzNDU2Nzg5MGFiY2RlZg==",
+                vec!["+15555550101".into(); MAX_GROUP_MEMBERS + 1],
+            ))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        let result = group_migrate_result_from_engine(&json!({
+            "groupId": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4",
+            "revision": 3
+        }))
+        .unwrap();
+        assert_eq!(result.group_id, "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4");
+        assert_eq!(result.revision, 3);
+        assert!(group_migrate_result_from_engine(&json!({ "groupId": "x" })).is_err());
+        assert!(group_migrate_result_from_engine(&json!({ "revision": 3 })).is_err());
+
+        // The server-rejection family (contract 1.123): deterministic,
+        // data.status rides verbatim when the engine carried one.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_MIGRATION_FAILED",
+            data: Some(json!({ "status": 409 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_MIGRATION_FAILED");
+        assert!(!api.retryable);
+        assert_eq!(api.data, Some(json!({ "status": 409 })));
     }
 
     /// §4.69: the four message-carrying cloud-restore families pass the

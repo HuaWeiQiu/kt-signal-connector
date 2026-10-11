@@ -8726,6 +8726,219 @@ async fn device_plane_faces_read_and_unlink() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.123 (§4.104): the groups.migrate face — the GV1→GV2
+/// migration upstream leg. The round-trip carries the resolved account, the
+/// legacy base64 groupId, and the roster upstream, and answers the engine's
+/// {groupId, revision} verbatim; the local ladder refuses the malformed
+/// legacy id, the empty roster, and the over-bounds roster before any
+/// upstream call; the server-rejection family rides GROUP_MIGRATION_FAILED
+/// with data.status verbatim; the crash-in-flight outcome answers
+/// SEND_OUTCOME_UNKNOWN and is never retried.
+#[tokio::test]
+async fn group_migration_round_trips_and_gates_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupMigrate" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let legacy_id = "MTIzNDU2Nzg5MGFiY2RlZg==";
+
+    // The round-trip: the definite success projects {groupId, revision} and
+    // the upstream frame carries the change set (optional keys omitted stay
+    // absent upstream).
+    let migrated = request(
+        &mut client,
+        "migrate",
+        "groups.migrate",
+        json!({ "accountId": account_id, "groupId": legacy_id, "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(
+        migrated["result"]["groupId"], "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=",
+        "{migrated}"
+    );
+    assert_eq!(migrated["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["account"] == "+15555550100"
+                && frame["groupId"] == legacy_id
+                && frame["members"] == json!(["+15555550101"])
+                && frame.get("title").is_none()
+        }),
+        "expected the migration upstream frame: {frames:?}"
+    );
+
+    // The optional change set rides when present.
+    let titled = request(
+        &mut client,
+        "migrate-titled",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": legacy_id,
+            "title": "Migrated",
+            "expiration": 86400,
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(titled["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| { frame["title"] == "Migrated" && frame["expiration"] == 86400 }),
+        "expected the titled migration frame: {frames:?}"
+    );
+
+    // The server-rejection family rides GROUP_MIGRATION_FAILED with the
+    // engine's data.status verbatim, deterministic.
+    let refused = request(
+        &mut client,
+        "migrate-refused",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": "Zml4dHVyZS1taWdyYXRpb24tZmFpbA==",
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["code"], "GROUP_MIGRATION_FAILED",
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(refused["error"]["data"]["status"], 409);
+
+    // The local ladder: the malformed legacy id, the empty roster, and the
+    // over-bounds roster refuse before any upstream call; unknown account.
+    let bad_id = request(
+        &mut client,
+        "migrate-bad-id",
+        "groups.migrate",
+        json!({ "accountId": account_id, "groupId": "not base64!!", "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(bad_id["error"]["code"], "INVALID_REQUEST", "{bad_id}");
+    let empty_roster = request(
+        &mut client,
+        "migrate-empty-roster",
+        "groups.migrate",
+        json!({ "accountId": account_id, "groupId": legacy_id, "members": [] }),
+    )
+    .await;
+    assert_eq!(empty_roster["error"]["code"], "INVALID_REQUEST");
+    let over_roster = request(
+        &mut client,
+        "migrate-over-roster",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": legacy_id,
+            "members": vec!["+15555550101"; 1002]
+        }),
+    )
+    .await;
+    assert_eq!(over_roster["error"]["code"], "INVALID_REQUEST");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["groupId"] == "not base64!!")
+            .count(),
+        0,
+        "a malformed id never reaches the engine"
+    );
+    let missing = request(
+        &mut client,
+        "migrate-missing-account",
+        "groups.migrate",
+        json!({ "accountId": "no-such-account", "groupId": legacy_id, "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "migrate-crash",
+        "groups.migrate",
+        json!({
+            "accountId": account_id,
+            "groupId": legacy_id,
+            "title": "[fixture-crash-migrate]",
+            "members": ["+15555550101"]
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-migrate", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["title"] == "[fixture-crash-migrate]")
+            .count(),
+        1,
+        "an unknown migration outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.68: the §4.61 safety-number faces — identities.get
 /// (the pinned listIdentities read narrowed to the resolved peer reference,
 /// the honest empty-list no-identity face) and identities.verify (the pinned

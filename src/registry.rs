@@ -1679,6 +1679,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.cancel_join_request(params).await
     }
 
+    /// groups.migrate (contract revision 1.123, §4.104): the migration is
+    /// the account's own upstream group write, so it routes through the
+    /// account's owning engine.
+    pub async fn migrate_group(
+        &self,
+        params: crate::service::GroupsMigrateParams,
+    ) -> Result<crate::service::GroupsMigrateResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.migrate_group(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

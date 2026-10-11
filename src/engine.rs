@@ -2700,6 +2700,15 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // a later attempt may reach the server.
     "DEVICES_FAILED",
     "DEVICES_UNAVAILABLE",
+    // §4.104 group migration (contract 1.123, engine B8 migrateGroup): the
+    // server-rejection family for the GV1→GV2 migration route with the
+    // engine's `data.status?` honest HTTP pass-through (the CALL_CREDENTIALS_
+    // FAILED channel); retryable=false — the same group state refuses the
+    // same way, and a 409 race unblocks only after re-reading the group
+    // state. The avatar partial-success family rides GROUP_AVATAR_UPLOAD_
+    // FAILED and the transport family rides STORAGE_UNAVAILABLE, both
+    // registered above.
+    "GROUP_MIGRATION_FAILED",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.

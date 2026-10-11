@@ -261,6 +261,17 @@ pub const METHODS: &[MethodRow] = &[
     ("groups.previewViaLink", Lane::Read, false, "read"),
     ("groups.joinViaLink", Lane::Send, true, "send"),
     ("groups.cancelJoinRequest", Lane::Send, true, "send"),
+    // Group migration (contract revision 1.123, §4.104): mutating, send-lane
+    // upstream traffic — the groups class verbatim, same-account mutex and
+    // delete barrier included; advertised through the existing
+    // `group-management` tag, widened in place (the 1.82 precedent — the
+    // migration is the group life cycle's own GV1→GV2 face). The engine
+    // derives the new GV2 master key and answers {groupId, revision}; its
+    // already-migrated fallback probe (the official
+    // hasV1GroupBeenMigrated semantic) presents as the same honest answer.
+    // Zero local writes: the migrated group converges through contacts.sync
+    // like every group row.
+    ("groups.migrate", Lane::Send, true, "send"),
     // Android local-backup export (contract revision 1.47, §4.46): the
     // engine's background export task is account-mutating state, so the
     // start face rides the send lane behind the reaction-class write-lane
@@ -619,8 +630,11 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// / `groups.buildInviteLink` / `groups.parseInviteLink` material-and-parse
 /// reads plus `groups.previewViaLink` preview read and the
 /// `groups.joinViaLink` / `groups.cancelJoinRequest` join-family writes — one
-/// capability for the whole link life cycle, the 1.53 appendix discipline);
-/// and `device-management` (contract revision 1.122) marks the §4.103
+/// capability for the whole link life cycle, the 1.53 appendix discipline),
+/// widened in place by revision 1.123 (the `groups.migrate` GV1→GV2
+/// migration write — the migration is the group life cycle's own face; the
+/// same no-new-bit discipline); and `device-management` (contract revision
+/// 1.122) marks the §4.103
 /// device-plane faces (`accounts.getDevices` — the bounded device-list read
 /// with engine-side device-name decryption — plus the `accounts.unlinkDevice`
 /// server-side unlink write; one capability for the read and write halves,
@@ -762,6 +776,7 @@ mod tests {
             "groups.revokeInvites",
             "groups.joinViaLink",
             "groups.cancelJoinRequest",
+            "groups.migrate",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
@@ -821,6 +836,7 @@ mod tests {
             "groups.revokeInvites",
             "groups.joinViaLink",
             "groups.cancelJoinRequest",
+            "groups.migrate",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",

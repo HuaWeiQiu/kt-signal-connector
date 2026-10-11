@@ -8378,6 +8378,65 @@ the restart, exactly one crashing frame). Gated behind the full local
 gate suite (fmt + clippy -D warnings + cargo test + release build),
 all green.
 
+### 4.104 The GV1→GV2 migration reaches the host: `groups.migrate` (contract revision 1.123, 2026-10-12)
+
+The engine's B8 batch shipped `migrateGroup` — the official
+`initiateMigrationToGroupV2` face: the engine derives the new GV2
+master key from the legacy id (the HKDF derivation primitive is defined
+over arbitrary bytes, so the engine pins no 16-byte id length) and
+answers `{groupId, revision}`, with the already-migrated fallback probe
+(the put lost its race to a concurrent migration; the official
+`hasV1GroupBeenMigrated` semantic) presenting as the same honest
+answer. This batch wires it into the host contract as `groups.migrate`,
+advertised through the existing `group-management` tag widened in
+place (the 1.82 precedent — the migration is the group life cycle's own
+face). Until now the desktop could join, update, quit, and terminate
+groups but could not migrate a legacy one; the GV1→GV2 decision had no
+outbound leg.
+
+**The shape.** `groups.migrate {accountId, groupId, title?,
+expiration?, avatar?, members}` — the legacy group id is addressed
+directly in standard base64 (no local conversation row resolves; the
+desktop owns the GV1 roster it hands over, and the migrated group
+converges through contacts.sync like every group row). The local shape
+ladder refuses before any upstream call: a non-base64 or empty id
+(INVALID_REQUEST — the engine's shape face made precise), a non-empty
+title over the 256-byte `groupName` bound, an empty roster (the
+migration must carry the V1 member list — the official migrate always
+ships it), and the §4.44 roster bounds (1..1001 entries of 1..128
+characters). The avatar tri-state (absent = keep, null = remove, a
+data URI = replace) runs the §4.45 `validate_avatar_data_uri` gate
+locally, so a malformed URI answers INVALID_REQUEST instead of folding
+into the generic upstream family; the fixture-side dispatch log
+digest-summarizes the avatar (the engine's "zero avatar bytes in the
+dispatch log" discipline mirrored).
+
+**The failure faces.** GROUP_MIGRATION_FAILED joins the structured
+whitelist (engine.rs allowlist + schema enum mirrored verbatim):
+retryable=false — the same group state refuses the same way, and a 409
+race unblocks only after re-reading the group state — with the engine's
+`data.status?` riding the honest HTTP pass-through channel (the
+CALL_CREDENTIALS_FAILED / DEVICES_FAILED channel). The avatar
+partial-success family rides the existing GROUP_AVATAR_UPLOAD_FAILED
+and the transport family the existing STORAGE_UNAVAILABLE. A mutating
+upstream write whose outcome can be lost in transport: an
+indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never
+retried (the AGENTS.md red line — a migration whose delivery is
+unknown may already have created the GV2 group server-side).
+
+Tests: the service unit pins the prepare ladder (base64 gate, title
+bound, roster bounds, the optional-keys-absent-stay-absent frame, the
+avatar tri-state) and the result parse plus the GROUP_MIGRATION_FAILED
+faces; the methods-table test pins the lane and mutating
+classification; the integration test round-trips the migration (the
+change set rides upstream verbatim, the answer projects {groupId,
+revision}), the local ladder (malformed id / empty roster / over-bounds
+roster refuse with zero upstream frames, unknown account), the server
+rejection (data.status 409 verbatim), and the red line
+(crash-in-flight answers SEND_OUTCOME_UNKNOWN across the restart,
+exactly one crashing frame). Gated behind the full local gate suite
+(fmt + clippy -D warnings + cargo test + release build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

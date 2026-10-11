@@ -40,20 +40,21 @@ use crate::service::{
     ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
     ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
     GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsGetParams,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsParseInviteLinkParams,
-    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
-    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
-    HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessageRequestParams,
-    MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams,
-    MessagesEditParams, MessagesListParams, MessagesMarkReadParams,
-    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
-    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
-    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    MessagesSyncReadParams, MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
+    HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams, LinkSessionParams, LinkStartParams,
+    MessageGetTextParams, MessageRequestParams, MessagesAdjacentMediaParams,
+    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
+    MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams, MessagesEditParams,
+    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
+    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
+    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
+    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, MessagesSyncReadParams,
+    MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
@@ -2955,6 +2956,24 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Group migration (contract revision 1.123, §4.104): the GV1→GV2
+        // upstream leg — the answer projects the engine's {groupId, revision}
+        // verbatim (the new master key is the id every other group face
+        // addresses); an indeterminate mutating outcome folds to
+        // SEND_OUTCOME_UNKNOWN and is never retried.
+        "groups.migrate" => match serde_json::from_value::<GroupsMigrateParams>(request.params) {
+            Ok(params) => match runtime.migrate_group(params).await {
+                Ok(result) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(result).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid groups.migrate params", false),
+            ),
+        },
         "messages.reportSpam" => {
             match serde_json::from_value::<MessagesReportSpamParams>(request.params) {
                 Ok(params) => match runtime.report_spam(params).await {
