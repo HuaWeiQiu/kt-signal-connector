@@ -2822,9 +2822,10 @@ impl Store {
         Ok(record)
     }
 
-    /// Replace an outgoing row's body after a confirmed upstream `send` with
-    /// `editTimestamp` (contract 1.15). The status is untouched — an edited
-    /// message stays `sent` — and `edited_at` marks the row.
+    /// Replace an outgoing row's body after a confirmed upstream
+    /// `editMessage` (contract 1.15; the engine's native edit method since
+    /// 1.105). The status is untouched — an edited message stays `sent` — and
+    /// `edited_at` marks the row.
     pub fn apply_outgoing_edit(
         &self,
         message_id: &str,

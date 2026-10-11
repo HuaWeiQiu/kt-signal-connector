@@ -4056,12 +4056,14 @@ impl RuntimeSupervisor {
     }
 
     /// messages.edit (contract revision 1.15): retarget one previously sent
-    /// message's body via the upstream `send` + `editTimestamp` entry point.
-    /// Local prepare (row resolution, text bounds) under the service lock,
-    /// upstream mutating call without it; on confirmed success the local row
-    /// is rewritten and the updated record returned (`Some(record)`); an
-    /// indeterminate outcome maps to `Ok(None)` with the local row unchanged —
-    /// never an automatic retry.
+    /// message's body via the engine's native `editMessage` wire method
+    /// (contract 1.105 migration — the signal-cli-era `send` + `editTimestamp`
+    /// call dispatched a brand-new message on the kt-engine, which has no
+    /// `editTimestamp` parameter). Local prepare (row resolution, text bounds)
+    /// under the service lock, upstream mutating call without it; on confirmed
+    /// success the local row is rewritten and the updated record returned
+    /// (`Some(record)`); an indeterminate outcome maps to `Ok(None)` with the
+    /// local row unchanged — never an automatic retry.
     pub async fn edit_message(
         &self,
         account_id: String,
@@ -4075,7 +4077,7 @@ impl RuntimeSupervisor {
             service.prepare_edit(&account_id, &conversation_id, &message_id, &text)?
         };
         match engine
-            .call("send", prepared.params, CallClass::Mutating)
+            .call("editMessage", prepared.params, CallClass::Mutating)
             .await
         {
             Ok(_) => {

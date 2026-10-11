@@ -4731,10 +4731,10 @@ impl ConnectorService {
     }
 
     /// Pure local validation for `messages.edit` (contract revision 1.15,
-    /// upstream `send` with `editTimestamp`): resolve the target row exactly
-    /// like `prepare_remote_delete` — only an outgoing row in the terminal
-    /// state `sent` carries the upstream protocol identity an edit must
-    /// reference — and build the exact upstream jsonRpc params.
+    /// engine `editMessage` wire method since contract 1.105): resolve the
+    /// target row exactly like `prepare_remote_delete` — only an outgoing row
+    /// in the terminal state `sent` carries the upstream protocol identity an
+    /// edit must reference — and build the exact engine jsonRpc params.
     pub fn prepare_edit(
         &self,
         account_id: &str,
@@ -4751,13 +4751,16 @@ impl ConnectorService {
         if message.direction != "outgoing" || !outgoing_status_is_addressable(message.status) {
             return Err(StoreError::MessageNotFound.into());
         }
-        // signal-cli `send` with editTimestamp (verified against the jsonRpc
-        // surface: SendCommand dest `edit-timestamp` maps to the camelCase
-        // jsonRpc key) retargets the earlier message; addressing matches send.
+        // The engine's native `editMessage` method (official edit send face:
+        // `Content.editMessage{targetSentTimestamp, dataMessage}`) retargets
+        // the earlier message through `targetTimestamp`; addressing matches
+        // send — `set_upstream_target` emits the exact-one-leg shape
+        // (`recipient` array / 32B group master key `groupId`) the method
+        // dispatches on (sendMessageRequestResponse 同构).
         let mut params = json!({
             "account": account.signal_account,
             "message": text,
-            "editTimestamp": message.sent_at,
+            "targetTimestamp": message.sent_at,
         });
         set_upstream_target(&mut params, &conversation);
         Ok(PreparedEdit {
@@ -21072,8 +21075,9 @@ mod tests {
     }
 
     /// `messages.edit` preparation: an outgoing sent row resolves to
-    /// upstream editTimestamp params; settlement rewrites the body and
-    /// stamps editedAt.
+    /// engine `editMessage` params (contract 1.105 — the wire key is
+    /// `targetTimestamp`, the edited row's protocol timestamp); settlement
+    /// rewrites the body and stamps editedAt.
     #[test]
     fn prepare_edit_targets_sent_row_and_settlement_rewrites_it() {
         let (_temp, mut service) = service();
@@ -21084,7 +21088,7 @@ mod tests {
             .prepare_edit(&account.id, &conversation.id, &pending, "edited body")
             .unwrap();
         assert_eq!(
-            prepared.params["editTimestamp"], 430,
+            prepared.params["targetTimestamp"], 430,
             "upstream edit targets the sent row's protocol timestamp"
         );
         assert_eq!(prepared.params["message"], "edited body");

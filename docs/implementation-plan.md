@@ -5,7 +5,25 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.104 (2026-10-11; the call-history sync consume face (§4.85): the
+- Contract revision: 1.105 (2026-10-11; the edit-send migration (§4.86): `messages.edit`'s
+  upstream face moved off the signal-cli-era `send` + `editTimestamp` dispatch onto the
+  engine's native `editMessage` wire method (the 2026-10-11 six-questions batch, official
+  edit send face `Content.editMessage{targetSentTimestamp, dataMessage}`). The old call was
+  the audit's only ❌-class send-path break: the kt-engine `send` carries no `editTimestamp`
+  parameter, so every desktop edit went upstream as a brand-new message with the previous
+  body discarded by the engine's parameter reader — the remote saw a duplicate message and
+  the original stayed unedited. The host wire face is unchanged (`messages.edit`, the same
+  params, the same `MessageRecord` result, the same `SEND_OUTCOME_UNKNOWN` indeterminate
+  discipline, the same message-addressed row resolution): `prepare_edit` now emits
+  `targetTimestamp: <sent row's protocol timestamp>` (the engine's u64 key, the same key
+  name `remoteDelete` already dispatches on) and the supervisor dispatches `editMessage`
+  with the same exactly-one-leg addressing (`recipient` array for direct, the 32-byte group
+  master key `groupId` for groups — the shape `set_upstream_target` already produced, the
+  `sendMessageRequestResponse` 同构 the engine's dispatch parses). Zero desktop changes. No
+  new host method, error, or capability; the schema's `messages.edit` description is the
+  only wire-surface text moved (no shape change, additive-only in the revision sense);
+  tests unchanged green) —
+  previously 1.104 (2026-10-11; the call-history sync consume face (§4.85): the
   engine's `syncMessage.callEvent` projection — the account's own linked device wrote one
   1:1/group call's history entry, the official callEventSync face — consumed as pure transient
   forwarding. (a) The receive: fail-closed shape gates on the record's primary key — the
@@ -1632,16 +1650,17 @@ Consequences for the host: the `MessageRecord` projection gains optional `quote`
 gains `conversation.typing` (ephemeral) alongside the existing `message.upserted` /
 `message.statusChanged` / `conversation.changed` events.
 
-### 4.14 messages.edit (contract revision 1.15, 2026-09-23)
+### 4.14 messages.edit (contract revision 1.15, 2026-09-23; upstream face migrated 1.105)
 
 `messages.edit` edits one previously sent message upstream: params `accountId`,
 `conversationId`, `messageId`, `text`, `clientRequestId`. It resolves the target exactly like
 `messages.remoteDelete` (addressable outgoing row `sent`/`delivered`/`read` = upstream protocol identity),
-then dispatches signal-cli `send` with `editTimestamp: <upstream timestamp>` plus the same
-target addressing (`recipient`/`groupId`) — the signal-cli edit entry point (no dedicated
-`sendEditMessage` exists in the jsonRpc surface). Official clients allow a 24 h edit window;
-the connector adds no local window — a late edit answers the upstream rejection
-(`UPSTREAM_ERROR`), keeping the connector's rule set minimal.
+then dispatches the engine's native `editMessage` wire method with
+`targetTimestamp: <upstream timestamp>` plus the same target addressing (`recipient` array /
+group master key `groupId`) — since contract 1.105 (§4.86); the original 1.15 face dispatched
+the signal-cli-era `send` + `editTimestamp`, which the kt-engine reads as a brand-new message.
+Official clients allow a 24 h edit window; the connector adds no local window — a late edit
+answers the upstream rejection (`UPSTREAM_ERROR`), keeping the connector's rule set minimal.
 
 Settlement mirrors `messages.sendText`: on confirmed success the row's body is replaced and
 `edited_at` set (status unchanged) and the method answers the updated `MessageRecord`; an
@@ -7025,6 +7044,55 @@ flat camelCase shape, the absent optionals); and the schema consistency pair
 identity rides the shared `opaqueId` def, no inline bound to pin, the event
 enum auto-balanced against the emission
 literal). Gates: 621 → 624, all green.
+
+### 4.86 Edit-send migration: `messages.edit` rides the engine `editMessage` face (contract revision 1.105, 2026-10-11)
+
+The audit's one ❌-class send-path break closes here. `messages.edit` was the last surface
+still speaking the signal-cli era: the supervisor dispatched the upstream `send` method with
+an `editTimestamp` parameter. The kt-engine `send` carries no `editTimestamp` parameter — the
+engine's parameter reader ignored it — so every desktop edit crossed the wire as a
+brand-new message (a duplicate landed on the remote; the original stayed unedited; the
+engine's `editMessage` method, wired in its 2026-10-11 six-questions batch for the official
+edit send face, sat unused behind the connector).
+
+The migration is connector-internal; the host wire face does not move:
+
+- **Host face unchanged** — `messages.edit` keeps its params
+  (`accountId`/`conversationId`/`messageId`/`text`/`clientRequestId`), its message-addressed
+  row resolution (§4.14: only an outgoing row in the terminal `sent`/`delivered`/`read`
+  state carries the upstream protocol identity), its `MessageRecord` settlement result
+  (body replaced, `editedAt` set, status untouched), and its indeterminate discipline
+  (`SEND_OUTCOME_UNKNOWN`, row unchanged, never auto-retried). Zero desktop changes.
+- **Upstream params** — `prepare_edit` emits `{account, message, targetTimestamp}` plus the
+  `set_upstream_target` addressing: `targetTimestamp` is the engine's u64 key for the edited
+  row's protocol timestamp (the same key name `remoteDelete` dispatches on; the old
+  `editTimestamp` key was the signal-cli dash-dest transliteration and no engine code reads
+  it). `message` is the non-empty validated body the engine's dispatch gates on (the
+  official `canEditMessage` body gate); the connector's 1..65536-byte `validate_text` bound
+  already covers it.
+- **Addressing legs** — the engine's `editMessage` parses exactly-one addressing leg
+  (sendMessageRequestResponse 同构): the direct leg through `recipient` (string array,
+  non-empty) and the group leg through `groupId` (32-byte group master key, standard
+  base64). `set_upstream_target` has produced exactly that pair for `send`/`sendTyping`/
+  `remoteDelete`/`sendReaction` since 1.10; no shape change was needed. Both legs present,
+  both missing, or either malformed answer the engine's `-32603`, which surfaces through the
+  existing §4.17 error ladder as `UPSTREAM_ERROR` — the same surface a late edit's official
+  24 h window rejection rides (the window stays an upstream/UI gate, §4.14 unchanged).
+- **Settlement unchanged** — the engine answers `{timestamp, results}` (the `send` result
+  shape); the supervisor's confirmed-success path is value-blind, so the settlement row
+  rewrite (`apply_outgoing_edit`) and the `message.upserted`/`conversation.changed` event
+  flow are byte-identical.
+
+No new method, error code, or capability tag; no queue/store shape moves — the only wire-surface
+text change is the `messages.edit` schema description (no shape delta, additive-only revision
+discipline). The receive-side edit paths (§4.13 inbound control plane, the envelope-level
+`editMessage` normalization) were already engine-native and are untouched.
+
+Tests: the service unit `prepare_edit_targets_sent_row_and_settlement_rewrites_it` asserts
+the `targetTimestamp` key on the prepared params (the one assertion the migration moves);
+the host/registry/lane surfaces are covered by their existing tables (`messages.edit` keeps
+its `messages.edit` row: send lane, account-scoped mutating, `send` metrics class). Gates:
+624 → 624, all green.
 
 ## 5. signal-cli Boundary
 
