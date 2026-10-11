@@ -5,7 +5,18 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.111 (2026-10-11; the startup sweep (§4.92): a 'pending' outgoing
+- Contract revision: 1.112 (2026-10-11; the ending never regresses (§4.93): the live
+  message insert and the send completion still wrote the conversation/account endings
+  unconditionally, and both can carry an older timestamp than the summaries already
+  publish (per-sender clocks make delayed deliveries real; the completion re-stamps with
+  the engine-assigned upstream timestamp that can sit below newer rows and the pre-send
+  local clock). Both writers now take the max in place — the CASE guard the
+  history-import backfill already ran, extended to the live paths it was protecting —
+  with the insert-path preview moving together with its timestamp and the unread counters
+  deliberately unconditional (an old message still deserves its badge; the 1.29
+  same-transaction bump untouched). No wire change. Tests 653 → 654 (lib 494 → 495),
+  all green) —
+  previously 1.111 (2026-10-11; the startup sweep (§4.92): a 'pending' outgoing
   row is a send whose completion never landed — the process died between the insert and
   the engine answer — and nothing can ever complete it again, because the only writers of
   that transition lived in the process that died; the desktop saw a spinner that outlived
@@ -7602,6 +7613,45 @@ sweeps exactly the stale pending row, the sent/failed rows untouched, the
 swept row rearms through the guarded retry face, the re-armed row sweeps
 back on the next orphaned open). Gates: 652 → 653 (lib 493 → 494), all
 green.
+
+### 4.93 The ending never regresses: lastMessageAt takes the max (contract revision 1.112, 2026-10-11)
+
+Two store paths still wrote the conversation/account endings
+(`last_message_at`) unconditionally: the live message insert and the send
+completion. Both can carry a timestamp OLDER than what the summaries
+already publish — Signal timestamps are per-sender clocks, so the live path
+meets delayed deliveries (a peer back from offline lands yesterday's
+message after today's), and the completion path re-stamps the row with the
+engine-assigned upstream timestamp, which can sit below both newer rows and
+the pre-send local clock value (skew, or a slow completion of an old
+send). The regression was visible twice over: the conversation list re-sorts
+by `last_message_at DESC`, so the dragged-back conversation jumped down and
+then jumped up again when the next row landed, and both summaries showed an
+ending older than messages the desktop already rendered.
+
+**The guard.** Both writers take the max, in place: the ending columns move
+only when the arriving value is newer (`CASE WHEN last_message_at IS NULL
+OR last_message_at < ? THEN ? ELSE last_message_at END`), the exact
+discipline the history-import backfill already ran (its "backfill never
+regresses a summary" comment was the spec — this batch extends it to the
+live paths it was protecting against). On the insert path the preview moves
+together with the timestamp (the ending's two faces point at one row), and
+the unread counters stay deliberately unconditional — an old message still
+deserves its badge, and the 1.29 same-transaction bump discipline is
+untouched. On the completion path the preview is deliberately untouched
+(that path never wrote it — the preview already points at this row from the
+pending insert, or at a newer row the guard now leaves alone). The account
+ending rides the same CASE shape; the backfill/expire recomputes
+(`MAX(last_message_at)` over the conversation rows) already agree with it.
+
+No wire change: the method/event/error enums are untouched, no new
+capability, and `tests/schema_consistency.rs` stays green unchanged.
+
+Tests: `message_insert_and_send_completion_never_regress_the_ending` (the
+delayed older row keeps the ending and still bumps the badge; the slow
+completion at its upstream timestamp — the pre-guard regression — stays;
+the stale-local-clock pending insert stays; the in-ladder completion still
+advances). Gates: 653 → 654 (lib 494 → 495), all green.
 
 ## 5. signal-cli Boundary
 

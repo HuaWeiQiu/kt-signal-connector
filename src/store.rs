@@ -2562,11 +2562,22 @@ impl Store {
         // The @ badge rides the same transaction as the unread badge (contract
         // 1.29): an incoming row that mentions self bumps both counters or
         // neither, so a crash between them can never split the pair.
+        // Contract 1.112 (§4.93): the ending never regresses — Signal
+        // timestamps are per-sender clocks, so a delayed delivery (a peer
+        // back from offline, a late mirror) can land a row OLDER than what
+        // the conversation already shows; the preview and the timestamp move
+        // together only when the new row is newer (the history backfill's
+        // guard), while the unread counters stay unconditional (an old
+        // message still deserves its badge).
         let conversation_updated = transaction
             .execute(
                 "UPDATE conversations
-                 SET last_message_preview=?2,
-                     last_message_at=?3,
+                 SET last_message_preview=CASE
+                       WHEN last_message_at IS NULL OR last_message_at < ?3 THEN ?2
+                       ELSE last_message_preview END,
+                     last_message_at=CASE
+                       WHEN last_message_at IS NULL OR last_message_at < ?3 THEN ?3
+                       ELSE last_message_at END,
                      unread_count = unread_count + ?4,
                      unread_mentions = unread_mentions + ?5
                  WHERE id=?1",
@@ -2585,7 +2596,9 @@ impl Store {
         let account_updated = transaction
             .execute(
                 "UPDATE accounts
-                 SET last_message_at=?2,
+                 SET last_message_at=CASE
+                       WHEN last_message_at IS NULL OR last_message_at < ?2 THEN ?2
+                       ELSE last_message_at END,
                      unread_count = unread_count + ?3
                  WHERE id=?1",
                 params![
@@ -4897,15 +4910,31 @@ impl Store {
             return Ok(None);
         }
         let status_transitioned = previous_status.as_deref() != Some("sent");
+        // Contract 1.112 (§4.93): the send completion never regresses the
+        // ending — the engine-assigned upstream timestamp can sit below what
+        // newer rows (or the pre-send local clock value) already published,
+        // and a slow completion of an old send must not drag the
+        // conversation/account summaries backwards. The preview is
+        // deliberately untouched (this path never wrote it): it already
+        // points at this row from the pending insert, or at a newer row the
+        // guard now leaves alone.
         transaction
             .execute(
-                "UPDATE conversations SET last_message_at=?2 WHERE id=?1 AND account_id=?3",
+                "UPDATE conversations
+                 SET last_message_at=CASE
+                       WHEN last_message_at IS NULL OR last_message_at < ?2 THEN ?2
+                       ELSE last_message_at END
+                 WHERE id=?1 AND account_id=?3",
                 params![conversation_id, sent_at as i64, account_id],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         transaction
             .execute(
-                "UPDATE accounts SET last_message_at=?2 WHERE id=?1",
+                "UPDATE accounts
+                 SET last_message_at=CASE
+                       WHEN last_message_at IS NULL OR last_message_at < ?2 THEN ?2
+                       ELSE last_message_at END
+                 WHERE id=?1",
                 params![account_id, sent_at as i64],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -9853,6 +9882,110 @@ mod tests {
                 .status,
             "failed"
         );
+    }
+
+    /// Contract 1.112 (§4.93): Signal timestamps are per-sender clocks, so
+    /// rows can land out of order — a delayed delivery (a peer back from
+    /// offline) or a slow send completion carrying an older upstream
+    /// timestamp must never drag the conversation/account endings backwards.
+    /// The unread counters stay unconditional: an old message still deserves
+    /// its badge.
+    #[test]
+    fn message_insert_and_send_completion_never_regress_the_ending() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let row = |store: &Store,
+                   id: &str,
+                   direction: &'static str,
+                   sender: &str,
+                   sent_at: u64,
+                   status: &'static str| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction,
+                sender_id: sender.into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some(id.into()),
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: true,
+                status,
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            let increment_unread = direction == "incoming";
+            store
+                .insert_message(&message, None, None, increment_unread)
+                .unwrap();
+        };
+        let ending = |store: &Store| {
+            let conversation = store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap();
+            let account = store.account_summary(&account.id).unwrap().unwrap();
+            (
+                conversation.last_message_at,
+                conversation.unread_count,
+                account.last_message_at,
+            )
+        };
+
+        // A pending send composes (its local clock reads 450), then the peer
+        // answers with newer rows while the dispatch is still in flight.
+        row(&store, "slow-send", "outgoing", &account.id, 450, "pending");
+        assert_eq!(ending(&store), (Some(450), 0, Some(450)));
+        row(&store, "newer", "incoming", "peer-hash", 500, "delivered");
+        assert_eq!(ending(&store), (Some(500), 1, Some(500)));
+
+        // A delayed older row lands: the ending stays, the badge still moves.
+        row(&store, "older", "incoming", "peer-hash", 300, "delivered");
+        assert_eq!(ending(&store), (Some(500), 2, Some(500)));
+
+        // The slow send completes with its upstream timestamp (450): the
+        // pre-guard code dragged the ending back to 450; now it stays.
+        store
+            .complete_outgoing_send("slow-send", &account.id, &conversation.id, 450)
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(ending(&store), (Some(500), 2, Some(500)));
+
+        // A pending send inserted with an absurdly stale local clock value
+        // does not regress the ending either (the insert guard covers
+        // outgoing rows the same way), and its completion inside the ladder
+        // still advances the ending.
+        row(&store, "fast-send", "outgoing", &account.id, 1, "pending");
+        assert_eq!(ending(&store), (Some(500), 2, Some(500)));
+        store
+            .complete_outgoing_send("fast-send", &account.id, &conversation.id, 600)
+            .unwrap()
+            .expect("the pending row exists");
+        assert_eq!(ending(&store), (Some(600), 2, Some(600)));
     }
 
     #[test]
