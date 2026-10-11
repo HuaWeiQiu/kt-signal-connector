@@ -51,10 +51,10 @@ use crate::service::{
     MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
     MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
     MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, MessagesSyncReadParams,
-    MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
+    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    MessagesSyncReadParams, MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
@@ -2974,6 +2974,27 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid groups.migrate params", false),
             ),
         },
+        // Contact-card send (contract revision 1.124, §4.105): the engine's
+        // sendContact face — the conversation row's kind decides the leg. The
+        // answer projects the engine's send timestamp as {sentAt} (the
+        // calls.sendSignal ack shape); an indeterminate mutating outcome
+        // folds to SEND_OUTCOME_UNKNOWN and is never retried.
+        "messages.sendContact" => {
+            match serde_json::from_value::<MessagesSendContactParams>(request.params) {
+                Ok(params) => match runtime.send_contact(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendContact params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "messages.reportSpam" => {
             match serde_json::from_value::<MessagesReportSpamParams>(request.params) {
                 Ok(params) => match runtime.report_spam(params).await {

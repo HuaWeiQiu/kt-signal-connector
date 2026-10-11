@@ -38,13 +38,13 @@ use crate::service::{
     IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
     MediaCloseView, MediaIngest, MediaOpenView, MessageRequestOutcome, MessageRequestParams,
-    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
-    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
     StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
     UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
     account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
@@ -3328,6 +3328,46 @@ impl RuntimeSupervisor {
             .call("migrateGroup", upstream, CallClass::Mutating)
             .await?;
         group_migrate_result_from_engine(&result)
+    }
+
+    /// messages.sendContact (contract revision 1.124, §4.105, capability
+    /// send-contact): the shape gate + resolution under the service lock,
+    /// then the mutating engine `sendContact` call — the reaction-class
+    /// discipline verbatim (same-account mutex, delete barrier, an unknown
+    /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried — a card
+    /// whose delivery is unknown may already sit in the recipients'
+    /// timelines). The conversation kind decides the leg (direct recipient /
+    /// group groupId, the calls.sendSignal addressing precedent). The
+    /// result is the engine's send timestamp, echoed as `{sentAt}` — the
+    /// send ack, not message state (the connector keeps no send rows for
+    /// the face).
+    pub async fn send_contact(
+        &self,
+        params: MessagesSendContactParams,
+    ) -> Result<Value, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_send_contact(&params)?
+        };
+        match engine
+            .call("sendContact", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => {
+                let sent_at = result
+                    .get("timestamp")
+                    .and_then(Value::as_u64)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+                Ok(json!({ "sentAt": sent_at }))
+            }
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// conversations.getAvatar (contract revision 1.48, §4.47, capability

@@ -8939,6 +8939,264 @@ async fn group_migration_round_trips_and_gates_the_shape() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.124 (§4.105): the messages.sendContact face — the
+/// contact-card send. The direct leg resolves the row's peer reference into
+/// the engine's recipient addressing and the group leg the groupId
+/// addressing (the calls.sendSignal precedent); the {sentAt} ack echoes the
+/// engine's send timestamp; the card rides the local fail-closed ladder (the
+/// all-empty card, the out-of-vocabulary type word, the postal MOBILE, the
+/// over-bounds scalar, the over-entries array, and the malformed avatar data
+/// URI refuse before any upstream call); the empty-string organization
+/// drops from the upstream frame; the crash-in-flight outcome answers
+/// SEND_OUTCOME_UNKNOWN and is never retried.
+#[tokio::test]
+async fn contact_send_round_trips_both_legs_and_gates_the_card() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [46_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ContactSend" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let avatar_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+
+    // The direct leg: a fresh peer send mints the row; the card routes the
+    // engine's recipient face and answers the {sentAt} ack. The avatar
+    // rides the data URI upstream and is digest-summarized in the dispatch
+    // log; the empty-string organization is the official falsy-absent and
+    // drops from the frame.
+    let seeded = request(
+        &mut client,
+        "seed-direct",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Contact Target",
+            "text": "seed the row",
+            "clientRequestId": "contact-seed-1"
+        }),
+    )
+    .await;
+    let direct_conversation = seeded["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct = request(
+        &mut client,
+        "contact-direct",
+        "messages.sendContact",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "contact": {
+                "name": { "givenName": "Ada", "familyName": "Lovelace" },
+                "number": [{ "value": "+15551230000", "type": "MOBILE", "label": "cell" }],
+                "email": [{ "value": "ada@example.test", "type": "WORK" }],
+                "address": [{ "type": "HOME", "city": "London" }],
+                "organization": "",
+                "avatar": avatar_uri
+            }
+        }),
+    )
+    .await;
+    assert_eq!(direct["result"]["sentAt"], 1727000000000_u64, "{direct}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["account"], "+15555550100");
+    assert_eq!(frame["recipient"], "+15555550103");
+    assert!(frame.get("groupId").is_none(), "{frame}");
+    assert_eq!(frame["contact"]["name"]["givenName"], "Ada");
+    assert_eq!(frame["contact"]["number"][0]["type"], "MOBILE");
+    assert_eq!(frame["contact"]["email"][0]["value"], "ada@example.test");
+    assert_eq!(frame["contact"]["address"][0]["city"], "London");
+    assert_eq!(
+        frame["contact"]["avatar"],
+        json!(format!("[avatar data uri: {} bytes]", avatar_uri.len()))
+    );
+    assert!(
+        frame["contact"].get("organization").is_none(),
+        "the empty-string organization is the official falsy-absent: {frame}"
+    );
+
+    // The group leg: the fixture links with one group conversation in
+    // place; the card routes the groupId addressing, the optional type
+    // stays absent upstream.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let group = request(
+        &mut client,
+        "contact-group",
+        "messages.sendContact",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "contact": {
+                "name": { "givenName": "Grace" },
+                "number": [{ "value": "+15551230001" }]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(group["result"]["sentAt"], 1727000000000_u64, "{group}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["account"], "+15555550100");
+    assert_eq!(frame["groupId"], "ZmFrZS1ncm91cC0x");
+    assert!(frame.get("recipient").is_none(), "{frame}");
+    assert_eq!(frame["contact"]["name"]["givenName"], "Grace");
+    assert!(
+        frame["contact"]["number"][0].get("type").is_none(),
+        "the optional type stays absent upstream: {frame}"
+    );
+
+    // The local ladder refuses before any upstream call: the all-empty
+    // card (and its all-falsy twin), the out-of-vocabulary type word, the
+    // postal MOBILE, the over-bounds scalar, the over-entries array, and
+    // the malformed avatar data URI.
+    let frames_before = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    let many: Vec<Value> = (0..65).map(|_| json!({ "value": "+1" })).collect();
+    let ladder: Vec<(&str, Value)> = vec![
+        ("empty-card", json!({})),
+        ("falsy-card", json!({ "organization": "" })),
+        (
+            "bad-type",
+            json!({ "number": [{ "value": "+1", "type": "CELL" }] }),
+        ),
+        (
+            "postal-mobile",
+            json!({ "address": [{ "type": "MOBILE", "city": "x" }] }),
+        ),
+        (
+            "long-value",
+            json!({ "number": [{ "value": "x".repeat(129) }] }),
+        ),
+        ("many-entries", json!({ "number": many })),
+        ("bad-avatar", json!({ "avatar": "not-a-data-uri" })),
+    ];
+    for (id, contact) in ladder {
+        let refused = request(
+            &mut client,
+            id,
+            "messages.sendContact",
+            json!({
+                "accountId": account_id,
+                "conversationId": direct_conversation,
+                "contact": contact
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"], "INVALID_REQUEST",
+            "{id}: {refused}"
+        );
+    }
+    let frames_after = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    assert_eq!(
+        frames_before, frames_after,
+        "a refused card never reaches the engine"
+    );
+
+    // Unknown account.
+    let missing = request(
+        &mut client,
+        "contact-missing-account",
+        "messages.sendContact",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": direct_conversation,
+            "contact": { "name": { "givenName": "Ada" } }
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing
+    // frame across the restart.
+    let crash = request(
+        &mut client,
+        "contact-crash",
+        "messages.sendContact",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "contact": { "organization": "[fixture-crash-contact]" }
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    assert_eq!(crash["error"]["retryable"], false);
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-contact", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["contact"]["organization"] == "[fixture-crash-contact]")
+            .count(),
+        1,
+        "an unknown contact-send outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.68: the §4.61 safety-number faces — identities.get
 /// (the pinned listIdentities read narrowed to the resolved peer reference,
 /// the honest empty-list no-identity face) and identities.verify (the pinned

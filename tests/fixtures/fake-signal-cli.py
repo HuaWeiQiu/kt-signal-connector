@@ -1902,6 +1902,43 @@ for line in sys.stdin:
             "groupId": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=",
             "revision": 0,
         }
+    elif method == "sendContact":
+        # Contract 1.124 §4.105: the contact-card send route (the 1:1 and
+        # group legs share the engine face; recipient/groupId exactly one —
+        # the sendCallMessage discipline). Same dispatch-recording
+        # discipline as `send`: the exact upstream params land in SEND_LOG,
+        # with the contact.avatar data URI digest-summarized before logging
+        # (the createGroup/migrateGroup "zero avatar bytes in the dispatch
+        # log" discipline the engine pins; the rest of the card is the
+        # caller's own text data and rides verbatim). Sentinel: organization
+        # "[fixture-crash-contact]" crashes with the mutating call in flight
+        # (os._exit(46); disjoint from 25/29/30/31/32/33/34). Success
+        # answers the send shape {timestamp}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                logged = json.loads(json.dumps(params))
+                if isinstance(logged.get("contact"), dict) and isinstance(
+                    logged["contact"].get("avatar"), str
+                ):
+                    logged["contact"]["avatar"] = "[avatar data uri: %d bytes]" % len(
+                        logged["contact"]["avatar"]
+                    )
+                log.write(json.dumps(logged, separators=(",", ":")) + "\n")
+        if bool(params.get("recipient")) == bool(params.get("groupId")):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "sendContact requires exactly one of recipient, groupId",
+                },
+            }
+            emit_json(response)
+            continue
+        contact = params.get("contact") or {}
+        if contact.get("organization") == "[fixture-crash-contact]":
+            os._exit(46)
+        result = {"timestamp": 1727000000000}
     elif method == "updateGroup":
         # Contract 1.45 §4.44: the group-management write route. Same
         # dispatch-recording discipline as `send`/`updateContact`: the exact

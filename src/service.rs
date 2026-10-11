@@ -3541,6 +3541,68 @@ impl ConnectorService {
         Ok(upstream)
     }
 
+    /// messages.sendContact (contract revision 1.124, §4.105, capability
+    /// send-contact): the local shape ladder, then the upstream frame. The
+    /// conversation row's kind decides the leg — a direct row routes the
+    /// engine's 1:1 `sendContact` (recipient = the row's peer reference), a
+    /// group row the `groupId` group leg (the calls.sendSignal 1:82
+    /// addressing precedent: the connector already holds the kind, so no new
+    /// parameter). The card gates are fail-closed before any upstream call
+    /// (the engine's parse face mirrors them, but a local refusal never
+    /// spends a fan-out frame): an all-empty card carries nothing and
+    /// answers INVALID_REQUEST; every entry array holds at most 64 entries;
+    /// every scalar is bounded at 128 characters with the entry values
+    /// non-empty; the `type` vocabularies are the official numberTo*Type
+    /// words (number/email: HOME | MOBILE | WORK | CUSTOM, address:
+    /// HOME | WORK | CUSTOM — the postal enum never had a MOBILE; the
+    /// official client silently folds out-of-vocabulary words to HOME and
+    /// the engine refuses instead, the textStyle precedent); the avatar
+    /// data URI rides the §4.45 setProfile gate; the organization's empty
+    /// string is the official falsy-absent and drops from the upstream
+    /// frame.
+    pub fn prepare_messages_send_contact(
+        &self,
+        params: &MessagesSendContactParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.conversation_id.is_empty()
+            || params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        validate_contact_payload(&params.contact)?;
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        let mut upstream = if conversation.kind == "group" {
+            json!({
+                "account": account.signal_account,
+                "groupId": conversation.peer_key,
+            })
+        } else if conversation.kind == "direct" {
+            json!({
+                "account": account.signal_account,
+                "recipient": conversation.peer_key,
+            })
+        } else {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "messages.sendContact addresses direct or group conversations only",
+                false,
+            )));
+        };
+        let mut contact = params.contact.clone();
+        if contact.organization.as_deref() == Some("") {
+            contact.organization = None;
+        }
+        upstream["contact"] = serde_json::to_value(&contact).unwrap_or(Value::Null);
+        Ok(upstream)
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolve the direct conversation's rows to the engine's
     /// `reportSpam {account, targetAci, serverGuids}` payload. The report is
@@ -11515,6 +11577,221 @@ pub struct GroupsMigrateResult {
     pub revision: u32,
 }
 
+/// The §4.105 contact-attachment bounds (contract revision 1.124): KT bounds
+/// for one host frame — the upstream takes open arrays and open strings, the
+/// connector keeps the frame and every scalar inside its budget (the §4.55
+/// usernames bound precedent). 64 entries per array and 128 characters per
+/// scalar are far above any real contact card and below any frame concern.
+pub const MAX_CONTACT_FIELD_ENTRIES: usize = 64;
+pub const MAX_CONTACT_FIELD_CHARS: usize = 128;
+
+/// One §4.105 phone/email entry (contract revision 1.124): the value is
+/// mandatory non-empty; the `type` is the official numberTo*Type vocabulary
+/// (HOME | MOBILE | WORK | CUSTOM — the two official enums share numbering
+/// and vocabulary), the label a free string; both optional.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactField {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// One §4.105 postal-address entry (contract revision 1.124): the
+/// official Contact.PostalAddress nine-field shape; the `type` vocabulary
+/// carries no MOBILE (the postal enum never had one).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactAddress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub street: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pobox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighborhood: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postcode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+}
+
+/// The §4.105 contact name (contract revision 1.124): the six official
+/// components, all optional.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactName {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub given_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub middle_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+}
+
+/// The §4.105 contact attachment (contract revision 1.124): the official
+/// ContactAttachment shape — the name, the phone/email/address entry arrays,
+/// the organization (an empty string is the official falsy-absent), and the
+/// avatar as a data URI whose bytes ride the CDN uplink as a pointer. Every
+/// field optional; an all-empty card is refused locally (it carries nothing).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContactPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<ContactName>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub number: Vec<ContactField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub email: Vec<ContactField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address: Vec<ContactAddress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+}
+
+/// messages.sendContact params (contract revision 1.124, §4.105): the
+/// addressing pair plus the contact card. The conversation row's kind
+/// decides the leg — a direct row routes the engine's 1:1 `sendContact`
+/// (recipient = the row's peer reference), a group row the `groupId`
+/// group leg (the calls.sendSignal 1:82 addressing precedent: the connector
+/// already holds the kind, so no new parameter).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendContactParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub contact: ContactPayload,
+}
+
+/// The §4.105 contact-card local gate (contract revision 1.124): the
+/// fail-closed bounds and vocabularies `prepare_messages_send_contact` runs
+/// before any upstream call. An all-empty card — no name component, no
+/// entry array, no organization, no avatar; empty-string name components and
+/// the empty organization are the official falsy-absent — answers
+/// INVALID_REQUEST (it carries nothing, and the upstream would spend a
+/// fan-out on an empty DataMessage.contact entry). Every string is bounded
+/// at the §4.105 scalar bound; the phone/email values are non-empty; the
+/// `type` words gate against the official numberTo*Type vocabularies
+/// (number/email: HOME | MOBILE | WORK | CUSTOM, address: HOME | WORK |
+/// CUSTOM — the postal enum never had a MOBILE); the avatar rides the
+/// §4.45 setProfile data-URI gate.
+fn validate_contact_payload(contact: &ContactPayload) -> Result<(), ServiceError> {
+    const NAME_BOUND: &str = "contact name components carry at most 128 characters";
+    const FIELD_BOUND: &str = "contact entry values carry 1-128 characters";
+    const TYPE_VOCABULARY: &str = "contact entry type must be HOME, MOBILE, WORK, or CUSTOM";
+    const ADDRESS_TYPE_VOCABULARY: &str = "contact address type must be HOME, WORK, or CUSTOM";
+    let refusal = |message: &'static str| -> Result<(), ServiceError> {
+        Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            message,
+            false,
+        )))
+    };
+    let bound = |value: &str| value.chars().count() <= MAX_CONTACT_FIELD_CHARS;
+    let over_entries = |len: usize| len > MAX_CONTACT_FIELD_ENTRIES;
+    if over_entries(contact.number.len())
+        || over_entries(contact.email.len())
+        || over_entries(contact.address.len())
+    {
+        return refusal("contact entry arrays carry at most 64 entries");
+    }
+    let mut has_content = false;
+    if let Some(name) = &contact.name {
+        for value in [
+            &name.given_name,
+            &name.family_name,
+            &name.prefix,
+            &name.suffix,
+            &name.middle_name,
+            &name.nickname,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !bound(value) {
+                return refusal(NAME_BOUND);
+            }
+            has_content |= !value.is_empty();
+        }
+    }
+    for entry in contact.number.iter().chain(contact.email.iter()) {
+        if entry.value.is_empty() || !bound(&entry.value) {
+            return refusal(FIELD_BOUND);
+        }
+        if let Some(kind) = &entry.r#type
+            && !matches!(kind.as_str(), "HOME" | "MOBILE" | "WORK" | "CUSTOM")
+        {
+            return refusal(TYPE_VOCABULARY);
+        }
+        if let Some(label) = &entry.label
+            && !bound(label)
+        {
+            return refusal(FIELD_BOUND);
+        }
+        has_content = true;
+    }
+    for entry in &contact.address {
+        if let Some(kind) = &entry.r#type
+            && !matches!(kind.as_str(), "HOME" | "WORK" | "CUSTOM")
+        {
+            return refusal(ADDRESS_TYPE_VOCABULARY);
+        }
+        if let Some(label) = &entry.label
+            && !bound(label)
+        {
+            return refusal(FIELD_BOUND);
+        }
+        for value in [
+            &entry.street,
+            &entry.pobox,
+            &entry.neighborhood,
+            &entry.city,
+            &entry.region,
+            &entry.postcode,
+            &entry.country,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !bound(value) {
+                return refusal(FIELD_BOUND);
+            }
+            has_content |= !value.is_empty();
+        }
+    }
+    if let Some(organization) = &contact.organization {
+        if !bound(organization) {
+            return refusal(FIELD_BOUND);
+        }
+        has_content |= !organization.is_empty();
+    }
+    if let Some(avatar) = &contact.avatar {
+        validate_avatar_data_uri(avatar)?;
+        has_content = true;
+    }
+    if !has_content {
+        return refusal("the contact card carries no content");
+    }
+    Ok(())
+}
+
 /// `groups.generateInviteLinkPassword` params (contract revision 1.117,
 /// §4.98): none — the password is account-less CSPRNG material (the official
 /// `generateGroupInviteLinkPassword`), so the host face takes an empty
@@ -13467,6 +13744,168 @@ mod tests {
         assert_eq!(api.code, "GROUP_MIGRATION_FAILED");
         assert!(!api.retryable);
         assert_eq!(api.data, Some(json!({ "status": 409 })));
+    }
+
+    /// §4.105 contact-send prepare (contract 1.124): the card ladder — the
+    /// all-empty refusal, the type vocabularies (number/email four words,
+    /// address three), the entry and scalar bounds, the avatar data-URI
+    /// gate — and the leg routing (the direct row's peer reference, the
+    /// group row's groupId; the calls.sendSignal addressing precedent),
+    /// with the empty-string organization folding out of the frame.
+    #[test]
+    fn contact_send_prepare_ladder_and_leg_routing() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Fixture Group")
+            .unwrap();
+        let params_for =
+            |conversation_id: String, contact: ContactPayload| MessagesSendContactParams {
+                account_id: account.id.clone(),
+                conversation_id,
+                contact,
+            };
+        let full_card = ContactPayload {
+            name: Some(ContactName {
+                given_name: Some("Ada".into()),
+                ..Default::default()
+            }),
+            number: vec![ContactField {
+                value: "+15551230000".into(),
+                r#type: Some("MOBILE".into()),
+                label: Some("cell".into()),
+            }],
+            email: vec![ContactField {
+                value: "ada@example.test".into(),
+                r#type: Some("WORK".into()),
+                label: None,
+            }],
+            address: vec![ContactAddress {
+                r#type: Some("HOME".into()),
+                city: Some("London".into()),
+                ..Default::default()
+            }],
+            organization: Some("".into()),
+            avatar: Some("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==".into()),
+        };
+
+        // The direct leg: the row's peer reference is the recipient; the
+        // empty-string organization is the official falsy-absent and drops.
+        let upstream = service
+            .prepare_messages_send_contact(&params_for(direct.id.clone(), full_card.clone()))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["recipient"], direct.peer_key);
+        assert!(upstream.get("groupId").is_none());
+        assert_eq!(upstream["contact"]["name"]["givenName"], "Ada");
+        assert_eq!(upstream["contact"]["number"][0]["type"], "MOBILE");
+        assert_eq!(upstream["contact"]["email"][0]["value"], "ada@example.test");
+        assert_eq!(upstream["contact"]["address"][0]["city"], "London");
+        assert_eq!(
+            upstream["contact"]["avatar"],
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+        );
+        assert!(upstream["contact"].get("organization").is_none());
+
+        // The group leg: the row's peer reference is the groupId.
+        let upstream = service
+            .prepare_messages_send_contact(&params_for(group.id.clone(), full_card))
+            .unwrap();
+        assert_eq!(upstream["groupId"], "ZmFrZS1ncm91cC0x");
+        assert!(upstream.get("recipient").is_none());
+
+        // The ladder: every refusal lands before any upstream frame.
+        let refused = |contact: ContactPayload| {
+            service
+                .prepare_messages_send_contact(&params_for(direct.id.clone(), contact))
+                .unwrap_err()
+                .into_api()
+                .code
+        };
+        let field = |value: &str, kind: Option<&str>| ContactField {
+            value: value.into(),
+            r#type: kind.map(Into::into),
+            label: None,
+        };
+        assert_eq!(refused(ContactPayload::default()), "INVALID_REQUEST");
+        assert_eq!(
+            refused(ContactPayload {
+                organization: Some("".into()),
+                ..Default::default()
+            }),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            refused(ContactPayload {
+                number: vec![field("+1", Some("CELL"))],
+                ..Default::default()
+            }),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            refused(ContactPayload {
+                address: vec![ContactAddress {
+                    r#type: Some("MOBILE".into()),
+                    city: Some("x".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            refused(ContactPayload {
+                number: vec![field(&"x".repeat(129), None)],
+                ..Default::default()
+            }),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            refused(ContactPayload {
+                number: (0..MAX_CONTACT_FIELD_ENTRIES + 1)
+                    .map(|_| field("+1", None))
+                    .collect(),
+                ..Default::default()
+            }),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            refused(ContactPayload {
+                avatar: Some("not-a-data-uri".into()),
+                ..Default::default()
+            }),
+            "INVALID_REQUEST"
+        );
+
+        // The unknown account and the conversation-id bounds refuse too.
+        let error = service
+            .prepare_messages_send_contact(&MessagesSendContactParams {
+                account_id: "no-such-account".into(),
+                conversation_id: direct.id.clone(),
+                contact: ContactPayload {
+                    name: Some(ContactName {
+                        given_name: Some("Ada".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            })
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+        let error = service
+            .prepare_messages_send_contact(&params_for(
+                String::new(),
+                ContactPayload {
+                    name: Some(ContactName {
+                        given_name: Some("Ada".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
     }
 
     /// §4.69: the four message-carrying cloud-restore families pass the

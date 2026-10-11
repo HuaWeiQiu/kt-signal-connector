@@ -1690,6 +1690,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.migrate_group(params).await
     }
 
+    /// messages.sendContact (contract revision 1.124, §4.105): the card send
+    /// is the account's own upstream message write, so it routes through the
+    /// account's owning engine like every send-lane face.
+    pub async fn send_contact(
+        &self,
+        params: crate::service::MessagesSendContactParams,
+    ) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_contact(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

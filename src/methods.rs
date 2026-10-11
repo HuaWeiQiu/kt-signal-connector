@@ -71,6 +71,10 @@ pub const METHODS: &[MethodRow] = &[
     // the §4.12 attachment class verbatim, same-account mutex and delete
     // barrier included; advertised through `send-sticker`.
     ("messages.sendSticker", Lane::Send, true, "send"),
+    // Contact-card send (contract revision 1.124, §4.105): mutating,
+    // send-lane upstream traffic — the reaction class verbatim, same-account
+    // mutex and delete barrier included; advertised through `send-contact`.
+    ("messages.sendContact", Lane::Send, true, "send"),
     ("messages.edit", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
@@ -638,7 +642,10 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// device-plane faces (`accounts.getDevices` — the bounded device-list read
 /// with engine-side device-name decryption — plus the `accounts.unlinkDevice`
 /// server-side unlink write; one capability for the read and write halves,
-/// the 1.53 appendix discipline). They never
+/// the 1.53 appendix discipline); and `send-contact` (contract revision
+/// 1.124) marks the §4.105 contact-card send face (`messages.sendContact` —
+/// the official DataMessage.contact single-entry face, the conversation
+/// row's kind deciding the 1:1 / group leg). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -684,6 +691,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "conversation-state",
     "group-invite-links",
     "device-management",
+    "send-contact",
     "delete-for-me",
 ];
 
@@ -751,6 +759,7 @@ mod tests {
             "messages.retryText",
             "messages.attachments.send",
             "messages.sendSticker",
+            "messages.sendContact",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
@@ -807,6 +816,7 @@ mod tests {
             "messages.retryText",
             "messages.attachments.send",
             "messages.sendSticker",
+            "messages.sendContact",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",

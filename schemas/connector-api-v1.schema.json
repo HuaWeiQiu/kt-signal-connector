@@ -76,6 +76,7 @@
             "messages.retryText",
             "messages.attachments.send",
             "messages.sendSticker",
+            "messages.sendContact",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
@@ -598,6 +599,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendStickerParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendContact" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendContactParams" }
             }
           }
         },
@@ -3045,6 +3057,111 @@
           "description": "The link the join went through \u2014 any official URL form or the bare invite code; the engine parses it."
         }
       }
+    },
+    "messagesSendContactParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "contact"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation row the card rides — its kind decides the leg: a direct row routes the engine's 1:1 sendContact (recipient = the row's peer reference), a group row the groupId group leg (the calls.sendSignal addressing precedent: the connector already holds the kind, so no new parameter). A row of neither kind answers INVALID_REQUEST."
+        },
+        "contact": { "$ref": "#/$defs/contactPayload" }
+      },
+      "description": "Send one contact card (contract revision 1.124, \u00a74.105, capability send-contact; the official DataMessage.contact single-entry face): the conversation row's kind decides the leg (see conversationId). The card gates run locally fail-closed before any upstream call (the engine's parse face mirrors them, but a local refusal never spends a fan-out frame): an all-empty card answers INVALID_REQUEST (it carries nothing — empty-string name components and the empty organization are the official falsy-absent), entry arrays hold at most 64 entries, every string is bounded at 128 characters with the phone/email values non-empty, the type vocabularies are HOME|MOBILE|WORK|CUSTOM (number/email) and HOME|WORK|CUSTOM (address — the postal enum never had a MOBILE; the official client silently folds out-of-vocabulary words to HOME and the engine refuses instead, the textStyle precedent), and the avatar rides the \u00a74.45 setProfile data-URI gate. The empty-string organization drops from the upstream frame. Unknown account answers ACCOUNT_NOT_FOUND. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried (a card whose delivery is unknown may already sit in the recipients' timelines). The response is {sentAt} — the engine's send timestamp, the calls.sendSignal ack shape; the connector keeps no send rows for the face. Structured engine errors ride the existing upstream send family; no new codes."
+    },
+    "contactPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The official ContactAttachment shape (contract revision 1.124): name (the six official components), number/email (the value entries), address (the official postal fields), organization (an empty string is the official falsy-absent), avatar (a data:image/*;base64 URI whose bytes ride the CDN uplink as an attachment pointer — never a connector store). Every field optional; the card must carry at least one non-falsy field.",
+      "properties": {
+        "name": { "$ref": "#/$defs/contactName" },
+        "number": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/contactField" }
+        },
+        "email": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/contactField" }
+        },
+        "address": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/contactAddress" }
+        },
+        "organization": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "The card's organization; an empty string is the official falsy-absent and drops from the upstream frame."
+        },
+        "avatar": {
+          "type": "string",
+          "description": "The card photo as a data:image/*;base64 URI within 10485760 decoded bytes (the \u00a74.45 setProfile gate runs locally, so a malformed URI answers INVALID_REQUEST before any upstream call). The engine uploads the bytes and the pointer lands in the card (the official EmbeddedContactWithUploadedAvatar semantics); the bytes never touch a connector store."
+        }
+      }
+    },
+    "contactField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value"],
+      "properties": {
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The phone number or email address; non-empty, at most 128 characters."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["HOME", "MOBILE", "WORK", "CUSTOM"],
+          "description": "The official numberTo*Type vocabulary (both official enums share the words); optional."
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "A free-form label; optional."
+        }
+      },
+      "description": "One phone/email entry (contract revision 1.124): the value is mandatory non-empty; the type is the official numberTo*Type vocabulary (HOME | MOBILE | WORK | CUSTOM — the two official enums share numbering and vocabulary), the label a free string; both optional."
+    },
+    "contactAddress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["HOME", "WORK", "CUSTOM"],
+          "description": "The official postal type vocabulary; the postal enum never had a MOBILE."
+        },
+        "label": { "type": "string", "maxLength": 128 },
+        "street": { "type": "string", "maxLength": 128 },
+        "pobox": { "type": "string", "maxLength": 128 },
+        "neighborhood": { "type": "string", "maxLength": 128 },
+        "city": { "type": "string", "maxLength": 128 },
+        "region": { "type": "string", "maxLength": 128 },
+        "postcode": { "type": "string", "maxLength": 128 },
+        "country": { "type": "string", "maxLength": 128 }
+      },
+      "description": "One postal-address entry (contract revision 1.124): the official Contact.PostalAddress nine-field shape; every field an optional string of at most 128 characters; the type vocabulary carries no MOBILE."
+    },
+    "contactName": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "givenName": { "type": "string", "maxLength": 128 },
+        "familyName": { "type": "string", "maxLength": 128 },
+        "prefix": { "type": "string", "maxLength": 128 },
+        "suffix": { "type": "string", "maxLength": 128 },
+        "middleName": { "type": "string", "maxLength": 128 },
+        "nickname": { "type": "string", "maxLength": 128 }
+      },
+      "description": "The official contact name (contract revision 1.124): the six official components, all optional strings of at most 128 characters (an empty string is the official falsy-absent)."
     },
     "groupsMigrateParams": {
       "type": "object",

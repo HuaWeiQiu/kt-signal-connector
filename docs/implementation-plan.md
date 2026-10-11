@@ -8437,6 +8437,78 @@ rejection (data.status 409 verbatim), and the red line
 exactly one crashing frame). Gated behind the full local gate suite
 (fmt + clippy -D warnings + cargo test + release build), all green.
 
+### 4.105 The contact card reaches the host: `messages.sendContact` (contract revision 1.124, 2026-10-12)
+
+The engine's window-D batch shipped `sendContact` — the official
+DataMessage.contact single-entry face (the desktop's
+`SendMessage.preload.ts` toProto contact section + the
+`EmbeddedContact.std.ts` numberTo*Type vocabulary, same position). This
+batch wires it into the host contract as `messages.sendContact`,
+advertised through the new `send-contact` capability tag (contract
+1.34 discipline — desktops gate the surface on the tag, so an old
+connector answers a clean capability gap instead of
+`METHOD_NOT_ALLOWED`). Until now the desktop could send text,
+attachments, stickers, stories, reactions, and pins but could not share
+a contact card; the address-book share had no outbound leg.
+
+**The shape.** `messages.sendContact {accountId, conversationId,
+contact}` — the conversation row's kind decides the leg (the
+calls.sendSignal 1:82 addressing precedent: the connector already holds
+the kind, so no new parameter). A direct row routes the engine's 1:1
+`sendContact` (`{account, recipient: the row's peer reference,
+contact}`); a group row routes the `groupId` group leg — one upstream
+call fans the card to every group member through the sender-key
+channel. `contact` is the official ContactAttachment shape verbatim:
+`name` (the six official components, all optional), `number`/`email`
+(the value entries), `address` (the official postal nine-field shape),
+`organization` (an empty string is the official falsy-absent and drops
+from the upstream frame), `avatar` (a data URI whose bytes ride the CDN
+uplink as an attachment pointer — the official
+EmbeddedContactWithUploadedAvatar upload face, the engine failing the
+whole call when the upload chain fails; the bytes never touch a
+connector store). The card gates
+are fail-closed before any upstream call (the engine's parse face
+mirrors them, but a local refusal never spends a fan-out frame): an
+all-empty card answers INVALID_REQUEST (it carries nothing —
+empty-string name components count as absent, the official falsy
+mirror); entry arrays hold at most 64 entries; every string is bounded
+at 128 characters with the phone/email values non-empty; the `type`
+vocabularies are the official numberTo*Type words (number/email:
+HOME | MOBILE | WORK | CUSTOM, address: HOME | WORK | CUSTOM — the
+postal enum never had a MOBILE; the official client silently folds
+out-of-vocabulary words to HOME and the engine refuses instead, the
+textStyle precedent, §5 deviation recorded); the avatar data URI rides
+the §4.45 `validate_avatar_data_uri` gate so a malformed URI answers
+INVALID_REQUEST first. The fixture-side dispatch log digest-summarizes
+the avatar (the engine's "zero avatar bytes in the dispatch log"
+discipline mirrored); the rest of the card is the caller's own text
+data and rides verbatim.
+
+**The answer and the failure faces.** The response is `{sentAt}` — the
+engine's send timestamp, the calls.sendSignal ack shape; the connector
+keeps no send rows for the face (the conversation timeline converges
+through the receive projection like every outbound send). No new
+structured codes: the face rides the existing upstream send family, and
+a mutating upstream write whose outcome can be lost in transport answers
+SEND_OUTCOME_UNKNOWN (retryable=false) and is never retried (the
+AGENTS.md red line — a card whose delivery is unknown may already sit
+in the recipients' timelines).
+
+Tests: the service unit pins the prepare ladder (the all-empty and
+all-falsy refusals, the type vocabularies both legs, the entry and
+scalar bounds, the avatar gate, the organization fold) and the leg
+routing (the direct row's peer reference, the group row's groupId);
+the methods-table test pins the lane and mutating classification and
+the capability list; the integration test round-trips both legs (the
+direct frame carries the recipient and the card verbatim with the
+avatar digest-summarized, the group frame carries the groupId; the
+{sentAt} ack echoes the engine timestamp), the local ladder (seven
+refusals with a byte-frozen dispatch log), the unknown account, and the
+red line (crash-in-flight answers SEND_OUTCOME_UNKNOWN across the
+restart, exactly one crashing frame). Gated behind the full local gate
+suite (fmt + clippy -D warnings + cargo test + release build), all
+green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
