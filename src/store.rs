@@ -4143,6 +4143,86 @@ impl Store {
         Ok(stamped)
     }
 
+    /// First-stamp `read_at` on the given incoming rows (contract 1.100,
+    /// §4.81): the cross-device read sync's local projection — the account
+    /// read these rows on another device, so this store carries the same
+    /// stamp the desktop's own open path implies. Same first-stamp-wins
+    /// discipline as `stamp_incoming_viewed` — a replayed sync never
+    /// re-stamps. Only incoming rows qualify: the sync entries name messages
+    /// the account received, never its own sends or system rows.
+    pub fn stamp_incoming_read(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        row_ids: &[String],
+        when: u64,
+    ) -> Result<u64, StoreError> {
+        if row_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "UPDATE messages SET read_at=?4
+                 WHERE account_id=?1 AND conversation_id=?2 AND id=?3
+                   AND direction='incoming' AND read_at IS NULL",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut stamped = 0u64;
+        for row_id in row_ids.iter().take(256) {
+            let changes = stmt
+                .execute(params![account_id, conversation_id, row_id, when as i64])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            stamped += changes as u64;
+        }
+        Ok(stamped)
+    }
+
+    /// The incoming rows one read/viewed sync names (contract 1.100, §4.81):
+    /// rows of one conversation whose upstream sent timestamp is in the
+    /// list — the sync's (sender, timestamp) entries resolved against this
+    /// conversation. The result follows the caller's timestamp order;
+    /// a timestamp with no incoming row (pruned, or never landed here)
+    /// is simply absent — the sync never invents rows.
+    pub fn incoming_rows_by_sent_at(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: &[u64],
+    ) -> Result<Vec<MessageRecord>, StoreError> {
+        if sent_at.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = Vec::with_capacity(sent_at.len());
+        let mut seen = std::collections::HashSet::with_capacity(sent_at.len());
+        for at in sent_at.iter().take(256) {
+            if !seen.insert(*at) {
+                continue;
+            }
+            if let Some(record) = stmt
+                .query_row(
+                    params![account_id, conversation_id, *at as i64],
+                    message_record_from_row,
+                )
+                .optional()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+            {
+                rows.push(record);
+            }
+        }
+        Ok(rows)
+    }
+
     /// The incoming rows of one conversation in receipt order (`sent_at ASC,
     /// id ASC`), bounded — the absent-`messageIds` mode of
     /// `messages.markRead` / `messages.markViewed` (contract 1.34). Only
@@ -13129,6 +13209,113 @@ mod tests {
         // An empty selection is the trivial no-op.
         let noop = store
             .stamp_incoming_viewed(&account.id, &conversation.id, &[], 6000)
+            .unwrap();
+        assert_eq!(noop, 0);
+    }
+
+    /// `stamp_incoming_read` + `incoming_rows_by_sent_at` (contract 1.100,
+    /// §4.81): the cross-device read sync's store half — the (sender,
+    /// timestamp) entries resolve to the matching incoming rows in caller
+    /// order, the read stamp lands first-stamp-wins on incoming rows only,
+    /// and a timestamp naming no row is simply absent.
+    #[test]
+    fn sync_read_store_half_resolves_timestamps_and_stamps_first_only() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction,
+            sender_id: if direction == "incoming" {
+                "peer".into()
+            } else {
+                "self".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        };
+        for (id, sent_at, direction) in [
+            ("m-in-1", 500, "incoming"),
+            ("m-in-2", 501, "incoming"),
+            ("m-out", 502, "outgoing"),
+        ] {
+            let row = record(id, sent_at, direction);
+            store
+                .insert_message(&row, None, row.text.as_deref(), true)
+                .unwrap();
+        }
+
+        // The timestamp resolution follows the caller's order, dedupes, and
+        // skips timestamps naming nothing incoming.
+        let rows = store
+            .incoming_rows_by_sent_at(&account.id, &conversation.id, &[501, 999, 500, 501])
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["m-in-2", "m-in-1"]
+        );
+
+        // The read stamp lands on the named incoming rows only; a stamp on
+        // an outgoing row's timestamp never leaves this call with it in the
+        // id list (the caller resolves ids from the same resolution).
+        let stamped = store
+            .stamp_incoming_read(
+                &account.id,
+                &conversation.id,
+                &["m-in-1".to_string(), "m-out".to_string()],
+                5000,
+            )
+            .unwrap();
+        assert_eq!(stamped, 1);
+        let stored = |id: &str| {
+            store
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(stored("m-in-1").read_at, Some(5000));
+        assert_eq!(stored("m-out").read_at, None);
+
+        // First stamp wins: a replayed sync never re-stamps.
+        let restamped = store
+            .stamp_incoming_read(&account.id, &conversation.id, &["m-in-1".to_string()], 6000)
+            .unwrap();
+        assert_eq!(restamped, 0);
+        assert_eq!(stored("m-in-1").read_at, Some(5000));
+
+        // An empty list is the trivial no-op.
+        let noop = store
+            .stamp_incoming_read(&account.id, &conversation.id, &[], 6000)
             .unwrap();
         assert_eq!(noop, 0);
     }

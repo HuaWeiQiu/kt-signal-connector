@@ -887,6 +887,31 @@ pub enum ControlReceive {
     Story {
         message: Value,
     },
+    /// The engine's `syncMessage.read[]` / `.viewed[]` projection (contract
+    /// 1.100, §4.81): the account's own linked device marked upstream
+    /// messages read (or viewed) — the official #handleRead/#handleViewed
+    /// faces. Each entry names one message by its author's ACI and upstream
+    /// timestamp; entries address conversations by their own sender, never
+    /// by the envelope source (the envelope is our own account). Both faces
+    /// ride one envelope (the proto carries the two repeated fields side by
+    /// side); either list alone is fine. Unusable entries never reach this
+    /// variant — the projection parser dropped them.
+    SyncReadState {
+        read: Vec<SyncReadEntry>,
+        viewed: Vec<SyncReadEntry>,
+    },
+}
+
+/// One (sender, timestamp) pair off the engine's `syncMessage.read[]` /
+/// `.viewed[]` projection (contract 1.100, §4.81): the author identity the
+/// entry names plus the upstream timestamp of the message it marks.
+/// `sender_number` rides only when the engine's contacts cache resolved the
+/// author's number (the receive author-number discipline).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncReadEntry {
+    pub sender_uuid: String,
+    pub sender_number: Option<String>,
+    pub timestamp: u64,
 }
 
 /// Protocol-side bounds for inbound control-plane data (§4.13).
@@ -900,6 +925,11 @@ const MAX_EMOJI_CHARS: usize = 16;
 /// truncated (Signal Desktop batches receipts per conversation, so real
 /// batches stay far below).
 const MAX_RECEIPT_TIMESTAMPS: usize = 256;
+/// One sync read/viewed face carries at most this many entries (contract
+/// 1.100, §4.81): the same coarse batch guard the receipt family rides —
+/// real multi-device read syncs stay far below it; entries past the cap
+/// drop (the same truncate discipline as `MAX_RECEIPT_TIMESTAMPS`).
+const MAX_SYNC_READ_ENTRIES: usize = 256;
 /// Rich-body bounds (contract 1.25, §4.13 parity): caps on card/range counts
 /// and string sizes. Entries past a cap drop, oversized strings truncate — a
 /// hostile payload can never fail the message itself.
@@ -1043,10 +1073,19 @@ impl NormalizedReceive {
                         + std::mem::size_of::<NormalizedAttachment>()
                 })
                 .sum::<usize>()
-            // Quotes carry a bounded preview; control payloads are enum-sized.
+            // Quotes carry a bounded preview; control payloads are enum-sized —
+            // except the sync read/viewed entry lists, whose heap Vecs count
+            // here so the queue budget stays honest (§4.13).
             + self.quote.as_ref().map_or(0, |quote| {
                 quote.author.len() + quote.text.len() + std::mem::size_of::<NormalizedQuote>()
             })
+            + match self.control.as_ref() {
+                Some(ControlReceive::SyncReadState { read, viewed }) => {
+                    (read.len() + viewed.len())
+                        * (2 * MAX_RECEIVE_ID_CHARS + std::mem::size_of::<SyncReadEntry>())
+                }
+                _ => 0,
+            }
             // Rich bodies carry capped urls/titles/names; ranges are fixed-width.
             + self.rich.as_ref().map_or(0, |rich| {
                 std::mem::size_of::<NormalizedRich>()
@@ -2162,6 +2201,48 @@ fn normalized_message_request_response(
     })
 }
 
+/// Bounded `syncMessage.read[]` / `.viewed[]` entry family (contract 1.100,
+/// §4.81): the wire entry is `{senderUuid, senderNumber?, timestamp}` — the
+/// engine projects the (senderAci, timestamp) pair the official entries
+/// carry, plus the contacts-resolved number when its cache had one. The
+/// identity caps mirror the receive id family, the per-face cap mirrors the
+/// receipt batch; an entry without a sender or a positive timestamp drops
+/// (宁缺勿错 — the engine already drops unparseable ones, so what survives
+/// here is the bounds family's own guard).
+fn normalized_sync_read_entries(value: Option<&Value>) -> Vec<SyncReadEntry> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .take(MAX_SYNC_READ_ENTRIES)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let sender_uuid = object
+                .get("senderUuid")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+            let timestamp = object
+                .get("timestamp")
+                .and_then(Value::as_u64)
+                .filter(|timestamp| *timestamp > 0)?;
+            let sender_number = object
+                .get("senderNumber")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+            Some(SyncReadEntry {
+                sender_uuid,
+                sender_number,
+                timestamp,
+            })
+        })
+        .collect()
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -2881,6 +2962,25 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             group_id: group_id.clone(),
             control,
         });
+    }
+    // The engine's `syncMessage.read[]` / `.viewed[]` projection (contract
+    // 1.100, §4.81): the account's own linked device marked upstream
+    // messages read (or viewed). The face is intercepted before the plain
+    // syncMessage skip like its messageRequestResponse sibling; an envelope
+    // whose entries all failed the bounds falls through to that skip. The
+    // routing source stays None — the envelope is our own account, the
+    // entries name their own senders (the view-once open precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
+        let read = normalized_sync_read_entries(sync.get("read"));
+        let viewed = normalized_sync_read_entries(sync.get("viewed"));
+        if !read.is_empty() || !viewed.is_empty() {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: None,
+                group_id: None,
+                control: ControlReceive::SyncReadState { read, viewed },
+            });
+        }
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
     // projection routes like every body-less control face — an empty or
@@ -5379,6 +5479,69 @@ mod tests {
             panic!("expected a view-once open control");
         };
         assert_eq!(timestamp, 0);
+    }
+
+    /// Contract 1.100 (§4.81): the engine's `syncMessage.read[]` /
+    /// `.viewed[]` projection routes as a control receive addressed by the
+    /// entries' own senders; unusable entries drop before the variant;
+    /// a face with no usable entry at all falls through to the plain
+    /// syncMessage skip.
+    #[test]
+    fn sync_read_viewed_routes_bounded_control_entries() {
+        let entry = |uuid: &str, timestamp: u64, number: Option<&str>| {
+            let mut object = json!({ "senderUuid": uuid, "timestamp": timestamp });
+            if let Some(number) = number {
+                object["senderNumber"] = json!(number);
+            }
+            object
+        };
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "sourceUuid": "99999999-9999-9999-9999-999999999999",
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncReadState { read, viewed }, source)) = routing(json!({
+            "read": [
+                entry("11111111-1111-1111-1111-111111111111", 1726999999000, Some("+15555550101")),
+                // Unusable: no timestamp, no sender — both drop.
+                { "senderUuid": "22222222-2222-2222-2222-222222222222" },
+                { "timestamp": 1726999998000u64 },
+            ],
+            "viewed": [
+                entry("11111111-1111-1111-1111-111111111111", 1726999997000, None),
+            ],
+        })) else {
+            panic!("expected a sync read control routing");
+        };
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0].sender_uuid, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(read[0].sender_number.as_deref(), Some("+15555550101"));
+        assert_eq!(read[0].timestamp, 1726999999000);
+        assert_eq!(viewed.len(), 1);
+        assert_eq!(viewed[0].timestamp, 1726999997000);
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // Both faces empty (or absent) → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "read": [], "viewed": [] }),
+            json!({ "read": [{ "timestamp": 1726999999000u64 }] }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
     }
 
     /// Call signaling (contract 1.50, §4.48): the engine's `callMessage`

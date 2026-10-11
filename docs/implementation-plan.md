@@ -6409,6 +6409,59 @@ service-layer mapping unit (`send_chain_transport_errors_map_to_send_error_codes
 three host codes with their contract-fixed retryability and no invented data object); and
 the schema error-code enumeration (`tests/schema_consistency.rs`).
 
+### 4.81 Engine D-batch consume faces: read/viewed sync, group changes, quote attachments, device capabilities (contract revision 1.100, 2026-10-11)
+
+The engine's P8-D alignment batch (kt-signal-engine, 2026-10-11) landed four additive wire
+faces the connector did not consume yet. This batch consumes them connector-side, wire
+additive on both faces it adds (one event, one method), existing fields untouched.
+
+#### D2 — cross-device read/viewed sync (`syncMessage.read` / `syncMessage.viewed`)
+
+The engine projects the official `#handleRead`/`#handleViewed` faces as
+`envelope.syncMessage.read[]` / `.viewed[]` entries `{senderUuid, senderNumber?, timestamp}`
+— the (senderAci, timestamp) pair per marked message, senderNumber only when the engine's
+contacts cache resolved it. The connector previously dropped the whole face on the plain
+`syncMessage` skip. Consumption:
+
+- **Parse bounds** (§4.13 family): per-face entry cap 256 (the receipt-batch guard,
+  entries past it truncate); identity caps mirror the receive id family (128 chars); an
+  entry without a non-empty `senderUuid` or a positive `timestamp` drops (宁缺勿错 — the
+  engine already drops unparseable ones); an envelope with no usable entry keeps the plain
+  skip. The control variant is `SyncReadState { read, viewed }`; the queue byte budget
+  counts the entry lists explicitly (they are the one control variant with heap payload).
+- **Routing**: intercepted before the conversation ladder like every own-account sync (the
+  envelope source is our own account — the view-once open and messageRequestResponse
+  precedents); each distinct sender resolves one direct conversation through the shared
+  ladder — the entry ACI, the recorded ACI→peer-key mappings (§4.37), the entry's
+  contacts-resolved number, contacts digit-suffix matches (§4.29). A sender naming no
+  local conversation is warn-only dropped. Direct conversations only.
+- **Row stamps**: each face resolves its own entries' timestamps to this conversation's
+  incoming rows (upstream `sent_at` equality; caller-order, deduplicated, missing
+  timestamps absent — never invented) and stamps its own column first-stamp-wins:
+  `read_at` for read entries, `viewed_at` for viewed entries (the §4.77 stamp
+  discipline). Outgoing and system rows never qualify — the entries name messages the
+  account received.
+- **Badge convergence**: the conversation badge is a coarse per-conversation counter with
+  no per-row unread model (§4.29 — the desktop owns its read state; the counter exists
+  for the badge), so any matched entry clears it through the same primitive the
+  connector's own open path runs (`messages.list`), and the refreshed summary rides
+  `conversation.changed` with the account total on `account.changed` (the insert-path
+  precedent). Recorded deviation: an entry naming only an old row also clears the badge —
+  the coarse-counter cost, preferred over inventing per-row unread state.
+- **Events**: `message.statusChanged` per moved row (the row's own `status`,
+  `delivered_at`, the stamp the face just wrote; absent keys stay absent — the 1.32
+  absent-means-no-op merge discipline), then the badge pair. Replayed syncs stamp nothing
+  and emit nothing.
+
+Tests: the engine routing unit (`sync_read_viewed_routes_bounded_control_entries` — both
+faces in one envelope, unusable entries drop, the routing source stays None, the
+empty-face envelope keeps the plain skip); the store half
+(`sync_read_store_half_resolves_timestamps_and_stamps_first_only` — caller-order
+resolution with dedupe and misses, first-stamp-wins, incoming-only, the empty-list no-op);
+the service unit (`sync_read_state_stamps_rows_and_converges_the_badge` — two faces two
+rows, the badge pair rides a matched entry, the no-row timestamp stays silent, the replay
+is silent, the unknown sender is silent).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

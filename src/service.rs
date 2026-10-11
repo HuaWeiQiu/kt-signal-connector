@@ -12,7 +12,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
     ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, ReceiptKind,
-    timer_change_material, timer_change_rich, truncate_utf8_bytes,
+    SyncReadEntry, timer_change_material, timer_change_rich, truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -6145,6 +6145,14 @@ impl ConnectorService {
                 group_id.as_deref(),
             );
         }
+        // Contract 1.100 (§4.81 D2 consume batch): the read/viewed sync also
+        // addresses its rows across conversations — by each entry's own
+        // sender identity, never by an envelope source (the envelope is our
+        // own account). Intercepted before the generic ladder with the same
+        // ACI→peer-key resolution family the view-once open sync runs.
+        if let ControlReceive::SyncReadState { read, viewed } = &control {
+            return self.apply_sync_read_state(&account, read, viewed);
+        }
         // Story receives (contract 1.76, §4.67): a story addresses no
         // conversation — the bounded projection forwards as the transient
         // `story.received` event and the connector keeps no row. The
@@ -6737,6 +6745,11 @@ impl ConnectorService {
                 signal_type,
                 payload,
             }]),
+            // The read/viewed sync is intercepted before the conversation
+            // ladder (its entries span conversations); this arm is the same
+            // unreachable-in-practice guard the other cross-conversation
+            // faces carry.
+            ControlReceive::SyncReadState { .. } => Ok(Vec::new()),
         }
     }
 
@@ -6815,6 +6828,197 @@ impl ConnectorService {
             message_id: record.id,
             opened_at,
         }])
+    }
+
+    /// Contract 1.100 (§4.81 D2 consume batch): consume one
+    /// `syncMessage.read[]` / `.viewed[]` projection — the account read (or
+    /// viewed) upstream messages on another linked device. Each entry names
+    /// one message by (author ACI, upstream timestamp); the face resolves
+    /// each entry's conversation through the shared ACI→peer-key ladder,
+    /// stamps the matching incoming rows (`read_at` / `viewed_at`,
+    /// first-stamp-wins per face — a replayed sync never re-stamps), and
+    /// converges the conversation badge through the same primitive the
+    /// connector's own open path uses (`messages.list`): the counter is a
+    /// coarse per-conversation face with no per-row unread model (the §4.29
+    /// discipline — the desktop owns its read state; the counter exists for
+    /// the badge), so any matched entry clears it and the refreshed summary
+    /// rides `conversation.changed`. Row truth rides `message.statusChanged`
+    /// per moved row; a sync naming no local row or no local conversation
+    /// stays silent (宁缺勿错 — never invent rows or conversations).
+    fn apply_sync_read_state(
+        &mut self,
+        account: &AccountRow,
+        read: &[SyncReadEntry],
+        viewed: &[SyncReadEntry],
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // Resolve one conversation per distinct sender: the official entries
+        // are per-sender pairs, and a sender repeating across both faces
+        // resolves once. Insertion order preserved so event order follows
+        // the wire.
+        let mut senders: Vec<(String, Option<String>)> = Vec::new();
+        for entry in read.iter().chain(viewed.iter()) {
+            if !senders.iter().any(|(uuid, _)| uuid == &entry.sender_uuid) {
+                senders.push((entry.sender_uuid.clone(), entry.sender_number.clone()));
+            }
+        }
+        let mut events = Vec::new();
+        for (sender_uuid, sender_number) in &senders {
+            let Some(conversation) =
+                self.sync_sender_conversation(account, sender_uuid, sender_number.as_deref())?
+            else {
+                tracing::warn!(
+                    kind = "sync_read_state",
+                    "read sync matched no local conversation; dropped"
+                );
+                continue;
+            };
+            let mut read_timestamps: Vec<u64> = read
+                .iter()
+                .filter(|entry| &entry.sender_uuid == sender_uuid)
+                .map(|entry| entry.timestamp)
+                .collect();
+            read_timestamps.sort_unstable();
+            read_timestamps.dedup();
+            let mut viewed_timestamps: Vec<u64> = viewed
+                .iter()
+                .filter(|entry| &entry.sender_uuid == sender_uuid)
+                .map(|entry| entry.timestamp)
+                .collect();
+            viewed_timestamps.sort_unstable();
+            viewed_timestamps.dedup();
+            let read_rows = self.store.incoming_rows_by_sent_at(
+                &account.id,
+                &conversation.id,
+                &read_timestamps,
+            )?;
+            let viewed_rows = self.store.incoming_rows_by_sent_at(
+                &account.id,
+                &conversation.id,
+                &viewed_timestamps,
+            )?;
+            if read_rows.is_empty() && viewed_rows.is_empty() {
+                continue;
+            }
+            let when = now_ms();
+            // The read face first, then viewed — the official read/viewed
+            // pair upgrades, never downgrades; each face stamps its own
+            // column first-stamp-wins over the rows its own entries name.
+            let read_ids: Vec<String> = read_rows
+                .iter()
+                .filter(|record| record.read_at.is_none())
+                .map(|record| record.id.clone())
+                .collect();
+            if !read_ids.is_empty() {
+                self.store
+                    .stamp_incoming_read(&account.id, &conversation.id, &read_ids, when)?;
+                for record in read_rows.iter().filter(|record| record.read_at.is_none()) {
+                    events.push(HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id.clone(),
+                        message_id: record.id.clone(),
+                        status: record.status,
+                        delivered_at: record.delivered_at,
+                        read_at: Some(when),
+                        viewed_at: record.viewed_at,
+                    });
+                }
+            }
+            let viewed_ids: Vec<String> = viewed_rows
+                .iter()
+                .filter(|record| record.viewed_at.is_none())
+                .map(|record| record.id.clone())
+                .collect();
+            if !viewed_ids.is_empty() {
+                self.store.stamp_incoming_viewed(
+                    &account.id,
+                    &conversation.id,
+                    &viewed_ids,
+                    when,
+                )?;
+                for record in viewed_rows
+                    .iter()
+                    .filter(|record| record.viewed_at.is_none())
+                {
+                    // This row's read truth: the stamp this call's read face
+                    // just wrote (when the row was in it), else whatever the
+                    // row carried. Absent stays absent — the merge never
+                    // clears a stamp with a no-op (the 1.32
+                    // absent-means-no-op discipline).
+                    let read_at = if read_ids.iter().any(|id| id == &record.id) {
+                        Some(when)
+                    } else {
+                        record.read_at
+                    };
+                    events.push(HostSideEvent::MessageStatusChanged {
+                        account_id: record.account_id.clone(),
+                        message_id: record.id.clone(),
+                        status: record.status,
+                        delivered_at: record.delivered_at,
+                        read_at,
+                        viewed_at: Some(when),
+                    });
+                }
+            }
+            // The badge converges conversation-wide on any matched entry
+            // (the coarse-counter cost, recorded in §4.81): the account read
+            // this thread elsewhere, so the badge clears through the same
+            // primitive `messages.list` runs. The account total moves with
+            // it (the insert path precedent).
+            if self
+                .store
+                .clear_conversation_unread(&account.id, &conversation.id)?
+                > 0
+            {
+                if let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
+                }
+                if let Some(summary) = self.store.account_summary(&account.id)? {
+                    events.push(HostSideEvent::AccountChanged(summary));
+                }
+            }
+        }
+        Ok(events)
+    }
+
+    /// The conversation one sync read/viewed entry's sender resolves to
+    /// (contract 1.100, §4.81): the view-once open ladder plus the entry's
+    /// contacts-resolved number — the ACI itself, then the recorded
+    /// ACI→peer-key mappings (§4.37), then the number form when the engine's
+    /// contacts cache supplied one, then contacts digit-suffix matches (the
+    /// §4.29 mention resolution rule). Direct conversations only: a read
+    /// sync names a 1:1 message's author even when the entry rode a group
+    /// context.
+    fn sync_sender_conversation(
+        &mut self,
+        account: &AccountRow,
+        sender_uuid: &str,
+        sender_number: Option<&str>,
+    ) -> Result<Option<crate::store::ConversationRow>, ServiceError> {
+        let mut peer_keys: Vec<String> = Vec::new();
+        if let Some(number) = sender_number {
+            peer_keys.push(number.to_string());
+        }
+        peer_keys.push(sender_uuid.to_string());
+        peer_keys.extend(self.store.peer_keys_for_aci(&account.id, sender_uuid)?);
+        let digits = address_digits(sender_uuid);
+        if !digits.is_empty() {
+            for key in self.store.contact_peer_keys(&account.id)? {
+                let candidate = address_digits(&key);
+                if !candidate.is_empty() && candidate.ends_with(&digits) {
+                    peer_keys.push(key);
+                }
+            }
+        }
+        peer_keys.sort();
+        peer_keys.dedup();
+        Ok(peer_keys.into_iter().find_map(|peer_key| {
+            self.store
+                .conversation_by_peer(&account.id, "direct", &peer_key)
+                .ok()
+                .flatten()
+        }))
     }
 
     /// Contract 1.70 (§4.58 consume batch): consume one
@@ -18482,13 +18686,158 @@ mod tests {
         prepared
     }
 
-    /// Contract 1.34: `prepare_receipt` (markRead/markViewed shared body) —
-    /// a direct conversation fans one group out to its peer with ascending
-    /// deduplicated timestamps, explicit ids are filtered to incoming rows in
-    /// receipt order, group conversations answer zero groups (local sender
-    /// hashes cannot be resolved to an author), a 600-id list is truncated to
-    /// the 512 cap instead of rejected, and an empty conversation is the
-    /// trivial no-op.
+    /// Contract 1.100 (§4.81 D2 consume batch): the read/viewed sync stamps
+    /// the matching incoming rows (first stamp per face, a replay stays
+    /// silent), converges the conversation badge through the open path's
+    /// primitive, and stays silent when the sender or the timestamps name
+    /// nothing local.
+    #[test]
+    fn sync_read_state_stamps_rows_and_converges_the_badge() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        let seed = |id: &str, sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        seed("m1", 10);
+        seed("m2", 20);
+        let unread_before = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap()
+            .unread_count;
+        assert_eq!(unread_before, 2);
+
+        let entry = |uuid: &str, timestamp: u64| crate::engine::SyncReadEntry {
+            sender_uuid: uuid.into(),
+            sender_number: None,
+            timestamp,
+        };
+        let sync = |read: Vec<crate::engine::SyncReadEntry>,
+                    viewed: Vec<crate::engine::SyncReadEntry>| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncReadState { read, viewed },
+            );
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+
+        let events = service
+            .ingest_receive(
+                sync(vec![entry(ACI, 10), entry(ACI, 999)], vec![entry(ACI, 20)]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        // Two row events (read m1, viewed m2), then the badge pair; the
+        // timestamp naming no row stays silent.
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            HostSideEvent::MessageStatusChanged {
+                message_id, read_at: Some(_), viewed_at: None, ..
+            } if message_id == "m1"
+        ));
+        assert!(matches!(
+            &events[1],
+            HostSideEvent::MessageStatusChanged {
+                message_id, read_at: None, viewed_at: Some(_), ..
+            } if message_id == "m2"
+        ));
+        assert!(matches!(&events[2], HostSideEvent::ConversationChanged(_)));
+        assert!(matches!(&events[3], HostSideEvent::AccountChanged(_)));
+
+        let stored = |id: &str| {
+            service
+                .store_ref()
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+                .unwrap()
+        };
+        let m1 = stored("m1");
+        assert!(m1.read_at.is_some() && m1.viewed_at.is_none());
+        let m2 = stored("m2");
+        assert!(m2.read_at.is_none() && m2.viewed_at.is_some());
+        let summary = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.unread_count, 0, "the badge converges to read");
+
+        // The replayed sync: every stamp is first-stamp-wins, the badge is
+        // already zero — nothing moves, nothing emits.
+        let events = service
+            .ingest_receive(
+                sync(vec![entry(ACI, 10)], vec![entry(ACI, 20)]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "a replayed sync stays silent: {events:?}"
+        );
+
+        // A sender nothing resolves (no mapping, no conversation): silent.
+        let events = service
+            .ingest_receive(
+                sync(
+                    vec![entry("22222222-2222-2222-2222-222222222222", 10)],
+                    vec![],
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "an unknown sender stays silent: {events:?}"
+        );
+    }
+
     #[test]
     fn prepare_receipt_groups_direct_timestamps_and_skips_groups() {
         let (_temp, mut service) = service();
