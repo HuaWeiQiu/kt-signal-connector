@@ -29,18 +29,19 @@ use crate::service::{
     AccountsGetUsernameParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
     AccountsSetUsernameParams, AccountsUnlinkDeviceParams, AccountsUpdateConfigurationParams,
     BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
-    BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
-    BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
-    BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsCreateLinkAuthParams,
-    CallsEndorsementsPublicKeyParams, CallsGetStateParams, CallsGroupMembersParams,
-    CallsGroupProofParams, CallsLinkPresentationParams, CallsSendGroupCallUpdateParams,
-    CallsSendSignalParams, ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
-    ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
-    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsCreateParams,
-    GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportPlaintextParams,
+    BackupsExportStatusParams, BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams,
+    BackupsRestoreFromCloudParams, BackupsUploadStatusParams, BackupsUploadToCloudParams,
+    CallsCreateLinkAuthParams, CallsEndorsementsPublicKeyParams, CallsGetStateParams,
+    CallsGroupMembersParams, CallsGroupProofParams, CallsLinkPresentationParams,
+    CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFoldersListParams,
+    ChatFoldersSetRecordsParams, ContactsListParams, ContactsSetLocalAliasParams,
+    ContactsSyncParams, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsListParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    ConversationsSetStateParams, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
+    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsGetParams,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
     GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
@@ -1360,6 +1361,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid backups.export params", false),
             ),
         },
+        "backups.exportPlaintext" => {
+            match serde_json::from_value::<BackupsExportPlaintextParams>(request.params) {
+                Ok(params) => match runtime.export_plaintext(&params.account_id).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid backups.exportPlaintext params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "backups.exportStatus" => {
             match serde_json::from_value::<BackupsExportStatusParams>(request.params) {
                 Ok(params) => match runtime.export_backup_status(&params.account_id).await {

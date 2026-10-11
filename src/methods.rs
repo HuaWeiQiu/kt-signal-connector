@@ -299,6 +299,20 @@ pub const METHODS: &[MethodRow] = &[
     // mutex and delete barrier; the status poll and the media-three-chain
     // file face are bounded reads. Advertised through `backup-export`.
     ("backups.export", Lane::Send, true, "accounts"),
+    // Plaintext chat export (contract revision 1.132, §4.115): the S1
+    // 「明文不过引擎」 face — the connector projects its own store into a
+    // plaintext JSONL artifact engine-free (zero network requests; the
+    // build itself never calls the engine, and the start slot's only engine
+    // touch is the best-effort read-only exportStatus slot poll). The start
+    // face is account-mutating local state (the
+    // connector-local per-account task slot, shared with the encrypted
+    // export in the start direction), so it rides the send lane behind the
+    // reaction-class write-lane mutex and delete barrier — the
+    // backups.export class verbatim; the status poll and the file
+    // three-chain are the unchanged §4.46 reads. Advertised through the
+    // existing `backup-export` tag, widened in place (the 1.87 upload
+    // precedent — no new capability bit).
+    ("backups.exportPlaintext", Lane::Send, true, "accounts"),
     ("backups.exportStatus", Lane::Read, false, "read"),
     ("backups.exportFile.open", Lane::Read, false, "read"),
     ("backups.exportFile.readChunk", Lane::Read, false, "read"),
@@ -639,7 +653,10 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// place by revision 1.87 (the §4.72 cloud-backup upload faces
 /// `backups.uploadToCloud` / `backups.uploadStatus` — the upload's entire
 /// input is the backup-export artifact chain; the 1.82 call-signaling
-/// no-new-bit discipline);
+/// no-new-bit discipline) and by revision 1.132 (the §4.115 plaintext chat
+/// export face `backups.exportPlaintext` plus the `exportStatus` additive
+/// `kind` field and the `exportFile.open` third `file` value — the
+/// connector-local store projection; the same no-new-bit discipline);
 /// `avatar-fetch` / `blocked-write` (contract revision 1.48) mark the §4.47
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
@@ -890,6 +907,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "backups.exportPlaintext",
             "backups.importSnapshot",
             "backups.restoreFromCloud",
             "backups.uploadToCloud",
@@ -961,6 +979,7 @@ mod tests {
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
+            "backups.exportPlaintext",
             "backups.importSnapshot",
             "backups.restoreFromCloud",
             "backups.uploadToCloud",

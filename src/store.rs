@@ -225,6 +225,12 @@ CREATE INDEX IF NOT EXISTS messages_expire_due
 ";
 /// Retention: newest rows a conversation keeps regardless of age.
 const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
+/// §4.115 plaintext export: per-conversation reaction-row read fuse. The
+/// `message_events` table has no retention sweep, so the export read is
+/// bounded here — far above what a retention-bounded conversation (2,000
+/// messages) can legitimately accrete; a truncated tail counts as
+/// `skippedReactions` instead of failing the build.
+const MAX_PLAINTEXT_REACTION_ROWS_PER_CONVERSATION: u64 = 250_000;
 /// Retention: age past which a message is no longer kept.
 const MESSAGE_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
 /// Preview length ingest stores for a conversation's newest message.
@@ -1035,6 +1041,52 @@ pub struct BackupMessageRow {
     pub sticker_json: Option<String>,
 }
 
+/// Message row for the §4.115 plaintext export build: the §4.46 column set
+/// widened with the projection faces the plaintext line set carries — the
+/// quote pair (the snapshot verbatim plus the resolved target row id, the
+/// join key), the receipt stamps (`delivered_at`/`read_at`/`viewed_at`), and
+/// the edit marker. Raw JSON markers stay strings; the builder interprets
+/// them (a malformed arm counts its skip cause and the line rides on).
+pub struct PlaintextMessageRow {
+    pub id: String,
+    pub direction: &'static str,
+    pub sender_id: String,
+    pub sent_at: u64,
+    pub received_at: Option<u64>,
+    pub body: Option<String>,
+    pub body_truncated: bool,
+    pub status: &'static str,
+    pub admin_deleted: bool,
+    pub quote_message_id: Option<String>,
+    pub quote_snapshot: Option<String>,
+    pub attachments_json: Option<String>,
+    pub rich_json: Option<String>,
+    pub sticker_json: Option<String>,
+    pub edited_at: Option<u64>,
+    pub delivered_at: Option<u64>,
+    pub read_at: Option<u64>,
+    pub viewed_at: Option<u64>,
+}
+
+/// One `message_events` reaction row for the §4.115 plaintext projection:
+/// the emoji state, the target's upstream timestamp (the join key), the
+/// actor key (the sender-map spelling hash, or the account's own id for
+/// self), the removal flag (history stays auditable), and the event time.
+pub struct PlaintextReactionRow {
+    pub target_timestamp: u64,
+    pub emoji: String,
+    pub actor_id: String,
+    pub removed: bool,
+    pub updated_at: u64,
+}
+
+/// One conversation's reaction read: the rows plus the runaway-fuse
+/// truncation mark (§4.115).
+pub struct PlaintextReactionPage {
+    pub rows: Vec<PlaintextReactionRow>,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContactSummary {
@@ -1216,6 +1268,14 @@ impl Store {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The connector-owned state directory the store file lives in — the
+    /// root the §4.115 plaintext export artifacts sit under
+    /// (`plaintext-exports/<accountId>/`). Derived from the store path (the
+    /// single source of truth), so the two can never drift.
+    pub fn state_dir(&self) -> &Path {
+        self.path.parent().unwrap_or(&self.path)
     }
 
     /// The store is one `Arc` shared by every proxy-group runtime, so all
@@ -3409,6 +3469,121 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(rows)
+    }
+
+    /// All message rows of one conversation for the §4.115 plaintext export,
+    /// oldest first — the same emission order and retention bound as
+    /// [`backup_message_rows`], over the widened column set
+    /// ([`PlaintextMessageRow`]).
+    pub fn plaintext_message_rows(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<PlaintextMessageRow>, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, direction, sender_id, sent_at, received_at, body, body_truncated,
+                        status, admin_deleted, quote_message_id, quote_snapshot, attachments_json,
+                        rich_json, sticker_json, edited_at, delivered_at, read_at, viewed_at
+                 FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2
+                 ORDER BY sent_at ASC, id ASC",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let rows = stmt
+            .query_map(params![account_id, conversation_id], |row| {
+                Ok(PlaintextMessageRow {
+                    id: row.get(0)?,
+                    direction: static_direction(row.get::<_, String>(1)?),
+                    sender_id: row.get(2)?,
+                    sent_at: row.get::<_, i64>(3)?.max(0) as u64,
+                    received_at: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+                    body: row.get(5)?,
+                    body_truncated: row.get::<_, i64>(6)? != 0,
+                    status: static_status(row.get::<_, String>(7)?),
+                    admin_deleted: row.get::<_, i64>(8)? != 0,
+                    quote_message_id: row.get(9)?,
+                    quote_snapshot: row.get(10)?,
+                    attachments_json: row.get(11)?,
+                    rich_json: row.get(12)?,
+                    sticker_json: row.get(13)?,
+                    edited_at: row.get::<_, Option<i64>>(14)?.map(|v| v.max(0) as u64),
+                    delivered_at: row.get::<_, Option<i64>>(15)?.map(|v| v.max(0) as u64),
+                    read_at: row.get::<_, Option<i64>>(16)?.map(|v| v.max(0) as u64),
+                    viewed_at: row.get::<_, Option<i64>>(17)?.map(|v| v.max(0) as u64),
+                })
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(rows)
+    }
+
+    /// The reaction rows of one conversation for the §4.115 plaintext
+    /// projection, target-then-event-time order. Unlike `messages` rows the
+    /// `message_events` table has no retention sweep, so the read carries its
+    /// own runaway fuse (`MAX_PLAINTEXT_REACTION_ROWS_PER_CONVERSATION`) —
+    /// far above anything a retained conversation can legitimately accrete.
+    /// The page reports `truncated` when the fuse cut the tail; the builder
+    /// counts the cut rows as `skippedReactions` instead of failing the
+    /// build.
+    pub fn plaintext_reaction_rows(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<PlaintextReactionPage, StoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT target_timestamp, emoji, actor_id, removed, updated_at
+                 FROM message_events
+                 WHERE account_id=?1 AND conversation_id=?2 AND kind='reaction'
+                 ORDER BY target_timestamp ASC, updated_at ASC, id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut rows = stmt
+            .query_map(
+                params![
+                    account_id,
+                    conversation_id,
+                    (MAX_PLAINTEXT_REACTION_ROWS_PER_CONVERSATION + 1) as i64
+                ],
+                |row| {
+                    Ok(PlaintextReactionRow {
+                        target_timestamp: row.get::<_, i64>(0)?.max(0) as u64,
+                        emoji: row.get(1)?,
+                        actor_id: row.get(2)?,
+                        removed: row.get::<_, i64>(3)? != 0,
+                        updated_at: row.get::<_, i64>(4)?.max(0) as u64,
+                    })
+                },
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let truncated = rows.len() as u64 > MAX_PLAINTEXT_REACTION_ROWS_PER_CONVERSATION;
+        rows.truncate(MAX_PLAINTEXT_REACTION_ROWS_PER_CONVERSATION as usize);
+        Ok(PlaintextReactionPage { rows, truncated })
+    }
+
+    /// The conversation's total reaction count — the overflow measurement
+    /// when [`plaintext_reaction_rows`] returns exactly the fuse length.
+    pub fn count_conversation_reactions(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<u64, StoreError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_events
+             WHERE account_id=?1 AND conversation_id=?2 AND kind='reaction'",
+            params![account_id, conversation_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as u64)
+        .map_err(|error| StoreError::Unavailable(Some(error)))
     }
 
     // -------------------------------------------------------------------------

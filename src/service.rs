@@ -10957,6 +10957,16 @@ pub struct BackupsExportParams {
     pub account_id: String,
 }
 
+/// backups.exportPlaintext (contract revision 1.132, §4.115): the
+/// account-addressed start face of the plaintext chat export. The only
+/// parameter is the account — the whole build is a connector-local store
+/// projection, so there is nothing else to address.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupsExportPlaintextParams {
+    pub account_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupsExportStatusParams {

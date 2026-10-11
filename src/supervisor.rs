@@ -207,6 +207,12 @@ pub struct RuntimeSupervisor {
     /// build; published after `build_artifact` writes the artifact, merged
     /// into `backups.exportStatus` answers. Content-free numbers only.
     backup_counters: StdMutex<HashMap<String, crate::backup_export::SkipCounters>>,
+    /// Per-account plaintext export task slots (contract revision 1.132,
+    /// §4.115): connector-local and in-memory like the engine's own task
+    /// registry — a restart reads idle while the on-disk artifacts stay
+    /// listed. Shared with the spawned build tasks, which outlive any borrow
+    /// of `self`.
+    plaintext_tasks: Arc<crate::backup_export::PlaintextTaskRegistry>,
 }
 
 impl RuntimeSupervisor {
@@ -298,6 +304,7 @@ impl RuntimeSupervisor {
             last_title_enrich_ms: AtomicU64::new(0),
             backup_handles,
             backup_counters: StdMutex::new(HashMap::new()),
+            plaintext_tasks: Arc::new(crate::backup_export::PlaintextTaskRegistry::new()),
         }
     }
 
@@ -1718,6 +1725,14 @@ impl RuntimeSupervisor {
                         if let Some(handles) = self.backup_handles.as_ref() {
                             handles.clear_account(&account_id);
                         }
+                        // §4.115: the plaintext task record and its artifact
+                        // directory die with the account session too — an
+                        // export product never outlives it.
+                        self.plaintext_tasks.clear(&account_id);
+                        crate::backup_export::clear_plaintext_artifacts(
+                            self.store.state_dir(),
+                            &account_id,
+                        );
                         return Ok(json!({}));
                     }
                     AccountDeletePlan::Dispatch {
@@ -1746,6 +1761,8 @@ impl RuntimeSupervisor {
             if let Some(handles) = self.backup_handles.as_ref() {
                 handles.clear_account(&account_id);
             }
+            self.plaintext_tasks.clear(&account_id);
+            crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), &account_id);
             return Ok(json!({}));
         }
         match engine
@@ -1788,6 +1805,10 @@ impl RuntimeSupervisor {
         if let Some(handles) = self.backup_handles.as_ref() {
             handles.clear_account(&account_id);
         }
+        // §4.115: the plaintext task record and its artifact directory die
+        // with the account session too — an export product never outlives it.
+        self.plaintext_tasks.clear(&account_id);
+        crate::backup_export::clear_plaintext_artifacts(self.store.state_dir(), &account_id);
         Ok(json!({}))
     }
 
@@ -5125,12 +5146,96 @@ impl RuntimeSupervisor {
         }
     }
 
+    /// backups.exportPlaintext (contract revision 1.132, §4.115): build the
+    /// plaintext JSONL artifact connector-locally — engine-free (red line 1:
+    /// no network request, no engine call; the artifact is a pure store
+    /// projection). The start gates share one task slot per account across
+    /// the family: a plaintext build already running answers
+    /// BACKUP_PLAINTEXT_ALREADY_RUNNING, and an engine export whose status
+    /// reads running answers BACKUP_EXPORT_ALREADY_RUNNING — both
+    /// retryable=false (poll, never retry). The build runs on the blocking
+    /// pool behind a spawned settle-watch; the face answers `started`
+    /// immediately and the desktop polls `backups.exportStatus`, where the
+    /// additive `kind` field discriminates the family.
+    pub async fn export_plaintext(
+        self: &Arc<Self>,
+        account_id: &str,
+    ) -> Result<Value, ServiceError> {
+        self.backup_handles()?;
+        let signal_account = {
+            let service = self.service.lock().await;
+            service.prepare_backups_account(account_id)?
+        };
+        // Forward gate against the engine's encrypted export: a read-only
+        // poll. An engine that is down, or an indeterminate read, proves no
+        // running task — the task registry is engine-process memory (§10.4)
+        // — so the build proceeds; only a definite `running` blocks.
+        if let Ok(engine) = self.running_engine().await
+            && let Ok(status) = engine
+                .call(
+                    "backup.exportStatus",
+                    json!({ "account": signal_account }),
+                    CallClass::ReadOnly,
+                )
+                .await
+            && status.get("state").and_then(Value::as_str) == Some("running")
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "BACKUP_EXPORT_ALREADY_RUNNING",
+                "an encrypted backup export is already running for this account; poll backups.exportStatus",
+                false,
+            )));
+        }
+        let started_at_ms = crate::link::now_ms();
+        if !self.plaintext_tasks.begin(account_id, started_at_ms) {
+            return Err(ServiceError::Api(ApiError::new(
+                "BACKUP_PLAINTEXT_ALREADY_RUNNING",
+                "a plaintext export is already running for this account; poll backups.exportStatus",
+                false,
+            )));
+        }
+        let store = Arc::clone(&self.store);
+        let account = account_id.to_string();
+        let build = tokio::task::spawn_blocking(move || {
+            crate::backup_export::build_plaintext_artifact(&store, &account, &signal_account)
+        });
+        let tasks = Arc::clone(&self.plaintext_tasks);
+        let account = account_id.to_string();
+        tokio::spawn(async move {
+            match build.await {
+                Ok(Ok(outcome)) => {
+                    tasks.complete(&account, crate::link::now_ms(), &outcome);
+                }
+                Ok(Err(error)) => {
+                    let class = crate::backup_export::plaintext_error_class(&error);
+                    tracing::warn!(error_class = class, "plaintext export build failed");
+                    tasks.fail(&account, crate::link::now_ms(), class);
+                }
+                // JoinError: the blocking build panicked — settle the slot so
+                // it never sticks `running` (the class is content-free).
+                Err(_) => {
+                    tasks.fail(
+                        &account,
+                        crate::link::now_ms(),
+                        crate::backup_export::PLAINTEXT_PANIC_ERROR_CLASS,
+                    );
+                }
+            }
+        });
+        Ok(json!({ "status": "started" }))
+    }
+
     /// backups.exportStatus: poll the engine read-only and project the
     /// answer — the upstream `account` echo is stripped (the raw number never
     /// crosses the host boundary, §4.46), `accountId` rides in its place,
     /// and the connector's own skip counters merge in after a successful
-    /// build. Read-only, so an unknown outcome degrades honestly to the same
-    /// shape as an idle engine rather than inventing a state.
+    /// build. Since revision 1.132 (§4.115) the answer carries the additive
+    /// `kind` field naming which product family owns the latest task:
+    /// `plaintext_jsonl` when the connector-local plaintext task is the
+    /// latest started (startedAtMs wins the comparison), `backup` when the
+    /// engine's encrypted task does, absent when no task has ever run
+    /// (honest absence). Read-only, so an unknown outcome degrades honestly
+    /// to the same shape as an idle engine rather than inventing a state.
     pub async fn export_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
         self.backup_handles()?;
         let signal_account = {
@@ -5152,29 +5257,60 @@ impl RuntimeSupervisor {
             // poll. Read-only, so this is honest, not a guess.
             Err(_) => None,
         };
+        let plaintext_task = self.plaintext_tasks.latest(account_id);
         match upstream {
             Some(Ok(result)) => {
+                let engine_started_ms = result
+                    .get("startedAtMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(task) =
+                    plaintext_task.filter(|task| task.started_at_ms >= engine_started_ms)
+                {
+                    let data_dir = self.config.data_dir.clone();
+                    let account = account_id.to_string();
+                    return blocking_service(move || {
+                        Ok(plaintext_status_projection(
+                            &data_dir,
+                            &account,
+                            &signal_account,
+                            task,
+                        ))
+                    })
+                    .await;
+                }
                 let counters = self
                     .backup_counters
                     .lock()
                     .expect("backup counters mutex")
                     .get(account_id)
                     .copied();
-                Ok(export_status_projection(
-                    account_id,
-                    &signal_account,
-                    result,
-                    counters,
-                ))
+                let mut projected =
+                    export_status_projection(account_id, &signal_account, result, counters);
+                // The engine's task owns the latest run: name the family
+                // unless the engine has never run one (idle = honest
+                // absence, §4.115).
+                if projected.get("state").and_then(Value::as_str) != Some("idle") {
+                    projected["kind"] = json!("backup");
+                }
+                Ok(projected)
             }
             // Read-only, so an indeterminate outcome degrades to the same
             // disk-truth projection as an engine that is down (§4.46: never
-            // invent a task state).
+            // invent a task state). A live plaintext task record is the only
+            // task memory left on this path and wins the projection.
             Some(Err(EngineError::UnknownOutcome)) | None => {
                 let data_dir = self.config.data_dir.clone();
                 let account = account_id.to_string();
                 blocking_service(move || {
-                    export_status_idle_projection(&data_dir, &account, &signal_account)
+                    Ok(match plaintext_task {
+                        Some(task) => {
+                            plaintext_status_projection(&data_dir, &account, &signal_account, task)
+                        }
+                        None => {
+                            export_status_idle_projection(&data_dir, &account, &signal_account)?
+                        }
+                    })
                 })
                 .await
             }
@@ -5183,10 +5319,12 @@ impl RuntimeSupervisor {
     }
 
     /// backups.exportFile.open: mint a chunk-stream handle for one fixed file
-    /// (`metadata`/`main`) of the latest snapshot. Pure local resolution —
-    /// the engine is not consulted; the snapshot directory is the addressable
-    /// unit, its name is the newest one on disk (the same rule the engine's
-    /// exportStatus list applies).
+    /// of the latest export artifact. Pure local resolution — the engine is
+    /// not consulted. `metadata`/`main` address the newest encrypted snapshot
+    /// directory (its name is the newest one on disk, the same rule the
+    /// engine's exportStatus list applies); `plaintext_jsonl` (revision
+    /// 1.132, §4.115) addresses the newest plaintext artifact in the
+    /// connector's state dir.
     pub async fn export_file_open(
         &self,
         account_id: &str,
@@ -5202,14 +5340,33 @@ impl RuntimeSupervisor {
         let account = account_id.to_string();
         let file = file.to_string();
         blocking_service(move || {
-            let snapshot = export_latest_snapshot(&store, &data_dir, &account, &signal_account)?;
+            // The enum gate runs before any filesystem touch; each arm then
+            // resolves its own family's latest artifact lazily — a plaintext
+            // export never requires an encrypted snapshot to exist, and vice
+            // versa.
             let path = match file.as_str() {
-                "metadata" => snapshot.join("metadata"),
-                "main" => snapshot.join("main"),
+                "metadata" | "main" => {
+                    let snapshot =
+                        export_latest_snapshot(&store, &data_dir, &account, &signal_account)?;
+                    snapshot.join(file.as_str())
+                }
+                // §4.115 (revision 1.132): the additive third enum value
+                // addresses the newest plaintext artifact in the connector's
+                // state dir — the three-chain mechanics are untouched.
+                "plaintext_jsonl" => crate::backup_export::latest_plaintext_artifact(
+                    &crate::backup_export::plaintext_export_root(store.state_dir(), &account),
+                )
+                .ok_or_else(|| {
+                    ServiceError::Api(ApiError::new(
+                        "BACKUP_SNAPSHOT_MISSING",
+                        "the account has no plaintext export artifact yet",
+                        false,
+                    ))
+                })?,
                 _ => {
                     return Err(ServiceError::Api(ApiError::new(
                         "INVALID_REQUEST",
-                        "file must be \"metadata\" or \"main\"",
+                        "file must be \"metadata\", \"main\", or \"plaintext_jsonl\"",
                         false,
                     )));
                 }
@@ -7046,6 +7203,60 @@ fn export_status_idle_projection(
         });
     }
     Ok(result)
+}
+
+/// The §4.115 plaintext arm of `backups.exportStatus`: the connector-local
+/// task registry's own state — content-free numbers and error classes only
+/// (red line 3) — with `artifactPresent: false` (no engine artifact exists on
+/// this path) and the encrypted family's on-disk snapshot listing kept
+/// verbatim (the disk truth is symmetric across the families). Pure disk
+/// reads; the caller runs it on the blocking pool.
+fn plaintext_status_projection(
+    data_dir: &Path,
+    account_id: &str,
+    signal_account: &str,
+    task: crate::backup_export::PlaintextTaskSnapshot,
+) -> Value {
+    let account_dir = crate::history_import::engine_account_dir(data_dir, signal_account);
+    let snapshots = account_dir
+        .as_ref()
+        .map(|dir| crate::backup_export::list_snapshots(dir))
+        .unwrap_or_default();
+    let snapshots = snapshots
+        .iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "mainBytes": entry.main_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "accountId": account_id,
+        "state": task.state.as_str(),
+        "kind": "plaintext_jsonl",
+        "artifactPresent": false,
+        "startedAtMs": task.started_at_ms,
+        "snapshots": snapshots,
+    });
+    // Honest absence for the optional keys — settled faces only when the
+    // referent exists, never zero-filled.
+    if let Some(finished_at_ms) = task.finished_at_ms {
+        result["finishedAtMs"] = json!(finished_at_ms);
+    }
+    if let Some(lines) = task.lines {
+        result["lines"] = json!(lines);
+    }
+    if let Some(bytes) = task.bytes {
+        result["bytes"] = json!(bytes);
+    }
+    if let Some(error) = task.error {
+        result["error"] = json!(error);
+    }
+    if let Some(counters) = task.counters {
+        counters.merge_into(&mut result);
+    }
+    result
 }
 
 /// The engine-answering `backups.exportStatus` projection (§4.46): the engine
@@ -10127,6 +10338,88 @@ mod tests {
                 error.is_connect(),
                 "the refusal must be the proxy hop, got: {error}"
             );
+        }
+    }
+
+    /// §4.115 (contract revision 1.132): the plaintext arm of
+    /// `backups.exportStatus` — the connector-local registry's own state,
+    /// content-free numbers and classes only, honest absence for the
+    /// optional keys, `artifactPresent: false` (no engine artifact exists on
+    /// this path), and the encrypted family's snapshot listing kept beside
+    /// it. Red line 3: no content ever rides this projection.
+    #[test]
+    fn plaintext_status_projection_reports_the_registry_state_content_free() {
+        use crate::backup_export::{PlaintextTaskSnapshot, PlaintextTaskState};
+
+        let temp = TempDir::new().unwrap();
+        let task = PlaintextTaskSnapshot {
+            state: PlaintextTaskState::Completed,
+            started_at_ms: 1_000,
+            finished_at_ms: Some(2_000),
+            lines: Some(12),
+            bytes: Some(1_234),
+            error: None,
+            counters: Some(crate::backup_export::SkipCounters {
+                skipped_reactions: 3,
+                ..Default::default()
+            }),
+        };
+        let projected =
+            super::plaintext_status_projection(temp.path(), "acct-1", "+15555550099", task);
+        assert_eq!(projected["accountId"], "acct-1");
+        assert_eq!(projected["state"], "completed");
+        assert_eq!(projected["kind"], "plaintext_jsonl");
+        assert_eq!(projected["artifactPresent"], false);
+        assert_eq!(projected["startedAtMs"], 1_000);
+        assert_eq!(projected["finishedAtMs"], 2_000);
+        assert_eq!(projected["lines"], 12);
+        assert_eq!(projected["bytes"], 1_234);
+        assert_eq!(projected["skippedReactions"], 3);
+        assert!(
+            projected.get("error").is_none(),
+            "a completed task carries no error class"
+        );
+        assert!(
+            projected.get("snapshot").is_none(),
+            "no engine snapshot exists on this path"
+        );
+        assert!(
+            projected.get("frames").is_none(),
+            "frame counts are the encrypted family's face, never invented"
+        );
+
+        // A failed task: the content-free class rides, the counters do not.
+        let failed = PlaintextTaskSnapshot {
+            state: PlaintextTaskState::Failed,
+            started_at_ms: 5_000,
+            finished_at_ms: Some(6_000),
+            lines: None,
+            bytes: None,
+            error: Some("store-read"),
+            counters: None,
+        };
+        let projected =
+            super::plaintext_status_projection(temp.path(), "acct-1", "+15555550099", failed);
+        assert_eq!(projected["state"], "failed");
+        assert_eq!(projected["error"], "store-read");
+        assert!(projected.get("lines").is_none(), "honest absence");
+        assert!(projected.get("finishedAtMs").is_some());
+
+        // A running task: no finished stamp, no counts.
+        let running = PlaintextTaskSnapshot {
+            state: PlaintextTaskState::Running,
+            started_at_ms: 9_000,
+            finished_at_ms: None,
+            lines: None,
+            bytes: None,
+            error: None,
+            counters: None,
+        };
+        let projected =
+            super::plaintext_status_projection(temp.path(), "acct-1", "+15555550099", running);
+        assert_eq!(projected["state"], "running");
+        for key in ["finishedAtMs", "lines", "bytes", "error"] {
+            assert!(projected.get(key).is_none(), "{key} stays absent");
         }
     }
 }

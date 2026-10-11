@@ -134,6 +134,7 @@
             "history.attachmentDownload",
             "attachments.download",
             "backups.export",
+            "backups.exportPlaintext",
             "backups.exportStatus",
             "backups.exportFile.open",
             "backups.exportFile.readChunk",
@@ -1211,6 +1212,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/backupsExportParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "backups.exportPlaintext" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/backupsExportPlaintextParams" }
             }
           }
         },
@@ -3812,11 +3824,20 @@
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
     },
+    "backupsExportPlaintextParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Start the connector-local plaintext chat export for the account (contract revision 1.132, §4.115, capability backup-export — no new capability bit): the S1 plaintext-export face (方案 A「明文不过引擎」). The connector projects its own SQLite store into a plaintext JSONL artifact (UTF-8, one JSON object per line: account / contact / group / chat / message projections — text, conversation, timestamps, direction, reactions, receipt stamps, quotes (author + bounded preview + quoted-attachment metadata, quote_message_id joinable), sticker metadata, attachment metadata placeholder entries; attachment BYTES are a phase-two switch and never ship in v1). The engine takes zero part in the data path: no network request, no new upstream face — the artifact lands under the connector's own state directory (plaintext-exports/<accountId>/), never the engine data tree; the one engine touch on the whole face is the start slot's best-effort read-only backup.exportStatus poll (the shared-slot gate below — a content-free control-plane read, carrying no export byte), and the build itself never calls the engine. The build runs on the blocking pool behind a connector-local per-account task slot shared with the encrypted export: a second start while a plaintext build runs answers BACKUP_PLAINTEXT_ALREADY_RUNNING (retryable=false — poll backups.exportStatus instead of retrying), and a start while the engine's encrypted export task runs answers BACKUP_EXPORT_ALREADY_RUNNING (same poll-not-retry semantics). Result {status: 'started'} on a definite acceptance; the terminal state is observed through backups.exportStatus (the additive optional kind field reads 'plaintext_jsonl' when the latest task is a plaintext one; absent on old task snapshots — honest absence, never inferred). The product is read back through the unchanged backups.exportFile three-chain with file='plaintext_jsonl'. Caps reuse the §4.46 artifact fuses verbatim: per-line 1048576 bytes, 4000000 lines, 2147483648 bytes total, message body 131072 bytes. Logging discipline: message bodies, quote previews, file names and captions never enter logs or error messages — counters and error classes only (red line 3). A failed build removes the partial artifact (tmp-name write plus atomic rename — red line 4); account deletion removes the account's plaintext artifacts with the rest of its local data.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
     "backupsExportStatusParams": {
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId"],
-      "description": "Poll the engine's Android local-backup export task (contract revision 1.47, §4.46, capability backup-export): result mirrors the engine honestly — {state: idle|running|completed|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]} with absent keys omitted rather than zero-filled; snapshots lists at most 32 entries newest-first and the engine only reports, never deletes (cleanup ownership is the connector's: keep the latest snapshot, clear older ones and -tmp residue before the next export). Desktops poll while running; deliberately no push event (§4.38 precedent). The task registry is engine-process memory: an engine restart reads idle while on-disk snapshots stay listed. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
+      "description": "Poll the account's export task state (contract revision 1.47, §4.46, capability backup-export; widened in place by revision 1.132, §4.115 — the additive optional `kind` field): result mirrors the engine honestly for the encrypted export — {state: idle|running|completed|failed, artifactPresent, startedAtMs?, finishedAtMs?, lines?, frames?, snapshot?: {name, mainBytes, frames?}, error?, snapshots: [{name, mainBytes, frames?}]} with absent keys omitted rather than zero-filled; snapshots lists at most 32 entries newest-first and the engine only reports, never deletes (cleanup ownership is the connector's: keep the latest snapshot, clear older ones and -tmp residue before the next export). Since 1.132 the answer carries the optional kind field naming which product family the latest task produced: 'backup' (the engine's Android local-backup export) or 'plaintext_jsonl' (the §4.115 connector-local plaintext JSONL export — its state, startedAtMs/finishedAtMs, lines, artifact byte count and error class come from the connector's own task registry, engine-free); kind stays absent when no task has ever run (old readers ignore the key — honest absence, never inferred). Desktops poll while running; deliberately no push event (§4.38 precedent). The encrypted task registry is engine-process memory: an engine restart reads idle while on-disk snapshots stay listed. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
@@ -3825,12 +3846,12 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "file"],
-      "description": "Open a chunked stream for one file of the latest local-backup snapshot (contract revision 1.47, §4.46, capability backup-export): the media three-chain shape (messages.attachments.open, ADR 0002) reused verbatim — response {fileHandle, sizeBytes, chunkBytes} with chunkBytes 262144, handle TTL 300 s, at most 8 live handles per account, released early by backups.exportFile.closeHandle. file is a two-value enum: only the latest snapshot's fixed file names are addressable — there is no path parameter and the connector never exposes arbitrary paths; 'latest snapshot' is the newest signal-backup-<UTC ts> directory in the account's SignalBackups/ root as reported by backups.exportStatus.snapshots. No snapshot exists yet answers BACKUP_SNAPSHOT_MISSING. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
+      "description": "Open a chunked stream for one export product file (contract revision 1.47, §4.46, capability backup-export; widened in place by revision 1.132, §4.115 — the file enum's additive third value): the media three-chain shape (messages.attachments.open, ADR 0002) reused verbatim — response {fileHandle, sizeBytes, chunkBytes} with chunkBytes 262144, handle TTL 300 s, at most 8 live handles per account, released early by backups.exportFile.closeHandle. file is a three-value enum and no path parameter exists anywhere — the connector never exposes arbitrary paths: 'metadata'/'main' address the two fixed files of the latest encrypted snapshot (the newest signal-backup-<UTC ts> directory in the account's SignalBackups/ root as reported by backups.exportStatus.snapshots), and 'plaintext_jsonl' addresses the latest plaintext export artifact (the newest plaintext-export-<UTC ts>.jsonl under the connector's own plaintext-exports/<accountId>/ directory — the §4.115 product, resolved from disk exactly like the snapshot faces). No addressable product of the requested kind answers BACKUP_SNAPSHOT_MISSING. Wire-frame registration landed with the connector implementation batch (implemented 2026-10-06, §4.46 plan); see backupsExportParams.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "file": {
-          "enum": ["metadata", "main"],
-          "description": "The fixed snapshot file name; no path component is accepted."
+          "enum": ["metadata", "main", "plaintext_jsonl"],
+          "description": "The fixed product file name; no path component is accepted. 'plaintext_jsonl' (contract revision 1.132, §4.115) addresses the latest plaintext JSONL export artifact."
         }
       }
     },
@@ -4952,6 +4973,7 @@
             "STORAGE_WRITE_FAILED",
             "STORAGE_READ_FAILED",
             "BACKUP_EXPORT_ALREADY_RUNNING",
+            "BACKUP_PLAINTEXT_ALREADY_RUNNING",
             "BACKUP_ARTIFACT_MISSING",
             "BACKUP_ARTIFACT_INVALID",
             "BACKUP_SNAPSHOT_EXISTS",

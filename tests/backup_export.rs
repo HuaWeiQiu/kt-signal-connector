@@ -819,3 +819,146 @@ async fn export_counts_skips_per_cause() {
     assert_eq!(items[0]["body"], "has a quote");
     assert_eq!(items[1]["body"], "kept");
 }
+
+/// §4.115 (contract revision 1.132): the plaintext export end to end — the
+/// start face accepts, the additive `kind` field discriminates the family on
+/// the unchanged status poll, the product streams home through the unchanged
+/// file three-chain, and the JSONL parses into the §4.115 line set with the
+/// admitted faces (quote join keys, reaction authors, receipt stamps). Red
+/// line 1 is structural: no engine call happens on the build path — the
+/// fixture only ever sees the §4.46 status probe.
+#[tokio::test]
+async fn plaintext_export_starts_polls_and_streams_the_jsonl() {
+    fn decode_chunk(encoded: &str) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut buffer = 0_u32;
+        let mut bits = 0_u32;
+        for byte in encoded.bytes() {
+            if byte == b'=' {
+                break;
+            }
+            let value = ALPHABET
+                .iter()
+                .position(|c| *c == byte)
+                .expect("standard alphabet") as u32;
+            buffer = (buffer << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buffer >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    async fn wait_for_plaintext_done(supervisor: &RuntimeSupervisor, account_id: &str) -> Value {
+        for _ in 0..80 {
+            let status = supervisor.export_backup_status(account_id).await.unwrap();
+            if status["kind"] == "plaintext_jsonl" && status["state"] == "completed" {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "exportStatus never settled on a completed plaintext task: {:?}",
+            supervisor.export_backup_status(account_id).await
+        );
+    }
+
+    let temp = TempDir::new().unwrap();
+    let data_dir = temp.path().join("signal-data");
+    let (store, supervisor, account_id) = backup_supervisor(&temp, &data_dir);
+    let conversation_id = seed_direct_history(&store, &account_id);
+    supervisor.start().await.unwrap();
+
+    // Nothing built yet: the third enum value answers the no-product code,
+    // same family error as an empty snapshot face.
+    let missing = supervisor
+        .export_file_open(&account_id, "plaintext_jsonl")
+        .await
+        .err()
+        .unwrap()
+        .into_api();
+    assert_eq!(missing.code, "BACKUP_SNAPSHOT_MISSING");
+
+    let started = supervisor.export_plaintext(&account_id).await.unwrap();
+    assert_eq!(started["status"], "started");
+
+    let done = wait_for_plaintext_done(&supervisor, &account_id).await;
+    assert_eq!(done["artifactPresent"], false);
+    assert_eq!(done["accountId"], account_id);
+    let status_lines = done["lines"].as_u64().unwrap();
+    assert_eq!(done["skippedRows"], 0);
+
+    // The product streams home through the unchanged three-chain.
+    let open = supervisor
+        .export_file_open(&account_id, "plaintext_jsonl")
+        .await
+        .unwrap();
+    assert_eq!(open["chunkBytes"], 262_144);
+    assert_eq!(open["sizeBytes"], done["bytes"]);
+    let file_handle = open["fileHandle"].as_str().unwrap().to_string();
+    let mut offset = 0_u64;
+    let mut raw = Vec::new();
+    loop {
+        let chunk = supervisor
+            .export_file_read_chunk(&file_handle, offset)
+            .await
+            .unwrap();
+        offset += chunk["sizeBytes"].as_u64().unwrap();
+        raw.extend_from_slice(&decode_chunk(chunk["dataBase64"].as_str().unwrap()));
+        if chunk["eof"].as_bool().unwrap() {
+            break;
+        }
+    }
+    assert_eq!(offset, done["bytes"].as_u64().unwrap());
+    supervisor
+        .export_file_close_handle(&file_handle)
+        .await
+        .unwrap();
+
+    let content = String::from_utf8(raw).unwrap();
+    let lines: Vec<Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len() as u64, status_lines, "the status count matches");
+    assert_eq!(lines[0]["type"], "account");
+    assert_eq!(lines[0]["account"], SIGNAL_ACCOUNT);
+    assert!(
+        lines[0].get("givenName").is_none(),
+        "honest absence: this fixture sets no display name"
+    );
+
+    let message_lines: Vec<&Value> = lines.iter().filter(|l| l["type"] == "message").collect();
+    assert_eq!(message_lines.len(), 2, "the seeded exchange, nothing else");
+    let incoming = message_lines
+        .iter()
+        .find(|l| l["direction"] == "incoming")
+        .unwrap();
+    assert_eq!(incoming["body"], "hello from alice");
+    assert_eq!(incoming["status"], "read");
+    assert_eq!(incoming["sentAt"], 1_000);
+    let outgoing = message_lines
+        .iter()
+        .find(|l| l["direction"] == "outgoing")
+        .unwrap();
+    assert_eq!(outgoing["author"], 0);
+    assert_eq!(outgoing["body"], "hello back");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["type"] == "chat" && l["kind"] == "direct")
+    );
+
+    // The store's conversation id is untouched by the export — zero local
+    // writes on this face (red line 1: a pure projection).
+    assert!(
+        store
+            .conversation_summary(&account_id, &conversation_id)
+            .unwrap()
+            .is_some()
+    );
+}

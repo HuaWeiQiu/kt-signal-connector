@@ -1526,6 +1526,15 @@ impl ProxyGroupRuntime {
         slot.supervisor.export_local_backup(account_id).await
     }
 
+    /// backups.exportPlaintext (contract revision 1.132, §4.115, capability
+    /// backup-export — no new bit): account-addressed, routed to the owning
+    /// group's supervisor like every account-scoped face; the build itself is
+    /// connector-local and engine-free.
+    pub async fn export_plaintext(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(account_id).await?;
+        slot.supervisor.export_plaintext(account_id).await
+    }
+
     pub async fn export_backup_status(&self, account_id: &str) -> Result<Value, ServiceError> {
         let slot = self.slot_for_account(account_id).await?;
         slot.supervisor.export_backup_status(account_id).await

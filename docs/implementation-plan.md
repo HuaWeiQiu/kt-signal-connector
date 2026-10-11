@@ -9072,6 +9072,134 @@ drop behavior, which is safe (nothing is lost that the desktop waits
 for — queue-drain and skew are advisory; profile-key and
 group-termination refreshes ride the next full pull).
 
+### 4.115 The plaintext chat export reaches the host: `backups.exportPlaintext` (contract revision 1.132, 2026-10-12)
+
+The S1 plaintext-export batch (方案 A「明文不过引擎」, desktop施工
+图 `signal-plaintext-export-plan.md`): the official desktop has no
+plaintext export at all (Preferences → Chats carries the entry with no
+data face — greenfield parity), and the §4.46 encrypted export covers
+restore, not data portability. This face projects the connector's own
+SQLite store into a plaintext JSONL artifact the desktop streams home
+through the unchanged §4.46 file three-chain. **The engine takes zero
+part in the data path** (red line 1): no network request, no new
+upstream face — the engine process neither sees nor serves a single
+byte of the export, and the artifact never lands in the engine's data
+tree (it lives under the connector's own state directory,
+`plaintext-exports/<accountId>/`). The one engine touch on the whole
+face is the start slot's best-effort read-only `backup.exportStatus`
+poll (below) — a control-plane registry read, content-free, carrying
+no export byte in either direction; the build itself never calls the
+engine. `backups.export`'s Android backup
+semantics are unchanged — not one gate, code path, or artifact of the
+§4.46 machine moves.
+
+**The face.** `backups.exportPlaintext {accountId}` →
+`{status: "started"}`; send lane, account-scoped mutating (the
+`backups.export` class verbatim: write-lane mutex and delete barrier),
+metrics `accounts`, capability `backup-export` widened in place (the
+1.87 upload precedent — no new bit). The build runs connector-side on
+the blocking pool behind a connector-local per-account task registry:
+one task slot per account, shared with the encrypted export in the
+start direction — a second start while a plaintext build runs answers
+`BACKUP_PLAINTEXT_ALREADY_RUNNING` (retryable=false; poll
+`backups.exportStatus` instead of retrying, the engine's
+BACKUP_EXPORT_ALREADY_RUNNING semantics mirrored), and a start while
+the engine's encrypted export task reports `running` answers
+`BACKUP_EXPORT_ALREADY_RUNNING` (the engine's own code riding the
+connector's start face). The engine slot check is best-effort: an
+engine that is down or answers indeterminately cannot hold a task
+(its registry is process memory), so the plaintext start proceeds —
+the two builds share no file, no lock, no state. The reverse
+direction is deliberately not gated this batch: `backups.export`
+keeps the engine's registry as its sole slot authority (Android
+backup semantics zero change), and a plaintext build — seconds-scale
+bounded local IO writing a disjoint file — cannot corrupt the
+engine's export.
+
+**The artifact** (`plaintext-exports/<accountId>/plaintext-export-
+<yyyy-MM-dd-HH-mm-ss>.jsonl`, the §4.46 snapshot-name timestamp shape):
+UTF-8, one JSON object per line, reference-before-referencing order —
+`account` (the account's own address spelling plus `givenName` when
+known), `contact` rows (the §4.46 identity projection verbatim:
+deterministic ids in canonical-key order, `aci`/`e164`/`givenName`,
+roster members merged, self never a contact row), `group` rows
+(`masterKey` hex plus the conversation title when known), `chat` rows
+(`kind` + `recipient`, so an independent parser never has to guess
+which id space a recipient references), then `message` rows per chat
+in store order. A message line carries the row's store id (the stable
+join key), the `chat` line it rides (the chat line's own `id`), the
+`direction`, the author resolved through the §4.46 sender
+reverse map (0 = self), `sentAt`, `receivedAt?`, `status` (the receipt
+stamp the row carries), `deliveredAt?`/`readAt?`/`viewedAt?`,
+`editedAt?`, the body, and the v1 projection faces the owner's 带面
+admitted: `quote` (NormalizedQuote verbatim — `id`/`text` bounded
+preview/`attachments` metadata — plus `messageId` when the store
+resolved the target, the join key to the quoted row's own line; the
+author resolves through the same sender map, and an unresolvable
+author rides `authorRaw` verbatim rather than dangling), `sticker`
+(NormalizedSticker metadata verbatim), `attachments` (the
+NormalizedAttachment metadata entries verbatim — the placeholder face;
+attachment BYTES are the phase-two 「仅本地在盘+覆盖率报告」 switch
+and never ship in v1), and `reactions` (the message_events rows
+targeting the message — emoji, resolved author, `removed`,
+`reactedAt` — removed rows included, history stays auditable). The
+row-level gates are §4.46's verbatim: system rows, remote-deleted and
+admin-deleted tombstones, and unconfirmed outgoing rows never
+masquerade as delivered history; a truncated preview body never
+becomes export text (`skippedBodyTruncated`); a row with neither body
+nor quote nor sticker nor attachments carries no conversational
+content and counts `skippedRows`. Skeleton peers (no ACI/E164 shape)
+stay unprojectable and count `skippedSkeletonChats`.
+
+**The caps and the counters** are the §4.46 machine reused, not
+re-lit: per-line 1 MiB, 4,000,000 lines, 2 GiB total, 128 KiB body —
+the build fails closed mid-write and removes the partial file
+(tmp-name write plus atomic rename, red line 4: an interrupted export
+never leaves a partial product addressable). The per-cause
+`SkipCounters` block merges into the status answer of a plaintext task
+exactly like the encrypted build's: `skippedQuotes`/`skippedStickers`
+count projection failures (the faces project — a malformed stored JSON
+arm counts and the line rides on without it); `skippedReactions`
+counts every reaction row that earned no line face — a malformed arm,
+a target row the row gates skipped, and the fuse-cut tail of the
+per-conversation reaction read (a runaway `message_events` table has
+no retention sweep, so the read carries its own fuse) — never a
+silent drop; and `skippedAttachments` keeps its byte-honest meaning:
+one per row whose attachment descriptors exist while their bytes did
+not ship (v1 never carries bytes).
+
+**The status face** (`backups.exportStatus`, additive — old readers
+ignore the new key): the answer gains the optional `kind` field,
+`"backup"` when the engine's encrypted task owns the latest run,
+`"plaintext_jsonl"` when the connector-local plaintext task is the
+latest started (startedAtMs wins the comparison; a plaintext task
+newer than the engine's answer projects the plaintext registry's own
+state, startedAtMs/finishedAtMs/lines/bytes/error class — content-free
+classes and counters only — with `artifactPresent: false`, because no
+engine artifact exists on this path). `kind` stays absent when no task has
+ever run (honest absence, never inferred). The disk truth is
+symmetric: snapshot listing stays the engine family's, and
+`backups.exportFile.open` gains the additive third `file` value
+`plaintext_jsonl` addressing the newest plaintext artifact on disk —
+the three-chain mechanics (handles, sequential chunks, TTL, per-account
+ceiling) are untouched. Red line 3 holds across the whole face: bodies,
+quote previews, file names, and captions never enter logs or error
+messages — counters and error classes only. Account deletion removes
+the account's plaintext artifact directory and task record beside the
+existing handle cleanup, so an export product never outlives its
+account session.
+
+**Error face.** `ACCOUNT_NOT_FOUND` (unknown accountId),
+`INVALID_REQUEST` (malformed params), `BACKUP_PLAINTEXT_ALREADY_RUNNING`
+and `BACKUP_EXPORT_ALREADY_RUNNING` (retryable=false — poll, never
+retry), `CAPABILITY_UNAVAILABLE` (the launcher did not arm the
+backup-export family), `STORAGE_READ_FAILED` (a store read failed —
+the artifact is a store projection), `INVALID_REQUEST` when the
+connector's own projection exceeds a cap (fail-closed before the
+partial file would exist), `STORAGE_WRITE_FAILED` (the artifact could
+not be written). The engine is never called, so no engine error code
+can surface from this face.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
