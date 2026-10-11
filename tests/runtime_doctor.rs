@@ -1,19 +1,21 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! End-to-end coverage for the read-only `runtime.doctor` face (contract
-//! revision 1.97, §4.79): the whole payload over a real authenticated socket
-//! against the fake engine — the version chain (both engine faces ride the
-//! fake's own answers through verbatim; the fake echoes any method it does
-//! not know, so both arrive `present`, and the unit suite pins the honest
-//! `absent`-with-reason side), the data-dir and lock faces (the connector
-//! holds its own occupancy locks, so `held` with its own pid), the
-//! recent-error ring fed by real failed dispatches, and the Signal
-//! service-plane face (field presence in the whole-payload answer; the
-//! `not_configured` path over the wire with the proxy environment removed).
-//! The unit suite in
+//! revision 1.97 §4.79, credential face 1.101): the whole payload over a
+//! real authenticated socket against the fake engine — the version chain
+//! (both engine faces ride the fake's own answers through verbatim; the fake
+//! echoes any method it does not know, so both arrive `present`, and the
+//! unit suite pins the honest `absent`-with-reason side), the data-dir and
+//! lock faces (the connector holds its own occupancy locks, so `held` with
+//! its own pid), the recent-error ring fed by real failed dispatches, the
+//! Signal service-plane face (field presence in the whole-payload answer;
+//! the `not_configured` path over the wire with the proxy environment
+//! removed), and the per-group credential face (the healthy literal in the
+//! whole-payload answer; the `credentialsInvalid` literal with the fixture's
+//! unlink signature planted). The unit suite in
 //! `src/doctor.rs` pins the pure halves — structure, unreachable
 //! degradation, the three lock forms, the read-only discipline, and the
-//! service-probe classification literals.
+//! service-probe and credential-state classification literals.
 
 #![cfg(unix)]
 
@@ -194,6 +196,16 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
     let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
     assert_eq!(started["result"]["state"], "running");
 
+    // Materialize the group's account row (the engine's listAccounts sync)
+    // so the credentials probe has its target.
+    let accounts = request(&mut client, "accounts-1", "accounts.list", json!({})).await;
+    assert!(
+        accounts["result"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "the fake engine reports one linked account"
+    );
+
     let empty = request(
         &mut client,
         "doctor-params",
@@ -346,6 +358,61 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
             );
         }
     }
+
+    // The per-group credential face (revision 1.101): the fake engine
+    // answers `getUserStatus` with the registered face here, so the probe
+    // folds to the healthy literal — and the face carries no probe-target
+    // trace.
+    let credentials = &group["credentials"];
+    assert_eq!(credentials["state"], json!("healthy"));
+    assert!(credentials.get("account").is_none());
+
+    drop(client);
+    let _ = connector.kill().await;
+}
+
+/// The credential-death path over the wire (contract revision 1.101): with
+/// the fixture's auth-failure marker planted, the group's `getUserStatus`
+/// probe answers the unlink face, the connector's classifier folds it to
+/// `EngineError::Unauthorized`, and the doctor reports the independent
+/// `credentialsInvalid` state — the credential layer the unauthenticated
+/// service probes cannot see.
+#[tokio::test]
+async fn doctor_credentials_face_reports_credentials_invalid_on_auth_failure() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret = [7_u8; 32];
+    let mut connector = spawn_connector(temp.path(), &endpoint);
+    wait_for_path(&endpoint).await;
+
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start-1", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+
+    // Materialize the group's account row so the probe has a target, then
+    // plant the unlink signature.
+    let accounts = request(&mut client, "accounts-1", "accounts.list", json!({})).await;
+    assert!(
+        accounts["result"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "the fake engine reports one linked account"
+    );
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-auth-failed-user-status"),
+        "",
+    )
+    .unwrap();
+
+    let report = request(&mut client, "doctor-cred", "runtime.doctor", json!({})).await;
+    let group = &report["result"]["groups"][0];
+    assert_eq!(group["credentials"]["state"], json!("credentialsInvalid"));
 
     drop(client);
     let _ = connector.kill().await;

@@ -22,10 +22,16 @@
 //!   the per-group engine status plus the process-wide watchdog/receive-drop
 //!   counters — no new instrumentation there;
 //! - the Signal service plane (revision 1.97): the doctor's ONLY declared
-//!   network probes — two read-only HTTPS GETs (chat, storage) through the
-//!   launcher's SOCKS proxy environment, each folding into one fixed
+//!   direct network probes — two read-only HTTPS GETs (chat, storage) through
+//!   the launcher's SOCKS proxy environment, each folding into one fixed
 //!   classification literal. The report never carries error text, request
 //!   content, a URL, or a proxy endpoint.
+//! - the per-group credential state (revision 1.101): one read-only
+//!   `getUserStatus` ride through each group's own live engine — the
+//!   doctor's only account-authenticated probe — folded into one fixed
+//!   literal (`healthy` / `credentialsInvalid` / `indeterminate` /
+//!   `unreachable` / `noAccount`). The account number rides only into the
+//!   engine call params, never into the report.
 //!
 //! Read-only discipline (pinned by tests): the doctor never starts or stops
 //! an engine, never cleans or deletes a lock, never writes anything
@@ -148,6 +154,30 @@ pub struct GroupReport {
     pub engine: EngineFace,
     pub data_dir: DataDirFace,
     pub lock: LockFace,
+    /// The per-group credential-state face (contract revision 1.101, §4.79).
+    pub credentials: CredentialsFace,
+}
+
+/// The per-group credential-state face (contract revision 1.101, §4.79): the
+/// doctor's one account-authenticated probe — a single read-only
+/// `getUserStatus` ride through the group's own engine for the watchdog's
+/// ping-target account, folded into exactly one fixed literal. This is the
+/// layer the unauthenticated service probes above cannot see: `chat`'s 401 is
+/// the healthy edge answer for a probe with no credentials, while a dead
+/// linked-device credential is only observable through an authenticated call.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsFace {
+    /// `healthy` (the engine answered the registered face) |
+    /// `credentialsInvalid` (the engine answered the credential-death face —
+    /// the same classification the §4.17 unlink chain rides) |
+    /// `indeterminate` (the engine answered a different error — e.g. a
+    /// transport-layer failure folded content-free; the connector cannot
+    /// tell a dead credential from a dead route on that face) |
+    /// `unreachable` (no live engine to probe through) |
+    /// `noAccount` (live engine, but the group has no account to probe) —
+    /// never anything else.
+    pub state: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -276,6 +306,9 @@ pub(crate) struct DoctorGroupFace {
     pub data_dir: std::path::PathBuf,
     pub status: EngineStatus,
     pub engine: Option<EngineHandle>,
+    /// The credentials probe target (the watchdog's any-account-of-this-group
+    /// rule). Transient only — the number never enters the report.
+    pub probe_account: Option<String>,
 }
 
 /// Assemble the whole doctor payload for the runtime: every launch-plan group
@@ -287,11 +320,18 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
         let data_dir = probe_data_dir(&face.data_dir);
         let lock = probe_lock(&face.data_dir);
         let engine = engine_face(&face.status, face.engine.as_ref()).await;
+        let credentials = credentials_face(
+            &face.status,
+            face.engine.as_ref(),
+            face.probe_account.as_deref(),
+        )
+        .await;
         groups.push(GroupReport {
             group_id: group_id.to_string(),
             engine,
             data_dir,
             lock,
+            credentials,
         });
     }
     DoctorReport {
@@ -403,6 +443,80 @@ fn unreachable_reason(state: EngineState) -> &'static str {
         EngineState::Faulted => {
             "engine faulted: the process crashed or failed to start; the watchdog may restart it"
         }
+    }
+}
+
+// ---------------------------------------------------------- credentials ----
+
+/// The per-group credential-state probe (contract revision 1.101, §4.79):
+/// one read-only `getUserStatus` ride through the group's own live engine —
+/// the same read-only call the liveness watchdog pings with — under the
+/// doctor's 3-second diagnostic budget. The gate is the same reachability
+/// rule the engine face uses; a probe that cannot run degrades honestly
+/// instead of guessing.
+async fn credentials_face(
+    status: &EngineStatus,
+    engine: Option<&EngineHandle>,
+    account: Option<&str>,
+) -> CredentialsFace {
+    let reachable = status.state == EngineState::Running && engine.is_some();
+    match credentials_probe_gate(reachable, engine, account) {
+        CredentialsProbe::Skip(state) => CredentialsFace { state },
+        CredentialsProbe::Run(engine, account) => CredentialsFace {
+            state: credentials_state_literal(
+                &engine
+                    .call_with_timeout(
+                        "getUserStatus",
+                        json!({ "account": account }),
+                        CallClass::ReadOnly,
+                        DOCTOR_ENGINE_CALL_TIMEOUT,
+                    )
+                    .await,
+            ),
+        },
+    }
+}
+
+/// The probe gate, split pure so the unit suite pins every skip branch
+/// without a live engine: the engine face's reachability rule first, then
+/// the account requirement.
+fn credentials_probe_gate<'a>(
+    reachable: bool,
+    engine: Option<&'a EngineHandle>,
+    account: Option<&'a str>,
+) -> CredentialsProbe<'a> {
+    match (reachable, account) {
+        (false, _) => CredentialsProbe::Skip("unreachable"),
+        (true, None) => CredentialsProbe::Skip("noAccount"),
+        (true, Some(account)) => {
+            CredentialsProbe::Run(engine.expect("reachable implies a live handle"), account)
+        }
+    }
+}
+
+enum CredentialsProbe<'a> {
+    Skip(&'static str),
+    Run(&'a EngineHandle, &'a str),
+}
+
+/// The pure outcome half, split from the transport call so the unit suite
+/// pins every literal without any engine. The classification rides the same
+/// ladder the request path uses: the engine boundary has already folded the
+/// raw upstream error, so `Unauthorized` here means the credential-death
+/// face — the §4.17 anchors or the §4.82 plain-text 401 body — and any other
+/// engine answer is honestly indistinguishable from a network failure at
+/// this boundary (the engine-side websocket-upgrade gap, §4.82).
+fn credentials_state_literal(result: &Result<Value, EngineError>) -> &'static str {
+    match result {
+        Ok(_) => "healthy",
+        Err(EngineError::Unauthorized) => "credentialsInvalid",
+        Err(
+            EngineError::Timeout
+            | EngineError::NotRunning
+            | EngineError::Exited
+            | EngineError::Backpressure,
+        ) => "unreachable",
+        Err(_) => "indeterminate",
     }
 }
 
@@ -935,6 +1049,9 @@ mod tests {
                     holder_alive: Some(true),
                     classification: "held",
                 },
+                credentials: CredentialsFace {
+                    state: "credentialsInvalid",
+                },
             }],
             network: NetworkFace {
                 watchdog_restarts_total: 0,
@@ -1015,6 +1132,9 @@ mod tests {
         assert_eq!(lock["pid"], json!(7));
         assert_eq!(lock["holderAlive"], json!(true));
         assert_eq!(lock["classification"], json!("held"));
+
+        let credentials = &group["credentials"];
+        assert_eq!(credentials["state"], json!("credentialsInvalid"));
 
         let recent = &value["recentErrors"];
         assert_eq!(recent["window"], json!(ERROR_RING_CAPACITY));
@@ -1100,6 +1220,78 @@ mod tests {
             EngineMethodFace::answered(json!({"baseline": {"presageRev": "a"}, "extra": 1}));
         assert!(answered.present);
         assert_eq!(answered.face.expect("face")["extra"], json!(1));
+    }
+
+    // ------------------------------------------------------ credentials --
+
+    /// The credential face's fixed literal ladder (contract revision 1.101):
+    /// every fold pinned from pure inputs with no engine and no network —
+    /// the registered answer, the credential-death face, the four
+    /// probe-impossible transport failures, and the honest indeterminate
+    /// fold for every other engine answer (the upstream-error families the
+    /// connector cannot separate from a dead route at this boundary).
+    #[test]
+    fn credentials_state_literal_maps_every_branch() {
+        use EngineError as Error;
+        let cases: [(Result<Value, EngineError>, &str); 9] = [
+            (Ok(json!({ "isRegistered": true })), "healthy"),
+            (Ok(json!({})), "healthy"),
+            (Err(Error::Unauthorized), "credentialsInvalid"),
+            (Err(Error::Timeout), "unreachable"),
+            (Err(Error::NotRunning), "unreachable"),
+            (Err(Error::Exited), "unreachable"),
+            (Err(Error::Backpressure), "unreachable"),
+            (Err(Error::Upstream), "indeterminate"),
+            (Err(Error::Protocol), "indeterminate"),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(
+                credentials_state_literal(&result),
+                expected,
+                "{result:?} must fold to {expected}"
+            );
+        }
+    }
+
+    /// The gate folds like the engine face's reachability rule: no live
+    /// engine answers `unreachable` regardless of any account, a live engine
+    /// without an account answers `noAccount`, and the probe target itself
+    /// never enters the serialized face.
+    #[tokio::test]
+    async fn credentials_face_degrades_without_engine_or_account() {
+        let running = EngineStatus {
+            state: EngineState::Running,
+            pid: Some(9),
+            rss_bytes: None,
+            resource_pressure: false,
+        };
+        let stopped = stopped_status(EngineState::Stopped);
+
+        for (status, engine, account, expected) in [
+            (&stopped, None, Some("+15555550100"), "unreachable"),
+            // A Running status with no live handle is the transitioning race:
+            // unreachable, not noAccount — the gate is reachability first.
+            (&running, None, Some("+15555550100"), "unreachable"),
+            (&running, None, None, "unreachable"),
+        ] {
+            let face = credentials_face(status, engine, account).await;
+            assert_eq!(face.state, expected);
+        }
+
+        // A running engine with no group account skips to noAccount — the
+        // pure gate covers the branch the suite cannot reach with a live
+        // handle (no engine spawns in the unit suite).
+        match credentials_probe_gate(true, None, None) {
+            CredentialsProbe::Skip(state) => assert_eq!(state, "noAccount"),
+            CredentialsProbe::Run(..) => panic!("no live handle must never reach the probe"),
+        }
+
+        let value = serde_json::to_value(CredentialsFace { state: "healthy" }).expect("serialize");
+        assert_eq!(value, json!({ "state": "healthy" }));
+        assert!(
+            value.get("account").is_none(),
+            "the probe target never enters the report"
+        );
     }
 
     // ------------------------------------------------------------- lock --

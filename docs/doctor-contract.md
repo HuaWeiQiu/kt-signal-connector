@@ -1,9 +1,9 @@
 # `runtime.doctor` — the read-only diagnostic face
 
-Contract revision 1.97, §4.79 of `docs/implementation-plan.md` is the normative
-specification; this document is the field-level quick reference for consumers
-(the desktop support surface). The method answers the whole diagnostic payload
-in one Control-lane call.
+Contract revisions 1.97 (§4.79) and 1.101 (§4.82) of
+`docs/implementation-plan.md` are the normative specification; this document is
+the field-level quick reference for consumers (the desktop support surface). The
+method answers the whole diagnostic payload in one Control-lane call.
 
 ## Call
 
@@ -47,7 +47,8 @@ may have moved on. Nothing in the answer is a lease or a reservation.
                   "version"?:            { "present", "face"?|, "reason"? },
                   "protocolCapabilities"?: { "present", "face"?|, "reason"? } },
     "dataDir":  { "path", "exists", "writable", "freeBytes"?, "totalBytes"? },
-    "lock":     { "present", "held", "pid"?, "holderAlive"?, "classification" }
+    "lock":     { "present", "held", "pid"?, "holderAlive"?, "classification" },
+    "credentials": { "state" }
   } ],
   "network":      { "watchdogRestartsTotal", "receiveDroppedTotal" },
   "recentErrors": { "window", "recordedTotal",
@@ -100,6 +101,31 @@ construction:
 
 Absent engine answers are the designed degradation — a diagnostic never fails
 as a whole because one engine face could not answer.
+
+## Credentials face
+
+`credentials` (contract 1.101, §4.82) is the per-group credential state — the
+doctor's one account-authenticated probe and the layer the unauthenticated
+service probes below cannot see: `chat`'s 401 is the healthy edge answer for a
+probe with no credentials, while a dead linked-device credential is only
+observable through an authenticated call. One read-only `getUserStatus` ride
+through the group's own live engine for the watchdog's ping-target account,
+under the same 3-second diagnostic budget, folding into exactly one fixed
+literal:
+
+| `state`              | meaning |
+| -------------------- | ------- |
+| `healthy`            | the engine answered the registered face |
+| `credentialsInvalid` | the engine answered the credential-death face — the same classification the `ACCOUNT_UNLINKED` chain rides; the account state converges exactly like any other request's |
+| `indeterminate`      | the engine answered a different error — honestly unclassifiable at this boundary (the engine-side websocket-upgrade 401 gap, §4.82), never a guessed verdict |
+| `unreachable`        | no live engine to probe through (the engine face carries the granular reason) |
+| `noAccount`          | live engine, but the group has no account to probe |
+
+The report carries only the literal: the probe target (an account number) rides
+only into the engine call params and never enters the report, and no error text,
+URL, or timing is carried. On the `credentialsInvalid` literal the desktop
+should render the independent credential-invalid state (relink needed), not the
+retryable network-error family.
 
 ## Lock face
 

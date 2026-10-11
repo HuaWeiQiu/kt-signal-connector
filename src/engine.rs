@@ -1938,7 +1938,9 @@ async fn handle_upstream_line(
         return Err(EngineError::Protocol);
     }
     if has_error {
-        if upstream_error_is_unauthorized(object.get("error")) {
+        if upstream_error_is_unauthorized(object.get("error"))
+            || upstream_error_is_credential_invalid(object.get("error"))
+        {
             if let Some(account) = &request.account {
                 let _ = events.send(EngineEvent::AccountUnauthorized {
                     account: account.clone(),
@@ -2016,6 +2018,31 @@ fn upstream_error_is_unauthorized(error: Option<&Value>) -> bool {
                 || message.contains("Authorization failed")
                 || (message.starts_with("User ") && message.ends_with(" is not registered."))
         })
+}
+
+/// The Signal chat service answers a dead linked-device credential with HTTP
+/// 401 whose body is this exact plain-text sentence — never a JSON error
+/// object, so the structural and exception-name matchers above cannot see it.
+/// Contract 1.101 §4.82: matched as a standalone pure addition beside the
+/// frozen §4.17 match set (the §4.80 boundary note applies verbatim), folding
+/// into the same `EngineError::Unauthorized` arm — the credential is dead and
+/// the recovery is the same relink.
+const ENGINE_CREDENTIALS_401_BODY_ANCHOR: &str =
+    "Credentials are required to access this resource.";
+
+/// The raw 401-body anchor matcher (contract 1.101 §4.82): `true` when the
+/// upstream error `message` carries the chat service's plain-text
+/// credentials-required sentence. Deliberately narrow — one exact sentence,
+/// case-sensitive — so incidental text (a recipient-level message, a storage
+/// family code, a transport anchor) can never flip an account's state. The
+/// engine contract at this revision folds credential death into the unbound
+/// message the §4.17 matcher already answers; this matcher is the additive
+/// net for faces that carry the upstream body verbatim.
+fn upstream_error_is_credential_invalid(error: Option<&Value>) -> bool {
+    error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(|message| message.contains(ENGINE_CREDENTIALS_401_BODY_ANCHOR))
 }
 
 /// Contract 1.99 §4.80 send-chain transport anchors: the engine folds a
@@ -4844,6 +4871,93 @@ mod tests {
                 "authorization matcher must not match {message}"
             );
         }
+    }
+
+    /// Contract 1.101 §4.82: the chat service's plain-text 401 body — the
+    /// credential-death face the exception-name matchers cannot see —
+    /// classifies to `EngineError::Unauthorized` through the real line
+    /// handler and drives the §4.17 event chain (the credential is dead; the
+    /// recovery is the same relink), attributed to the request's account.
+    #[tokio::test]
+    async fn credentials_401_body_anchor_classifies_as_unauthorized() {
+        for message in [
+            // The raw upstream body, bare and inside an engine-style wrapper.
+            "Credentials are required to access this resource.",
+            "Failed to send message: Credentials are required to access this \
+             resource. (Unauthorized)",
+        ] {
+            let (events, mut event_rx) = event_channel();
+            let (ingress, _receiver) = receive_channel();
+            let mut pending = HashMap::new();
+            let mut degraded = false;
+            let (response_tx, response_rx) = oneshot::channel();
+            pending.insert(
+                "kt-5".to_string(),
+                PendingRequest {
+                    class: CallClass::ReadOnly,
+                    account: Some("+15555550100".to_string()),
+                    response: response_tx,
+                },
+            );
+            let line = serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": "kt-5",
+                "error": { "code": -32603, "message": message }
+            }))
+            .unwrap();
+            handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+            assert_eq!(
+                response_rx.await.unwrap(),
+                Err(EngineError::Unauthorized),
+                "{message}"
+            );
+            assert!(
+                matches!(
+                    event_rx.recv().await.unwrap(),
+                    EngineEvent::AccountUnauthorized { ref account } if account == "+15555550100"
+                ),
+                "{message} drives the unlink chain"
+            );
+        }
+    }
+
+    /// The credential anchor's match set stays narrow: only the exact
+    /// upstream sentence classifies — case variants, partial sentences, the
+    /// §4.17 signatures, the §4.80 transport anchors, structured codes, and
+    /// ordinary engine errors all answer false, so incidental text can never
+    /// flip an account's state through this matcher.
+    #[test]
+    fn credentials_anchor_match_set_stays_narrow() {
+        let matches = |message: &str| {
+            upstream_error_is_credential_invalid(Some(&json!({ "message": message })))
+        };
+        assert!(matches("Credentials are required to access this resource."));
+        for message in [
+            "credentials are required to access this resource.",
+            "Credentials are required to access this resource",
+            "Credentials required to access this resource.",
+            "Failed to send message: Authorization failed! (AuthorizationFailedException)",
+            "User +15555550100 is not registered.",
+            "The user +15555550100 is not registered.",
+            "Failed to send message: Timed out waiting for a response (RateLimitExceeded)",
+            "Failed to send message: Proof required (ProofRequiredException)",
+            "Failed to send message: Bad gateway (ServerUnavailableException)",
+            "Internal error",
+            "STORAGE_UNAVAILABLE",
+        ] {
+            assert!(
+                !matches(message),
+                "credential matcher must not match {message}"
+            );
+        }
+        // Structure: no error object, or a non-string message, answers false.
+        assert!(!upstream_error_is_credential_invalid(None));
+        assert!(!upstream_error_is_credential_invalid(Some(&json!({}))));
+        assert!(!upstream_error_is_credential_invalid(Some(&json!({
+            "message": 401
+        }))));
     }
 
     /// Contract 1.99 §4.80 wire shape: an upstream send error embedding one

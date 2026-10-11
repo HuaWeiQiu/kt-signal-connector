@@ -6277,7 +6277,9 @@ the method rides the handshake method-list advertisement), and the discipline is
 read-only end to end: the doctor never starts or stops an engine, never breaks, removes,
 or truncates a lock, never writes a byte — every probe reads, and a slice that cannot
 answer degrades honestly while the call still succeeds. The answer is
-`{connector, groups[], network, recentErrors, service}`; the field-level consumer reference lives
+`{connector, groups[], network, recentErrors, service}`; since contract revision 1.101
+each group additionally carries the `credentials` face (§4.82), the doctor's one
+account-authenticated probe; the field-level consumer reference lives
 in `docs/doctor-contract.md`.
 
 - **Version chain** — `connector` carries the connector's own `version`, `apiVersion`,
@@ -6593,6 +6595,97 @@ resolved-account prepare frame); the wire face
 `account` key, the resolved-account upstream frame on the dispatch log, the
 ACCOUNT_NOT_FOUND / INVALID_REQUEST ladder); the schema method enumeration and the
 params `$def` (`tests/schema_consistency.rs`).
+
+### 4.82 Credential-death classification and the doctor credentials face (contract revision 1.101, 2026-10-11)
+
+The 2026-10-09 real-device debugging chain (CSS → DNS/socks5h → proxy split → the
+credential 401) exposed the one layer the desktop cannot see: a dead linked-device
+credential surfaces to the user as the generic retryable `UPSTREAM_ERROR` family —
+"send failed, please retry" — because the credential-death evidence never survives
+to a face the connector's matchers can classify. This batch closes the
+connector-side half; the engine-side residual is recorded below.
+
+#### The plain-text 401 anchor (the classifier)
+
+The Signal chat service answers a dead credential with HTTP 401 whose body is the
+exact plain-text sentence `Credentials are required to access this resource.` —
+never a JSON error object, so the §4.17 matchers (exception names, the
+`User … is not registered.` prefix/suffix pair) cannot see it. The connector
+classifies the sentence as a standalone pure matcher
+(`upstream_error_is_credential_invalid`) beside the frozen §4.17 match set — the
+§4.80 boundary note applies verbatim — folding into the same
+`EngineError::Unauthorized` arm at the same single observation point: the
+credential is dead, the recovery is the same relink, and the
+`AccountUnauthorized` → `ACCOUNT_UNLINKED` chain (retryable=false, the store's
+`device_unlinked` state) is the independent credential-invalid state, distinct
+from the retryable network-error families by construction. The match is one exact
+case-sensitive sentence: case variants, partial sentences, the §4.17 signatures,
+the §4.80 transport anchors, structured codes, and ordinary engine errors all
+answer false — incidental text can never flip an account's state through this
+matcher. No new host error code: `ACCOUNT_UNLINKED` is the face.
+
+#### The doctor credentials face (the projection)
+
+`runtime.doctor` gains a per-group `credentials` face — the doctor's one
+account-authenticated probe, the layer the unauthenticated §4.79 service probes
+cannot see (chat's 401 is the healthy edge answer for a probe with no
+credentials, while a dead linked-device credential is only observable through an
+authenticated call). One read-only `getUserStatus` ride through the group's own
+live engine for the watchdog's any-account-of-this-group ping target, under the
+doctor's 3-second diagnostic budget, folding into exactly one fixed literal:
+
+- `healthy` — the engine answered the registered face.
+- `credentialsInvalid` — the engine answered the credential-death face (the same
+  classification the §4.17 unlink chain rides; a doctor probe that discovers it
+  converges account state exactly like any other request would).
+- `indeterminate` — the engine answered a different error: honestly
+  unclassifiable at this boundary (see the engine residual below) rather than a
+  guessed verdict.
+- `unreachable` — no live engine to probe through (the engine face beside it
+  carries the granular reason).
+- `noAccount` — live engine, but the group has no account to probe.
+
+The report carries only the literal — never the probe target (the account number
+rides only into the engine call params), never error text, never a URL. The gate
+is the engine face's reachability rule; the probe reuses the existing read-only
+call path with the same budget, adds no thread and no polling, and a face that
+cannot run degrades honestly while the call still succeeds.
+
+#### The engine-side residual (recorded, owned by the engine batch)
+
+The dominant real-world credential-death path is the websocket-upgrade 401: the
+vendored `PushService::ws` upgrade goes through `reqwest-websocket`, whose
+handshake failure drops the HTTP status (the 401 body included), so the error
+folds to `ServiceError::WsError` — never `ServiceError::Unauthorized`. The
+engine's fold points (`get_user_status`, the send-chain `service_error_face`)
+match only `Unauthorized`, so a 401 at the upgrade layer answers the
+content-free `Internal error` face: the connector sees the retryable generic
+family (the desktop's "send failed, please retry") and the liveness watchdog
+counts ping failures instead of an unlink. Until the engine classifies the
+upgrade-layer 401 (e.g. reading the upgrade response's status before
+`into_websocket`, or a REST whoami re-probe when the identified websocket
+upgrade fails), the doctor's `credentials` face answers `indeterminate` on that
+path — honest, and precise the moment the engine fix lands; the connector-side
+anchor matcher above is the net for any fold point that carries the upstream
+sentence. The fix belongs to the engine repository (read-only during this
+batch); no connector-side change can recover a status the upgrade layer already
+dropped.
+
+Tests: the classifier units (`credentials_401_body_anchor_classifies_as_unauthorized`
+— the bare sentence and an engine-wrapped shape through the real line handler,
+each to `EngineError::Unauthorized` with the attributed `AccountUnauthorized`
+event; `credentials_anchor_match_set_stays_narrow` — the None ladder, the
+near-miss ladder, and the §4.17/§4.80 sets the matcher must not absorb); the
+doctor units (`credentials_state_literal_maps_every_branch` — every fold from
+pure inputs with no engine; `credentials_face_degrades_without_engine_or_account`
+— the gate's skip branches and the face's account-free serialization; the
+structure test pins the new face in the whole payload); the wire roundtrip
+(`tests/runtime_doctor.rs`: `doctor_credentials_face_reports_credentials_invalid_on_auth_failure`
+— the unlink signature planted, the group face answering `credentialsInvalid`
+over the wire; the whole-payload test gains the `healthy` assertion). No schema
+change: the doctor result stays a free-form object (the 1.97 precedent), the
+method/error/event enums are untouched, and `tests/schema_consistency.rs` stays
+green unchanged.
 
 ## 5. signal-cli Boundary
 

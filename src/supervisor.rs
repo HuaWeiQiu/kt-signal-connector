@@ -1004,6 +1004,17 @@ impl RuntimeSupervisor {
     /// contract — it never starts, stops, or writes anything; the doctor's
     /// engine method probes ride the handle's read-only call path.
     pub(crate) async fn doctor_face(&self) -> crate::doctor::DoctorGroupFace {
+        // The credentials probe target first — the same any-account-of-this-
+        // group rule the watchdog ping uses, taken before the engine mutex so
+        // the store read never holds it across SQLite I/O. The number rides
+        // only into the engine call params — it never enters the report.
+        let probe_account = self
+            .service
+            .lock()
+            .await
+            .any_signal_account_number_in_group(&self.group_id)
+            .ok()
+            .flatten();
         let slot = self.engine.lock().await;
         let live = slot.as_ref().filter(|engine| !engine.is_terminal());
         crate::doctor::DoctorGroupFace {
@@ -1018,6 +1029,7 @@ impl RuntimeSupervisor {
                     resource_pressure: false,
                 }),
             engine: live.cloned(),
+            probe_account,
         }
     }
 
