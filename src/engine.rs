@@ -2349,6 +2349,32 @@ async fn handle_upstream_line(
                     }
                 }
             }
+        } else if method == "accountUnbound" {
+            // Contract 1.113 §4.94: the engine's unbound stop-ring (B4) pushes
+            // a single `accountUnbound` notification when a 401 credential
+            // rejection halts the receive loop — official linked-device
+            // semantics, the account waits for a re-link instead of a
+            // reconnect loop. The account-unlink watcher already consumes the
+            // attributed event lane, so the notification replays onto
+            // AccountUnauthorized with the account taken verbatim from
+            // params. A malformed payload (missing params, missing, non-string
+            // or empty account) carries no attributable identity and falls
+            // back to the unknown-notification warning rather than inventing
+            // an account.
+            let attributed = object
+                .get("params")
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            if let Some(account) = attributed {
+                let _ = events.send(EngineEvent::AccountUnauthorized {
+                    account: account.to_string(),
+                });
+            } else {
+                let _ = events.send(EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification",
+                });
+            }
         } else {
             let _ = events.send(EngineEvent::ProtocolWarning {
                 kind: "unknownNotification",
@@ -5815,6 +5841,86 @@ mod tests {
             .unwrap();
 
         assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// Contract 1.113 §4.94: the engine's unbound stop-ring notification
+    /// replays onto the attributed AccountUnauthorized lane the unlink
+    /// watcher already consumes — exactly one event, no warning.
+    #[tokio::test]
+    async fn account_unbound_notification_marks_the_account() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "method": "accountUnbound",
+            "params": { "account": "+15555550100" }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            event_rx.recv().await.unwrap(),
+            EngineEvent::AccountUnauthorized { ref account } if account == "+15555550100"
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// Contract 1.113 §4.94: a malformed accountUnbound payload — missing
+    /// params, missing, non-string or empty account — carries no attributable
+    /// identity and degrades to the unknown-notification warning instead of
+    /// inventing an account.
+    #[tokio::test]
+    async fn malformed_account_unbound_notifications_stay_unattributed() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let lines = [
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "accountUnbound"
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "accountUnbound",
+                "params": {}
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "accountUnbound",
+                "params": { "account": 401 }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "accountUnbound",
+                "params": { "account": "" }
+            }))
+            .unwrap(),
+        ];
+        for line in &lines {
+            handle_upstream_line(line, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..lines.len() {
+            assert!(matches!(
+                event_rx.recv().await.unwrap(),
+                EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification"
+                }
+            ));
+        }
         assert!(event_rx.try_recv().is_err());
     }
 

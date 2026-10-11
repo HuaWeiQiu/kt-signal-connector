@@ -5,7 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.112 (2026-10-11; the ending never regresses (§4.93): the live
+- Contract revision: 1.113 (2026-10-11; the accountUnbound whitelist (§4.94):
+  the engine's unbound stop-ring (B4) already pushed a single `accountUnbound`
+  notification when the server's 401 credential rejection halted the receive
+  loop — wire-additive, deliberately unconsumed. That left the account's death
+  reachable only through pull-shaped evidence: the host lane learned of the
+  dead link only when some later send failed with the authorization signature,
+  and until then the desktop kept rendering a live account whose receive loop
+  was parked for good. The dispatch now carries an arm for the notification: a
+  strictly-parsed non-empty `params.account` replays onto the
+  `AccountUnauthorized` lane the account-unlink watcher already consumes
+  (mark → `account.changed`), and a malformed payload — missing, non-string or
+  empty account — cannot be attributed and degrades to the
+  unknown-notification warning instead of inventing an account. No host or
+  schema change; no wire change (the notification is engine→connector only).
+  Tests 654 → 656 (lib 495 → 497), all green) —
+  previously 1.112 (2026-10-11; the ending never regresses (§4.93): the live
   message insert and the send completion still wrote the conversation/account endings
   unconditionally, and both can carry an older timestamp than the summaries already
   publish (per-sender clocks make delayed deliveries real; the completion re-stamps with
@@ -7652,6 +7667,43 @@ delayed older row keeps the ending and still bumps the badge; the slow
 completion at its upstream timestamp — the pre-guard regression — stays;
 the stale-local-clock pending insert stays; the in-ladder completion still
 advances). Gates: 653 → 654 (lib 494 → 495), all green.
+
+### 4.94 The accountUnbound whitelist (contract revision 1.113, 2026-10-11)
+
+The engine's unbound stop-ring (B4) pushes a single `accountUnbound`
+notification (`{"method":"accountUnbound","params":{"account":"<number>"}}`)
+when the server's 401 credential rejection halts the receive loop — official
+linked-device semantics: the account waits for a re-link instead of an
+infinite reconnect backoff. The notification shipped wire-additive with the
+connector whitelist deliberately not consuming it, which left the account's
+death reachable only through pull-shaped evidence: the host lane learned of
+the dead link only when some later send failed with the authorization
+signature, and until then the desktop kept rendering a live account whose
+receive loop was parked for good.
+
+**The arm.** `handle_upstream_line` now carries a dedicated dispatch arm for
+the notification, replaying it onto the lane the unlink watcher already
+consumes: a strictly-parsed non-empty `params.account` becomes
+`EngineEvent::AccountUnauthorized` — the exact event
+`account_unlink_watch_loop` handles by marking the account device-unlinked in
+the shared store and surfacing `account.changed` on the host lane, so the
+desktop sees the unlink with no new host surface and no supervisor change.
+A malformed payload — missing `params`, missing, non-string or empty
+`account` — carries no attributable identity and degrades to the
+`unknownNotification` protocol warning instead of inventing an account; the
+untrusted-launcher discipline (never log or fabricate identities) holds.
+Accounts that share a proxy group stay untouched: the notification names one
+account, and only that account's row moves.
+
+No wire change on the connector's own API surface: the notification is
+engine→connector only, the host-facing method/event/error enums are
+untouched, and `tests/schema_consistency.rs` stays green unchanged.
+
+Tests: `account_unbound_notification_marks_the_account` (exactly one
+attributed event, no warning) and
+`malformed_account_unbound_notifications_stay_unattributed` (missing
+`params`, missing, non-string and empty `account` each yield only the
+warning). Gates: 654 → 656 (lib 495 → 497), all green.
 
 ## 5. signal-cli Boundary
 
