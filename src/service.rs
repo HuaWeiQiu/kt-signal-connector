@@ -282,6 +282,11 @@ pub const GROUP_MEMBER_LABEL_MAX_BYTES: usize = 256;
 /// than truncating, so the read projection never renders a clipped label.
 pub const GROUP_MEMBER_LABEL_SERVER_MAX_BYTES: usize = 512;
 pub const GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES: usize = 64;
+/// The engine's `groupChanged` change-list cap (contract 1.100, §4.81): the
+/// official detail word list is 27 classes, so real batches land far below;
+/// entries past the cap drop connector-side (the parse-side truncate — the
+/// schema bound mirrors this number).
+pub const GROUP_CHANGED_MAX_CHANGES: usize = 32;
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -928,6 +933,22 @@ pub enum HostSideEvent {
         viewer_name: Option<String>,
         sent_timestamps: Vec<u64>,
         viewed_at: u64,
+    },
+    /// The engine's `groupChanged` projection forwarded (contract 1.100,
+    /// §4.81 D3): the official change word list for one group update rides
+    /// verbatim as the transient `group.changed` event — the connector keeps
+    /// no change history (the conversation row's group state comes from the
+    /// live `groups.get` face), so nothing persists and nothing self-heals
+    /// from a missed delivery. The timer leg, when the batch carried one,
+    /// has already converged the conversation row; its refreshed summary
+    /// rides `conversation.changed` beside this event.
+    GroupChanged {
+        account_id: String,
+        conversation_id: String,
+        revision: u64,
+        changes: Value,
+        editor: Option<String>,
+        expire_timer_seconds: Option<u32>,
     },
 }
 
@@ -6257,8 +6278,11 @@ impl ConnectorService {
         } else {
             // The groupUpdated projection always names its group; a timer
             // update with no group reference has nothing to converge and is
-            // warn-only dropped like the unknown-group drop below.
-            if matches!(control, ControlReceive::GroupTimerUpdate { .. }) {
+            // warn-only dropped like the unknown-group drop below. The
+            // groupChanged projection shares the guarantee and the fate.
+            if matches!(control, ControlReceive::GroupTimerUpdate { .. })
+                || matches!(control, ControlReceive::GroupChanged { .. })
+            {
                 tracing::warn!(
                     account_id = %account.id,
                     "groupUpdated carries no group reference; dropping the timer convergence"
@@ -6286,7 +6310,9 @@ impl ConnectorService {
             {
                 return Ok(vec![event]);
             }
-            if matches!(control, ControlReceive::GroupTimerUpdate { .. }) {
+            if matches!(control, ControlReceive::GroupTimerUpdate { .. })
+                || matches!(control, ControlReceive::GroupChanged { .. })
+            {
                 tracing::warn!(
                     account_id = %account.id,
                     "groupUpdated names an unknown group; dropping the timer convergence"
@@ -6710,6 +6736,48 @@ impl ConnectorService {
                 if let Some(summary) = self
                     .store
                     .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok(events)
+            }
+            ControlReceive::GroupChanged {
+                revision,
+                changes,
+                editor,
+                expire_timer_seconds,
+            } => {
+                // The engine's groupChanged projection (2026-10-11 engine D
+                // batch): the official change word list for one group update,
+                // verbatim. The connector is a pipe — the batch forwards as
+                // the transient `group.changed` event and the desktop renders
+                // the change notices; no system row lands (the official
+                // renders the whole batch as change notices, which the event
+                // carries — the timer-notice row stays the groupUpdated
+                // pure-timer face's). The timer leg (a batch that carried a
+                // timer change beside the others) converges through the
+                // §4.41 mirror exactly like GroupTimerUpdate — value-only,
+                // before the event, and the refreshed summary rides
+                // `conversation.changed` so a lagging window converges.
+                if let Some(seconds) = expire_timer_seconds {
+                    self.store.set_conversation_expire_timer(
+                        &account.id,
+                        &conversation.id,
+                        u64::from(seconds),
+                    )?;
+                }
+                let mut events = vec![HostSideEvent::GroupChanged {
+                    account_id: account.id.clone(),
+                    conversation_id: conversation.id.clone(),
+                    revision,
+                    changes,
+                    editor,
+                    expire_timer_seconds,
+                }];
+                if expire_timer_seconds.is_some()
+                    && let Some(summary) = self
+                        .store
+                        .conversation_summary(&account.id, &conversation.id)?
                 {
                     events.push(HostSideEvent::ConversationChanged(summary));
                 }
@@ -18835,6 +18903,92 @@ mod tests {
         assert!(
             events.is_empty(),
             "an unknown sender stays silent: {events:?}"
+        );
+    }
+
+    /// Contract 1.100 (§4.81 D3): the groupChanged batch forwards verbatim
+    /// as the `group.changed` event addressed by the group it routed to; a
+    /// timer leg converges the conversation mirror and re-pushes the
+    /// summary; an unknown group stays silent (the groupUpdated warn-only
+    /// discipline).
+    #[test]
+    fn group_changed_forwards_verbatim_and_mirrors_the_timer_leg() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "G")
+            .unwrap();
+        let _ = conversation;
+        let changes = json!([
+            { "type": "title", "newTitle": "renamed" },
+            { "type": "member-add", "aci": "11111111-1111-1111-1111-111111111111" },
+        ]);
+        let receive = |group_id: Option<&str>| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::GroupChanged {
+                    revision: 10,
+                    changes: changes.clone(),
+                    editor: Some("33333333-3333-3333-3333-333333333333".into()),
+                    expire_timer_seconds: Some(60),
+                },
+            );
+            receive.group_id = group_id.map(str::to_string);
+            receive
+        };
+
+        let events = service
+            .ingest_receive(
+                receive(Some("ZmFrZS1ncm91cC0x")),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let HostSideEvent::GroupChanged {
+            account_id: event_account,
+            conversation_id: event_conversation,
+            revision,
+            changes: event_changes,
+            editor,
+            expire_timer_seconds,
+        } = &events[0]
+        else {
+            panic!("expected a GroupChanged event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(event_conversation, &group.id);
+        assert_eq!(revision, &10);
+        assert_eq!(event_changes, &changes, "the batch rides verbatim");
+        assert_eq!(
+            editor.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(expire_timer_seconds, &Some(60));
+        assert!(matches!(&events[1], HostSideEvent::ConversationChanged(_)));
+
+        let summary = service
+            .store_ref()
+            .conversation_summary(&account.id, &group.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.expire_timer_seconds,
+            Some(60),
+            "the timer leg converges through the §4.41 mirror"
+        );
+
+        // A batch the ladder cannot resolve (unknown group) stays silent.
+        let events = service
+            .ingest_receive(
+                receive(Some("bm90LWEtZ3JvdXA")),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "an unknown group stays silent: {events:?}"
         );
     }
 

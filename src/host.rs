@@ -2984,6 +2984,31 @@ where
             }
             send_shared(writer, &HostEvent::new("story.viewed", payload)).await
         }
+        HostSideEvent::GroupChanged {
+            account_id,
+            conversation_id,
+            revision,
+            changes,
+            editor,
+            expire_timer_seconds,
+        } => {
+            // Contract 1.100, §4.81 D3: the verbatim change batch forwards
+            // with the absent-optional discipline — an unnamed editor and a
+            // timer-less batch stay absent keys.
+            let mut payload = json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "revision": revision,
+                "changes": changes,
+            });
+            if let Some(aci) = editor {
+                payload["editor"] = json!(aci);
+            }
+            if let Some(seconds) = expire_timer_seconds {
+                payload["expireTimerSeconds"] = json!(seconds);
+            }
+            send_shared(writer, &HostEvent::new("group.changed", payload)).await
+        }
     }
 }
 
@@ -3812,5 +3837,55 @@ mod tests {
         // The absent-optional discipline: a missing identity stays absent.
         assert!(frame["data"].get("senderName").is_none());
         assert_eq!(frame["data"]["timestamp"], 1727000002000u64);
+    }
+
+    /// Contract 1.100 (§4.81 D3): the `group.changed` wire frame — the
+    /// change batch rides verbatim and the absent-optional keys stay
+    /// absent.
+    #[tokio::test]
+    async fn group_changed_event_rides_the_batch_verbatim() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::GroupChanged {
+                account_id: "acct-1".into(),
+                conversation_id: "conv-1".into(),
+                revision: 10,
+                changes: json!([
+                    { "type": "title", "newTitle": "renamed" },
+                    { "type": "group-link-reset" },
+                ]),
+                editor: None,
+                expire_timer_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let line = timeout(Duration::from_millis(500), async {
+            Framed::new(&mut server, LinesCodec::new()).next().await
+        })
+        .await
+        .expect("the event frame must flush")
+        .unwrap()
+        .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "group.changed");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["conversationId"], "conv-1");
+        assert_eq!(frame["data"]["revision"], 10);
+        assert_eq!(
+            frame["data"]["changes"],
+            json!([
+                { "type": "title", "newTitle": "renamed" },
+                { "type": "group-link-reset" },
+            ])
+        );
+        // The absent-optional discipline: no editor, no timer leg.
+        assert!(frame["data"].get("editor").is_none());
+        assert!(frame["data"].get("expireTimerSeconds").is_none());
     }
 }

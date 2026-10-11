@@ -6462,6 +6462,49 @@ the service unit (`sync_read_state_stamps_rows_and_converges_the_badge` — two 
 rows, the badge pair rides a matched entry, the no-row timestamp stays silent, the replay
 is silent, the unknown sender is silent).
 
+#### D3 — group change batches (`groupChanged`)
+
+The engine projects one decrypted group update batch carrying non-timer/terminate changes
+as `envelope.groupChanged {groupId, revision, editor?, expireTimerSeconds?, changes[]}` —
+the official GroupV2ChangeDetailType word list (title/avatar/description/access-\*/
+member-\*/pending-\*/admin-approval-\*/member-add-from-\*/group-link-reset/
+announcements-only), entries verbatim, the official-non-rendering classes never reaching
+the wire. The connector previously dropped the whole face. Consumption — a pipe, not a
+renderer (the desktop renders the change notices; the conversation row's group state
+comes from the live `groups.get` face):
+
+- **Parse bounds** (§4.13 family): the guaranteed faces fail closed — a missing or
+  non-u64 `revision`, a missing or non-array `changes`, or an empty batch skips (a
+  protocol error, not an unknown shape); `groupId` absence still routes so the service
+  layer keeps its warn-only drop (the groupUpdated precedent); `editor` rides through the
+  same bounded form that face reads (≤64 bytes, hostile shape reads absent); the
+  `changes` array passes bounded and verbatim — 32-entry cap (the schema mirrors it,
+  `GROUP_CHANGED_MAX_CHANGES`), entries past it truncate, material over the 64 KiB coarse
+  guard drops the whole face (宁缺勿错, never a truncated lie). The timer leg parses
+  beside the others (`u32` fail-closed; a non-u32 shape reads absent — the mirror skips,
+  the event still forwards).
+- **Routing**: the generic conversation ladder (`groupId` is the master key's standard
+  base64 — the `listGroups` id form); an unknown group stays warn-only silent (the
+  groupUpdated discipline — better to converge late than to invent state).
+- **Convergence**: a batch that carried a timer leg converges the conversation timer
+  through the §4.41 mirror exactly like `GroupTimerUpdate` (0 = off) — value-only, and
+  the refreshed summary rides `conversation.changed` so a lagging window converges. No
+  system row lands for a mixed batch: the official renders the whole batch as change
+  notices, which the event carries — the timer-notice row stays the `groupUpdated`
+  pure-timer face's.
+- **Event**: `group.changed` (new) — `{accountId, conversationId, revision, changes,
+  editor?, expireTimerSeconds?}`, the batch verbatim, absent-optional keys absent.
+  Transient: nothing persists, a missed delivery is not self-healed.
+
+Tests: the engine routing unit (`group_changed_routes_bounded_verbatim_changes` — the
+batch rides verbatim, editor and timer leg parse, the three fail-closed skips); the
+service unit (`group_changed_forwards_verbatim_and_mirrors_the_timer_leg` — the event
+addresses the routed group, the batch rides verbatim, the timer leg converges the
+conversation mirror and re-pushes the summary, the unknown group stays silent); the wire
+frame (`group_changed_event_rides_the_batch_verbatim` — the verbatim batch plus the
+absent-optional discipline); the schema event enumeration and the 32-entry bound pairing
+(`tests/schema_consistency.rs`).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

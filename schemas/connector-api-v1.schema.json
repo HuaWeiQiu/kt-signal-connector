@@ -3107,7 +3107,8 @@
             "call.incoming",
             "call.groupIncoming",
             "story.received",
-            "story.viewed"
+            "story.viewed",
+            "group.changed"
           ]
         },
         "data": {
@@ -3437,6 +3438,49 @@
                     "type": "integer",
                     "minimum": 1,
                     "description": "The receipt's arrival instant (the envelope timestamp, contract 1.32; connector clock when the envelope carried none) — the desktop's viewedAtMs."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "group.changed" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversationId", "revision", "changes"],
+                "description": "One group change batch forwarded (contract 1.100, §4.81 D3, capability group-management receive half): the engine's groupChanged projection — the official GroupV2ChangeDetailType word list (title/avatar/description/access-*/member-*/pending-*/admin-approval-*/member-add-from-*/group-link-reset/announcements-only) decrypted out of one group update batch, entries verbatim and bounded (32-entry cap, 64 KiB coarse guard; the official-non-rendering classes the engine cannot name never reach the wire). The connector is a pipe: nothing persists, a missed delivery is not self-healed — the conversation row's group state comes from the live groups.get face. A batch that also carried a timer change converges the conversation timer first (its refreshed summary rides conversation.changed); the timer leg rides here as expireTimerSeconds (0 = off, the groupUpdated semantics). editor is the change author's ACI when the projection named one; absent stays absent.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversationId": { "$ref": "#/$defs/opaqueId" },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The group revision the change batch produced (the engine's decrypted GroupChange value)."
+                  },
+                  "changes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "items": { "type": "object" },
+                    "description": "The change entries verbatim, official detail word list — {type: title, newTitle?}, {type: avatar, removed?}, {type: description, description?|removed?}, access-* {newPrivilege}, member-add {aci}, member-remove {aci}, member-privilege {aci, newPrivilege}, pending-add-one {serviceId}, pending-remove-one {serviceId}, member-add-from-invite {aci|pni}, admin-approval-add-one {aci}, admin-approval-remove-one {aci}, member-add-from-admin-approval {aci}, group-link-reset, announcements-only {announcementsOnly}. Key absence inside an entry is protocol absence (宁缺勿错)."
+                  },
+                  "editor": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "The change author's ACI UUID when the projection named one (the groupUpdated editor discipline); absent keeps the batch unattributed."
+                  },
+                  "expireTimerSeconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The batch's timer leg when it carried one beside the other changes (0 = off, the groupUpdated semantics); the conversation timer has already converged through the same mirror. Absent on timer-less batches — pure timer batches stay on the groupUpdated face entirely."
                   }
                 }
               }

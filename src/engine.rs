@@ -900,6 +900,25 @@ pub enum ControlReceive {
         read: Vec<SyncReadEntry>,
         viewed: Vec<SyncReadEntry>,
     },
+    /// The engine's `groupChanged {groupId, revision, changes[], editor?,
+    /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
+    /// official GroupV2ChangeDetailType word list the engine decrypted out
+    /// of one group update batch — every non-timer/terminate change rides
+    /// here verbatim (the official-non-rendering classes the engine cannot
+    /// name never reach the wire). The connector is a pipe like the story
+    /// and call faces: `changes` is the bounded verbatim array — never
+    /// parsed or re-shaped connector-side (the desktop renders the change
+    /// notices). `expire_timer_seconds` rides only when the batch carried a
+    /// timer change beside the others (pure timer batches stay on the
+    /// `groupUpdated` face); the service layer mirrors it like that face.
+    /// The routing group id is the projection's `groupId` (the master
+    /// key's standard base64 — the listGroups id form).
+    GroupChanged {
+        revision: u64,
+        changes: Value,
+        editor: Option<String>,
+        expire_timer_seconds: Option<u32>,
+    },
 }
 
 /// One (sender, timestamp) pair off the engine's `syncMessage.read[]` /
@@ -930,6 +949,11 @@ const MAX_RECEIPT_TIMESTAMPS: usize = 256;
 /// real multi-device read syncs stay far below it; entries past the cap
 /// drop (the same truncate discipline as `MAX_RECEIPT_TIMESTAMPS`).
 const MAX_SYNC_READ_ENTRIES: usize = 256;
+/// `groupChanged.changes` serialized byte guard (contract 1.100, §4.81):
+/// the coarse guard family the story/call faces ride — real change batches
+/// are orders of magnitude smaller; only hostile material trips it, and an
+/// oversized face drops whole (宁缺勿错, never a truncated lie).
+const MAX_GROUP_CHANGED_BYTES: usize = 64 * 1024;
 /// Rich-body bounds (contract 1.25, §4.13 parity): caps on card/range counts
 /// and string sizes. Entries past a cap drop, oversized strings truncate — a
 /// hostile payload can never fail the message itself.
@@ -2935,6 +2959,61 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             control: ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds,
                 editor,
+            },
+        });
+    }
+    // The engine's `groupChanged` projection (contract 1.100, §4.81 D3): a
+    // decrypted group change batch with non-timer/terminate changes,
+    // envelope-replaced before it reaches the connector. The guaranteed
+    // faces fail closed (the projection always names a revision and a
+    // non-empty change list — their absence is a protocol error, not an
+    // unknown shape, and the envelope falls to the plain skip);
+    // `groupId` absence still routes so the service layer keeps its
+    // warn-only drop (the groupUpdated precedent). `editor` rides when the
+    // projection named one — the same bounded form the groupUpdated arm
+    // reads; the timer leg rides only beside other changes (pure timer
+    // batches stay on the groupUpdated face) and a non-u32 shape reads as
+    // absent (the mirror skips, the event still forwards). The `changes`
+    // array passes bounded and verbatim: entries past the cap truncate,
+    // material over the coarse byte guard drops the whole face (宁缺勿错,
+    // never a truncated lie).
+    if let Some(change) = envelope.get("groupChanged").and_then(Value::as_object) {
+        let revision = change.get("revision").and_then(Value::as_u64)?;
+        let changes = change.get("changes").and_then(Value::as_array)?;
+        if changes.is_empty() {
+            return None;
+        }
+        let mut bounded = changes.clone();
+        bounded.truncate(crate::service::GROUP_CHANGED_MAX_CHANGES);
+        let changes = Value::Array(bounded);
+        if serde_json::to_string(&changes)
+            .is_ok_and(|material| material.len() > MAX_GROUP_CHANGED_BYTES)
+        {
+            return None;
+        }
+        let group_id = change
+            .get("groupId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let editor = change
+            .get("editor")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|aci| !aci.is_empty() && aci.len() <= GROUP_UPDATED_EDITOR_MAX_BYTES)
+            .map(str::to_string);
+        let expire_timer_seconds = change
+            .get("expireTimerSeconds")
+            .and_then(Value::as_u64)
+            .and_then(|seconds| u32::try_from(seconds).ok());
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id,
+            control: ControlReceive::GroupChanged {
+                revision,
+                changes,
+                editor,
+                expire_timer_seconds,
             },
         });
     }
@@ -5542,6 +5621,80 @@ mod tests {
             );
             assert!(routing.is_none(), "expected the plain skip: {sync}");
         }
+    }
+
+    /// Contract 1.100 (§4.81 D3): the engine's `groupChanged` projection
+    /// routes with the verbatim change batch (bounded verbatim — the
+    /// connector never re-shapes the word list); the guaranteed faces fail
+    /// closed; the timer leg parses beside the other changes.
+    #[test]
+    fn group_changed_routes_bounded_verbatim_changes() {
+        let routing = |change: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "groupChanged": change,
+                })
+                .as_object()
+                .unwrap(),
+            )
+        };
+        let Some(routing) = routing(json!({
+            "groupId": "ZmFrZS1ncm91cC0x",
+            "revision": 10u64,
+            "editor": "33333333-3333-3333-3333-333333333333",
+            "expireTimerSeconds": 60u64,
+            "changes": [
+                { "type": "title", "newTitle": "renamed" },
+                { "type": "member-add", "aci": "11111111-1111-1111-1111-111111111111" },
+                { "type": "group-link-reset" },
+            ],
+        })) else {
+            panic!("expected a groupChanged routing");
+        };
+        assert_eq!(routing.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+        assert!(routing.source.is_none(), "the envelope has no peer source");
+        let ControlReceive::GroupChanged {
+            revision,
+            changes,
+            editor,
+            expire_timer_seconds,
+        } = routing.control
+        else {
+            panic!("expected a GroupChanged control: {:?}", routing.control);
+        };
+        assert_eq!(revision, 10);
+        assert_eq!(
+            changes,
+            json!([
+                { "type": "title", "newTitle": "renamed" },
+                { "type": "member-add", "aci": "11111111-1111-1111-1111-111111111111" },
+                { "type": "group-link-reset" },
+            ]),
+            "the batch rides verbatim"
+        );
+        assert_eq!(
+            editor.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(expire_timer_seconds, Some(60));
+
+        // The guaranteed faces fail closed: no revision, no change list, an
+        // empty batch — all skip (a protocol error, not an unknown shape).
+        for change in [
+            json!({ "groupId": "ZmFrZS1ncm91cC0x", "changes": [{ "type": "group-link-reset" }] }),
+            json!({ "groupId": "ZmFrZS1ncm91cC0x", "revision": 10u64 }),
+            json!({ "groupId": "ZmFrZS1ncm91cC0x", "revision": 10u64, "changes": [] }),
+        ] {
+            assert!(
+                routing_shape_none(&change),
+                "expected the fail-closed skip: {change}"
+            );
+        }
+    }
+
+    fn routing_shape_none(change: &serde_json::Value) -> bool {
+        control_routing(json!({ "groupChanged": change }).as_object().unwrap()).is_none()
     }
 
     /// Call signaling (contract 1.50, §4.48): the engine's `callMessage`
