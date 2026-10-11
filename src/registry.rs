@@ -1038,6 +1038,26 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_conversation_blocked(params).await
     }
 
+    /// conversations.getState / conversations.setState (contract 1.116,
+    /// §4.97): the three mute/archive/unread bits live in the account's
+    /// storage records, so the read and the write route through the
+    /// account's owning engine like every other storage face.
+    pub async fn get_conversation_state(
+        &self,
+        params: crate::service::ConversationsGetStateParams,
+    ) -> Result<crate::service::ConversationState, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_conversation_state(params).await
+    }
+
+    pub async fn set_conversation_state(
+        &self,
+        params: crate::service::ConversationsSetStateParams,
+    ) -> Result<crate::service::ConversationState, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.set_conversation_state(params).await
+    }
+
     /// conversations.acceptRequest / conversations.declineRequest (contract
     /// 1.63, §4.56): the MRR sync write is account-scoped upstream traffic,
     /// so it routes through the account's owning engine like every other

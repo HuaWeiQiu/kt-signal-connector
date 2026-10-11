@@ -5,7 +5,28 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.115 (2026-10-12; groups.update / groups.quit ride
+- Contract revision: 1.116 (2026-10-12; the conversation-state trio rides
+  the storage face (§4.97): `conversations.getState` /
+  `conversations.setState` carry the engine's
+  getConversationState/setConversationState faces — the official Storage
+  Service record's mute/archive/marked-unread bits — behind the §4.47
+  blocked face's addressing trio (accountId/conversationId/kind) and the
+  shared resolution ladder. The write is partial by grammar: only the
+  flags the caller sent ride the payload, an empty intent answers
+  INVALID_REQUEST locally, and the answer is the post-write projection
+  read back; both faces persist nothing locally. No new error codes: the
+  engine's canonicalization refusals arrive CONVERSATION_NOT_RESOLVED
+  (retryable=false), the outage family passes through as STORAGE_*
+  (retryable), and the mutating face keeps the reaction-class
+  SEND_OUTCOME_UNKNOWN discipline. Advertised through the new
+  `conversation-state` capability tag. Tests 654 → 657 (lib 499 → 501),
+  all green. Counting recalibration: this revision's total is the summed
+  cargo-test `passed` across every target, re-measured at the 1.115 tag
+  (654, not the 658 previously recorded — the integration legs were
+  over-counted by four in the earlier bookkeeping; the per-batch deltas
+  and the lib counts were exact throughout, and from here the base is
+  the reproducible cargo-test sum)) —
+  previously 1.115 (2026-10-12; groups.update / groups.quit ride
   the engine write face (§4.96): the engine batch landed the full
   `updateGroup` write family (title + avatar tri-state + member arrays +
   the invite-link access word) and the quit write under its own method
@@ -7839,6 +7860,73 @@ the payload verbatim), `groups_quit_preparation_resolves_the_ladder_and_
 builds_the_payload`, and `group_update_failed_maps_with_the_status_pass_
 through` (403/409/empty-data rides verbatim, retryable=false, the
 data-less face content-free). Gates: 657 → 658 (lib 498 → 499), all green.
+
+### 4.97 The conversation-state trio rides the storage face (contract revision 1.116, 2026-10-12)
+
+The engine's P15b batch landed `getConversationState` /
+`setConversationState` — the official Storage Service record's three
+per-conversation bits (mutedUntilTimestamp / archived / markedUnread, one
+record per Contact/GV1/GV2 conversation) as a read and a partial write.
+Until this revision the connector surfaced none of the trio: the desktop
+had no honest channel to mute, archive, or mark-unread through the linked
+account, and the state lived only in the engine's cloud records.
+
+**The faces.** `conversations.getState` (read lane, ReadOnly call) and
+`conversations.setState` (send lane, Mutating) take the §4.47 blocked
+face's addressing trio verbatim — accountId, conversationId, the
+three-value kind enum through `validate_pinned_kind` — resolve the local
+row through the shared ladder, and forward the resolved peer reference
+plus kind. The empty-peer §4.42 self row fails closed locally (the
+§4.56 guard). The set face carries the engine's partial-write grammar:
+only the flags the caller sent ride the payload (absent = no write
+intent for that bit; a flag value carries no tri-state of its own — the
+host `null` folds to absent at the params deserializer), an intent with
+no flags answers INVALID_REQUEST before any upstream call, and the
+answer is the post-write three-bit projection read back (the engine's
+official upload-success semantics). Both faces persist nothing locally —
+the cloud record plus the desktop's own cache is the whole story; the
+connector holds no state copy and mints no conversation.changed of its
+own. The projection parser takes the engine's three-key contract
+strictly: all three keys always ride (0/false = unset bit — a record the
+cloud has not materialized reads as the all-default projection, the
+honest idempotent read), and a missing or wrong-shaped key is a protocol
+defect, not a default.
+
+**The error faces.** No new codes. The engine's canonicalization
+refusals arrive structured: a reference outside the storage taxonomy (a
+contact the engine cannot resolve to a service id; a group id that is
+not 32-byte master-key material — the fixture group's 12-byte id
+included, a deliberate honesty mirror) answers CONVERSATION_NOT_RESOLVED
+retryable=false; the outage family answers STORAGE_UNAVAILABLE /
+STORAGE_WRITE_FAILED / STORAGE_READ_FAILED verbatim (retryable); the
+bare -32603 parameter face (an account the engine no longer holds, a
+malformed parameter the typed ladder cannot produce) folds into
+UPSTREAM_ERROR retryable=false — the 1.115 deterministic-refusal
+discipline, a replay fails the same way. The
+mutating face rides the reaction-class discipline: an indeterminate
+outcome answers SEND_OUTCOME_UNKNOWN and is never retried — the storage
+write may already have landed. Advertised through the new
+`conversation-state` capability tag (one capability for the read and
+write halves, the 1.53 appendix discipline).
+
+Tests: `conversation_state_round_trip_and_guards` — the handshake
+advertises the two methods plus the tag, the all-default read, the
+one-flag and two-flag writes composing over untouched bits (answers and
+read-backs), the byte-exact dispatch pair pinning the
+only-present-flags contract on the fixture log, the local refusal ladder
+(empty intent, wrong flag shapes, kind enum on both faces, unknown
+conversation/account), the CONVERSATION_NOT_RESOLVED shape pair (12-byte
+group id; phone number addressed as group), and the STORAGE_UNAVAILABLE
+sentinel pair with retryable=true. Lib tests join:
+`prepare_conversation_state_faces_ladder_and_payload` (the addressing
+trio, the only-present-flags payloads, the empty-intent refusal, the
+wire-order ladder) and `conversation_state_projection_parses_strictly`
+(the strict three-key parse, missing and wrong-shaped keys are protocol
+defects). The fixture gains the in-memory conversation-state store with
+the engine's canonicalization faces and the
+`[fixture-state-unavailable]` outage sentinel. Gates: 654 → 657 (lib
+499 → 501), all green — the total recalibrates at this revision (§1):
+the per-batch deltas were honest, the running total was not.
 
 ## 5. signal-cli Boundary
 

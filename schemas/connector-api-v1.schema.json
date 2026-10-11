@@ -59,6 +59,8 @@
             "conversations.getPinned",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.getState",
+            "conversations.setState",
             "conversations.acceptRequest",
             "conversations.declineRequest",
             "identities.get",
@@ -344,6 +346,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/conversationsSetBlockedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.getState" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsGetStateParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.setState" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsSetStateParams" }
             }
           }
         },
@@ -2131,6 +2155,64 @@
         "blocked": {
           "type": "boolean",
           "description": "true blocks the conversation, false unblocks it. Required — there is no toggle form."
+        }
+      }
+    },
+    "conversationsGetStateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "kind"],
+      "description": "Read one conversation's cloud state bits (contract revision 1.116, \u00a74.97, capability conversation-state): the engine reads the official Storage Service record's three bits — mutedUntilTimestamp (epoch ms; 0 = not muted), archived, markedUnread — off the record family the kind names (Contact / GroupV1 / GroupV2) and answers {mutedUntilTimestamp, archived, markedUnread}, all three keys always present (0/false = unset bit; a record the cloud has not materialized reads as the all-default projection — the honest idempotent read). The connector resolves the local conversation row first (CONVERSATION_NOT_FOUND before any upstream call) and forwards the resolved peer reference and kind. Structured engine errors: CONVERSATION_NOT_RESOLVED (the reference does not resolve in the engine's storage taxonomy — retryable=false) and the STORAGE_* family passed through verbatim (retryable); a parameter face the local ladder cannot reach (unregistered account) folds into UPSTREAM_ERROR (retryable=false — the deterministic-refusal discipline). Read lane; the connector persists nothing — the cloud record plus the desktop's own cache is the whole story.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to read; resolved against the account before any upstream call."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "group", "legacyGroup"],
+          "description": "The upstream conversation reference taxonomy: direct chat, GroupsV2 group, or GroupsV1 legacy group — the record family the engine reads."
+        }
+      }
+    },
+    "conversationsSetStateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "kind"],
+      "anyOf": [
+        { "required": ["mutedUntilTimestamp"] },
+        { "required": ["archived"] },
+        { "required": ["markedUnread"] }
+      ],
+      "description": "Write one conversation's cloud state bits (contract revision 1.116, \u00a74.97, capability conversation-state): the engine reads the official Storage Service record, flips only the flags the caller sent (absent = no write intent for that bit — the official partial-write grammar; the flag values carry no tri-state of their own), encodes the record back field-preserving (decode\u2192mutate\u2192encode keeps every other byte of the record, the official toModelRecorder semantics), and answers the post-write projection {mutedUntilTimestamp, archived, markedUnread} — the \u00a74.97 getState result face verbatim. At least one flag is required: an empty intent answers INVALID_REQUEST before any upstream call (there is no toggle-to-nothing form). The connector resolves the local conversation row first (CONVERSATION_NOT_FOUND before any upstream call) and forwards the resolved peer reference, kind, and the present flags only. The set is idempotent cloud-side: re-sending an already-satisfied intent is a no-op write that answers the same projection. mutedUntilTimestamp is epoch ms (0 clears the mute). Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Zero local writes: the projection converges through the desktop's own cache and later reads. Structured engine errors: CONVERSATION_NOT_RESOLVED (retryable=false) and the STORAGE_* family passed through verbatim (retryable); a bare engine -32603 (the parameter face the typed ladder cannot produce) folds into UPSTREAM_ERROR retryable=false; no new codes on this face.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to write; resolved against the account before any upstream call."
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "group", "legacyGroup"],
+          "description": "The upstream conversation reference taxonomy: direct chat, GroupsV2 group, or GroupsV1 legacy group — the record family the engine writes."
+        },
+        "mutedUntilTimestamp": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Write the mute expiry (epoch ms); 0 clears the mute. Absent = leave the current value untouched."
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "Write the archive bit. Absent = leave the current value untouched."
+        },
+        "markedUnread": {
+          "type": "boolean",
+          "description": "Write the marked-unread bit. Absent = leave the current value untouched."
         }
       }
     },

@@ -36,13 +36,14 @@ use crate::service::{
     CallsGroupProofParams, CallsLinkPresentationParams, CallsSendSignalParams,
     ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
     ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsListParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    GroupsApproveJoinRequestsParams, GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams,
-    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadParams,
-    HistoryImportRetryParams, HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams,
-    IdentitiesVerifyParams, LinkSessionParams, LinkStartParams, MessageGetTextParams,
-    MessageRequestParams, MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
+    ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
+    GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
+    HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessageRequestParams,
+    MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
     MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
     MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
     MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
@@ -2026,6 +2027,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid conversations.setBlocked params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.getState" => {
+            match serde_json::from_value::<ConversationsGetStateParams>(request.params) {
+                Ok(params) => match runtime.get_conversation_state(params).await {
+                    Ok(state) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(state).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.getState params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.setState" => {
+            match serde_json::from_value::<ConversationsSetStateParams>(request.params) {
+                Ok(params) => match runtime.set_conversation_state(params).await {
+                    Ok(state) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(state).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.setState params",
                         false,
                     ),
                 ),

@@ -4283,6 +4283,102 @@ impl ConnectorService {
         }))
     }
 
+    /// conversations.getState / conversations.setState (contract revision
+    /// 1.116, §4.97): bounds, kind enum, and resolution — the §4.47
+    /// blocked-write ladder verbatim, plus the §4.56 empty-peer guard (the
+    /// self row has no upstream address). No local row is read or written:
+    /// the cloud record's three bits are the whole state and the engine
+    /// answers the projection. The set face forwards only the flags the
+    /// caller sent (absent = no write intent, the engine's partial-write
+    /// grammar) and refuses an empty intent before any upstream call.
+    pub fn prepare_conversations_get_state(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+    ) -> Result<Value, ServiceError> {
+        let account = self.prepare_conversation_state_ladder(account_id, conversation_id, kind)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        if conversation.peer_key.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "this conversation has no upstream address",
+                false,
+            )));
+        }
+        Ok(json!({
+            "account": account.signal_account,
+            "conversationId": conversation.peer_key,
+            "kind": kind,
+        }))
+    }
+
+    pub fn prepare_conversations_set_state(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+        muted_until_timestamp: Option<u64>,
+        archived: Option<bool>,
+        marked_unread: Option<bool>,
+    ) -> Result<Value, ServiceError> {
+        if muted_until_timestamp.is_none() && archived.is_none() && marked_unread.is_none() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "at least one of mutedUntilTimestamp, archived, markedUnread is required",
+                false,
+            )));
+        }
+        let account = self.prepare_conversation_state_ladder(account_id, conversation_id, kind)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        if conversation.peer_key.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "this conversation has no upstream address",
+                false,
+            )));
+        }
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "conversationId": conversation.peer_key,
+            "kind": kind,
+        });
+        let object = upstream.as_object_mut().expect("object literal");
+        if let Some(muted_until) = muted_until_timestamp {
+            object.insert("mutedUntilTimestamp".to_string(), json!(muted_until));
+        }
+        if let Some(archived) = archived {
+            object.insert("archived".to_string(), json!(archived));
+        }
+        if let Some(marked_unread) = marked_unread {
+            object.insert("markedUnread".to_string(), json!(marked_unread));
+        }
+        Ok(upstream)
+    }
+
+    /// The shared §4.97 pre-ladder: bounds, kind enum, account resolution —
+    /// everything that fails closed before the conversation row is touched.
+    fn prepare_conversation_state_ladder(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+    ) -> Result<AccountRow, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        validate_pinned_kind(kind)?;
+        let account = self.resolve_account(account_id)?;
+        Ok(account)
+    }
+
     /// conversations.acceptRequest / conversations.declineRequest (contract
     /// revision 1.63, §4.56): bounds, kind classification, and resolution —
     /// the §4.47 blocked-write ladder verbatim. No local row is written: the
@@ -9222,6 +9318,18 @@ pub struct BlockedConversations {
     pub blocked: Vec<BlockedConversation>,
 }
 
+/// The §4.97 result of `conversations.getState` / `conversations.setState`
+/// (contract revision 1.116): the three storage-record bits verbatim, all
+/// three keys always present — 0/false is the unset bit, and the set face
+/// answers the post-write projection (the engine's read-back).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationState {
+    pub muted_until_timestamp: u64,
+    pub archived: bool,
+    pub marked_unread: bool,
+}
+
 /// The §4.81 result of `accounts.deviceCapabilities` (contract revision
 /// 1.100): the device-face registration read-back — the engine's answer
 /// with the bare `account` identity stripped (a bare identity never crosses
@@ -10276,6 +10384,33 @@ pub struct ConversationsSetBlockedParams {
     pub conversation_id: String,
     pub kind: String,
     pub blocked: bool,
+}
+
+/// `conversations.getState` params (contract revision 1.116, §4.97): the
+/// addressing pair plus the three-value kind enum — the §4.47 blocked face's
+/// taxonomy verbatim; the kind keys the cloud record family (Contact/GV1/GV2)
+/// the engine reads.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsGetStateParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub kind: String,
+}
+
+/// `conversations.setState` params (contract revision 1.116, §4.97): the
+/// same addressing trio with the three optional write flags — absent means
+/// no write intent for that bit (the engine's partial-write grammar), so the
+/// empty intent is refused in the prepare ladder, not on the wire.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsSetStateParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub kind: String,
+    pub muted_until_timestamp: Option<u64>,
+    pub archived: Option<bool>,
+    pub marked_unread: Option<bool>,
 }
 
 /// `conversations.acceptRequest` / `conversations.declineRequest` params
@@ -11594,6 +11729,32 @@ pub(crate) fn blocked_conversations_result(entries: &[Value]) -> BlockedConversa
         })
         .collect();
     BlockedConversations { blocked }
+}
+
+/// Parse the engine's three-bit projection (contract revision 1.116, §4.97):
+/// the three keys always ride (0/false = unset bit). A missing or
+/// wrong-shaped key is a protocol defect, not a default — the engine's
+/// contract has no partial projection on this face.
+pub(crate) fn conversation_state_from_engine(
+    result: &Value,
+) -> Result<ConversationState, ServiceError> {
+    let muted_until_timestamp = result
+        .get("mutedUntilTimestamp")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let archived = result
+        .get("archived")
+        .and_then(Value::as_bool)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let marked_unread = result
+        .get("markedUnread")
+        .and_then(Value::as_bool)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(ConversationState {
+        muted_until_timestamp,
+        archived,
+        marked_unread,
+    })
 }
 
 /// Project the engine's `engine.deviceCapabilities` answer onto the wire
@@ -17323,6 +17484,129 @@ mod tests {
             .prepare_conversations_set_blocked(&account.id, "", "contact", true)
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// The §4.97 conversation-state faces (contract revision 1.116): the
+    /// §4.47 ladder verbatim — the addressing trio forwards the resolved
+    /// peer reference and kind; the set payload carries only the flags the
+    /// caller sent; the empty intent, the kind enum, and the bounds fail
+    /// closed before any upstream call.
+    #[test]
+    fn prepare_conversation_state_faces_ladder_and_payload() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        // getState: peer reference + kind, never the opaque local id.
+        let upstream = service
+            .prepare_conversations_get_state(&account.id, &conversation.id, "contact")
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["conversationId"], conversation.peer_key);
+        assert_eq!(upstream["kind"], "contact");
+
+        // setState: only the flags the caller sent travel (absent = no write
+        // intent, the engine's partial-write grammar).
+        let upstream = service
+            .prepare_conversations_set_state(
+                &account.id,
+                &conversation.id,
+                "contact",
+                None,
+                Some(true),
+                None,
+            )
+            .unwrap();
+        assert_eq!(upstream["archived"], true);
+        assert!(upstream.get("mutedUntilTimestamp").is_none());
+        assert!(upstream.get("markedUnread").is_none());
+
+        let upstream = service
+            .prepare_conversations_set_state(
+                &account.id,
+                &conversation.id,
+                "group",
+                Some(7_200_000),
+                Some(false),
+                Some(true),
+            )
+            .unwrap();
+        assert_eq!(upstream["kind"], "group");
+        assert_eq!(upstream["mutedUntilTimestamp"], 7_200_000);
+        assert_eq!(upstream["markedUnread"], true);
+        assert!(upstream.get("archived").is_some());
+
+        // Empty intent: INVALID_REQUEST before any upstream call.
+        let error = service
+            .prepare_conversations_set_state(
+                &account.id,
+                &conversation.id,
+                "contact",
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // Fail-closed ladder in wire order: bounds, kind enum, unknown
+        // account, unknown conversation.
+        let error = service
+            .prepare_conversations_get_state(&account.id, "", "contact")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_conversations_get_state(&account.id, &"A".repeat(257), "contact")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_conversations_get_state(&account.id, &conversation.id, "story")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_conversations_get_state("no-such-account", &conversation.id, "contact")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+        let error = service
+            .prepare_conversations_get_state(&account.id, "no-such-conversation", "contact")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+    }
+
+    /// The §4.97 projection parser: all three keys always ride; a missing or
+    /// wrong-shaped key is a protocol defect, not a default — the engine's
+    /// contract has no partial projection on this face.
+    #[test]
+    fn conversation_state_projection_parses_strictly() {
+        let full = serde_json::json!({
+            "mutedUntilTimestamp": 7_200_000_u64,
+            "archived": true,
+            "markedUnread": false,
+        });
+        let state = conversation_state_from_engine(&full).unwrap();
+        assert_eq!(state.muted_until_timestamp, 7_200_000);
+        assert!(state.archived);
+        assert!(!state.marked_unread);
+
+        for missing in ["mutedUntilTimestamp", "archived", "markedUnread"] {
+            let mut broken = full.clone();
+            broken.as_object_mut().expect("object").remove(missing);
+            assert!(
+                matches!(
+                    conversation_state_from_engine(&broken),
+                    Err(ServiceError::Engine(EngineError::Protocol))
+                ),
+                "{missing}"
+            );
+        }
+        let wrong_shape = serde_json::json!({
+            "mutedUntilTimestamp": "soon",
+            "archived": true,
+            "markedUnread": false,
+        });
+        assert!(matches!(
+            conversation_state_from_engine(&wrong_shape),
+            Err(ServiceError::Engine(EngineError::Protocol))
+        ));
     }
 
     /// The message-request faces (contract revision 1.63, §4.56): the direct

@@ -6053,6 +6053,453 @@ async fn groups_update_quit_round_trip_and_guards() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// conversations.getState / conversations.setState end to end (contract
+/// 1.116, §4.97, capability conversation-state): the read answers the
+/// all-default projection, the partial writes answer the post-write
+/// projection and persist across reads, only the sent flags ride the wire
+/// (asserted byte-exact on the fixture dispatch log), and the honest engine
+/// faces pass through — CONVERSATION_NOT_RESOLVED for a reference outside
+/// the engine's storage taxonomy (a 12-byte fixture group id is not 32-byte
+/// master-key material; a phone number is not group material either),
+/// STORAGE_UNAVAILABLE for the outage sentinel — while the local refusal
+/// ladder (empty intent, wrong flag shapes, kind enum, unknown rows)
+/// answers before any upstream call.
+#[tokio::test]
+async fn conversation_state_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    // The handshake carries the new faces before anything else runs.
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "conversations.getState",
+        "conversations.setState",
+        "conversation-state",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-ConversationState" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The §4.58 factor probe rides the first conversations.list (the batch-A
+    // choreography): burn it before the staged envelopes are written so the
+    // burst stays under the typing flush's control.
+    let _ = request(
+        &mut client,
+        "probe-burn",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+
+    // Stage the storage-outage sentinel group; the receive projection
+    // materializes its row with the sentinel groupId verbatim as peer
+    // reference.
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 64,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-state-unavailable]",
+                        "type": "UPDATE",
+                        "groupName": "State Sentinel",
+                        "revision": 4
+                    }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let listed = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group" && row["title"] == "Fixture Group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with the fixture group");
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "state round trip",
+            "clientRequestId": "state-rt-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Flush the staged envelope through the typing hook and wait for the
+    // sentinel row's summary mirror.
+    let _ = request(
+        &mut client,
+        "flush-state",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "stop": true
+        }),
+    )
+    .await;
+    let mut sentinel_conversation = None;
+    for _ in 0..16 {
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the sentinel group's conversation.changed never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame["event"] == "conversation.changed" && frame["data"]["title"] == "State Sentinel" {
+            sentinel_conversation = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            break;
+        }
+    }
+    let sentinel_conversation = sentinel_conversation
+        .expect("the staged sentinel group must materialize with its mirrored title");
+
+    // The all-default read: a conversation the cloud record holds at the
+    // unset bits reads {0, false, false}, all three keys present.
+    let initial = request(
+        &mut client,
+        "state-initial",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(
+        initial["result"],
+        json!({
+            "mutedUntilTimestamp": 0,
+            "archived": false,
+            "markedUnread": false
+        }),
+        "{initial}"
+    );
+
+    // The partial write: only the sent flag rides the wire, the answer is
+    // the post-write projection, and a read-back observes the write.
+    let archived = request(
+        &mut client,
+        "state-archive",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "archived": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        archived["result"],
+        json!({
+            "mutedUntilTimestamp": 0,
+            "archived": true,
+            "markedUnread": false
+        }),
+        "{archived}"
+    );
+    let read_back = request(
+        &mut client,
+        "state-read-back",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(read_back["result"]["archived"], true, "{read_back}");
+
+    // The two-flag write composes over the untouched bit.
+    let muted = request(
+        &mut client,
+        "state-mute",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "mutedUntilTimestamp": 7_200_000,
+            "markedUnread": true
+        }),
+    )
+    .await;
+    assert_eq!(
+        muted["result"],
+        json!({
+            "mutedUntilTimestamp": 7_200_000,
+            "archived": true,
+            "markedUnread": true
+        }),
+        "{muted}"
+    );
+
+    // The exact upstream contract: the resolved peer reference, the kind,
+    // and only the flags each write carried.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the dispatch");
+    let state_writes: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| {
+            params.get("kind").is_some()
+                && (params.get("archived").is_some() || params.get("mutedUntilTimestamp").is_some())
+        })
+        .collect();
+    assert_eq!(state_writes.len(), 2, "{state_writes:?}");
+    assert_eq!(
+        state_writes[0],
+        json!({
+            "account": "+15555550100",
+            "conversationId": "+15555550102",
+            "kind": "contact",
+            "archived": true
+        }),
+        "{state_writes:?}"
+    );
+    assert_eq!(
+        state_writes[1],
+        json!({
+            "account": "+15555550100",
+            "conversationId": "+15555550102",
+            "kind": "contact",
+            "mutedUntilTimestamp": 7_200_000,
+            "markedUnread": true
+        }),
+        "{state_writes:?}"
+    );
+
+    // The local refusal ladder, each before any upstream call: an empty
+    // intent (no write intent — there is no toggle-to-nothing form), a
+    // wrong-shaped flag, a flag value that is not a number, and the kind
+    // enum on both faces.
+    let empty = request(
+        &mut client,
+        "state-empty",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(empty["error"]["code"], "INVALID_REQUEST", "{empty}");
+    let wrong_shape = request(
+        &mut client,
+        "state-wrong-shape",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "archived": "yes"
+        }),
+    )
+    .await;
+    assert_eq!(wrong_shape["error"]["code"], "INVALID_REQUEST");
+    let bad_mute = request(
+        &mut client,
+        "state-bad-mute",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "contact",
+            "mutedUntilTimestamp": "soon"
+        }),
+    )
+    .await;
+    assert_eq!(bad_mute["error"]["code"], "INVALID_REQUEST");
+    // The kind enum refuses on both faces — the get face with the bare
+    // addressing trio (its params carry no flags), the set face with a flag
+    // present so the empty-intent gate does not outrank the kind ladder.
+    let refused_get = request(
+        &mut client,
+        "state-kind-get",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "story"
+        }),
+    )
+    .await;
+    assert_eq!(refused_get["error"]["code"], "INVALID_REQUEST");
+    let refused_set = request(
+        &mut client,
+        "state-kind-set",
+        "conversations.setState",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "kind": "story",
+            "archived": true
+        }),
+    )
+    .await;
+    assert_eq!(refused_set["error"]["code"], "INVALID_REQUEST");
+
+    // Unknown rows answer the local NOT_FOUND ladder.
+    let unknown_conversation = request(
+        &mut client,
+        "state-unknown-conversation",
+        "conversations.getState",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation",
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"], "CONVERSATION_NOT_FOUND",
+        "{unknown_conversation}"
+    );
+    let unknown_account = request(
+        &mut client,
+        "state-unknown-account",
+        "conversations.getState",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": direct_conversation,
+            "kind": "contact"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND",
+        "{unknown_account}"
+    );
+
+    // The engine's canonicalization refusal (1.116, §4.97): a reference
+    // outside the storage taxonomy — the fixture group's 12-byte id is not
+    // 32-byte master-key material, and a phone number is not group material
+    // either — answers CONVERSATION_NOT_RESOLVED, retryable=false.
+    for (request_id, conversation, kind) in [
+        ("state-group-shape", group_conversation.as_str(), "group"),
+        ("state-kind-mismatch", direct_conversation.as_str(), "group"),
+    ] {
+        let unresolved = request(
+            &mut client,
+            request_id,
+            "conversations.getState",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation,
+                "kind": kind
+            }),
+        )
+        .await;
+        assert_eq!(
+            unresolved["error"]["code"], "CONVERSATION_NOT_RESOLVED",
+            "{request_id}: {unresolved}"
+        );
+        assert_eq!(unresolved["error"]["retryable"], false, "{request_id}");
+    }
+
+    // The storage-outage sentinel: both faces answer STORAGE_UNAVAILABLE
+    // verbatim, retryable=true (the outage may clear).
+    for (request_id, method, extra) in [
+        ("state-outage-get", "conversations.getState", json!({})),
+        (
+            "state-outage-set",
+            "conversations.setState",
+            json!({ "archived": true }),
+        ),
+    ] {
+        let mut params = json!({
+            "accountId": account_id,
+            "conversationId": sentinel_conversation,
+            "kind": "group"
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            params
+                .as_object_mut()
+                .unwrap()
+                .insert(key.clone(), value.clone());
+        }
+        let outage = request(&mut client, request_id, method, params).await;
+        assert_eq!(
+            outage["error"]["code"], "STORAGE_UNAVAILABLE",
+            "{request_id}: {outage}"
+        );
+        assert_eq!(outage["error"]["retryable"], true, "{request_id}");
+    }
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract 1.49 (§4.48): the reportSpam round trip. Envelopes staged
 /// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
 /// values; the report addresses the persisted rows, guid-less rows answer

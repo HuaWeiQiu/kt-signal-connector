@@ -24,29 +24,30 @@ use crate::service::{
     AccountsSetUsernameParams, AccountsUpdateConfigurationParams, AttachmentSendTarget,
     AvatarDownload, BlockedConversations, CallsSendSignalParams, ChatFolderSyncs,
     ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome,
-    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams,
-    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
-    GroupsApproveJoinRequestsParams, GroupsQuitParams, GroupsRevokeInvitesParams,
-    GroupsTerminateParams, GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent,
-    IdentitiesGetParams, IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome,
-    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
-    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MessageRequestOutcome,
-    MessageRequestParams, MessagesReportSpamParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
-    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    ConversationState, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
+    GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails, GroupsApproveJoinRequestsParams,
+    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
+    MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest,
+    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
+    MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget, PinnedConversations,
+    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
+    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
+    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
+    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
     StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
     UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
     account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
-    chat_folder_syncs_result, identity_from_engine, pinned_conversations_result,
-    sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
-    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
-    store_search_messages, validate_account_delete_operation_id,
+    chat_folder_syncs_result, conversation_state_from_engine, identity_from_engine,
+    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
+    validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -3546,6 +3547,87 @@ impl RuntimeSupervisor {
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// conversations.getState (contract revision 1.116, §4.97, capability
+    /// conversation-state): bounds + resolution under the service lock, then
+    /// the read-only engine call — the three cloud bits read back, all keys
+    /// always present (0/false = unset bit). The connector persists nothing:
+    /// the cloud record is the whole state.
+    pub async fn get_conversation_state(
+        &self,
+        params: ConversationsGetStateParams,
+    ) -> Result<ConversationState, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_get_state(
+                &params.account_id,
+                &params.conversation_id,
+                &params.kind,
+            )?
+        };
+        match engine
+            .call("getConversationState", upstream, CallClass::ReadOnly)
+            .await
+        {
+            Ok(result) => conversation_state_from_engine(&result),
+            // The bare -32603 face (an account the engine no longer holds, a
+            // malformed parameter the typed ladder cannot produce) is a
+            // deterministic refusal — retryable=false, the 1.115 discipline.
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// conversations.setState (contract revision 1.116, §4.97, capability
+    /// conversation-state): bounds + resolution under the service lock, then
+    /// the mutating engine call — the reaction-class discipline verbatim (an
+    /// indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never
+    /// retried: the storage write may already have landed). Only the flags
+    /// the caller sent travel (the engine's partial-write grammar); the
+    /// success result is the post-write projection read back, not a local
+    /// echo. Zero local writes: the cloud record is the whole state.
+    pub async fn set_conversation_state(
+        &self,
+        params: ConversationsSetStateParams,
+    ) -> Result<ConversationState, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_conversations_set_state(
+                &params.account_id,
+                &params.conversation_id,
+                &params.kind,
+                params.muted_until_timestamp,
+                params.archived,
+                params.marked_unread,
+            )?
+        };
+        match engine
+            .call("setConversationState", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => conversation_state_from_engine(&result),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            // The bare -32603 face rejects the parameters before any write
+            // lands — a deterministic refusal, retryable=false (the 1.115
+            // groups discipline).
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),

@@ -140,6 +140,13 @@ pub const METHODS: &[MethodRow] = &[
     // post-write cloud blocked list read back, not a local echo; advertised
     // through `blocked-write`.
     ("conversations.setBlocked", Lane::Send, true, "send"),
+    // Conversation state trio (contract 1.116, §4.97): get is a bounded
+    // cloud-backed read of the storage records' mute/archive/unread bits;
+    // set is the mutating storage-service partial write — reaction-class
+    // write-lane mutex and delete barrier, no local persistence on either
+    // side; advertised through `conversation-state`.
+    ("conversations.getState", Lane::Read, false, "read"),
+    ("conversations.setState", Lane::Send, true, "send"),
     // Sticker pack sync (contract 1.37, §4.34): getSyncs is a bounded
     // cloud-backed read of the account's StickerPackRecord set; setSync is
     // the mutating storage-service write — reaction-class write-lane mutex
@@ -564,7 +571,12 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// marks the §4.78 chat-folder sync faces (`chatFolders.list` read over the
 /// account's ChatFolderRecord set plus the `chatFolders.setRecords`
 /// storage-service write — one capability for the read and write halves,
-/// the 1.36/1.37 sync-face discipline). They never
+/// the 1.36/1.37 sync-face discipline); and `conversation-state` (contract
+/// revision 1.116) marks the §4.97 conversation-state faces
+/// (`conversations.getState` read over the storage records'
+/// mutedUntilTimestamp/archived/markedUnread bits plus `conversations.setState`
+/// partial write — one capability for the read and write halves, the 1.53
+/// appendix discipline). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -606,6 +618,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "safety-number",
     "stories",
     "chat-folders",
+    "conversation-state",
 ];
 
 #[cfg(test)]
@@ -636,6 +649,7 @@ mod tests {
             "stickerPacks.getImage",
             "conversations.getPinned",
             "stickerPacks.getSyncs",
+            "conversations.getState",
             "history.importStatus",
             "backups.exportStatus",
             "backups.exportFile.open",
@@ -681,6 +695,7 @@ mod tests {
             "presence.setTypingMessage",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.setState",
             "conversations.setExpireTimer",
             "groups.update",
             "groups.quit",
@@ -735,6 +750,7 @@ mod tests {
             "accounts.deleteLocalData",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.setState",
             "conversations.setExpireTimer",
             "groups.update",
             "groups.quit",

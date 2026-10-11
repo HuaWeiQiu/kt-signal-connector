@@ -59,6 +59,39 @@ BLOCKED_STATE = [
     {"conversationId": "+15555550103", "kind": "contact"},
     {"conversationId": "bGVnYWN5LWdyb3VwLTE=", "kind": "legacyGroup"},
 ]
+# Contract 1.116 §4.97 conversation-state fixture state: keyed
+# (kind:conversationId) → the three storage-record bits, seeded on first
+# touch with the all-default projection (the cloud record's unset bits).
+# getConversationState reads it, setConversationState mutates it in place so
+# a read-back after a write observes the write. Canonicalization faces are
+# mirrored from the engine's storage ladder: a contact reference outside the
+# fixture's contacted numbers, or a group reference that is not 32-byte
+# standard-base64 master-key material, answers CONVERSATION_NOT_RESOLVED;
+# the "[fixture-state-unavailable]" sentinel answers STORAGE_UNAVAILABLE.
+CONVERSATION_STATE = {}
+CONVERSATION_STATE_KNOWN_CONTACTS = ("+15555550101", "+15555550102", "+15555550103")
+
+
+def conversation_state_default():
+    return {"mutedUntilTimestamp": 0, "archived": False, "markedUnread": False}
+
+
+def canonical_conversation_reference(kind, conversation_id):
+    """The engine's storage canonicalization refusal face (§4.97): a
+    reference that cannot key a storage record of the named family answers
+    None (the caller turns it into CONVERSATION_NOT_RESOLVED)."""
+    if kind == "contact":
+        return conversation_id in CONVERSATION_STATE_KNOWN_CONTACTS
+    if kind in ("group", "legacyGroup"):
+        if kind == "group":
+            try:
+                decoded = base64.b64decode(conversation_id, validate=True)
+            except Exception:
+                return False
+            return len(decoded) == 32
+        return bool(conversation_id)
+    return None
+
 # Contract 1.95 chat-folder sync fixture state: the Storage Service
 # ChatFolderRecordJson projection in storage order — the full 11-key record
 # face the engine projects (id/name/position/booleans/folderType/both
@@ -1361,6 +1394,50 @@ for line in sys.stdin:
             emit_json(response)
             continue
         result = {"dataUri": AVATAR_DATA_URI, "size": len(AVATAR_PNG_BYTES)}
+    elif method == "getConversationState":
+        # Contract 1.116 §4.97 state read: the storage ladder's canonical
+        # refusal face first (unknown record family reference →
+        # CONVERSATION_NOT_RESOLVED, the engine's ConversationNotResolved),
+        # then the three-bit projection — an unseeded (kind, id) reads as the
+        # all-default record (the cloud record's unset bits). Sentinel
+        # conversationId "[fixture-state-unavailable]" answers
+        # STORAGE_UNAVAILABLE (the storage-outage face; disjoint from every
+        # other face's magic). Read face, no SEND_LOG dispatch recording
+        # (read-lane discipline, listContacts precedent).
+        account = params.get("account")
+        kind = params.get("kind")
+        conversation_id = params.get("conversationId")
+        if not account or kind not in ("contact", "group", "legacyGroup") or not conversation_id:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "invalid getConversationState params"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "[fixture-state-unavailable]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        if not canonical_conversation_reference(kind, conversation_id):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "CONVERSATION_NOT_RESOLVED"},
+            }
+            emit_json(response)
+            continue
+        key = f"{kind}:{conversation_id}"
+        state = dict(CONVERSATION_STATE.get(key, conversation_state_default()))
+        result = {
+            "mutedUntilTimestamp": state["mutedUntilTimestamp"],
+            "archived": state["archived"],
+            "markedUnread": state["markedUnread"],
+        }
     elif method == "setConversationBlocked":
         # Contract 1.48 §4.47 blocked write: record the exact upstream params
         # (tests assert the resolved conversationId/kind/blocked contract),
@@ -1399,6 +1476,97 @@ for line in sys.stdin:
             blocked.append({"conversationId": conversation_id, "kind": kind})
         BLOCKED_STATE[:] = blocked
         result = {"blocked": list(BLOCKED_STATE)}
+    elif method == "setConversationState":
+        # Contract 1.116 §4.97 state write: record the exact upstream params
+        # (tests assert the resolved reference + the only-present-flags
+        # partial-write contract), apply the write over the fixture state,
+        # answer the post-write three-bit projection. Parameter discipline
+        # mirrors the engine face verbatim: mutedUntilTimestamp must be a
+        # number, archived/markedUnread booleans, at least one flag present —
+        # anything else is the -32603 parameter face. Sentinels mirror the
+        # read face: "[fixture-state-unavailable]" answers STORAGE_UNAVAILABLE;
+        # the canonicalization refusal answers CONVERSATION_NOT_RESOLVED. No
+        # crash sentinel: the sibling mutating faces carry the unknown-outcome
+        # drills (25/29/30/31/32/33).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        kind = params.get("kind")
+        conversation_id = params.get("conversationId")
+        if not params.get("account") or kind not in (
+            "contact",
+            "group",
+            "legacyGroup",
+        ) or not conversation_id:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "invalid setConversationState params"},
+            }
+            emit_json(response)
+            continue
+        muted_until = params.get("mutedUntilTimestamp")
+        archived = params.get("archived")
+        marked_unread = params.get("markedUnread")
+        if muted_until is None and archived is None and marked_unread is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "no write intent"},
+            }
+            emit_json(response)
+            continue
+        # JSON true/false are ints in Python — gate the bool leak first.
+        if muted_until is not None and (
+            isinstance(muted_until, bool) or not isinstance(muted_until, int)
+        ):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "invalid mutedUntilTimestamp"},
+            }
+            emit_json(response)
+            continue
+        if (archived is not None and not isinstance(archived, bool)) or (
+            marked_unread is not None and not isinstance(marked_unread, bool)
+        ):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "invalid boolean flag"},
+            }
+            emit_json(response)
+            continue
+        if conversation_id == "[fixture-state-unavailable]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        if not canonical_conversation_reference(kind, conversation_id):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "CONVERSATION_NOT_RESOLVED"},
+            }
+            emit_json(response)
+            continue
+        key = f"{kind}:{conversation_id}"
+        state = dict(CONVERSATION_STATE.get(key, conversation_state_default()))
+        if muted_until is not None:
+            state["mutedUntilTimestamp"] = muted_until
+        if archived is not None:
+            state["archived"] = archived
+        if marked_unread is not None:
+            state["markedUnread"] = marked_unread
+        CONVERSATION_STATE[key] = state
+        result = {
+            "mutedUntilTimestamp": state["mutedUntilTimestamp"],
+            "archived": state["archived"],
+            "markedUnread": state["markedUnread"],
+        }
     elif method == "sendCallMessage":
         # Contract 1.50 §4.48 call-signaling outbound face: record the exact
         # upstream params (tests assert the resolved recipient + verbatim
