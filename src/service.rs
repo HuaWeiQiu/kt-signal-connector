@@ -973,6 +973,27 @@ pub enum HostSideEvent {
         account_id: String,
         deletes: Vec<SyncDeleteForMeGroup>,
     },
+    /// The engine's `syncMessage.verified` projection forwarded (contract
+    /// 1.103, §4.84): the account's own linked device settled one peer's
+    /// safety-number trust state — `verified` / `unverified` / `default`, the
+    /// engine's lowercase trust words. The engine already wrote the state to
+    /// its authoritative sidecar store before projecting, and the connector
+    /// keeps no trust bit of its own (the §4.61 identity read-through is the
+    /// host's reconciliation path), so this is a pure notify: the record
+    /// forwards with the resolved local `conversationId` when the destination
+    /// laddered to a thread (the §4.81 resolution family), absent otherwise.
+    /// Transient: nothing persists and nothing self-heals store-side — a
+    /// missed delivery converges through the next `identities.get` read, the
+    /// same read-through the official desktop leans on for its own verified
+    /// presentation.
+    IdentityVerifiedChanged {
+        account_id: String,
+        destination_uuid: String,
+        state: &'static str,
+        destination_number: Option<String>,
+        identity_key: Option<String>,
+        conversation_id: Option<String>,
+    },
 }
 
 /// One conversation-scoped delete group on the `message.deleteForMe` event
@@ -6248,6 +6269,13 @@ impl ConnectorService {
         if let ControlReceive::SyncDeleteForMe { deletes } = &control {
             return self.apply_sync_delete_for_me(&account, deletes);
         }
+        // Contract 1.103 (§4.84 consume batch): the verified sync addresses
+        // one peer, not an envelope source (the envelope is our own account).
+        // Intercepted before the generic ladder with the same resolution
+        // family.
+        if let ControlReceive::SyncVerified { verified } = &control {
+            return self.apply_sync_verified(&account, verified);
+        }
         // Story receives (contract 1.76, §4.67): a story addresses no
         // conversation — the bounded projection forwards as the transient
         // `story.received` event and the connector keeps no row. The
@@ -6896,6 +6924,10 @@ impl ConnectorService {
             // span conversations); this arm is the same
             // unreachable-in-practice guard too.
             ControlReceive::SyncDeleteForMe { .. } => Ok(Vec::new()),
+            // The verified sync is intercepted the same way (it addresses its
+            // own destination, never an envelope source); this arm is the
+            // same unreachable-in-practice guard too.
+            ControlReceive::SyncVerified { .. } => Ok(Vec::new()),
         }
     }
 
@@ -7307,6 +7339,44 @@ impl ConnectorService {
                 .filter(|conversation| conversation.kind == "group"));
         }
         self.sync_sender_conversation(account, conversation_id, None)
+    }
+
+    /// Contract 1.103 (§4.84): forward one `syncMessage.verified` projection
+    /// — the account's own linked device settled a peer's safety-number trust
+    /// state (the official SyncMessage.verified face). Pure forwarding, by
+    /// three honest counts: the engine already applied the state to its own
+    /// authoritative sidecar store before projecting (the write happened
+    /// upstream of this face), the connector store carries no trust bit to
+    /// mirror into (conversations/contacts/peer_identities are all
+    /// trust-less — §4.84 records the discretion), and the host's own
+    /// reconciliation path is the §4.61 `identities.get` read-through. The
+    /// one enrichment is the §4.81 resolution family: the destination walks
+    /// the number/ACI rungs and the destination's own number rides first when
+    /// the projection resolved one — a hit carries the local `conversationId`
+    /// (the id form the desktop addresses), a miss stays conversation-less
+    /// and the record still forwards (the official client drops its
+    /// no-conversation sync; this connector forwards the state change and
+    /// lets the host join — the trust state is self-describing by its
+    /// destination). Transient: nothing persists, nothing self-heals; a
+    /// missed delivery converges through the next `identities.get` read.
+    fn apply_sync_verified(
+        &mut self,
+        account: &AccountRow,
+        verified: &crate::engine::SyncVerifiedState,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let conversation = self.sync_sender_conversation(
+            account,
+            &verified.destination_uuid,
+            verified.destination_number.as_deref(),
+        )?;
+        Ok(vec![HostSideEvent::IdentityVerifiedChanged {
+            account_id: account.id.clone(),
+            destination_uuid: verified.destination_uuid.clone(),
+            state: verified.state,
+            destination_number: verified.destination_number.clone(),
+            identity_key: verified.identity_key.clone(),
+            conversation_id: conversation.map(|conversation| conversation.id),
+        }])
     }
 
     /// Contract 1.70 (§4.58 consume batch): consume one
@@ -19444,6 +19514,88 @@ mod tests {
         };
         assert!(deletes[0].messages[0].message_id.is_none());
         assert!(stored(&service, &conversation.id, "m1").is_none());
+    }
+
+    /// Contract 1.103 (§4.84): the verified sync forwards as one transient
+    /// event — the destination ladders to the thread through the recorded
+    /// ACI→peer-key mapping (with the projection's number riding the first
+    /// rung), an unknown destination stays conversation-less, and the
+    /// connector store keeps no trust bit: nothing converges beside the
+    /// event (no summary rides, nothing mirrors).
+    #[test]
+    fn sync_verified_forwards_with_the_resolved_thread() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        let sync =
+            |destination_uuid: &str, destination_number: Option<&str>, state: &'static str| {
+                let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncVerified {
+                    verified: crate::engine::SyncVerifiedState {
+                        destination_uuid: destination_uuid.into(),
+                        destination_number: destination_number.map(str::to_string),
+                        identity_key: Some(
+                            "05ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12"
+                                .into(),
+                        ),
+                        state,
+                    },
+                },
+            );
+                receive.source = None;
+                receive.source_uuid = None;
+                receive
+            };
+
+        // The destination ladders (number rung, then the recorded ACI
+        // mapping) to the local thread.
+        let events = service
+            .ingest_receive(
+                sync(ACI, Some("+15555550101"), "verified"),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::IdentityVerifiedChanged {
+            account_id: event_account,
+            destination_uuid,
+            state,
+            destination_number,
+            identity_key,
+            conversation_id,
+        } = &events[0]
+        else {
+            panic!("expected the verified event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(destination_uuid, ACI);
+        assert_eq!(*state, "verified");
+        assert_eq!(destination_number.as_deref(), Some("+15555550101"));
+        assert!(identity_key.is_some());
+        assert_eq!(conversation_id.as_deref(), Some(conversation.id.as_str()));
+
+        // An unknown destination forwards conversation-less — the event is
+        // the whole delivery, nothing converges beside it.
+        let events = service
+            .ingest_receive(
+                sync("22222222-2222-2222-2222-222222222222", None, "unverified"),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::IdentityVerifiedChanged {
+            conversation_id, ..
+        } = &events[0]
+        else {
+            panic!("expected the unverified event: {:?}", events[0]);
+        };
+        assert!(conversation_id.is_none());
     }
 
     /// Contract 1.100 (§4.81 D3): the groupChanged batch forwards verbatim

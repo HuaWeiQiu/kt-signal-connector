@@ -3049,6 +3049,39 @@ where
             )
             .await
         }
+        HostSideEvent::IdentityVerifiedChanged {
+            account_id,
+            destination_uuid,
+            state,
+            destination_number,
+            identity_key,
+            conversation_id,
+        } => {
+            // Contract 1.103, §4.84: the verified record forwards flat with
+            // the absent-optional discipline — an unresolved destination
+            // stays conversation-less, and the number/key ride only when the
+            // projection carried them (the story.received conditional-insert
+            // style).
+            let mut payload = json!({
+                "accountId": account_id,
+                "destinationUuid": destination_uuid,
+                "state": state,
+            });
+            if let Some(number) = destination_number {
+                payload["destinationNumber"] = json!(number);
+            }
+            if let Some(key) = identity_key {
+                payload["identityKey"] = json!(key);
+            }
+            if let Some(conversation_id) = conversation_id {
+                payload["conversationId"] = json!(conversation_id);
+            }
+            send_shared(
+                writer,
+                &HostEvent::new("identity.verifiedChanged", payload),
+            )
+            .await
+        }
     }
 }
 
@@ -3996,5 +4029,76 @@ mod tests {
         // messageId-less, an unresolved group stays conversation-less.
         assert!(first["messages"][1].get("messageId").is_none());
         assert!(frame["data"]["deletes"][1].get("conversationId").is_none());
+    }
+
+    /// Contract 1.103 (§4.84): the `identity.verifiedChanged` wire frame —
+    /// the record rides flat with the absent-optional discipline: the
+    /// number/key/conversationId keys exist only when the projection carried
+    /// them or the destination resolved.
+    #[tokio::test]
+    async fn verified_changed_event_rides_the_flat_record() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::IdentityVerifiedChanged {
+                account_id: "acct-1".into(),
+                destination_uuid: "11111111-1111-1111-1111-111111111111".into(),
+                state: "verified",
+                destination_number: Some("+15555550101".into()),
+                identity_key: Some(
+                    "05ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12".into(),
+                ),
+                conversation_id: Some("conv-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::IdentityVerifiedChanged {
+                account_id: "acct-1".into(),
+                destination_uuid: "22222222-2222-2222-2222-222222222222".into(),
+                state: "default",
+                destination_number: None,
+                identity_key: None,
+                conversation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut lines = Framed::new(&mut server, LinesCodec::new());
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the event frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "identity.verifiedChanged");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(
+            frame["data"]["destinationUuid"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(frame["data"]["state"], "verified");
+        assert_eq!(frame["data"]["destinationNumber"], "+15555550101");
+        assert!(frame["data"]["identityKey"].is_string());
+        assert_eq!(frame["data"]["conversationId"], "conv-1");
+
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the second frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["data"]["state"], "default");
+        // The absent-optional discipline: an unresolved destination carries
+        // none of the three optional keys.
+        assert!(frame["data"].get("destinationNumber").is_none());
+        assert!(frame["data"].get("identityKey").is_none());
+        assert!(frame["data"].get("conversationId").is_none());
     }
 }

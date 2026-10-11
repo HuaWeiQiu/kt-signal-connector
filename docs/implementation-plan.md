@@ -5,29 +5,29 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.102 (2026-10-11; the delete-for-me consume face (§4.83): the
-  engine's `syncMessage.deleteForMe` projection — the account deleted messages for
-  itself on another linked device, the official #handleDeleteForMeSync face — consumed
-  through three faces. (a) The receive: a bounded control receive (64 groups × 256
-  entries) with the fail-closed parse (the author id non-empty, trimmed, truncated at
-  128; the timestamp strictly positive — the engine's zero-defaulted entries drop; a
-  group whose entries all die drops; a batch that parses to nothing falls back to the
-  plain `syncMessage` skip instead of becoming a phantom event). (b) The store mirror:
-  a hit removes the row outright — any direction, addressed by conversation + sentAt
-  (the official `removeMessageById` anchor) — and repairs the conversation summary and
-  the account aggregates in the same transaction, `ConversationChanged`/`AccountChanged`
-  riding each actual removal; replayed controls mirror nothing and touch no summary.
-  (c) The forward: the new `message.deleteForMe` host event carries the accountId and
-  the groups, each enriched with the local `conversationId` when the group's identity
-  resolved (the projection's 32-byte base64 conversation, else the §4.81 resolution
-  ladder — absent that, per-entry author laddering, the own-author entry naturally
-  dropping exactly as the official no-target-conversation discard) and the removed
-  rows' `messageId`s; absent optionals stay absent, and the event is transient beside
-  the mirror — a missed delivery converges on the next conversation read exactly like
-  `message.expired`. No new method, error, or capability (the `message.expired`
-  precedent for core events); the schema gains the event enum entry, the allOf[11]
-  data block, and three schema-pairing bounds; tests 614 → 618, all green) —
-  previously 1.101 (2026-10-11; the credential-death classification batch
+- Contract revision: 1.103 (2026-10-11; the verified trust-sync consume face (§4.84): the
+  engine's `syncMessage.verified` projection — the account's own linked device settled one
+  peer's safety-number trust state, the official SyncMessage.verified face — consumed through
+  two faces. (a) The receive: a fail-closed parse whose gates are the engine's lowercase trust
+  word whitelist (`verified`/`unverified`/`default` — anything else, including the wire enum
+  numbers, is a hostile face) and the ServiceId UUID shape gate on the destination (the engine
+  projects `service_id_string()` verbatim); the optional `destinationNumber`/`identityKey` keys
+  fail per-key (a hostile shape answers absent — a fingerprint is never truncated into a lie),
+  and a face that fails the hard gates falls back to the plain `syncMessage` skip instead of
+  becoming a phantom event. (b) The forward: the new `identity.verifiedChanged` host event
+  carries `{accountId, destinationUuid, state, destinationNumber?, identityKey?,
+  conversationId?}` — flat, absent optionals staying absent (the story.received
+  conditional-insert style), with the destination laddered through the §4.81 resolution family
+  to the local `conversationId` when it resolves. No store mirror, by recorded discretion: the
+  engine already applied the state to its authoritative sidecar store before projecting
+  (`identity::apply_synced_trust` upstream of the projection), the connector store carries no
+  trust bit to mirror into (conversations/contacts/peer_identities are all trust-less), and the
+  host's reconciliation path is the §4.61 `identities.get` read-through — a second authority
+  would only drift. No new method, error, or capability (the `message.expired` precedent for
+  core events); the schema gains the event enum entry, the allOf[12] data block, and two
+  schema-pairing bounds (the destination's 128 ↔ `MAX_RECEIVE_ID_CHARS`, the key's 128 ↔
+  `MAX_SYNC_IDENTITY_KEY_CHARS`); tests 618 → 621, all green) —
+  previously 1.102 (2026-10-11; the delete-for-me consume face (§4.83): the
   (§4.82): the layer the 2026-10-09 real-device debugging chain (CSS → DNS/socks5h →
   proxy split → the credential 401) exposed — a dead linked-device credential reached
   the desktop as the generic retryable `UPSTREAM_ERROR` family ("send failed, please
@@ -6844,6 +6844,86 @@ camelCase shape); and the schema consistency pairs (the 64/256/128 bounds pinned
 to `MAX_SYNC_DELETE_GROUPS`/`MAX_SYNC_DELETE_GROUP_MESSAGES`/
 `MAX_RECEIVE_ID_CHARS`, the event enum auto-balanced against the emission
 literal). Gates: 614 → 618, all green.
+
+### 4.84 Verified trust sync: the identity.verifiedChanged event (contract revision 1.103, 2026-10-11)
+
+The engine B4 identity surface projects one more sync face the connector was
+dropping on the plain skip: `syncMessage.verified` — the account's own linked
+device settled a peer's safety-number trust state, the official
+SyncMessage.verified face. The engine's multi-device trust convergence already
+did its authoritative work before this projection ever rides the wire:
+`identity::apply_synced_trust` writes the sidecar trust store, then the
+projection notifies the downstream connector. The official client consumes the
+same face by flipping its conversation's verified presentation
+(DEFAULT/VERIFIED/UNVERIFIED), so the desktop's need is a notify it can join
+against its own conversations — not a mirror the connector must reconcile.
+
+**The receive.** The projection rides the envelope as
+`syncMessage.verified = {destinationUuid, destinationNumber?, identityKey?,
+state}` — `destinationUuid` the peer's ServiceId UUID string (the engine
+projects `service_id_string()`, never a number here), `state` one of the
+engine's lowercase trust words (`verified` / `unverified` / `default`, the
+`TrustState::word()` output), the number the e164 the engine's contacts cache
+resolved, the key the hex identity key the proto stated (66 chars on the
+modern EC key). The parse is fail-closed at two hard gates: the state word
+must be exactly one of the three whitelist members (a non-member string or
+any non-string shape is a hostile face — the wire enum numbers the proto
+carries never reappear downstream), and the destination must survive the
+ServiceId UUID shape gate verbatim (the `messageRequestResponse` thread-leg
+gate). Both hard gates failing drops the whole record and the envelope falls
+back to the plain `syncMessage` skip — a verified sync that cannot prove its
+subject is not an event (宁缺勿错). The optional keys fail per-key: a wrong
+JSON type, an empty survivor, or an over-bound string answers absent — never
+a truncated lie (an identity key is a fingerprint; shortening one mints a
+wrong safety number; the key bound `MAX_SYNC_IDENTITY_KEY_CHARS` = 128 only
+ever bites on a hostile face). The queue budget counts the record's heap
+strings (§4.13), and `control_routing` intercepts the surviving record before
+the plain skip beside its read/viewed/delete-for-me siblings —
+`direction: "incoming"`, `source: None`, `group_id: None` (the envelope is
+our own account; the record names its own destination).
+
+**The store mirror — deliberately none.** Three honest counts, recorded as
+the discretion §4.84 was asked to make: (1) the authoritative write already
+happened upstream — the engine applied the state to its sidecar store before
+projecting, so a connector mirror would be a copy of a copy; (2) the
+connector store has no trust bit to hang the state on — the `conversations`
+row carries thread state (peer_key/title/unread/muted/pinned/timer/mrr
+factors), the `contacts` row carries directory material, the
+`peer_identities` table carries the ACI→peer-key mapping, and none carries a
+trust column; inventing one would create a second authority that drifts from
+the engine's store with no reader; and (3) the host's own reconciliation path
+already exists — the §4.61 `identities.get` read-through projects the
+authoritative upstream trust face (`trustLevel === 'TRUSTED_VERIFIED'` is the
+desktop's own verified derivation), so the event's job is only to say *when*
+to re-read, not to carry the truth itself.
+
+**The forward.** The record forwards as the transient
+`identity.verifiedChanged` event: `{accountId, destinationUuid, state,
+destinationNumber?, identityKey?, conversationId?}` — flat, absent optionals
+staying absent (the story.received conditional-insert style). The one
+enrichment is the §4.81 resolution family: the destination walks its own
+number first (when the projection resolved one) then the ACI rungs (the raw
+UUID, the recorded ACI→peer-key mappings, the contacts digit-suffix
+matches); a hit carries the local `conversationId` (the id form the desktop
+addresses), a miss stays conversation-less and the record still forwards —
+the trust state is self-describing by its destination, so the host joins by
+`destinationUuid` alone when the connector held no thread. The event is
+transient: nothing persists, nothing self-heals store-side; a missed delivery
+converges through the next `identities.get` read exactly as the official
+client's own presentation does. No new method, error code, or capability tag
+(the `message.expired` precedent for core consume events).
+
+Tests: the engine unit (`sync_verified_routes_the_whitelisted_state` — the
+whitelist and UUID gates, the per-key fail-closed optionals, the plain-skip
+fall-through); the service integration
+(`sync_verified_forwards_with_the_resolved_thread` — the ladder enrichment,
+the conversation-less unknown destination, the single-event face with no
+summary convergence); the wire frame
+(`verified_changed_event_rides_the_flat_record` — the event name, the flat
+camelCase shape, the absent optionals); and the schema consistency pairs (the
+destination/key maxLengths pinned to `MAX_RECEIVE_ID_CHARS`/
+`MAX_SYNC_IDENTITY_KEY_CHARS`, the event enum auto-balanced against the
+emission literal). Gates: 618 → 621, all green.
 
 ## 5. signal-cli Boundary
 

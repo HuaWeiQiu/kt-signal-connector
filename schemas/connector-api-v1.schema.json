@@ -3130,7 +3130,8 @@
             "story.received",
             "story.viewed",
             "group.changed",
-            "message.deleteForMe"
+            "message.deleteForMe",
+            "identity.verifiedChanged"
           ]
         },
         "data": {
@@ -3565,6 +3566,50 @@
                         }
                       }
                     }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "identity.verifiedChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "destinationUuid", "state"],
+                "description": "One safety-number trust sync forwarded (contract 1.103, §4.84): the engine's syncMessage.verified projection — the account's own linked device settled the peer's safety-number state, one of the engine's lowercase trust words. The engine applied the state to its authoritative store before projecting and the connector keeps no trust bit (the identities.get read-through is the reconciliation path), so this is a pure transient notify: the record forwards with the local conversationId when the destination laddered to a thread; a missed delivery converges through the next identities.get read.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "destinationUuid": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The peer the state settled for — the projection's ServiceId UUID string verbatim (ACI or PNI form, the shape gate connector-side)."
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": ["verified", "unverified", "default"],
+                    "description": "The settled trust state — the engine's lowercase trust-word list, whitelisted connector-side; anything else never leaves the plain syncMessage skip."
+                  },
+                  "destinationNumber": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The peer's e164 when the projection resolved one through its contacts cache; absent otherwise (the per-key fail-closed discipline — a hostile shape answers absent, never a truncated lie)."
+                  },
+                  "identityKey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The peer's hex identity key when the proto stated it (the modern EC key projects 66 chars); absent otherwise. A key over the bound drops whole — a truncated fingerprint would mint a wrong safety number."
+                  },
+                  "conversationId": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The destination's resolved local conversation — the id form the desktop addresses; absent when the destination laddered to nothing (the record still forwards, the state is self-describing by its destination)."
                   }
                 }
               }

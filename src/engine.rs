@@ -948,6 +948,22 @@ pub enum ControlReceive {
     SyncDeleteForMe {
         deletes: Vec<SyncDeleteGroup>,
     },
+    /// The engine's `syncMessage.verified` projection (contract 1.103,
+    /// §4.84): the account's own linked device settled one peer's safety-number
+    /// trust state — the official SyncMessage.verified face, the engine's B4
+    /// identity surface. The destination is the peer's ServiceId UUID string,
+    /// the state one of the engine's lowercase trust words (`verified` /
+    /// `unverified` / `default`); the optional number and hex identity key
+    /// ride only when the projection resolved them. The engine has already
+    /// applied the state to its authoritative sidecar store before projecting
+    /// (`identity::apply_synced_trust`), so this is a pure notify face — the
+    /// connector keeps no trust bit to mirror and forwards it to the host.
+    /// A face whose destination or state word fails the shape gates never
+    /// reaches this variant — the projection parser dropped it, and an
+    /// envelope with nothing usable left keeps the plain syncMessage skip.
+    SyncVerified {
+        verified: SyncVerifiedState,
+    },
     /// The engine's `groupChanged {groupId, revision, changes[], editor?,
     /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
     /// official GroupV2ChangeDetailType word list the engine decrypted out
@@ -1003,6 +1019,24 @@ pub struct SyncDeleteGroup {
     pub messages: Vec<SyncDeleteEntry>,
 }
 
+/// One safety-number trust sync off the engine's `syncMessage.verified`
+/// projection (contract 1.103, §4.84): the destination peer's ServiceId UUID
+/// string, the settled trust state as the engine's lowercase word
+/// (`verified` / `unverified` / `default` — the parser's whitelist, so a
+/// hostile word never reaches this struct), and the optional enrichment the
+/// projection carried — the peer's e164 when the engine's contacts cache
+/// resolved one, and the peer's hex identity key when the proto stated it.
+/// `state` stays the `&'static str` whitelist member (the call-signaling
+/// `signal_type` discipline): the word list is closed and the service/host
+/// faces carry it verbatim.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncVerifiedState {
+    pub destination_uuid: String,
+    pub destination_number: Option<String>,
+    pub identity_key: Option<String>,
+    pub state: &'static str,
+}
+
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
@@ -1032,6 +1066,14 @@ pub const MAX_SYNC_DELETE_GROUPS: usize = 64;
 /// (the same truncate discipline). `pub` since the §4.83 host-event data
 /// shape mirrors the bound (the schema-pairing test pins the two together).
 pub const MAX_SYNC_DELETE_GROUP_MESSAGES: usize = 256;
+/// One verified sync's hex identity key carries at most this many characters
+/// (contract 1.103, §4.84): the modern EC key projects 66 hex chars, so the
+/// bound only ever bites on a hostile face — and it bites by dropping the
+/// key, never truncating it (a truncated fingerprint is a lie; an absent key
+/// is the honest missing-enrichment face). `pub` since the §4.84 host-event
+/// data shape mirrors the bound (the schema-pairing test pins the two
+/// together).
+pub const MAX_SYNC_IDENTITY_KEY_CHARS: usize = 128;
 /// One quote carries at most this many attachment metadata entries (contract
 /// 1.100, §4.81): real quoted-media batches are small and Signal Desktop
 /// renders the pill metadata-only; entries past the cap drop (the same
@@ -1229,6 +1271,14 @@ impl NormalizedReceive {
                                     + std::mem::size_of::<SyncDeleteEntry>())
                     })
                     .sum(),
+                // The verified sync carries one bounded record — the heap
+                // strings count here so the queue budget stays honest (§4.13).
+                Some(ControlReceive::SyncVerified { verified }) => {
+                    std::mem::size_of::<SyncVerifiedState>()
+                        + verified.destination_uuid.len()
+                        + verified.destination_number.as_ref().map_or(0, String::len)
+                        + verified.identity_key.as_ref().map_or(0, String::len)
+                }
                 _ => 0,
             }
             // Rich bodies carry capped urls/titles/names; ranges are fixed-width.
@@ -2487,6 +2537,59 @@ fn normalized_sync_delete_groups(value: Option<&Value>) -> Vec<SyncDeleteGroup> 
         .collect()
 }
 
+/// The engine's `syncMessage.verified` face (contract 1.103, §4.84): the
+/// wire shape is `{destinationUuid, destinationNumber?, identityKey?, state}`
+/// — the settled trust state as the engine's lowercase word, everything else
+/// enrichment. Entirely fail-closed: the state must be one of the engine's
+/// three trust words (`verified` / `unverified` / `default` — the projection
+/// maps its `TrustState::word()` output, so anything else is a hostile face)
+/// and the destination must survive the ServiceId UUID shape gate verbatim
+/// (the engine projects `service_id_string()`, never a number here; a
+/// non-UUID is not the protocol's face — the whole record drops and the
+/// envelope falls back to the plain syncMessage skip). The optional keys are
+/// per-key fail-closed: a hostile shape answers absent, never a truncated
+/// lie — an identity key is a fingerprint, and shortening one would mint a
+/// wrong safety number.
+fn normalized_sync_verified(value: Option<&Value>) -> Option<SyncVerifiedState> {
+    let object = value?.as_object()?;
+    let state = match object.get("state").and_then(Value::as_str)? {
+        "verified" => "verified",
+        "unverified" => "unverified",
+        "default" => "default",
+        _ => return None,
+    };
+    let destination_uuid = object
+        .get("destinationUuid")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uuid| is_service_id_uuid(uuid))?;
+    let destination_number = optional_bounded_string(object.get("destinationNumber"));
+    let identity_key = object
+        .get("identityKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && key.chars().count() <= MAX_SYNC_IDENTITY_KEY_CHARS)
+        .map(str::to_string);
+    Some(SyncVerifiedState {
+        destination_uuid: destination_uuid.to_string(),
+        destination_number,
+        identity_key,
+        state,
+    })
+}
+
+/// One optional string key's fail-closed read (the §4.84 verified face's
+/// number and the §4.85 call-event conversation identity share it): a string,
+/// trimmed, non-empty, and bounded at the receive-id cap — anything else (the
+/// wrong JSON type, an empty survivor, an over-bound face) answers absent.
+fn optional_bounded_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -3351,6 +3454,23 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 control: ControlReceive::SyncDeleteForMe { deletes },
             });
         }
+    }
+    // The engine's `syncMessage.verified` projection (contract 1.103,
+    // §4.84): the account's own linked device settled one peer's
+    // safety-number trust state. Intercepted before the plain syncMessage
+    // skip like its read/viewed/delete-for-me siblings; an envelope whose
+    // face failed the shape gates falls through to that skip. The routing
+    // source stays None — the envelope is our own account and the record
+    // names its own destination (the read/viewed precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(verified) = normalized_sync_verified(sync.get("verified"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncVerified { verified },
+        });
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
     // projection routes like every body-less control face — an empty or
@@ -6075,6 +6195,94 @@ mod tests {
             json!({ "deleteForMe": { "messageDeletes": [{ "messages": [{ "author": "a" }] }] } }),
             json!({ "deleteForMe": { "messageDeletes": [{ "messages": [{ "timestamp": 1726999999000u64 }] }] } }),
             json!({ "deleteForMe": { "messageDeletes": [{ "conversationId": "c", "messages": [{ "author": "a", "timestamp": 0u64 }] }] } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.103 (§4.84): the engine's `syncMessage.verified` projection
+    /// routes as one control receive — the trust word rides the whitelist,
+    /// the destination must survive the ServiceId UUID gate, the optional
+    /// number/key keys are per-key fail-closed (a hostile key drops, the
+    /// record survives), and a face with a hostile state word or destination
+    /// falls through to the plain syncMessage skip.
+    #[test]
+    fn sync_verified_routes_the_whitelisted_state() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncVerified { verified }, source)) = routing(json!({
+            "verified": {
+                "destinationUuid": "11111111-1111-1111-1111-111111111111",
+                "destinationNumber": "+15555550101",
+                "identityKey": "05ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12",
+                "state": "verified",
+            },
+        })) else {
+            panic!("expected a verified control routing");
+        };
+        assert_eq!(
+            verified.destination_uuid,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(verified.destination_number.as_deref(), Some("+15555550101"));
+        assert!(verified.identity_key.is_some());
+        assert_eq!(verified.state, "verified");
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The optional keys fail per-key: a hostile number/key shape answers
+        // absent while the record itself survives.
+        let Some((ControlReceive::SyncVerified { verified }, _)) = routing(json!({
+            "verified": {
+                "destinationUuid": "22222222-2222-2222-2222-222222222222",
+                "destinationNumber": 1727000000u64,
+                "identityKey": "",
+                "state": "unverified",
+            },
+        })) else {
+            panic!("expected the verified routing to survive hostile optionals");
+        };
+        assert_eq!(verified.state, "unverified");
+        assert!(verified.destination_number.is_none());
+        assert!(verified.identity_key.is_none());
+
+        // The default word is the third whitelist member.
+        let Some((ControlReceive::SyncVerified { verified }, _)) = routing(json!({
+            "verified": {
+                "destinationUuid": "33333333-3333-3333-3333-333333333333",
+                "state": "default",
+            },
+        })) else {
+            panic!("expected the default-word routing");
+        };
+        assert_eq!(verified.state, "default");
+
+        // No usable face at all → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "verified": {} }),
+            // The state word whitelist is closed.
+            json!({ "verified": { "destinationUuid": "11111111-1111-1111-1111-111111111111", "state": "TRANSLATED" } }),
+            json!({ "verified": { "destinationUuid": "11111111-1111-1111-1111-111111111111", "state": 1u64 } }),
+            // The destination must be a ServiceId UUID — a number or a
+            // malformed UUID is not the face.
+            json!({ "verified": { "destinationUuid": "+15555550101", "state": "verified" } }),
+            json!({ "verified": { "destinationUuid": "not-a-uuid", "state": "verified" } }),
+            json!({ "verified": { "state": "verified" } }),
         ] {
             let routing = control_routing(
                 json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
