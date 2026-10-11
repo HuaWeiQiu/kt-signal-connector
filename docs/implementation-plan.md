@@ -8617,6 +8617,48 @@ restart, exactly one crashing frame). Gated behind the full local gate
 suite (fmt + clippy -D warnings + cargo test + release build), all
 green.
 
+### 4.108 The group-call era update reaches the host: `calls.sendGroupCallUpdate` (contract revision 1.127, 2026-10-12)
+
+The engine's window-A batch shipped `sendGroupCallUpdate` — the official
+DataMessage.groupCallUpdate face (the group-call start/end signaling the
+desktop's `CallingFrame` era model rides, same position). This batch
+wires it into the host contract as `calls.sendGroupCallUpdate`,
+advertised through the existing `call-signaling` tag widened in place
+(the 1.82/1.88 precedent — the era update is the same signaling pipe's
+group-era face, no new capability bit). Until now the desktop could
+forward 1:1 and group call signaling envelopes but could not announce a
+group-call era change; the group call life cycle had no update leg.
+
+**The shape.** `calls.sendGroupCallUpdate {accountId, conversationId,
+eraId}` — the conversation row must resolve to a group kind before
+anything travels (group call signaling has no direct form — 1:1 call
+signaling rides `calls.sendSignal`, so a direct row answers
+INVALID_REQUEST locally); the row's peer reference is the upstream
+groupId, gated locally as standard base64 decoding to exactly 32 bytes
+(the engine's `decode_group_id` face made precise — a short-key row
+never spends a fan-out frame); `eraId` is the mandatory non-empty RingRTC
+era identity string (≤256 characters, the engine's shape gate mirrored).
+
+**The answer and the failure faces.** The engine's success body is
+empty — the update's identity is the era string itself — so the definite
+success answers the explicit `{"status":"sent"}` (the remoteDelete
+discipline), and an indeterminate mutating outcome answers
+SEND_OUTCOME_UNKNOWN (retryable=false) and is never retried (the
+AGENTS.md red line — an era update whose delivery is unknown may already
+sit in the group's call state). No new structured codes: the faces ride
+the existing upstream send family.
+
+Tests: the service unit pins the prepare ladder (the group-kind gate,
+the 32-byte master-key gate, the eraId bound, the frame verbatim) and
+the refusals; the methods-table test pins the lane and mutating
+classification; the integration test round-trips the update (the frame
+carrying the resolved account, the master key, and the era string; the
+{"status":"sent"} ack), the local ladder (the direct row, the empty
+eraId, the unknown account — every refusal byte-frozen), and the red
+line (crash-in-flight answers SEND_OUTCOME_UNKNOWN across the restart,
+exactly one crashing frame). Gated behind the full local gate suite
+(fmt + clippy -D warnings + cargo test + release build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

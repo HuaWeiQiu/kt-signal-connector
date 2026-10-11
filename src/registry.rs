@@ -1133,6 +1133,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.send_call_signal(params).await
     }
 
+    /// calls.sendGroupCallUpdate (contract 1.127, §4.108): the group-call
+    /// era update is account-scoped upstream traffic, so it routes through
+    /// the account's owning engine like every other send face.
+    pub async fn send_group_call_update(
+        &self,
+        params: crate::service::CallsSendGroupCallUpdateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_group_call_update(params).await
+    }
+
     /// calls.getState (contract 1.50, §4.48): a store-only read scoped to
     /// the account's owning connector slot — no engine call, no network.
     pub async fn call_state(

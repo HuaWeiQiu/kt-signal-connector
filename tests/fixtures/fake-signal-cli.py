@@ -1839,6 +1839,20 @@ for line in sys.stdin:
         if params.get("data") == "[fixture-call-crash]":
             os._exit(33)
         result = {"timestamp": 1727000000000}
+    elif method == "sendGroupCallUpdate":
+        # Contract 1.127 §4.108: the group-call era update route. Same
+        # dispatch-recording discipline as `send`: the exact upstream params
+        # land in SEND_LOG (the test asserts the resolved account, the group
+        # master key, and the era string). Sentinels: eraId
+        # "[fixture-crash-gcu]" crashes with the mutating call in flight
+        # (os._exit(49); disjoint from 25/29/30/31/32/33/34/35/36/37/46/47/48).
+        # Success answers the engine's empty body.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if params.get("eraId") == "[fixture-crash-gcu]":
+            os._exit(49)
+        result = {}
     elif method == "updateContact":
         # Same dispatch-recording discipline as `send`: the exact upstream
         # params, so tests can assert the single-string recipient contract.

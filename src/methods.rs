@@ -353,6 +353,16 @@ pub const METHODS: &[MethodRow] = &[
     // lives in the desktop + calling sidecar (the honest near-empty
     // registry). Advertised through `call-signaling`.
     ("calls.sendSignal", Lane::Send, true, "send"),
+    // Group call update (contract revision 1.127, §4.108): mutating,
+    // send-lane upstream traffic — the reaction class verbatim, same-account
+    // mutex and delete barrier included; advertised through the existing
+    // `call-signaling` tag, widened in place (the 1.82/1.88 precedent — the
+    // group-call update is the same signaling pipe's group-era face). The
+    // conversation row must resolve to a group kind before anything travels
+    // (group call signaling has no direct form — 1:1 signaling rides
+    // calls.sendSignal), and the engine's DataMessage.groupCallUpdate
+    // fan-out carries the era id.
+    ("calls.sendGroupCallUpdate", Lane::Send, true, "send"),
     ("calls.getState", Lane::Read, false, "read"),
     // Username write (contract revision 1.59, §4.55): mutating, send-lane
     // upstream traffic — the account-settings class verbatim, same-account
@@ -594,13 +604,16 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
 /// the row-level serverGuid persistence); `call-signaling` (contract
-/// revision 1.51, widened in place by 1.82 and by 1.88) marks the §4.49
+/// revision 1.51, widened in place by 1.82, by 1.88, and by 1.127) marks
+/// the §4.49
 /// call signaling faces (`calls.sendSignal` — the 1:1 and, since 1.82, the
 /// group-addressed route — plus the `call.incoming` and `call.groupIncoming`
 /// events) and, since 1.88, the §4.73 call-link credential material faces
 /// (`calls.linkPresentation` / `calls.createLinkAuth` / `calls.groupProof` /
 /// `calls.groupMembers` / `calls.endorsementsPublicKey` — the signaling
-/// pipeline's own material supply, the same no-new-bit discipline);
+/// pipeline's own material supply) and, since 1.127, the §4.108 group-call
+/// update write (`calls.sendGroupCallUpdate` — the same pipe's group-era
+/// face; the same no-new-bit discipline);
 /// `group-terminate` (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
@@ -823,6 +836,7 @@ mod tests {
             "history.attachmentDownload",
             "attachments.download",
             "calls.sendSignal",
+            "calls.sendGroupCallUpdate",
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",
@@ -888,6 +902,7 @@ mod tests {
             "history.attachmentDownload",
             "attachments.download",
             "calls.sendSignal",
+            "calls.sendGroupCallUpdate",
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",

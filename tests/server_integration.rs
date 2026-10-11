@@ -12374,6 +12374,229 @@ async fn call_signaling_faces_round_trip_and_gate_the_envelope() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.127 (§4.108): the calls.sendGroupCallUpdate face —
+/// the group-call era update. The conversation row must resolve to a group
+/// kind carrying a 32-byte master key (a direct row and a short-key row
+/// refuse locally with zero upstream frames); the round-trip forwards
+/// {account, groupId, eraId} verbatim and answers the explicit
+/// {"status":"sent"}; the crash-in-flight outcome answers
+/// SEND_OUTCOME_UNKNOWN and is never retried across the restart.
+#[tokio::test]
+async fn group_call_update_round_trips_and_gates_the_group_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupCallUpdate" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    // Stage a 32-byte master-key group row (the engine's decode_group_id
+    // gate is the shape the update fans out to).
+    let master_key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 80,
+                "dataMessage": {
+                    "groupId": master_key,
+                    "message": "group call incoming"
+                }
+            }
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut group_id = String::new();
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("gcu-group-poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("gcu-group-list-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        // The ingest-built row carries the bare "group" title (the seed
+        // fixture's own "Fixture Group" row is a different, short-key group
+        // the update must never address).
+        if let Some(found) = listed["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["type"] == "group" && row["title"] == "group")
+            .and_then(|row| row["id"].as_str())
+        {
+            group_id = found.to_string();
+            break;
+        }
+    }
+    assert!(
+        !group_id.is_empty(),
+        "the staged group row must materialize"
+    );
+
+    // The round trip: {status:"sent"} and the frame carries the resolved
+    // account, the group master key, and the era string verbatim.
+    let updated = request(
+        &mut client,
+        "gcu-send",
+        "calls.sendGroupCallUpdate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "eraId": "era-1"
+        }),
+    )
+    .await;
+    assert_eq!(updated["result"]["status"], "sent", "{updated}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["account"] == "+15555550100"
+                && frame["groupId"] == master_key
+                && frame["eraId"] == "era-1"
+        }),
+        "expected the group-call-update upstream frame: {frames:?}"
+    );
+
+    // The local ladder: a direct conversation has no group-call face, an
+    // empty eraId is a shape error, an unknown account refuses — every
+    // refusal stays local (the dispatch log gains no frame).
+    let direct_sent = request(
+        &mut client,
+        "gcu-direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "hello",
+            "clientRequestId": "gcu-direct-0"
+        }),
+    )
+    .await;
+    let direct_id = direct_sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let direct_refused = request(
+        &mut client,
+        "gcu-direct",
+        "calls.sendGroupCallUpdate",
+        json!({ "accountId": account_id, "conversationId": direct_id, "eraId": "era-1" }),
+    )
+    .await;
+    assert_eq!(direct_refused["error"]["code"], "INVALID_REQUEST");
+    let empty_era = request(
+        &mut client,
+        "gcu-empty-era",
+        "calls.sendGroupCallUpdate",
+        json!({ "accountId": account_id, "conversationId": group_id, "eraId": "" }),
+    )
+    .await;
+    assert_eq!(empty_era["error"]["code"], "INVALID_REQUEST");
+    let missing = request(
+        &mut client,
+        "gcu-missing-account",
+        "calls.sendGroupCallUpdate",
+        json!({ "accountId": "no-such-account", "conversationId": group_id, "eraId": "era-1" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.get("eraId").is_some())
+            .count(),
+        1,
+        "a refusal never reaches the engine"
+    );
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "gcu-crash",
+        "calls.sendGroupCallUpdate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_id,
+            "eraId": "[fixture-crash-gcu]"
+        }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "gcu-restart", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["eraId"] == "[fixture-crash-gcu]")
+            .count(),
+        1,
+        "an unknown era-update outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revisions 1.83 + 1.84 (§4.69): the cloud-backup restore round
 /// trip in kt-engine mode (the engine-only face, the §4.68 spawn posture).
 /// The handshake advertises both faces with no new feature tag (the restore

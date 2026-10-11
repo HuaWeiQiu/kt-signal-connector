@@ -23,10 +23,10 @@ use crate::service::{
     AccountsGetDevicesParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
     AccountsUpdateConfigurationParams, AttachmentSendTarget, AvatarDownload, BlockedConversations,
-    CallsSendSignalParams, ChatFolderSyncs, ChatFoldersListParams, ChatFoldersSetRecordsParams,
-    ConnectorService, ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFolderSyncs, ChatFoldersListParams,
+    ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome, ConversationState,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsGetStateParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
     ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
     DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
     GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
@@ -4182,6 +4182,38 @@ impl RuntimeSupervisor {
         let service = self.service.lock().await;
         let state = service.prepare_calls_get_state(&account_id)?;
         Ok(serde_json::to_value(state).unwrap_or(Value::Null))
+    }
+
+    /// calls.sendGroupCallUpdate (contract revision 1.127, §4.108,
+    /// capability call-signaling): the group-call era update — the engine
+    /// `sendGroupCallUpdate` face (the official DataMessage.groupCallUpdate
+    /// group fan-out). A mutating upstream write: the indeterminate outcome
+    /// folds to SEND_OUTCOME_UNKNOWN (retryable=false) and is never retried
+    /// — an era update whose delivery is unknown may already sit in the
+    /// group's call state. The definite success answers the explicit
+    /// `{"status":"sent"}` — the engine's own body is empty, the update's
+    /// identity is the era string itself.
+    pub async fn send_group_call_update(
+        &self,
+        params: CallsSendGroupCallUpdateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_calls_send_group_call_update(&params)?
+        };
+        match engine
+            .call("sendGroupCallUpdate", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// calls.linkPresentation (contract revision 1.88, §4.73, capability

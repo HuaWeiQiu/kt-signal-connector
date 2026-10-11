@@ -137,6 +137,7 @@
             "backups.uploadToCloud",
             "backups.uploadStatus",
             "calls.sendSignal",
+            "calls.sendGroupCallUpdate",
             "calls.getState",
             "calls.linkPresentation",
             "calls.createLinkAuth",
@@ -1241,6 +1242,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/callsSendSignalParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.sendGroupCallUpdate" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsSendGroupCallUpdateParams" }
             }
           }
         },
@@ -2521,6 +2533,27 @@
           "type": "string",
           "enum": ["droppable", "handleImmediately"],
           "description": "The optional wake-up bit (contract 1.55), forwarded to the engine's CallMessage{opaque{urgency}}. Absent = the engine's droppable default (proto: a missing urgency treats as DROPPABLE). Only meaningful with a payload (the legacy bare frames have no opaque envelope)."
+        }
+      }
+    },
+    "callsSendGroupCallUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "eraId"],
+      "description": "Send one group-call era update (contract revision 1.127, \u00a74.108, capability call-signaling widened in place \u2014 no new capability bit; the official DataMessage.groupCallUpdate face, the engine sendGroupCallUpdate method): the connector resolves the local conversation row (CONVERSATION_NOT_FOUND before any upstream call) and refuses any non-group kind locally \u2014 group call signaling has no direct form, 1:1 call signaling rides calls.sendSignal. The row's peer reference is the upstream groupId and is gated locally as standard base64 decoding to exactly 32 bytes (the group master key the engine's decode_group_id face re-gates); eraId is the mandatory non-empty RingRTC era identity string (\u2264256 characters). Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply; the definite success answers the explicit {\"status\":\"sent\"} (the engine's own body is empty \u2014 the update's identity is the era string itself) and an indeterminate outcome answers SEND_OUTCOME_UNKNOWN, never retried (an era update whose delivery is unknown may already sit in the group's call state).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation the update addresses; resolved against the account before any upstream call. A non-group kind answers INVALID_REQUEST."
+        },
+        "eraId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The RingRTC group-call era identity string, forwarded verbatim on DataMessage.groupCallUpdate."
         }
       }
     },

@@ -5466,6 +5466,64 @@ impl ConnectorService {
         Ok(upstream)
     }
 
+    /// calls.sendGroupCallUpdate (contract revision 1.127, §4.108): the
+    /// group-call era update — the conversation row must resolve to a group
+    /// kind (group call signaling has no direct form; 1:1 signaling rides
+    /// calls.sendSignal) and its peer reference is the upstream groupId. The
+    /// eraId is mandatory non-empty (the engine's own shape gate mirrored);
+    /// the group id is gated locally as standard base64 decoding to exactly
+    /// 32 bytes — the engine's decode_group_id face made precise before any
+    /// fan-out frame is spent.
+    pub fn prepare_calls_send_group_call_update(
+        &self,
+        params: &CallsSendGroupCallUpdateParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.conversation_id.is_empty()
+            || params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if params.era_id.is_empty() || params.era_id.chars().count() > 256 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "eraId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "group call updates address group conversations only — 1:1 call signaling rides calls.sendSignal",
+                false,
+            )));
+        }
+        {
+            let mut decoded = Vec::new();
+            let decoded_ok = base64_decode_to_vec(&conversation.peer_key, &mut decoded).is_ok()
+                && decoded.len() == 32;
+            if !decoded_ok {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "the conversation's group id is not a 32-byte group master key",
+                    false,
+                )));
+            }
+        }
+        Ok(json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+            "eraId": params.era_id,
+        }))
+    }
+
     /// calls.getState (contract revision 1.50, §4.48): the honest
     /// projection of what this connector knows — always the empty registry.
     /// The call state machine lives in the desktop + calling sidecar and
@@ -11427,6 +11485,18 @@ pub struct CallsSendSignalParams {
     pub call_id: u32,
     pub payload: Option<String>,
     pub urgency: Option<String>,
+}
+
+/// `calls.sendGroupCallUpdate` params (contract revision 1.127, §4.108):
+/// the group-call era update — the conversation row resolves to the group
+/// the update fans out to, `eraId` is the RingRTC era identity string the
+/// engine rides on DataMessage.groupCallUpdate.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsSendGroupCallUpdateParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub era_id: String,
 }
 
 /// `calls.getState` params (contract revision 1.51, §4.49): account-scoped
@@ -20942,6 +21012,71 @@ mod tests {
         assert_eq!(again.calls.len(), state.calls.len());
         let error = service
             .prepare_calls_get_state("no-such-account")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// Group-call update prepare (contract 1.127, §4.108): the conversation
+    /// row must resolve to a group kind and carry a 32-byte master key peer
+    /// reference; the eraId is mandatory non-empty; the upstream frame
+    /// carries {account, groupId, eraId} verbatim.
+    #[test]
+    fn prepare_group_call_update_gates_the_group_shape() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(
+                &account.id,
+                "group",
+                "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+                "group",
+            )
+            .unwrap();
+        let params = |conversation_id: &str, era_id: &str| CallsSendGroupCallUpdateParams {
+            account_id: account.id.clone(),
+            conversation_id: conversation_id.to_string(),
+            era_id: era_id.to_string(),
+        };
+
+        let upstream = service
+            .prepare_calls_send_group_call_update(&params(&group.id, "era-1"))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(
+            upstream["groupId"],
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        );
+        assert_eq!(upstream["eraId"], "era-1");
+
+        // A direct conversation has no group-call face — 1:1 signaling rides
+        // calls.sendSignal.
+        let error = service
+            .prepare_calls_send_group_call_update(&params(&direct.id, "era-1"))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The eraId ladder: empty refuses; a 16-byte group id (a direct-call
+        // artifact) refuses the 32-byte master-key gate.
+        let error = service
+            .prepare_calls_send_group_call_update(&params(&group.id, ""))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let short_group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "legacy")
+            .unwrap();
+        let error = service
+            .prepare_calls_send_group_call_update(&params(&short_group.id, "era-1"))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        let error = service
+            .prepare_calls_send_group_call_update(&CallsSendGroupCallUpdateParams {
+                account_id: "no-such-account".into(),
+                conversation_id: group.id.clone(),
+                era_id: "era-1".into(),
+            })
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
     }

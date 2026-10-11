@@ -33,8 +33,8 @@ use crate::service::{
     BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
     BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsCreateLinkAuthParams,
     CallsEndorsementsPublicKeyParams, CallsGetStateParams, CallsGroupMembersParams,
-    CallsGroupProofParams, CallsLinkPresentationParams, CallsSendSignalParams,
-    ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
+    CallsGroupProofParams, CallsLinkPresentationParams, CallsSendGroupCallUpdateParams,
+    CallsSendSignalParams, ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
     ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsGetAvatarParams,
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
     ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
@@ -2190,6 +2190,29 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 Err(_) => HostResponse::failure(
                     request_id,
                     ApiError::new("INVALID_REQUEST", "invalid calls.sendSignal params", false),
+                ),
+            }
+        }
+        // Group call update (contract revision 1.127, §4.108): the engine's
+        // DataMessage.groupCallUpdate fan-out — the conversation row must
+        // resolve to a group kind (the connector refuses anything else
+        // before any upstream frame). A definite success answers the
+        // explicit {"status":"sent"} (the engine's own body is empty); an
+        // indeterminate mutating outcome folds to SEND_OUTCOME_UNKNOWN and
+        // is never retried.
+        "calls.sendGroupCallUpdate" => {
+            match serde_json::from_value::<CallsSendGroupCallUpdateParams>(request.params) {
+                Ok(params) => match runtime.send_group_call_update(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid calls.sendGroupCallUpdate params",
+                        false,
+                    ),
                 ),
             }
         }
