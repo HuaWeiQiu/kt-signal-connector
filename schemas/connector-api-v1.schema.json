@@ -118,6 +118,7 @@
             "groups.joinViaLink",
             "groups.cancelJoinRequest",
             "groups.migrate",
+            "groups.create",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "history.importStatus",
@@ -1006,6 +1007,19 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/groupsCancelJoinRequestParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "groups.create" }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsCreateParams" }
             }
           }
         },
@@ -3296,6 +3310,37 @@
       },
       "description": "The official contact name (contract revision 1.124): the six official components, all optional strings of at most 128 characters (an empty string is the official falsy-absent)."
     },
+    "groupsCreateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "title"],
+      "description": "Create one new group (contract revision 1.126, \u00a74.107, capability group-management widened in place; the official createGroupV2 posture): the engine derives the new group master key and answers {groupId, revision} \u2014 groupId is the new master key in standard base64, the id every other group face addresses. title is required non-empty \u2264256 bytes (the official createGroupV2 `name: string` is mandatory the same way; the \u00a74.104 `groupName` bound); expiration the optional timer seconds (u32; absent = the official falsy timer-off posture); avatar the tri-state update (absent = keep, null = remove, a data:image/*;base64 URI = replace \u2014 the \u00a74.45 setProfile data-URI gate runs locally so a malformed URI answers INVALID_REQUEST before any upstream call); members the optional initial roster (absent = create the empty group; when present the \u00a74.44 member-array bounds hold \u2014 1..1001 entries of 1..128 characters, an explicit empty array being the engine's own refusal mirrored locally). Unknown account answers ACCOUNT_NOT_FOUND. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried (a create whose delivery is unknown may already have created the group server-side). Structured engine errors: GROUP_CREATE_FAILED (server rejection, retryable=false, data.status? verbatim when the server gave one), GROUP_AVATAR_UPLOAD_FAILED (the group landed but the avatar upload chain failed \u2014 the {retryable, textSaved} partial-success family), STORAGE_UNAVAILABLE (retryable=true). Zero local writes: the new group converges through contacts.sync like every group row.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The new group's title \u2014 required non-empty, at most 256 bytes (the official `groupName` bound)."
+        },
+        "expiration": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Optional disappearing-message timer in seconds; 0 = off."
+        },
+        "avatar": {
+          "description": "Tri-state avatar update: absent = keep (no avatar key upstream), null = remove, a data:image/*;base64 URI = replace (validated locally before any upstream call)."
+        },
+        "members": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "minItems": 1,
+          "maxItems": 1001,
+          "description": "The optional initial roster \u2014 peer references (E.164 or service-id strings), 1..1001 entries of 1..128 characters; absent = create the empty group."
+        }
+      }
+    },
     "groupsMigrateParams": {
       "type": "object",
       "additionalProperties": false,
@@ -4667,6 +4712,7 @@
             "GROUP_INVITE_LINK_UNAVAILABLE",
             "GROUP_INVITE_LINK_PREVIEW_FAILED",
             "GROUP_MIGRATION_FAILED",
+            "GROUP_CREATE_FAILED",
             "USERNAME_TAKEN",
             "USERNAME_RESERVATION_GONE",
             "USERNAME_RATE_LIMITED",
@@ -4705,7 +4751,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one; since contract 1.122 DEVICES_FAILED carries {status?} the same way (the device-plane server-rejection family); since contract 1.123 GROUP_MIGRATION_FAILED carries {status?} the same way (the migration server-rejection family). The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one; since contract 1.122 DEVICES_FAILED carries {status?} the same way (the device-plane server-rejection family); since contract 1.123 GROUP_MIGRATION_FAILED carries {status?} the same way (the migration server-rejection family); since contract 1.126 GROUP_CREATE_FAILED carries {status?} the same way (the new-group server-rejection family). The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

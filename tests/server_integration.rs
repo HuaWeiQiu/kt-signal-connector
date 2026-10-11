@@ -8939,6 +8939,209 @@ async fn group_migration_round_trips_and_gates_the_shape() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.126 (§4.107): the groups.create face — the new-group
+/// upstream leg. The round-trip carries the resolved account and title (the
+/// optional change set rides when present, absent keys stay absent), and
+/// answers the engine's {groupId, revision} verbatim; the local ladder
+/// refuses the empty title, the over-bounds title, the explicit empty
+/// roster, and the over-bounds roster before any upstream call; the
+/// server-rejection family rides GROUP_CREATE_FAILED with data.status
+/// verbatim; the crash-in-flight outcome answers SEND_OUTCOME_UNKNOWN and
+/// is never retried.
+#[tokio::test]
+async fn group_create_round_trips_and_gates_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [45_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GroupCreate" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    // The round-trip: the definite success projects {groupId, revision} and
+    // the upstream frame carries the title plus the optional roster (the
+    // engine derives the new group master key).
+    let created = request(
+        &mut client,
+        "create",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "kt group", "members": ["+15555550101"] }),
+    )
+    .await;
+    assert_eq!(
+        created["result"]["groupId"], "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=",
+        "{created}"
+    );
+    assert_eq!(created["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["account"] == "+15555550100"
+                && frame["title"] == "kt group"
+                && frame["members"] == json!(["+15555550101"])
+                && frame.get("expiration").is_none()
+                && frame.get("avatar").is_none()
+        }),
+        "expected the create upstream frame: {frames:?}"
+    );
+
+    // The bare create: no roster, no change set — the frame carries the
+    // title alone (the absent keys stay absent upstream).
+    let bare = request(
+        &mut client,
+        "create-bare",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "bare group" }),
+    )
+    .await;
+    assert_eq!(bare["result"]["revision"], 0);
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame["title"] == "bare group" && frame.get("members").is_none()),
+        "expected the bare create frame: {frames:?}"
+    );
+
+    // The server-rejection family rides GROUP_CREATE_FAILED with the
+    // engine's data.status verbatim, deterministic.
+    let refused = request(
+        &mut client,
+        "create-refused",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "[fixture-reject-create]" }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "GROUP_CREATE_FAILED", "{refused}");
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(refused["error"]["data"]["status"], 400);
+
+    // The local ladder: the empty title, the over-bounds title, the
+    // explicit empty roster, and the over-bounds roster refuse before any
+    // upstream call; unknown account.
+    let empty_title = request(
+        &mut client,
+        "create-empty-title",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "" }),
+    )
+    .await;
+    assert_eq!(empty_title["error"]["code"], "INVALID_REQUEST");
+    let over_title = request(
+        &mut client,
+        "create-over-title",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "x".repeat(257) }),
+    )
+    .await;
+    assert_eq!(over_title["error"]["code"], "INVALID_REQUEST");
+    let empty_roster = request(
+        &mut client,
+        "create-empty-roster",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "kt group", "members": [] }),
+    )
+    .await;
+    assert_eq!(empty_roster["error"]["code"], "INVALID_REQUEST");
+    let over_roster = request(
+        &mut client,
+        "create-over-roster",
+        "groups.create",
+        json!({
+            "accountId": account_id,
+            "title": "kt group",
+            "members": vec!["+15555550101"; 1002]
+        }),
+    )
+    .await;
+    assert_eq!(over_roster["error"]["code"], "INVALID_REQUEST");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames.iter().filter(|frame| frame["title"] == "").count(),
+        0,
+        "an empty title never reaches the engine"
+    );
+    let missing = request(
+        &mut client,
+        "create-missing-account",
+        "groups.create",
+        json!({ "accountId": "no-such-account", "title": "kt group" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "create-crash",
+        "groups.create",
+        json!({ "accountId": account_id, "title": "[fixture-crash-create]" }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-create", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["title"] == "[fixture-crash-create]")
+            .count(),
+        1,
+        "an unknown create outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.124 (§4.105): the messages.sendContact face — the
 /// contact-card send. The direct leg resolves the row's peer reference into
 /// the engine's recipient addressing and the group leg the groupId

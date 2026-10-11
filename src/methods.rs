@@ -284,6 +284,15 @@ pub const METHODS: &[MethodRow] = &[
     // Zero local writes: the migrated group converges through contacts.sync
     // like every group row.
     ("groups.migrate", Lane::Send, true, "send"),
+    // Group create (contract revision 1.126, §4.107): mutating, send-lane
+    // upstream traffic — the groups class verbatim, same-account mutex and
+    // delete barrier included; advertised through the existing
+    // `group-management` tag, widened in place (the 1.82 precedent — the
+    // create is the group life cycle's own first face). The engine derives
+    // the new group master key and answers {groupId, revision} (the
+    // official createGroupV2 posture). Zero local writes: the new group
+    // converges through contacts.sync like every group row.
+    ("groups.create", Lane::Send, true, "send"),
     // Android local-backup export (contract revision 1.47, §4.46): the
     // engine's background export task is account-mutating state, so the
     // start face rides the send lane behind the reaction-class write-lane
@@ -644,8 +653,9 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `groups.joinViaLink` / `groups.cancelJoinRequest` join-family writes — one
 /// capability for the whole link life cycle, the 1.53 appendix discipline),
 /// widened in place by revision 1.123 (the `groups.migrate` GV1→GV2
-/// migration write — the migration is the group life cycle's own face; the
-/// same no-new-bit discipline); and `device-management` (contract revision
+/// migration write) and again by revision 1.126 (the `groups.create`
+/// new-group write — the create is the group life cycle's own first face;
+/// the same no-new-bit discipline); and `device-management` (contract revision
 /// 1.122) marks the §4.103
 /// device-plane faces (`accounts.getDevices` — the bounded device-list read
 /// with engine-side device-name decryption — plus the `accounts.unlinkDevice`
@@ -802,6 +812,7 @@ mod tests {
             "groups.joinViaLink",
             "groups.cancelJoinRequest",
             "groups.migrate",
+            "groups.create",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
@@ -866,6 +877,7 @@ mod tests {
             "groups.joinViaLink",
             "groups.cancelJoinRequest",
             "groups.migrate",
+            "groups.create",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",

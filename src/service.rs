@@ -524,6 +524,22 @@ impl ServiceError {
                         data,
                     );
                 }
+                // §4.107 group create (contract 1.126, engine createGroup):
+                // the same honest HTTP pass-through channel, create-faced —
+                // the server refused the new-group put (the engine sends an
+                // empty object when the server gave no status, the
+                // self-credential face included). Deterministic:
+                // retryable=false — the same group state refuses the same
+                // way.
+                if code == "GROUP_CREATE_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "GROUP_CREATE_FAILED",
+                        "the group create was rejected by the Signal server",
+                        data,
+                    );
+                }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
                         "STICKER_PACK_KEY_INVALID",
@@ -777,6 +793,17 @@ impl ServiceError {
                     "GROUP_MIGRATION_FAILED" => ApiError::new(
                         "GROUP_MIGRATION_FAILED",
                         "the group migration was rejected by the Signal server",
+                        false,
+                    ),
+                    // §4.107 group create (contract 1.126, engine
+                    // createGroup): the data-less fallback for the
+                    // server-rejection family (and the schema-consistency
+                    // scanner's code-side anchor). Deterministic:
+                    // retryable=false — the same group state refuses the
+                    // same way.
+                    "GROUP_CREATE_FAILED" => ApiError::new(
+                        "GROUP_CREATE_FAILED",
+                        "the group create was rejected by the Signal server",
                         false,
                     ),
                     "REPORT_SPAM_FAILED" => {
@@ -3451,6 +3478,70 @@ impl ConnectorService {
             "the kt-engine face has no updateGroup member-family method yet",
             false,
         )))
+    }
+
+    /// groups.create (contract revision 1.126, §4.107, capability
+    /// group-management): the local shape ladder, then the upstream frame.
+    /// The official createGroupV2 posture — the engine derives the new group
+    /// master key and answers {groupId, revision}. The title gate mirrors
+    /// the engine's shape face (required non-empty, the §4.104 256-byte
+    /// `groupName` bound); the optional roster carries the §4.44 bounds
+    /// when present (an explicit empty array is the engine's own refusal —
+    /// the local ladder mirrors it, absent stays absent); the avatar
+    /// data URI is validated locally (the §4.45 setProfile gate) so a
+    /// malformed URI answers INVALID_REQUEST before any upstream call.
+    pub fn prepare_groups_create(
+        &self,
+        params: &GroupsCreateParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.title.is_empty() || params.title.len() > GROUP_NAME_MAX_BYTES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "title must contain between 1 and 256 bytes",
+                false,
+            )));
+        }
+        if let Some(members) = &params.members
+            && (members.is_empty()
+                || members.len() > MAX_GROUP_MEMBERS
+                || members.iter().any(|member| {
+                    member.is_empty() || member.chars().count() > MAX_GROUP_MEMBER_ID_CHARS
+                }))
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "members carries at most 1001 entries of 1-128 characters",
+                false,
+            )));
+        }
+        let avatar = match &params.avatar {
+            AvatarUpdate::Replace(data_uri) => {
+                AvatarUpdate::Replace(validate_avatar_data_uri(data_uri)?)
+            }
+            keep_or_remove => keep_or_remove.clone(),
+        };
+        let account = self.resolve_account(&params.account_id)?;
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "title": params.title,
+        });
+        if let Some(expiration) = params.expiration {
+            upstream["expiration"] = json!(expiration);
+        }
+        match avatar {
+            AvatarUpdate::Keep => {}
+            AvatarUpdate::Remove => {
+                upstream["avatar"] = Value::Null;
+            }
+            AvatarUpdate::Replace(data_uri) => {
+                upstream["avatar"] = json!(data_uri);
+            }
+        }
+        if let Some(members) = &params.members {
+            upstream["members"] = json!(members);
+        }
+        Ok(upstream)
     }
 
     /// groups.migrate (contract revision 1.123, §4.104, capability
@@ -11672,6 +11763,37 @@ pub struct GroupsRevokeInvitesParams {
     pub operation_id: Option<String>,
 }
 
+/// groups.create params (contract revision 1.126, §4.107, capability
+/// group-management): the new group's title (required non-empty — the
+/// official createGroupV2 `name: string` is mandatory the same way) plus
+/// the optional change set. `expiration` the optional timer seconds,
+/// `avatar` the tri-state update (absent = keep, null = remove, a data URI
+/// = replace), `members` the optional initial roster (absent = create the
+/// empty group; the engine refuses an explicit empty array the same way it
+/// refuses any unparseable member — the local ladder mirrors both).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsCreateParams {
+    pub account_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub expiration: Option<u32>,
+    #[serde(default)]
+    pub avatar: AvatarUpdate,
+    #[serde(default)]
+    pub members: Option<Vec<String>>,
+}
+
+/// The groups.create result (contract revision 1.126, §4.107): the new
+/// group's master key (standard base64 — the id every other group face
+/// addresses) and the fresh group revision.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupsCreateResult {
+    pub group_id: String,
+    pub revision: u32,
+}
+
 /// groups.migrate params (contract revision 1.123, §4.104, capability
 /// group-management): the legacy GV1 group id as the caller holds it —
 /// standard base64 of the 16-byte legacy id (the engine decodes it; a
@@ -13194,6 +13316,29 @@ pub(crate) fn device_list_from_engine(result: &Value) -> Result<DeviceList, Serv
     Ok(DeviceList { devices: projected })
 }
 
+/// Parse the engine's `createGroup` result (contract revision 1.126,
+/// §4.107): `{groupId, revision}` — the new group master key (standard
+/// base64) and the fresh revision. A missing or non-string groupId, or a
+/// missing or non-numeric revision, is a protocol defect, not an empty
+/// answer.
+pub(crate) fn group_create_result_from_engine(
+    result: &Value,
+) -> Result<GroupsCreateResult, ServiceError> {
+    let group_id = result
+        .get("groupId")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let revision = result
+        .get("revision")
+        .and_then(Value::as_u64)
+        .and_then(|revision| u32::try_from(revision).ok())
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(GroupsCreateResult {
+        group_id: group_id.to_string(),
+        revision,
+    })
+}
+
 /// Parse the engine's `migrateGroup` result (contract revision 1.123,
 /// §4.104): `{groupId, revision}` — the new GV2 master key (standard base64)
 /// and the fresh revision. A missing or non-string groupId, or a missing or
@@ -13992,6 +14137,80 @@ mod tests {
         assert_eq!(api.code, "GROUP_MIGRATION_FAILED");
         assert!(!api.retryable);
         assert_eq!(api.data, Some(json!({ "status": 409 })));
+    }
+
+    /// §4.107 create prepare (contract 1.126): the local shape ladder —
+    /// the required non-empty title bound, the optional roster's bounds
+    /// (an explicit empty array is the engine's own refusal, mirrored) —
+    /// and the upstream frame (optional keys absent stay absent, the avatar
+    /// tri-state rides). The result parse answers the engine's
+    /// {groupId, revision}; a protocol-shaped defect answers Protocol.
+    #[test]
+    fn group_create_prepare_ladder_and_result_parse() {
+        let (_temp, mut service) = service();
+        let (account, _direct) = linked_account_and_conversation(&mut service);
+        let params = |title: &str, members: Option<Vec<String>>| GroupsCreateParams {
+            account_id: account.id.clone(),
+            title: title.to_string(),
+            expiration: None,
+            avatar: AvatarUpdate::Keep,
+            members,
+        };
+
+        let upstream = service
+            .prepare_groups_create(&params("kt group", Some(vec!["+15555550101".into()])))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["title"], "kt group");
+        assert!(upstream.get("expiration").is_none());
+        assert!(upstream.get("avatar").is_none());
+        assert_eq!(upstream["members"], json!(["+15555550101"]));
+
+        let bare = service
+            .prepare_groups_create(&params("kt group", None))
+            .unwrap();
+        assert!(bare.get("members").is_none());
+
+        let error = service
+            .prepare_groups_create(&params("", Some(vec!["+15555550101".into()])))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_create(&params(&"x".repeat(257), None))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_create(&params("kt group", Some(vec![])))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_create(&params(
+                "kt group",
+                Some(vec!["+15555550101".into(); MAX_GROUP_MEMBERS + 1]),
+            ))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        let result = group_create_result_from_engine(&json!({
+            "groupId": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4",
+            "revision": 0
+        }))
+        .unwrap();
+        assert_eq!(result.group_id, "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4");
+        assert_eq!(result.revision, 0);
+        assert!(group_create_result_from_engine(&json!({ "groupId": "x" })).is_err());
+        assert!(group_create_result_from_engine(&json!({ "revision": 3 })).is_err());
+
+        // The server-rejection family (contract 1.126): deterministic,
+        // data.status rides verbatim when the engine carried one.
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_CREATE_FAILED",
+            data: Some(json!({ "status": 400 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_CREATE_FAILED");
+        assert!(!api.retryable);
+        assert_eq!(api.data, Some(json!({ "status": 400 })));
     }
 
     /// §4.105 contact-send prepare (contract 1.124): the card ladder — the

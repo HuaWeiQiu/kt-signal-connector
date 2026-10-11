@@ -2709,6 +2709,14 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // FAILED and the transport family rides STORAGE_UNAVAILABLE, both
     // registered above.
     "GROUP_MIGRATION_FAILED",
+    // §4.107 group create (contract 1.126, engine createGroup): the
+    // server-rejection family for the new-group route with the engine's
+    // `data.status?` honest HTTP pass-through (the CALL_CREDENTIALS_
+    // FAILED channel); retryable=false — the same group state refuses the
+    // same way. The avatar partial-success family rides GROUP_AVATAR_
+    // UPLOAD_FAILED and the transport family rides STORAGE_UNAVAILABLE,
+    // both registered above.
+    "GROUP_CREATE_FAILED",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.

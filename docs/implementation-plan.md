@@ -8568,6 +8568,55 @@ unknown account, and the red line (crash-in-flight answers
 Gated behind the full local gate suite (fmt + clippy -D warnings +
 cargo test + release build), all green.
 
+### 4.107 The group create reaches the host: `groups.create` (contract revision 1.126, 2026-10-12)
+
+The engine shipped `createGroup` — the official createGroupV2 face: the
+engine derives the new group master key from its CSPRNG and answers
+`{groupId, revision}` (revision 0 — a fresh group's first state). This
+batch wires it into the host contract as `groups.create`, advertised
+through the existing `group-management` tag widened in place (the 1.82
+precedent — the create is the group life cycle's own first face).
+Until now the desktop could join, update, migrate, quit, and terminate
+groups but could not create one; the new-group decision had no outbound
+leg.
+
+**The shape.** `groups.create {accountId, title, expiration?, avatar?,
+members?}` — `title` is required non-empty within the 256-byte
+`groupName` bound (the official createGroupV2 `name: string` is
+mandatory the same way); `expiration` the optional timer seconds; the
+avatar tri-state (absent = keep, null = remove, a data URI = replace)
+runs the §4.45 `validate_avatar_data_uri` gate locally; `members` the
+optional initial roster — absent creates the empty group (the engine's
+own default), present it carries the §4.44 bounds (1..1001 entries of
+1..128 characters), and an explicit empty array is the engine's own
+refusal mirrored locally so the shape faces stay total. A malformed
+avatar URI answers INVALID_REQUEST before any upstream call.
+
+**The failure faces.** GROUP_CREATE_FAILED joins the structured
+whitelist (engine.rs allowlist + schema enum mirrored verbatim):
+retryable=false — the same group state refuses the same way — with the
+engine's `data.status?` riding the honest HTTP pass-through channel
+(GROUP_MIGRATION_FAILED 1.123 channel). The avatar partial-success
+family rides the existing GROUP_AVATAR_UPLOAD_FAILED and the transport
+family the existing STORAGE_UNAVAILABLE. A mutating upstream write
+whose outcome can be lost in transport: an indeterminate outcome
+answers SEND_OUTCOME_UNKNOWN and is never retried (the AGENTS.md red
+line — a create whose delivery is unknown may already have created the
+group server-side; a blind replay would create a second one).
+
+Tests: the service unit pins the prepare ladder (the title bound, the
+roster bounds both arms, the optional-keys-absent-stay-absent frame,
+the bare frame) and the result parse plus the GROUP_CREATE_FAILED
+faces; the methods-table test pins the lane and mutating
+classification; the integration test round-trips the create (the bare
+and rostered frames, the answer projecting {groupId, revision}), the
+local ladder (four refusals with a byte-frozen dispatch log), the
+server rejection (data.status 400 verbatim), the unknown account, and
+the red line (crash-in-flight answers SEND_OUTCOME_UNKNOWN across the
+restart, exactly one crashing frame). Gated behind the full local gate
+suite (fmt + clippy -D warnings + cargo test + release build), all
+green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

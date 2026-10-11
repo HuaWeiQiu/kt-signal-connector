@@ -1690,6 +1690,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.migrate_group(params).await
     }
 
+    /// groups.create (contract revision 1.126, §4.107): the new-group write
+    /// is the account's own upstream group write, so it routes through the
+    /// account's owning engine.
+    pub async fn create_group(
+        &self,
+        params: crate::service::GroupsCreateParams,
+    ) -> Result<crate::service::GroupsCreateResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.create_group(params).await
+    }
+
     /// messages.sendContact (contract revision 1.124, §4.105): the card send
     /// is the account's own upstream message write, so it routes through the
     /// account's owning engine like every send-lane face.

@@ -39,8 +39,8 @@ use crate::service::{
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
     ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
     ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
-    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsGetParams,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsCreateParams,
+    GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
     GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
@@ -2957,6 +2957,24 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Group create (contract revision 1.126, §4.107): the official
+        // createGroupV2 upstream leg — the engine derives the new group
+        // master key and the answer projects {groupId, revision} verbatim;
+        // an indeterminate mutating outcome folds to SEND_OUTCOME_UNKNOWN
+        // and is never retried.
+        "groups.create" => match serde_json::from_value::<GroupsCreateParams>(request.params) {
+            Ok(params) => match runtime.create_group(params).await {
+                Ok(result) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(result).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid groups.create params", false),
+            ),
+        },
         // Group migration (contract revision 1.123, §4.104): the GV1→GV2
         // upstream leg — the answer projects the engine's {groupId, revision}
         // verbatim (the new master key is the id every other group face

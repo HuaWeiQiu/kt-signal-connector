@@ -1865,6 +1865,44 @@ for line in sys.stdin:
         if params.get("expirationInSeconds") == 2147483647:
             os._exit(25)
         result = {}
+    elif method == "createGroup":
+        # Contract 1.126 §4.107: the new-group route (the official
+        # createGroupV2 posture). Same dispatch-recording discipline: the
+        # exact upstream params (the test asserts the resolved account, the
+        # title, and the optional roster; the avatar data URI is
+        # digest-summarized before logging — the createGroup/migrateGroup
+        # "zero avatar bytes in the dispatch log" discipline the engine
+        # pins). Sentinels (grammar-legal, they pass the connector's local
+        # shape gate): title "[fixture-crash-create]" crashes with the
+        # mutating call in flight (os._exit(48); disjoint from
+        # 25/29/30/31/32/33/34/35/36/37/46/47); title
+        # "[fixture-reject-create]" answers the server-rejection face
+        # (-1 GROUP_CREATE_FAILED, data.status 400). Success answers the
+        # create result shape {groupId: new master key base64, revision: 0}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                logged = json.loads(json.dumps(params))
+                if isinstance(logged.get("avatar"), str):
+                    logged["avatar"] = "[avatar data uri: %d bytes]" % len(logged["avatar"])
+                log.write(json.dumps(logged, separators=(",", ":")) + "\n")
+        if params.get("title") == "[fixture-crash-create]":
+            os._exit(48)
+        if params.get("title") == "[fixture-reject-create]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_CREATE_FAILED",
+                    "data": {"status": 400},
+                },
+            }
+            emit_json(response)
+            continue
+        result = {
+            "groupId": "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=",
+            "revision": 0,
+        }
     elif method == "migrateGroup":
         # Contract 1.123 §4.104: the GV1→GV2 migration route. Same
         # dispatch-recording discipline: the exact upstream params (the test
