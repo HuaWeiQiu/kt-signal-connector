@@ -2967,13 +2967,23 @@ impl Store {
 
     /// Mark a message remote-deleted (contract 1.15): a peer's or our own
     /// multi-device remoteDelete pointing at this row's upstream timestamp.
-    /// Idempotent; returns the updated row when the status actually
-    /// transitioned so a replayed delete does not re-emit events.
+    /// Contract 1.109 (§4.90): the delete is author-scoped — only rows whose
+    /// `sender_id` is the delete envelope's own author projection (the same
+    /// derivation the landing row stored, the account id itself for the
+    /// outgoing multi-device mirrors) ever transition. Per-sender clocks make
+    /// (conversation, sent_at) shared across authors in a group, so the
+    /// author-blind update could wipe a foreign member's row that happens to
+    /// carry the same timestamp. Idempotent; returns the updated row when the
+    /// status actually transitioned so a replayed delete does not re-emit
+    /// events. `None` answers either an absent target or a target owned by
+    /// another author — the caller cannot distinguish the two and must not
+    /// (the absent case is the early-arrival question, §4.91).
     pub fn mark_remote_deleted(
         &self,
         account_id: &str,
         conversation_id: &str,
         target_sent_at: u64,
+        author_sender_id: &str,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
         let conn = self.lock_conn()?;
         let transaction = conn
@@ -2984,8 +2994,14 @@ impl Store {
                 "UPDATE messages
                  SET status='remote-deleted'
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND sender_id=?4
                    AND status NOT IN ('remote-deleted', 'system')",
-                params![account_id, conversation_id, target_sent_at as i64],
+                params![
+                    account_id,
+                    conversation_id,
+                    target_sent_at as i64,
+                    author_sender_id
+                ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let record = transaction
@@ -2994,9 +3010,14 @@ impl Store {
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
                  FROM messages
-                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
-                params![account_id, conversation_id, target_sent_at as i64],
+                params![
+                    account_id,
+                    conversation_id,
+                    target_sent_at as i64,
+                    author_sender_id
+                ],
                 message_record_from_row,
             )
             .optional()
@@ -8991,7 +9012,7 @@ mod tests {
         // but exposes no send state — the official icon set has no
         // representation for it.
         store
-            .mark_remote_deleted(&account.id, &conversation.id, 300)
+            .mark_remote_deleted(&account.id, &conversation.id, 300, &account.id)
             .unwrap();
         let current = store
             .conversation_summary(&conversation.account_id, &conversation.id)
@@ -9128,7 +9149,7 @@ mod tests {
         // same boundary `unread_count` already has.
         push("m4", &["+15555550100"], true);
         store
-            .mark_remote_deleted(&account.id, &conversation.id, 40)
+            .mark_remote_deleted(&account.id, &conversation.id, 40, "peer")
             .unwrap();
         let current = summary();
         assert_eq!(current.unread_count, 1);
@@ -9621,6 +9642,99 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// Contract 1.109 (§4.90): the remote delete is author-scoped at the
+    /// store level — per-sender clocks let two members' rows share one
+    /// (conversation, sent_at), and only the delete author's own row ever
+    /// transitions; an author with no row answers None, and a replay
+    /// answers the already-deleted row with changed=false.
+    #[test]
+    fn remote_delete_scopes_to_the_delete_author() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtc2NvcGU", "Scoped")
+            .unwrap();
+        let row = |store: &Store, id: &str, sender: &str| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: sender.into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at: 700,
+                received_at: None,
+                text: Some(id.into()),
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            store.insert_message(&message, None, None, false).unwrap();
+        };
+        row(&store, "author-a", "hash-a");
+        row(&store, "author-b", "hash-b");
+
+        // Author B's delete converges only B's own row, never A's.
+        let applied = store
+            .mark_remote_deleted(&account.id, &conversation.id, 700, "hash-b")
+            .unwrap()
+            .expect("the author's own row exists");
+        assert_eq!(applied.0.id, "author-b");
+        assert!(applied.1, "the first transition reports changed");
+        let untouched = store
+            .message_by_id(&account.id, &conversation.id, "author-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.status, "delivered");
+
+        // An author with no row at the timestamp answers None.
+        assert!(
+            store
+                .mark_remote_deleted(&account.id, &conversation.id, 700, "hash-c")
+                .unwrap()
+                .is_none(),
+            "a foreign author's delete matches no row of its own"
+        );
+
+        // Author A's own delete converges only its row; the replay reports
+        // the same row with changed=false.
+        let own = store
+            .mark_remote_deleted(&account.id, &conversation.id, 700, "hash-a")
+            .unwrap()
+            .expect("the author's own row exists");
+        assert_eq!(own.0.id, "author-a");
+        assert!(own.1);
+        let replay = store
+            .mark_remote_deleted(&account.id, &conversation.id, 700, "hash-a")
+            .unwrap()
+            .expect("the replay still finds the row");
+        assert!(
+            !replay.1,
+            "the replayed delete never re-reports a transition"
+        );
     }
 
     #[test]

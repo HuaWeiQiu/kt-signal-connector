@@ -5,7 +5,20 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.108 (2026-10-11; the read/viewed SELF-SYNC upstream legs (§4.89):
+- Contract revision: 1.109 (2026-10-11; the remoteDelete author and age gates (§4.90):
+  the inbound remoteDelete control applied without checking who was speaking or how old
+  the target was — the store's delete matched (account, conversation, sent_at) alone, so
+  in a group author A's delete wiped author B's row that shared the per-sender timestamp,
+  and a delete naming a target older than the official 24 h compose window applied anyway.
+  The store delete is now author-scoped (`mark_remote_deleted` carries the envelope's own
+  author projection — the row's `sender_id` derivation verbatim; direct-conversation
+  identity pairs collapse to one string, so direct behavior is byte-identical; the §4.83
+  delete-for-me sync keeps its deliberately author-less path), and the arm drops deletes
+  whose sender-clock compose age — envelope timestamp minus target timestamp, immune to
+  sender/receiver clock skew — blew past `REMOTE_DELETE_MAX_AGE_MS` (24 h), before the
+  store call and before the §4.91 early-arrival buffer. No wire change. Tests 645 → 648
+  (lib 486 → 489), all green) —
+  previously 1.108 (2026-10-11; the read/viewed SELF-SYNC upstream legs (§4.89):
   `messages.syncRead` / `messages.syncViewed` close the connector's silent second
   read-state channel — the markRead pair spent its fan-out on the peer-facing
   `sendReadReceipt`/`sendViewedReceipt` faces (gated by the account's `readReceipts`
@@ -7395,6 +7408,61 @@ Tests: one service integration (`sync_read_and_sync_viewed_prepare_mirror_the_re
 — the peer group mirrors the receipt face with ascending timestamps, syncViewed stamps
 locally with first-stamp-wins, syncRead never stamps, group conversations skip the
 fan-out but keep the viewed stamp). Gates: 640 → 641, all green.
+
+### 4.90 remoteDelete author and age gates (contract revision 1.109, 2026-10-11)
+
+The inbound remoteDelete control was the one message-addressed arm that applied
+without checking who was speaking or when the target was composed: the store's
+delete matched (account, conversation, sent_at) alone. Two real defects fall out
+of that shape. (1) The author defect is a live misattribution: Signal
+timestamps are per-sender clocks, so in a group two members' rows can carry the
+same `sent_at`, and any member's remoteDelete wiped every row sitting at that
+timestamp — author A's delete deleted author B's message. (2) The age defect is
+a hardening gap: the official delete-for-everyone window is 24 h at compose
+time (docs/remote-delete-l2-plan.md §3.2), and the connector applied deletes
+naming targets no honest sender could still have composed a delete for.
+
+**The author gate (the store face).** `mark_remote_deleted` takes the delete
+envelope's own author projection — the same derivation the landing row stored
+as its `sender_id` (`stable_hash_id([account, kind, source])` for peers, the
+account id itself for the outgoing multi-device mirrors) — and scopes both the
+UPDATE and its read-back with `sender_id = ?`. Only the author's own row ever
+transitions; an author with no row at the timestamp answers `None` (which the
+§4.91 early-arrival buffer reads as the early-arrival question), a replay
+still answers the already-deleted row with `changed=false`, and the direct-
+conversation identity pair collapses to one string (source = peer key), so
+existing direct deletes are byte-identical in behavior. The delete-for-me sync
+keeps its deliberately author-less store path (`delete_messages_by_sent_at`,
+§4.83): that face is the account's own self-sync and names its conversations,
+not its authors.
+
+**The age gate (the arm face).** The window reads the delete envelope's own
+sender clock — the delta between the envelope `timestamp` and the named
+target timestamp — not the connector's clock. Both values are the author's
+assertions, so the delta is the compose-time age the official window governs
+and the check is immune to sender/receiver clock skew; a fresh envelope naming
+an ancient target (relay lag, stale replay) still trips it, while a
+legitimately-composed delete that arrives late applies. A delete past the
+`REMOTE_DELETE_MAX_AGE_MS` window (24 h) is dropped silently: no event, no
+state change, a kind-only warn log. The gate is deliberately narrow hardening,
+not a protocol re-derivation: a hostile author can forge both fields, so the
+window exists to filter broken/stale faces (a corrupted or replayed timestamp
+colliding with a real row), and it sits BEFORE the store call so an aged
+delete can never consume the §4.91 buffer either (an aged delete only grows
+older while it waits).
+
+No wire change: the method/event/error enums are untouched, no new
+capability, and `tests/schema_consistency.rs` stays green unchanged.
+
+Tests: the store unit (`remote_delete_scopes_to_the_delete_author` — the
+shared-timestamp group collision, the foreign-author None, the own-author
+apply, the changed=false replay); the service arm units
+(`group_remote_delete_is_author_scoped` — the live arm through the full
+ingest ladder with the replay and the foreign-author silent faces;
+`aged_remote_delete_is_dropped_silently` — one millisecond past the window
+drops, one millisecond inside applies, the boundary is the window itself);
+the two pre-existing summary tests now pin the author-scoped call shape.
+Gates: 645 → 648 (lib 486 → 489), all green.
 
 ## 5. signal-cli Boundary
 

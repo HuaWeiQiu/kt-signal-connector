@@ -272,6 +272,16 @@ pub const STORY_TEXT_STYLES: [&str; 6] =
 /// GroupsV2 group-size ceiling. The contacts sync projects at most this many
 /// members into the cached group row; entries past the cap drop.
 pub const MAX_GROUP_MEMBERS: usize = 1001;
+/// The inbound remoteDelete age gate (contract revision 1.109, §4.90): the
+/// official delete-for-everyone window is 24 h on the sender side
+/// (docs/remote-delete-l2-plan.md §3.2). The gate reads the delete
+/// envelope's own sender clock — the delta between the envelope timestamp
+/// and the named target timestamp — so it measures the compose-time age the
+/// official window governs and stays immune to sender/receiver clock skew.
+/// An aged delete is dropped: never applied, never buffered. The window is
+/// generous on purpose: it is a hostile-or-broken filter, not a precision
+/// re-derivation of the sender's compose-time check.
+pub const REMOTE_DELETE_MAX_AGE_MS: u64 = 24 * 60 * 60 * 1_000;
 /// One roster member address (contract 1.40): a number or UUID-shaped ACI,
 /// bounded like the opaqueId family it must stay joinable against.
 pub const MAX_GROUP_MEMBER_ID_CHARS: usize = 128;
@@ -6681,10 +6691,50 @@ impl ConnectorService {
                 Ok(events)
             }
             ControlReceive::RemoteDelete { target_timestamp } => {
+                // Contract 1.109 (§4.90): the delete author's receive-identity
+                // projection — the same derivation the target row stored as
+                // its `sender_id` when it landed (the account id itself for
+                // the outgoing multi-device mirrors). The store's delete is
+                // author-scoped, so a foreign member's row at the same
+                // per-sender timestamp is never the target.
+                let author_sender_id = match receive.direction {
+                    "outgoing" => account.id.clone(),
+                    _ => stable_hash_id(&[
+                        &account.id,
+                        kind,
+                        receive.source.as_deref().unwrap_or(peer_key),
+                    ]),
+                };
+                // Contract 1.109 (§4.90): the age gate — the official
+                // delete-for-everyone window is 24 h on the sender side
+                // (docs/remote-delete-l2-plan.md §3.2), so a delete whose
+                // compose-time age blew past the window is either hostile or
+                // clock-broken. The age rides the ENVELOPE's own sender
+                // clock: both the delete envelope's timestamp and the named
+                // target timestamp are the author's clock, so the delta is
+                // the compose-time age the official window governs — immune
+                // to sender/receiver clock skew, and a fresh envelope naming
+                // an ancient target (relay lag, stale replay) still trips
+                // it. A dropped delete never applies and carries no event
+                // and no state change; the §4.91 early-arrival buffer rides
+                // this same gate (an aged delete only grows older while it
+                // waits).
+                let age = receive
+                    .timestamp
+                    .map_or(0, |envelope| envelope.saturating_sub(target_timestamp));
+                if age > REMOTE_DELETE_MAX_AGE_MS {
+                    tracing::warn!(
+                        account_id = %account.id,
+                        kind = "remote_delete_age_gate",
+                        "aged remote delete dropped"
+                    );
+                    return Ok(Vec::new());
+                }
                 match self.store.mark_remote_deleted(
                     &account.id,
                     &conversation.id,
                     target_timestamp,
+                    &author_sender_id,
                 )? {
                     Some((record, true)) => Ok(vec![HostSideEvent::MessageStatusChanged {
                         account_id: record.account_id,
@@ -6694,6 +6744,10 @@ impl ConnectorService {
                         read_at: None,
                         viewed_at: None,
                     }]),
+                    // A replay (the row is already remote-deleted) stays
+                    // silent; no row by this author at this timestamp keeps
+                    // the historical silent skip (the §4.91 early-arrival
+                    // buffer owns that case).
                     _ => Ok(Vec::new()),
                 }
             }
@@ -21367,6 +21421,202 @@ mod tests {
         assert_eq!(messages.len(), 1, "no duplicate row is created");
         assert_eq!(messages[0].status, "remote-deleted");
         assert_eq!(messages[0].sent_at, 300);
+    }
+
+    /// Contract 1.109 (§4.90) author gate: in a group, author A's remote
+    /// delete never touches author B's row that shares the timestamp (the
+    /// per-sender clocks make that a real collision) — only A's own row
+    /// converges, B's row stays delivered, and a replay plus a delete from
+    /// an author with no row at the timestamp both stay silent.
+    #[test]
+    fn group_remote_delete_is_author_scoped() {
+        let (_temp, mut service) = service();
+        let (account, _direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtYXV0aA", "Author Gate Group")
+            .unwrap();
+        let seed_row = |service: &mut ConnectorService, source: &str| {
+            let incoming = NormalizedReceive {
+                timestamp: Some(700),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some(source.into()),
+                source_uuid: None,
+                peer_name: None,
+                group_id: Some("Z3JvdXAtYXV0aA".into()),
+                text: Some(format!("from {source}")),
+                text_bytes: None,
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+            };
+            service
+                .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+        };
+        // Both members' rows land at the same per-sender timestamp.
+        seed_row(&mut service, "+15555550101");
+        seed_row(&mut service, "+15555550102");
+
+        let mut delete = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 700,
+            },
+        );
+        delete.group_id = Some("Z3JvdXAtYXV0aA".into());
+        let events = service
+            .ingest_receive(delete, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the author's own row converges: {events:?}"
+        );
+
+        let rows = service
+            .list_messages(&account.id, &group.id, 10, None)
+            .unwrap()
+            .items;
+        let status_of = |source: &str| {
+            rows.iter()
+                .find(|row| row.text.as_deref() == Some(&format!("from {source}")))
+                .map(|row| row.status)
+        };
+        assert_eq!(status_of("+15555550101"), Some("remote-deleted"));
+        assert_eq!(
+            status_of("+15555550102"),
+            Some("delivered"),
+            "a foreign member's row at the same timestamp is never the target"
+        );
+
+        // A replay of the same delete stays silent (already converged).
+        let mut replay = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 700,
+            },
+        );
+        replay.group_id = Some("Z3JvdXAtYXV0aA".into());
+        assert!(
+            service
+                .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A delete from an author with no row at this timestamp touches
+        // nothing: the store answers no matching row and the arm stays
+        // silent (the §4.91 early-arrival buffer owns the absent case).
+        let mut foreign = control_receive(
+            "+15555550100",
+            "+15555550103",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 700,
+            },
+        );
+        foreign.group_id = Some("Z3JvdXAtYXV0aA".into());
+        assert!(
+            service
+                .ingest_receive(foreign, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let rows = service
+            .list_messages(&account.id, &group.id, 10, None)
+            .unwrap()
+            .items;
+        let untouched = rows
+            .iter()
+            .find(|row| row.text.as_deref() == Some("from +15555550102"))
+            .map(|row| row.status);
+        assert_eq!(untouched, Some("delivered"));
+    }
+
+    /// Contract 1.109 (§4.90) age gate: a delete whose compose-time age —
+    /// the delete envelope's own sender-clock delta to the named target —
+    /// blew past the official 24 h delete-for-everyone window is dropped
+    /// silently: the row stays delivered, no event, and the arm never
+    /// reaches the store.
+    #[test]
+    fn aged_remote_delete_is_dropped_silently() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let original = NormalizedReceive {
+            timestamp: Some(500),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("stays".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+        };
+        service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        // The envelope names the target 500 and carries a sender-clock
+        // timestamp one millisecond past the window.
+        let mut aged = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 500,
+            },
+        );
+        aged.timestamp = Some(500 + REMOTE_DELETE_MAX_AGE_MS + 1);
+        let events = service
+            .ingest_receive(aged, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(events.is_empty(), "an aged delete is dropped, not applied");
+
+        // A delete one millisecond inside the window still applies — the
+        // boundary is the window itself, and both clocks here are the
+        // sender's.
+        let mut fresh = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 500,
+            },
+        );
+        fresh.timestamp = Some(500 + REMOTE_DELETE_MAX_AGE_MS);
+        let events = service
+            .ingest_receive(fresh, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(HostSideEvent::MessageStatusChanged { status, .. }) if *status == "remote-deleted"
+        ));
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(messages[0].status, "remote-deleted");
     }
 
     /// A peer's envelope-level edit (direction "incoming" + control Edit)
