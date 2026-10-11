@@ -1469,39 +1469,40 @@ for line in sys.stdin:
         # server-rejection faces mirror the engine's GROUP_UPDATE_FAILED data
         # mapping: groupId "[fixture-group-forbidden]" answers data.status=403
         # (non-admin), "[fixture-group-conflict]" answers data.status=409
-        # (revision race).
+        # (revision race). Contract 1.115 §4.96: the sentinels answer on
+        # every updateGroup route (the wired groups.update face rides
+        # title/member/link-access/avatar changes, never `expiration`).
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
         if params.get("name") == "[fixture-crash-group]":
             os._exit(25)
-        if params.get("expiration") is not None:
-            if params.get("groupId") == "[fixture-crash-group-timer]":
-                os._exit(34)
-            if params.get("groupId") == "[fixture-group-forbidden]":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -1,
-                        "message": "GROUP_UPDATE_FAILED",
-                        "data": {"status": 403},
-                    },
-                }
-                emit_json(response)
-                continue
-            if params.get("groupId") == "[fixture-group-conflict]":
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {
-                        "code": -1,
-                        "message": "GROUP_UPDATE_FAILED",
-                        "data": {"status": 409},
-                    },
-                }
-                emit_json(response)
-                continue
+        if params.get("expiration") is not None and params.get("groupId") == "[fixture-crash-group-timer]":
+            os._exit(34)
+        if params.get("groupId") == "[fixture-group-forbidden]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_UPDATE_FAILED",
+                    "data": {"status": 403},
+                },
+            }
+            emit_json(response)
+            continue
+        if params.get("groupId") == "[fixture-group-conflict]":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_UPDATE_FAILED",
+                    "data": {"status": 409},
+                },
+            }
+            emit_json(response)
+            continue
         # Contract 1.58 §4.53: the join-request approval rides updateGroup's
         # member family (the fold already emptied everything but requesting
         # members). Contract 1.64 §4.57: the invite revocation rides the
@@ -1543,10 +1544,13 @@ for line in sys.stdin:
         ):
             os._exit(37)
         result = {"timestamp": 99, "results": []}
-    elif method == "quitGroup":
-        # Contract 1.45 §4.44: same recording discipline; the magic group id
-        # answers the upstream user error a last-admin quit produces
-        # (UPSTREAM_ERROR family), every other id leaves the group cleanly.
+    elif method == "leaveGroup":
+        # Contract 1.45 §4.44 / contract 1.115 §4.96: the wired groups.quit
+        # route — the engine's method name for the upstream quit write (the
+        # engine face never carried a `quitGroup` literal). Same recording
+        # discipline; the magic group id answers the upstream user error a
+        # last-admin quit produces (the deterministic UPSTREAM_ERROR face),
+        # every other id leaves cleanly with the engine's {status: "left"}.
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
@@ -1558,7 +1562,7 @@ for line in sys.stdin:
             }
             emit_json(response)
             continue
-        result = {"timestamp": 99, "results": []}
+        result = {"status": "left"}
     elif method == "terminateGroup":
         # Contract 1.52 §4.50: the group-termination write route. Same
         # recording discipline as updateGroup/quitGroup: the exact upstream

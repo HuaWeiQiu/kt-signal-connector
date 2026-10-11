@@ -2664,6 +2664,13 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // {retryable, textSaved} verbatim — the PROFILE_UPLOAD_FAILED shape,
     // group-faced.
     "GROUP_AVATAR_UPLOAD_FAILED",
+    // §4.96 group-update write face (contract 1.115, the updateGroup/quit
+    // wiring batch): the engine's server-rejection answer for the wired
+    // updateGroup route — the change broadcast (title/member/link-access/
+    // avatar) was refused by the Signal server. The `data.status?` rides
+    // verbatim (the CALL_CREDENTIALS_FAILED channel); retryable=false —
+    // a 409 revision race unblocks only after re-reading the group state.
+    "GROUP_UPDATE_FAILED",
     // §4.73 call-link credential material faces (contract 1.88, engine
     // a3ae39b, P4c slice 1 — the registration the engine's compat §3 calls
     // rows assign to this connector batch): FAILED is the server-rejection /

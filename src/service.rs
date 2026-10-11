@@ -391,10 +391,11 @@ impl ServiceError {
             ServiceError::Engine(EngineError::UpstreamCode { code, data }) => {
                 // Contract 1.50: PROFILE_UPLOAD_FAILED carries the engine's
                 // partial-success data object ({retryable, textSaved})
-                // verbatim — the only code whose host face depends on the
-                // payload. Every other allowlisted code keeps the fixed
-                // content-free face below; their data (if any) is dropped
-                // here rather than leaking engine internals unpromised.
+                // verbatim — the first code whose host face depends on the
+                // payload; the data-carrying faces below followed. Every
+                // other allowlisted code keeps the fixed content-free face
+                // in the match below; their data (if any) is dropped here
+                // rather than leaking engine internals unpromised.
                 if code == "PROFILE_UPLOAD_FAILED"
                     && let Some(data) = data
                 {
@@ -430,6 +431,25 @@ impl ServiceError {
                     return ApiError::with_data(
                         "GROUP_AVATAR_UPLOAD_FAILED",
                         "the group avatar upload failed after the group change was saved",
+                        data,
+                    );
+                }
+                // §4.96 group-update write face (contract 1.115): the
+                // engine's server-rejection answer for the wired updateGroup
+                // route. The `data.status?` rides verbatim — the same honest
+                // HTTP pass-through channel as CALL_CREDENTIALS_FAILED (the
+                // engine sends an empty object when the server gave no
+                // status); `with_data` derives retryable=false (the data
+                // carries no retryable key) and the contract fixes it: the
+                // same change against the same server state fails the same
+                // way, and a 409 revision race unblocks only after the
+                // caller re-reads the group state, never by blind replay.
+                if code == "GROUP_UPDATE_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "GROUP_UPDATE_FAILED",
+                        "the group update was rejected by the Signal server",
                         data,
                     );
                 }
@@ -680,6 +700,15 @@ impl ServiceError {
                         "GROUP_AVATAR_UPLOAD_FAILED",
                         "the group avatar upload failed after the group change was saved",
                         true,
+                    ),
+                    // §4.96 group-update write face (contract 1.115): the
+                    // data-less fallback for the server-rejection family
+                    // (and the schema-consistency scanner's code-side
+                    // anchor). Deterministic: retryable=false.
+                    "GROUP_UPDATE_FAILED" => ApiError::new(
+                        "GROUP_UPDATE_FAILED",
+                        "the group update was rejected by the Signal server",
+                        false,
                     ),
                     _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
                 }
@@ -2836,20 +2865,21 @@ impl ConnectorService {
     }
 
     /// groups.update (contract revision 1.45, §4.44, capability
-    /// group-management): the full local validation + resolution ladder, then
-    /// the honest refusal. Field bounds mirror the schema; the change keys are
-    /// individually optional, at least one must be present (`resetLink: false`
-    /// counts as absent), and explicit empty member arrays are refused —
-    /// upstream reads absence as "no change" and an empty set would commit a
-    /// no-delta group change broadcast. The conversation id must resolve to a
-    /// kind='group' row (direct answers INVALID_REQUEST before any upstream
-    /// call). The engine face has no updateGroup method and answers
-    /// CAPABILITY_UNAVAILABLE (retryable=false) after the local validation
-    /// completed — engine-batch debt, honest by design (ADR 0003: the removed
-    /// signal-cli fallback face took `updateGroup` directly, but its removal
-    /// is not a capability regression; the answer was already the kt-engine
-    /// behavior). Zero local writes: group state converges through the
-    /// receive projection.
+    /// group-management; the engine write face wired by contract 1.115,
+    /// §4.96): the full local validation + resolution ladder, then the
+    /// engine's updateGroup payload. Field bounds mirror the schema; the
+    /// change keys are individually optional, at least one must be present
+    /// (`resetLink: false` counts as absent), and explicit empty member
+    /// arrays are refused — upstream reads absence as "no change" and an
+    /// empty set would commit a no-delta group change broadcast. The
+    /// conversation id must resolve to a kind='group' row (direct answers
+    /// INVALID_REQUEST before any upstream call). The engine carries the
+    /// title/member/avatar/link-access subset; a change set naming anything
+    /// outside it (description, admin/ban families, resetLink, permission
+    /// trio, member label pair) answers CAPABILITY_UNAVAILABLE naming the
+    /// keys (retryable=false) after the local validation completed — the
+    /// honest whole-call refusal, never a partial application. Zero local
+    /// writes: group state converges through the receive projection.
     pub fn prepare_groups_update(
         &self,
         params: &GroupsUpdateParams,
@@ -2928,14 +2958,18 @@ impl ConnectorService {
             changes.push((key, json!(members)));
         }
         if let Some(link_state) = params.link_state.as_deref() {
-            // The connector's enabled-without-approval is the upstream
-            // "enabled" choice under a stricter name: the official link state
-            // knows enabled / enabled-with-approval / disabled (pinned
-            // UpdateGroupCommand --link choices).
-            let upstream = match link_state {
-                "enabled-with-approval" => "enabled-with-approval",
-                "enabled-without-approval" => "enabled",
-                "disabled" => "disabled",
+            // The engine's addFromInviteLinkAccess vocabulary (contract
+            // 1.115, §4.96): the connector's enabled-without-approval is the
+            // official "anyone with the link joins" face (ANY),
+            // enabled-with-approval is the admin-approval gate
+            // (ADMINISTRATOR), and disabled is the upstream UNSATISFIABLE —
+            // the state no access level can satisfy (the official
+            // buildAccessControlAddFromInviteLinkChange enum, the engine's
+            // exact write word).
+            let access = match link_state {
+                "enabled-with-approval" => "ADMINISTRATOR",
+                "enabled-without-approval" => "ANY",
+                "disabled" => "UNSATISFIABLE",
                 _ => {
                     return Err(ServiceError::Api(ApiError::new(
                         "INVALID_REQUEST",
@@ -2944,7 +2978,7 @@ impl ConnectorService {
                     )));
                 }
             };
-            changes.push(("link", json!(upstream)));
+            changes.push(("addFromInviteLinkAccess", json!(access)));
         }
         if params.reset_link == Some(true) {
             changes.push(("resetLink", json!(true)));
@@ -3021,9 +3055,8 @@ impl ConnectorService {
             )));
         }
         // The account row resolves first (the shared ladder's wire order —
-        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND) even though the
-        // tail is the structured refusal.
-        self.resolve_account(&params.account_id)?;
+        // ACCOUNT_NOT_FOUND before CONVERSATION_NOT_FOUND).
+        let account = self.resolve_account(&params.account_id)?;
         let conversation =
             self.resolve_conversation(&params.account_id, &params.conversation_id)?;
         if conversation.kind != "group" {
@@ -3033,29 +3066,80 @@ impl ConnectorService {
                 false,
             )));
         }
-        // Engine-batch debt (the contract 1.89 payload side is already
-        // validated above and rides unchanged when the engine's updateGroup
-        // face lands): the honest structured refusal after the full local
-        // ladder, never a disguised no-op.
-        Err(ServiceError::Api(ApiError::new(
-            "CAPABILITY_UNAVAILABLE",
-            "the kt-engine face has no updateGroup method yet",
-            false,
-        )))
+        // The engine face (contract 1.115, §4.96): the change set folds onto
+        // the engine's updateGroup vocabulary — groupName→title, the member
+        // arrays verbatim, the avatar tri-state verbatim, the link access
+        // word above. A change set carrying any key outside that subset
+        // (groupDescription, the admin and ban families, resetLink, the
+        // permission trio, the member label pair) answers
+        // CAPABILITY_UNAVAILABLE naming the keys — the honest whole-call
+        // refusal, never a partial application: the engine commits the set
+        // as one change broadcast and the official client applies it
+        // atomically, so folding a subset would silently shrink what the
+        // caller asked for.
+        let mut unsupported: Vec<&'static str> = Vec::new();
+        let mut payload = serde_json::Map::new();
+        payload.insert("account".to_owned(), json!(account.signal_account));
+        payload.insert("groupId".to_owned(), json!(conversation.peer_key));
+        for (key, value) in changes {
+            match key {
+                "name" => {
+                    payload.insert("title".to_owned(), value);
+                }
+                "members" => {
+                    payload.insert("addMembers".to_owned(), value);
+                }
+                "removeMembers" => {
+                    payload.insert("removeMembers".to_owned(), value);
+                }
+                "avatar" => {
+                    payload.insert("avatar".to_owned(), value);
+                }
+                "addFromInviteLinkAccess" => {
+                    payload.insert("addFromInviteLinkAccess".to_owned(), value);
+                }
+                // The refusal names the caller's schema vocabulary, not the
+                // internal upstream keys the change vec carries.
+                _ => {
+                    let host = match key {
+                        "description" => "groupDescription",
+                        "admins" => "promoteAdmins",
+                        "removeAdmins" => "demoteAdmins",
+                        "bans" => "banMembers",
+                        "unbans" => "unbanMembers",
+                        "setPermissionAddMember" => "permissionAddMember",
+                        "setPermissionEditDetails" => "permissionEditDetails",
+                        "setPermissionSendMessages" => "permissionSendMessages",
+                        other => other,
+                    };
+                    unsupported.push(host);
+                }
+            }
+        }
+        if !unsupported.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "CAPABILITY_UNAVAILABLE",
+                format!(
+                    "the kt-engine updateGroup face does not carry: {}",
+                    unsupported.join(", ")
+                ),
+                false,
+            )));
+        }
+        Ok(Value::Object(payload))
     }
 
     /// groups.quit (contract revision 1.45, §4.44, capability
-    /// group-management): resolution ladder then the honest refusal. The
-    /// upstream `quitGroup {account, groupId}` payload shape is what the
-    /// engine batch will consume. The upstream --delete local-data flag and
-    /// the --admin last-admin handoff list are deliberately not exposed: the
-    /// official client keeps the conversation as a non-member after leaving,
-    /// and a last-admin quit without a handoff answers the upstream user
-    /// error verbatim (UPSTREAM_ERROR family). The engine face has no
-    /// quitGroup method and answers CAPABILITY_UNAVAILABLE after local
-    /// validation — engine-batch debt, honest by design. The local
-    /// conversation row is kept — non-member state is upstream convergence,
-    /// like groups.update.
+    /// group-management; the engine write face wired by contract 1.115,
+    /// §4.96): resolution ladder then the engine's `leaveGroup {account,
+    /// groupId}` payload — the engine's method name for the upstream quit
+    /// write (its face never carried a `quitGroup` literal). The upstream
+    /// --delete local-data flag and the --admin last-admin handoff list are
+    /// deliberately not exposed: the official client keeps the conversation
+    /// as a non-member after leaving, and a last-admin quit without a
+    /// handoff answers the upstream user error verbatim (the deterministic
+    /// UPSTREAM_ERROR face, retryable=false). The local conversation row is
+    /// kept — non-member state is upstream convergence, like groups.update.
     pub fn prepare_groups_quit(&self, params: &GroupsQuitParams) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
         validate_opaque_id(&params.conversation_id, "conversationId")?;
@@ -3069,7 +3153,7 @@ impl ConnectorService {
         if let Some(operation_id) = params.operation_id.as_deref() {
             validate_opaque_id(operation_id, "operationId")?;
         }
-        self.resolve_account(&params.account_id)?;
+        let account = self.resolve_account(&params.account_id)?;
         let conversation =
             self.resolve_conversation(&params.account_id, &params.conversation_id)?;
         if conversation.kind != "group" {
@@ -3079,11 +3163,10 @@ impl ConnectorService {
                 false,
             )));
         }
-        Err(ServiceError::Api(ApiError::new(
-            "CAPABILITY_UNAVAILABLE",
-            "the kt-engine face has no quitGroup method yet",
-            false,
-        )))
+        Ok(json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+        }))
     }
 
     /// groups.terminate (contract revision 1.52, §4.50, capability
@@ -17676,6 +17759,51 @@ mod tests {
         );
     }
 
+    /// §4.96 (contract 1.115): the group-update server-rejection face maps
+    /// to itself with the engine's data.status pass-through riding verbatim
+    /// (the CALL_CREDENTIALS_FAILED channel) and retryable=false — the
+    /// same change against the same server state fails the same way, and a
+    /// 409 revision race unblocks only after the caller re-reads the group
+    /// state. The data-less face stays content-free and deterministic.
+    #[test]
+    fn group_update_failed_maps_with_the_status_pass_through() {
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_UPDATE_FAILED",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_UPDATE_FAILED");
+        assert!(!api.retryable);
+        assert!(api.data.is_none(), "no data, no face: {api:?}");
+
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_UPDATE_FAILED",
+            data: Some(json!({ "status": 409 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_UPDATE_FAILED");
+        assert!(!api.retryable, "the revision race is not a retry");
+        assert_eq!(api.data, Some(json!({ "status": 409 })));
+
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_UPDATE_FAILED",
+            data: Some(json!({ "status": 403 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_UPDATE_FAILED");
+        assert!(!api.retryable);
+        assert_eq!(api.data, Some(json!({ "status": 403 })));
+
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "GROUP_UPDATE_FAILED",
+            data: Some(json!({})),
+        })
+        .into_api();
+        assert_eq!(api.code, "GROUP_UPDATE_FAILED");
+        assert_eq!(api.data, Some(json!({})), "the no-status object rides");
+        assert!(!api.retryable);
+    }
+
     /// Call signaling (contract revision 1.53, §4.49): the sendSignal shape
     /// gate (type enum / positive callId / payload mandatory for the modern
     /// faces and optional for the legacy family / urgency enum), the resolved
@@ -23668,12 +23796,17 @@ mod tests {
         ));
     }
 
-    /// The kt-engine face has no group-management methods: a fully valid
-    /// change set still answers CAPABILITY_UNAVAILABLE (retryable=false)
-    /// after the local validation, while an invalid one keeps its
-    /// INVALID_REQUEST — the honest degradation, never a silent rewrite.
+    /// The wired engine face (contract 1.115, §4.96): a change set carried
+    /// by the engine subset folds onto the updateGroup payload verbatim
+    /// (groupName→title, the member arrays, the avatar tri-state, the link
+    /// access word); any change key outside the subset answers
+    /// CAPABILITY_UNAVAILABLE (retryable=false) naming the offending keys
+    /// after the local validation — the honest whole-call refusal, never a
+    /// partial application — while an invalid one keeps its
+    /// INVALID_REQUEST. groups.quit produces the leaveGroup {account,
+    /// groupId} payload.
     #[test]
-    fn groups_update_and_quit_refuse_the_engine_face_after_validation() {
+    fn groups_update_and_quit_fold_onto_the_engine_face() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -23683,18 +23816,22 @@ mod tests {
             .store_ref()
             .ensure_conversation(&account.id, "group", "group-id-1", "group")
             .unwrap();
-        let named = GroupsUpdateParams {
+        let base = |group_name: Option<String>,
+                    group_description: Option<String>,
+                    add_members: Option<Vec<String>>,
+                    remove_members: Option<Vec<String>>,
+                    link_state: Option<String>| GroupsUpdateParams {
             account_id: account.id.clone(),
             conversation_id: group.id.clone(),
-            group_name: Some("New Name".into()),
-            group_description: None,
-            add_members: None,
-            remove_members: None,
+            group_name,
+            group_description,
+            add_members,
+            remove_members,
             promote_admins: None,
             demote_admins: None,
             ban_members: None,
             unban_members: None,
-            link_state: None,
+            link_state,
             reset_link: None,
             permission_add_member: None,
             permission_edit_details: None,
@@ -23704,15 +23841,45 @@ mod tests {
             avatar: AvatarUpdate::Keep,
             operation_id: None,
         };
-        let error = service.prepare_groups_update(&named).unwrap_err();
+        let payload = service
+            .prepare_groups_update(&base(
+                Some("New Name".into()),
+                None,
+                Some(vec!["+15555550101".into()]),
+                Some(vec!["+15555550102".into()]),
+                Some("enabled-with-approval".into()),
+            ))
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "title": "New Name",
+                "addMembers": ["+15555550101"],
+                "removeMembers": ["+15555550102"],
+                "addFromInviteLinkAccess": "ADMINISTRATOR"
+            })
+        );
+        // Any key outside the engine subset refuses the whole call, naming
+        // the offenders.
+        let error = service
+            .prepare_groups_update(&base(
+                Some("New Name".into()),
+                Some("KT ops group".into()),
+                None,
+                None,
+                None,
+            ))
+            .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
-        // Validation outranks the capability gate.
-        let invalid = GroupsUpdateParams {
-            group_name: None,
-            ..named
-        };
-        let error = service.prepare_groups_update(&invalid).unwrap_err();
+                if api.code == "CAPABILITY_UNAVAILABLE"
+                    && !api.retryable
+                    && api.message.contains("groupDescription")));
+        // Validation outranks the capability gate: the empty change set.
+        let error = service
+            .prepare_groups_update(&base(None, None, None, None, None))
+            .unwrap_err();
         assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
 
         let quit = GroupsQuitParams {
@@ -23720,20 +23887,26 @@ mod tests {
             conversation_id: group.id.clone(),
             operation_id: None,
         };
-        let error = service.prepare_groups_quit(&quit).unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        let payload = service.prepare_groups_quit(&quit).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1"
+            })
+        );
     }
 
-    /// The groups.update avatar tri-state (contract 1.89): the wire
-    /// deserialization keeps the three states distinct (the dedicated
-    /// `AvatarUpdate` — an explicit null is `Remove`, never folded into
-    /// absence); the data-URI shape refusals answer INVALID_REQUEST before
-    /// any gate; a lone explicit-null or lone data-URI call is a real change
-    /// (it reaches the CAPABILITY_UNAVAILABLE downgrade, not the empty-set
-    /// INVALID_REQUEST). Zero local writes on every branch.
+    /// The groups.update avatar tri-state (contract 1.89; the engine face
+    /// wired by 1.115): the wire deserialization keeps the three states
+    /// distinct (the dedicated `AvatarUpdate` — an explicit null is
+    /// `Remove`, never folded into absence); the data-URI shape refusals
+    /// answer INVALID_REQUEST before any gate; a lone explicit-null or lone
+    /// data-URI call is a real change (it produces the updateGroup payload
+    /// with the avatar member, not the empty-set INVALID_REQUEST). Zero
+    /// local writes on every branch.
     #[test]
-    fn groups_update_avatar_tri_state_shapes_and_downgrade() {
+    fn groups_update_avatar_tri_state_shapes_and_payload() {
         // The wire deserialization: absent → Keep, explicit null → Remove,
         // string → Replace, any other JSON type → the params-shape
         // INVALID_REQUEST (the host's blanket refusal).
@@ -23812,39 +23985,57 @@ mod tests {
             );
         }
 
-        // The exact 10 MiB decoded budget passes the shape gate, so a lone
-        // replace call rides the ladder into the capability downgrade —
-        // CAPABILITY_UNAVAILABLE (retryable=false), the updateGroup debt.
+        // The exact 10 MiB decoded budget passes the shape gate and lands
+        // the updateGroup payload with the avatar member verbatim.
         let at_bound = format!(
             "data:image/png;base64,{}",
             "QUJD".repeat(MAX_AVATAR_BYTES / 3)
         );
-        let error = service
-            .prepare_groups_update(&base(AvatarUpdate::Replace(at_bound)))
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+        let payload = service
+            .prepare_groups_update(&base(AvatarUpdate::Replace(at_bound.clone())))
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "avatar": at_bound
+            })
+        );
 
-        // A lone explicit-null call answers the same downgrade — the
-        // refusal (not the empty-set INVALID_REQUEST) proves the Remove form
-        // counts as the change set's avatar member.
-        let error = service
+        // A lone explicit-null call produces the payload with the Remove
+        // form — the payload (not the empty-set INVALID_REQUEST) proves the
+        // Remove form counts as the change set's avatar member.
+        let payload = service
             .prepare_groups_update(&base(AvatarUpdate::Remove))
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "avatar": null
+            })
+        );
 
-        // The avatar member rides beside a text change and the refusal
-        // still lands after the full validation ladder.
-        let error = service
+        // The avatar member rides beside a text change in one payload —
+        // one updateGroup dispatch, one change broadcast.
+        let payload = service
             .prepare_groups_update(&GroupsUpdateParams {
                 group_name: Some("New Name".into()),
                 avatar: AvatarUpdate::Replace("data:image/png;base64,YQ==".into()),
                 ..base(AvatarUpdate::Keep)
             })
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1",
+                "title": "New Name",
+                "avatar": "data:image/png;base64,YQ=="
+            })
+        );
 
         // A keep (the key absent) is no avatar change at all: a call with no
         // other change is the §4.44 empty set, refused before the gates.
@@ -23858,9 +24049,9 @@ mod tests {
 
     /// groups.quit resolves the ladder (direct addressing and unknown
     /// conversations answer their steps) and the valid group call lands on
-    /// the honest capability refusal.
+    /// the leaveGroup {account, groupId} payload (contract 1.115, §4.96).
     #[test]
-    fn groups_quit_preparation_resolves_the_ladder_and_refuses_the_face() {
+    fn groups_quit_preparation_resolves_the_ladder_and_builds_the_payload() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
@@ -23879,11 +24070,16 @@ mod tests {
             conversation_id,
             operation_id: None,
         };
-        let error = service
+        let payload = service
             .prepare_groups_quit(&quit(group.id.clone()))
-            .unwrap_err();
-        assert!(matches!(error, ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable));
+            .unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "account": "+15555550100",
+                "groupId": "group-id-1"
+            })
+        );
         let error = service
             .prepare_groups_quit(&quit(direct.id.clone()))
             .unwrap_err();

@@ -5,7 +5,24 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.114 (2026-10-11; the identity gate gets a code
+- Contract revision: 1.115 (2026-10-12; groups.update / groups.quit ride
+  the engine write face (§4.96): the engine batch landed the full
+  `updateGroup` write family (title + avatar tri-state + member arrays +
+  the invite-link access word) and the quit write under its own method
+  name `leaveGroup`. The connector folds its validated change set onto
+  the engine payload (groupName→title, members verbatim, avatar verbatim,
+  linkState→addFromInviteLinkAccess ANY/ADMINISTRATOR/UNSATISFIABLE);
+  any change key outside that subset answers CAPABILITY_UNAVAILABLE
+  naming the keys — the honest whole-call refusal, never a partial
+  application. The engine's deny faces are deterministic: both call
+  sites map `EngineError::Upstream` to UPSTREAM_ERROR with
+  retryable=false. The server-rejection family gets its own allowlist
+  code `GROUP_UPDATE_FAILED` with the engine's `data.status?` verbatim
+  (retryable=false — a 409 revision race unblocks only after re-reading
+  the group state, never by blind replay). Schema: the error enum and
+  the two method descriptions restate the wired face. Tests 657 → 658
+  (lib 498 → 499), all green) —
+  previously 1.114 (2026-10-11; the identity gate gets a code
   (§4.95): the engine's send path refuses a send when the recipient's
   identity key changed without confirmation — official desktop's
   safety-number gate — and folds the refusal into the plain `-32603` face
@@ -7757,6 +7774,71 @@ parenthesized anchor and an anchor in the `code` slot do not), and the
 §4.80 mapping table row (`SEND_IDENTITY_UNVERIFIED`, retryable=false, no
 data object); `tests/schema_consistency.rs` covers the enum-set equality
 automatically. Gates: 656 → 657 (lib 497 → 498), all green.
+
+### 4.96 groups.update / groups.quit ride the engine write face (contract revision 1.115, 2026-10-12)
+
+The engine batch landed the full `updateGroup` write family (expiration +
+title + avatar tri-state + addMembers/removeMembers + the invite-link
+access word + inviteLinkPassword) and the quit write under its own method
+name `leaveGroup` (the engine face never carried a `quitGroup` literal).
+Until this revision the connector answered both host faces with the honest
+CAPABILITY_UNAVAILABLE debt refusal after local validation; the change-set
+ladder validated shapes no engine would ever consume.
+
+**The fold.** `prepare_groups_update` keeps the entire local ladder — the
+at-least-one-change rule, the empty-member-array refusal, the byte bounds,
+the avatar data-URI gate, the kind='group' resolution — and then folds the
+validated change set onto the engine payload: groupName→`title`,
+addMembers/removeMembers verbatim, the avatar tri-state verbatim, and
+linkState mapped onto the engine's `addFromInviteLinkAccess` vocabulary
+(enabled-without-approval→ANY, enabled-with-approval→ADMINISTRATOR,
+disabled→UNSATISFIABLE — the official buildAccessControlAddFromInviteLink
+enum). A change set naming any key outside that subset (groupDescription,
+promoteAdmins/demoteAdmins, banMembers/unbanMembers, resetLink, the
+permission trio, memberLabel/memberLabelEmoji) answers
+CAPABILITY_UNAVAILABLE (retryable=false) naming the offending keys — the
+honest whole-call refusal, never a partial application: the engine commits
+the set as one change broadcast and the official client applies it
+atomically, so folding a subset would silently shrink what the caller
+asked for. `prepare_groups_quit` produces the `leaveGroup {account,
+groupId}` payload (groupId = the row's peer_key, the terminate discipline).
+
+**The error faces.** The engine's deny answers (-32603: unknown
+account/group, non-member, a last-admin quit's user error) are
+deterministic: both call sites now map `EngineError::Upstream` to
+UPSTREAM_ERROR with retryable=false — a bare replay fails the same way
+(the generic `into_api` default retryable=true was the pre-wiring
+inheritance, wrong for a face whose every upstream error is a refusal).
+The server-rejection family gets its own allowlist code:
+`GROUP_UPDATE_FAILED` rides the `ENGINE_STRUCTURED_ERROR_CODES` allowlist
+and maps with the engine's `data.status?` verbatim (the
+CALL_CREDENTIALS_FAILED channel; `with_data` derives retryable=false —
+the data carries no retryable key and the contract fixes it). A 409
+revision race unblocks only after the caller re-reads the group state
+(groups.get / conversations.list) and re-composes the change — never by
+blind replay of the same set. A failed avatar upload after a landed group
+change keeps the 1.89 partial-success face (GROUP_AVATAR_UPLOAD_FAILED,
+data {retryable, textSaved}); the storage family keeps its STORAGE_*
+mapping. Zero local writes on every path: the group row converges through
+the receive projection (the §4.44 discipline).
+
+Tests: `groups_update_quit_round_trip_and_guards` rewritten — the wired
+avatar tri-state and the title/member/link change set assert the exact
+dispatch payloads ({account, groupId, avatar}, the folded six-key set with
+addFromInviteLinkAccess=ANY), the mixed set still refuses whole (naming
+groupDescription, zero dispatch delta), the sentinel rows answer
+GROUP_UPDATE_FAILED with data.status 403/409 verbatim, and the quit rides
+leaveGroup ({account, groupId}) with the last-admin deny answering
+UPSTREAM_ERROR retryable=false; the fixture's GROUP_UPDATE_FAILED
+sentinels now answer on every updateGroup route and its quit arm became
+`leaveGroup` ({status: "left"}). Lib tests join the rewrite:
+`groups_update_and_quit_fold_onto_the_engine_face` (the folded payload, the
+named-key refusal, validation outranking the gate, the quit payload),
+`groups_update_avatar_tri_state_shapes_and_payload` (the tri-state rides
+the payload verbatim), `groups_quit_preparation_resolves_the_ladder_and_
+builds_the_payload`, and `group_update_failed_maps_with_the_status_pass_
+through` (403/409/empty-data rides verbatim, retryable=false, the
+data-less face content-free). Gates: 657 → 658 (lib 498 → 499), all green.
 
 ## 5. signal-cli Boundary
 

@@ -2649,12 +2649,16 @@ impl RuntimeSupervisor {
     }
 
     /// groups.update (contract revision 1.45, §4.44, capability
-    /// group-management): full local validation + resolution under the
-    /// service lock, then the mutating `updateGroup` call — reaction-class
-    /// discipline with the timer face's unknown-outcome honesty: an
-    /// indeterminate answer is the SEND_OUTCOME_UNKNOWN error and is never
-    /// retried. Zero local writes: the group row converges through the
-    /// receive projection when the change's own group-update envelope lands.
+    /// group-management; the engine write face wired by contract 1.115,
+    /// §4.96): full local validation + resolution under the service lock,
+    /// then the mutating `updateGroup` call — reaction-class discipline with
+    /// the timer face's unknown-outcome honesty: an indeterminate answer is
+    /// the SEND_OUTCOME_UNKNOWN error and is never retried. The engine's
+    /// deny faces (unknown account/group, non-member, server user errors)
+    /// are deterministic refusals: UPSTREAM_ERROR with retryable=false — a
+    /// bare replay fails the same way. Zero local writes: the group row
+    /// converges through the receive projection when the change's own
+    /// group-update envelope lands.
     pub async fn update_group(
         &self,
         params: GroupsUpdateParams,
@@ -2674,15 +2678,23 @@ impl RuntimeSupervisor {
                 "mutating request has an unknown outcome",
                 false,
             ))),
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
             Err(error) => Err(error.into()),
         }
     }
 
     /// groups.quit (contract revision 1.45, §4.44, capability
-    /// group-management): resolution under the service lock, then the
-    /// mutating `quitGroup` call — the same unknown-outcome discipline as
-    /// groups.update. The local conversation row is kept; non-member state is
-    /// upstream convergence.
+    /// group-management; the engine write face wired by contract 1.115,
+    /// §4.96): resolution under the service lock, then the mutating
+    /// `leaveGroup` call — the engine's method name for the upstream quit
+    /// write — under the same unknown-outcome discipline as groups.update,
+    /// with the same deterministic deny face (a non-member or last-admin
+    /// quit is UPSTREAM_ERROR retryable=false). The local conversation row
+    /// is kept; non-member state is upstream convergence.
     pub async fn quit_group(&self, params: GroupsQuitParams) -> Result<&'static str, ServiceError> {
         let engine = self.running_engine().await?;
         let upstream = {
@@ -2690,13 +2702,18 @@ impl RuntimeSupervisor {
             service.prepare_groups_quit(&params)?
         };
         match engine
-            .call("quitGroup", upstream, CallClass::Mutating)
+            .call("leaveGroup", upstream, CallClass::Mutating)
             .await
         {
             Ok(_) => Ok("sent"),
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),

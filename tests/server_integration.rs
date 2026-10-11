@@ -5503,11 +5503,16 @@ async fn conversations_set_expire_timer_round_trip_and_guards() {
 }
 
 /// groups.update / groups.quit end to end (contract 1.45, §4.44, capability
-/// group-management): the local refusal ladder answers before any upstream
-/// call, and a fully valid change set (and a quit) rides it into the honest
-/// engine-face refusal — CAPABILITY_UNAVAILABLE (retryable=false), nothing
-/// dispatched (the engine's updateGroup carries the expiration family only;
-/// the change-set/quit methods are engine-batch debt) — while the receive
+/// group-management; the engine write face wired by contract 1.115, §4.96):
+/// the local refusal ladder answers before any upstream call, and the
+/// engine-carried change families ride the wired updateGroup/leaveGroup
+/// dispatch verbatim ({account, groupId} + title/member/link-access/avatar,
+/// the avatar tri-state included) while any change key outside the engine
+/// subset still answers the honest whole-call CAPABILITY_UNAVAILABLE —
+/// never a partial application, nothing dispatched. The structured
+/// GROUP_UPDATE_FAILED face carries data.status verbatim (403 non-admin,
+/// 409 revision race) with retryable=false, the leave deny face answers the
+/// deterministic UPSTREAM_ERROR (retryable=false), and the receive
 /// projection converges the group row independently of the send face: the
 /// bodyless UPDATE envelope lands as a system row carrying `isGroupUpdate` +
 /// the resulting title, and `conversation.changed` mirrors the new title.
@@ -5589,6 +5594,30 @@ async fn groups_update_quit_round_trip_and_guards() {
                 "dataMessage": {
                     "groupId": "ZmFhaWwtZ3JvdXAtMg==",
                     "message": "quit-fail group"
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 62,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-group-forbidden]",
+                        "type": "UPDATE",
+                        "groupName": "Forbidden Fixture",
+                        "revision": 2
+                    }
+                }
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 63,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": "[fixture-group-conflict]",
+                        "type": "UPDATE",
+                        "groupName": "Conflict Fixture",
+                        "revision": 3
+                    }
                 }
             }
         ])
@@ -5698,12 +5727,10 @@ async fn groups_update_quit_round_trip_and_guards() {
     .await;
     assert_eq!(unknown["error"]["code"], "CONVERSATION_NOT_FOUND");
 
-    // Contract 1.89: the avatar tri-state. A malformed data URI answers the
-    // shape ladder (INVALID_REQUEST); a well-formed one — and an explicit
-    // null — ride past it into the engine-face refusal
-    // (CAPABILITY_UNAVAILABLE, retryable=false): every change-set family is
-    // refused until the engine byte face arrives, and the call never reaches
-    // updateGroup.
+    // Contract 1.89 avatar tri-state on the wired face (1.115): a malformed
+    // data URI answers the shape ladder (INVALID_REQUEST); a well-formed
+    // one — and an explicit null — ride the updateGroup dispatch verbatim
+    // and answer {status: "sent"}.
     let bad_avatar = request(
         &mut client,
         "update-avatar-bad",
@@ -5716,11 +5743,30 @@ async fn groups_update_quit_round_trip_and_guards() {
     )
     .await;
     assert_eq!(bad_avatar["error"]["code"], "INVALID_REQUEST");
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let group_dispatches = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| {
+                // updateGroup/leaveGroup dispatches carry {account, groupId};
+                // the typing flush rows carry the same pair plus `stop`, and
+                // the text send lane carries neither pair.
+                params.get("account").is_some()
+                    && params.get("groupId").is_some()
+                    && params.get("stop").is_none()
+            })
+            .collect()
+    };
     for (request_id, avatar) in [
         ("update-avatar-replace", json!("data:image/png;base64,YQ==")),
         ("update-avatar-remove", Value::Null),
     ] {
-        let refused = request(
+        let sent = request(
             &mut client,
             request_id,
             "groups.update",
@@ -5731,16 +5777,68 @@ async fn groups_update_quit_round_trip_and_guards() {
             }),
         )
         .await;
-        assert_eq!(
-            refused["error"]["code"], "CAPABILITY_UNAVAILABLE",
-            "{request_id}"
-        );
-        assert_eq!(refused["error"]["retryable"], false, "{request_id}");
+        assert_eq!(sent["result"]["status"], "sent", "{request_id}: {sent}");
     }
+    let avatar_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("avatar").is_some())
+        .collect();
+    assert_eq!(avatar_calls.len(), 2, "{avatar_calls:?}");
+    assert_eq!(
+        avatar_calls[0]["account"], "+15555550100",
+        "{avatar_calls:?}"
+    );
+    assert_eq!(
+        avatar_calls[0]["groupId"], "ZmFrZS1ncm91cC0x",
+        "{avatar_calls:?}"
+    );
+    assert_eq!(avatar_calls[0]["avatar"], "data:image/png;base64,YQ==");
+    assert!(avatar_calls[0].get("title").is_none(), "{avatar_calls:?}");
+    assert_eq!(avatar_calls[1]["avatar"], Value::Null, "{avatar_calls:?}");
 
-    // A fully valid change set still answers the honest refusal after local
-    // validation — nothing is dispatched and the send log gains no
-    // updateGroup entry.
+    // The engine-carried change set (contract 1.115, §4.96) rides one
+    // updateGroup dispatch: groupName→title, the member arrays verbatim,
+    // and linkState mapped onto the engine's access word.
+    let renamed = request(
+        &mut client,
+        "update-wired",
+        "groups.update",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "groupName": "Renamed Fixture",
+            "addMembers": ["+15555550102"],
+            "removeMembers": ["+15555550102"],
+            "linkState": "enabled-without-approval",
+            "operationId": "group-mgmt-op-1"
+        }),
+    )
+    .await;
+    assert_eq!(renamed["result"]["status"], "sent", "{renamed}");
+    let wired_calls: Vec<Value> = group_dispatches()
+        .into_iter()
+        .filter(|params| params.get("title").is_some())
+        .collect();
+    assert_eq!(wired_calls.len(), 1, "{wired_calls:?}");
+    assert_eq!(
+        wired_calls[0],
+        json!({
+            "account": "+15555550100",
+            "groupId": "ZmFrZS1ncm91cC0x",
+            "title": "Renamed Fixture",
+            "addMembers": ["+15555550102"],
+            "removeMembers": ["+15555550102"],
+            "addFromInviteLinkAccess": "ANY"
+        }),
+        "{wired_calls:?}"
+    );
+
+    // Any change key outside the engine subset (description, the admin and
+    // ban families, resetLink, the permission trio, the member label pair)
+    // still answers the honest whole-call refusal — naming the offending
+    // keys, retryable=false — and dispatches nothing: never a partial
+    // application of the change set.
+    let dispatches_before = group_dispatches().len();
     let refused_update = request(
         &mut client,
         "update-all",
@@ -5763,25 +5861,23 @@ async fn groups_update_quit_round_trip_and_guards() {
             "permissionSendMessages": "only-admins",
             "memberLabel": "KT",
             "memberLabelEmoji": "🛠️",
-            "operationId": "group-mgmt-op-1"
+            "operationId": "group-mgmt-op-3"
         }),
     )
     .await;
     assert_eq!(refused_update["error"]["code"], "CAPABILITY_UNAVAILABLE");
     assert_eq!(refused_update["error"]["retryable"], false);
-    let send_log_path = temp
-        .path()
-        .join("signal-data")
-        .join(".fixture-send-log.jsonl");
-    let update_calls: Vec<Value> = fs::read_to_string(&send_log_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|params| params.get("name").is_some() && params.get("groupId").is_some())
-        .collect();
     assert!(
-        update_calls.is_empty(),
-        "a refused group update never reaches the engine: {update_calls:?}"
+        refused_update["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("groupDescription"),
+        "{refused_update}"
+    );
+    assert_eq!(
+        group_dispatches().len(),
+        dispatches_before,
+        "a refused change set never reaches the engine"
     );
 
     // Flush the staged envelopes through the typing hook (the receive burst
@@ -5845,9 +5941,9 @@ async fn groups_update_quit_round_trip_and_guards() {
     assert_eq!(update_row["text"], "群聊信息已更新");
     assert_eq!(update_row["groupName"], "Renamed Fixture");
 
-    // groups.quit is the same honest refusal: local validation passes, the
-    // face answers CAPABILITY_UNAVAILABLE, and no quitGroup call is
-    // dispatched.
+    // The wired quit face (1.115): the resolved group row dispatches
+    // leaveGroup {account, groupId} — the engine's method name for the
+    // upstream quit write — and answers {status: "sent"}.
     let quit = request(
         &mut client,
         "quit-group",
@@ -5859,24 +5955,98 @@ async fn groups_update_quit_round_trip_and_guards() {
         }),
     )
     .await;
-    assert_eq!(quit["error"]["code"], "CAPABILITY_UNAVAILABLE");
-    assert_eq!(quit["error"]["retryable"], false);
-    let quit_calls: Vec<Value> = fs::read_to_string(&send_log_path)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    assert_eq!(quit["result"]["status"], "sent", "{quit}");
+    let quit_calls: Vec<Value> = group_dispatches()
+        .into_iter()
         .filter(|params| {
-            // The quitGroup upstream shape is {account, groupId} verbatim;
-            // the typing flush rows also carry `stop` and must not count.
-            params.get("name").is_none()
-                && params.get("stop").is_none()
-                && params.get("groupId").is_some()
+            params.get("title").is_none()
+                && params.get("avatar").is_none()
+                && params.get("addMembers").is_none()
+                && params.get("removeMembers").is_none()
+                && params.get("addFromInviteLinkAccess").is_none()
         })
         .collect();
-    assert!(
-        quit_calls.is_empty(),
-        "a refused quit never reaches the engine: {quit_calls:?}"
+    assert_eq!(quit_calls.len(), 1, "{quit_calls:?}");
+    assert_eq!(quit_calls[0]["account"], "+15555550100", "{quit_calls:?}");
+    assert_eq!(
+        quit_calls[0]["groupId"], "ZmFrZS1ncm91cC0x",
+        "{quit_calls:?}"
     );
+
+    // The structured server-rejection face (1.115, §4.96): the fixture's
+    // sentinel group rows answer GROUP_UPDATE_FAILED with the engine's
+    // data.status pass-through verbatim — 403 (non-admin) and 409 (revision
+    // race) — retryable=false both: a bare replay fails the same way, and a
+    // 409 unblocks only after re-reading the group state.
+    let relisted = request(
+        &mut client,
+        "list-sentinel-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let find_by = |title: &str, preview: &str| {
+        relisted["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["type"] == "group"
+                    && row["title"] == title
+                    && row["lastMessagePreview"] == preview
+            })
+            .map(|row| row["id"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the staged sentinel row {title} must exist; items: {:?}",
+                    relisted["result"]["items"]
+                )
+            })
+    };
+    let forbidden_conversation = find_by("Forbidden Fixture", "群聊信息已更新");
+    let conflict_conversation = find_by("Conflict Fixture", "群聊信息已更新");
+    let quit_fail_conversation = find_by("group", "quit-fail group");
+    for (request_id, conversation, status) in [
+        ("update-forbidden", forbidden_conversation.as_str(), 403),
+        ("update-conflict", conflict_conversation.as_str(), 409),
+    ] {
+        let rejected = request(
+            &mut client,
+            request_id,
+            "groups.update",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation,
+                "groupName": "Still Forbidden"
+            }),
+        )
+        .await;
+        assert_eq!(
+            rejected["error"]["code"], "GROUP_UPDATE_FAILED",
+            "{request_id}: {rejected}"
+        );
+        assert_eq!(rejected["error"]["retryable"], false, "{request_id}");
+        assert_eq!(rejected["error"]["data"]["status"], status, "{request_id}");
+    }
+
+    // The leave deny face: a last-admin quit (the fixture's user-error
+    // sentinel) answers the deterministic UPSTREAM_ERROR — retryable=false,
+    // the 1.115 correction: a replay of the same quit fails the same way.
+    let quit_denied = request(
+        &mut client,
+        "quit-denied",
+        "groups.quit",
+        json!({
+            "accountId": account_id,
+            "conversationId": quit_fail_conversation
+        }),
+    )
+    .await;
+    assert_eq!(
+        quit_denied["error"]["code"], "UPSTREAM_ERROR",
+        "{quit_denied}"
+    );
+    assert_eq!(quit_denied["error"]["retryable"], false);
 
     drop(client);
     wait_for_process_exit(engine_pid).await;
