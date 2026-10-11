@@ -17,7 +17,7 @@
 //! snapshot whose name matches the second the next export will stamp.
 //!
 //! [`BackupFileHandleTable`] streams the two fixed snapshot files back to the
-//! desktop with the media three-chain shape (ADR 0002): unguessable handles,
+//! desktop with the media three-chain shape (ADR 0004): unguessable handles,
 //! strictly sequential chunk reads, 300 s TTL, ≤ 8 live handles per account.
 //! Like the media table it is process-wide: `readChunk`/`closeHandle` carry
 //! no accountId, so all groups must resolve handles from one table.
@@ -67,7 +67,7 @@ pub const MAX_ARTIFACT_BODY_BYTES: usize = 131_072;
 /// Snapshot list cap, newest-first (§10.4).
 pub const MAX_SNAPSHOT_ENTRIES: usize = 32;
 /// Raw bytes per `backups.exportFile.readChunk` — the media chain's chunk
-/// size (ADR 0002); base64 expands one chunk to 349,528 characters.
+/// size (ADR 0004); base64 expands one chunk to 349,528 characters.
 pub const CHUNK_BYTES: u64 = 262_144;
 /// Handle lifetime — the media chain's TTL backstop.
 pub const HANDLE_TTL: Duration = Duration::from_secs(300);
@@ -1781,7 +1781,7 @@ pub fn prepare_snapshots_for_export(account_dir: &Path) {
 }
 
 // -------------------------------------------------------------------------
-// File-handle table (the media three-chain shape, ADR 0002).
+// File-handle table (the media three-chain shape, ADR 0004).
 // -------------------------------------------------------------------------
 
 /// Why a handle operation failed — mapped onto wire codes by the supervisor;

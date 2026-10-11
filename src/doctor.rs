@@ -10,7 +10,10 @@
 //!   libsignal version baseline) passed through verbatim — an engine that is
 //!   not running answers `unreachable` with the state's classification, and
 //!   an engine that does not carry a method answers honestly with the engine
-//!   error class instead of a guessed value;
+//!   error class instead of a guessed value; since contract revision 1.133
+//!   (§4.116) the face also carries the engine's `engine.perfMetrics`
+//!   snapshot projected through the connector's pinned allowlist (unknown
+//!   keys drop and count — deliberately not verbatim);
 //! - data-directory status per group: path, existence, writability, and the
 //!   filesystem's free space;
 //! - occupancy-lock status per group: `.kt-signal-connector.lock` presence,
@@ -56,7 +59,7 @@ use crate::datalock::LOCK_FILE_NAME;
 use crate::engine::{CallClass, EngineError, EngineHandle, EngineState, EngineStatus, SocksProxy};
 use crate::registry::ProxyGroupRuntime;
 
-/// Bounded engine-call budget for the two doctor probes (`version`,
+/// Bounded engine-call budget for the three doctor probes (`version`,
 /// `engine.protocolCapabilities`): a diagnostic must not sit on a wedged
 /// engine anywhere near the ordinary 15 s request timeout.
 const DOCTOR_ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(3);
@@ -154,11 +157,11 @@ pub struct GroupReport {
     pub engine: EngineFace,
     pub data_dir: DataDirFace,
     pub lock: LockFace,
-    /// The per-group credential-state face (contract revision 1.101, §4.79).
+    /// The per-group credential-state face (contract revision 1.101, §4.82).
     pub credentials: CredentialsFace,
 }
 
-/// The per-group credential-state face (contract revision 1.101, §4.79): the
+/// The per-group credential-state face (contract revision 1.101, §4.82): the
 /// doctor's one account-authenticated probe — a single read-only
 /// `getUserStatus` ride through the group's own engine for the watchdog's
 /// ping-target account, folded into exactly one fixed literal. This is the
@@ -198,6 +201,15 @@ pub struct EngineFace {
     pub version: Option<EngineMethodFace>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_capabilities: Option<EngineMethodFace>,
+    /// The engine's read-only `engine.perfMetrics` snapshot (contract
+    /// revision 1.133, §4.116), projected onto the connector's pinned
+    /// engine allowlist — deliberately **not** the verbatim passthrough
+    /// the two faces above use: a future engine may grow its metric
+    /// vocabulary, and this face never forwards an unbounded key space
+    /// (unknown keys drop and count into the face's
+    /// `connectorDroppedKeys`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf_metrics: Option<EngineMethodFace>,
 }
 
 /// One engine method probe's outcome: the engine's own answer passed through
@@ -351,10 +363,11 @@ pub async fn collect(runtime: &ProxyGroupRuntime) -> DoctorReport {
 }
 
 /// Per-group engine face: the supervised status verbatim plus, for a live
-/// engine, the two read-only method probes (`version`,
-/// `engine.protocolCapabilities`) under the bounded diagnostic budget. A
+/// engine, the three read-only method probes (`version`,
+/// `engine.protocolCapabilities`, `engine.perfMetrics`) under the bounded
+/// diagnostic budget. A
 /// non-running engine marks `unreachable` with the state classification and
-/// answers both probes `present: false` with that same reason.
+/// answers all three probes `present: false` with that same reason.
 async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> EngineFace {
     let reachable = status.state == EngineState::Running && engine.is_some();
     // A Running status with no live handle is a mid-transition race, not a
@@ -364,33 +377,36 @@ async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> En
     } else {
         unreachable_reason(status.state)
     };
-    let (version, protocol_capabilities) = if let Some(engine) = engine.filter(|_| reachable) {
-        (
-            Some(
-                probe_engine_method(
-                    engine,
-                    "version",
-                    "the engine answered an error for the version method \
-                     (an engine that does not carry it surfaces the upstream class)",
-                )
-                .await,
-            ),
-            Some(
-                probe_engine_method(
-                    engine,
-                    "engine.protocolCapabilities",
-                    "the engine answered an error for the self-certification method \
-                     (a stock signal-cli engine does not carry the kt-engine face)",
-                )
-                .await,
-            ),
-        )
-    } else {
-        (
-            Some(EngineMethodFace::failed(degraded_reason)),
-            Some(EngineMethodFace::failed(degraded_reason)),
-        )
-    };
+    let (version, protocol_capabilities, perf_metrics) =
+        if let Some(engine) = engine.filter(|_| reachable) {
+            (
+                Some(
+                    probe_engine_method(
+                        engine,
+                        "version",
+                        "the engine answered an error for the version method \
+                         (an engine that does not carry it surfaces the upstream class)",
+                    )
+                    .await,
+                ),
+                Some(
+                    probe_engine_method(
+                        engine,
+                        "engine.protocolCapabilities",
+                        "the engine answered an error for the self-certification method \
+                         (a stock signal-cli engine does not carry the kt-engine face)",
+                    )
+                    .await,
+                ),
+                Some(probe_engine_perf_metrics(engine).await),
+            )
+        } else {
+            (
+                Some(EngineMethodFace::failed(degraded_reason)),
+                Some(EngineMethodFace::failed(degraded_reason)),
+                Some(EngineMethodFace::failed(degraded_reason)),
+            )
+        };
     EngineFace {
         state: status.state,
         pid: status.pid,
@@ -400,6 +416,7 @@ async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> En
         unreachable_reason: (!reachable).then_some(degraded_reason),
         version,
         protocol_capabilities,
+        perf_metrics,
     }
 }
 
@@ -429,6 +446,43 @@ async fn probe_engine_method(
     }
 }
 
+/// The `engine.perfMetrics` probe (contract revision 1.133, §4.116): the
+/// same read-only budget, with the answer projected through the connector's
+/// pinned engine allowlist (`perf_metrics::filter_engine_snapshot`) — the
+/// connector never forwards a key space it does not know, and the face
+/// carries `connectorDroppedKeys` so a lossy projection is visible to the
+/// consumer. A stock signal-cli engine or an engine predating the
+/// `engine.perfMetrics` face answers the upstream-error class, same
+/// degradation family as the other probes.
+async fn probe_engine_perf_metrics(engine: &EngineHandle) -> EngineMethodFace {
+    match engine
+        .call_with_timeout(
+            "engine.perfMetrics",
+            json!({}),
+            CallClass::ReadOnly,
+            DOCTOR_ENGINE_CALL_TIMEOUT,
+        )
+        .await
+    {
+        Ok(face) => {
+            let (filtered, dropped) = crate::perf_metrics::filter_engine_snapshot(&face);
+            crate::perf_metrics::add(crate::perf_metrics::keys::ENGINE_SNAPSHOT_DROPPED, dropped);
+            EngineMethodFace::answered(filtered)
+        }
+        Err(
+            EngineError::Timeout
+            | EngineError::NotRunning
+            | EngineError::Exited
+            | EngineError::Backpressure,
+        ) => EngineMethodFace::failed("the engine stopped answering mid-probe"),
+        Err(_) => EngineMethodFace::failed(
+            "the engine answered an error for the perf-metrics method \
+             (a stock signal-cli engine, or an engine predating the \
+             engine.perfMetrics face, surfaces the upstream class)",
+        ),
+    }
+}
+
 /// The honest start/state failure classification for a non-running engine:
 /// static, content-free state names only.
 fn unreachable_reason(state: EngineState) -> &'static str {
@@ -448,7 +502,7 @@ fn unreachable_reason(state: EngineState) -> &'static str {
 
 // ---------------------------------------------------------- credentials ----
 
-/// The per-group credential-state probe (contract revision 1.101, §4.79):
+/// The per-group credential-state probe (contract revision 1.101, §4.82):
 /// one read-only `getUserStatus` ride through the group's own live engine —
 /// the same read-only call the liveness watchdog pings with — under the
 /// doctor's 3-second diagnostic budget. The gate is the same reachability
@@ -1032,6 +1086,9 @@ mod tests {
                         EngineState::Faulted,
                     ))),
                     protocol_capabilities: Some(EngineMethodFace::failed(unreachable_reason(
+                        EngineState::Faulted,
+                    ))),
+                    perf_metrics: Some(EngineMethodFace::failed(unreachable_reason(
                         EngineState::Faulted,
                     ))),
                 },

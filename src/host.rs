@@ -2843,7 +2843,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
-        // Media ingest triple (ADR 0002): local chunked streaming behind the
+        // Media ingest triple (ADR 0004): local chunked streaming behind the
         // `--media-ingest` launcher opt-in. Without it the service answers
         // CAPABILITY_UNAVAILABLE before any other check; with it, params
         // shape errors answer INVALID_REQUEST and every failure maps through

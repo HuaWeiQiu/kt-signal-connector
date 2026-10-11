@@ -19,7 +19,7 @@
 //!
 //! Nothing proportional to the archive is held in memory: the archive is read
 //! as a line stream with a hard per-line cap, staged through per-account
-//! scratch tables, and written one bounded transaction at a time (ADR 0002
+//! scratch tables, and written one bounded transaction at a time (ADR 0004
 //! bounded discipline). The engine-side dependency registered in §4.38
 //! (recipient service identity) landed engine-side in E5. Since contract
 //! 1.55 (§4.38 attachv2) the message frames' attachment objects also carry

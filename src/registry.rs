@@ -1482,7 +1482,7 @@ impl ProxyGroupRuntime {
             .await
     }
 
-    /// Media ingest (ADR 0002): `open` routes by account like every other
+    /// Media ingest (ADR 0004): `open` routes by account like every other
     /// account-addressed method, so the file resolves in the owning group's
     /// data directory.
     pub async fn open_media(
@@ -1493,7 +1493,7 @@ impl ProxyGroupRuntime {
         slot.supervisor.open_media(params).await
     }
 
-    /// `readChunk` carries no accountId on the wire (ADR 0002): the
+    /// `readChunk` carries no accountId on the wire (ADR 0004): the
     /// process-wide handle table is the single-origin authority, so any
     /// supervisor's service resolves it identically. The first group serves.
     pub async fn read_media_chunk(
@@ -1600,7 +1600,7 @@ impl ProxyGroupRuntime {
         slot.supervisor.export_file_open(account_id, file).await
     }
 
-    /// `readChunk` carries no accountId on the wire (§4.46 reuses the ADR 0002
+    /// `readChunk` carries no accountId on the wire (§4.46 reuses the ADR 0004
     /// shape): the process-wide backup handle table is the single-origin
     /// authority, so any supervisor's table resolves it identically. The
     /// first group serves.
@@ -1907,7 +1907,7 @@ fn effective_media_ingest(media_ingest: bool) -> bool {
 /// Open the shared per-profile store once and assemble one supervised engine
 /// stack per planned group (ADR 0001 R4/R5). History retention is process-wide
 /// and therefore spawned once; watchdogs are per group. With `media_ingest`
-/// (ADR 0002) every group's service is armed with the engine's data directory
+/// (ADR 0004) every group's service is armed with the engine's data directory
 /// and one process-wide handle table — process-wide because a
 /// `readChunk`/`closeHandle` carries no accountId, so handle resolution must
 /// not depend on which supervisor the registry routed a request through —

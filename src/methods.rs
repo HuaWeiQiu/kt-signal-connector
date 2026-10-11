@@ -115,7 +115,7 @@ pub const METHODS: &[MethodRow] = &[
     // an upstream failure degrades {status: unknown} and is never retried.
     ("messages.sendViewOnceOpen", Lane::Send, true, "send"),
     ("messages.markViewOnceOpened", Lane::Send, true, "send"),
-    // Media ingest (ADR 0002): the chunked streaming triple rides the READ
+    // Media ingest (ADR 0004): the chunked streaming triple rides the READ
     // lane — one bounded chunk per call, no mutation, no upstream traffic.
     // The one-shot base64 reader (`messages.attachments.get`, contract 1.10
     // PoC) was retired with contract 1.20; the chunked triple is the only

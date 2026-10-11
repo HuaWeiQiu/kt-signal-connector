@@ -1365,7 +1365,7 @@ pub struct SyncDeleteForMeEntry {
 const TYPING_RATE_LIMIT_MS: u64 = 1_000;
 const TYPING_RATE_MAP_CAPACITY: usize = 256;
 
-/// The filesystem-and-handles half of media ingest (ADR 0002), injected into
+/// The filesystem-and-handles half of media ingest (ADR 0004), injected into
 /// one service per proxy group when the launcher passes `--media-ingest`.
 /// `None` is the pre-1.17 shape: every media method answers
 /// `CAPABILITY_UNAVAILABLE` before anything else happens. The handle table is
@@ -1538,7 +1538,7 @@ pub struct ConnectorService {
     /// Early-arrival edit/remoteDelete buffer (§4.91): flat table, bounded
     /// by capacity with oldest-eviction and lazy TTL sweeps at every touch.
     early_controls: Vec<EarlyControlEntry>,
-    /// Media ingest backing (ADR 0002); `None` keeps every media method on
+    /// Media ingest backing (ADR 0004); `None` keeps every media method on
     /// the pre-PoC `CAPABILITY_UNAVAILABLE` answer.
     media: Option<MediaIngest>,
 }
@@ -6962,13 +6962,13 @@ impl ConnectorService {
         })
     }
 
-    /// messages.attachments.open (ADR 0002, contract revision 1.17): resolve
+    /// messages.attachments.open (ADR 0004, contract revision 1.17): resolve
     /// the addressed rows, then locate the already-downloaded file in the
     /// engine's data directory and mint a short-lived chunk-stream handle for
     /// it. The addressing resolves before any file is touched, the id passes
     /// the sanitizeId-parity gate before any path join, and a missing file
     /// answers UPSTREAM_ERROR — not-downloaded and governor-deleted are
-    /// deliberately indistinguishable (ADR 0002).
+    /// deliberately indistinguishable (ADR 0004).
     pub fn open_media_handle(
         &self,
         account_id: &str,
@@ -7334,7 +7334,7 @@ impl ConnectorService {
     /// stories do not have. Same capability gate, id gate, sanitize gate,
     /// and the same not-available answer (UPSTREAM_ERROR retryable=true —
     /// not-downloaded and governor-deleted stay deliberately
-    /// indistinguishable, ADR 0002). Chunk read and close ride the existing
+    /// indistinguishable, ADR 0004). Chunk read and close ride the existing
     /// handle faces unchanged.
     pub fn open_story_attachment_handle(
         &self,
@@ -7372,7 +7372,7 @@ impl ConnectorService {
         })
     }
 
-    /// messages.attachments.readChunk (ADR 0002): deliver exactly one bounded
+    /// messages.attachments.readChunk (ADR 0004): deliver exactly one bounded
     /// chunk of one live handle at a strictly sequential offset. The handle
     /// table validates origin, TTL, and offset; this layer base64-encodes the
     /// raw chunk (≤ 4 * ceil(262_144 / 3) = 349_528 characters, far inside
@@ -7398,7 +7398,7 @@ impl ConnectorService {
         })
     }
 
-    /// messages.attachments.closeHandle (ADR 0002): explicit early release.
+    /// messages.attachments.closeHandle (ADR 0004): explicit early release.
     /// Idempotent — a handle the TTL already reaped still closes cleanly
     /// (`released: false`) instead of turning the backstop into a race the
     /// caller must survive.
@@ -7412,7 +7412,7 @@ impl ConnectorService {
         })
     }
 
-    /// ADR 0002 gate 3: handles cannot outlive their account session. The
+    /// ADR 0004 gate 3: handles cannot outlive their account session. The
     /// delete-local-data path calls this once the account rows are gone; the
     /// 300 s TTL backstops every other kind of abandonment.
     pub fn clear_media_handles_for_account(&self, account_id: &str) {
@@ -10222,7 +10222,7 @@ pub struct PreparedMarkViewOnceOpened {
     pub open_sender_aci: Option<String>,
 }
 
-/// `messages.attachments.open` result (ADR 0002, contract revision 1.17): an
+/// `messages.attachments.open` result (ADR 0004, contract revision 1.17): an
 /// unguessable 128-bit handle bound to the resolved
 /// (account, conversation, message, attachment) tuple, the file size the
 /// stream will deliver, and the raw chunk size every `readChunk` offsets
@@ -10235,7 +10235,7 @@ pub struct MediaOpenView {
     pub chunk_bytes: u64,
 }
 
-/// `messages.attachments.readChunk` result (ADR 0002): exactly one chunk.
+/// `messages.attachments.readChunk` result (ADR 0004): exactly one chunk.
 /// `size_bytes` counts this chunk's raw bytes; `dataBase64` inflates them by
 /// the usual per-chunk base64 factor to at most
 /// `4 * ceil(262_144 / 3)` = 349_528 characters — bounded, and far inside
@@ -12191,7 +12191,7 @@ pub struct MessagesMarkViewOnceOpenedParams {
     pub message_id: String,
 }
 
-/// messages.attachments.open params (ADR 0002): the message-addressing triple
+/// messages.attachments.open params (ADR 0004): the message-addressing triple
 /// plus the attachment id from the message's received metadata. There is no
 /// caller-declared sizeBytes: the file size is measured locally and reported
 /// back, never trusted from the wire.
@@ -13206,7 +13206,7 @@ pub fn validate_backup_handle(value: &str) -> Result<(), ServiceError> {
     validate_opaque_id(value, "fileHandle")
 }
 
-/// signal-cli `AttachmentStore.sanitizeId` parity (ADR 0002 security gate 3).
+/// signal-cli `AttachmentStore.sanitizeId` parity (ADR 0004 security gate 3).
 /// Upstream resolves an attachment id as
 /// `new File(attachmentsPath, sanitizeId(id))` where `sanitizeId` replaces
 /// every character outside `[A-Za-z0-9_.-]` with `_`; the connector applies
@@ -13317,7 +13317,7 @@ fn validate_attachment_send_payload(
 
 /// Encode standard padded base64 — the same canonical form
 /// `build_attachment_data_uri` re-encodes to and `base64_decode_to_vec`
-/// accepts. The chunked media delivery (ADR 0002) uses it per 256 KiB chunk:
+/// accepts. The chunked media delivery (ADR 0004) uses it per 256 KiB chunk:
 /// 349_528 characters worst case, bounded and frame-safe. Public for the
 /// §4.46 test suite (the backup chunk encoder shares the alphabet; the
 /// function itself stays out of the host surface).
@@ -26926,7 +26926,7 @@ mod tests {
         );
     }
 
-    // ---- Media ingest (ADR 0002) -------------------------------------
+    // ---- Media ingest (ADR 0004) -------------------------------------
 
     /// A service with the media backing armed over an engine-shaped data
     /// directory (`<data>/attachments/`, the single-account probe layout).
@@ -26985,7 +26985,7 @@ mod tests {
 
     /// Without the launcher opt-in (`ConnectorService::new`), all three
     /// media methods answer the shared capability gate before any other
-    /// check — the pre-PoC contract (ADR 0002 acceptance gate 5).
+    /// check — the pre-PoC contract (ADR 0004 acceptance gate 5).
     #[test]
     fn media_methods_are_capability_gated_without_the_opt_in() {
         let (_temp, service) = service();
@@ -27002,7 +27002,7 @@ mod tests {
         }
     }
 
-    /// Security gate (ADR 0002 acceptance gate 3): traversal-shaped ids —
+    /// Security gate (ADR 0004 acceptance gate 3): traversal-shaped ids —
     /// `../x`, absolute paths, backslashes, and the sanitize survivors
     /// `.` / `..` — answer INVALID_REQUEST before the filesystem is touched.
     /// The decoy file makes the check real: a naive path join would resolve
@@ -27098,7 +27098,7 @@ mod tests {
     }
 
     /// A missing file answers UPSTREAM_ERROR: not-downloaded and
-    /// governor-deleted are indistinguishable (ADR 0002).
+    /// governor-deleted are indistinguishable (ADR 0004).
     #[test]
     fn media_open_answers_upstream_error_when_the_file_is_absent() {
         let (_temp, service) = media_service();

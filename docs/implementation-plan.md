@@ -5,7 +5,41 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.121 (2026-10-12; the media-ingest gate flips to
+- Contract revision: 1.133 (2026-10-12; the S2a measurement layer lands
+  connector-side (§4.116): the `receive_persistence_loop` per-envelope
+  ingest transaction — the registered largest-bottleneck candidate
+  (30-envelope burst = 30 transactions) — is timed and counted per
+  attempt (`receive_ingest` timing, `receive_ingest_ok`/`_err`
+  outcomes, `receive_ingest_events` realized batch size), and the
+  doctor's per-group engine face gains the additive `perfMetrics`
+  probe: the engine's read-only `engine.perfMetrics` snapshot (the
+  engine slice's closed 31-key vocabulary) projected through the
+  connector's pinned allowlist — known keys pass verbatim, unknown
+  keys drop and count into the face's `connectorDroppedKeys`, never an
+  unbounded forward — deliberately not the verbatim passthrough the
+  `version`/`protocolCapabilities` faces use. Measure-only, zero
+  behavior change; no content, no keys, no envelopes enter the layer.
+  The S2a "vendored batch-window three-phase" leftover is verified
+  engine-vendor-side (`kt-signal-engine/vendor/presage`: window
+  fill/decrypt/batch persist) — the connector has no presage and no
+  batch window, its receive leg is per-envelope by construction — and
+  stays an engine-side batch. Wire additive-only: one optional doctor
+  key; no new method, error, or capability; schema unchanged (the
+  doctor result has never been schema-pinned). Same-batch doc repairs:
+  the Status chain now carries the 1.122-1.132 index, §2 and README
+  state the kt-engine reality (ADR 0003 fallback posture), the ADR
+  0002 collision resolved (media-ingest ADR renumbered 0004, the
+  multiple-instances ADR keeps 0002), 1.108-era count brackets.
+  Tests 700 → 709 (lib 523 → 532), all green) —
+  previously 1.132 (2026-10-12; the plaintext chat export reaches the
+  host, §4.115 — the section carries the full record) —
+  previously 1.131-1.122 (2026-10-12; each revision's record lives in
+  its own section: the storage merge/import + call-link faces §4.112,
+  the story distribution lists §4.111, the notification profiles
+  §4.110, the serverTimestamp ingest §4.109, the group-call era update
+  §4.108, the group create §4.107, the polls §4.106, the contact card
+  §4.105, the GV1→GV2 migration §4.104, the device plane §4.103) —
+  previously 1.121 (2026-10-12; the media-ingest gate flips to
   pass-through (§4.102): the registry's `effective_media_ingest` — the
   kt-engine era's forced downgrade that kept `--ignore-attachments` on
   the argv and answered every media method CAPABILITY_UNAVAILABLE
@@ -216,7 +250,10 @@
   `markRead`/`markViewed` call (`{account, reads|viewed: [{sender, timestamp}...]}`, the
   engine chunking 100/envelope); syncViewed keeps the §4.77 local-first `viewed_at`
   stamp, syncRead stays stamp-free. Schema additive: two enum entries, two if/then
-  pairs, two `$defs`. Desktop call-site migration is a separate batch. Tests 640 → 641,
+  pairs, two `$defs`. Desktop call-site migration is a separate batch. Tests 640 → 641
+  (a pre-recalibration total: measured under the bookkeeping the 1.116 entry below
+  corrects — the integration legs were over-counted by four; the reproducible base
+  re-measured at 1.115 is 654, and the all-targets baseline has since grown past it),
   all green) —
   previously 1.107 (2026-10-11; the ingest key-list completion (§4.88): the connector's
   ingest faces now consume the engine's P14 live-projection batch key-for-key — the faces the
@@ -1329,7 +1366,10 @@ open-source kt-signal-connector (Rust)
         |
         | stdin/stdout JSON-RPC 2.0
         v
-unmodified signal-cli + JRE 25
+Signal engine child process
+  - production: self-hosted kt-signal-engine (Rust, vendored presage stack)
+  - fallback: pinned signal-cli + JRE (development and behavior
+    comparison only, ADR 0003)
         |
         v
 Signal service
@@ -1339,7 +1379,9 @@ Per local KT profile the fixed process count is:
 
 ```text
 1 x kt-signal-connector
-G x signal-cli engines (JVM or native), one per proxy group (G >= 1, hard ceiling 8)
+G x engine child processes (kt-signal-engine in production; the pinned
+  signal-cli JVM/native runtime in the development/comparison fallback),
+  one per proxy group (G >= 1, hard ceiling 8)
 N x Signal accounts
 M x conversations
 ```
@@ -1652,7 +1694,7 @@ end; design rationale and the upstream-verification notes live in `docs/remote-d
 
 ### 4.7 messages.attachments.get (contract revision 1.8, 2026-09-03; **retired with 1.20, 2026-09-24**)
 
-> **Retired (contract 1.20).** The chunked media triple (ADR 0002: `messages.attachments.open`
+> **Retired (contract 1.20).** The chunked media triple (ADR 0004: `messages.attachments.open`
 > / `readChunk` / `closeHandle`) replaced the one-shot base64 reader as the only inbound
 > attachment channel; the method, its params `$def`, its lane-table entry, and the fixture
 > `getAttachment` handler were removed in the same batch. The history below is kept for
@@ -1979,7 +2021,7 @@ omitted it from the schema enum; data `{accountId, conversationId, action: START
 ### 4.16 Retire messages.attachments.get (contract revision 1.20, 2026-09-24)
 
 The desktop contract (kt-desktop `contracts/signal-host-adapter.md` 1.20) removes
-`getAttachmentSessionMessage` / `messages.attachments.get`: the ADR 0002 chunked triple
+`getAttachmentSessionMessage` / `messages.attachments.get`: the ADR 0004 chunked triple
 (§4.15-era media PoC, contract revision 1.17) has been the default inbound-attachment channel
 since 1.17 and the one-shot base64 path only added a second code path to validate (whole
 payload through one host frame, no chunk budget). Removal is symmetric across both repos:
@@ -2986,7 +3028,7 @@ documented data-directory artifact instead of an RPC surface.
   route the engine's own transport takes through walled or DNS-poisoned
   networks; a missing value builds the previous direct client, and the
   connect 10 s / total 120 s / no-redirect posture is unchanged.
-- Bounded discipline (ADR 0002): the archive is read as a line stream with a hard per-line cap;
+- Bounded discipline (ADR 0004): the archive is read as a line stream with a hard per-line cap;
   pass 1 stages recipient/chat identity maps into bounded SQLite temp tables (dropped at the
   end), pass 2 streams messages in fixed-size batches (256 rows per transaction, store lock
   released between batches on the blocking pool). Nothing proportional to the archive is held in
@@ -3699,7 +3741,7 @@ gates pass both ways: method enum ↔ dispatch literals, error enum ↔ `ApiErro
   precedent: one number ticking, not low-latency delivery). Engine restart resets the task
   registry to `idle`; on-disk snapshots remain and stay listed.
 - `backups.exportFile.open` / `readChunk` / `closeHandle`: the media three-chain shape
-  (§ messages.attachments.open/readChunk/closeHandle, ADR 0002) reused verbatim — open
+  (§ messages.attachments.open/readChunk/closeHandle, ADR 0004) reused verbatim — open
   `{accountId, file: "metadata" | "main"}` → `{fileHandle, sizeBytes, chunkBytes}`;
   readChunk `{fileHandle, offset}` strictly sequential → `{dataBase64, sizeBytes, eof}`;
   closeHandle `{fileHandle}` → `{released}` (idempotent). Read lane. **Only the latest
@@ -3775,7 +3817,7 @@ Implementation batch record (2026-10-06) — deviations and decisions as built:
   connector build targets it; the JVM/native path fails honestly rather than guessing.
 - **Delete paths release backup handles.** All three `deleteLocalAccountData` completion
   paths (idempotent replay, reconcile short-circuit, confirmed delete) clear the account's
-  live backup file handles beside the media handles (ADR 0002 gate 3 verbatim).
+  live backup file handles beside the media handles (ADR 0004 gate 3 verbatim).
 - **Unknown start outcome.** `backup.export` is Mutating: an indeterminate outcome answers
   `SEND_OUTCOME_UNKNOWN` (retryable=false) — the task may already be running upstream; the
   desktop polls `backups.exportStatus` to learn the truth. An engine-down or
@@ -5975,7 +6017,7 @@ re-runs the byte machine it already runs for rows.
   directory probe, the same process-wide handle table (per-account
   budget, TTL, sequential chunks), and the same not-available answer —
   UPSTREAM_ERROR retryable=true, not-downloaded and governor-deleted
-  deliberately indistinguishable (ADR 0002). Chunk read and release ride
+  deliberately indistinguishable (ADR 0004). Chunk read and release ride
   `messages.attachments.readChunk` / `messages.attachments.closeHandle`
   unchanged: the handle, not the addressing, is the single-origin
   authority, so the story bytes need zero new read faces.
@@ -6649,15 +6691,19 @@ in `docs/doctor-contract.md`.
 - **Version chain** — `connector` carries the connector's own `version`, `apiVersion`,
   and `pid`; each group's `engine` carries the launcher-selected `mode` (the clap value
   name, so the label follows the enum verbatim), the live `state`/`pid`/`rssBytes`/
-  `resourcePressure` status view, the doctor's own `reachable` probe result, and the two
-  engine method faces: `version` and `engine.protocolCapabilities`. A face is mutually
+  `resourcePressure` status view, the doctor's own `reachable` probe result, and the
+  engine method faces: `version` and `engine.protocolCapabilities`, plus (since 1.133,
+  §4.116) `perfMetrics` — the engine's read-only snapshot through the connector's
+  allowlist projection, not verbatim. A face is mutually
   exclusive by construction — `present: true` with the engine's own answer riding
   through **verbatim** (never re-derived, re-keyed, or normalized; the kt-engine
-  self-certification face keeps its upstream spelling, `profiles_v2` included), or
+  self-certification face keeps its upstream spelling, `profiles_v2` included;
+  `perfMetrics` is the one deliberate exception — its `face` is the allowlist
+  projection with `connectorDroppedKeys`), or
   `present: false` with a static, content-free `reason` — never a value the connector
   invented.
 - **Honest degradation** — an engine that is not running answers `reachable: false` and
-  both faces absent with the state's static reason (stopped: not started since connector
+  the method faces absent with the state's static reason (stopped: not started since connector
   boot or stopped by runtime.stop; exited: the process ended on its own; faulted: it
   crashed or failed to start, the watchdog may restart it); a running engine whose live
   handle vanished mid-probe answers the transitioning reason; a probe that exhausts the
@@ -7588,10 +7634,15 @@ Schema: two method enum entries, two if/then pairs, two additive `$defs` param o
 The desktop call-site migration is a separate batch (this batch is the connector's
 semantic split only).
 
-Tests: one service integration (`sync_read_and_sync_viewed_prepare_mirror_the_receipt_faces`
-— the peer group mirrors the receipt face with ascending timestamps, syncViewed stamps
-locally with first-stamp-wins, syncRead never stamps, group conversations skip the
-fan-out but keep the viewed stamp). Gates: 640 → 641, all green.
+— the syncRead/syncViewed pair, the supervisor spending the group on one engine call,
+receipt-class semantics end to end. Tests: one service integration
+(`sync_read_and_sync_viewed_prepare_mirror_the_receipt_faces` — the peer group mirrors the
+receipt face with ascending timestamps, syncViewed stamps locally with first-stamp-wins,
+syncRead never stamps, group conversations skip the fan-out but keep the viewed stamp).
+Gates: 640 → 641, all green. (Count bracket: this total predates the 1.116 recount —
+the integration legs were over-counted by four in the earlier bookkeeping; the
+reproducible all-targets base re-measured at 1.115 is 654. The per-batch delta of one
+and the lib count were exact throughout.)
 
 ### 4.90 remoteDelete author and age gates (contract revision 1.109, 2026-10-11)
 
@@ -9200,6 +9251,106 @@ partial file would exist), `STORAGE_WRITE_FAILED` (the artifact could
 not be written). The engine is never called, so no engine error code
 can surface from this face.
 
+### 4.116 The S2a measurement layer reaches the connector: the ingest transaction instrumentation + the doctor `perfMetrics` face (contract revision 1.133, 2026-10-12)
+
+The connector slice of the S2a instrumentation layer (the desktop registry
+`signal-runtime-followup-projects.md` §附四②: measure-only, baseline first,
+optimization is a separate batch with owner sign-off). Three registered
+leftovers; two land here, one is verified out of this repository's reach.
+
+**1. The per-envelope ingest transaction is measured** — the registered
+largest-bottleneck candidate (a 30-envelope burst = 30 transactions; the
+engine side already batched its own store window, the connector's local
+store leg is an independent face). The `receive_persistence_loop` attempt
+is now wrapped with `Instant` timing and counters in
+`src/perf_metrics.rs` (the connector's own bounded registry, the engine
+slice's shape: closed word list, unknown keys drop and count, BTreeMap
+deterministic snapshot order, honest absence, microsecond
+`totalUs/maxUs/lastUs`): `receive_ingest` (wall time per transaction
+attempt, failed attempts included), `receive_ingest_ok` /
+`receive_ingest_err` (attempts = ok + err; each err sleeps and re-attempts),
+and `receive_ingest_events` (host events the landed transactions produced,
+summed — the realized batch size; the mean is events / ok). Measure-only by
+construction: the call, its arguments, and the control flow around it are
+byte-identical; the layer holds counts and durations only — zero message
+content, zero addresses, zero key material, per the perfMetrics red line.
+
+**2. The engine snapshot passes through a whitelist, not verbatim** — the
+doctor's per-group `engine` face gains the additive `perfMetrics` probe
+(same reachability gate, same read-only 3-second diagnostic budget, same
+degradation family as the `version` / `engine.protocolCapabilities`
+faces): the engine's read-only `engine.perfMetrics` answer (engine slice
+`38238b3`, a closed 31-key vocabulary — 12 timing series + 19 counters)
+projected through the connector's own pinned copy of that vocabulary
+(`ENGINE_TIMING_KEYS` / `ENGINE_COUNTER_KEYS`). The projection is
+deliberately **not** the verbatim passthrough those two faces use: a
+future engine may grow its metric vocabulary, and this face never forwards
+an unbounded key space — unknown top-level keys, unknown
+`timings`/`counters` entries, and malformed entries drop and count into
+the face's always-present `connectorDroppedKeys` (a meaningful zero, so a
+clean projection is distinguishable from a lossy one without diffing key
+sets); `uptimeMs` / `unknownKeyDropped` pass through only as `u64`;
+whitelisted well-formed entries keep the engine's own series object
+verbatim. Face shape: `present: true` with the filtered projection, or
+`present: false` with the same reason strings the other probes use (a
+stock signal-cli engine, or an engine predating `engine.perfMetrics`,
+answers the upstream-error class — the honest degradation, a diagnostic
+never fails as a whole because one engine face could not answer). The
+connector-side dropped keys also accumulate into the local registry's
+`engine_snapshot_dropped` counter. Route record: this rides the **existing
+doctor payload as an additive key** rather than a new connector method —
+one wire surface, one advertisement story, zero new methods or error
+codes; pre-1.133 hosts read byte-identical doctor answers without the
+key. Schema unchanged: the doctor result has never been schema-pinned
+(the JSON schema carries only the method name in the request enum), so
+there is nothing to sync.
+
+**3. The vendored batch-window three-phase split is not connector-side
+(verification record)** — the S2a engine record's "vendored 批窗内部三相
+未打点" was verified against both trees before any code moved: the batch
+window is the **engine repository's** vendored presage receive pipeline
+(75 ms / 30-window fill → decrypt → batch persist,
+`kt-signal-engine/vendor/presage`, per the engine's own
+`docs/jsonrpc-compat.md` record), not a connector machine. The connector
+has no presage dependency and no batch window in its receive leg — the leg
+is per-envelope by construction (exactly what measurement 1 now proves
+with numbers). Instrumenting the three phases means touching the engine's
+vendor tree under the engine repo's `vendor/README.md` discipline — an
+engine-side batch, and the engine repository was read-only for this batch.
+The connector-side proxies are already in place: measurement 1 covers the
+connector leg, and the passthrough carries the engine's
+`receive_envelope` series, which the engine record notes already includes
+the batch window's end-to-end latency. Naming record: the three phases are
+窗填充/解密/批量落库 (window fill / decrypt / batch persist), not the
+攒窗/落库/提交 shorthand the leftover list carried.
+
+**Same-batch non-wire repairs** (no contract surface): the Status header
+revision chain, stale since 1.121, now carries the 1.122-1.132 index (each
+revision's own record has always lived in its §4.10x section); the §2
+process diagram and README now state the kt-engine production reality
+(ADR 0003 demoted the pinned signal-cli runtime to the
+development/comparison fallback); the ADR directory's 0002 collision is
+resolved — the media-ingest ADR (2026-09-23, the later of the two) is
+renumbered 0004 with every media-facing reference updated and every
+namespace/lock reference (the multiple-instances ADR, 2026-09-06) left on
+0002; the 1.108-era test totals (640 → 641, header and §4.89) carry the
+pre-recalibration bracket; `runtime.doctor`'s credentials-face comments
+corrected §4.79 → §4.82. The parity matrix (the desktop repository's
+`signal-official-parity-matrix.md`) carries no doctor-related rows at all
+— it is a UI-feature alignment matrix, so no row can drift against this
+face; recorded rather than edited. The desktop registry's connector-slice
+leftover list is backfilled by the desktop batch, not here.
+
+Tests: nine unit tests over the new registry and the engine-snapshot
+filter (series aggregation, unknown-key drop counting, word-list
+closedness and its disjointness from the engine allowlist, deterministic
+key order, whitelist passthrough with drop counting, honest absence for
+malformed scalars, fail-closed on a non-object answer, the meaningful
+zero) plus the `runtime.doctor` integration test extends the engine-face
+assertions with the `perfMetrics` face (present + projected + drop count
+against the fake engine's echo). Gates: tests 700 → 709 (lib 523 → 532),
+all green; fmt / clippy / release build clean.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
@@ -9559,7 +9710,7 @@ change still requires the dedicated bounded-download PoC this section demands.
 after the PoC landed — §4.16; the boundary statement now lives entirely in the chunked
 channel's gating.)
 
-That PoC is now designed: `docs/adr/0002-media-ingest-poc.md` (2026-09-23) defines the
+That PoC is now designed: `docs/adr/0004-media-ingest-poc.md` (2026-09-23) defines the
 opt-in `--media-ingest` spawn flag, a quota+TTL media governor, and chunked handle
 delivery (`messages.attachments.open` / `readChunk` / `closeHandle`, contract revision
 1.17). ~~Until that PoC passes its acceptance gates, this boundary stands.~~（该门已过、

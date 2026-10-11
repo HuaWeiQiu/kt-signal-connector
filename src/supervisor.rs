@@ -147,7 +147,7 @@ pub struct RuntimeSupervisor {
     /// Shared store handle for the store-only paths (retention, reads) that
     /// run on the blocking pool without the service lock.
     store: Arc<Store>,
-    /// Media ingest backing (ADR 0002) when the launcher passed
+    /// Media ingest backing (ADR 0004) when the launcher passed
     /// `--media-ingest`; drives the retention trigger and exists iff the
     /// service's own backing exists. Never held; `MediaGovernor` is a plain
     /// data-dir handle.
@@ -164,7 +164,7 @@ pub struct RuntimeSupervisor {
     account_unlink_worker: JoinHandle<()>,
     /// One-shot history retention pass; never held across an await.
     retention: StdMutex<Option<JoinHandle<()>>>,
-    /// One-shot media governor pass (ADR 0002: once per process start);
+    /// One-shot media governor pass (ADR 0004: once per process start);
     /// never held across an await.
     media_governor_pass: StdMutex<Option<JoinHandle<()>>>,
     /// One-shot contacts/groups re-sync pass (once per process start);
@@ -478,7 +478,7 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// One media governor pass per process start (ADR 0002 trigger
+    /// One media governor pass per process start (ADR 0004 trigger
     /// discipline; idempotent). Media retention is per engine data directory,
     /// so — unlike the store-wide history retention — every proxy group's
     /// supervisor runs its own pass, and the receive pipeline repeats it
@@ -1797,7 +1797,7 @@ impl RuntimeSupervisor {
         {
             let mut service = self.service.lock().await;
             service.complete_account_delete(&account_id, operation_id.as_deref())?;
-            // ADR 0002 gate 3: a chunk-stream handle cannot outlive the
+            // ADR 0004 gate 3: a chunk-stream handle cannot outlive the
             // account session it was opened from — media and §4.46 backup
             // file streams alike.
             service.clear_media_handles_for_account(&account_id);
@@ -5024,7 +5024,7 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// Media ingest (ADR 0002, contract revision 1.17): open a chunk stream
+    /// Media ingest (ADR 0004, contract revision 1.17): open a chunk stream
     /// for one already-downloaded attachment. Pure local resolution — the
     /// engine is not consulted, the upstream whole-file base64
     /// `getAttachment` read is never used, and a not-downloaded or
@@ -7310,7 +7310,7 @@ fn is_receive_fatal_stderr(line: &str) -> bool {
                 .any(|needle| lower.contains(needle)))
 }
 
-/// Run one media governor pass on a blocking task (ADR 0002): pure
+/// Run one media governor pass on a blocking task (ADR 0004): pure
 /// filesystem work — the store lock is never taken, so a deletion sweep can
 /// never delay receives or host requests. Counts only in the log; never
 /// paths or ids.
@@ -7374,7 +7374,7 @@ async fn receive_persistence_loop(
     delivery_receipts: mpsc::Sender<DeliveryReceiptJob>,
 ) {
     let mut storage_unavailable = false;
-    // ADR 0002 trigger discipline: after every GOVERNOR_INBOUND_MESSAGE_INTERVAL
+    // ADR 0004 trigger discipline: after every GOVERNOR_INBOUND_MESSAGE_INTERVAL
     // persisted inbound messages, one retention pass. A plain counter in this
     // single task — no shared state, no resident timer thread.
     let mut inbound_since_governor_pass = 0_u64;
@@ -7382,6 +7382,15 @@ async fn receive_persistence_loop(
         crate::metrics::receive_queue_drained();
         let mut retry_delay = RECEIVE_STORE_RETRY_MIN;
         loop {
+            // S2a measurement (contract revision 1.133, §4.116): the
+            // per-envelope ingest transaction — the registered
+            // largest-bottleneck candidate (30-envelope burst = 30
+            // transactions) — timed per attempt, outcome-counted, with the
+            // landed transaction's host-event count as its realized batch
+            // size. Measure-only: the call, its arguments, and the control
+            // flow below are byte-identical to the pre-instrumentation
+            // loop; counters are content-free (counts and durations only).
+            let perf_started = tokio::time::Instant::now();
             // The ingest is a synchronous SQLite batch serialized under the
             // service lock as before, but it runs on the blocking pool so a
             // slow store never occupies a tokio worker thread.
@@ -7396,8 +7405,17 @@ async fn receive_persistence_loop(
                 }
             })
             .await;
+            crate::perf_metrics::record_us(
+                crate::perf_metrics::keys::RECEIVE_INGEST,
+                perf_started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            );
             match result {
                 Ok(events) => {
+                    crate::perf_metrics::add(crate::perf_metrics::keys::RECEIVE_INGEST_OK, 1);
+                    crate::perf_metrics::add(
+                        crate::perf_metrics::keys::RECEIVE_INGEST_EVENTS,
+                        events.len() as u64,
+                    );
                     for event in &events {
                         let _ = host_events.send(event.clone());
                     }
@@ -7433,6 +7451,7 @@ async fn receive_persistence_loop(
                     break;
                 }
                 Err(error) => {
+                    crate::perf_metrics::add(crate::perf_metrics::keys::RECEIVE_INGEST_ERR, 1);
                     if !storage_unavailable {
                         storage_unavailable = true;
                         // Classification only: the store error may carry a

@@ -74,7 +74,7 @@ const STDERR_LINE_LIMIT: usize = 4 * 1024;
 pub struct SignalCliConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
-    /// Media ingest opt-in (ADR 0002). Launcher input only — never IPC
+    /// Media ingest opt-in (ADR 0004). Launcher input only — never IPC
     /// input. Since contract 1.121 (§4.102) the decision passes through
     /// verbatim: armed ingest drops `--ignore-attachments` from the argv and
     /// arms the media governor (the §4.54 locator chain serves the bytes on
@@ -172,7 +172,7 @@ impl std::str::FromStr for SocksProxy {
     }
 }
 
-/// Engine CLI arguments. `media_ingest` (ADR 0002) only decides whether
+/// Engine CLI arguments. `media_ingest` (ADR 0004) only decides whether
 /// `--ignore-attachments` is present: with it the rest of the argv —
 /// including `--ignore-stories` and `--ignore-stickers` — is unchanged, and
 /// without it the argv is byte-identical to the pre-media-POC launcher.
@@ -185,7 +185,7 @@ fn signal_cli_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsStrin
         "--receive-mode".into(),
         "on-start".into(),
     ];
-    // ADR 0002: dropping --ignore-attachments is the entire media opt-in —
+    // ADR 0004: dropping --ignore-attachments is the entire media opt-in —
     // the engine then downloads inbound attachments into its data directory,
     // where the connector's media governor bounds retention. Stories and
     // stickers stay ignored in every shape; they are not part of the media
@@ -5163,7 +5163,7 @@ mod tests {
         assert_eq!(signal_cli_args(Path::new("/data"), false), expected);
     }
 
-    /// Media opt-in (ADR 0002 gate 5): enabling `--media-ingest` changes the
+    /// Media opt-in (ADR 0004 gate 5): enabling `--media-ingest` changes the
     /// spawn argv by exactly one line — `--ignore-attachments` disappears;
     /// stories and stickers stay ignored and every other byte is unchanged.
     #[test]

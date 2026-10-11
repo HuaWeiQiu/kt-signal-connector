@@ -1,10 +1,10 @@
-# ADR 0002: Bounded inbound media ingest (PoC)
+# ADR 0004: Bounded inbound media ingest (PoC)
 
 - Status: accepted as design; implementation in progress
 - Date: 2026-09-23
 - Amends: implementation-plan §6.7 (Media limitation) — the boundary stays, the
   unlock path is defined here
-- Depends on: ADR 0001 (namespace/data-dir disjointness), §7.1 data ownership
+- Depends on: ADR 0002 (the multiple-instances namespace/data-dir disjointness rules), §7.1 data ownership
 
 ## Context
 

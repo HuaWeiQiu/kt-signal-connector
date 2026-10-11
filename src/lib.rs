@@ -18,6 +18,7 @@ pub mod media;
 pub mod methods;
 pub mod metrics;
 pub mod parent;
+pub mod perf_metrics;
 pub mod protocol;
 pub mod registry;
 pub mod resource;

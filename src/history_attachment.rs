@@ -47,7 +47,7 @@
 //!   cdnKey + cdnNumber) decides downloadability; a locator missing any
 //!   piece is the honest INVALID_REQUEST hole, never a guessed download.
 //!
-//! Bounded discipline (ADR 0002): the ciphertext streams to disk in chunks
+//! Bounded discipline (ADR 0004): the ciphertext streams to disk in chunks
 //! (resident memory is one chunk plus the 32-byte MAC holdback, never the
 //! body), the decrypt pass re-reads the temp file block-by-block with a
 //! one-block carry, and every temp file is unlinked on failure. A failure at
@@ -81,7 +81,7 @@ pub const SHA256_LENGTH: usize = 32;
 /// Minimum ciphertext body: IV + one AES block + trailing MAC.
 pub const MIN_BODY_BYTES: u64 = (IV_LENGTH + 16 + MAC_LENGTH) as u64;
 
-/// Hard plaintext ceiling (ADR 0002): the server's own 100 MiB
+/// Hard plaintext ceiling (ADR 0004): the server's own 100 MiB
 /// per-attachment cap — a locator claiming more is refused before any
 /// network traffic.
 pub const MAX_PLAINTEXT_BYTES: u64 = 100 * 1024 * 1024;
@@ -93,7 +93,7 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Streaming chunk for the download and the decrypt pass — resident memory
-/// per chain is one chunk, never the body (ADR 0002).
+/// per chain is one chunk, never the body (ADR 0004).
 const CHUNK_BYTES: usize = 64 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;

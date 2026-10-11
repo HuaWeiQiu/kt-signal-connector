@@ -272,6 +272,31 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
         );
     }
 
+    // Contract revision 1.133 (§4.116): the engine.perfMetrics probe rides
+    // the same reachability gate — present with a whitelist-projected face
+    // (never the verbatim passthrough; unknown keys drop and count), or
+    // absent with the same reason family. The fake engine echoes
+    // `{method}` for methods it does not implement, so the projection here
+    // is exactly the lossy-but-honest case: one unknown key dropped, only
+    // `connectorDroppedKeys` surviving.
+    let perf = &engine["perfMetrics"];
+    if perf["present"] == json!(true) {
+        let face = perf["face"].as_object().expect("projected face object");
+        assert!(
+            face.contains_key("connectorDroppedKeys"),
+            "the projection always carries its drop count"
+        );
+        assert_eq!(face["connectorDroppedKeys"].as_u64(), Some(1));
+    } else {
+        assert_eq!(perf["present"], json!(false));
+        assert!(
+            perf["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "the unavailable perf-metrics face carries its reason"
+        );
+    }
+
     let data_dir = &group["dataDir"];
     assert_eq!(data_dir["exists"], json!(true));
     assert_eq!(data_dir["writable"], json!(true));

@@ -1,6 +1,6 @@
 # `runtime.doctor` — the read-only diagnostic face
 
-Contract revisions 1.97 (§4.79) and 1.101 (§4.82) of
+Contract revisions 1.97 (§4.79), 1.101 (§4.82), and 1.133 (§4.116) of
 `docs/implementation-plan.md` are the normative specification; this document is
 the field-level quick reference for consumers (the desktop support surface). The
 method answers the whole diagnostic payload in one Control-lane call.
@@ -45,7 +45,8 @@ may have moved on. Nothing in the answer is a lease or a reservation.
     "engine":   { "state", "pid"?, "rssBytes"?, "resourcePressure",
                   "reachable", "unreachableReason"?,
                   "version"?:            { "present", "face"?|, "reason"? },
-                  "protocolCapabilities"?: { "present", "face"?|, "reason"? } },
+                  "protocolCapabilities"?: { "present", "face"?|, "reason"? },
+                  "perfMetrics"?:        { "present", "face"?*, "reason"? } },
     "dataDir":  { "path", "exists", "writable", "freeBytes"?, "totalBytes"? },
     "lock":     { "present", "held", "pid"?, "holderAlive"?, "classification" },
     "credentials": { "state" }
@@ -61,7 +62,9 @@ may have moved on. Nothing in the answer is a lease or a reservation.
 ```
 
 `groups` lists every launch-plan group in launcher order. Keys marked `?` are
-absent (not null) when the value does not apply.
+absent (not null) when the value does not apply. `face?|` is the engine's own
+answer verbatim; `face?*` (the `perfMetrics` face, contract 1.133) is the
+connector's allowlist projection — see the perf-metrics face below.
 
 ## Engine face
 
@@ -83,13 +86,15 @@ The one transitional case has its own string, independent of `state`: the
 engine was `running` but its live handle vanished mid-probe —
 `the engine is transitioning: the live handle vanished mid-probe`.
 
-Each method face (`version`, `protocolCapabilities`) is mutually exclusive by
-construction:
+Each method face (`version`, `protocolCapabilities`, `perfMetrics`) is mutually
+exclusive by construction:
 
 - `present: true` — the engine answered; `face` is the engine's own JSON answer
   passed through **verbatim**. The connector never re-derives, re-keys, or
   normalizes it (the kt-engine self-certification face keeps its upstream
-  spelling, including `profiles_v2`).
+  spelling, including `profiles_v2`). The `perfMetrics` face is the one
+  deliberate exception — its `face` is the allowlist projection (next
+  section).
 - `present: false` — the engine did not answer; `reason` is a static string:
   the `unreachableReason` above when the engine is not running, or
   - `the engine stopped answering mid-probe` (timeout / not-running /
@@ -97,10 +102,43 @@ construction:
   - `the engine answered an error for the version method …`,
   - `the engine answered an error for the self-certification method …`
     (a stock signal-cli engine does not carry the kt-engine face; the full
-    string carries the error class).
+    string carries the error class),
+  - `the engine answered an error for the perf-metrics method …`
+    (a stock signal-cli engine, or an engine predating the
+    `engine.perfMetrics` face; the full string carries the error class).
 
 Absent engine answers are the designed degradation — a diagnostic never fails
 as a whole because one engine face could not answer.
+
+## Perf-metrics face
+
+`perfMetrics` (contract 1.133, §4.116) carries the engine's own read-only
+`engine.perfMetrics` snapshot — the S2a baseline layer the engine slice
+landed (a closed 31-key vocabulary: 12 timing series, 19 counters). Unlike
+the two faces above it is **not** a verbatim passthrough: the connector
+projects the answer through its own pinned copy of the engine vocabulary
+(`perfMetrics.face`), and everything the projection cannot vouch for drops
+and counts:
+
+- known `timings` entries (object-valued) and known `counters` entries
+  (numeric) pass with the engine's own content verbatim;
+- unknown top-level keys, unknown section entries, and malformed entries
+  (`uptimeMs`/`unknownKeyDropped` not `u64`, a non-object series value, a
+  non-numeric counter) drop; the face always carries `connectorDroppedKeys`
+  — the number of dropped keys, `0` when the projection was lossless — so a
+  consumer can tell a clean snapshot from a lossy one without diffing key
+  sets;
+- a future engine may grow its vocabulary: those keys stay dropped (and
+  counted) until the connector's allowlist is widened by a contract batch.
+  The connector never forwards an unbounded key space.
+
+The probe rides the same reachability gate, the same 3-second read-only
+diagnostic budget, and the same degradation family as the other method
+faces: an engine predating `engine.perfMetrics` (or a stock signal-cli
+engine) answers `present: false` with the upstream-error-class reason; a
+wedged engine answers `the engine stopped answering mid-probe`. Read-only
+end to end: the engine's metric registry is process-internal state, the
+probe sends `{}` and writes nothing.
 
 ## Credentials face
 

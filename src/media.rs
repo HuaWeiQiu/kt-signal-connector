@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Bounded inbound media ingest (ADR 0002): the two connector-side machines
+//! Bounded inbound media ingest (ADR 0004): the two connector-side machines
 //! that make lifting `--ignore-attachments` survivable.
 //!
 //! [`MediaGovernor`] bounds the disk pressure signal-cli's eager downloads
@@ -17,7 +17,7 @@
 //! memory is one chunk, never the file, and no filesystem path ever crosses
 //! the host boundary.
 //!
-//! Trigger discipline for both (ADR 0002): one pass at process start plus one
+//! Trigger discipline for both (ADR 0004): one pass at process start plus one
 //! per [`GOVERNOR_INBOUND_MESSAGE_INTERVAL`] inbound messages — a counter, no
 //! resident timer thread. Filesystem work never holds the store lock; these
 //! types take no store dependency at all.
@@ -29,34 +29,34 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ids::random_id;
 
-/// How long a downloaded attachment stays fetchable (ADR 0002): seven days,
+/// How long a downloaded attachment stays fetchable (ADR 0004): seven days,
 /// mirroring Signal's own server-side retention expectations. Age is the
 /// file's `mtime`, which signal-cli sets at download time.
 pub const MEDIA_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Total attachment bytes one engine's data directory may retain (ADR 0002):
+/// Total attachment bytes one engine's data directory may retain (ADR 0004):
 /// 2 GiB across all of the engine's accounts. Bounds *retention*, not the
 /// instantaneous write — signal-cli downloads before the connector can veto,
 /// and the blast radius of one oversized download is the server's own
-/// 100 MiB per-attachment cap (ADR 0002).
+/// 100 MiB per-attachment cap (ADR 0004).
 pub const MEDIA_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-/// Deletions one governor pass may perform (ADR 0002). A directory far over
+/// Deletions one governor pass may perform (ADR 0004). A directory far over
 /// quota or full of expired files walks back inside the budget over several
 /// passes instead of stalling one.
 pub const MAX_DELETIONS_PER_PASS: usize = 256;
-/// Inbound messages that accumulate before the next governor pass (ADR 0002):
+/// Inbound messages that accumulate before the next governor pass (ADR 0004):
 /// once per process start plus once per 200 inbound messages, whichever
 /// first. A counter, never a resident timer thread.
 pub const GOVERNOR_INBOUND_MESSAGE_INTERVAL: u64 = 200;
-/// Raw bytes per `messages.attachments.readChunk` (ADR 0002). Base64 expands
+/// Raw bytes per `messages.attachments.readChunk` (ADR 0004). Base64 expands
 /// one full chunk to `4 * ceil(262_144 / 3)` = 349_528 characters, far under
 /// the 160 MiB host frame limit (`DEFAULT_HOST_FRAME_LIMIT`); resident memory
 /// per request is one chunk, never the file.
 pub const MEDIA_CHUNK_BYTES: u64 = 256 * 1024;
-/// Handle lifetime (ADR 0002): 300 seconds. `closeHandle` releases early;
+/// Handle lifetime (ADR 0004): 300 seconds. `closeHandle` releases early;
 /// the TTL is the backstop so an abandoned renderer loop cannot pin memory
 /// or an open-handle slot.
 pub const MEDIA_HANDLE_TTL: Duration = Duration::from_secs(300);
-/// Live handles one account may hold at once (ADR 0002). A leaking renderer
+/// Live handles one account may hold at once (ADR 0004). A leaking renderer
 /// loop is refused at `open` instead of growing without bound.
 pub const MAX_MEDIA_HANDLES_PER_ACCOUNT: usize = 8;
 
@@ -69,7 +69,7 @@ pub struct GovernorStats {
 }
 
 /// One engine's media retention machinery over its signal-cli data directory
-/// (ADR 0002). State by construction: every pass recomputes reality from the
+/// (ADR 0004). State by construction: every pass recomputes reality from the
 /// filesystem, so a crash mid-pass leaves nothing to clean up.
 #[derive(Clone, Debug)]
 pub struct MediaGovernor {
@@ -115,7 +115,7 @@ impl MediaGovernor {
         found
     }
 
-    /// Run one bounded pass (ADR 0002): orphaned/superseded `*.preview`
+    /// Run one bounded pass (ADR 0004): orphaned/superseded `*.preview`
     /// files first, then the 7-day TTL, then the quota LRU — all sharing one
     /// [`MAX_DELETIONS_PER_PASS`] batch. Never called while holding the store
     /// lock; the caller runs it on its own task.
@@ -189,7 +189,7 @@ impl MediaGovernor {
         }
 
         // Quota LRU: oldest mtime first until the survivor total is inside
-        // the budget (ADR 0002 gate: ≤ quota after enough passes).
+        // the budget (ADR 0004 gate: ≤ quota after enough passes).
         let mut total: u64 = remaining.iter().map(|(_, size, _)| *size).sum();
         if total > MEDIA_QUOTA_BYTES {
             remaining.sort_by_key(|(_, _, mtime)| *mtime);
@@ -272,7 +272,7 @@ pub enum MediaHandleError {
     /// three answer the caller identically (the wire code is INVALID_REQUEST),
     /// because the distinction would only help someone probing handle space.
     NotFound,
-    /// `readChunk` offsets must be strictly sequential (ADR 0002): this
+    /// `readChunk` offsets must be strictly sequential (ADR 0004): this
     /// offset is not exactly the next unread byte.
     NotSequential { expected: u64 },
     /// The `open` was refused because the account already holds the
@@ -286,7 +286,7 @@ pub enum MediaHandleError {
 
 /// Binding recorded at `open`: the resolved host addressing tuple plus the
 /// local file the open resolved to. The path stays connector-side forever —
-/// only the random handle crosses the wire (ADR 0002). The tuple fields are
+/// only the random handle crosses the wire (ADR 0004). The tuple fields are
 /// the binding record of the stream (what `open` resolved, for tests and
 /// future account-session enforcement); only `account_id` is read on the
 /// release path, so the struct carries the dead-field allowance explicitly.
@@ -310,7 +310,7 @@ pub struct MediaChunk {
     pub eof: bool,
 }
 
-/// Process-wide table of live chunk streams (ADR 0002). One instance serves
+/// Process-wide table of live chunk streams (ADR 0004). One instance serves
 /// every proxy group: `readChunk`/`closeHandle` carry no accountId on the
 /// wire, so the table — not the routing — is the single-origin authority.
 /// Handles are unguessable random 128-bit tokens bound to one resolved
@@ -368,7 +368,7 @@ impl MediaHandleTable {
     }
 
     /// Read the next sequential chunk of one handle's file. `offset` must be
-    /// exactly the bytes already delivered on this handle (ADR 0002: no
+    /// exactly the bytes already delivered on this handle (ADR 0004: no
     /// random-access scanning, so a hostile renderer cannot turn the handle
     /// into a seek oracle). The read is one bounded chunk; the file is never
     /// held open across calls.
@@ -399,7 +399,7 @@ impl MediaHandleTable {
         Ok(MediaChunk { data, eof })
     }
 
-    /// Explicit early release (ADR 0002). Idempotent by design: a caller that
+    /// Explicit early release (ADR 0004). Idempotent by design: a caller that
     /// closes after the TTL already reaped the handle still observes a
     /// released stream instead of a race-dependent error. Returns whether a
     /// live handle was released.
@@ -409,7 +409,7 @@ impl MediaHandleTable {
     }
 
     /// Drop every handle bound to one account. Runs when the account's local
-    /// data is deleted (ADR 0002 gate 3: a handle cannot outlive its account
+    /// data is deleted (ADR 0004 gate 3: a handle cannot outlive its account
     /// session); the TTL backstops every other kind of abandonment. Returns
     /// how many handles were released.
     pub fn clear_account(&self, account_id: &str) -> usize {

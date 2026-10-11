@@ -68,7 +68,7 @@ enum CliCommand {
         /// `default` group keeps this legacy SOCKS proxy and data directory.
         #[arg(long = "proxy-group", value_name = "ID=HOST:PORT")]
         proxy_group: Vec<String>,
-        /// Media ingest opt-in (ADR 0002; the launcher decision is the whole
+        /// Media ingest opt-in (ADR 0004; the launcher decision is the whole
         /// decision since contract 1.121, §4.102): arming the flag drops
         /// `--ignore-attachments` from the child argv, arms the media
         /// governor, and advertises `attachment-download` (the §4.54 locator
