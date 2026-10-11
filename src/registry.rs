@@ -1701,6 +1701,37 @@ impl ProxyGroupRuntime {
         slot.supervisor.send_contact(params).await
     }
 
+    /// messages.sendPollCreate (contract revision 1.125, §4.106): the poll
+    /// write rides the account's owning engine like every send-lane face.
+    pub async fn send_poll_create(
+        &self,
+        params: crate::service::MessagesSendPollCreateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_poll_create(params).await
+    }
+
+    /// messages.sendPollVote (contract revision 1.125, §4.106): the poll
+    /// write rides the account's owning engine like every send-lane face.
+    pub async fn send_poll_vote(
+        &self,
+        params: crate::service::MessagesSendPollVoteParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_poll_vote(params).await
+    }
+
+    /// messages.sendPollTerminate (contract revision 1.125, §4.106): the
+    /// poll write rides the account's owning engine like every send-lane
+    /// face.
+    pub async fn send_poll_terminate(
+        &self,
+        params: crate::service::MessagesSendPollTerminateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_poll_terminate(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

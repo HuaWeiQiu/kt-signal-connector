@@ -39,6 +39,7 @@ use crate::service::{
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView,
     MediaCloseView, MediaIngest, MediaOpenView, MessageRequestOutcome, MessageRequestParams,
     MessagesDeleteForMeParams, MessagesReportSpamParams, MessagesSendContactParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
     MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget, PinnedConversations,
     PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
     SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
@@ -3366,6 +3367,79 @@ impl RuntimeSupervisor {
                 "mutating request has an unknown outcome",
                 false,
             ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// messages.sendPollCreate (contract revision 1.125, §4.106, capability
+    /// polls): the shape gate + resolution under the service lock, then the
+    /// mutating engine `sendPollCreate` call — the remoteDelete answer
+    /// discipline (a definite success answers the explicit `sent`, an
+    /// indeterminate outcome the explicit `unknown`, a definite error
+    /// propagates; nothing retries). The upstream result body is empty —
+    /// the poll's identity is the send timestamp the receive projection
+    /// converges.
+    pub async fn send_poll_create(
+        &self,
+        params: MessagesSendPollCreateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_send_poll_create(&params)?
+        };
+        match engine
+            .call("sendPollCreate", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// messages.sendPollVote (contract revision 1.125, §4.106): the
+    /// `sendPollCreate` discipline verbatim against the engine's
+    /// group-only `sendPollVote` face (the anchor + selection gates ride
+    /// the prepare; an empty optionIndexes array is the legal clear-vote
+    /// and answers the same `sent`).
+    pub async fn send_poll_vote(
+        &self,
+        params: MessagesSendPollVoteParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_send_poll_vote(&params)?
+        };
+        match engine
+            .call("sendPollVote", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// messages.sendPollTerminate (contract revision 1.125, §4.106): the
+    /// `sendPollCreate` discipline verbatim against the engine's
+    /// group-only `sendPollTerminate` face.
+    pub async fn send_poll_terminate(
+        &self,
+        params: MessagesSendPollTerminateParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_send_poll_terminate(&params)?
+        };
+        match engine
+            .call("sendPollTerminate", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            Err(EngineError::UnknownOutcome) => Ok("unknown"),
             Err(error) => Err(error.into()),
         }
     }

@@ -52,6 +52,7 @@ use crate::service::{
     MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
     MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
     MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
+    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
     MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
     MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
     MessagesSyncReadParams, MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
@@ -2990,6 +2991,59 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.sendContact params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Poll send batch (contract revision 1.125, §4.106): the engine's
+        // group-only poll faces — the remoteDelete answer discipline (a
+        // definite success answers {"status":"sent"}, an indeterminate
+        // outcome the explicit {"status":"unknown"}, a definite error
+        // propagates; nothing retries).
+        "messages.sendPollCreate" => {
+            match serde_json::from_value::<MessagesSendPollCreateParams>(request.params) {
+                Ok(params) => match runtime.send_poll_create(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendPollCreate params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.sendPollVote" => {
+            match serde_json::from_value::<MessagesSendPollVoteParams>(request.params) {
+                Ok(params) => match runtime.send_poll_vote(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendPollVote params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "messages.sendPollTerminate" => {
+            match serde_json::from_value::<MessagesSendPollTerminateParams>(request.params) {
+                Ok(params) => match runtime.send_poll_terminate(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.sendPollTerminate params",
                         false,
                     ),
                 ),

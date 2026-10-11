@@ -1939,6 +1939,70 @@ for line in sys.stdin:
         if contact.get("organization") == "[fixture-crash-contact]":
             os._exit(46)
         result = {"timestamp": 1727000000000}
+    elif method == "sendPollCreate":
+        # Contract 1.125 §4.106: the poll-create route (group-only; groupId
+        # mandatory — a missing/undecodable one is the engine's -32603
+        # parameter face). Same dispatch-recording discipline as `send`:
+        # the exact upstream params land in SEND_LOG. Sentinel: question
+        # "[fixture-crash-poll]" crashes with the mutating call in flight
+        # (os._exit(47); disjoint from 25/29/30/31/32/33/34/46). Success
+        # answers the empty poll result {}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        group = params.get("groupId")
+        if not isinstance(group, str) or not group:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "sendPollCreate requires a groupId",
+                },
+            }
+            emit_json(response)
+            continue
+        if params.get("question") == "[fixture-crash-poll]":
+            os._exit(47)
+        result = {}
+    elif method == "sendPollVote":
+        # Contract 1.125 §4.106: the poll-vote route (group-only). Same
+        # dispatch-recording discipline; success answers {}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        group = params.get("groupId")
+        if not isinstance(group, str) or not group:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "sendPollVote requires a groupId",
+                },
+            }
+            emit_json(response)
+            continue
+        result = {}
+    elif method == "sendPollTerminate":
+        # Contract 1.125 §4.106: the poll-terminate route (group-only).
+        # Same dispatch-recording discipline; success answers {}.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        group = params.get("groupId")
+        if not isinstance(group, str) or not group:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "sendPollTerminate requires a groupId",
+                },
+            }
+            emit_json(response)
+            continue
+        result = {}
     elif method == "updateGroup":
         # Contract 1.45 §4.44: the group-management write route. Same
         # dispatch-recording discipline as `send`/`updateContact`: the exact

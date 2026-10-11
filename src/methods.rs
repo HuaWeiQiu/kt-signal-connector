@@ -75,6 +75,14 @@ pub const METHODS: &[MethodRow] = &[
     // send-lane upstream traffic — the reaction class verbatim, same-account
     // mutex and delete barrier included; advertised through `send-contact`.
     ("messages.sendContact", Lane::Send, true, "send"),
+    // Poll send batch (contract revision 1.125, §4.106): the three
+    // group-only poll faces — mutating, send-lane upstream traffic, the
+    // remoteDelete answer discipline (an indeterminate outcome answers the
+    // explicit `{"status":"unknown"}`, never an automatic retry);
+    // advertised through `polls`.
+    ("messages.sendPollCreate", Lane::Send, true, "send"),
+    ("messages.sendPollVote", Lane::Send, true, "send"),
+    ("messages.sendPollTerminate", Lane::Send, true, "send"),
     ("messages.edit", Lane::Send, true, "send"),
     ("messages.remoteDelete", Lane::Send, true, "send"),
     ("messages.sendReaction", Lane::Send, true, "send"),
@@ -645,7 +653,11 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// the 1.53 appendix discipline); and `send-contact` (contract revision
 /// 1.124) marks the §4.105 contact-card send face (`messages.sendContact` —
 /// the official DataMessage.contact single-entry face, the conversation
-/// row's kind deciding the 1:1 / group leg). They never
+/// row's kind deciding the 1:1 / group leg); and `polls` (contract revision
+/// 1.125) marks the §4.106 poll send faces (`messages.sendPollCreate` /
+/// `messages.sendPollVote` / `messages.sendPollTerminate` — the official
+/// PollCreateSchema/PollVoteSchema content gate, group-conversation legs
+/// exclusively). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -692,6 +704,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "group-invite-links",
     "device-management",
     "send-contact",
+    "polls",
     "delete-for-me",
 ];
 
@@ -760,6 +773,9 @@ mod tests {
             "messages.attachments.send",
             "messages.sendSticker",
             "messages.sendContact",
+            "messages.sendPollCreate",
+            "messages.sendPollVote",
+            "messages.sendPollTerminate",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
@@ -817,6 +833,9 @@ mod tests {
             "messages.attachments.send",
             "messages.sendSticker",
             "messages.sendContact",
+            "messages.sendPollCreate",
+            "messages.sendPollVote",
+            "messages.sendPollTerminate",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",

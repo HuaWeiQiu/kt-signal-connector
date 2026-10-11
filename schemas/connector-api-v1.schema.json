@@ -77,6 +77,9 @@
             "messages.attachments.send",
             "messages.sendSticker",
             "messages.sendContact",
+            "messages.sendPollCreate",
+            "messages.sendPollVote",
+            "messages.sendPollTerminate",
             "messages.edit",
             "messages.remoteDelete",
             "messages.sendReaction",
@@ -610,6 +613,39 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSendContactParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendPollCreate" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendPollCreateParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendPollVote" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendPollVoteParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.sendPollTerminate" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSendPollTerminateParams" }
             }
           }
         },
@@ -3057,6 +3093,103 @@
           "description": "The link the join went through \u2014 any official URL form or the bare invite code; the engine parses it."
         }
       }
+    },
+    "messagesSendPollCreateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "question", "options"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation the poll rides \u2014 polls are group-conversation faces exclusively (the official desktop ships them in groups; the 1:1 create form rides a feature flag that defaults off, vote/terminate have no 1:1 form at all), so any other conversation kind answers INVALID_REQUEST before any upstream call."
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "The poll question: 1..200 characters within 2048 bytes (the official PollCreateSchema content face, MAX_MESSAGE_BODY_BYTE_LENGTH)."
+        },
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 10,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "One poll option: 1..100 characters within 2048 bytes."
+          }
+        },
+        "allowMultiple": {
+          "type": "boolean",
+          "description": "Whether the poll accepts multiple selections; optional (absent = the engine's false default, the official single-selection form)."
+        }
+      },
+      "description": "Create one poll in a group conversation (contract revision 1.125, \u00a74.106, capability polls; the official DataMessage.pollCreate face): the content gates run locally fail-closed before any upstream call (the engine's poll faces pin the same bounds). Send lane, account-scoped mutating: the response is {\"status\":\"sent\"} on a definite success and the explicit {\"status\":\"unknown\"} on an indeterminate one \u2014 never an automatic retry. The upstream result body is empty; the poll's identity is the send timestamp the receive projection converges. Unknown account answers ACCOUNT_NOT_FOUND."
+    },
+    "messagesSendPollVoteParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "targetAuthor", "targetTimestamp", "optionIndexes"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation carrying the poll (polls are group-conversation faces exclusively)."
+        },
+        "targetAuthor": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The poll author the vote addresses (number or UUID; the \u00a74.44 member-id bound)."
+        },
+        "targetTimestamp": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The poll message's sent-at timestamp (the official z.number().int().positive()); 0 answers INVALID_REQUEST."
+        },
+        "optionIndexes": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9
+          },
+          "description": "The selected option indexes (the official PollVoteSchema domain 0..9, at most 10 entries); an empty array is the legal clear-vote action."
+        },
+        "voteCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The multi-ballot count; optional (absent = the engine's 1 default)."
+        }
+      },
+      "description": "Vote in (or clear the vote on) one group poll (contract revision 1.125, \u00a74.106, capability polls; the official DataMessage.pollVote face): the anchor and selection gates run locally fail-closed; the response follows the sendPollCreate status discipline (sent/unknown, never an automatic retry)."
+    },
+    "messagesSendPollTerminateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "targetTimestamp"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation carrying the poll (polls are group-conversation faces exclusively)."
+        },
+        "targetTimestamp": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The poll message's sent-at timestamp; 0 answers INVALID_REQUEST."
+        }
+      },
+      "description": "Terminate one group poll (contract revision 1.125, \u00a74.106, capability polls; the official DataMessage.pollTerminate face): closes the poll the anchor names; the response follows the sendPollCreate status discipline (sent/unknown, never an automatic retry)."
     },
     "messagesSendContactParams": {
       "type": "object",

@@ -8509,6 +8509,65 @@ restart, exactly one crashing frame). Gated behind the full local gate
 suite (fmt + clippy -D warnings + cargo test + release build), all
 green.
 
+### 4.106 The polls reach the host: `messages.sendPollCreate` / `sendPollVote` / `sendPollTerminate` (contract revision 1.125, 2026-10-12)
+
+The engine's window-D A7 batch shipped the poll send trio — the
+official DataMessage pollCreate/pollVote/pollTerminate faces (the
+desktop's PollCreateSchema / PollVoteSchema content gate,
+types/Polls.dom.ts, same position). This batch wires all three into the
+host contract under one capability tag, `polls` (the 1.34 discipline —
+desktops gate the surface on the tag so an old connector answers a
+clean capability gap instead of `METHOD_NOT_ALLOWED`). Until now the
+desktop could receive and render polls but could not create, vote in,
+or terminate one; the poll life cycle had no outbound leg.
+
+**The shape.** `messages.sendPollCreate {accountId, conversationId,
+question, options, allowMultiple?}` / `messages.sendPollVote
+{accountId, conversationId, targetAuthor, targetTimestamp,
+optionIndexes, voteCount?}` / `messages.sendPollTerminate {accountId,
+conversationId, targetTimestamp}` — all three are group-conversation
+faces exclusively (the official desktop ships polls in groups; the 1:1
+create form rides a feature flag that defaults off, vote/terminate have
+no 1:1 form at all), so the connector resolves the conversation row and
+refuses any non-group kind before any upstream call; the row's peer
+reference becomes the upstream groupId. The content gates are the
+official schema verbatim and run locally fail-closed (the engine's
+poll_question_face / poll_options_face / poll_option_indexes_face pin
+the same bounds, but a local refusal never spends a group fan-out): the
+question 1..=200 characters within 2048 bytes (the official
+MAX_MESSAGE_BODY_BYTE_LENGTH); the options 2..=10 entries of 1..=100
+characters each within 2048 bytes; the selection optionIndexes 0..=9
+with at most 10 entries, an empty array the legal clear-vote action;
+the anchor targetTimestamp a positive integer (the official
+`z.number().int().positive()`), targetAuthor the §4.44 member-id bound;
+voteCount positive, absent = the engine's 1 default; allowMultiple
+rides when present, absent = the engine's false default (the official
+single-selection form).
+
+**The answer and the failure faces.** The upstream result body is
+empty — the poll's identity is the send timestamp the receive
+projection converges — so the answer follows the remoteDelete status
+discipline: a definite success answers the explicit
+`{"status":"sent"}`, an indeterminate outcome the explicit
+`{"status":"unknown"}`, a definite error propagates; nothing retries
+(the AGENTS.md red line — a poll whose delivery is unknown may already
+sit in the group timeline). No new structured codes: the faces ride the
+existing upstream send family.
+
+Tests: the service unit pins the prepare ladder (the content bounds,
+the selection domain, the zero anchor, the direct-conversation
+refusal, unknown account) and the frames (the resolved account + group
+peer key, allowMultiple/voteCount absent-stay-absent); the
+methods-table test pins the three lanes and the capability list; the
+integration test round-trips all three faces upstream (create with and
+without allowMultiple, vote with a selection and the empty clear-vote,
+terminate; every frame carrying the resolved account and groupId), the
+local ladder (five refusals with a byte-frozen dispatch log), the
+unknown account, and the red line (crash-in-flight answers
+{"status":"unknown"} across the restart, exactly one crashing frame).
+Gated behind the full local gate suite (fmt + clippy -D warnings +
+cargo test + release build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

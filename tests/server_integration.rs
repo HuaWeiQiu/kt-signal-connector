@@ -9197,6 +9197,334 @@ async fn contact_send_round_trips_both_legs_and_gates_the_card() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.125 (§4.106): the poll send faces — the three
+/// group-only routes (create/vote/terminate). The round-trips carry the
+/// resolved account and the group's peer key upstream and answer the
+/// remoteDelete status discipline ({"status":"sent"} definite, the explicit
+/// {"status":"unknown"} indeterminate); the local ladder (the content
+/// bounds, the selection domain, the zero target, and the direct
+/// conversation refusal) refuses before any upstream call; the
+/// crash-in-flight outcome answers {"status":"unknown"} and is never
+/// retried.
+#[tokio::test]
+async fn poll_send_faces_round_trip_and_gate_the_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [47_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-PollSend" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    // The fixture links with one group conversation in place.
+    let listed = request(
+        &mut client,
+        "list-for-group",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+
+    // The create round-trip: the definite success answers {"status":"sent"}
+    // and the upstream frame carries the resolved account, the group peer
+    // key, and the content; allowMultiple rides when present, stays absent
+    // when not.
+    let created = request(
+        &mut client,
+        "poll-create",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "question": "Lunch?",
+            "options": ["Ramen", "Tacos"],
+            "allowMultiple": true
+        }),
+    )
+    .await;
+    assert_eq!(created["result"]["status"], "sent", "{created}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["account"], "+15555550100");
+    assert_eq!(frame["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(frame["question"], "Lunch?");
+    assert_eq!(frame["options"], json!(["Ramen", "Tacos"]));
+    assert_eq!(frame["allowMultiple"], true);
+    let created = request(
+        &mut client,
+        "poll-create-single",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "question": "Lunch?",
+            "options": ["Ramen", "Tacos"]
+        }),
+    )
+    .await;
+    assert_eq!(created["result"]["status"], "sent", "{created}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert!(
+        frame.get("allowMultiple").is_none(),
+        "the absent default stays absent upstream: {frame}"
+    );
+
+    // The vote round-trip: the anchor + selection ride verbatim; the empty
+    // selection is the legal clear-vote and answers the same sent.
+    let voted = request(
+        &mut client,
+        "poll-vote",
+        "messages.sendPollVote",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "targetAuthor": "+15555550101",
+            "targetTimestamp": 1727000000000_u64,
+            "optionIndexes": [0, 1],
+            "voteCount": 2
+        }),
+    )
+    .await;
+    assert_eq!(voted["result"]["status"], "sent", "{voted}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["targetAuthor"], "+15555550101");
+    assert_eq!(frame["targetTimestamp"], 1727000000000_u64);
+    assert_eq!(frame["optionIndexes"], json!([0, 1]));
+    assert_eq!(frame["voteCount"], 2);
+    let cleared = request(
+        &mut client,
+        "poll-vote-clear",
+        "messages.sendPollVote",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "targetAuthor": "+15555550101",
+            "targetTimestamp": 1727000000000_u64,
+            "optionIndexes": []
+        }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["status"], "sent", "{cleared}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["optionIndexes"], json!([]));
+    assert!(frame.get("voteCount").is_none(), "{frame}");
+
+    // The terminate round-trip.
+    let terminated = request(
+        &mut client,
+        "poll-terminate",
+        "messages.sendPollTerminate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "targetTimestamp": 1727000000000_u64
+        }),
+    )
+    .await;
+    assert_eq!(terminated["result"]["status"], "sent", "{terminated}");
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    let frame = frames.last().unwrap();
+    assert_eq!(frame["targetTimestamp"], 1727000000000_u64);
+
+    // The local ladder refuses before any upstream call: the over-bounds
+    // question, the single option, the out-of-domain index, the zero
+    // target, and the direct-conversation refusal (polls are
+    // group-conversation faces exclusively).
+    let seeded = request(
+        &mut client,
+        "seed-direct",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550103",
+            "peerTitle": "Poll Refusal",
+            "text": "seed the row",
+            "clientRequestId": "poll-seed-1"
+        }),
+    )
+    .await;
+    let direct_conversation = seeded["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let frames_before = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    let long_question = "x".repeat(201);
+    let ladder: Vec<(&str, &str, Value)> = vec![
+        (
+            "long-question",
+            "messages.sendPollCreate",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "question": long_question,
+                "options": ["A", "B"]
+            }),
+        ),
+        (
+            "one-option",
+            "messages.sendPollCreate",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "question": "Q",
+                "options": ["A"]
+            }),
+        ),
+        (
+            "bad-index",
+            "messages.sendPollVote",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "targetAuthor": "+15555550101",
+                "targetTimestamp": 1727000000000_u64,
+                "optionIndexes": [10]
+            }),
+        ),
+        (
+            "zero-target",
+            "messages.sendPollTerminate",
+            json!({
+                "accountId": account_id,
+                "conversationId": group_conversation,
+                "targetTimestamp": 0
+            }),
+        ),
+        (
+            "direct-refusal",
+            "messages.sendPollCreate",
+            json!({
+                "accountId": account_id,
+                "conversationId": direct_conversation,
+                "question": "Q",
+                "options": ["A", "B"]
+            }),
+        ),
+    ];
+    for (id, method, params) in ladder {
+        let refused = request(&mut client, id, method, params).await;
+        assert_eq!(
+            refused["error"]["code"], "INVALID_REQUEST",
+            "{id}: {refused}"
+        );
+    }
+    let frames_after = fs::read_to_string(&send_log_path).unwrap().lines().count();
+    assert_eq!(
+        frames_before, frames_after,
+        "a refused poll never reaches the engine"
+    );
+
+    // Unknown account.
+    let missing = request(
+        &mut client,
+        "poll-missing-account",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": "no-such-account",
+            "conversationId": group_conversation,
+            "question": "Q",
+            "options": ["A", "B"]
+        }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers the
+    // explicit {"status":"unknown"} and is never retried — exactly one
+    // crashing frame across the restart.
+    let crash = request(
+        &mut client,
+        "poll-crash",
+        "messages.sendPollCreate",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation,
+            "question": "[fixture-crash-poll]",
+            "options": ["A", "B"]
+        }),
+    )
+    .await;
+    assert_eq!(crash["result"]["status"], "unknown", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-poll", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["question"] == "[fixture-crash-poll]")
+            .count(),
+        1,
+        "an unknown poll-create outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.68: the §4.61 safety-number faces — identities.get
 /// (the pinned listIdentities read narrowed to the resolved peer reference,
 /// the honest empty-list no-identity face) and identities.verify (the pinned

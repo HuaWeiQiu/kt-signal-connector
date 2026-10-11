@@ -3603,6 +3603,138 @@ impl ConnectorService {
         Ok(upstream)
     }
 
+    /// The §4.106 poll legs are group-only (the official desktop ships polls
+    /// in group conversations exclusively — the 1:1 create form rides a
+    /// feature flag that defaults off, vote/terminate have no 1:1 form at
+    /// all): resolve the rows and refuse any non-group conversation before
+    /// any upstream call.
+    fn resolve_poll_group_leg(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<(AccountRow, crate::store::ConversationRow), ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "polls are group-conversation faces; the official desktop ships them in groups exclusively",
+                false,
+            )));
+        }
+        Ok((account, conversation))
+    }
+
+    /// messages.sendPollCreate (contract revision 1.125, §4.106, capability
+    /// polls): the content gates (the official PollCreateSchema face
+    /// verbatim — question 1..=200 characters within 2048 bytes, options
+    /// 2..=10 entries of 1..=100 characters within 2048 bytes), then the
+    /// engine's group-only `sendPollCreate` frame; allowMultiple rides when
+    /// present (absent stays absent — the engine's false default).
+    pub fn prepare_messages_send_poll_create(
+        &self,
+        params: &MessagesSendPollCreateParams,
+    ) -> Result<Value, ServiceError> {
+        let (account, conversation) =
+            self.resolve_poll_group_leg(&params.account_id, &params.conversation_id)?;
+        validate_poll_question(&params.question)?;
+        validate_poll_options(&params.options)?;
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+            "question": params.question,
+            "options": params.options,
+        });
+        if let Some(allow_multiple) = params.allow_multiple {
+            upstream["allowMultiple"] = json!(allow_multiple);
+        }
+        Ok(upstream)
+    }
+
+    /// messages.sendPollVote (contract revision 1.125, §4.106): the anchor
+    /// gates (targetAuthor the §4.44 member-id bound; targetTimestamp a
+    /// positive integer — the official `z.number().int().positive()`), the
+    /// selection gate (optionIndexes 0..=9, at most 10 entries, empty =
+    /// the legal clear-vote; voteCount positive, absent = the engine's 1
+    /// default), then the engine's group-only `sendPollVote` frame.
+    pub fn prepare_messages_send_poll_vote(
+        &self,
+        params: &MessagesSendPollVoteParams,
+    ) -> Result<Value, ServiceError> {
+        let (account, conversation) =
+            self.resolve_poll_group_leg(&params.account_id, &params.conversation_id)?;
+        if params.target_author.is_empty()
+            || params.target_author.chars().count() > MAX_POLL_TARGET_AUTHOR_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "targetAuthor must contain between 1 and 128 characters",
+                false,
+            )));
+        }
+        if params.target_timestamp == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "targetTimestamp must be a positive integer",
+                false,
+            )));
+        }
+        validate_poll_option_indexes(&params.option_indexes)?;
+        if let Some(count) = params.vote_count
+            && count == 0
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "voteCount must be a positive integer",
+                false,
+            )));
+        }
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+            "targetAuthor": params.target_author,
+            "targetTimestamp": params.target_timestamp,
+            "optionIndexes": params.option_indexes,
+        });
+        if let Some(count) = params.vote_count {
+            upstream["voteCount"] = json!(count);
+        }
+        Ok(upstream)
+    }
+
+    /// messages.sendPollTerminate (contract revision 1.125, §4.106): the
+    /// anchor gate (targetTimestamp positive), then the engine's group-only
+    /// `sendPollTerminate` frame.
+    pub fn prepare_messages_send_poll_terminate(
+        &self,
+        params: &MessagesSendPollTerminateParams,
+    ) -> Result<Value, ServiceError> {
+        let (account, conversation) =
+            self.resolve_poll_group_leg(&params.account_id, &params.conversation_id)?;
+        if params.target_timestamp == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "targetTimestamp must be a positive integer",
+                false,
+            )));
+        }
+        Ok(json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+            "targetTimestamp": params.target_timestamp,
+        }))
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): resolve the direct conversation's rows to the engine's
     /// `reportSpam {account, targetAci, serverGuids}` payload. The report is
@@ -11792,6 +11924,122 @@ fn validate_contact_payload(contact: &ContactPayload) -> Result<(), ServiceError
     Ok(())
 }
 
+/// The §4.106 poll-send bounds (contract revision 1.125): the official
+/// PollCreateSchema content gate (types/Polls.dom.ts) — the question 1..=200
+/// characters within 2048 bytes (the official MAX_MESSAGE_BODY_BYTE_LENGTH),
+/// the options 2..=10 entries of 1..=100 characters each within 2048 bytes,
+/// and the vote's optionIndexes 0..=9 with at most 10 entries. The upstream
+/// pins the same faces (the engine's poll_question_face / poll_options_face
+/// / poll_option_indexes_face); the connector runs them locally so a
+/// refused card never spends a group fan-out.
+pub const MAX_POLL_QUESTION_CHARS: usize = 200;
+pub const MAX_POLL_QUESTION_BYTES: usize = 2048;
+pub const POLL_OPTIONS_MIN: usize = 2;
+pub const POLL_OPTIONS_MAX: usize = 10;
+pub const MAX_POLL_OPTION_CHARS: usize = 100;
+pub const MAX_POLL_OPTION_BYTES: usize = 2048;
+pub const MAX_POLL_OPTION_INDEXES: usize = 10;
+
+/// The §4.106 poll target anchor: the author number/UUID the vote or
+/// termination addresses (the §4.44 member-id bound discipline) and the
+/// poll message's sent-at timestamp (a positive integer — the official
+/// `z.number().int().positive()`).
+pub const MAX_POLL_TARGET_AUTHOR_CHARS: usize = 128;
+
+/// messages.sendPollCreate params (contract revision 1.125, §4.106,
+/// capability polls): the group conversation plus the official
+/// PollCreateSchema content — the engine's group-only poll face (the
+/// official desktop ships polls in group conversations exclusively; the
+/// 1:1 create form rides a feature flag that defaults off). allowMultiple
+/// optional (absent = the engine's false default).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendPollCreateParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_multiple: Option<bool>,
+}
+
+/// messages.sendPollVote params (contract revision 1.125, §4.106): the
+/// poll anchor (targetAuthor + targetTimestamp) plus the official
+/// PollVoteSchema selection — optionIndexes 0..=9, at most 10 entries, an
+/// empty array the legal clear-vote action; voteCount the optional
+/// multi-ballot count (absent = the engine's 1 default).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendPollVoteParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub target_author: String,
+    pub target_timestamp: u64,
+    pub option_indexes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_count: Option<u32>,
+}
+
+/// messages.sendPollTerminate params (contract revision 1.125, §4.106):
+/// the poll anchor only — the termination closes the poll the target
+/// timestamp names.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSendPollTerminateParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub target_timestamp: u64,
+}
+
+/// The §4.106 poll-question gate: 1..=200 characters within 2048 bytes
+/// (the official PollCreateSchema content face verbatim).
+fn validate_poll_question(question: &str) -> Result<(), ServiceError> {
+    if question.is_empty()
+        || question.chars().count() > MAX_POLL_QUESTION_CHARS
+        || question.len() > MAX_POLL_QUESTION_BYTES
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "question must contain between 1 and 200 characters (2048 bytes)",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// The §4.106 options gate: 2..=10 entries of 1..=100 characters each
+/// within 2048 bytes (the official PollCreateSchema face verbatim).
+fn validate_poll_options(options: &[String]) -> Result<(), ServiceError> {
+    if options.len() < POLL_OPTIONS_MIN
+        || options.len() > POLL_OPTIONS_MAX
+        || options.iter().any(|option| {
+            option.is_empty()
+                || option.chars().count() > MAX_POLL_OPTION_CHARS
+                || option.len() > MAX_POLL_OPTION_BYTES
+        })
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "options carries between 2 and 10 entries of 1-100 characters (2048 bytes)",
+            false,
+        )));
+    }
+    Ok(())
+}
+
+/// The §4.106 selection gate: at most 10 entries in 0..=9 (the official
+/// PollVoteSchema domain); an empty array is the legal clear-vote action.
+fn validate_poll_option_indexes(indexes: &[u8]) -> Result<(), ServiceError> {
+    if indexes.len() > MAX_POLL_OPTION_INDEXES || indexes.iter().any(|index| *index > 9) {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "optionIndexes carries at most 10 entries in 0..=9; an empty array is the legal clear-vote",
+            false,
+        )));
+    }
+    Ok(())
+}
+
 /// `groups.generateInviteLinkPassword` params (contract revision 1.117,
 /// §4.98): none — the password is account-less CSPRNG material (the official
 /// `generateGroupInviteLinkPassword`), so the host face takes an empty
@@ -13906,6 +14154,142 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
+    }
+
+    /// §4.106 poll-send prepare (contract 1.125): the group-only leg, the
+    /// official content/selection bounds, the anchor gates, and the
+    /// optional-keys-absent-stay-absent frames.
+    #[test]
+    fn poll_send_prepare_ladder_and_group_leg() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Fixture Group")
+            .unwrap();
+
+        let upstream = service
+            .prepare_messages_send_poll_create(&MessagesSendPollCreateParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                question: "Lunch?".into(),
+                options: vec!["Ramen".into(), "Tacos".into()],
+                allow_multiple: Some(true),
+            })
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["groupId"], "ZmFrZS1ncm91cC0x");
+        assert_eq!(upstream["question"], "Lunch?");
+        assert_eq!(upstream["options"], json!(["Ramen", "Tacos"]));
+        assert_eq!(upstream["allowMultiple"], true);
+
+        let upstream = service
+            .prepare_messages_send_poll_create(&MessagesSendPollCreateParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                question: "Lunch?".into(),
+                options: vec!["Ramen".into(), "Tacos".into()],
+                allow_multiple: None,
+            })
+            .unwrap();
+        assert!(upstream.get("allowMultiple").is_none());
+
+        let upstream = service
+            .prepare_messages_send_poll_vote(&MessagesSendPollVoteParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                target_author: "+15555550101".into(),
+                target_timestamp: 1727000000000,
+                option_indexes: vec![0, 1],
+                vote_count: Some(2),
+            })
+            .unwrap();
+        assert_eq!(upstream["targetAuthor"], "+15555550101");
+        assert_eq!(upstream["targetTimestamp"], 1727000000000_u64);
+        assert_eq!(upstream["optionIndexes"], json!([0, 1]));
+        assert_eq!(upstream["voteCount"], 2);
+
+        let upstream = service
+            .prepare_messages_send_poll_terminate(&MessagesSendPollTerminateParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                target_timestamp: 1727000000000,
+            })
+            .unwrap();
+        assert_eq!(upstream["targetTimestamp"], 1727000000000_u64);
+
+        // The ladder: the content bounds, the selection domain, the zero
+        // anchor, and the direct-conversation refusal — every refusal before
+        // any upstream frame.
+        let create = |conversation_id: &str, question: String, options: Vec<String>| {
+            service
+                .prepare_messages_send_poll_create(&MessagesSendPollCreateParams {
+                    account_id: account.id.clone(),
+                    conversation_id: conversation_id.into(),
+                    question,
+                    options,
+                    allow_multiple: None,
+                })
+                .unwrap_err()
+                .into_api()
+                .code
+        };
+        assert_eq!(
+            create(
+                &group.id,
+                "x".repeat(MAX_POLL_QUESTION_CHARS + 1),
+                vec!["A".into(), "B".into()]
+            ),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            create(&group.id, "Q".into(), vec!["A".into()]),
+            "INVALID_REQUEST"
+        );
+        let error = service
+            .prepare_messages_send_poll_vote(&MessagesSendPollVoteParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                target_author: "+15555550101".into(),
+                target_timestamp: 1727000000000,
+                option_indexes: vec![10],
+                vote_count: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_messages_send_poll_vote(&MessagesSendPollVoteParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                target_author: "+15555550101".into(),
+                target_timestamp: 0,
+                option_indexes: vec![],
+                vote_count: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_messages_send_poll_terminate(&MessagesSendPollTerminateParams {
+                account_id: account.id.clone(),
+                conversation_id: group.id.clone(),
+                target_timestamp: 0,
+            })
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        assert_eq!(
+            create(&direct.id, "Q".into(), vec!["A".into(), "B".into()]),
+            "INVALID_REQUEST"
+        );
+        let error = service
+            .prepare_messages_send_poll_create(&MessagesSendPollCreateParams {
+                account_id: "no-such-account".into(),
+                conversation_id: group.id.clone(),
+                question: "Q".into(),
+                options: vec!["A".into(), "B".into()],
+                allow_multiple: None,
+            })
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
     }
 
     /// §4.69: the four message-carrying cloud-restore families pass the
