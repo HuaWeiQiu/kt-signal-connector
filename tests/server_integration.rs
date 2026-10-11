@@ -7070,6 +7070,282 @@ async fn groups_invite_link_round_trip_and_guards() {
     wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
+/// Contract revision 1.118 (§4.99): the delete-for-me upstream leg. The
+/// handshake advertises `messages.deleteForMe` plus the `delete-for-me`
+/// tag; the full-clear arm rides the engine `deleteForMeConversation` face
+/// with the entries verbatim, the local-only arm carries no entries, the
+/// grammar refuses (empty full-clear entries, oversized lists, entries on
+/// the local-only arm, a zero timestamp, legacyGroup), and the crash
+/// sentinel degrades to `unknown` with no error object and no retry (the
+/// receipt-class discipline).
+#[tokio::test]
+async fn messages_delete_for_me_rides_the_engine_sync_face() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [58_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in ["messages.deleteForMe", "delete-for-me"] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DeleteForMe" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // A direct conversation with one landed message: the delete-for-me
+    // conversation resolves through the local row.
+    let sent = request(
+        &mut client,
+        "dfm-send",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550101",
+            "text": "conversation to clear",
+            "clientRequestId": "dfm-send-1"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["status"], "sent");
+    let conversation_id = sent["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Full-clear arm: the entries ride verbatim, the conversation resolves
+    // to the peer reference the engine's toConversationIdentifier carries.
+    let cleared = request(
+        &mut client,
+        "dfm-clear",
+        "messages.deleteForMe",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "mostRecentMessages": [
+                { "author": "+15555550101", "timestamp": 99 },
+                { "author": "+15555550100", "timestamp": 100 }
+            ],
+            "mostRecentNonExpiringMessages": [
+                { "author": "+15555550101", "timestamp": 101 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(cleared["result"]["status"], "sent");
+    assert!(
+        cleared.get("error").is_none(),
+        "a confirmed sync must not carry an error: {cleared:?}"
+    );
+
+    // Local-only arm: no entries travel, the localOnly bit rides.
+    let local_only = request(
+        &mut client,
+        "dfm-local",
+        "messages.deleteForMe",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "localOnly": true
+        }),
+    )
+    .await;
+    assert_eq!(local_only["result"]["status"], "sent");
+
+    // The exact upstream dispatches were recorded by the fixture, in wire
+    // order, entries verbatim.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log deleteForMeConversation params");
+    let dispatches: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|params: &Value| {
+            params.get("mostRecentMessages").is_some() || params.get("localOnly").is_some()
+        })
+        .collect();
+    assert_eq!(
+        dispatches.len(),
+        2,
+        "both arms reach the upstream exactly once: {dispatches:?}"
+    );
+    assert_eq!(dispatches[0]["account"], "+15555550100");
+    assert_eq!(dispatches[0]["kind"], "contact");
+    assert_eq!(dispatches[0]["conversationId"], "+15555550101");
+    assert_eq!(
+        dispatches[0]["mostRecentMessages"],
+        json!([
+            { "author": "+15555550101", "timestamp": 99 },
+            { "author": "+15555550100", "timestamp": 100 }
+        ])
+    );
+    assert_eq!(
+        dispatches[0]["mostRecentNonExpiringMessages"],
+        json!([{ "author": "+15555550101", "timestamp": 101 }])
+    );
+    assert!(dispatches[0].get("localOnly").is_none());
+    assert_eq!(dispatches[1]["localOnly"], true);
+    assert!(dispatches[1].get("mostRecentMessages").is_none());
+    assert!(dispatches[1].get("mostRecentNonExpiringMessages").is_none());
+
+    // The grammar refuses before any upstream call.
+    let grammar_refusals: Vec<(&str, Value)> = vec![
+        (
+            "dfm-empty",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": []
+            }),
+        ),
+        (
+            "dfm-oversized",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": [
+                    { "author": "+15555550101", "timestamp": 1 },
+                    { "author": "+15555550101", "timestamp": 2 },
+                    { "author": "+15555550101", "timestamp": 3 },
+                    { "author": "+15555550101", "timestamp": 4 },
+                    { "author": "+15555550101", "timestamp": 5 },
+                    { "author": "+15555550101", "timestamp": 6 }
+                ]
+            }),
+        ),
+        (
+            "dfm-local-with-entries",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "localOnly": true,
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 99 }]
+            }),
+        ),
+        (
+            "dfm-zero-timestamp",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 0 }]
+            }),
+        ),
+        (
+            "dfm-legacy-group",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "legacyGroup",
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 99 }]
+            }),
+        ),
+        (
+            "dfm-oversized-non-expiring",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "kind": "contact",
+                "mostRecentMessages": [{ "author": "+15555550101", "timestamp": 99 }],
+                "mostRecentNonExpiringMessages": [
+                    { "author": "+15555550101", "timestamp": 1 },
+                    { "author": "+15555550101", "timestamp": 2 },
+                    { "author": "+15555550101", "timestamp": 3 },
+                    { "author": "+15555550101", "timestamp": 4 },
+                    { "author": "+15555550101", "timestamp": 5 },
+                    { "author": "+15555550101", "timestamp": 6 }
+                ]
+            }),
+        ),
+    ];
+    for (id, params) in grammar_refusals {
+        let refused = request(&mut client, id, "messages.deleteForMe", params).await;
+        assert_eq!(
+            refused["error"]["code"], "INVALID_REQUEST",
+            "{id} must refuse before any upstream call: {refused:?}"
+        );
+    }
+    let refusals_logged = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+    .filter(|params: &Value| {
+        params.get("mostRecentMessages").is_some() || params.get("localOnly").is_some()
+    })
+    .count();
+    assert_eq!(
+        refusals_logged, 2,
+        "the refusals must not reach the upstream"
+    );
+
+    // The crash sentinel (timestamp 427) kills the engine mid-call: the
+    // sync message may or may not have reached the other devices — the
+    // request degrades to `unknown`, no error object, no retry.
+    let indeterminate = request(
+        &mut client,
+        "dfm-crash",
+        "messages.deleteForMe",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "kind": "contact",
+            "mostRecentMessages": [
+                { "author": "+15555550101", "timestamp": 99 },
+                { "author": "+15555550101", "timestamp": 427 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(indeterminate["result"]["status"], "unknown");
+    assert!(
+        indeterminate.get("error").is_none(),
+        "a receipt failure must not fail the request: {indeterminate:?}"
+    );
+
+    wait_for_process_exit(engine_pid).await;
+    drop(client);
+    assert_clean_exit(&mut connector).await;
+}
 /// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
 /// Contract 1.49 (§4.48): the reportSpam round trip. Envelopes staged
 /// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`

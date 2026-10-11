@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.117 (2026-10-12; the group invite-link family rides
+- Contract revision: 1.118 (2026-10-12; the delete-for-me upstream leg
+  rides the engine sync face (§4.99): `messages.deleteForMe` behind the
+  new `delete-for-me` capability tag closes the §4.83 family's outbound
+  half — the engine `deleteForMeConversation` face, the official
+  deleteConversation sync. The §4.97 addressing trio resolves through the
+  shared ladder; `localOnly` absent/false is the full-clear arm
+  (mostRecentMessages 1..=5 {author, timestamp} entries verbatim — the
+  official slice(0, 5) mirror, oversized refused fail-closed, the
+  optional non-expiring companion ≤5), `localOnly: true` is the
+  local-only arm (no entries allowed), legacyGroup refuses
+  deterministically. Receipt-class, the §4.89 discipline verbatim: any
+  engine call failure degrades {status: sent|unknown} with no error
+  object and is never retried. Zero local writes — the §4.83 receive
+  mirror stays the inbound channel, this face is the outbound leg only.
+  No new error codes; no store shape moves. Tests 661 → 663 (lib 504 →
+  505), all green) —
+  previously 1.117 (2026-10-12; the group invite-link family rides
   the engine link faces (§4.98): six methods behind the new
   `group-invite-links` capability tag. The account-less read faces ride
   the default group's engine (the §4.32 anonymous-face discipline):
@@ -8026,6 +8042,68 @@ gains a module-level proto codec (varint fields, web-safe base64) with
 the build/parse engines and the three 16-byte password sentinels
 (forbidden / preview-failed / approval-requested). Gates: 657 → 661
 (lib 501 → 504), all green.
+
+### 4.99 The delete-for-me upstream leg rides the engine sync face (contract revision 1.118, 2026-10-12)
+
+The engine's P15c 项3 batch landed `deleteForMeConversation` — the
+official deleteConversation sync (SendMessage.preload.ts
+getDeleteForMeSyncMessage) a desktop fires when it clears a conversation,
+so the account's other linked devices converge their copies too. The
+connector's §4.83 batch already carries the inbound half of that family
+(the `syncMessage.deleteForMe` receive projection, the store mirror, the
+`message.deleteForMe` forward); the outbound half had no face at all —
+the desktop's own clear-decision could never reach the phone. One method
+closes the family: `messages.deleteForMe` behind the new `delete-for-me`
+capability tag.
+
+**The two arms.** The addressing trio is the §4.97 shape
+(accountId/conversationId/kind) resolved through the shared ladder — the
+conversation row's peer reference is exactly the identity the engine's
+toConversationIdentifier shape carries (a service-id string or an e164
+for kind=contact, the 32-byte master key for kind=group), and the §4.56
+empty-peer guard keeps the self row out. `localOnly` absent/false is the
+full-clear arm: `mostRecentMessages` carries 1..=5 {author, timestamp}
+entries (the official getMostRecentAddressableMessages().slice(0, 5)
+mirror — a larger list answers INVALID_REQUEST before any upstream call;
+a destructive intent is never silently truncated) with the optional
+`mostRecentNonExpiringMessages` companion ≤5 (the official
+areAnyDisappearing companion). `localOnly: true` is the local-only arm
+and must carry no entries at all (the official local-only branch has no
+message position — the other devices only clear their local rows).
+kind=legacyGroup refuses deterministically (the official
+getConversationIdentifier throw for non-GV2 groups). The entries forward
+verbatim — the phone-side row lookup keys on the exact
+(author, sentTimestamp) strings, so the connector never re-derives an
+author, an entry shape the typed ladder cannot produce is refused
+locally (zero timestamps, empty or oversized authors), and nothing is
+logged or persisted beyond the engine's own dispatch record.
+
+**The class.** Receipt-class, the §4.89 syncRead/syncViewed discipline
+verbatim: send lane, account-scoped mutating, and any engine call
+failure — including the engine's pre-flight -32603 refusal — degrades to
+{status: "unknown"} with no error object and is never retried (the sync
+message may already ride the self-send lane). Zero local writes: the
+§4.83 receive mirror stays the inbound channel, the connector's rows
+keep their mirror state, and the desktop's own convergence rides the
+same `message.deleteForMe` forward it already consumes — this face is
+the outbound leg only. No new error codes (INVALID_REQUEST before any
+upstream call; the degradation otherwise), no store shape moves.
+
+Tests: `messages_delete_for_me_rides_the_engine_sync_face` — the
+handshake advertises the method plus the tag, the full-clear arm's
+verbatim dispatch (account, resolved peer reference, both entry lists),
+the local-only arm's bit-only dispatch, both arms pinned in wire order
+against the fixture log, the six grammar refusals answering
+INVALID_REQUEST with nothing upstream, and the crash sentinel
+degrading to `unknown` with no error object. Lib tests join:
+`prepare_messages_delete_for_me_ladders_the_official_grammar` — both
+arms' exact upstream shapes, the group-kind master-key resolution, and
+the grammar ladder (empty/oversized lists, entries or companion on the
+local-only arm, zero timestamp, empty author, legacyGroup, unknown
+conversation). The fixture gains the `deleteForMeConversation` stub with
+the fail-closed param gate, the SEND_LOG dispatch record, and the 427
+crash sentinel (disjoint from the 421/423/424/425/426 space). Gates:
+661 → 663 (lib 504 → 505), all green.
 
 ## 5. signal-cli Boundary
 

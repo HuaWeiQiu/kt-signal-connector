@@ -91,6 +91,12 @@ pub const METHODS: &[MethodRow] = &[
     // so the same lane and mutex classification applies.
     ("messages.syncRead", Lane::Send, true, "send"),
     ("messages.syncViewed", Lane::Send, true, "send"),
+    // Delete-for-me SELF-SYNC upstream leg (contract 1.118, §4.99): the
+    // conversation-level delete-for-me sync the official desktop sends when
+    // a conversation is cleared — receipt-class, same lane and mutex
+    // classification as the syncRead/syncViewed pair; advertised through
+    // `delete-for-me`.
+    ("messages.deleteForMe", Lane::Send, true, "send"),
     // View-once faces (contract 1.38): the bare open-sync passthrough and
     // the burn trigger are both receipt-class — mutating, send-lane upstream
     // traffic under the reaction-class write-lane mutex and delete barrier;
@@ -648,6 +654,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "chat-folders",
     "conversation-state",
     "group-invite-links",
+    "delete-for-me",
 ];
 
 #[cfg(test)]
@@ -757,6 +764,7 @@ mod tests {
             "stories.sendReaction",
             "stories.downloadAttachment",
             "chatFolders.setRecords",
+            "messages.deleteForMe",
         ];
         let mutating = [
             "messages.sendText",
@@ -814,6 +822,7 @@ mod tests {
             "stories.sendReaction",
             "stories.downloadAttachment",
             "chatFolders.setRecords",
+            "messages.deleteForMe",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {
             let expected_lane = if read_lane.contains(name) {

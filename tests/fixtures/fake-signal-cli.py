@@ -856,6 +856,73 @@ for line in sys.stdin:
         if params.get("timestamp") == 426:
             os._exit(23)
         result = {}
+    elif method == "deleteForMeConversation":
+        # Contract 1.118 §4.99 delete-for-me upstream leg: same
+        # dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests can assert the {account, kind, conversationId,
+        # localOnly?/mostRecentMessages?} contract. Fail-closed param gate
+        # mirrors the engine's -32603 face (the deterministic refusal the
+        # connector's receipt-class degradation folds into `unknown`).
+        account = params.get("account")
+        kind = params.get("kind")
+        conversation_id = params.get("conversationId")
+        local_only = params.get("localOnly")
+        most_recent = params.get("mostRecentMessages")
+        non_expiring = params.get("mostRecentNonExpiringMessages")
+
+        def _entries_ok(entries):
+            if entries is None:
+                return True
+            if not isinstance(entries, list) or len(entries) > 5:
+                return False
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    return False
+                author = entry.get("author")
+                timestamp = entry.get("timestamp")
+                if not isinstance(author, str) or not author:
+                    return False
+                if not isinstance(timestamp, int) or timestamp <= 0:
+                    return False
+            return True
+
+        shape_ok = (
+            isinstance(account, str)
+            and bool(account)
+            and kind in ("contact", "group")
+            and isinstance(conversation_id, str)
+            and bool(conversation_id)
+            and _entries_ok(most_recent)
+            and _entries_ok(non_expiring)
+        )
+        if local_only is not None and not isinstance(local_only, bool):
+            shape_ok = False
+        if local_only and (most_recent or non_expiring):
+            shape_ok = False
+        if not local_only and (not most_recent or not (
+                isinstance(most_recent, list) and 1 <= len(most_recent) <= 5)):
+            shape_ok = False
+        if not shape_ok:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "invalid deleteForMeConversation params"},
+            }
+            emit_json(response)
+            continue
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # One-shot crash with the mutating call in flight: the sync message
+        # may or may not have reached the other devices, which is the
+        # indeterminate case (engine-exit path). Sentinel timestamp 427
+        # keeps the sentinel space disjoint from remoteDelete 421 /
+        # reaction 423 / pin 424 / receipt 425 / view-once 426.
+        if any(
+            entry.get("timestamp") == 427 for entry in (most_recent or [])
+        ):
+            os._exit(23)
+        result = {"status": "sent"}
     elif method == "getStickerPackManifest":
         # Contract 1.36 browse face: deterministic manifest keyed by pack id.
         # Sentinel packId ffffffffffffffffffffffffffffffff answers a

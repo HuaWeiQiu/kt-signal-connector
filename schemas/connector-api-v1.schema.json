@@ -84,6 +84,7 @@
             "messages.markViewed",
             "messages.syncRead",
             "messages.syncViewed",
+            "messages.deleteForMe",
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "messages.reportSpam",
@@ -693,6 +694,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesSyncViewedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.deleteForMe" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesDeleteForMeParams" }
             }
           }
         },
@@ -1804,6 +1816,57 @@
           "maxItems": 512,
           "items": { "$ref": "#/$defs/opaqueId" },
           "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
+        }
+      }
+    },
+    "messagesDeleteForMeEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["author", "timestamp"],
+      "description": "One delete-for-me entry (the official toAddressableMessage shape): the author string (service id or e164) and the message's sent timestamp, both forwarded verbatim — the phone-side row lookup keys on the exact strings, so the connector never re-derives either.",
+      "properties": {
+        "author": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The message's author as the desktop addressed it: a service-id string or an e164 number, forwarded verbatim."
+        },
+        "timestamp": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The message's sent timestamp (epoch ms); 0 is refused."
+        }
+      }
+    },
+    "messagesDeleteForMeParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "kind"],
+      "description": "Send the conversation-level delete-for-me upstream leg (contract revision 1.118, §4.99, capability delete-for-me): the engine deleteForMeConversation face — the official deleteConversation sync (SendMessage.preload.ts getDeleteForMeSyncMessage) the desktop fires when a conversation is cleared, so the account's other linked devices converge their copies too. Two arms by grammar: localOnly absent/false is the full-clear arm — mostRecentMessages is required and carries 1..=5 {author, timestamp} entries (the official slice(0, 5) mirror; a larger list answers INVALID_REQUEST — a destructive intent is never silently truncated), with the optional mostRecentNonExpiringMessages companion ≤5 (the official areAnyDisappearing companion); localOnly true is the local-only arm — mostRecent* must be absent/empty (the official local-only branch has no message position), the other devices only clear their local rows. kind must be 'contact' or 'group' (the official getConversationIdentifier refuses non-GV2 groups; legacyGroup answers INVALID_REQUEST); the conversation resolves through the local row to the upstream reference the engine's toConversationIdentifier shape carries. Entries forward verbatim. Send lane, account-scoped mutating; receipt-class {status: sent|unknown}: any engine call failure — including the pre-flight refusal — degrades to unknown and is never retried (the sync message may already ride the self-send lane). Zero local writes: the §4.83 message.deleteForMe receive mirror stays the inbound channel; this face is the outbound leg only (the §4.89 syncRead zero-local-write discipline).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "kind": {
+          "type": "string",
+          "enum": ["contact", "group"],
+          "description": "The conversation family the engine's toConversationIdentifier shape carries."
+        },
+        "localOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "true = the local-only arm (no entries allowed); absent/false = the full-clear arm (entries required)."
+        },
+        "mostRecentMessages": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/messagesDeleteForMeEntry" },
+          "description": "The full-clear arm's message entries (the official getMostRecentAddressableMessages().slice(0, 5) mirror; 1..=5)."
+        },
+        "mostRecentNonExpiringMessages": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/messagesDeleteForMeEntry" },
+          "description": "Optional companion list for conversations with disappearing messages (the official areAnyDisappearing companion; ≤5)."
         }
       }
     },

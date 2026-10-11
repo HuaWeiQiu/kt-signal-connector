@@ -36,17 +36,18 @@ use crate::service::{
     HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
     MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesReportSpamParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget, PinnedConversations,
-    PreparedHistoryDownload, PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget,
-    SendTextMentionParams, SendTextPreviewParams, SendTextStyleParams, ServiceError,
-    StickerManifestEntry, StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams,
-    StickerPackManifest, StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
-    UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
-    account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
-    chat_folder_syncs_result, conversation_state_from_engine, group_invite_join_status_from_engine,
+    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeParams,
+    MessagesReportSpamParams, MessagesSendStickerParams, MessagesSendStoryParams, PeerTarget,
+    PinnedConversations, PreparedHistoryDownload, PreparedSend, ReportSpamFailure,
+    ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled, StoriesGetDisabledParams,
+    StoriesMarkViewedParams, StoriesSendReactionParams, StoriesSetDisabledParams,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
+    account_limit_error, blocked_conversations_result, chat_folder_syncs_result,
+    conversation_state_from_engine, group_invite_join_status_from_engine,
     group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
     group_invite_link_preview_from_engine, identity_from_engine, pinned_conversations_result,
     sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
@@ -4399,6 +4400,36 @@ impl RuntimeSupervisor {
     ) -> Result<&'static str, ServiceError> {
         self.send_sync_receipt(account_id, conversation_id, message_ids, "markViewed")
             .await
+    }
+
+    /// messages.deleteForMe (contract revision 1.118, §4.99, capability
+    /// delete-for-me): the conversation-level delete-for-me upstream leg —
+    /// the engine `deleteForMeConversation` face (the official
+    /// deleteConversation sync, the full-clear arm and the local-only arm
+    /// verbatim). Receipt-class like the sync read/viewed pair: any engine
+    /// call failure degrades to `{status: "unknown"}` and is never retried
+    /// — the sync message may already ride the self-send lane. Zero local
+    /// writes (the §4.89 discipline): the §4.83 receive mirror stays the
+    /// inbound channel; this face is the outbound leg only.
+    pub async fn delete_for_me(
+        &self,
+        params: MessagesDeleteForMeParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_messages_delete_for_me(&params)?
+        };
+        match engine
+            .call("deleteForMeConversation", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("sent"),
+            // Same receipt-class degradation as the peer-faced fan-out: any
+            // failure — including the engine's pre-flight refusal — answers
+            // `unknown` and is never retried.
+            Err(_) => Ok("unknown"),
+        }
     }
 
     /// Shared sync read/viewed body: the receipt-class twin of

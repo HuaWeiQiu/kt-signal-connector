@@ -46,14 +46,14 @@ use crate::service::{
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     LinkSessionParams, LinkStartParams, MessageGetTextParams, MessageRequestParams,
     MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
-    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
-    MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, MessagesSyncReadParams,
-    MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams,
+    MessagesEditParams, MessagesListParams, MessagesMarkReadParams,
+    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
+    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendPinMessageParams,
+    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
+    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
+    MessagesSyncReadParams, MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
@@ -2542,6 +2542,28 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.syncViewed params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Delete-for-me SELF-SYNC upstream leg (contract revision 1.118,
+        // §4.99): the receipt dispatch shape again — params shape errors
+        // answer INVALID_REQUEST, the answer is {status: sent|unknown}, and
+        // a sync failure never fails the request (the supervisor degrades
+        // it; the deleteForMeConversation self-sync channel mirrors the
+        // syncRead/syncViewed pair).
+        "messages.deleteForMe" => {
+            match serde_json::from_value::<MessagesDeleteForMeParams>(request.params) {
+                Ok(params) => match runtime.delete_for_me(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.deleteForMe params",
                         false,
                     ),
                 ),

@@ -1301,6 +1301,17 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Delete-for-me SELF-SYNC routing (contract revision 1.118, §4.99):
+    /// the owning group's supervisor forwards the engine
+    /// `deleteForMeConversation` face, receipt-class semantics end to end.
+    pub async fn delete_for_me(
+        &self,
+        params: crate::service::MessagesDeleteForMeParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.delete_for_me(params).await
+    }
+
     /// Story-anchored viewed receipt routing (contract revision 1.85,
     /// §4.70): the owning group's supervisor sends the single-author frame
     /// over its own engine, receipt-class semantics end to end.

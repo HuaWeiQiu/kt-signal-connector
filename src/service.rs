@@ -4427,6 +4427,149 @@ impl ConnectorService {
         Ok(account)
     }
 
+    /// messages.deleteForMe (contract revision 1.118, §4.99): the §4.97
+    /// addressing ladder plus the official deleteConversation grammar. The
+    /// conversation resolves to the upstream reference the engine's
+    /// toConversationIdentifier shape carries (the §4.56 empty-peer guard:
+    /// the self row has no upstream address), and the entries forward
+    /// verbatim — the connector never re-derives an author (the phone-side
+    /// row lookup keys on the exact strings). The grammar is the engine's:
+    /// full-clear requires 1..=5 entries (the official slice(0, 5) mirror,
+    /// exceeded fail-closed — a destructive intent is never silently
+    /// truncated), the non-expiring companion rides ≤5, and the local-only
+    /// arm carries no entries at all (the official local-only branch has no
+    /// message position). Zero local writes: the upstream leg is the whole
+    /// face (the §4.89 syncRead discipline), the §4.83 receive mirror stays
+    /// the inbound channel.
+    pub fn prepare_messages_delete_for_me(
+        &self,
+        params: &MessagesDeleteForMeParams,
+    ) -> Result<Value, ServiceError> {
+        const MAX_DELETE_FOR_ME_ENTRIES: usize = 5;
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.conversation_id.is_empty()
+            || params.conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        validate_pinned_kind(&params.kind)?;
+        // The engine's toConversationIdentifier refuses a non-GV2 group (the
+        // official getConversationIdentifier throw) — the connector refuses
+        // it deterministically before any upstream call.
+        if params.kind == "legacyGroup" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "kind must be 'contact' or 'group' for deleteForMe",
+                false,
+            )));
+        }
+        let most_recent = params.most_recent_messages.as_deref().unwrap_or(&[]);
+        let most_recent_non_expiring = params
+            .most_recent_non_expiring_messages
+            .as_deref()
+            .unwrap_or(&[]);
+        if params.local_only {
+            if !most_recent.is_empty() || !most_recent_non_expiring.is_empty() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "a localOnly delete carries no message entries",
+                    false,
+                )));
+            }
+        } else {
+            if most_recent.is_empty() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "mostRecentMessages must carry at least one entry",
+                    false,
+                )));
+            }
+            if most_recent.len() > MAX_DELETE_FOR_ME_ENTRIES
+                || most_recent_non_expiring.len() > MAX_DELETE_FOR_ME_ENTRIES
+            {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "mostRecentMessages and mostRecentNonExpiringMessages carry at most 5 entries",
+                    false,
+                )));
+            }
+        }
+        let validate_entries = |entries: &[MessagesDeleteForMeEntry]| {
+            for entry in entries {
+                if entry.author.is_empty()
+                    || entry.author.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+                {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "entry author must contain between 1 and 256 characters",
+                        false,
+                    )));
+                }
+                if entry.timestamp == 0 {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "entry timestamp must be a positive integer",
+                        false,
+                    )));
+                }
+            }
+            Ok(())
+        };
+        validate_entries(most_recent)?;
+        validate_entries(most_recent_non_expiring)?;
+        let account = self.resolve_account(&params.account_id)?;
+        let conversation =
+            self.resolve_conversation(&params.account_id, &params.conversation_id)?;
+        if conversation.peer_key.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "this conversation has no upstream address",
+                false,
+            )));
+        }
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "kind": params.kind,
+            "conversationId": conversation.peer_key,
+        });
+        let object = upstream.as_object_mut().expect("object literal");
+        if params.local_only {
+            object.insert("localOnly".to_string(), json!(true));
+        } else {
+            object.insert(
+                "mostRecentMessages".to_string(),
+                json!(
+                    most_recent
+                        .iter()
+                        .map(|entry| json!({
+                            "author": entry.author,
+                            "timestamp": entry.timestamp,
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            if !most_recent_non_expiring.is_empty() {
+                object.insert(
+                    "mostRecentNonExpiringMessages".to_string(),
+                    json!(
+                        most_recent_non_expiring
+                            .iter()
+                            .map(|entry| json!({
+                                "author": entry.author,
+                                "timestamp": entry.timestamp,
+                            }))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            }
+        }
+        Ok(upstream)
+    }
+
     /// The §4.98 link-addressed pre-ladder (contract revision 1.117): the
     /// account-bound + invite-link-bound resolution shared by the preview,
     /// join, and cancel faces — everything that fails closed before the
@@ -10561,6 +10704,40 @@ pub struct ConversationsSetStateParams {
     pub muted_until_timestamp: Option<u64>,
     pub archived: Option<bool>,
     pub marked_unread: Option<bool>,
+}
+
+/// One `messages.deleteForMe` entry (contract revision 1.118, §4.99): the
+/// {author, timestamp} pair the official toAddressableMessage shape carries
+/// — the author is a service-id string or an e164 number forwarded
+/// verbatim (the engine never re-derives it; guessing a mapping would
+/// break the phone-side (author, sentTimestamp) row lookup), the
+/// timestamp the message's sent stamp.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesDeleteForMeEntry {
+    pub author: String,
+    pub timestamp: u64,
+}
+
+/// `messages.deleteForMe` params (contract revision 1.118, §4.99): the
+/// §4.97 addressing trio plus the official deleteConversation grammar —
+/// `localOnly` absent/false is the full-clear arm (mostRecentMessages
+/// required, 1..=5 entries — the official slice(0, 5) mirror, exceeded
+/// fail-closed: a destructive intent is never silently truncated), the
+/// optional non-expiring companion ≤5; `localOnly: true` is the
+/// local-only arm and must carry no entries at all.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesDeleteForMeParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub local_only: bool,
+    #[serde(default)]
+    pub most_recent_messages: Option<Vec<MessagesDeleteForMeEntry>>,
+    #[serde(default)]
+    pub most_recent_non_expiring_messages: Option<Vec<MessagesDeleteForMeEntry>>,
 }
 
 /// `conversations.acceptRequest` / `conversations.declineRequest` params
@@ -17979,6 +18156,209 @@ mod tests {
     /// the optional password; the shared link-addressed ladder bounds and
     /// resolves; the parse face bounds only. Every refusal answers before
     /// any engine call.
+    #[test]
+    /// Contract revision 1.118 (§4.99): the delete-for-me prepare ladder —
+    /// the two arms' exact upstream shapes, the entries verbatim, the
+    /// official grammar refusals, and the resolution ladder's faces.
+    fn prepare_messages_delete_for_me_ladders_the_official_grammar() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+        let params = |conversation_id: &str, kind: &str, extra: Value| {
+            let mut value = json!({
+                "accountId": account.id,
+                "conversationId": conversation_id,
+                "kind": kind,
+            });
+            let object = value.as_object_mut().unwrap();
+            for (key, entry) in extra.as_object().unwrap() {
+                object.insert(key.clone(), entry.clone());
+            }
+            value
+        };
+
+        // Full-clear arm: the entries ride verbatim, the conversation
+        // resolves to the peer reference, the companion list rides only
+        // when the caller sent one.
+        let upstream = service
+            .prepare_messages_delete_for_me(
+                &serde_json::from_value(params(
+                    &direct.id,
+                    "contact",
+                    json!({
+                        "mostRecentMessages": [
+                            { "author": "+15555550101", "timestamp": 99 },
+                            { "author": "+15555550100", "timestamp": 100 }
+                        ]
+                    }),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["kind"], "contact");
+        assert_eq!(upstream["conversationId"], direct.peer_key);
+        assert_eq!(
+            upstream["mostRecentMessages"],
+            json!([
+                { "author": "+15555550101", "timestamp": 99 },
+                { "author": "+15555550100", "timestamp": 100 }
+            ])
+        );
+        assert!(upstream.get("mostRecentNonExpiringMessages").is_none());
+        assert!(upstream.get("localOnly").is_none());
+
+        let upstream = service
+            .prepare_messages_delete_for_me(
+                &serde_json::from_value(params(
+                    &direct.id,
+                    "contact",
+                    json!({
+                        "mostRecentMessages": [
+                            { "author": "+15555550101", "timestamp": 99 }
+                        ],
+                        "mostRecentNonExpiringMessages": [
+                            { "author": "+15555550101", "timestamp": 101 }
+                        ]
+                    }),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            upstream["mostRecentNonExpiringMessages"],
+            json!([{ "author": "+15555550101", "timestamp": 101 }])
+        );
+
+        // Local-only arm: the bit rides, no message positions.
+        let upstream = service
+            .prepare_messages_delete_for_me(
+                &serde_json::from_value(params(
+                    &direct.id,
+                    "contact",
+                    json!({ "localOnly": true }),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(upstream["localOnly"], true);
+        assert!(upstream.get("mostRecentMessages").is_none());
+        assert!(upstream.get("mostRecentNonExpiringMessages").is_none());
+
+        // A group resolves through its master key reference.
+        let upstream = service
+            .prepare_messages_delete_for_me(
+                &serde_json::from_value(params(
+                    &group.id,
+                    "group",
+                    json!({
+                        "mostRecentMessages": [
+                            { "author": "+15555550101", "timestamp": 99 }
+                        ]
+                    }),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(upstream["conversationId"], group.peer_key);
+
+        // The grammar refusals, in wire order.
+        for (name, extra) in [
+            (
+                "empty full-clear entries",
+                json!({ "mostRecentMessages": [] }),
+            ),
+            (
+                "oversized full-clear entries",
+                json!({ "mostRecentMessages": [
+                    { "author": "+15555550101", "timestamp": 1 },
+                    { "author": "+15555550101", "timestamp": 2 },
+                    { "author": "+15555550101", "timestamp": 3 },
+                    { "author": "+15555550101", "timestamp": 4 },
+                    { "author": "+15555550101", "timestamp": 5 },
+                    { "author": "+15555550101", "timestamp": 6 }
+                ]}),
+            ),
+            (
+                "oversized companion list",
+                json!({ "mostRecentMessages": [
+                    { "author": "+15555550101", "timestamp": 1 }
+                ], "mostRecentNonExpiringMessages": [
+                    { "author": "+15555550101", "timestamp": 1 },
+                    { "author": "+15555550101", "timestamp": 2 },
+                    { "author": "+15555550101", "timestamp": 3 },
+                    { "author": "+15555550101", "timestamp": 4 },
+                    { "author": "+15555550101", "timestamp": 5 },
+                    { "author": "+15555550101", "timestamp": 6 }
+                ]}),
+            ),
+            (
+                "entries on the local-only arm",
+                json!({ "localOnly": true, "mostRecentMessages": [
+                    { "author": "+15555550101", "timestamp": 1 }
+                ]}),
+            ),
+            (
+                "companion on the local-only arm",
+                json!({ "localOnly": true, "mostRecentNonExpiringMessages": [
+                    { "author": "+15555550101", "timestamp": 1 }
+                ]}),
+            ),
+            (
+                "zero timestamp",
+                json!({ "mostRecentMessages": [
+                    { "author": "+15555550101", "timestamp": 0 }
+                ]}),
+            ),
+            (
+                "empty author",
+                json!({ "mostRecentMessages": [
+                    { "author": "", "timestamp": 99 }
+                ]}),
+            ),
+            (
+                "legacyGroup kind",
+                json!({ "mostRecentMessages": [
+                { "author": "+15555550101", "timestamp": 99 }
+            ], "kind_override": "legacyGroup" }),
+            ),
+        ] {
+            let mut value = params(&direct.id, "contact", extra.clone());
+            if let Some(kind) = extra.get("kind_override").and_then(Value::as_str) {
+                value["kind"] = json!(kind);
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("kind_override")
+                    .unwrap();
+            }
+            let error = service
+                .prepare_messages_delete_for_me(&serde_json::from_value(value).unwrap())
+                .unwrap_err();
+            assert_eq!(
+                error.into_api().code,
+                "INVALID_REQUEST",
+                "{name} must refuse"
+            );
+        }
+
+        // The resolution ladder's faces.
+        let error = service
+            .prepare_messages_delete_for_me(
+                &serde_json::from_value(params(
+                    "no-such-conversation",
+                    "contact",
+                    json!({ "localOnly": true }),
+                ))
+                .unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+    }
+
     #[test]
     fn prepare_group_invite_link_faces_ladders_and_payloads() {
         let (_temp, mut service) = service();
