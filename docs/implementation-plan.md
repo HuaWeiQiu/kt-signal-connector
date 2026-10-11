@@ -5,7 +5,26 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.99 (2026-10-11; the send-chain transport error classification batch
+- Contract revision: 1.100 (2026-10-11; the engine D-batch consume faces (§4.81): four faces
+  where the connector stops dropping engine projections and starts consuming them. D2 — the
+  cross-device read/viewed sync (`syncMessage.read`/`.viewed` route as a bounded 256-entry
+  control receive; per-face first stamps land on the rows, the unread badge converges through
+  the existing session-coarse `clear_conversation_unread` ladder with
+  `ConversationChanged`/`AccountChanged` in tow and per-row `message.statusChanged` events
+  riding along; the badge convergence is deliberately coarser than the official per-row
+  stamping — the recorded deviation). D3 — the group-change batch (`groupChanged` forwards
+  verbatim under the 32-entry/64 KiB bounds, the guaranteed faces fail closed, the timer leg
+  mirrors through the §4.41 path without landing a timer-notice row, and the new
+  `group.changed` event carries the batch to the desktop). D4 — the quoted-attachment
+  metadata (`quote.attachments` rides the three-key QuotedAttachment shape through the same
+  bounded parser — the 8-entry cap, id-less thumbnails drop, the locator half never
+  serializes; the §4.38 import face stays metadata-only this revision). D5 — the
+  device-capability registration read (`accounts.deviceCapabilities`: the idempotent engine
+  PUT with the host answer stripping the engine's bare `account` identity, the capability
+  bits verbatim, every engine failure folding to `UPSTREAM_ERROR`, and the §4.17 chain
+  gaining no matcher). The method surface grows by one (schema method enum + allOf branch +
+  `$def` paired); tests 600 → 609, all green) — previously 1.99 (2026-10-11; the send-chain
+  transport error classification batch
   (§4.80): the engine's send face folds transport-layer failures into the plain internal_error
   JSON-RPC face (`code: -32603`) whose `message` embeds the cause class, so every rate limit,
   proof challenge, and server outage reached the desktop as the generic retryable
