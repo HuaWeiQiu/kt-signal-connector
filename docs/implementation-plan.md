@@ -8947,6 +8947,58 @@ schema-consistency bound pairs and the server handshake advertisement.
 Gated behind the full local gate suite (fmt + clippy -D warnings +
 cargo test + release build), all green.
 
+### 4.113 The conversation flags have no inbound leg: the remote-storage-record face the engine does not project (verification record, 2026-10-12)
+
+The §4.97 conversation-state family (`conversations.getState` /
+`conversations.setState` over the mutedUntilTimestamp/archived/
+markedUnread bits) is desktop-local-write only: the connector's
+`setState` rides the engine's outbound write leg — the official
+Storage Service ContactRecord/GroupRecord flag flip
+(`apply_conversation_state`, kt-signal-engine `src/service/
+storage_sync.rs`, the proto bits 11/12/13) — and lands the change on
+the cloud record. This section records the verification of the other
+direction: when a *different* linked device flips the same bits on the
+Storage Service, does anything push the change to this connector? The
+answer, verified against the engine's current notification and
+storage-merge surfaces, is no — the engine has no inbound face here,
+and the connector wires nothing because there is nothing to wire.
+
+**The evidence.** The engine's complete notification vocabulary is
+four methods — `accountUnbound` (§4.94), `receive` (the envelope
+stream), `receive.clockskew`, and `receive.emptied` — and no storage
+notification rides any of them: the `receive` envelope keys the engine
+projects (`contactProfileUpdated`, `groupTerminated`, `identityChanged`,
+`storyMessage`, the sync faces) are message-decryption products, never
+storage-record diffs. The engine runs no Storage Service manifest
+subscription at all — its storage faces are connector-invoked
+request/response calls (read on demand, write on intent), so remote
+manifest revisions never arrive while idle; the only code paths the
+word "manifest" names are sticker-pack CDN manifests. And the inbound
+record-application path (`src/service/storage_merge.rs`, the
+§4.112 merge/import ingest family) lands remote records into the
+engine's own database and answers merge summaries — it emits no
+per-conversation notification and the three flag bits are not part of
+any summary it answers.
+
+**The consequence.** A remote flag edit (another device mutes,
+archives, or marks-unread a conversation) reaches this connector only
+if something pulls the storage records that carry the bits — and no
+current face does: the record-list sync faces (§4.78 chatFolders,
+§4.110 notificationProfiles, §4.111 storyDistributionLists) carry
+their own record families, not the conversation-state bits. The
+desktop's conversation list therefore does not converge on
+other-device flag edits; the §4.97 faces remain write-out,
+read-local-store.
+
+**The disposition.** Recorded as an engine projection gap (the inbound
+half of the conversation-state family). No connector code, no schema
+change, no capability tag, no contract revision. When the engine ships
+the inbound face — a `receive`-lane notification per remote
+conversation-state change, or a pull face carrying the three bits —
+the §4.97 section gains its inbound leg through the same
+ControlReceive interception family the other record-sync faces use
+(the §4.81–§4.87 pattern), and this section's gap closes.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
