@@ -3082,6 +3082,39 @@ where
             )
             .await
         }
+        HostSideEvent::CallHistoryEvent {
+            account_id,
+            call_id,
+            timestamp,
+            kind,
+            direction,
+            outcome,
+            conversation_id,
+        } => {
+            // Contract 1.104, §4.85: the call-history record forwards flat
+            // with the absent-optional discipline — the word legs ride only
+            // when the projection carried them and an unresolved record
+            // stays conversation-less (the story.received conditional-insert
+            // style).
+            let mut payload = json!({
+                "accountId": account_id,
+                "callId": call_id,
+                "timestamp": timestamp,
+            });
+            if let Some(kind) = kind {
+                payload["type"] = json!(kind);
+            }
+            if let Some(direction) = direction {
+                payload["direction"] = json!(direction);
+            }
+            if let Some(outcome) = outcome {
+                payload["event"] = json!(outcome);
+            }
+            if let Some(conversation_id) = conversation_id {
+                payload["conversationId"] = json!(conversation_id);
+            }
+            send_shared(writer, &HostEvent::new("call.historyEvent", payload)).await
+        }
     }
 }
 
@@ -4099,6 +4132,76 @@ mod tests {
         // none of the three optional keys.
         assert!(frame["data"].get("destinationNumber").is_none());
         assert!(frame["data"].get("identityKey").is_none());
+        assert!(frame["data"].get("conversationId").is_none());
+    }
+
+    /// Contract 1.104 (§4.85): the `call.historyEvent` wire frame — the
+    /// record rides flat with the absent-optional discipline: the word legs
+    /// exist only when the projection carried them and an unresolved record
+    /// stays conversation-less.
+    #[tokio::test]
+    async fn call_history_event_rides_the_flat_record() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::CallHistoryEvent {
+                account_id: "acct-1".into(),
+                call_id: "18446744073709551615".into(),
+                timestamp: 1726999999000,
+                kind: Some("audio"),
+                direction: Some("incoming"),
+                outcome: Some("accepted"),
+                conversation_id: Some("conv-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::CallHistoryEvent {
+                account_id: "acct-1".into(),
+                call_id: "42".into(),
+                timestamp: 1726999998000,
+                kind: None,
+                direction: None,
+                outcome: None,
+                conversation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut lines = Framed::new(&mut server, LinesCodec::new());
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the event frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "call.historyEvent");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["callId"], "18446744073709551615");
+        assert_eq!(frame["data"]["timestamp"], 1726999999000u64);
+        assert_eq!(frame["data"]["type"], "audio");
+        assert_eq!(frame["data"]["direction"], "incoming");
+        assert_eq!(frame["data"]["event"], "accepted");
+        assert_eq!(frame["data"]["conversationId"], "conv-1");
+
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the second frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["data"]["callId"], "42");
+        // The absent-optional discipline: an unprojected record carries none
+        // of the four optional keys.
+        assert!(frame["data"].get("type").is_none());
+        assert!(frame["data"].get("direction").is_none());
+        assert!(frame["data"].get("event").is_none());
         assert!(frame["data"].get("conversationId").is_none());
     }
 }

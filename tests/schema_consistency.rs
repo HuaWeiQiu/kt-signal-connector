@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::engine::{
-    MAX_RECEIVE_ID_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES, MAX_SYNC_DELETE_GROUPS,
-    MAX_SYNC_IDENTITY_KEY_CHARS,
+    MAX_RECEIVE_ID_CHARS, MAX_SYNC_CALL_ID_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES,
+    MAX_SYNC_DELETE_GROUPS, MAX_SYNC_IDENTITY_KEY_CHARS,
 };
 use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
@@ -625,6 +625,15 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/event/allOf/12/then/properties/data/properties/identityKey",
             "maxLength",
             MAX_SYNC_IDENTITY_KEY_CHARS as u64,
+        ),
+        // Call-event sync (contract 1.104, §4.85): the decimal call id
+        // mirrors its own bound (the parse also demands all-ASCII digits);
+        // the conversation identity rides the shared opaqueId def, so no
+        // inline pairing exists to pin.
+        (
+            "/$defs/event/allOf/13/then/properties/data/properties/callId",
+            "maxLength",
+            MAX_SYNC_CALL_ID_CHARS as u64,
         ),
         // Account settings (contract 1.46, §4.45): the profile text budgets
         // mirror the official desktop ProfileEditor; the emoji label reuses

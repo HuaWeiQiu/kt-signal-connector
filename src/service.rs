@@ -994,6 +994,29 @@ pub enum HostSideEvent {
         identity_key: Option<String>,
         conversation_id: Option<String>,
     },
+    /// The engine's `syncMessage.callEvent` projection forwarded (contract
+    /// 1.104, §4.85): the account's own linked device wrote one call-history
+    /// entry — the official callEventSync face. Pure transient forwarding,
+    /// by the same honesty the official client runs: the call log lives in
+    /// the desktop's own store (`updateCallHistoryFromRemoteEvent` is its
+    /// writer), the connector keeps no call-history store, and the official
+    /// consumer itself drops the record when its conversation lookup misses
+    /// — so the connector's one enrichment is the §4.85 conversation ladder
+    /// (the 32-byte group form addressing its group row directly, the
+    /// UUID/e164 forms through the §4.81 resolution family), and an
+    /// unresolved record forwards conversation-less for the desktop to join
+    /// by the projection's own `conversationId`. A missed delivery loses
+    /// that one history entry exactly as the official client loses one it
+    /// received while offline — transient, no self-heal, no replay.
+    CallHistoryEvent {
+        account_id: String,
+        call_id: String,
+        timestamp: u64,
+        kind: Option<&'static str>,
+        direction: Option<&'static str>,
+        outcome: Option<&'static str>,
+        conversation_id: Option<String>,
+    },
 }
 
 /// One conversation-scoped delete group on the `message.deleteForMe` event
@@ -6276,6 +6299,13 @@ impl ConnectorService {
         if let ControlReceive::SyncVerified { verified } = &control {
             return self.apply_sync_verified(&account, verified);
         }
+        // Contract 1.104 (§4.85 consume batch): the call-event sync addresses
+        // its own conversation, never an envelope source (the envelope is our
+        // own account). Intercepted before the generic ladder with the same
+        // resolution family.
+        if let ControlReceive::SyncCallEvent { event } = &control {
+            return self.apply_sync_call_event(&account, event);
+        }
         // Story receives (contract 1.76, §4.67): a story addresses no
         // conversation — the bounded projection forwards as the transient
         // `story.received` event and the connector keeps no row. The
@@ -6928,6 +6958,10 @@ impl ConnectorService {
             // own destination, never an envelope source); this arm is the
             // same unreachable-in-practice guard too.
             ControlReceive::SyncVerified { .. } => Ok(Vec::new()),
+            // The call-event sync is intercepted the same way (it addresses
+            // its own conversation); this arm is the same
+            // unreachable-in-practice guard too.
+            ControlReceive::SyncCallEvent { .. } => Ok(Vec::new()),
         }
     }
 
@@ -7375,6 +7409,65 @@ impl ConnectorService {
             state: verified.state,
             destination_number: verified.destination_number.clone(),
             identity_key: verified.identity_key.clone(),
+            conversation_id: conversation.map(|conversation| conversation.id),
+        }])
+    }
+
+    /// The conversation one call-event's projection conversation identity
+    /// resolves to (contract 1.104, §4.85): the delete-for-me group ladder
+    /// verbatim — the 32-byte standard-base64 form (a group master key) addresses
+    /// its group row directly, everything else (the 16-byte UUID form, an
+    /// e164, an ad-hoc hex room id) walks the §4.81 read-sync ladder through
+    /// `sync_sender_conversation`; the hex room id naturally resolves nothing
+    /// (the connector keeps no ad-hoc face) and stays honestly conversation-
+    /// less. Nothing resolves to None — the forward rides unenriched.
+    fn sync_call_event_conversation(
+        &mut self,
+        account: &AccountRow,
+        conversation_id: &str,
+    ) -> Result<Option<crate::store::ConversationRow>, ServiceError> {
+        let mut decoded = Vec::new();
+        if crate::service::base64_decode_to_vec(conversation_id, &mut decoded).is_ok()
+            && decoded.len() == GROUPV2_ID_LENGTH
+        {
+            return Ok(self
+                .store
+                .conversation_by_peer(&account.id, "group", conversation_id)?
+                .filter(|conversation| conversation.kind == "group"));
+        }
+        self.sync_sender_conversation(account, conversation_id, None)
+    }
+
+    /// Contract 1.104 (§4.85): forward one `syncMessage.callEvent`
+    /// projection — the account's own linked device wrote one call-history
+    /// entry (the official callEventSync face). Pure forwarding, no store
+    /// mirror: the connector keeps no call-history store and inventing one
+    /// would fork the desktop's authoritative call log (the official
+    /// consumer writes its own history through
+    /// `updateCallHistoryFromRemoteEvent`); the record is transient — a
+    /// missed delivery loses that one entry exactly as the official client
+    /// loses one it received while offline, no self-heal, no replay. The one
+    /// enrichment is the conversation ladder: the projection's own
+    /// conversation identity resolves through the §4.85 ladder above, a hit
+    /// carries the local `conversationId`, a miss forwards conversation-less
+    /// and the desktop joins by the projection's own identity. The word
+    /// legs ride verbatim (the parser's whitelists already resolved them).
+    fn apply_sync_call_event(
+        &mut self,
+        account: &AccountRow,
+        event: &crate::engine::SyncCallEvent,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let conversation = match event.conversation_id.as_deref() {
+            Some(id) => self.sync_call_event_conversation(account, id)?,
+            None => None,
+        };
+        Ok(vec![HostSideEvent::CallHistoryEvent {
+            account_id: account.id.clone(),
+            call_id: event.call_id.clone(),
+            timestamp: event.timestamp,
+            kind: event.kind,
+            direction: event.direction,
+            outcome: event.outcome,
             conversation_id: conversation.map(|conversation| conversation.id),
         }])
     }
@@ -19595,6 +19688,115 @@ mod tests {
         else {
             panic!("expected the unverified event: {:?}", events[0]);
         };
+        assert!(conversation_id.is_none());
+    }
+
+    /// Contract 1.104 (§4.85): the call-event sync forwards as one transient
+    /// event — the 32-byte group form addresses its group row directly, the
+    /// UUID form ladders to the direct thread, an ad-hoc hex room id stays
+    /// honestly conversation-less, and the word legs ride verbatim. Nothing
+    /// mirrors (the connector keeps no call-history store) and nothing
+    /// converges beside the event.
+    #[test]
+    fn sync_call_event_forwards_with_the_resolved_conversation() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        const GROUP_ID_32B: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", GROUP_ID_32B, "G")
+            .unwrap();
+        let sync = |call_id: &str, conversation_id: Option<&str>| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncCallEvent {
+                    event: crate::engine::SyncCallEvent {
+                        call_id: call_id.into(),
+                        timestamp: 1726999999000,
+                        kind: Some("video"),
+                        direction: Some("incoming"),
+                        outcome: Some("not-accepted"),
+                        conversation_id: conversation_id.map(str::to_string),
+                    },
+                },
+            );
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+        let event_of = |events: Vec<HostSideEvent>| match &events[0] {
+            HostSideEvent::CallHistoryEvent {
+                account_id,
+                call_id,
+                timestamp,
+                kind,
+                direction,
+                outcome,
+                conversation_id,
+            } => (
+                account_id.clone(),
+                call_id.clone(),
+                *timestamp,
+                *kind,
+                *direction,
+                *outcome,
+                conversation_id.clone(),
+                events.len(),
+            ),
+            other => panic!("expected the call-history event: {other:?}"),
+        };
+
+        // The 32-byte group form addresses the group row directly.
+        let (event_account, call_id, _, kind, direction, outcome, conversation_id, count) =
+            event_of(
+                service
+                    .ingest_receive(
+                        sync("1001", Some(GROUP_ID_32B)),
+                        crate::DEFAULT_PROXY_GROUP_ID,
+                    )
+                    .unwrap(),
+            );
+        assert_eq!(event_account, account.id);
+        assert_eq!(call_id, "1001");
+        assert_eq!(kind, Some("video"));
+        assert_eq!(direction, Some("incoming"));
+        assert_eq!(outcome, Some("not-accepted"));
+        assert_eq!(conversation_id.as_deref(), Some(group.id.as_str()));
+        assert_eq!(count, 1, "one event, nothing converges beside it");
+
+        // The UUID form ladders to the direct thread through the recorded
+        // ACI→peer-key mapping.
+        let (_, _, _, _, _, _, conversation_id, _) = event_of(
+            service
+                .ingest_receive(sync("1002", Some(ACI)), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap(),
+        );
+        assert_eq!(conversation_id.as_deref(), Some(conversation.id.as_str()));
+
+        // An ad-hoc hex room id resolves nothing local — the record forwards
+        // conversation-less.
+        let (_, _, _, _, _, _, conversation_id, _) = event_of(
+            service
+                .ingest_receive(
+                    sync("1003", Some("deadbeef")),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap(),
+        );
+        assert!(conversation_id.is_none());
+
+        // No conversation identity at all — the same conversation-less face.
+        let (_, _, _, _, _, _, conversation_id, _) = event_of(
+            service
+                .ingest_receive(sync("1004", None), crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap(),
+        );
         assert!(conversation_id.is_none());
     }
 

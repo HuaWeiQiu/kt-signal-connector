@@ -3131,7 +3131,8 @@
             "story.viewed",
             "group.changed",
             "message.deleteForMe",
-            "identity.verifiedChanged"
+            "identity.verifiedChanged",
+            "call.historyEvent"
           ]
         },
         "data": {
@@ -3610,6 +3611,55 @@
                   "conversationId": {
                     "$ref": "#/$defs/opaqueId",
                     "description": "The destination's resolved local conversation — the id form the desktop addresses; absent when the destination laddered to nothing (the record still forwards, the state is self-describing by its destination)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "call.historyEvent" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "callId", "timestamp"],
+                "description": "One call-history sync record forwarded (contract 1.104, §4.85): the engine's syncMessage.callEvent projection — the account's own linked device wrote one 1:1/group call's history entry, the official callEventSync face. Pure transient forwarding: the desktop's own call log is the authoritative store (the connector keeps none), so a missed delivery loses that one entry exactly as the official client loses one it received while offline. The record carries the local conversationId when the projection's conversation identity resolved (the 32-byte group form addresses its group row directly, the UUID/e164 forms walk the §4.81 resolution ladder); absent stays absent and the desktop joins by the projection's own identity.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "callId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 20,
+                    "description": "The call's id as the decimal string the projection emitted (the official longToString form, kept verbatim for the desktop's call-log join)."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The record's timestamp (the projection entry; the engine's zero-defaulted records are dropped connector-side — a record with no timestamp is not a history record)."
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["audio", "video", "group", "ad-hoc", "unknown"],
+                    "description": "The call kind — the projection's lowercase word verbatim; absent when the projection carried none."
+                  },
+                  "direction": {
+                    "type": "string",
+                    "enum": ["outgoing", "incoming", "unknown"],
+                    "description": "The call direction — the projection's lowercase word verbatim; absent when the projection carried none."
+                  },
+                  "event": {
+                    "type": "string",
+                    "enum": ["accepted", "not-accepted", "delete", "observed", "unknown"],
+                    "description": "The history outcome — the projection's lowercase word verbatim; absent when the projection carried none."
+                  },
+                  "conversationId": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The record's resolved local conversation — the id form the desktop addresses; absent when the projection named none or its identity resolved to nothing (the desktop joins by its own map)."
                   }
                 }
               }

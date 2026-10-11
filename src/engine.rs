@@ -964,6 +964,25 @@ pub enum ControlReceive {
     SyncVerified {
         verified: SyncVerifiedState,
     },
+    /// The engine's `syncMessage.callEvent` projection (contract 1.104,
+    /// §4.85): the account's own linked device wrote one 1:1/group call's
+    /// history entry — the official callEventSync face, the desktop's
+    /// #handleCallEvent/#updateCallHistoryFromRemoteEvent consumer. The
+    /// record carries the call's decimal id string (the official
+    /// `longToString` form), the record's timestamp, the optional
+    /// type/direction/outcome words (the engine projects its enum members as
+    /// lowercase words, `unknown` for the UNKNOWN members), and the optional
+    /// conversation identity in the official three-form shape (hex room id
+    /// for ad-hoc, ServiceId UUID string for a 16-byte direct conversation,
+    /// standard base64 group master key otherwise). The connector keeps no
+    /// call-history store — the desktop's own call log is the authoritative
+    /// store, so this is a pure transient notify. A face whose callId or
+    /// timestamp fails the shape gates never reaches this variant — the
+    /// projection parser dropped it, and an envelope with nothing usable left
+    /// keeps the plain syncMessage skip.
+    SyncCallEvent {
+        event: SyncCallEvent,
+    },
     /// The engine's `groupChanged {groupId, revision, changes[], editor?,
     /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
     /// official GroupV2ChangeDetailType word list the engine decrypted out
@@ -1037,6 +1056,26 @@ pub struct SyncVerifiedState {
     pub state: &'static str,
 }
 
+/// One call-history sync record off the engine's `syncMessage.callEvent`
+/// projection (contract 1.104, §4.85): the call's decimal id string (the
+/// official `longToString` wire form, kept verbatim — the connector is a
+/// pipe for the desktop's call-log join), the record's positive timestamp,
+/// the optional type/direction/outcome words (whitelist members the parser
+/// resolved from the engine's lowercase projections — a hostile word answers
+/// absent, never a mangled one), and the optional conversation identity in
+/// the projection's verbatim form (hex room id / UUID string / base64 master
+/// key — the service layer's resolution ladder reads the form, the connector
+/// never re-encodes it).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncCallEvent {
+    pub call_id: String,
+    pub timestamp: u64,
+    pub kind: Option<&'static str>,
+    pub direction: Option<&'static str>,
+    pub outcome: Option<&'static str>,
+    pub conversation_id: Option<String>,
+}
+
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
@@ -1074,6 +1113,14 @@ pub const MAX_SYNC_DELETE_GROUP_MESSAGES: usize = 256;
 /// data shape mirrors the bound (the schema-pairing test pins the two
 /// together).
 pub const MAX_SYNC_IDENTITY_KEY_CHARS: usize = 128;
+/// One call-event sync's decimal call id carries at most this many
+/// characters (contract 1.104, §4.85): the id is the engine's `u64`
+/// `to_string()` output — 20 digits at the u64 ceiling — so the bound only
+/// ever bites on a hostile face; the parser also demands every character be
+/// an ASCII digit (the official decimal-string shape, kept verbatim). `pub`
+/// since the §4.85 host-event data shape mirrors the bound (the
+/// schema-pairing test pins the two together).
+pub const MAX_SYNC_CALL_ID_CHARS: usize = 20;
 /// One quote carries at most this many attachment metadata entries (contract
 /// 1.100, §4.81): real quoted-media batches are small and Signal Desktop
 /// renders the pill metadata-only; entries past the cap drop (the same
@@ -1278,6 +1325,13 @@ impl NormalizedReceive {
                         + verified.destination_uuid.len()
                         + verified.destination_number.as_ref().map_or(0, String::len)
                         + verified.identity_key.as_ref().map_or(0, String::len)
+                }
+                // The call-event sync carries one bounded record — the heap
+                // strings count here so the queue budget stays honest (§4.13).
+                Some(ControlReceive::SyncCallEvent { event }) => {
+                    std::mem::size_of::<SyncCallEvent>()
+                        + event.call_id.len()
+                        + event.conversation_id.as_ref().map_or(0, String::len)
                 }
                 _ => 0,
             }
@@ -2590,6 +2644,56 @@ fn optional_bounded_string(value: Option<&Value>) -> Option<String> {
         .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
 }
 
+/// The engine's `syncMessage.callEvent` face (contract 1.104, §4.85): the
+/// wire shape is `{callId, timestamp, type?, direction?, event?,
+/// conversationId?}` — the call's decimal id string, the record timestamp,
+/// and the optional projection words. Fail-closed at two hard gates: the
+/// callId must be a non-empty all-ASCII-digit string at the u64 ceiling (the
+/// engine projects `u64::to_string()`, the official `longToString` form —
+/// anything else is not the record's primary key) and the timestamp must be
+/// strictly positive (the engine projects 0 for an unstated stamp — the
+/// read-face unknown-marker discipline; a record with no timestamp is not a
+/// history record). Either gate failing drops the whole face and the
+/// envelope falls back to the plain syncMessage skip. The word keys fail
+/// per-key: each must be exactly one of the engine's lowercase projection
+/// words (a non-member answers absent — the desktop renders its own word for
+/// a missing leg, never a mangled one), and the conversation identity rides
+/// verbatim in whatever form the projection chose (hex / UUID / base64 — the
+/// service ladder reads the form).
+fn normalized_sync_call_event(value: Option<&Value>) -> Option<SyncCallEvent> {
+    let object = value?.as_object()?;
+    let call_id = object
+        .get("callId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= MAX_SYNC_CALL_ID_CHARS
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+        })?;
+    let timestamp = object
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .filter(|timestamp| *timestamp > 0)?;
+    let word_key = |key: &str, words: &[&'static str]| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|word| words.iter().copied().find(|member| *member == word))
+    };
+    Some(SyncCallEvent {
+        call_id: call_id.to_string(),
+        timestamp,
+        kind: word_key("type", &["audio", "video", "group", "ad-hoc", "unknown"]),
+        direction: word_key("direction", &["outgoing", "incoming", "unknown"]),
+        outcome: word_key(
+            "event",
+            &["accepted", "not-accepted", "delete", "observed", "unknown"],
+        ),
+        conversation_id: optional_bounded_string(object.get("conversationId")),
+    })
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -3470,6 +3574,23 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             source: None,
             group_id: None,
             control: ControlReceive::SyncVerified { verified },
+        });
+    }
+    // The engine's `syncMessage.callEvent` projection (contract 1.104,
+    // §4.85): the account's own linked device wrote one call-history entry —
+    // the official callEventSync face. Intercepted before the plain
+    // syncMessage skip like its verified sibling; an envelope whose face
+    // failed the shape gates falls through to that skip. The routing source
+    // stays None — the envelope is our own account and the record names its
+    // own conversation (the read/viewed precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(event) = normalized_sync_call_event(sync.get("callEvent"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncCallEvent { event },
         });
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
@@ -6283,6 +6404,89 @@ mod tests {
             json!({ "verified": { "destinationUuid": "+15555550101", "state": "verified" } }),
             json!({ "verified": { "destinationUuid": "not-a-uuid", "state": "verified" } }),
             json!({ "verified": { "state": "verified" } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.104 (§4.85): the engine's `syncMessage.callEvent`
+    /// projection routes as one control receive — the callId must be a
+    /// decimal string at the u64 ceiling, the timestamp strictly positive,
+    /// the word keys ride the per-key whitelists (a non-member drops, the
+    /// record survives), the conversation identity rides verbatim, and a
+    /// face failing a hard gate falls through to the plain syncMessage skip.
+    #[test]
+    fn sync_call_event_routes_the_shape_gated_record() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncCallEvent { event }, source)) = routing(json!({
+            "callEvent": {
+                "callId": "18446744073709551615",
+                "timestamp": 1726999999000u64,
+                "type": "audio",
+                "direction": "outgoing",
+                "event": "accepted",
+                "conversationId": "11111111-1111-1111-1111-111111111111",
+            },
+        })) else {
+            panic!("expected a call-event control routing");
+        };
+        assert_eq!(event.call_id, "18446744073709551615");
+        assert_eq!(event.timestamp, 1726999999000);
+        assert_eq!(event.kind, Some("audio"));
+        assert_eq!(event.direction, Some("outgoing"));
+        assert_eq!(event.outcome, Some("accepted"));
+        assert_eq!(
+            event.conversation_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The word keys fail per-key: a hostile word answers absent while
+        // the record survives.
+        let Some((ControlReceive::SyncCallEvent { event }, _)) = routing(json!({
+            "callEvent": {
+                "callId": "42",
+                "timestamp": 1726999998000u64,
+                "type": "TELEPORT",
+                "direction": 3u64,
+                "event": "ringing",
+            },
+        })) else {
+            panic!("expected the routing to survive hostile words");
+        };
+        assert!(event.kind.is_none());
+        assert!(event.direction.is_none());
+        assert!(event.outcome.is_none());
+        assert!(event.conversation_id.is_none());
+
+        // No usable face at all → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "callEvent": {} }),
+            // The callId shape gate: non-numeric, over-bound, missing.
+            json!({ "callEvent": { "callId": "12x34", "timestamp": 1726999999000u64 } }),
+            json!({ "callEvent": { "callId": "184467440737095516155", "timestamp": 1726999999000u64 } }),
+            json!({ "callEvent": { "callId": 42u64, "timestamp": 1726999999000u64 } }),
+            json!({ "callEvent": { "timestamp": 1726999999000u64 } }),
+            // The timestamp gate: the engine's zero marker is not a record.
+            json!({ "callEvent": { "callId": "42", "timestamp": 0u64 } }),
+            json!({ "callEvent": { "callId": "42" } }),
         ] {
             let routing = control_routing(
                 json!({ "timestamp": 1727000000000u64, "syncMessage": sync })

@@ -5,7 +5,30 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.103 (2026-10-11; the verified trust-sync consume face (§4.84): the
+- Contract revision: 1.104 (2026-10-11; the call-history sync consume face (§4.85): the
+  engine's `syncMessage.callEvent` projection — the account's own linked device wrote one
+  1:1/group call's history entry, the official callEventSync face — consumed as pure transient
+  forwarding. (a) The receive: fail-closed shape gates on the record's primary key — the
+  callId must be a non-empty all-ASCII-digit string at the u64 ceiling (the engine projects
+  `u64::to_string()`, the official `longToString` form) and the timestamp strictly positive
+  (the engine's zero-defaulted records are not history records); either gate failing drops the
+  whole face and the envelope falls back to the plain `syncMessage` skip. The type/direction/
+  event word keys fail per-key (each must be exactly one of the engine's lowercase projection
+  words — a non-member answers absent, never a mangled leg). (b) The forward: the new
+  `call.historyEvent` host event carries `{accountId, callId, timestamp, type?, direction?,
+  event?, conversationId?}` — flat, absent optionals staying absent, the conversation identity
+  resolved through the §4.85 ladder (the 32-byte group form addressing its group row directly,
+  the UUID/e164 forms through the §4.81 resolution family; the ad-hoc hex room id honestly
+  resolving nothing). No store mirror, by recorded discretion: the connector keeps no
+  call-history store and inventing one would fork the desktop's authoritative call log (the
+  official consumer writes its own history through `updateCallHistoryFromRemoteEvent`); the
+  record is transient — a missed delivery loses that one entry exactly as the official client
+  loses one it received while offline. No new method, error, or capability (the
+  `message.expired` precedent for core events); the schema gains the event enum entry, the
+  allOf[13] data block, and two schema-pairing bounds (the callId's 20 ↔
+  `MAX_SYNC_CALL_ID_CHARS`, the conversation identity's 128 ↔ `MAX_RECEIVE_ID_CHARS`); tests
+  621 → 624, all green) —
+  previously 1.103 (2026-10-11; the verified trust-sync consume face (§4.84): the
   engine's `syncMessage.verified` projection — the account's own linked device settled one
   peer's safety-number trust state, the official SyncMessage.verified face — consumed through
   two faces. (a) The receive: a fail-closed parse whose gates are the engine's lowercase trust
@@ -6924,6 +6947,84 @@ camelCase shape, the absent optionals); and the schema consistency pairs (the
 destination/key maxLengths pinned to `MAX_RECEIVE_ID_CHARS`/
 `MAX_SYNC_IDENTITY_KEY_CHARS`, the event enum auto-balanced against the
 emission literal). Gates: 618 → 621, all green.
+
+### 4.85 Call-history sync: the call.historyEvent event (contract revision 1.104, 2026-10-11)
+
+The 2026-10-06 engine batch taught the connector's engine to project one more
+sync face the connector was dropping on the plain skip: `syncMessage.callEvent`
+— the account's own linked device wrote one 1:1/group call's history entry,
+the official callEventSync face. The official consumer (`onCallEventSync` →
+`updateCallHistoryFromRemoteEvent`) resolves the record's conversation, drops
+the record when the lookup misses, and writes its **own** call-history store —
+so the connector's job is a bounded, honest pipe, not a mirror: the desktop's
+call log is the authoritative store, and duplicating it connector-side would
+fork the truth with no second reader.
+
+**The receive.** The projection rides the envelope as
+`syncMessage.callEvent = {callId, timestamp, type?, direction?, event?,
+conversationId?}` — the call id the decimal string the official
+`longToString` form carries (the engine projects `u64::to_string()`), the
+record timestamp (the engine projects 0 for an unstated one), the
+type/direction/event words the engine's enum projections resolve to lowercase
+(`audio|video|group|ad-hoc|unknown`, `outgoing|incoming|unknown`,
+`accepted|not-accepted|delete|observed|unknown`), and the conversation
+identity in the official three-form shape (hex room id for ad-hoc, ServiceId
+UUID string for a 16-byte direct conversation, standard base64 group master
+key otherwise). The parse is fail-closed at two hard gates on the record's
+primary key: the callId must be a non-empty all-ASCII-digit string at the u64
+ceiling (`MAX_SYNC_CALL_ID_CHARS` = 20 — anything non-numeric, over-bound, or
+non-string is not the record's key), and the timestamp must be strictly
+positive (the read-face unknown-marker discipline — a record with no
+timestamp is not a history record). Either gate failing drops the whole face
+and the envelope falls back to the plain `syncMessage` skip — a call record
+that cannot prove its key is not an event (宁缺勿错). The word keys fail
+per-key: a non-member string or any non-string shape answers absent — the
+desktop renders its own word for a missing leg, never a mangled one — and the
+conversation identity rides verbatim in whatever form the projection chose
+(the connector never re-encodes; the ladder reads the form). The queue budget
+counts the record's heap strings (§4.13), and `control_routing` intercepts
+the surviving record before the plain skip beside its verified sibling —
+`direction: "incoming"`, `source: None`, `group_id: None` (the envelope is
+our own account; the record names its own conversation).
+
+**The store mirror — deliberately none.** The connector keeps no call-history
+store: the schema has no call table, no call columns, no call state anywhere.
+The task discipline says exactly this: inventing call-history storage here
+would fork the desktop's authoritative log (the official consumer is the
+history writer), and the connector cannot replay what it never held — so the
+record is transient, and a missed delivery loses that one entry exactly as
+the official client loses one it received while offline. No self-heal, no
+replay, no summary convergence beside the event.
+
+**The forward.** The record forwards as the transient `call.historyEvent`
+event: `{accountId, callId, timestamp, type?, direction?, event?,
+conversationId?}` — flat, absent optionals staying absent (the
+story.received conditional-insert style). The one enrichment is the §4.85
+conversation ladder, the §4.83 delete-for-me group ladder verbatim: the
+32-byte standard-base64 form (a group master key) addresses its group row
+directly (kind-gated to a group row); everything else — the 16-byte UUID
+form, an e164, an ad-hoc hex room id — walks the §4.81 read-sync resolution
+(the raw value as the number/ACI rung, the recorded ACI→peer-key mappings,
+the contacts digit-suffix matches); the hex room id naturally resolves
+nothing (the connector keeps no ad-hoc face) and stays honestly
+conversation-less. A hit carries the local `conversationId` (the id form the
+desktop addresses), a miss forwards conversation-less — the desktop joins by
+the projection's own identity, the same lookup the official consumer runs.
+No new method, error code, or capability tag (the `message.expired` precedent
+for core consume events).
+
+Tests: the engine unit (`sync_call_event_routes_the_shape_gated_record` —
+the callId/timestamp gates, the per-key word whitelists, the verbatim
+conversation identity, the plain-skip fall-through); the service integration
+(`sync_call_event_forwards_with_the_resolved_conversation` — the 32-byte
+group direct address, the UUID ladder, the ad-hoc hex miss, the
+conversation-less no-identity face, the one-event-no-convergence count); the
+wire frame (`call_history_event_rides_the_flat_record` — the event name, the
+flat camelCase shape, the absent optionals); and the schema consistency pair
+(the callId maxLength pinned to `MAX_SYNC_CALL_ID_CHARS` — the conversation
+identity rides the shared `opaqueId` def, no inline bound to pin, the event
+enum auto-balanced against the emission
+literal). Gates: 621 → 624, all green.
 
 ## 5. signal-cli Boundary
 
