@@ -31,6 +31,9 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
+use kt_signal_connector::engine::{
+    MAX_RECEIVE_ID_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES, MAX_SYNC_DELETE_GROUPS,
+};
 use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
 use kt_signal_connector::service::{
@@ -589,6 +592,24 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/event/allOf/10/then/properties/data/properties/changes",
             "maxItems",
             GROUP_CHANGED_MAX_CHANGES as u64,
+        ),
+        // Delete-for-me sync (contract 1.102, §4.83): the event data mirrors
+        // the parse-side bounds — the group cap, the per-group entry cap,
+        // and the author id bound (the receive-id family).
+        (
+            "/$defs/event/allOf/11/then/properties/data/properties/deletes",
+            "maxItems",
+            MAX_SYNC_DELETE_GROUPS as u64,
+        ),
+        (
+            "/$defs/event/allOf/11/then/properties/data/properties/deletes/items/properties/messages",
+            "maxItems",
+            MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
+        ),
+        (
+            "/$defs/event/allOf/11/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
+            "maxLength",
+            MAX_RECEIVE_ID_CHARS as u64,
         ),
         // Account settings (contract 1.46, §4.45): the profile text budgets
         // mirror the official desktop ProfileEditor; the emoji label reuses

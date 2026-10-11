@@ -5,7 +5,29 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.101 (2026-10-11; the credential-death classification batch
+- Contract revision: 1.102 (2026-10-11; the delete-for-me consume face (§4.83): the
+  engine's `syncMessage.deleteForMe` projection — the account deleted messages for
+  itself on another linked device, the official #handleDeleteForMeSync face — consumed
+  through three faces. (a) The receive: a bounded control receive (64 groups × 256
+  entries) with the fail-closed parse (the author id non-empty, trimmed, truncated at
+  128; the timestamp strictly positive — the engine's zero-defaulted entries drop; a
+  group whose entries all die drops; a batch that parses to nothing falls back to the
+  plain `syncMessage` skip instead of becoming a phantom event). (b) The store mirror:
+  a hit removes the row outright — any direction, addressed by conversation + sentAt
+  (the official `removeMessageById` anchor) — and repairs the conversation summary and
+  the account aggregates in the same transaction, `ConversationChanged`/`AccountChanged`
+  riding each actual removal; replayed controls mirror nothing and touch no summary.
+  (c) The forward: the new `message.deleteForMe` host event carries the accountId and
+  the groups, each enriched with the local `conversationId` when the group's identity
+  resolved (the projection's 32-byte base64 conversation, else the §4.81 resolution
+  ladder — absent that, per-entry author laddering, the own-author entry naturally
+  dropping exactly as the official no-target-conversation discard) and the removed
+  rows' `messageId`s; absent optionals stay absent, and the event is transient beside
+  the mirror — a missed delivery converges on the next conversation read exactly like
+  `message.expired`. No new method, error, or capability (the `message.expired`
+  precedent for core events); the schema gains the event enum entry, the allOf[11]
+  data block, and three schema-pairing bounds; tests 614 → 618, all green) —
+  previously 1.101 (2026-10-11; the credential-death classification batch
   (§4.82): the layer the 2026-10-09 real-device debugging chain (CSS → DNS/socks5h →
   proxy split → the credential 401) exposed — a dead linked-device credential reached
   the desktop as the generic retryable `UPSTREAM_ERROR` family ("send failed, please
@@ -6713,6 +6735,115 @@ over the wire; the whole-payload test gains the `healthy` assertion). No schema
 change: the doctor result stays a free-form object (the 1.97 precedent), the
 method/error/event enums are untouched, and `tests/schema_consistency.rs` stays
 green unchanged.
+
+### 4.83 Delete-for-me sync: the message.deleteForMe event + the store mirror (contract revision 1.102, 2026-10-11)
+
+The engine D-batch (§4.81) taught the connector to consume `syncMessage.read`
+and `.viewed`; the same family carries one more projection the connector was
+dropping on the plain skip: `syncMessage.deleteForMe` — the account deleted
+messages **for itself** on another linked device, the official
+#handleDeleteForMeSync face (Signal-Desktop `MessageReceiver.preload.ts` →
+`deleteForMe.preload.ts` → `removeMessageById`, an outright row removal with
+the conversation re-count, not a tombstone). One account deleting its own copy
+is not the remote-delete face (§4.29's `mark_remote_deleted`): nothing is
+revoked upstream, other devices and recipients keep their copies, and the
+desktop must converge its local rows the same way. Three faces, in wire order:
+
+**The receive.** The projection rides the envelope as
+`syncMessage.deleteForMe = {messageDeletes: [{conversationId?, messages:
+[{author, timestamp}]}]}` — `author` an ACI/PNI string or an e164 number,
+`timestamp` the deleted message's sent stamp (the engine projects `0` for an
+unstated one). The parse is the read-face discipline at delete scale, entirely
+fail-closed: `normalized_sync_delete_groups` takes at most 64 groups
+(`MAX_SYNC_DELETE_GROUPS`) and 256 entries per group
+(`MAX_SYNC_DELETE_GROUP_MESSAGES`, the real batch scale — a full
+per-conversation cleanup stays far below), trims and drops an empty author and
+truncates any survivor at the receive-id bound (128 chars,
+`MAX_RECEIVE_ID_CHARS`), drops an entry whose timestamp is not strictly
+positive, drops a group whose entries all died, and answers empty for an
+envelope with no usable group at all — the empty answer falls through to the
+plain `syncMessage` skip (宁缺勿错: a partially-garbled batch deletes only
+what it can prove, and a fully-garbled one never becomes a phantom event).
+`control_routing` intercepts the surviving groups before that skip beside the
+read/viewed arms — `direction: "incoming"`, `source: None`, `group_id: None`
+(the envelope is our own account; the groups name their own conversations and
+the entries their own authors, the read/viewed precedent) — and the queue
+budget counts the control entry-wise like the read lists (`estimated_bytes`:
+the group structs plus their heap strings and entries), so the §4.13 queue
+stays honest.
+
+**The store mirror.** The connector's store keeps row-level message state, so
+the desktop's own (#handleDeleteForMeSync) first leg happens here: a resolved
+(author, timestamp) pair against a resolved conversation removes the matched
+rows outright — `delete_messages_by_sent_at` addresses rows by
+(conversation, sent_at) alone and deletes **any direction** (the
+`mark_remote_deleted` precedent; a same-stamp incoming/outgoing pair both die,
+matching the official row deletion), takes at most 256 hits per entry
+(the parse cap is also the delete cap), and repairs the touched conversation's
+`last_message`/preview/unread summary and the account aggregates in the same
+transaction (the `sweep_expired_messages`/`prune_history` store family, the
+insert-path's inverse). A pair naming no local row deletes nothing and rides
+silent — the mirror never invents rows or conversations (宁缺勿错). Each
+conversation that actually lost a row emits `conversation.changed` with the
+refreshed summary, and any removal at all closes with one `account.changed`
+carrying the refreshed account total — exactly the `message.expired`
+event-pair precedent. A replayed control finds its rows already gone: the
+second mirror pass removes nothing, emits nothing, and converges (the
+idempotency discipline).
+
+**The forward.** The connector is not the only mirror — the desktop holds its
+own rows and must remove them too. The groups forward as the new transient
+`message.deleteForMe` host event: `{accountId, deletes:
+[{conversationId?, messages: [{author, timestamp, messageId?}]}]}`, absent
+optionals staying absent (the story-received discipline). The enrichment is
+the connector's resolution work reused: a group whose conversation identity
+resolves carries the local `conversationId` — the projection's own id, which
+ladders as a 32-byte standard-base64 group master key (the `GROUPV2_ID_LENGTH`
+oneof discipline) to a direct group-row address, or as a
+service-id/e164 string through the §4.81 read-sync resolution
+(`sync_sender_conversation`); absent that, when every entry's author laddered
+to one and the same thread, that thread rides (the desktop gets a scoped
+group); an author resolving nothing — the account's own sends have no peer
+thread — rides unenriched and mirrors nothing, exactly the official
+no-target-conversation group drop; authors laddering to different threads
+leave the group conversation-less rather than mis-scoped. An entry whose pair
+removed a local row carries that row's `messageId` (the first hit's id when a
+sent-at stamp matched several rows — the desktop drops the handle directly and
+its own (author, sentAt) join clears any stragglers). The event forwards even
+when nothing resolved: the desktop joins its own rows by the (author,
+timestamp) pairs alone. The event is transient beside the mirror — the
+removed rows are already gone store-side, so a missed delivery converges on
+the next conversation read exactly like `message.expired`; no replay (a replayed sync forwards the event but mirrors nothing and touches
+no summary — the replayed-receipt idempotency discipline), no new method, error
+code, or
+capability tag (the `message.expired` precedent for core consume events).
+
+Deliberate divergences, recorded honestly: (1) the mirror does not verify the
+entry's `author` against the matched row's sender — the address is
+(conversation, sent_at), the `mark_remote_deleted` precedent, so a row the
+projection names with a stale author still dies; the official client behaves
+the same way (its row deletion keys on the same pair). (2) Replayed syncs
+forward the event but mirror nothing — the event is the desktop's own
+idempotent remove, safe to double-deliver. (3) A same-stamp multi-row hit
+reports only the first removed row's `messageId`; the wire shape is
+entry-scoped and the desktop's own join covers the rest.
+
+Tests: the engine units (`sync_delete_for_me_routes_bounded_groups` — the
+bounded parse: valid groups route with source None, oversized groups and
+entries truncate, zero timestamps and empty authors drop, an all-dead batch
+falls back to the plain skip); the store units
+(`delete_messages_by_sent_at_removes_any_direction_and_repairs_the_summary` —
+the any-direction deletion, the 256-hit cap, the summary and account
+repair); the service integration
+(`sync_delete_for_me_forwards_enriched_and_removes_matched_rows` — the group
+conversation resolution, the per-entry author ladder, the own-author drop,
+the mirror's row removal with the summary/account event pair, the absent-optional
+enrichment, and the replayed control forwarding without re-mirroring); the wire
+frame (`delete_for_me_event_rides_the_resolved_groups` — the event name and the
+camelCase shape); and the schema consistency pairs (the 64/256/128 bounds pinned
+to `MAX_SYNC_DELETE_GROUPS`/`MAX_SYNC_DELETE_GROUP_MESSAGES`/
+`MAX_RECEIVE_ID_CHARS`, the event enum auto-balanced against the emission
+literal). Gates: 614 → 618, all green.
 
 ## 5. signal-cli Boundary
 

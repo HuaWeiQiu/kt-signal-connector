@@ -11,8 +11,9 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::engine::{
-    ControlReceive, EngineError, NormalizedAttachment, NormalizedReceive, ReceiptKind,
-    SyncReadEntry, timer_change_material, timer_change_rich, truncate_utf8_bytes,
+    ControlReceive, EngineError, GROUPV2_ID_LENGTH, NormalizedAttachment, NormalizedReceive,
+    ReceiptKind, SyncDeleteGroup, SyncReadEntry, timer_change_material, timer_change_rich,
+    truncate_utf8_bytes,
 };
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
@@ -957,6 +958,51 @@ pub enum HostSideEvent {
         editor: Option<String>,
         expire_timer_seconds: Option<u32>,
     },
+    /// The engine's `syncMessage.deleteForMe` projection forwarded with the
+    /// connector's mirror enrichment (contract 1.102, §4.83): the account
+    /// deleted messages for itself on another linked device — the official
+    /// #handleDeleteForMeSync face. The bounded groups ride with the local
+    /// `conversationId` when the group's conversation identity resolved and
+    /// the removed rows' `messageId`s on their entries; the desktop removes
+    /// its local messages from these handles and its own (author, sentAt)
+    /// join for the entries the connector held no row for. Transient beside
+    /// the mirror: the removed rows are already gone store-side, so a missed
+    /// delivery converges on the next conversation read exactly like
+    /// `message.expired`.
+    SyncDeleteForMe {
+        account_id: String,
+        deletes: Vec<SyncDeleteForMeGroup>,
+    },
+}
+
+/// One conversation-scoped delete group on the `message.deleteForMe` event
+/// (contract 1.102, §4.83): the engine projection's group with the
+/// connector's resolution enrichment. `conversation_id` rides when the
+/// group resolved — through the projection's conversation identity, or
+/// (absent that) through its entries' authors laddering to one thread — the
+/// local id form the desktop addresses; an unresolved group rides
+/// conversation-less and the desktop joins its own rows by the entries
+/// alone.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeleteForMeGroup {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    pub messages: Vec<SyncDeleteForMeEntry>,
+}
+
+/// One (author, timestamp) delete entry on the `message.deleteForMe` event
+/// (contract 1.102, §4.83): the projection entry verbatim plus the mirror's
+/// hit — `message_id` rides only when the pair removed a local row (the id
+/// the desktop drops directly); absent means the connector held no such row
+/// and the desktop joins by the pair itself.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncDeleteForMeEntry {
+    pub author: String,
+    pub timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
 }
 
 /// Ephemeral typing notifications keep the event lane quiet: at most one
@@ -6194,6 +6240,14 @@ impl ConnectorService {
         if let ControlReceive::SyncReadState { read, viewed } = &control {
             return self.apply_sync_read_state(&account, read, viewed);
         }
+        // Contract 1.102 (§4.83 consume batch): the delete-for-me sync also
+        // addresses its rows across conversations — by the projection's
+        // conversation identity or each entry's own author, never by an
+        // envelope source (the envelope is our own account). Intercepted
+        // before the generic ladder with the same resolution family.
+        if let ControlReceive::SyncDeleteForMe { deletes } = &control {
+            return self.apply_sync_delete_for_me(&account, deletes);
+        }
         // Story receives (contract 1.76, §4.67): a story addresses no
         // conversation — the bounded projection forwards as the transient
         // `story.received` event and the connector keeps no row. The
@@ -6838,6 +6892,10 @@ impl ConnectorService {
             // unreachable-in-practice guard the other cross-conversation
             // faces carry.
             ControlReceive::SyncReadState { .. } => Ok(Vec::new()),
+            // The delete-for-me sync is intercepted the same way (its groups
+            // span conversations); this arm is the same
+            // unreachable-in-practice guard too.
+            ControlReceive::SyncDeleteForMe { .. } => Ok(Vec::new()),
         }
     }
 
@@ -7107,6 +7165,148 @@ impl ConnectorService {
                 .ok()
                 .flatten()
         }))
+    }
+
+    /// Contract 1.102 (§4.83): consume one `syncMessage.deleteForMe`
+    /// projection — the account deleted messages for itself on another
+    /// linked device (the official #handleDeleteForMeSync face). Two faces:
+    ///
+    /// Forwarding — the bounded groups ride the transient
+    /// `message.deleteForMe` event with the connector's resolution enriching
+    /// them: a group whose conversation identity resolves carries the local
+    /// `conversationId` (the id form the desktop addresses), an entry whose
+    /// (author, timestamp) removed a local row carries that row's
+    /// `messageId`; absent stays absent (the absent-optional discipline).
+    /// The event forwards even when nothing resolved — the desktop joins its
+    /// own rows by the (author, timestamp) pairs, and a replayed sync finds
+    /// its rows already gone both sides (idempotent, no double-remove).
+    ///
+    /// Mirror — a hit removes the row outright (the official
+    /// `removeMessageById` behavior anchor, the expire-sweep store family:
+    /// any direction, the (conversation, sent_at) address the
+    /// `mark_remote_deleted` precedent runs) and repairs the touched
+    /// conversation's summary; the refreshed summaries ride
+    /// `conversation.changed` with the account total on `account.changed`
+    /// (the insert-path precedent). An entry naming no local row, or a group
+    /// nothing resolves, stays silent on the mirror and rides unenriched
+    /// (宁缺勿错 — never invent rows or conversations).
+    fn apply_sync_delete_for_me(
+        &mut self,
+        account: &AccountRow,
+        deletes: &[SyncDeleteGroup],
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let mut event_groups = Vec::with_capacity(deletes.len());
+        let mut touched_conversations: Vec<String> = Vec::new();
+        for group in deletes {
+            // Resolve the group's conversation once when the projection
+            // named one; the entries' own authors ladder only when it did
+            // not (the read-precedent resolution family, §4.81).
+            let group_conversation = match group.conversation_id.as_deref() {
+                Some(id) => self.sync_delete_group_conversation(account, id)?,
+                None => None,
+            };
+            let mut event_messages = Vec::with_capacity(group.messages.len());
+            let mut entry_conversation: Option<String> = None;
+            let mut entry_conversation_ambiguous = false;
+            for entry in &group.messages {
+                let conversation = if let Some(conversation) = &group_conversation {
+                    Some(conversation.clone())
+                } else {
+                    // The projection named no conversation: the entry's own
+                    // author walks the read-sync ladder. An author that
+                    // resolves nothing — the account's own sends have no
+                    // peer thread to resolve — drops mirror-side and rides
+                    // unenriched (the official no-target-conversation drop).
+                    self.sync_sender_conversation(account, &entry.author, None)?
+                };
+                let removed = match &conversation {
+                    Some(conversation) => self.store.delete_messages_by_sent_at(
+                        &account.id,
+                        &conversation.id,
+                        std::slice::from_ref(&entry.timestamp),
+                    )?,
+                    None => Vec::new(),
+                };
+                if let Some(conversation) = &conversation {
+                    if !removed.is_empty()
+                        && !touched_conversations
+                            .iter()
+                            .any(|id| id == &conversation.id)
+                    {
+                        touched_conversations.push(conversation.id.clone());
+                    }
+                    // The group's event face scopes itself by the resolved
+                    // conversation when the entries agreed on one — the
+                    // projection's identity or, absent that, the single
+                    // thread its authors laddered to.
+                    match &entry_conversation {
+                        None => entry_conversation = Some(conversation.id.clone()),
+                        Some(resolved) if resolved != &conversation.id => {
+                            entry_conversation_ambiguous = true;
+                        }
+                        _ => {}
+                    }
+                }
+                event_messages.push(SyncDeleteForMeEntry {
+                    author: entry.author.clone(),
+                    timestamp: entry.timestamp,
+                    message_id: removed.into_iter().next().map(|(_, id)| id),
+                });
+            }
+            event_groups.push(SyncDeleteForMeGroup {
+                conversation_id: group_conversation
+                    .map(|conversation| conversation.id)
+                    .or_else(|| {
+                        (!entry_conversation_ambiguous)
+                            .then_some(())
+                            .and(entry_conversation)
+                    }),
+                messages: event_messages,
+            });
+        }
+        let mut events = vec![HostSideEvent::SyncDeleteForMe {
+            account_id: account.id.clone(),
+            deletes: event_groups,
+        }];
+        for conversation_id in &touched_conversations {
+            if let Some(summary) = self
+                .store
+                .conversation_summary(&account.id, conversation_id)?
+            {
+                events.push(HostSideEvent::ConversationChanged(summary));
+            }
+        }
+        if !touched_conversations.is_empty()
+            && let Some(summary) = self.store.account_summary(&account.id)?
+        {
+            events.push(HostSideEvent::AccountChanged(summary));
+        }
+        Ok(events)
+    }
+
+    /// The conversation one delete group's projection conversation identity
+    /// resolves to (contract 1.102, §4.83): the group master key form
+    /// (32-byte standard base64 — the `listGroups` id form the group faces
+    /// address by, the §4.58 oneof discipline) addresses its group row
+    /// directly; the service-id/e164 form walks the §4.81 read-sync ladder
+    /// (the raw value as the number/ACI rung, the recorded ACI→peer-key
+    /// mappings, contacts digit-suffix matches). Nothing resolves to None —
+    /// the mirror stays silent and the forward rides unenriched.
+    fn sync_delete_group_conversation(
+        &mut self,
+        account: &AccountRow,
+        conversation_id: &str,
+    ) -> Result<Option<crate::store::ConversationRow>, ServiceError> {
+        let mut decoded = Vec::new();
+        if crate::service::base64_decode_to_vec(conversation_id, &mut decoded).is_ok()
+            && decoded.len() == GROUPV2_ID_LENGTH
+        {
+            return Ok(self
+                .store
+                .conversation_by_peer(&account.id, "group", conversation_id)?
+                .filter(|conversation| conversation.kind == "group"));
+        }
+        self.sync_sender_conversation(account, conversation_id, None)
     }
 
     /// Contract 1.70 (§4.58 consume batch): consume one
@@ -19049,6 +19249,201 @@ mod tests {
             events.is_empty(),
             "an unknown sender stays silent: {events:?}"
         );
+    }
+
+    /// Contract 1.102 (§4.83): the delete-for-me sync forwards enriched and
+    /// mirrors the hits — the projection's conversation identity resolves
+    /// the group (the 32-byte group form addressing its group row directly),
+    /// the entries' own authors ladder when it did not name one, a hit
+    /// removes the row in any direction and carries its `messageId`, a miss
+    /// rides unenriched, and the touched summaries converge. A replay finds
+    /// everything already gone and still forwards (idempotent face).
+    #[test]
+    fn sync_delete_for_me_forwards_enriched_and_removes_matched_rows() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        // The group-form leg: a real 32-byte master key base64 addressing
+        // its group row directly.
+        const GROUP_ID_32B: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", GROUP_ID_32B, "G")
+            .unwrap();
+        let seed = |conversation_id: &str, id: &str, sent_at: u64, direction: &'static str| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation_id.into(),
+                direction,
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), direction == "incoming")
+                    .unwrap()
+            );
+        };
+        seed(&conversation.id, "m1", 10, "incoming");
+        seed(&conversation.id, "m2", 20, "incoming");
+        seed(&group.id, "g1", 40, "incoming");
+        let m3 = seed_outgoing_sent(&mut service, &account.id, &conversation.id, 30);
+        let stored = |service: &ConnectorService, conversation_id: &str, id: &str| {
+            service
+                .store_ref()
+                .message_by_id(&account.id, conversation_id, id)
+                .unwrap()
+        };
+        let entry = |author: &str, timestamp: u64| crate::engine::SyncDeleteEntry {
+            author: author.into(),
+            timestamp,
+        };
+        let group_of =
+            |conversation_id: Option<&str>, messages: Vec<_>| crate::engine::SyncDeleteGroup {
+                conversation_id: conversation_id.map(str::to_string),
+                messages,
+            };
+        let sync = |deletes: Vec<crate::engine::SyncDeleteGroup>| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncDeleteForMe { deletes },
+            );
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+
+        let events = service
+            .ingest_receive(
+                sync(vec![
+                    // The projection named the conversation: the entries
+                    // address it regardless of their author, the peer hit
+                    // and the account's own send alike.
+                    group_of(
+                        Some(ACI),
+                        vec![entry(ACI, 10), entry("+15555550100", 30), entry(ACI, 999)],
+                    ),
+                    // No conversation identity: the entry's own author
+                    // ladders to the thread.
+                    group_of(None, vec![entry(ACI, 20)]),
+                    // The 32-byte group form addresses the group row
+                    // directly (the author is not needed for addressing).
+                    group_of(Some(GROUP_ID_32B), vec![entry("unknown-author", 40)]),
+                    // Nothing resolves: forwarded unenriched, mirror silent.
+                    group_of(
+                        Some("22222222-2222-2222-2222-222222222222"),
+                        vec![entry("22222222-2222-2222-2222-222222222222", 10)],
+                    ),
+                ]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        // One forwarding event, then the touched summaries (direct + group)
+        // and the account total.
+        assert_eq!(events.len(), 4, "{events:?}");
+        let HostSideEvent::SyncDeleteForMe {
+            account_id: event_account,
+            deletes: event_groups,
+        } = &events[0]
+        else {
+            panic!("expected the forwarding event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(event_groups.len(), 4, "{event_groups:?}");
+        assert_eq!(
+            event_groups[0].conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+        assert_eq!(event_groups[0].messages.len(), 3);
+        assert_eq!(
+            event_groups[0].messages[0].message_id.as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            event_groups[0].messages[1].message_id.as_deref(),
+            Some(m3.as_str())
+        );
+        assert!(event_groups[0].messages[2].message_id.is_none(), "the miss");
+        assert!(event_groups[1].conversation_id.is_some(), "author-laddered");
+        assert_eq!(
+            event_groups[1].messages[0].message_id.as_deref(),
+            Some("m2")
+        );
+        assert_eq!(
+            event_groups[2].conversation_id.as_deref(),
+            Some(group.id.as_str())
+        );
+        assert_eq!(
+            event_groups[2].messages[0].message_id.as_deref(),
+            Some("g1")
+        );
+        assert!(
+            event_groups[3].conversation_id.is_none(),
+            "the unknown identity resolves nothing"
+        );
+        assert!(event_groups[3].messages[0].message_id.is_none());
+        assert!(matches!(&events[1], HostSideEvent::ConversationChanged(_)));
+        assert!(matches!(&events[2], HostSideEvent::ConversationChanged(_)));
+        assert!(matches!(&events[3], HostSideEvent::AccountChanged(_)));
+
+        // The mirror removed the rows outright.
+        assert!(stored(&service, &conversation.id, "m1").is_none());
+        assert!(stored(&service, &conversation.id, "m2").is_none());
+        assert!(stored(&service, &conversation.id, &m3).is_none());
+        assert!(stored(&service, &group.id, "g1").is_none());
+        let summary = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.unread_count, 0);
+        assert_eq!(summary.last_message_at, None);
+
+        // The replayed sync: every row is already gone — the entries ride
+        // unenriched, nothing converges, the event still forwards.
+        let events = service
+            .ingest_receive(
+                sync(vec![group_of(Some(ACI), vec![entry(ACI, 10)])]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::SyncDeleteForMe { deletes, .. } = &events[0] else {
+            panic!("expected the replayed forwarding event: {:?}", events[0]);
+        };
+        assert!(deletes[0].messages[0].message_id.is_none());
+        assert!(stored(&service, &conversation.id, "m1").is_none());
     }
 
     /// Contract 1.100 (§4.81 D3): the groupChanged batch forwards verbatim

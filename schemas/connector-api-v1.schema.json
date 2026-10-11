@@ -3129,7 +3129,8 @@
             "call.groupIncoming",
             "story.received",
             "story.viewed",
-            "group.changed"
+            "group.changed",
+            "message.deleteForMe"
           ]
         },
         "data": {
@@ -3502,6 +3503,68 @@
                     "type": "integer",
                     "minimum": 0,
                     "description": "The batch's timer leg when it carried one beside the other changes (0 = off, the groupUpdated semantics); the conversation timer has already converged through the same mirror. Absent on timer-less batches — pure timer batches stay on the groupUpdated face entirely."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "message.deleteForMe" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "deletes"],
+                "description": "One delete-for-me sync forwarded (contract 1.102, §4.83): the engine's syncMessage.deleteForMe projection — the account deleted messages for itself on another linked device, the official #handleDeleteForMeSync face. The connector mirrors first (matched store rows are removed outright and the conversation summary repaired, the removeMessageById anchor), then forwards each group with the local conversationId when the group's conversation identity resolved (the projection's conversation id — the 32-byte standard-base64 form — or, absent that, its entries' authors laddering through the same resolution the read state uses) and the removed rows' messageIds on their entries; absent optionals stay absent. The desktop removes its own local messages from these handles, joining by (author, sentAt) alone for the entries the connector held no row for. Transient beside the mirror: a missed delivery converges on the next conversation read exactly like message.expired.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "deletes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["messages"],
+                      "properties": {
+                        "conversationId": {
+                          "$ref": "#/$defs/opaqueId",
+                          "description": "The group's resolved local conversation — the projection's conversation identity when present, else the one thread every entry's author laddered to; absent on an unresolved group (each entry may name a different thread, the desktop joins by its own map)."
+                        },
+                        "messages": {
+                          "type": "array",
+                          "minItems": 1,
+                          "maxItems": 256,
+                          "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["author", "timestamp"],
+                            "properties": {
+                              "author": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 128,
+                                "description": "The deleted message's sender — ACI, PNI, or e164, the projection entry verbatim."
+                              },
+                              "timestamp": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "The deleted message's sent timestamp (the projection entry; the engine's zero-defaulted entries are dropped connector-side)."
+                              },
+                              "messageId": {
+                                "$ref": "#/$defs/opaqueId",
+                                "description": "The removed local row's id when the mirror hit — the id the desktop drops directly; absent means the connector held no such row and the desktop joins by the pair itself."
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
                   }
                 }
               }

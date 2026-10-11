@@ -3029,6 +3029,26 @@ where
             }
             send_shared(writer, &HostEvent::new("group.changed", payload)).await
         }
+        HostSideEvent::SyncDeleteForMe {
+            account_id,
+            deletes,
+        } => {
+            // Contract 1.102, §4.83: the delete groups ride with the
+            // absent-optional discipline — a group nothing resolved stays
+            // conversation-less, an unmatched entry stays messageId-less (the
+            // serde skip keeps the keys absent).
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "message.deleteForMe",
+                    json!({
+                        "accountId": account_id,
+                        "deletes": deletes,
+                    }),
+                ),
+            )
+            .await
+        }
     }
 }
 
@@ -3907,5 +3927,74 @@ mod tests {
         // The absent-optional discipline: no editor, no timer leg.
         assert!(frame["data"].get("editor").is_none());
         assert!(frame["data"].get("expireTimerSeconds").is_none());
+    }
+
+    /// Contract 1.102 (§4.83): the `message.deleteForMe` wire frame — the
+    /// groups ride with the absent-optional discipline: a resolved group
+    /// carries its `conversationId`, an unmatched entry stays
+    /// `messageId`-less, an unresolved group stays conversation-less.
+    #[tokio::test]
+    async fn delete_for_me_event_rides_the_resolved_groups() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::SyncDeleteForMe {
+                account_id: "acct-1".into(),
+                deletes: vec![
+                    crate::service::SyncDeleteForMeGroup {
+                        conversation_id: Some("conv-1".into()),
+                        messages: vec![
+                            crate::service::SyncDeleteForMeEntry {
+                                author: "22222222-2222-2222-2222-222222222222".into(),
+                                timestamp: 1726999999000,
+                                message_id: Some("msg-1".into()),
+                            },
+                            crate::service::SyncDeleteForMeEntry {
+                                author: "+15555550101".into(),
+                                timestamp: 1726999998000,
+                                message_id: None,
+                            },
+                        ],
+                    },
+                    crate::service::SyncDeleteForMeGroup {
+                        conversation_id: None,
+                        messages: vec![crate::service::SyncDeleteForMeEntry {
+                            author: "33333333-3333-3333-3333-333333333333".into(),
+                            timestamp: 1726999997000,
+                            message_id: None,
+                        }],
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let line = timeout(Duration::from_millis(500), async {
+            Framed::new(&mut server, LinesCodec::new()).next().await
+        })
+        .await
+        .expect("the event frame must flush")
+        .unwrap()
+        .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "message.deleteForMe");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["deletes"].as_array().unwrap().len(), 2);
+        let first = &frame["data"]["deletes"][0];
+        assert_eq!(first["conversationId"], "conv-1");
+        assert_eq!(
+            first["messages"][0]["author"],
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(first["messages"][0]["timestamp"], 1726999999000u64);
+        assert_eq!(first["messages"][0]["messageId"], "msg-1");
+        // The absent-optional discipline: an unmatched entry stays
+        // messageId-less, an unresolved group stays conversation-less.
+        assert!(first["messages"][1].get("messageId").is_none());
+        assert!(frame["data"]["deletes"][1].get("conversationId").is_none());
     }
 }

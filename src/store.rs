@@ -4223,6 +4223,108 @@ impl Store {
         Ok(rows)
     }
 
+    /// Remove the rows one delete-for-me sync names in one conversation
+    /// (contract 1.102, §4.83): rows whose upstream sent timestamp is in the
+    /// list, any direction — the account deletes its own sends and its
+    /// received messages alike (the official `removeMessageById` behavior
+    /// anchor; the (conversation, sent_at) address the `mark_remote_deleted`
+    /// precedent runs, no author verification: the conversation-scoped
+    /// timestamp is the address). Returns the removed row ids as
+    /// (sent_at, id) pairs in caller order, deduplicated; a timestamp with
+    /// no row is simply absent — the sync never invents rows. When anything
+    /// was removed, the touched conversation's summary is repaired in the
+    /// same transaction — the same last-message/unread clamp
+    /// [`Self::prune_history`] applies — and the account aggregates recompute
+    /// behind it, so the summary never promises a row the sync ate.
+    pub fn delete_messages_by_sent_at(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        sent_at: &[u64],
+    ) -> Result<Vec<(u64, String)>, StoreError> {
+        if sent_at.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut delete = transaction
+            .prepare(
+                "DELETE FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                 RETURNING id",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut removed: Vec<(u64, String)> = Vec::with_capacity(sent_at.len());
+        let mut seen = std::collections::HashSet::with_capacity(sent_at.len());
+        for at in sent_at.iter().take(256) {
+            if !seen.insert(*at) {
+                continue;
+            }
+            let rows = delete
+                .query_map(params![account_id, conversation_id, *at as i64], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for id in rows {
+                removed.push((
+                    *at,
+                    id.map_err(|error| StoreError::Unavailable(Some(error)))?,
+                ));
+            }
+        }
+        drop(delete);
+        if removed.is_empty() {
+            transaction
+                .commit()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            return Ok(removed);
+        }
+        // The summary may have been quoting a removed row (the last-message
+        // columns and the unread badge): the same repair the retention prune
+        // runs, recomputed from whatever the conversation still holds, and
+        // the account aggregates behind it.
+        transaction
+            .execute(
+                "UPDATE conversations
+                    SET last_message_at = (
+                          SELECT MAX(sent_at) FROM messages WHERE conversation_id=?1
+                        ),
+                        last_message_preview = (
+                          SELECT substr(body, 1, ?2) FROM messages
+                           WHERE conversation_id=?1
+                           ORDER BY sent_at DESC, id DESC
+                           LIMIT 1
+                        ),
+                        unread_count = MIN(unread_count, (
+                          SELECT COUNT(*) FROM messages
+                           WHERE conversation_id=?1 AND direction='incoming'
+                        ))
+                  WHERE id=?1",
+                params![conversation_id, PREVIEW_CHARS],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .execute(
+                "UPDATE accounts
+                    SET unread_count = COALESCE((
+                          SELECT SUM(unread_count) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        ), 0),
+                        last_message_at = (
+                          SELECT MAX(last_message_at) FROM conversations
+                           WHERE conversations.account_id = accounts.id
+                        )",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(removed)
+    }
+
     /// The incoming rows of one conversation in receipt order (`sent_at ASC,
     /// id ASC`), bounded — the absent-`messageIds` mode of
     /// `messages.markRead` / `messages.markViewed` (contract 1.34). Only
@@ -13318,6 +13420,119 @@ mod tests {
             .stamp_incoming_read(&account.id, &conversation.id, &[], 6000)
             .unwrap();
         assert_eq!(noop, 0);
+    }
+
+    /// `delete_messages_by_sent_at` (contract 1.102, §4.83): the
+    /// delete-for-me sync's store half — the (conversation, sent_at) address
+    /// removes rows in any direction (the account's own sends included), a
+    /// timestamp naming no row is simply absent, a replay removes nothing,
+    /// and a removal repairs the touched summary (the last-message columns
+    /// and the unread clamp) plus the account aggregates.
+    #[test]
+    fn delete_messages_by_sent_at_removes_any_direction_and_repairs_the_summary() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let record = |id: &str, sent_at: u64, direction: &'static str| MessageRecord {
+            id: id.into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction,
+            sender_id: if direction == "incoming" {
+                "peer".into()
+            } else {
+                "self".into()
+            },
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("body".into()),
+            text_bytes: Some(4),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        };
+        for (id, sent_at, direction) in [
+            ("m-in-old", 500, "incoming"),
+            ("m-in-last", 502, "incoming"),
+            ("m-out", 503, "outgoing"),
+        ] {
+            let row = record(id, sent_at, direction);
+            store
+                .insert_message(&row, None, row.text.as_deref(), direction == "incoming")
+                .unwrap();
+        }
+        let stored = |id: &str| {
+            store
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+        };
+        let summary = || {
+            store
+                .conversation_summary(&account.id, &conversation.id)
+                .unwrap()
+                .unwrap()
+        };
+
+        // Before: the summary promises the newest row and counts the unread.
+        assert_eq!(summary().last_message_at, Some(503));
+        assert_eq!(summary().unread_count, 2);
+
+        // The (conversation, sent_at) address removes in any direction,
+        // caller order, with the miss and the duplicate simply absent.
+        let removed = store
+            .delete_messages_by_sent_at(&account.id, &conversation.id, &[503, 999, 500, 503])
+            .unwrap();
+        assert_eq!(
+            removed,
+            vec![(503, "m-out".to_string()), (500, "m-in-old".to_string())]
+        );
+        assert!(stored("m-out").is_none());
+        assert!(stored("m-in-old").is_none());
+        assert!(stored("m-in-last").is_some());
+
+        // The repaired summary quotes a row it still holds, and the unread
+        // clamp follows the remaining incoming rows.
+        let after = summary();
+        assert_eq!(after.last_message_at, Some(502));
+        assert_eq!(after.last_message_preview.as_deref(), Some("body"));
+        assert_eq!(after.unread_count, 1);
+        let account_after = store.account_summary(&account.id).unwrap().unwrap();
+        assert_eq!(account_after.unread_count, 1);
+
+        // A replay removes nothing: the rows are already gone.
+        let replay = store
+            .delete_messages_by_sent_at(&account.id, &conversation.id, &[503, 500])
+            .unwrap();
+        assert!(replay.is_empty());
+
+        // An empty list is the trivial no-op.
+        let noop = store
+            .delete_messages_by_sent_at(&account.id, &conversation.id, &[])
+            .unwrap();
+        assert!(noop.is_empty());
     }
 
     /// The official `isConversationAccepted` factor weights on the material

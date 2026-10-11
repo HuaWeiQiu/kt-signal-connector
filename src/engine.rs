@@ -63,8 +63,10 @@ const MAX_INBOUND_TEXT_PREVIEW_BYTES: usize = 4 * 1024;
 /// Receive routing ids (account, source, group id). These ids become stored
 /// peer keys, which the schema bounds at 128 (opaqueId/peerKey family in
 /// schemas/connector-api-v1.schema.json); accepting a longer one inbound would
-/// create a conversation the host contract forbids addressing.
-pub(crate) const MAX_RECEIVE_ID_CHARS: usize = 128;
+/// create a conversation the host contract forbids addressing. `pub` since
+/// the §4.83 delete-for-me author field mirrors the same bound (the
+/// schema-pairing test pins the two together).
+pub const MAX_RECEIVE_ID_CHARS: usize = 128;
 const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 
@@ -930,6 +932,22 @@ pub enum ControlReceive {
         read: Vec<SyncReadEntry>,
         viewed: Vec<SyncReadEntry>,
     },
+    /// The engine's `syncMessage.deleteForMe` projection (contract 1.102,
+    /// §4.83): the account's own linked device deleted messages for itself
+    /// ("delete for me") — the official #handleDeleteForMeSync face, the
+    /// `SyncContent.deleteForMe=22` content arm. Each group carries one
+    /// conversation's deletes: the proto ConversationIdentifier as the
+    /// engine's conversation string (ACI/PNI ServiceId UUID, group master
+    /// key standard base64, or e164 — absent when the proto carried none),
+    /// and the (author, timestamp) entries naming the messages (the author
+    /// an ACI/PNI string or e164, the timestamp the message's upstream
+    /// sent stamp; the engine projects 0 for an unstated stamp and the
+    /// parser drops it). Groups whose entries all failed the bounds never
+    /// reach this variant — the projection parser dropped them, and an
+    /// envelope with nothing usable left keeps the plain syncMessage skip.
+    SyncDeleteForMe {
+        deletes: Vec<SyncDeleteGroup>,
+    },
     /// The engine's `groupChanged {groupId, revision, changes[], editor?,
     /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
     /// official GroupV2ChangeDetailType word list the engine decrypted out
@@ -963,6 +981,28 @@ pub struct SyncReadEntry {
     pub timestamp: u64,
 }
 
+/// One (author, timestamp) pair off the engine's `syncMessage.deleteForMe`
+/// projection (contract 1.102, §4.83): the message's author identity (ACI/PNI
+/// ServiceId string or e164) plus the upstream timestamp of the message the
+/// account deleted for itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncDeleteEntry {
+    pub author: String,
+    pub timestamp: u64,
+}
+
+/// One conversation-scoped delete group off the engine's
+/// `syncMessage.deleteForMe` projection (contract 1.102, §4.83): the
+/// proto ConversationIdentifier as the engine's conversation string (an
+/// ACI/PNI ServiceId UUID, a group master key's standard base64, or an e164)
+/// when the projection carried one, plus that conversation's bounded delete
+/// entries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncDeleteGroup {
+    pub conversation_id: Option<String>,
+    pub messages: Vec<SyncDeleteEntry>,
+}
+
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
@@ -979,6 +1019,19 @@ const MAX_RECEIPT_TIMESTAMPS: usize = 256;
 /// real multi-device read syncs stay far below it; entries past the cap
 /// drop (the same truncate discipline as `MAX_RECEIPT_TIMESTAMPS`).
 const MAX_SYNC_READ_ENTRIES: usize = 256;
+/// One delete-for-me sync carries at most this many conversation groups
+/// (contract 1.102, §4.83): the same coarse batch guard family the read
+/// sync rides — real batches group per conversation and stay far below;
+/// groups past the cap drop whole (the read-face truncate discipline).
+/// `pub` since the §4.83 host-event data shape mirrors the bound (the
+/// schema-pairing test pins the two together).
+pub const MAX_SYNC_DELETE_GROUPS: usize = 64;
+/// One delete group carries at most this many (author, timestamp) entries
+/// (contract 1.102, §4.83): the read-face entry cap at group scale — real
+/// per-conversation batches stay far below it; entries past the cap drop
+/// (the same truncate discipline). `pub` since the §4.83 host-event data
+/// shape mirrors the bound (the schema-pairing test pins the two together).
+pub const MAX_SYNC_DELETE_GROUP_MESSAGES: usize = 256;
 /// One quote carries at most this many attachment metadata entries (contract
 /// 1.100, §4.81): real quoted-media batches are small and Signal Desktop
 /// renders the pill metadata-only; entries past the cap drop (the same
@@ -1037,8 +1090,9 @@ const MAX_CALL_ICE_FRAMES: usize = 64;
 /// The official desktop's `GROUPV2_ID_LENGTH` (MessageReceiver.preload.ts
 /// :3274-3309, contract 1.70 §4.58 consume batch): the group master key is a
 /// 32-byte value carried on the wire as standard base64; any other decoded
-/// length is not the protocol's face.
-const GROUPV2_ID_LENGTH: usize = 32;
+/// length is not the protocol's face. `pub(crate)` since the §4.83
+/// delete-for-me conversation resolution reads the same group-id form.
+pub(crate) const GROUPV2_ID_LENGTH: usize = 32;
 /// The highest `messageRequestResponseType` enum member this connector
 /// consumes (UNKNOWN=0 … BLOCK_AND_SPAM=6; `SignalService.proto:666-678`).
 const MRR_RESPONSE_TYPE_MAX: u8 = 6;
@@ -1163,6 +1217,18 @@ impl NormalizedReceive {
                     (read.len() + viewed.len())
                         * (2 * MAX_RECEIVE_ID_CHARS + std::mem::size_of::<SyncReadEntry>())
                 }
+                // The delete groups carry heap Vecs like the read lists —
+                // counted entry-wise so the queue budget stays honest (§4.13).
+                Some(ControlReceive::SyncDeleteForMe { deletes }) => deletes
+                    .iter()
+                    .map(|group| {
+                        std::mem::size_of::<SyncDeleteGroup>()
+                            + group.conversation_id.as_ref().map_or(0, String::len)
+                            + group.messages.len()
+                                * (2 * MAX_RECEIVE_ID_CHARS
+                                    + std::mem::size_of::<SyncDeleteEntry>())
+                    })
+                    .sum(),
                 _ => 0,
             }
             // Rich bodies carry capped urls/titles/names; ranges are fixed-width.
@@ -2349,6 +2415,78 @@ fn normalized_sync_read_entries(value: Option<&Value>) -> Vec<SyncReadEntry> {
         .collect()
 }
 
+/// Bounded `syncMessage.deleteForMe` group family (contract 1.102, §4.83):
+/// the wire shape is `{messageDeletes: [{conversationId?, messages:
+/// [{author, timestamp}]}]}` — the engine projects the official
+/// DeleteForMe.messageDeletes arm, each group optionally naming its
+/// conversation (key absent when the proto carried none) and every entry
+/// naming one message by its author identity plus upstream timestamp. The
+/// identity caps mirror the receive id family, the group/message caps the
+/// read-face batch guard; an entry without an author or a positive
+/// timestamp drops (the engine projects 0 for an unstated stamp — the read
+/// face's unknown-marker discipline), a group whose entries all drop drops
+/// whole, and an envelope with no usable group at all answers empty (the
+/// plain syncMessage skip — 宁缺勿错; the engine already dropped its own
+/// unparseable entries, so what survives here is the bounds family's own
+/// guard).
+fn normalized_sync_delete_groups(value: Option<&Value>) -> Vec<SyncDeleteGroup> {
+    let Some(groups) = value
+        .and_then(|face| face.get("messageDeletes"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    groups
+        .iter()
+        .take(MAX_SYNC_DELETE_GROUPS)
+        .filter_map(|group| {
+            let object = group.as_object()?;
+            let conversation_id = object
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| id.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+            let messages: Vec<SyncDeleteEntry> = object
+                .get("messages")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .take(MAX_SYNC_DELETE_GROUP_MESSAGES)
+                        .filter_map(|entry| {
+                            let object = entry.as_object()?;
+                            let author = object
+                                .get("author")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|author| !author.is_empty())
+                                .map(|author| {
+                                    author
+                                        .chars()
+                                        .take(MAX_RECEIVE_ID_CHARS)
+                                        .collect::<String>()
+                                })?;
+                            let timestamp = object
+                                .get("timestamp")
+                                .and_then(Value::as_u64)
+                                .filter(|timestamp| *timestamp > 0)?;
+                            Some(SyncDeleteEntry { author, timestamp })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if messages.is_empty() {
+                return None;
+            }
+            Some(SyncDeleteGroup {
+                conversation_id,
+                messages,
+            })
+        })
+        .collect()
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -3192,6 +3330,25 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 source: None,
                 group_id: None,
                 control: ControlReceive::SyncReadState { read, viewed },
+            });
+        }
+    }
+    // The engine's `syncMessage.deleteForMe` projection (contract 1.102,
+    // §4.83): the account's own linked device deleted messages for itself —
+    // the official #handleDeleteForMeSync face. Intercepted before the plain
+    // syncMessage skip like its read/viewed sibling; an envelope whose groups
+    // all failed the bounds falls through to that skip. The routing source
+    // stays None — the envelope is our own account; the groups name their own
+    // conversations and the entries their own authors (the read/viewed
+    // precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
+        let deletes = normalized_sync_delete_groups(sync.get("deleteForMe"));
+        if !deletes.is_empty() {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: None,
+                group_id: None,
+                control: ControlReceive::SyncDeleteForMe { deletes },
             });
         }
     }
@@ -5834,6 +5991,90 @@ mod tests {
             json!({}),
             json!({ "read": [], "viewed": [] }),
             json!({ "read": [{ "timestamp": 1726999999000u64 }] }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.102 (§4.83): the engine's `syncMessage.deleteForMe`
+    /// projection routes as a control receive carrying the bounded groups —
+    /// unusable entries drop, a group whose entries all drop drops whole,
+    /// the conversation identity rides optional, and a face with no usable
+    /// group at all falls through to the plain syncMessage skip.
+    #[test]
+    fn sync_delete_for_me_routes_bounded_groups() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncDeleteForMe { deletes }, source)) = routing(json!({
+            "deleteForMe": {
+                "messageDeletes": [
+                    {
+                        "conversationId": "11111111-1111-1111-1111-111111111111",
+                        "messages": [
+                            {
+                                "author": "22222222-2222-2222-2222-222222222222",
+                                "timestamp": 1726999999000u64,
+                            },
+                            // Unusable: no author, no timestamp — both drop.
+                            { "timestamp": 1726999998000u64 },
+                            { "author": "+15555550101" },
+                            // The engine's unknown marker: timestamp 0 drops.
+                            { "author": "+15555550103", "timestamp": 0u64 },
+                        ],
+                    },
+                    {
+                        // No conversation identity — the entries still ride.
+                        "messages": [
+                            { "author": "+15555550102", "timestamp": 1726999997000u64 },
+                        ],
+                    },
+                    // Unusable group: every entry drops → the group drops.
+                    { "conversationId": "abc", "messages": [{ "author": "x" }] },
+                ],
+            },
+        })) else {
+            panic!("expected a sync delete control routing");
+        };
+        assert_eq!(deletes.len(), 2, "{deletes:?}");
+        assert_eq!(
+            deletes[0].conversation_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(deletes[0].messages.len(), 1);
+        assert_eq!(
+            deletes[0].messages[0].author,
+            "22222222-2222-2222-2222-222222222222"
+        );
+        assert_eq!(deletes[0].messages[0].timestamp, 1726999999000);
+        assert!(deletes[1].conversation_id.is_none());
+        assert_eq!(deletes[1].messages[0].author, "+15555550102");
+        assert_eq!(deletes[1].messages[0].timestamp, 1726999997000);
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // No usable group at all → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "deleteForMe": {} }),
+            json!({ "deleteForMe": { "messageDeletes": [] } }),
+            json!({ "deleteForMe": { "messageDeletes": [{ "messages": [] }] } }),
+            json!({ "deleteForMe": { "messageDeletes": [{ "messages": [{ "author": "a" }] }] } }),
+            json!({ "deleteForMe": { "messageDeletes": [{ "messages": [{ "timestamp": 1726999999000u64 }] }] } }),
+            json!({ "deleteForMe": { "messageDeletes": [{ "conversationId": "c", "messages": [{ "author": "a", "timestamp": 0u64 }] }] } }),
         ] {
             let routing = control_routing(
                 json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
