@@ -9595,12 +9595,18 @@ pub struct ChatFolderSyncs {
 
 /// One blocked-conversation entry of the §4.45 result: the storage record's
 /// blocked-bit projection, the same shape and kind taxonomy as the §4.33
-/// pinned entry.
+/// pinned entry. `blocked_at_timestamp_ms` rides the engine's 窗D B7
+/// read-projection (contract revision 1.119, §4.100) additively — present
+/// only when the record carries a positive stamp (0 is the official
+/// "unknown" and stays absent, GV1 records never carry the bit), so an
+/// entry from a pre-B7 answer reads byte-identically.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlockedConversation {
     pub conversation_id: String,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_at_timestamp_ms: Option<u64>,
 }
 
 /// The §4.45 result of `conversations.getBlocked`: the blocked list in
@@ -12160,6 +12166,11 @@ pub(crate) fn blocked_conversations_result(entries: &[Value]) -> BlockedConversa
             Some(BlockedConversation {
                 conversation_id: conversation_id.to_string(),
                 kind: kind.to_string(),
+                // The engine's 窗D B7 projection: present only when the
+                // record carries a positive stamp; absent/non-shape stays
+                // None (the 0-is-unknown official posture, the pre-B7
+                // answer shape).
+                blocked_at_timestamp_ms: entry.get("blockedAtTimestampMs").and_then(Value::as_u64),
             })
         })
         .collect();
@@ -17867,6 +17878,28 @@ mod tests {
         assert_eq!(result.blocked[0].conversation_id, "conv-0");
         assert_eq!(result.blocked[255].conversation_id, "conv-255");
         assert_eq!(result.blocked[0].kind, "contact");
+        assert_eq!(result.blocked[0].blocked_at_timestamp_ms, None);
+
+        // The 窗D B7 read-projection (contract revision 1.119, §4.100):
+        // a positive stamp rides, a non-shape value stays absent, the
+        // key-less pre-B7 answer shape reads identically. A literal 0
+        // rides verbatim too — the engine's own projection never sends
+        // the key for its 0-is-unknown posture, and the connector never
+        // re-derives an engine answer.
+        let stamped = vec![
+            json!({"conversationId": "conv-s", "kind": "contact", "blockedAtTimestampMs": 1700000000000_u64}),
+            json!({"conversationId": "conv-z", "kind": "contact", "blockedAtTimestampMs": 0}),
+            json!({"conversationId": "conv-b", "kind": "contact", "blockedAtTimestampMs": "not-a-stamp"}),
+            json!({"conversationId": "conv-g", "kind": "legacyGroup"}),
+        ];
+        let result = blocked_conversations_result(&stamped);
+        assert_eq!(
+            result.blocked[0].blocked_at_timestamp_ms,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(result.blocked[1].blocked_at_timestamp_ms, Some(0));
+        assert_eq!(result.blocked[2].blocked_at_timestamp_ms, None);
+        assert_eq!(result.blocked[3].blocked_at_timestamp_ms, None);
 
         // Malformed entries drop instead of failing the whole read.
         let mixed = vec![

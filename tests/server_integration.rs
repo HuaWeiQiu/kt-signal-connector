@@ -8020,7 +8020,12 @@ async fn account_settings_and_blocked_faces_round_trip() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0]["conversationId"], "+15555550103");
     assert_eq!(entries[0]["kind"], "contact");
+    // The 窗D B7 read-projection (contract revision 1.119, §4.100): the
+    // contact record's stamp rides verbatim, the GV1 entry never carries
+    // the key (the official shape).
+    assert_eq!(entries[0]["blockedAtTimestampMs"], 1700000000000_u64);
     assert_eq!(entries[1]["kind"], "legacyGroup");
+    assert!(entries[1].get("blockedAtTimestampMs").is_none());
     let missing_account = request(
         &mut client,
         "blocked-missing-account",

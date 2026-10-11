@@ -56,7 +56,8 @@ PACK_SYNC_STATE = [
 # read-only storage-order constant (the §4.45 batch has no unblock write
 # face); the three write faces are dispatch-recorded no-ops.
 BLOCKED_STATE = [
-    {"conversationId": "+15555550103", "kind": "contact"},
+    {"conversationId": "+15555550103", "kind": "contact",
+     "blockedAtTimestampMs": 1700000000000},
     {"conversationId": "bGVnYWN5LWdyb3VwLTE=", "kind": "legacyGroup"},
 ]
 # Contract 1.116 §4.97 conversation-state fixture state: keyed

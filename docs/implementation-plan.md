@@ -5,7 +5,16 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.118 (2026-10-12; the delete-for-me upstream leg
+- Contract revision: 1.119 (2026-10-12; the blocked read carries the
+  block stamp (§4.100): the engine's 窗D B7 read-projection
+  `blockedAtTimestampMs` rides the §4.45 `conversations.getBlocked`
+  entries additively — present only when the record holds a positive
+  stamp, 0-is-unknown stays absent (the deletedAtTimestampMs family
+  posture), GV1 records never carry the key. Per-key shape-tolerant
+  parse; a pre-B7 answer reads byte-identically. Record-face additive
+  only: no new method/error/tag, no store move. Tests 663 held (lib 505
+  held; the two extended tests grow assertions in place), all green) —
+  previously 1.118 (2026-10-12; the delete-for-me upstream leg
   rides the engine sync face (§4.99): `messages.deleteForMe` behind the
   new `delete-for-me` capability tag closes the §4.83 family's outbound
   half — the engine `deleteForMeConversation` face, the official
@@ -8104,6 +8113,49 @@ conversation). The fixture gains the `deleteForMeConversation` stub with
 the fail-closed param gate, the SEND_LOG dispatch record, and the 427
 crash sentinel (disjoint from the 421/423/424/425/426 space). Gates:
 661 → 663 (lib 504 → 505), all green.
+
+### 4.100 The blocked read carries the block stamp: `blockedAtTimestampMs` (contract revision 1.119, 2026-10-12)
+
+The engine's 窗D B7 batch closed its own B7 gap: the blocked read face
+now projects `blockedAtTimestampMs` off the official storage-record bits
+(ContactRecord.blockedAtTimestamp field 27 / GroupV2Record field 13,
+official
+`ts/services/storageRecordOps.preload.ts:1058-1075` consumption). The
+connector's §4.45 `conversations.getBlocked` projection was keyed to the
+old answer shape, so the stamp the engine now sends was falling on the
+floor — the desktop could see that a conversation is blocked but never
+since when. The projection picks the key up per entry, additive only.
+
+**The shape.** `BlockedConversation` gains the optional
+`blockedAtTimestampMs` (u64, present only when the record holds a
+positive stamp — the engine sends the key only then; 0 is the official
+"unknown" posture and stays absent, the getCallLinks
+deletedAtTimestampMs family precedent, `Ms` suffix included). A GV1
+record never carries the bit (the StorageService proto has no such
+field for GV1 — the engine's recorded boundary), so the legacyGroup
+entry keeps the bare shape. The parse is shape-tolerant per key
+(absent/non-shape → absent — the read-face per-key degradation; an
+answer from a pre-B7 engine reads byte-identically), the cap and the
+drop rules are untouched, and the write leg (conversations.setBlocked)
+needs nothing: its write-after echo rides the same projection through
+the same parse.
+
+**The wire.** Record-face additive only: one optional key on the
+blocked entry, old hosts ignore it as an unknown JSON member. No new
+method, error code, or capability tag; no store move (the read persists
+nothing, as before). The schema's getBlocked description paragraph
+restates the projection (and retires the "deliberately no
+blockedAtTimestamp in v1" sentence that 1.119 makes false).
+
+Tests: the lib test `blocked_conversations_result_caps_and_projects`
+gains the projection ladder (a positive stamp rides verbatim, 0 and a
+non-shape value stay absent, the key-less pre-B7 shape reads the same,
+the GV1 entry stays bare); the blocked-read integration assertions gain
+the pass-through pair (the fixture's contact entry carries the stamp,
+the legacyGroup entry never does). The fixture's BLOCKED_STATE contact
+entry gains the stamp. Gates: 663 held (lib 505 held — the projection
+ladder and the pass-through pair extend two existing tests in place,
+the baseline grows in assertions, not in test count), all green.
 
 ## 5. signal-cli Boundary
 
