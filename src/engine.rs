@@ -410,6 +410,36 @@ pub struct NormalizedQuote {
     pub author: String,
     /// Bounded quoted-body preview.
     pub text: String,
+    /// Quoted attachment metadata (contract 1.100, §4.81 D4): the official
+    /// QuotedAttachment wire entries — the engine projects
+    /// `quote.attachments[]` (contentType/filename/thumbnail) and this face
+    /// forwards it bounded beside the preview. Empty on rows quoting a
+    /// text-only message and on every pre-1.100 row (never backfilled).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<NormalizedQuoteAttachment>,
+}
+
+/// One quoted-attachment metadata entry (contract 1.100, §4.81 D4): the
+/// official QuotedAttachment three-key wire shape — key absence is protocol
+/// absence (the engine projects what the wire carried, nothing else). The
+/// `filename` key keeps the engine's attachment-face spelling (the
+/// signal-cli wire key), not the official desktop's camelCase `fileName`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedQuoteAttachment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// The bounded thumbnail pointer — the engine's AttachmentPointer
+    /// projection through the same bounded parser the message attachments
+    /// run, so a pointer the bounds cannot carry (an id-less pointer)
+    /// drops rather than rendering half a face. Metadata-only: the locator
+    /// half stays internal and never serializes, so a quote thumbnail
+    /// rides the wire and the store as pure metadata (the honest 1.98
+    /// posture — the desktop renders the pill metadata-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<NormalizedAttachment>,
 }
 
 /// One inbound attachment descriptor: metadata only, never bytes (§4.13).
@@ -949,6 +979,11 @@ const MAX_RECEIPT_TIMESTAMPS: usize = 256;
 /// real multi-device read syncs stay far below it; entries past the cap
 /// drop (the same truncate discipline as `MAX_RECEIPT_TIMESTAMPS`).
 const MAX_SYNC_READ_ENTRIES: usize = 256;
+/// One quote carries at most this many attachment metadata entries (contract
+/// 1.100, §4.81): real quoted-media batches are small and Signal Desktop
+/// renders the pill metadata-only; entries past the cap drop (the same
+/// truncate discipline as `MAX_INBOUND_ATTACHMENTS`).
+const MAX_QUOTE_ATTACHMENTS: usize = 8;
 /// `groupChanged.changes` serialized byte guard (contract 1.100, §4.81):
 /// the coarse guard family the story/call faces ride — real change batches
 /// are orders of magnitude smaller; only hostile material trips it, and an
@@ -1101,7 +1136,27 @@ impl NormalizedReceive {
             // except the sync read/viewed entry lists, whose heap Vecs count
             // here so the queue budget stays honest (§4.13).
             + self.quote.as_ref().map_or(0, |quote| {
-                quote.author.len() + quote.text.len() + std::mem::size_of::<NormalizedQuote>()
+                quote.author.len()
+                    + quote.text.len()
+                    + std::mem::size_of::<NormalizedQuote>()
+                    + quote
+                        .attachments
+                        .iter()
+                        .map(|entry| {
+                            entry.content_type.as_ref().map_or(0, String::len)
+                                + entry.filename.as_ref().map_or(0, String::len)
+                                + entry
+                                    .thumbnail
+                                    .as_ref()
+                                    .map_or(0, |thumb| {
+                                        thumb.id.len()
+                                            + thumb.content_type.as_ref().map_or(0, String::len)
+                                            + thumb.filename.as_ref().map_or(0, String::len)
+                                            + std::mem::size_of::<NormalizedAttachment>()
+                                    })
+                                + std::mem::size_of::<NormalizedQuoteAttachment>()
+                        })
+                        .sum::<usize>()
             })
             + match self.control.as_ref() {
                 Some(ControlReceive::SyncReadState { read, viewed }) => {
@@ -2337,7 +2392,59 @@ fn normalized_quote(value: &Value) -> Option<NormalizedQuote> {
         .and_then(Value::as_str)
         .map(|text| text.chars().take(MAX_QUOTE_TEXT_CHARS).collect::<String>())
         .unwrap_or_default();
-    Some(NormalizedQuote { id, author, text })
+    let attachments = object
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .take(MAX_QUOTE_ATTACHMENTS)
+                .filter_map(|entry| entry.as_object().and_then(normalized_quote_attachment))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(NormalizedQuote {
+        id,
+        author,
+        text,
+        attachments,
+    })
+}
+
+/// One bounded quoted-attachment entry off a QuotedAttachment-shaped object
+/// (contract 1.100, §4.81 D4). Key absence is protocol absence; an entry
+/// carrying none of the three keys says nothing and drops whole. The
+/// thumbnail rides the same bounded attachment parser the message face runs,
+/// so an id-less pointer drops rather than rendering half a face.
+fn normalized_quote_attachment(
+    object: &serde_json::Map<String, Value>,
+) -> Option<NormalizedQuoteAttachment> {
+    let content_type = object
+        .get("contentType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(MAX_ATTACHMENT_CONTENT_TYPE_CHARS)
+                .collect::<String>()
+        });
+    let filename = object
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
+        .filter(|s| !s.is_empty());
+    let thumbnail = object
+        .get("thumbnail")
+        .and_then(Value::as_object)
+        .and_then(normalized_attachment);
+    let face = NormalizedQuoteAttachment {
+        content_type,
+        filename,
+        thumbnail,
+    };
+    (face.content_type.is_some() || face.filename.is_some() || face.thumbnail.is_some())
+        .then_some(face)
 }
 
 /// Bounded inbound attachment descriptors (§4.13): metadata only, entries past
@@ -5695,6 +5802,135 @@ mod tests {
 
     fn routing_shape_none(change: &serde_json::Value) -> bool {
         control_routing(json!({ "groupChanged": change }).as_object().unwrap()).is_none()
+    }
+
+    /// Contract 1.100 (§4.81 D4): the quote's `attachments[]` rides the same
+    /// bounded parser the message face runs — entries pass verbatim (the
+    /// three-key QuotedAttachment shape), an entry that says nothing drops,
+    /// an id-less thumbnail drops before it renders half a face, and a batch
+    /// past the cap truncates. The sent-sync face shares the parser.
+    #[test]
+    fn quote_attachments_ride_bounded_metadata_entries() {
+        let thumbnail = json!({
+            "id": "thumb-1",
+            "contentType": "image/jpeg",
+            "size": 1024,
+            "width": 64,
+            "height": 64,
+        });
+        let normalized = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 61,
+                "dataMessage": {
+                    "message": "replying to media",
+                    "quote": {
+                        "id": 60u64,
+                        "author": "+15555550102",
+                        "text": "look at this",
+                        "attachments": [
+                            {
+                                "contentType": "image/png",
+                                "filename": "shot.png",
+                                "thumbnail": thumbnail,
+                            },
+                            // Says nothing on the wire → drops whole.
+                            {},
+                            // Wrong-shaped keys are absence, not values.
+                            { "contentType": 7, "filename": [], "thumbnail": "nope" },
+                            // An id-less thumbnail drops; the entry survives
+                            // on its own keys.
+                            {
+                                "contentType": "video/mp4",
+                                "thumbnail": { "contentType": "image/jpeg" },
+                            },
+                        ],
+                    },
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        let quote = normalized.quote.as_ref().expect("quote snapshot");
+        assert_eq!(quote.attachments.len(), 2, "{:?}", quote.attachments);
+        let first = &quote.attachments[0];
+        assert_eq!(first.content_type.as_deref(), Some("image/png"));
+        assert_eq!(first.filename.as_deref(), Some("shot.png"));
+        let thumb = first.thumbnail.as_ref().expect("thumbnail pointer");
+        assert_eq!(thumb.id, "thumb-1");
+        assert_eq!(thumb.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(thumb.size, Some(1024));
+        assert_eq!(thumb.width, Some(64));
+        assert_eq!(thumb.height, Some(64));
+        assert_eq!(thumb.locator, None, "the quote face projects no locator");
+        assert_eq!(
+            quote.attachments[1].content_type.as_deref(),
+            Some("video/mp4")
+        );
+        assert_eq!(quote.attachments[1].thumbnail, None);
+
+        // A batch past the cap truncates (the `MAX_INBOUND_ATTACHMENTS`
+        // discipline at quote scale).
+        let entries: Vec<_> = (0..MAX_QUOTE_ATTACHMENTS + 1)
+            .map(|index| json!({ "contentType": format!("application/x-{index}") }))
+            .collect();
+        let truncated = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "source": "+15555550101",
+                "timestamp": 62,
+                "dataMessage": {
+                    "message": "replying to a lot",
+                    "quote": {
+                        "id": 61u64,
+                        "author": "+15555550102",
+                        "attachments": entries,
+                    },
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        let quote = truncated.quote.as_ref().expect("quote snapshot");
+        assert_eq!(quote.attachments.len(), MAX_QUOTE_ATTACHMENTS);
+        assert_eq!(
+            quote.attachments[MAX_QUOTE_ATTACHMENTS - 1]
+                .content_type
+                .as_deref(),
+            Some("application/x-7"),
+        );
+
+        // The sent-sync face runs the same parser.
+        let sent = normalize_receive(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 63,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 63u64,
+                        "message": "sent from another device",
+                        "quote": {
+                            "id": 60u64,
+                            "author": "+15555550102",
+                            "attachments": [{ "filename": "clip.mp4" }],
+                        },
+                    },
+                },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        let quote = sent.quote.as_ref().expect("sent quote snapshot");
+        assert_eq!(quote.attachments.len(), 1);
+        assert_eq!(quote.attachments[0].filename.as_deref(), Some("clip.mp4"));
+
+        // Pre-1.100 store rows carry no attachments key — the snapshot
+        // deserializes with the empty face (the serde default discipline).
+        let legacy: NormalizedQuote =
+            serde_json::from_value(json!({ "id": 60u64, "author": "+15555550102", "text": "hi" }))
+                .expect("legacy snapshot");
+        assert!(legacy.attachments.is_empty());
     }
 
     /// Call signaling (contract 1.50, §4.48): the engine's `callMessage`

@@ -1166,6 +1166,11 @@ impl<'a> Importer<'a> {
             id,
             author,
             text: truncate_utf8_bytes(text, MAX_HOST_TEXT_PREVIEW_BYTES),
+            // The §4.38 import face keeps quote snapshots metadata-only
+            // (contract 1.100, §4.81 D4): backup quote attachments ride a
+            // different wire shape and stay unparsed this revision — the
+            // empty vec serializes as an absent key, the same pre-1.100 row.
+            attachments: Vec::new(),
         }))
     }
 

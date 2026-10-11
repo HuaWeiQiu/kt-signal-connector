@@ -6505,6 +6505,39 @@ frame (`group_changed_event_rides_the_batch_verbatim` — the verbatim batch plu
 absent-optional discipline); the schema event enumeration and the 32-entry bound pairing
 (`tests/schema_consistency.rs`).
 
+#### D4 — quoted-attachment metadata (`quote.attachments`)
+
+The engine projects the official QuotedAttachment entries
+(`{contentType?, filename?, thumbnail?}`) on the existing quote snapshot — the desktop
+renders the quoted-media pill metadata-only. The connector previously carried
+preview-only quotes, so a media quote rendered bare. Consumption — metadata beside the
+preview, never bytes (§4.13):
+
+- **Parse bounds** (§4.13 family): an 8-entry cap — entries past it truncate (the
+  `MAX_INBOUND_ATTACHMENTS` discipline at quote scale); `contentType` rides the
+  attachment-face cap (≤64 chars), `filename` the ≤128-byte one; the thumbnail rides
+  the same bounded attachment parser the message face runs — an id-less pointer drops
+  rather than rendering half a face, the entry survives on its own keys, and the
+  locator half stays internal (`#[serde(skip)]`): a quote thumbnail rides the wire and
+  the store as pure metadata, the honest 1.98 posture. An entry carrying none of the
+  three keys says nothing and drops whole; key absence is protocol absence. The
+  `filename` key keeps the engine's attachment-face spelling (the signal-cli wire
+  key), not the official desktop's camelCase `fileName`.
+- **Persistence**: the entries ride the quote snapshot JSON verbatim —
+  `#[serde(default, skip_serializing_if = "Vec::is_empty")]`, so pre-1.100 rows
+  deserialize with the empty face and an empty face serializes as an absent key
+  (byte-identical to the old row shape, no migration); `messages.list` returns them
+  verbatim.
+- **Boundary**: the §4.38 history-import face keeps its quote snapshots metadata-only
+  this revision — the backup NDJSON shapes its quote attachments differently and stays
+  unparsed. The engine and sent-sync faces share the one parser.
+
+Tests: the engine unit (`quote_attachments_ride_bounded_metadata_entries` — the
+verbatim ride, the nothing-said drop, the id-less thumbnail drop, the cap truncation,
+the sent-sync shared parser, the legacy-row deserialize); the service roundtrip
+(`inbound_quote_and_attachment_metadata_roundtrip_through_the_store` — the quoted
+metadata end-to-end through SQLite, the thumbnail's locator half staying internal).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

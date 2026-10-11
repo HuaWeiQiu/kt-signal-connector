@@ -10514,7 +10514,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::engine::{NormalizedAttachment, NormalizedQuote, ReceiptKind};
+    use crate::engine::{
+        NormalizedAttachment, NormalizedQuote, NormalizedQuoteAttachment, ReceiptKind,
+    };
     use crate::store::StoreKey;
 
     fn service() -> (TempDir, ConnectorService) {
@@ -20266,6 +20268,20 @@ mod tests {
                 id: 350,
                 author: "+15555550100".into(),
                 text: "the original".into(),
+                attachments: vec![NormalizedQuoteAttachment {
+                    content_type: Some("image/png".into()),
+                    filename: Some("quoted.png".into()),
+                    thumbnail: Some(NormalizedAttachment {
+                        id: "quote-thumb".into(),
+                        content_type: Some("image/jpeg".into()),
+                        filename: None,
+                        size: Some(1024),
+                        width: Some(64),
+                        height: Some(64),
+                        is_voice_note: false,
+                        locator: None,
+                    }),
+                }],
             }),
             attachments: vec![NormalizedAttachment {
                 id: "att-1".into(),
@@ -20301,6 +20317,17 @@ mod tests {
         assert_eq!(quote.id, 350);
         assert_eq!(quote.author, "+15555550100");
         assert_eq!(quote.text, "the original");
+        // The quoted-attachment metadata rides the same snapshot verbatim
+        // (contract 1.100, §4.81 D4); the thumbnail's locator half stays
+        // internal and never round-trips.
+        assert_eq!(quote.attachments.len(), 1);
+        let quoted = &quote.attachments[0];
+        assert_eq!(quoted.content_type.as_deref(), Some("image/png"));
+        assert_eq!(quoted.filename.as_deref(), Some("quoted.png"));
+        let thumb = quoted.thumbnail.as_ref().expect("thumbnail survives");
+        assert_eq!(thumb.id, "quote-thumb");
+        assert_eq!(thumb.size, Some(1024));
+        assert_eq!(thumb.locator, None);
         assert_eq!(row.attachments.len(), 1);
         assert_eq!(row.attachments[0].id, "att-1");
         assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
