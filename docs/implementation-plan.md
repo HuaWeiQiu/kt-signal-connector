@@ -5,7 +5,34 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.100 (2026-10-11; the engine D-batch consume faces (§4.81): four faces
+- Contract revision: 1.101 (2026-10-11; the credential-death classification batch
+  (§4.82): the layer the 2026-10-09 real-device debugging chain (CSS → DNS/socks5h →
+  proxy split → the credential 401) exposed — a dead linked-device credential reached
+  the desktop as the generic retryable `UPSTREAM_ERROR` family ("send failed, please
+  retry") because its evidence never survived to a face the connector's matchers
+  classify. Two faces, one independent state: (a) the classifier — the chat service's
+  plain-text 401 body (`Credentials are required to access this resource.`; never a
+  JSON error object, invisible to the exception-name matchers) classifies at the §4.17
+  observation point through a standalone pure matcher beside the frozen match set (the
+  §4.80 boundary note verbatim), folding into the same `EngineError::Unauthorized` arm
+  — `ACCOUNT_UNLINKED` stays the host face and the store's `device_unlinked` state
+  stays the credential-invalid answer distinct from the retryable network families; no
+  new error code; the match is one exact case-sensitive sentence, so the §4.17
+  signatures, the §4.80 transport anchors, structured codes, and ordinary errors never
+  trip it. (b) The projection — `runtime.doctor` groups gain the `credentials` face
+  (§4.79 amended, `docs/doctor-contract.md` updated), the doctor's one
+  account-authenticated probe: one read-only `getUserStatus` ride through the group's
+  own live engine for the watchdog's ping-target account under the same 3-second
+  diagnostic budget, folding into exactly one fixed literal — `healthy` /
+  `credentialsInvalid` / `indeterminate` / `unreachable` / `noAccount` — with the
+  probe target never entering the report. The engine-side residual is recorded, not
+  fixed here: the vendored websocket-upgrade path drops the 401 status
+  (reqwest-websocket handshake failure → `ServiceError::WsError`), so upgrade-layer
+  credential death still answers the content-free `Internal error` face and the doctor
+  answers `indeterminate` on it — honest until the engine batch lands the
+  upgrade-status classification (the engine repository stayed read-only during this
+  batch). No schema change (the 1.97 free-form-result precedent; method/error/event
+  enums untouched); tests 609 → 614, all green) — previously 1.100 (2026-10-11; the engine D-batch consume faces (§4.81): four faces
   where the connector stops dropping engine projections and starts consuming them. D2 — the
   cross-device read/viewed sync (`syncMessage.read`/`.viewed` route as a bounded 256-entry
   control receive; per-face first stamps land on the rows, the unread badge converges through
