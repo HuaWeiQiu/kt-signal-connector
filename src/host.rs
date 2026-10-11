@@ -59,7 +59,8 @@ use crate::service::{
     NotificationProfilesSetRecordsParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -2473,6 +2474,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid notificationProfiles.setRecords params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "storyDistributionLists.list" => {
+            match serde_json::from_value::<StoryDistributionListsListParams>(request.params) {
+                Ok(params) => match runtime.story_distribution_lists_list(params).await {
+                    Ok(lists) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(lists).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid storyDistributionLists.list params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "storyDistributionLists.setRecords" => {
+            match serde_json::from_value::<StoryDistributionListsSetRecordsParams>(request.params) {
+                Ok(params) => match runtime.story_distribution_lists_set_records(params).await {
+                    Ok(lists) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(lists).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid storyDistributionLists.setRecords params",
                         false,
                     ),
                 ),

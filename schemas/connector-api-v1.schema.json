@@ -105,6 +105,8 @@
             "chatFolders.setRecords",
             "notificationProfiles.list",
             "notificationProfiles.setRecords",
+            "storyDistributionLists.list",
+            "storyDistributionLists.setRecords",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -551,6 +553,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/notificationProfilesSetRecordsParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "storyDistributionLists.list" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storyDistributionListsListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "storyDistributionLists.setRecords" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storyDistributionListsSetRecordsParams" }
             }
           }
         },
@@ -2898,6 +2922,52 @@
             "maxLength": 128
           },
           "description": "The official deleteKey half of the write batch (KT bound 64 entries): profile record ids to remove from the manifest; optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
+        }
+      }
+    },
+    "storyDistributionListsListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's story distribution lists (contract revision 1.130, \u00a74.111, capability stories): the engine reads the official Storage Service StoryDistributionList set (manifest STORY_DISTRIBUTION_LIST=5 identifiers, storage order) and the result projects {lists: [record...]} \u2014 each record the engine's StoryDistributionListRecordJson verbatim: {identifier (uuid string), name (may be empty \u2014 the official tombstone posture is a cleared name plus cleared members plus a set deletedAtTimestamp), recipientServiceIds (service-id strings, ACI uuid / PNI:uuid), recipientServiceIdsBinary (standard-base64 service-id binaries, 16-byte ACI / 17-byte PNI), deletedAtTimestamp (u64, always present; 0 = live, non-0 = tombstone), allowsReplies, isBlockList}. The two member faces project independently (the official read face's binary-first/string-fallback is a merge-cost decision the caller owns; the engine surfaces both verbatim). My Story is the all-zero uuid projected like every other list, no special case. Entries the engine cannot decode drop engine-side (broken entries never break the read); the connector caps the list at 64 entries (KT bound, overflow truncated) and drops entries missing identifier. A cloud state with no lists answers {lists: []} \u2014 the empty state is the answer, not an error. Structured engine errors: STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Read lane, non-mutating; the connector persists nothing \u2014 the cloud record plus the desktop's own cache is the whole story.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "storyDistributionListsSetRecordsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Write the account's story-distribution-list records (contract revision 1.130, \u00a74.111, capability stories): the official storage upload semantics \u2014 records upsert by identifier, a non-zero deletedAtTimestamp is the tombstone write (the official tombstone posture: cleared name, cleared members, set timestamp), removeIds is the official deleteKey face, and a record identical to the cloud state is an idempotent no-write (the whole batch replaying is safe). At least one of records / removeIds must be non-empty (INVALID_REQUEST before any upstream call); only the non-empty half rides the upstream frame. Each records entry is the engine's StoryDistributionListRecordJson (the storyDistributionLists.list description carries the full key face) \u2014 forwarded verbatim: the connector enforces only the identity face (an object carrying a non-empty string identifier \u2264 128 chars); the record grammar is the engine's definite -32603, never a local re-derivation. The result is the post-write cloud state {lists: [...]} read back \u2014 not a local echo. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: STORAGE_WRITE_FAILED / STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Zero local persistence.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "records": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["identifier"],
+            "properties": {
+              "identifier": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "The list's record identifier (a uuid string on the official face) \u2014 the upsert key and the identity the projection gate keeps."
+              }
+            },
+            "description": "One StoryDistributionListRecordJson, forwarded to the engine verbatim (see the storyDistributionLists.list params description for the key face); only the identifier gate is connector-enforced, the grammar is the engine's."
+          },
+          "description": "The upsert half of the write batch (KT bound 64 entries); optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
+        },
+        "removeIds": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "description": "The official deleteKey half of the write batch (KT bound 64 entries): list identifiers to remove from the manifest; optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
         }
       }
     },

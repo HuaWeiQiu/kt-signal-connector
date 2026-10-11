@@ -111,6 +111,15 @@ pub const MAX_CHAT_FOLDER_ID_CHARS: usize = 128;
 pub const MAX_NOTIFICATION_PROFILES: usize = 64;
 pub const MAX_NOTIFICATION_PROFILE_BATCH: usize = 64;
 pub const MAX_NOTIFICATION_PROFILE_ID_CHARS: usize = 128;
+/// Story-distribution-list sync bounds (contract revision 1.130, §4.111):
+/// the §4.78 bounds verbatim — the returned list and both write halves
+/// capped at 64, the per-record identity bound 128 characters. The record
+/// body beyond `identifier` is the engine's StoryDistributionListRecordJson
+/// grammar (the official mergeStoryDistributionListRecord output face) —
+/// the connector never re-derives it.
+pub const MAX_STORY_DISTRIBUTION_LISTS: usize = 64;
+pub const MAX_STORY_LIST_BATCH: usize = 64;
+pub const MAX_STORY_LIST_ID_CHARS: usize = 128;
 /// Account settings bounds (contract revision 1.46, §4.45): the profile text
 /// budgets mirror the official desktop ProfileEditor (v8.31
 /// `ts/components/ProfileEditor.dom.tsx`) — both name components maxBytes 128,
@@ -4158,6 +4167,113 @@ impl ConnectorService {
                 )));
             }
             if id.chars().count() > MAX_NOTIFICATION_PROFILE_ID_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "removeIds entries must not exceed 128 characters",
+                    false,
+                )));
+            }
+        }
+        if records.is_empty() && remove_ids.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "at least one of records, removeIds is required",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let mut upstream = serde_json::Map::new();
+        upstream.insert(
+            "account".into(),
+            Value::String(account.signal_account.clone()),
+        );
+        if !records.is_empty() {
+            upstream.insert("records".into(), Value::Array(records.to_vec()));
+        }
+        if !remove_ids.is_empty() {
+            upstream.insert(
+                "removeIds".into(),
+                Value::Array(
+                    remove_ids
+                        .iter()
+                        .map(|id| Value::String(id.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        Ok(Value::Object(upstream))
+    }
+
+    /// storyDistributionLists.list (contract revision 1.130, §4.111): the
+    /// §4.78 read ladder verbatim — account bounds and resolution, the
+    /// service reads nothing locally, the engine owns the record grammar.
+    pub fn prepare_story_distribution_lists_list(
+        &self,
+        account_id: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// storyDistributionLists.setRecords (contract revision 1.130,
+    /// §4.111): the §4.78 batch gates verbatim under the service lock — at
+    /// least one non-empty half, each records entry an object carrying a
+    /// non-empty bounded string `identifier` (the story-list identity key;
+    /// the StoryDistributionListRecordJson grammar stays the engine's,
+    /// never a local re-derivation), each removeId a bounded non-empty
+    /// string. Only the non-empty half rides the upstream frame. No local
+    /// row is written.
+    pub fn prepare_story_distribution_lists_set_records(
+        &self,
+        account_id: &str,
+        records: &[Value],
+        remove_ids: &[String],
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if records.len() > MAX_STORY_LIST_BATCH {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "records exceeds the batch bound of 64 entries",
+                false,
+            )));
+        }
+        if remove_ids.len() > MAX_STORY_LIST_BATCH {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "removeIds exceeds the batch bound of 64 entries",
+                false,
+            )));
+        }
+        for entry in records {
+            let id = entry
+                .get("identifier")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "every records entry must be an object carrying a non-empty string identifier",
+                        false,
+                    ))
+                })?;
+            if id.chars().count() > MAX_STORY_LIST_ID_CHARS {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "records entry identifier exceeds 128 characters",
+                    false,
+                )));
+            }
+        }
+        for id in remove_ids {
+            if id.is_empty() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "removeIds entries must be non-empty",
+                    false,
+                )));
+            }
+            if id.chars().count() > MAX_STORY_LIST_ID_CHARS {
                 return Err(ServiceError::Api(ApiError::new(
                     "INVALID_REQUEST",
                     "removeIds entries must not exceed 128 characters",
@@ -10258,6 +10374,19 @@ pub struct NotificationProfileSyncs {
     pub profiles: Vec<Value>,
 }
 
+/// The §4.111 result shape shared by `storyDistributionLists.list` and
+/// `storyDistributionLists.setRecords`: the engine's
+/// StoryDistributionListRecordJson entries verbatim, in storage order,
+/// capped at [`MAX_STORY_DISTRIBUTION_LISTS`]. The record body is the
+/// engine's contract (the official mergeStoryDistributionListRecord output
+/// face) — the connector neither interprets nor re-keys it, so the entries
+/// stay opaque JSON values on this wire.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoryDistributionListSyncs {
+    pub lists: Vec<Value>,
+}
+
 /// One blocked-conversation entry of the §4.45 result: the storage record's
 /// blocked-bit projection, the same shape and kind taxonomy as the §4.33
 /// pinned entry. `blocked_at_timestamp_ms` rides the engine's 窗D B7
@@ -11168,6 +11297,29 @@ pub struct NotificationProfilesListParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NotificationProfilesSetRecordsParams {
+    pub account_id: String,
+    pub records: Option<Vec<Value>>,
+    pub remove_ids: Option<Vec<String>>,
+}
+
+/// `storyDistributionLists.list` params (contract revision 1.130, §4.111).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoryDistributionListsListParams {
+    pub account_id: String,
+}
+
+/// `storyDistributionLists.setRecords` params (contract revision 1.130,
+/// §4.111): the §4.78 write-batch shape with the story-list identity key
+/// `identifier` — both halves optional and at least one non-empty
+/// (service-enforced). `records` entries are the engine's
+/// StoryDistributionListRecordJson objects — forwarded verbatim,
+/// connector-enforced identity face only (a non-empty string `identifier`);
+/// `removeIds` entries are the official deleteKey identifiers. Both arrays
+/// are capped at [`MAX_STORY_LIST_BATCH`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoryDistributionListsSetRecordsParams {
     pub account_id: String,
     pub records: Option<Vec<Value>>,
     pub remove_ids: Option<Vec<String>>,
@@ -13320,6 +13472,26 @@ pub(crate) fn notification_profile_syncs_result(entries: &[Value]) -> Notificati
         .cloned()
         .collect();
     NotificationProfileSyncs { profiles }
+}
+
+/// Project the engine's story-distribution-list record list onto the wire
+/// shape with the KT entry cap (§4.111): the §4.78 projection verbatim —
+/// storage order, entries beyond 64 truncated, record bodies verbatim, an
+/// entry that is not an object carrying a string `identifier` drops rather
+/// than half-carries.
+pub(crate) fn story_distribution_lists_result(entries: &[Value]) -> StoryDistributionListSyncs {
+    let lists = entries
+        .iter()
+        .take(MAX_STORY_DISTRIBUTION_LISTS)
+        .filter(|entry| {
+            entry
+                .get("identifier")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        })
+        .cloned()
+        .collect();
+    StoryDistributionListSyncs { lists }
 }
 
 /// Project the engine's blocked list onto the wire shape with the KT entry

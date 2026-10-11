@@ -284,6 +284,37 @@ NOTIFICATION_PROFILE_STATE = [
         "deletedAtTimestampMs": 0,
     },
 ]
+# Contract 1.130 story-distribution-list sync fixture state: the Storage
+# Service StoryDistributionListRecordJson projection in storage order — the
+# engine's read face keys (identifier uuid / name / both member faces /
+# deletedAtTimestamp always present / allowsReplies / isBlockList);
+# storyDistributionLists.setRecords mutates it in place so a read-back
+# after a write observes the write.
+STORY_LIST_STATE = [
+    {
+        "identifier": "00000000-0000-0000-0000-000000000000",
+        "name": "My Story",
+        "recipientServiceIds": [],
+        "recipientServiceIdsBinary": [],
+        "deletedAtTimestamp": 0,
+        "allowsReplies": True,
+        "isBlockList": False,
+    },
+    {
+        "identifier": "d1e2f3a4-b5c6-4718-a93a-4b5c6d7e8f90",
+        "name": "Close friends",
+        "recipientServiceIds": [
+            "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+            "PNI:8f7e6d5c-4b3a-4928-8172-63d4e5f60718",
+        ],
+        "recipientServiceIdsBinary": [
+            "bGVnYWN5LWJpbmFyeS0x",
+        ],
+        "deletedAtTimestamp": 0,
+        "allowsReplies": False,
+        "isBlockList": False,
+    },
+]
 # Contract 1.48 §4.47 avatar fixture: a tiny PNG magic payload — the engine
 # sniffs the MIME from the magic bytes and answers a data URI plus the
 # decoded byte count; getAvatar's sentinel conversationId answers the
@@ -1447,6 +1478,160 @@ for line in sys.stdin:
                     profiles.append(record)
             NOTIFICATION_PROFILE_STATE[:] = profiles
         result = {"profiles": list(NOTIFICATION_PROFILE_STATE)}
+    elif method == "storyDistributionLists.list":
+        # Contract 1.130 story-distribution-list sync read: the storage-order
+        # record projection as a fixture constant (My Story = the all-zero
+        # uuid, no special case + one custom list carrying both member
+        # faces). Account gate mirrors the engine (-32603 on an unregistered
+        # account). Markers the driving test writes steer the structured
+        # storage ladder: `.fixture-story-list-read-failed` answers
+        # STORAGE_READ_FAILED, `.fixture-story-list-unavailable` answers
+        # STORAGE_UNAVAILABLE.
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-story-list-read-failed").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_READ_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-story-list-unavailable").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        result = {"lists": list(STORY_LIST_STATE)}
+    elif method == "storyDistributionLists.setRecords":
+        # Contract 1.130 story-distribution-list sync write: record the
+        # exact upstream params (tests assert the resolved account and the
+        # verbatim records/removeIds contract), apply the official upload
+        # semantics — upsert by identifier in place, removeIds out of the
+        # set — and answer the post-write cloud state. Account gate mirrors
+        # the engine (-32603 on an unregistered account); the structured
+        # ladder steers from markers: `.fixture-story-list-write-failed`
+        # answers STORAGE_WRITE_FAILED, `.fixture-story-list-read-failed`
+        # answers STORAGE_READ_FAILED (the engine reads before it writes),
+        # `.fixture-story-list-unavailable` answers STORAGE_UNAVAILABLE.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        marker_errors = (
+            (".fixture-story-list-write-failed", "STORAGE_WRITE_FAILED"),
+            (".fixture-story-list-read-failed", "STORAGE_READ_FAILED"),
+            (".fixture-story-list-unavailable", "STORAGE_UNAVAILABLE"),
+        )
+        for marker, code in marker_errors:
+            if (SIGNAL_DATA_DIR / marker).exists():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": code},
+                }
+                emit_json(response)
+                continue
+        # The mutating-crash sentinel (identifier magic; exit 31 = the
+        # shared mutating-in-flight crash code, disjoint from every other
+        # face by trigger): the connector must answer SEND_OUTCOME_UNKNOWN
+        # and never retry.
+        if any(
+            isinstance(record, dict)
+            and record.get("identifier") == "cede0000-0000-4000-8000-000000000033"
+            for record in params.get("records") or []
+        ):
+            os._exit(31)
+        # The engine's strict record grammar (parse_story_list): every
+        # record must carry the required keys with the right shapes —
+        # identifier (uuid string), name (string; empty is the official
+        # tombstone posture), recipientServiceIds (string array),
+        # allowsReplies / isBlockList (booleans) — else the engine answers
+        # -32603. Optional: deletedAtTimestamp (u64 or absent),
+        # recipientServiceIdsBinary (string array or absent).
+        def _story_list_shape_ok(record):
+            if not isinstance(record, dict):
+                return False
+            try:
+                uuid.UUID(str(record.get("identifier")))
+            except (ValueError, AttributeError, TypeError):
+                return False
+            if not isinstance(record.get("name"), str):
+                return False
+            for key in ("recipientServiceIds", "recipientServiceIdsBinary"):
+                value = record.get(key)
+                if value is not None and not (
+                    isinstance(value, list)
+                    and all(isinstance(item, str) for item in value)
+                ):
+                    return False
+            for key in ("allowsReplies", "isBlockList"):
+                if not isinstance(record.get(key), bool):
+                    return False
+            stamp = record.get("deletedAtTimestamp")
+            if stamp is not None and (
+                not isinstance(stamp, int) or isinstance(stamp, bool) or stamp < 0
+            ):
+                return False
+            return True
+
+        records = params.get("records") or []
+        if any(not _story_list_shape_ok(record) for record in records):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        with WRITE_LOCK:
+            lists = [
+                entry
+                for entry in STORY_LIST_STATE
+                if entry["identifier"] not in set(params.get("removeIds") or [])
+            ]
+            for record in params.get("records") or []:
+                record = json.loads(json.dumps(record))
+                for index, entry in enumerate(lists):
+                    if entry["identifier"] == record["identifier"]:
+                        lists[index] = record
+                        break
+                else:
+                    lists.append(record)
+            STORY_LIST_STATE[:] = lists
+        result = {"lists": list(STORY_LIST_STATE)}
     elif method == "setAccountConfiguration":
         # Contract 1.46 §4.45 account settings write: record the exact
         # upstream params (tests assert only the provided keys appear — the

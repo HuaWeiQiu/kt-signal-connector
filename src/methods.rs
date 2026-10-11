@@ -519,6 +519,22 @@ pub const METHODS: &[MethodRow] = &[
     // `notification-profiles`.
     ("notificationProfiles.list", Lane::Read, false, "read"),
     ("notificationProfiles.setRecords", Lane::Send, true, "send"),
+    // Story-distribution-list sync (contract revision 1.130, §4.111): the
+    // stories surface's own audience-management sync pipe — list is a
+    // bounded cloud-backed read of the account's StoryDistributionList
+    // set; setRecords is the mutating storage-service write —
+    // reaction-class write-lane mutex and delete barrier, no local
+    // persistence on either side. KT-extension, no upstream counterpart;
+    // advertised through the existing `stories` tag, widened in place (the
+    // 1.82 no-new-bit discipline — the distribution lists are the story
+    // audience the §4.67 send faces address).
+    ("storyDistributionLists.list", Lane::Read, false, "read"),
+    (
+        "storyDistributionLists.setRecords",
+        Lane::Send,
+        true,
+        "send",
+    ),
     // Read-only runtime diagnostic face (contract 1.97, §4.79): one payload
     // answering the whole chain — connector/engine versions plus the
     // engine's self-certification baseline, per-group data-dir and
@@ -660,7 +676,11 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// same no-new-bit discipline) and by revision 1.94 (the
 /// `stories.sendReaction` story-anchored reaction send plus the `viewedAt`
 /// projection key on message rows and `message.statusChanged`; the same
-/// no-new-bit discipline), and `chat-folders` (contract revision 1.95)
+/// no-new-bit discipline) and by revision 1.130 (the
+/// `storyDistributionLists.list` / `storyDistributionLists.setRecords`
+/// story-audience sync faces — the §4.78 sync-face pair over the story
+/// distribution lists the §4.67 send faces address; the same no-new-bit
+/// discipline), and `chat-folders` (contract revision 1.95)
 /// marks the §4.78 chat-folder sync faces (`chatFolders.list` read over the
 /// account's ChatFolderRecord set plus the `chatFolders.setRecords`
 /// storage-service write — one capability for the read and write halves,
@@ -798,6 +818,7 @@ mod tests {
             "calls.endorsementsPublicKey",
             "chatFolders.list",
             "notificationProfiles.list",
+            "storyDistributionLists.list",
             "groups.generateInviteLinkPassword",
             "groups.buildInviteLink",
             "groups.parseInviteLink",
@@ -865,6 +886,7 @@ mod tests {
             "stories.downloadAttachment",
             "chatFolders.setRecords",
             "notificationProfiles.setRecords",
+            "storyDistributionLists.setRecords",
             "messages.deleteForMe",
         ];
         let mutating = [
@@ -932,6 +954,7 @@ mod tests {
             "stories.downloadAttachment",
             "chatFolders.setRecords",
             "notificationProfiles.setRecords",
+            "storyDistributionLists.setRecords",
             "messages.deleteForMe",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

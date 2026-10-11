@@ -8790,6 +8790,83 @@ bound pairs and the server handshake advertisement. Gated behind the
 full local gate suite (fmt + clippy -D warnings + cargo test + release
 build), all green.
 
+### 4.111 The story distribution lists reach the host: `storyDistributionLists.list` / `storyDistributionLists.setRecords` (contract revision 1.130, 2026-10-12)
+
+The engine's Stories 跨设备名单同步批 shipped the story-distribution-list
+face pair — the official StoryDistributionList record surface (manifest
+STORY_DISTRIBUTION_LIST=5, the official mergeStoryDistributionListRecord
+read/write faces, the story-audience picker's own sync pipe). This batch
+wires both into the host contract as `storyDistributionLists.list` /
+`storyDistributionLists.setRecords`, advertised through the existing
+`stories` tag widened in place (the 1.82 no-new-bit discipline — the
+distribution lists are the story audience the §4.67 send faces
+address). Until now the desktop could send stories and manage the
+receive toggle but could not read or write its audience lists; the
+audience half of the story life cycle had no host leg. The wiring
+template is the §4.78 chat-folder batch verbatim — same lanes, same
+gates, same zero-local-footprint contract — with the identity key the
+official record carries: `identifier` (a uuid string), not `id`.
+
+**The shape.** `storyDistributionLists.list {accountId}` →
+`{lists: [...]}` — the engine's StoryDistributionListRecordJson entries
+verbatim (the official mergeStoryDistributionListRecord output face:
+`identifier` (uuid), `name` (a string that may be empty — the official
+tombstone posture is a cleared name plus cleared members plus a set
+`deletedAtTimestamp`), `recipientServiceIds` (service-id strings, ACI
+uuid / PNI:uuid), `recipientServiceIdsBinary` (standard-base64 binaries,
+16-byte ACI / 17-byte PNI), `deletedAtTimestamp` (always present, 0 =
+live), `allowsReplies`, `isBlockList`). The two member faces project
+independently — the official read face's binary-first/string-fallback
+is a merge-cost decision the caller owns; the engine surfaces both
+verbatim and the connector does not merge them. My Story is the
+all-zero uuid projected like every other list, no special case. Read
+lane, non-mutating, metrics `read`; the array is capped at
+`MAX_STORY_DISTRIBUTION_LISTS` (64, the §4.78 cap verbatim) and entries
+without a usable identity (a string `identifier`) drop (the §4.34
+discipline).
+
+`storyDistributionLists.setRecords {accountId, records?, removeIds?}` →
+the same `{lists: [...]}` projection — the engine answers with the
+post-write manifest. Send lane, account-scoped mutating, metrics
+`send`, the reaction class: a definite upstream error propagates, an
+unknown outcome answers SEND_OUTCOME_UNKNOWN (retryable=false) and is
+never retried. Local gates (all INVALID_REQUEST, retryable=false)
+mirror the §4.78 ladder over the `identifier` key: at least one half
+non-empty, each half at most `MAX_STORY_LIST_BATCH` (64), every
+`records` entry an object carrying a non-empty string `identifier` of
+at most `MAX_STORY_LIST_ID_CHARS` (128), every `removeIds` entry a
+non-empty string of at most 128 chars — the identity face only; the
+record grammar (the uuid word, the service-id vocabularies both faces)
+stays the engine's audit, never a local re-derivation. The upstream
+frame carries only the non-empty half, values verbatim.
+
+**Zero local footprint, idempotency, and the error face** are the
+§4.78/§4.110 contract verbatim (no record content in the connector
+store, the resolved upstream `account` the only frame addition, the
+engine's own upload semantics the whole idempotency story, and the
+transparent STORAGE_* / UPSTREAM_ERROR error faces). The ladder order
+holds (shape gates → resolve_account → engine).
+
+Tests: the service unit pins the prepare ladder (the batch caps, the
+`identifier` identity face, the removeId bounds, the at-least-one rule,
+the resolved non-empty-half frame); the methods-table test pins the
+lane and mutating classification; the integration tests
+(`tests/story_distribution_lists.rs`: `story_list_faces_pass_through_verbatim`
+— My Story's all-zero uuid and the custom list's both member faces read
+byte-faithfully, a records-only write crossing verbatim and reading
+back the post-write manifest, a removeIds-only write reading back the
+shrunk manifest;
+`story_list_error_ladder_rides_the_wire` — the three markers plus the
+engine's non-uuid grammar refusal degrading to UPSTREAM_ERROR;
+`story_list_gates_answer_locally` — the at-least-one rule, the
+identity face over `identifier`, the 129-char bounds, the 65-entry
+batches, the ladder, the engine-unknown account;
+`story_list_crash_answers_unknown_and_never_retries` — the crash
+sentinel with exactly one dispatch frame); plus the
+schema-consistency bound pairs and the server handshake advertisement.
+Gated behind the full local gate suite (fmt + clippy -D warnings +
+cargo test + release build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

@@ -924,6 +924,27 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Story-distribution-list sync (contract revision 1.130, §4.111): the
+    /// §4.78 routing shape — the list records live in the account's storage
+    /// session, so both faces route through the account's owning engine.
+    pub async fn story_distribution_lists_list(
+        &self,
+        params: crate::service::StoryDistributionListsListParams,
+    ) -> Result<crate::service::StoryDistributionListSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.story_distribution_lists_list(params).await
+    }
+
+    pub async fn story_distribution_lists_set_records(
+        &self,
+        params: crate::service::StoryDistributionListsSetRecordsParams,
+    ) -> Result<crate::service::StoryDistributionListSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .story_distribution_lists_set_records(params)
+            .await
+    }
+
     /// Account settings writes (contract 1.46, §4.45): account-record state —
     /// the writes live in the account's storage session, so all three route
     /// through the account's owning engine like every other mutating face.

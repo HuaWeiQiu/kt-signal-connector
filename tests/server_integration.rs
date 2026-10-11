@@ -4463,6 +4463,8 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "notificationProfiles.list",
         "notificationProfiles.setRecords",
         "notification-profiles",
+        "storyDistributionLists.list",
+        "storyDistributionLists.setRecords",
         "groups.update",
         "groups.quit",
         "group-management",

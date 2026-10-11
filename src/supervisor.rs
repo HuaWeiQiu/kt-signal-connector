@@ -48,8 +48,9 @@ use crate::service::{
     StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
     StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled,
     StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
-    UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
+    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, StorySendRecipientResult, StorySendResult,
+    StorySendSuccess, UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
     account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
     chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
     group_create_result_from_engine, group_invite_join_status_from_engine,
@@ -58,7 +59,7 @@ use crate::service::{
     notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
     store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
     store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -3190,6 +3191,72 @@ impl RuntimeSupervisor {
             Ok(result) => Ok(notification_profile_syncs_result(
                 result
                     .get("profiles")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// storyDistributionLists.list (contract revision 1.130, §4.111): the
+    /// §4.78 read shape — bounds and account resolution under the service
+    /// lock, then the read-only engine call; the list projects straight
+    /// from the engine result with the KT entry cap, record bodies
+    /// verbatim.
+    pub async fn story_distribution_lists_list(
+        &self,
+        params: StoryDistributionListsListParams,
+    ) -> Result<StoryDistributionListSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_story_distribution_lists_list(&params.account_id)?
+        };
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("storyDistributionLists.list", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(story_distribution_lists_result(
+            result
+                .get("lists")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
+    }
+
+    /// storyDistributionLists.setRecords (contract revision 1.130,
+    /// §4.111): the §4.78 write shape — bounds under the service lock, then
+    /// the mutating engine call with the reaction-class unknown-outcome
+    /// discipline; the success result is the post-write cloud state read
+    /// back, not a local echo.
+    pub async fn story_distribution_lists_set_records(
+        &self,
+        params: StoryDistributionListsSetRecordsParams,
+    ) -> Result<StoryDistributionListSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_story_distribution_lists_set_records(
+                &params.account_id,
+                params.records.as_deref().unwrap_or(&[]),
+                params.remove_ids.as_deref().unwrap_or(&[]),
+            )?
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call(
+                "storyDistributionLists.setRecords",
+                upstream,
+                CallClass::Mutating,
+            )
+            .await
+        {
+            Ok(result) => Ok(story_distribution_lists_result(
+                result
+                    .get("lists")
                     .and_then(Value::as_array)
                     .ok_or(ServiceError::Engine(EngineError::Protocol))?,
             )),
