@@ -7713,6 +7713,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -7816,6 +7817,7 @@ mod tests {
                 expire_start_at: None,
                 control: None,
                 server_guid: None,
+                server_timestamp: None,
             })
             .await
             .unwrap();
@@ -8829,6 +8831,7 @@ mod tests {
             expire_seconds: Some(60),
             expire_start_at: Some(deadline_ms.saturating_sub(60_000)),
             server_guid: None,
+            server_timestamp: None,
         }
     }
 
@@ -9788,6 +9791,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             assert!(
                 store

@@ -412,6 +412,14 @@ pub struct NormalizedReceive {
     /// serialized; absent on envelopes without the key.
     #[serde(skip)]
     pub server_guid: Option<String>,
+    /// Envelope `serverTimestamp` (contract revision 1.128, §4.109): the
+    /// server-recorded receive time in epoch milliseconds — the 48h edit
+    /// window's judgment input on the engine face and the message row's
+    /// server-time key. The engine projects it on every receive envelope
+    /// (proto 缺省 0 = the official `?? 0n` unknown sentinel, stored as
+    /// NULL); connector-internal, never serialized.
+    #[serde(skip)]
+    pub server_timestamp: Option<u64>,
 }
 
 /// Inbound quote snapshot: the quoted message's upstream identity plus a
@@ -4545,6 +4553,16 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+    // The server-time key (contract revision 1.128, §4.109): the engine
+    // projects `serverTimestamp` on every receive envelope — the
+    // server-recorded receive time (P15c 项5, the official event face's
+    // same-position key). The proto-absent envelope still projects 0 (the
+    // official `?? 0n` sentinel), so 0 folds to None here — an unknown
+    // server time stores as NULL, never as the epoch.
+    let server_timestamp = envelope
+        .get("serverTimestamp")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
 
     let make = |timestamp: Option<u64>,
                 content_kind: &'static str,
@@ -4576,6 +4594,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         expire_seconds: None,
         expire_start_at: None,
         server_guid: server_guid.clone(),
+        server_timestamp,
     };
 
     // Typing and body-less reaction / remote-delete receives carry no message
@@ -5249,6 +5268,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         let mut admitted = 0;
@@ -5655,6 +5675,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         let mut admitted = 0;
@@ -5706,6 +5727,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         while matches!(
@@ -8628,6 +8650,48 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(blank.server_guid.is_none());
+    }
+
+    /// Contract 1.128 (§4.109): the envelope `serverTimestamp` key (P15c
+    /// 项5, the engine projects it on every receive envelope) lands on the
+    /// normalized receive as the row's server-time key. A positive value
+    /// rides verbatim; the proto-absent projection's 0 (the official `?? 0n`
+    /// unknown sentinel) folds to None — an unknown server time stores as
+    /// NULL, never as the epoch; an absent key stores None the same way.
+    #[test]
+    fn receive_captures_server_timestamp() {
+        let normalized = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "serverTimestamp": 1_700_000_004_321u64,
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(normalized.server_timestamp, Some(1_700_000_004_321));
+        let zero = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "serverTimestamp": 0,
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(zero.server_timestamp, None);
+        let absent = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": { "message": "hi" },
+            },
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(absent.server_timestamp, None);
     }
 
     /// Contract 1.42 (§4.41): a dataMessage states its conversation's

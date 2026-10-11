@@ -101,6 +101,7 @@ fn seed_direct_history(store: &Store, account_id: &str) {
         sender_name: None,
         mentions_self: false,
         server_guid: None,
+        server_timestamp: None,
         sent_at: 1_000,
         received_at: Some(1_005),
         text: Some("hello from alice".into()),

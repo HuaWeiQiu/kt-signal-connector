@@ -754,6 +754,7 @@ impl<'a> Importer<'a> {
             // The §4.38 archive frames carry no server GUID — the report face
             // stays a live-receive surface; imported rows keep NULL (§4.48).
             server_guid: None,
+            server_timestamp: None,
         };
         let preview = record
             .text
@@ -860,6 +861,7 @@ impl<'a> Importer<'a> {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let preview = Some(text.chars().take(120).collect::<String>());
         self.batch.push(HistoryImportInsert {
@@ -962,6 +964,7 @@ impl<'a> Importer<'a> {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let preview = Some(text.chars().take(120).collect::<String>());
         self.batch.push(HistoryImportInsert {
@@ -2666,6 +2669,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(store.insert_message(&live, None, None, true).unwrap());
 

@@ -2689,6 +2689,7 @@ impl ConnectorService {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let inserted = self
             .store
@@ -2817,6 +2818,7 @@ impl ConnectorService {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -7412,6 +7414,10 @@ impl ConnectorService {
             // envelope key too when the engine projected one (the sync shape
             // shares the public metadata), honest verbatim.
             server_guid: receive.server_guid,
+            // The server-time key (contract revision 1.128, §4.109): the
+            // envelope's server-recorded receive time rides the row the same
+            // honest verbatim way (the 48h edit-window judgment input).
+            server_timestamp: receive.server_timestamp,
         };
         let preview = message
             .text
@@ -8364,6 +8370,7 @@ impl ConnectorService {
                     expire_seconds: None,
                     expire_start_at: None,
                     server_guid: receive.server_guid,
+                    server_timestamp: receive.server_timestamp,
                 };
                 let preview = message
                     .text
@@ -13636,6 +13643,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         }
     }
 
@@ -14865,6 +14873,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -14935,6 +14944,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -15415,6 +15425,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(sync_receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -15546,6 +15557,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         let first = receive("peer-a", "first");
@@ -15616,6 +15628,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(
             !service
@@ -15657,6 +15670,7 @@ mod tests {
             text: Some("好的".into()),
             text_bytes: Some(6),
             server_guid: None,
+            server_timestamp: None,
             ..receive
         };
         assert!(
@@ -15698,6 +15712,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         assert!(
@@ -15977,6 +15992,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -16179,6 +16195,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -16368,6 +16385,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -16489,6 +16507,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -16619,6 +16638,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -16899,6 +16919,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -17043,6 +17064,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -17220,6 +17242,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -17726,6 +17749,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -18397,6 +18421,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         for record in [
             base("m-view-in", &conversation.id, "incoming"),
@@ -21115,6 +21140,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
@@ -21177,6 +21203,7 @@ mod tests {
                 expire_seconds: None,
                 expire_start_at: None,
                 server_guid: None,
+                server_timestamp: None,
             }
         };
         let opaque = |payload: Value| crate::engine::ControlReceive::Call {
@@ -22266,6 +22293,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let story_reply_receive = crate::engine::NormalizedReceive {
             timestamp: Some(1727000001000),
@@ -22294,6 +22322,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         // Enabled (the official default): the story forwards, the reply
@@ -22416,6 +22445,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
@@ -23119,6 +23149,7 @@ mod tests {
             expire_start_at: None,
             control: Some(control),
             server_guid: None,
+            server_timestamp: None,
         }
     }
 
@@ -23223,6 +23254,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             assert!(
                 service
@@ -23384,6 +23416,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             assert!(
                 service
@@ -24112,6 +24145,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             assert!(
                 service
@@ -24223,6 +24257,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             assert!(
                 service
@@ -24332,6 +24367,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             assert!(
                 service
@@ -24427,6 +24463,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(
             service
@@ -24494,6 +24531,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(
             service
@@ -24880,6 +24918,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
@@ -24946,6 +24985,7 @@ mod tests {
                 expire_start_at: None,
                 control: None,
                 server_guid: None,
+                server_timestamp: None,
             };
             service
                 .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25062,6 +25102,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25135,6 +25176,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25250,6 +25292,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25337,6 +25380,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25413,6 +25457,7 @@ mod tests {
                 expire_start_at: None,
                 control: None,
                 server_guid: None,
+                server_timestamp: None,
             };
             service
                 .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25571,6 +25616,7 @@ mod tests {
                     expire_start_at: None,
                     control: None,
                     server_guid: None,
+                    server_timestamp: None,
                 },
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
@@ -25796,6 +25842,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
@@ -25941,6 +25988,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
@@ -26025,6 +26073,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
@@ -26115,6 +26164,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
@@ -26198,6 +26248,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
@@ -26624,6 +26675,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(timer_change.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -26671,6 +26723,7 @@ mod tests {
             text: Some("已更新消息定时消失：已关闭".into()),
             expire_seconds: None,
             server_guid: None,
+            server_timestamp: None,
             ..timer_change
         };
         let events = service
@@ -27738,6 +27791,7 @@ mod tests {
             expire_start_at: None,
             control: None,
             server_guid: None,
+            server_timestamp: None,
         };
         let events = service
             .ingest_receive(group_update.clone(), crate::DEFAULT_PROXY_GROUP_ID)
@@ -27776,6 +27830,7 @@ mod tests {
                 ..Default::default()
             }),
             server_guid: None,
+            server_timestamp: None,
             ..group_update.clone()
         };
         let events = service
@@ -27808,6 +27863,7 @@ mod tests {
                 ..Default::default()
             }),
             server_guid: None,
+            server_timestamp: None,
             ..group_update
         };
         let events = service
@@ -27861,6 +27917,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            server_timestamp: None,
             peer_name: None,
             group_id: Some("group-id-1".into()),
             text: None,
@@ -28031,6 +28088,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            server_timestamp: None,
             peer_name: None,
             group_id: Some("group-id-1".into()),
             text: None,
@@ -28125,6 +28183,7 @@ mod tests {
                     source: None,
                     source_uuid: None,
                     server_guid: None,
+                    server_timestamp: None,
                     peer_name: None,
                     group_id: Some("dW5rbm93bi1ncm91cA==".into()),
                     text: None,
@@ -28181,6 +28240,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            server_timestamp: None,
             peer_name: None,
             group_id: None,
             text: None,
@@ -28330,6 +28390,7 @@ mod tests {
             source: None,
             source_uuid: None,
             server_guid: None,
+            server_timestamp: None,
             peer_name: None,
             group_id: None,
             text: None,

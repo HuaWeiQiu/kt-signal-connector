@@ -8659,6 +8659,44 @@ line (crash-in-flight answers SEND_OUTCOME_UNKNOWN across the restart,
 exactly one crashing frame). Gated behind the full local gate suite
 (fmt + clippy -D warnings + cargo test + release build), all green.
 
+### 4.109 The envelope's server time lands in the store: `serverTimestamp` ingest (contract revision 1.128, 2026-10-12)
+
+The engine's P15c 项5 batch started projecting `Envelope.serverTimestamp`
+— the server-recorded receive time in epoch milliseconds (the official
+event face's same-position key, `MessageReceiver.preload.ts:1178`) — on
+every receive envelope, wire-additive: the proto-absent envelope still
+projects 0 (the official `?? 0n` sentinel), the engine never invents and
+never omits the key. This batch consumes it on the connector's receive
+side as a store key: the normalized receive captures the value, and the
+message row persists it — the 48h edit-window judgment input the engine
+face documents, and the row's server-time key for the consumers that
+follow (schema v22, `SCHEMA_VERSION` 21→22).
+
+**The shape.** No new method, no wire face: the key is connector-
+internal (`#[serde(skip)]` both on the normalized receive and the
+message record — the desktop never sees it), captured at receive
+(a positive value rides verbatim), folded at the sentinel (a projected
+0 is the unknown server time and stores NULL — never the epoch, the
+same honesty the `?? 0n` fallback encodes), absent on every row that
+predates the key (the v22 `ALTER TABLE` migration adds the nullable
+column in place; pre-1.128 rows, history-import rows, and outgoing
+mirror rows without an envelope are never backfilled — the server time
+a past envelope carried was only knowable from the envelope itself,
+and inventing one would corrupt the edit-window judgment the key
+feeds).
+
+Tests: the engine unit pins the three capture faces (positive verbatim,
+the 0 sentinel folding to None, the absent key to None); the store unit
+pins the v22 upgrade (the pre-1.128 schema in place, the column added,
+the version stamped) and the round-trip (a stamped row reads verbatim,
+an unstamped row reads NULL); the integration face stays honest — the
+key has no wire observation point on this connector (the consumer is
+the engine-side edit window), so the store-level units carry the proof
+and the receive path's behavior tests (the fixture envelopes already
+exercise ingest) cover the lane. Gated behind the full local gate
+suite (fmt + clippy -D warnings + cargo test + release build), all
+green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

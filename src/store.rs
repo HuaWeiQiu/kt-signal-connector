@@ -13,7 +13,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS messages (
   expire_start_at INTEGER,
   expire_at INTEGER,
   server_guid TEXT,
+  server_timestamp INTEGER,
   edited_at INTEGER,
   sender_name TEXT,
   mentions_self INTEGER NOT NULL DEFAULT 0,
@@ -959,6 +960,14 @@ pub struct MessageRecord {
     /// pre-1.49 rows and envelopes without the key (never backfilled).
     #[serde(skip)]
     pub server_guid: Option<String>,
+    /// The server-recorded receive time the receive envelope carried
+    /// (contract revision 1.128, §4.109, epoch milliseconds): the 48h edit
+    /// window's judgment input on the engine face and the row's server-time
+    /// key. Connector-internal — never serialized onto the wire. NULL on
+    /// pre-1.128 rows, history-import rows, and envelopes whose projection
+    /// folded the proto-absent 0 to unknown (never backfilled).
+    #[serde(skip)]
+    pub server_timestamp: Option<u64>,
 }
 
 /// One prior body of an edited message (contract 1.32): the text the edit
@@ -2175,7 +2184,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -2260,7 +2269,7 @@ impl Store {
                     AdjacentMediaDirection::Older => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
@@ -2270,7 +2279,7 @@ impl Store {
                     AdjacentMediaDirection::Newer => {
                         "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                                 body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                                quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                          FROM messages
                          WHERE account_id=?1 AND conversation_id=?2
                            AND (sent_at > ?3 OR (sent_at = ?3 AND id > ?4))
@@ -2355,7 +2364,7 @@ impl Store {
                 .prepare(
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                             body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                      FROM messages
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
@@ -2395,7 +2404,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages WHERE account_id=?1 AND client_request_id=?2",
                 params![account_id, client_request_id],
                 message_record_from_row,
@@ -2415,7 +2424,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
                 message_record_from_row,
@@ -2443,7 +2452,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction=?3 AND sent_at=?4
                    AND sender_id IN (?5, ?6)
@@ -2496,8 +2505,8 @@ impl Store {
                     stored_at, body, body_bytes, body_truncated, status, client_request_id,
                     quote_message_id, quote_snapshot, attachments_json, live_attachment_locators,
                     rich_json, edited_at, sender_name,
-                    mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                    mentions_self, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?14, ?8, ?9, ?10, ?11, ?12, ?13, ?15, ?16, ?17, ?19, ?18, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
                 params![
                     message.id,
                     message.account_id,
@@ -2550,6 +2559,7 @@ impl Store {
                     message.expire_start_at.map(|value| value as i64),
                     expire_deadline(message, stored_at).map(|value| value as i64),
                     message.server_guid,
+                    message.server_timestamp.map(|value| value as i64),
                 ],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -2705,7 +2715,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2743,7 +2753,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2836,7 +2846,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND sender_id IN (?4, ?5)
@@ -2912,7 +2922,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages WHERE id=?1",
                 params![message_id],
                 message_record_from_row,
@@ -2985,7 +2995,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                    AND direction='outgoing'
@@ -3044,7 +3054,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3 AND sender_id=?4
                  ORDER BY id ASC LIMIT 1",
@@ -3165,7 +3175,7 @@ impl Store {
             .query_row(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                  ORDER BY id ASC LIMIT 1",
@@ -3774,9 +3784,9 @@ impl Store {
                         client_request_id, quote_message_id, quote_snapshot, attachments_json,
                         attachment_locators, rich_json, edited_at, sender_name, mentions_self,
                         sticker_json, expire_seconds, expire_start_at, expire_at, server_guid,
-                        admin_deleted
+                        server_timestamp, admin_deleted
                      ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, NULL, ?12,
-                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL, ?23)",
+                              ?13, ?14, ?21, ?20, NULL, ?15, ?16, ?22, ?17, ?18, ?19, NULL, NULL, ?23)",
                     params![
                             record.id,
                             record.account_id,
@@ -3880,7 +3890,7 @@ impl Store {
                     m.body, m.body_bytes, m.body_truncated, m.status, m.quote_message_id, m.client_request_id,
                     m.quote_snapshot, m.attachments_json, m.rich_json, m.edited_at, m.sender_name, m.mentions_self,
                     m.delivered_at, m.read_at, m.admin_deleted, m.sticker_json,
-                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.viewed_at
+                    m.expire_seconds, m.expire_start_at, m.expire_at, m.server_guid, m.server_timestamp, m.viewed_at
              FROM messages m
              JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
              WHERE m.account_id = ?1 AND m.sent_at = ?2 AND m.rich_json IS NOT NULL
@@ -3962,7 +3972,7 @@ impl Store {
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self,
-                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3",
                 params![message_id, account_id, conversation_id],
@@ -4059,7 +4069,7 @@ impl Store {
                     "SELECT id, account_id, conversation_id, direction, sender_id, sent_at,
                             received_at, body, body_bytes, body_truncated, status,
                             quote_message_id, client_request_id, quote_snapshot,
-                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                            attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                      FROM messages
                      WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
                        AND direction='outgoing'
@@ -4105,6 +4115,7 @@ impl Store {
                             viewed_confirmed.push(MessageRecord {
                                 viewed_at: Some(when),
                                 server_guid: None,
+                                server_timestamp: None,
                                 ..record
                             });
                         }
@@ -4151,6 +4162,7 @@ impl Store {
                         read_at,
                         viewed_at,
                         server_guid: None,
+                        server_timestamp: None,
                         ..record
                     });
                 }
@@ -4256,7 +4268,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming' AND sent_at=?3",
             )
@@ -4399,7 +4411,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                  ORDER BY sent_at ASC, id ASC
@@ -4433,7 +4445,7 @@ impl Store {
             .prepare(
                 "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
-                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, viewed_at
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE id=?1 AND account_id=?2 AND conversation_id=?3 AND direction='incoming'",
             )
@@ -6418,6 +6430,23 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 22 {
+        // Contract revision 1.128 (§4.109): the envelope's server-recorded
+        // receive time (P15c 项5, the engine projects it on every receive
+        // envelope). One additive nullable column — pre-1.128 rows, history
+        // import rows, and envelopes whose proto-absent projection folded to
+        // the unknown sentinel store NULL and are never backfilled: the
+        // server time a past envelope carried was only knowable from the
+        // envelope itself, and inventing one would corrupt the edit-window
+        // judgment the key feeds.
+        if !table_has_column(conn, "messages", "server_timestamp")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN server_timestamp INTEGER",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -6897,7 +6926,7 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         edits: Vec::new(),
         delivered_at: row.get::<_, Option<i64>>(19)?.map(|value| value as u64),
         read_at: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
-        viewed_at: row.get::<_, Option<i64>>(27)?.map(|value| value as u64),
+        viewed_at: row.get::<_, Option<i64>>(28)?.map(|value| value as u64),
         admin_deleted: row.get::<_, i64>(21)? != 0,
         sticker: row
             .get::<_, Option<String>>(22)?
@@ -6909,6 +6938,9 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
             .get::<_, Option<i64>>(24)?
             .map(|value| value.max(0) as u64),
         server_guid: row.get(26)?,
+        server_timestamp: row
+            .get::<_, Option<i64>>(27)?
+            .map(|value| value.max(0) as u64),
     })
 }
 
@@ -7326,6 +7358,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(
             store
@@ -7394,6 +7427,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
 
         let mut rich = base("rich-1");
@@ -7570,6 +7604,7 @@ mod tests {
                 expire_seconds: None,
                 expire_start_at: None,
                 server_guid: None,
+                server_timestamp: None,
             }
         };
         let insert = |message: &MessageRecord| {
@@ -7777,6 +7812,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
         // Same sent_at as the anchor: id below the anchor is older, id above
         // is newer — the tiebreak matches list_messages' keyset order.
@@ -7896,6 +7932,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         for (id, sent_at, direction) in [
             ("m3", 30, "incoming"),
@@ -8327,6 +8364,7 @@ mod tests {
             expire_seconds: None,
             expire_start_at: None,
             server_guid: None,
+            server_timestamp: None,
         };
 
         let mut sticker_row = base("sticker-row", 60);
@@ -8440,6 +8478,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(
             store
@@ -8603,6 +8642,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         assert!(
             store
@@ -8704,6 +8744,7 @@ mod tests {
                     expire_start_at: None,
                     admin_deleted: false,
                     server_guid: None,
+                    server_timestamp: None,
                 };
                 store.insert_message(&message, None, text, false).unwrap();
             };
@@ -8843,6 +8884,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store.insert_message(&message, None, text, false).unwrap();
         };
@@ -9029,6 +9071,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -9143,6 +9186,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store
                 .insert_message(&message, None, None, increment_unread)
@@ -9254,6 +9298,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store.insert_message(&plain, None, None, true).unwrap();
 
@@ -9289,6 +9334,7 @@ mod tests {
                 ..Default::default()
             }),
             server_guid: None,
+            server_timestamp: None,
             ..plain.clone()
         };
         store.insert_message(&mentioned, None, None, true).unwrap();
@@ -9352,6 +9398,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(
@@ -9456,6 +9503,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
 
         assert!(matches!(
@@ -9528,6 +9576,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("hello"), true)
@@ -9605,6 +9654,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("control notice"), false)
@@ -9666,6 +9716,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("body"), false)
@@ -9743,6 +9794,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -9837,6 +9889,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -9937,6 +9990,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             let increment_unread = direction == "incoming";
             store
@@ -10043,6 +10097,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store
                 .insert_message(&message, None, Some(id), false)
@@ -10124,6 +10179,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&changed, None, Some("newer-message-2"), false)
@@ -10179,6 +10235,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&other_message, None, Some("other-message"), false)
@@ -10275,6 +10332,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             if id == "attachment-only" {
                 message.text = None;
@@ -10374,6 +10432,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         }
@@ -10475,6 +10534,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
 
@@ -11077,6 +11137,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -11153,6 +11214,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -11249,6 +11311,7 @@ mod tests {
                     expire_start_at: None,
                     admin_deleted: false,
                     server_guid: None,
+                    server_timestamp: None,
                 };
                 store
                     .insert_message(&message, None, Some("body"), true)
@@ -11402,6 +11465,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, Some("request-pending"), Some("body"), false)
@@ -11479,6 +11543,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&recent, None, Some("body"), true)
@@ -11551,6 +11616,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -11626,6 +11692,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -12053,6 +12120,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("hello"), false)
@@ -12103,6 +12171,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&message, None, Some("v0"), true)
@@ -12358,6 +12427,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
         // FK 合法的幽灵行：账户存在、会话存在，但 account 归属另一账户。
@@ -12501,6 +12571,7 @@ mod tests {
                 expire_start_at: None,
                 admin_deleted: false,
                 server_guid: None,
+                server_timestamp: None,
             };
         for record in [
             base("m-incoming", &peer.id, "incoming", true),
@@ -12621,6 +12692,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         store
             .insert_message(&record, None, Some("self-destructing"), true)
@@ -12691,6 +12763,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         }
     }
 
@@ -12996,6 +13069,133 @@ mod tests {
         assert_eq!(guids, vec![Some("guid-one".to_string()), None, None]);
     }
 
+    /// Schema v22 (contract revision 1.128, §4.109): the
+    /// `server_timestamp` column upgrades in place from a pre-1.128 store,
+    /// pre-existing rows stay NULL (never backfilled), and a stamped row
+    /// round-trips through insert + read with the value verbatim.
+    #[test]
+    fn schema_v22_upgrade_adds_server_timestamp_column() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '21');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               proxy_group TEXT NOT NULL DEFAULT 'default'
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               last_message_preview TEXT,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               unread_mentions INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               expire_timer_seconds INTEGER,
+               UNIQUE(account_id, kind, peer_key),
+               FOREIGN KEY(account_id) REFERENCES accounts(id)
+             );
+             CREATE TABLE history_import_stage_chats (
+               account_id TEXT NOT NULL,
+               id INTEGER NOT NULL,
+               recipient_id INTEGER NOT NULL,
+               expire_timer_ms INTEGER,
+               PRIMARY KEY(account_id, id),
+               FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               viewed_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "server_timestamp").unwrap());
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The server-time key (contract revision 1.128, §4.109): a receive
+    /// envelope's `serverTimestamp` lands on the row verbatim and reads back
+    /// through the projection; a row without the key reads NULL — never
+    /// backfilled, never invented.
+    #[test]
+    fn server_timestamp_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Peer")
+            .unwrap();
+        let mut stamped = expire_record("m1", &account.id, &conversation.id);
+        stamped.server_timestamp = Some(1_700_000_004_321);
+        store.insert_message(&stamped, None, None, true).unwrap();
+        let plain = expire_record("m2", &account.id, &conversation.id);
+        store.insert_message(&plain, None, None, true).unwrap();
+
+        let fetched = store
+            .message_by_id(&account.id, &conversation.id, "m1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fetched.server_timestamp, Some(1_700_000_004_321));
+        let unstamped = store
+            .message_by_id(&account.id, &conversation.id, "m2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unstamped.server_timestamp, None);
+    }
+
     /// The sweep deadline picks the honest countdown start — the engine's
     /// start stamp when stated, else the receive time, else the store's own
     /// insert clock — and rows without a live timer never get one.
@@ -13286,6 +13486,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         }
     }
 
@@ -13530,6 +13731,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         for (id, sent_at, status) in [
             ("m-400", 400, "sent"),
@@ -13665,6 +13867,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         for (id, sent_at, direction) in [
             ("m-in-1", 500, "incoming"),
@@ -13768,6 +13971,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         for (id, sent_at, direction) in [
             ("m-in-1", 500, "incoming"),
@@ -13876,6 +14080,7 @@ mod tests {
             expire_start_at: None,
             admin_deleted: false,
             server_guid: None,
+            server_timestamp: None,
         };
         for (id, sent_at, direction) in [
             ("m-in-old", 500, "incoming"),
