@@ -6538,6 +6538,43 @@ the sent-sync shared parser, the legacy-row deserialize); the service roundtrip
 (`inbound_quote_and_attachment_metadata_roundtrip_through_the_store` — the quoted
 metadata end-to-end through SQLite, the thumbnail's locator half staying internal).
 
+#### D5 — device-capability registration read (`accounts.deviceCapabilities`)
+
+The engine's KT-extension device face: the idempotent device-capability registration
+(the official `registerCapabilities` endpoint, PUT — repeating the call repeats the
+same server-side declaration, the official every-start semantics) with the upload
+read-back the host can query. Consumption — a read face with one hard rule, the bare
+identity never crosses the connector:
+
+- **Routing**: the standard account ladder (`accounts.deviceCapabilities {accountId}`);
+  `Lane::Read` with account-scoped mutating serialization (the `contacts.sync`
+  precedent — the upstream face is a PUT), advertised through the method table; the
+  engine call rides `CallClass::ReadOnly` (the declaration is idempotent, an
+  indeterminate outcome carries no account-state risk).
+- **Projection**: the engine answers `{account, registered, capabilities}` — the
+  connector strips the `account` key and answers `{registered, capabilities}`; a bare
+  identity never crosses the connector (the §4.13 metadata discipline at identity
+  scale). The capability bits ride verbatim — the connector invents no keys and
+  strips none (the official CapabilitiesUploadType key set, additive); the result
+  face carries coarse bounds (16 entries, 4 KiB) that only a hostile or broken
+  engine face trips, and an oversized face is a protocol defect, never a truncated
+  lie. A missing or non-bool `registered`, a missing or non-object `capabilities`
+  answers `UPSTREAM_PROTOCOL_ERROR`.
+- **Errors**: the engine folds every failure — unknown/unregistered account, the 401
+  unlink, any other server failure — into the plain `-32603`; the connector adds no
+  matcher of its own and the face answers `UPSTREAM_ERROR`. The §4.17
+  unlink-classification chain stays the engine-event worker's job; this face extends
+  no anchor set (the generic call-site matcher applies as to every call, nothing
+  more). No local persistence, no events.
+
+Tests: the service unit (`device_capabilities_projection_strips_the_bare_identity` —
+the bare-identity strip, the bits verbatim, the defect ladder, the coarse bounds, the
+resolved-account prepare frame); the wire face
+(`device_capabilities_strips_the_bare_identity` — the end-to-end answer without the
+`account` key, the resolved-account upstream frame on the dispatch log, the
+ACCOUNT_NOT_FOUND / INVALID_REQUEST ladder); the schema method enumeration and the
+params `$def` (`tests/schema_consistency.rs`).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

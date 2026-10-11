@@ -940,6 +940,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.get_blocked_conversations(params).await
     }
 
+    /// accounts.deviceCapabilities (contract revision 1.100, §4.81): the
+    /// device-face registration is the account's own upstream state, so the
+    /// read routes through the account's owning engine.
+    pub async fn get_device_capabilities(
+        &self,
+        params: crate::service::AccountsDeviceCapabilitiesParams,
+    ) -> Result<crate::service::AccountDeviceCapabilities, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_device_capabilities(params).await
+    }
+
     /// accounts.setUsername (contract 1.59, §4.55): the username is
     /// account-record upstream state, so the write routes through the
     /// account's owning engine like every other mutating face.

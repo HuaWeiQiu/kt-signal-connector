@@ -1138,6 +1138,27 @@ for line in sys.stdin:
                 "username": "fixture_user.01",
                 "usernameLink": "https://signal.me/username/fixture-link",
             }
+    elif method == "engine.deviceCapabilities":
+        # Contract 1.100 §4.81 D5: the device-face registration probe. Record
+        # the exact upstream params (the test asserts the resolved account key
+        # and that the connector strips it from the host answer). The fixture
+        # answers the registered shape with the four official upload bits —
+        # the pinned DEVICE_CAPABILITIES_UPLOAD mirror the engine's own
+        # capabilities face projects (fake/real same-code-path, getUsername
+        # precedent).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        result = {
+            "account": params.get("account"),
+            "registered": True,
+            "capabilities": {
+                "attachmentBackfill": False,
+                "spqr": True,
+                "usernameChangeSyncMessage": True,
+                "optionalPhoneNumber": False,
+            },
+        }
     elif method == "usernameLookup":
         # Contract 1.74 §4.65: the kt-engine lookup route — the same top-level
         # array contract as the getUserStatus --username face (first entry

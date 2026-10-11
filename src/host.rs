@@ -25,9 +25,10 @@ use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
-    AccountDeleteLocalDataParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
-    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
-    BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
+    AccountDeleteLocalDataParams, AccountsDeviceCapabilitiesParams, AccountsGetUsernameParams,
+    AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsSetUsernameParams,
+    AccountsUpdateConfigurationParams, BackupsCloudStatusParams,
+    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
     BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
     BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsCreateLinkAuthParams,
@@ -1068,6 +1069,25 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid accounts.getUsername params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "accounts.deviceCapabilities" => {
+            match serde_json::from_value::<AccountsDeviceCapabilitiesParams>(request.params) {
+                Ok(params) => match runtime.get_device_capabilities(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.deviceCapabilities params",
                         false,
                     ),
                 ),

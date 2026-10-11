@@ -132,6 +132,13 @@ pub const USERNAME_LOOKUP_MAX_ENTRIES: usize = 20;
 /// and cross-checking `byteSize`, not by this length.
 pub const MAX_AVATAR_DATA_URI_CHARS: usize = 13_981_080;
 pub const MAX_BLOCKED_CONVERSATIONS: usize = 256;
+/// `accounts.deviceCapabilities` result-face bounds (contract revision
+/// 1.100, §4.81): the official upload body is four boolean capability bits
+/// today and grows additively — the coarse guards only trip on a hostile or
+/// broken engine face, and an oversized face drops whole (宁缺勿错, never a
+/// truncated lie).
+pub const MAX_DEVICE_CAPABILITY_ENTRIES: usize = 16;
+pub const MAX_DEVICE_CAPABILITIES_BYTES: usize = 4 * 1024;
 /// Call signaling (contract revision 1.50, §4.48): the `calls.sendSignal`
 /// shape gate. `type` is the five-value RingRTC frame-family enum, `callId`
 /// is a positive u32 (the legacy frames' `id` face and the state machines'
@@ -3373,6 +3380,19 @@ impl ConnectorService {
     /// storage records, the service reads nothing locally (no persistence on
     /// this face).
     pub fn prepare_conversations_get_blocked(
+        &self,
+        account_id: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// accounts.deviceCapabilities (contract revision 1.100, §4.81): account
+    /// bounds and existence — the device-face registration is the account's
+    /// own upstream state, the service reads nothing locally (no persistence
+    /// on this face).
+    pub fn prepare_accounts_device_capabilities(
         &self,
         account_id: &str,
     ) -> Result<Value, ServiceError> {
@@ -8023,6 +8043,19 @@ pub struct BlockedConversations {
     pub blocked: Vec<BlockedConversation>,
 }
 
+/// The §4.81 result of `accounts.deviceCapabilities` (contract revision
+/// 1.100): the device-face registration read-back — the engine's answer
+/// with the bare `account` identity stripped (a bare identity never crosses
+/// the connector). The capability bits ride verbatim: the connector invents
+/// no keys and strips none (the official CapabilitiesUploadType key set
+/// grows additively).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDeviceCapabilities {
+    pub registered: bool,
+    pub capabilities: Value,
+}
+
 /// The §4.47 result of `conversations.getAvatar` (contract revision 1.48):
 /// the decrypted avatar as a data URI (MIME sniffed engine-side from the
 /// magic bytes, `application/octet-stream` when unrecognized) plus the
@@ -8887,6 +8920,13 @@ pub struct AccountsSetExpireTimerParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationsGetBlockedParams {
+    pub account_id: String,
+}
+
+/// `accounts.deviceCapabilities` params (contract revision 1.100, §4.81).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsDeviceCapabilitiesParams {
     pub account_id: String,
 }
 
@@ -10353,6 +10393,38 @@ pub(crate) fn blocked_conversations_result(entries: &[Value]) -> BlockedConversa
         })
         .collect();
     BlockedConversations { blocked }
+}
+
+/// Project the engine's `engine.deviceCapabilities` answer onto the wire
+/// shape (contract revision 1.100, §4.81): the bare identity never crosses
+/// the connector — the `account` key drops here while `registered` and the
+/// capability bits stay. A missing or non-bool `registered`, a missing or
+/// non-object `capabilities`, or a face over the coarse bounds is a
+/// protocol defect, not an empty answer.
+pub(crate) fn account_device_capabilities_from_engine(
+    result: &Value,
+) -> Result<AccountDeviceCapabilities, ServiceError> {
+    let registered = result
+        .get("registered")
+        .and_then(Value::as_bool)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let capabilities = result
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    if capabilities.len() > MAX_DEVICE_CAPABILITY_ENTRIES {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    let capabilities = Value::Object(capabilities.clone());
+    if serde_json::to_string(&capabilities)
+        .is_ok_and(|material| material.len() > MAX_DEVICE_CAPABILITIES_BYTES)
+    {
+        return Err(ServiceError::Engine(EngineError::Protocol));
+    }
+    Ok(AccountDeviceCapabilities {
+        registered,
+        capabilities,
+    })
 }
 
 /// Project the engine's `listIdentities` answer onto the wire shape (contract
@@ -15883,6 +15955,77 @@ mod tests {
         let result = blocked_conversations_result(&mixed);
         assert_eq!(result.blocked.len(), 2);
         assert_eq!(result.blocked[1].kind, "legacyGroup");
+    }
+
+    /// Device-capability face (contract revision 1.100, §4.81): the engine
+    /// answer projects with the bare `account` identity stripped, the
+    /// deterministic defect ladder (missing/non-bool registered, missing/
+    /// non-object capabilities, over-bound faces), and the resolved-account
+    /// prepare frame.
+    #[test]
+    fn device_capabilities_projection_strips_the_bare_identity() {
+        let answer = json!({
+            "account": "+15555550100",
+            "registered": true,
+            "capabilities": {
+                "attachmentBackfill": false,
+                "spqr": true,
+                "usernameChangeSyncMessage": true,
+                "optionalPhoneNumber": false,
+            },
+        });
+        let projected = account_device_capabilities_from_engine(&answer).unwrap();
+        assert!(projected.registered);
+        assert_eq!(
+            projected.capabilities,
+            json!({
+                "attachmentBackfill": false,
+                "spqr": true,
+                "usernameChangeSyncMessage": true,
+                "optionalPhoneNumber": false,
+            }),
+            "the bits ride verbatim — the connector invents no keys and strips none"
+        );
+
+        // The defect ladder: a protocol answer, never an empty face.
+        for (label, broken) in [
+            ("missing-registered", json!({ "capabilities": {} })),
+            (
+                "non-bool-registered",
+                json!({ "registered": "yes", "capabilities": {} }),
+            ),
+            ("missing-capabilities", json!({ "registered": true })),
+            (
+                "non-object-capabilities",
+                json!({ "registered": true, "capabilities": ["spqr"] }),
+            ),
+        ] {
+            let error = account_device_capabilities_from_engine(&broken).unwrap_err();
+            assert_eq!(error.into_api().code, "UPSTREAM_PROTOCOL_ERROR", "{label}");
+        }
+
+        // The coarse bounds: an over-wide face drops whole (宁缺勿错).
+        let wide: serde_json::Map<String, Value> = (0..MAX_DEVICE_CAPABILITY_ENTRIES + 1)
+            .map(|index| (format!("bit{index}"), json!(true)))
+            .collect();
+        let error = account_device_capabilities_from_engine(&json!({
+            "registered": true,
+            "capabilities": wide,
+        }))
+        .unwrap_err();
+        assert_eq!(error.into_api().code, "UPSTREAM_PROTOCOL_ERROR");
+
+        // The prepare frame: the resolved account, never the opaque local id.
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let upstream = service
+            .prepare_accounts_device_capabilities(&account.id)
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        let error = service
+            .prepare_accounts_device_capabilities("no-such-account")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
     }
 
     /// Avatar face (contract revision 1.48, §4.47): the conversation

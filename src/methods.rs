@@ -295,6 +295,12 @@ pub const METHODS: &[MethodRow] = &[
     // account's own username/link straight from the upstream `updateAccount`
     // result shape — read lane, no mutation, no local persistence.
     ("accounts.getUsername", Lane::Read, false, "read"),
+    // Device-capability registration read (contract revision 1.100, §4.81):
+    // the idempotent device-face registration probe — a read-lane call that
+    // still serializes on the account mutex (the contacts.sync precedent:
+    // the upstream face is a PUT), no local persistence. The result strips
+    // the engine's bare `account` identity before it crosses the connector.
+    ("accounts.deviceCapabilities", Lane::Read, true, "accounts"),
     // Username lookup (contract revision 1.59, §4.55): upstream `getUserStatus
     // --username` passthrough (0.14.8 GetUserStatusCommand.java:41,69) — one
     // bounded cloud read, no mutation, no local state; the candidate bounds
@@ -619,6 +625,7 @@ mod tests {
             "contacts.sync",
             "contacts.list",
             "groups.get",
+            "accounts.deviceCapabilities",
             "stickerPacks.getManifest",
             "stickerPacks.getImage",
             "conversations.getPinned",
@@ -712,6 +719,7 @@ mod tests {
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "contacts.sync",
+            "accounts.deviceCapabilities",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "accounts.deleteLocalData",

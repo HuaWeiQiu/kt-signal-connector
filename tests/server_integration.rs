@@ -6896,6 +6896,105 @@ async fn account_settings_and_blocked_faces_round_trip() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.100 (§4.81 D5): the accounts.deviceCapabilities read
+/// face — the idempotent engine registration rides the resolved account, the
+/// host answer strips the engine's bare `account` identity (a bare identity
+/// never crosses the connector), the capability bits ride verbatim, and the
+/// ladder answers the deterministic failures.
+#[tokio::test]
+async fn device_capabilities_strips_the_bare_identity() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DeviceCapabilities" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+
+    let capabilities = request(
+        &mut client,
+        "device-capabilities",
+        "accounts.deviceCapabilities",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let result = &capabilities["result"];
+    assert_eq!(result["registered"], true);
+    // The pinned upload bits ride verbatim — the connector invents no keys
+    // and strips none.
+    assert_eq!(result["capabilities"]["attachmentBackfill"], false);
+    assert_eq!(result["capabilities"]["spqr"], true);
+    assert_eq!(result["capabilities"]["usernameChangeSyncMessage"], true);
+    assert_eq!(result["capabilities"]["optionalPhoneNumber"], false);
+    // The engine's bare `account` identity never crosses the connector.
+    assert!(result.get("account").is_none(), "{result}");
+
+    // The upstream frame carried the resolved account number (the fixture's
+    // dispatch log, the getUsername read-face discipline) — exactly the
+    // single-key frame the prepare face projects.
+    let frames: Vec<Value> = fs::read_to_string(&send_log_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| **frame == json!({ "account": "+15555550100" }))
+            .count(),
+        1,
+        "expected exactly one resolved-account frame: {frames:?}"
+    );
+
+    // The deterministic ladder: unknown account, malformed params.
+    let missing = request(
+        &mut client,
+        "capabilities-missing-account",
+        "accounts.deviceCapabilities",
+        json!({ "accountId": "no-such-account" }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+    let malformed = request(
+        &mut client,
+        "capabilities-malformed",
+        "accounts.deviceCapabilities",
+        json!({}),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.68: the §4.61 safety-number faces — identities.get
 /// (the pinned listIdentities read narrowed to the resolved peer reference,
 /// the honest empty-list no-identity face) and identities.verify (the pinned

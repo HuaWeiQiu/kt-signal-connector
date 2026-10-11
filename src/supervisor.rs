@@ -19,12 +19,13 @@ use crate::engine::{
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
-    AccountUsername, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
-    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUpdateConfigurationParams,
-    AttachmentSendTarget, AvatarDownload, BlockedConversations, CallsSendSignalParams,
-    ChatFolderSyncs, ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService,
-    ContactsSyncOutcome, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
-    ConversationsGetPinnedParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    AccountDeviceCapabilities, AccountUsername, AccountsDeviceCapabilitiesParams,
+    AccountsGetUsernameParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
+    AccountsSetUsernameParams, AccountsUpdateConfigurationParams, AttachmentSendTarget,
+    AvatarDownload, BlockedConversations, CallsSendSignalParams, ChatFolderSyncs,
+    ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
     ConversationsSetExpireTimerResult, ConversationsSetPinnedParams,
     GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
     GroupsApproveJoinRequestsParams, GroupsQuitParams, GroupsRevokeInvitesParams,
@@ -40,12 +41,12 @@ use crate::service::{
     StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled,
     StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
     StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
-    UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult, account_limit_error,
-    blocked_conversations_result, chat_folder_syncs_result, identity_from_engine,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
+    account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
+    chat_folder_syncs_result, identity_from_engine, pinned_conversations_result,
+    sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -3200,6 +3201,27 @@ impl RuntimeSupervisor {
                 .and_then(Value::as_array)
                 .ok_or(ServiceError::Engine(EngineError::Protocol))?,
         ))
+    }
+
+    /// accounts.deviceCapabilities (contract revision 1.100, §4.81): account
+    /// resolution then the read-only engine call — the idempotent device-face
+    /// registration (the official registerCapabilities endpoint, PUT — the
+    /// engine folds every failure into the plain -32603, the connector adds
+    /// no matcher of its own) — and the projection that strips the engine's
+    /// bare `account` identity before it crosses the connector.
+    pub async fn get_device_capabilities(
+        &self,
+        params: AccountsDeviceCapabilitiesParams,
+    ) -> Result<AccountDeviceCapabilities, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_device_capabilities(&params.account_id)?
+        };
+        let result = engine
+            .call("engine.deviceCapabilities", upstream, CallClass::ReadOnly)
+            .await?;
+        account_device_capabilities_from_engine(&result)
     }
 
     /// conversations.getAvatar (contract revision 1.48, §4.47, capability

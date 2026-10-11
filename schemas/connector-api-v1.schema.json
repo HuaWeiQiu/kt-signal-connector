@@ -48,6 +48,7 @@
             "accounts.updateConfiguration",
             "accounts.setUsername",
             "accounts.getUsername",
+            "accounts.deviceCapabilities",
             "username.lookup",
             "link.start",
             "link.finish",
@@ -229,6 +230,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/accountsGetUsernameParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.deviceCapabilities" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsDeviceCapabilitiesParams" }
             }
           }
         },
@@ -1280,6 +1292,15 @@
       "additionalProperties": false,
       "required": ["accountId"],
       "description": "Read the account's own username (contract revision 1.59, \u00a74.55; the face opened with contract 1.74, \u00a74.65; capability username). The face routes the engine's getUsername reader (the AccountRecord username(33)/usernameLink(35) storage truth, engine compat \u00a73) and answers {username, usernameLink} with both fields null when the account never set one \u2014 the unset state is the answer, not an error. Read lane.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "accountsDeviceCapabilitiesParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Register and read back the account's device-face capabilities (contract revision 1.100, \u00a74.81). The face dispatches the engine's idempotent deviceCapabilities registration (the official registerCapabilities endpoint, PUT \u2014 repeating the call repeats the same server-side declaration, the official every-start semantics) and answers {registered, capabilities}: the engine's bare account identity never crosses the connector (the answer strips the account key), and the capability bits ride verbatim \u2014 the connector invents no keys and strips none (the official CapabilitiesUploadType key set, additive). Every engine failure folds to UPSTREAM_ERROR (unknown/unregistered account, 401 unlink, server failure all collapse engine-side); this face extends no matcher of its own \u2014 the \u00a74.17 unlink chain stays the engine-event worker's job. Read lane, account-scoped mutating serialization (the contacts.sync precedent: the upstream face is a PUT). No local persistence.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
       }
