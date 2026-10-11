@@ -1247,6 +1247,40 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Outbound read SELF-SYNC routing (contract revision 1.108, §4.89):
+    /// the owning group's supervisor rides the engine `markRead` face —
+    /// SyncMessage.read to the account's own devices — receipt-class
+    /// semantics end to end.
+    pub async fn send_sync_read(
+        &self,
+        params: crate::service::MessagesSyncReadParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_sync_read_receipt(
+                params.account_id,
+                params.conversation_id,
+                params.message_ids,
+            )
+            .await
+    }
+
+    /// Outbound viewed SELF-SYNC routing (contract revision 1.108, §4.89):
+    /// the engine `markViewed` face, same discipline.
+    pub async fn send_sync_viewed(
+        &self,
+        params: crate::service::MessagesSyncViewedParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .send_sync_viewed_receipt(
+                params.account_id,
+                params.conversation_id,
+                params.message_ids,
+            )
+            .await
+    }
+
     /// Story-anchored viewed receipt routing (contract revision 1.85,
     /// §4.70): the owning group's supervisor sends the single-author frame
     /// over its own engine, receipt-class semantics end to end.

@@ -4055,6 +4055,100 @@ impl RuntimeSupervisor {
         Ok(if all_confirmed { "sent" } else { "unknown" })
     }
 
+    /// Outbound read SELF-SYNC (contract revision 1.108, §4.89): the same
+    /// selection and receipt-class answer as `send_read_receipt`, but the
+    /// upstream face is the engine's `markRead` — SyncMessage.read to the
+    /// account's own devices — not the peer-facing `sendReadReceipt`. The
+    /// two channels are independent protocol faces (the official
+    /// markConversationRead.preload.ts:252 note); the sync leg is what makes
+    /// the account's OTHER devices show the read state, and it is not gated
+    /// by the account's readReceipts configuration flag. The prepared group
+    /// (direct conversations only, one author) maps to the engine's entry
+    /// list `{account, reads: [{sender, timestamp}...]}` — one engine call,
+    /// the engine chunking 100 entries per envelope internally.
+    pub async fn send_sync_read_receipt(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<&'static str, ServiceError> {
+        self.send_sync_receipt(account_id, conversation_id, message_ids, "markRead")
+            .await
+    }
+
+    /// Outbound viewed SELF-SYNC (contract revision 1.108, §4.89): identical
+    /// shape, engine `markViewed` (`{account, viewed: [...]}`), with the
+    /// same local `viewed_at` first-stamp discipline as the peer-faced
+    /// markViewed.
+    pub async fn send_sync_viewed_receipt(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<&'static str, ServiceError> {
+        self.send_sync_receipt(account_id, conversation_id, message_ids, "markViewed")
+            .await
+    }
+
+    /// Shared sync read/viewed body: the receipt-class twin of
+    /// [`Self::send_receipt`] on the self-sync engine faces. Prepare and the
+    /// `viewed_at` first-stamp are byte-identical (the local stamp is the
+    /// request's own effect and survives any upstream failure); only the
+    /// engine method and params shape differ — `{account, reads|viewed:
+    /// [{sender, timestamp}...]}` carries the author inside each entry, so
+    /// the whole group rides ONE call (the direct-conversation selection has
+    /// exactly one resolvable author). The same aggregation, degradation,
+    /// and never-retry discipline applies.
+    async fn send_sync_receipt(
+        &self,
+        account_id: String,
+        conversation_id: String,
+        message_ids: Option<Vec<String>>,
+        method: &'static str,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let prepared = {
+            let service = self.service.lock().await;
+            let prepared = match method {
+                "markRead" => {
+                    service.prepare_sync_read(&account_id, &conversation_id, message_ids)?
+                }
+                _ => service.prepare_sync_viewed(&account_id, &conversation_id, message_ids)?,
+            };
+            if method == "markViewed" {
+                service.complete_mark_viewed(&prepared)?;
+            }
+            prepared
+        };
+        if prepared.groups.is_empty() {
+            return Ok("sent");
+        }
+        let mut all_confirmed = true;
+        for group in &prepared.groups {
+            let list_key = if method == "markRead" {
+                "reads"
+            } else {
+                "viewed"
+            };
+            let entries: Vec<Value> = group
+                .timestamps
+                .iter()
+                .map(|timestamp| json!({ "sender": group.recipient, "timestamp": timestamp }))
+                .collect();
+            let params = json!({
+                "account": prepared.account_signal,
+                list_key: entries,
+            });
+            match engine.call(method, params, CallClass::Mutating).await {
+                Ok(_) => {}
+                // Same receipt-class discipline as the peer-faced fan-out:
+                // any failure degrades to `unknown` and is never retried.
+                Err(_) => all_confirmed = false,
+            }
+        }
+        Ok(if all_confirmed { "sent" } else { "unknown" })
+    }
+
     /// messages.edit (contract revision 1.15): retarget one previously sent
     /// message's body via the engine's native `editMessage` wire method
     /// (contract 1.105 migration — the signal-cli-era `send` + `editTimestamp`

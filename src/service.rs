@@ -5302,6 +5302,44 @@ impl ConnectorService {
         self.prepare_receipt(account_id, conversation_id, message_ids)
     }
 
+    /// messages.syncRead (contract revision 1.108, §4.89): the SELF-SYNC
+    /// upstream leg — the same incoming-row selection, bounds, and grouping
+    /// discipline as `prepare_mark_read`, but the supervisor spends the
+    /// group on the engine's `markRead` face (SyncMessage.read to the
+    /// account's own devices) instead of `sendReadReceipt`. The two faces
+    /// are independent protocol channels (the official
+    /// markConversationRead.preload.ts:252 note): the peer receipt tells the
+    /// AUTHOR we read their message, the sync tells OUR OWN DEVICES — and
+    /// the sync channel is not gated by the account's readReceipts
+    /// configuration flag. The prepared shape is identical
+    /// (`PreparedReceipts`), so the supervisor picks the engine face while
+    /// the selection semantics stay byte-identical.
+    pub fn prepare_sync_read(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<PreparedReceipts, ServiceError> {
+        self.prepare_receipt(account_id, conversation_id, message_ids)
+    }
+
+    /// messages.syncViewed (contract revision 1.108, §4.89): identical
+    /// addressing, selection, and grouping, engine `markViewed` (the
+    /// SyncMessage.viewed self-sync). Like `prepare_mark_viewed`, the viewed
+    /// face also has the local projection (contract 1.94, §4.77): the
+    /// selected incoming rows take their first `viewed_at` stamp via
+    /// `complete_mark_viewed` before the upstream sync — the official
+    /// local-first discipline, so the played marker survives an upstream
+    /// failure and needs no retry.
+    pub fn prepare_sync_viewed(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        message_ids: Option<Vec<String>>,
+    ) -> Result<PreparedReceipts, ServiceError> {
+        self.prepare_receipt(account_id, conversation_id, message_ids)
+    }
+
     /// The local half of messages.markViewed (contract 1.94, §4.77):
     /// first-stamp `viewed_at` on the selected incoming rows at the
     /// connector's own clock — the official `readStatus === Viewed` is this
@@ -10065,6 +10103,28 @@ pub struct MessagesMarkReadParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesMarkViewedParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Option<Vec<String>>,
+}
+
+/// messages.syncRead params (contract revision 1.108, §4.89): identical
+/// shape to [`MessagesMarkReadParams`] — the self-sync face keeps the
+/// read-face addressing byte-identical so the desktop picks the channel by
+/// method name alone.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSyncReadParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub message_ids: Option<Vec<String>>,
+}
+
+/// messages.syncViewed params: identical shape to
+/// [`MessagesSyncReadParams`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessagesSyncViewedParams {
     pub account_id: String,
     pub conversation_id: String,
     pub message_ids: Option<Vec<String>>,
@@ -20685,6 +20745,168 @@ mod tests {
         assert!(!read.groups.is_empty());
         let before = stored(&service, &conversation.id, "m1").read_at;
         assert_eq!(before, None, "markRead never stamps rows locally");
+    }
+
+    /// Contract 1.108 (§4.89): the SELF-SYNC faces prepare exactly like the
+    /// peer receipt faces — same selection, same direct-conversation author
+    /// group (the supervisor spends it on the engine markRead/markViewed
+    /// SyncMessage faces), same local `viewed_at` first-stamp on the viewed
+    /// face, same no-stamp discipline on the read face, same empty-group
+    /// skip for group conversations whose authors local data cannot
+    /// resolve.
+    #[test]
+    fn sync_read_and_sync_viewed_prepare_mirror_the_receipt_faces() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        seed(&service, "s1", 10);
+        seed(&service, "s2", 20);
+
+        // syncRead: the peer group with ascending timestamps, no local
+        // stamps on either face of the rows.
+        let sync_read = service
+            .prepare_sync_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(sync_read.groups.len(), 1);
+        assert_eq!(sync_read.groups[0].recipient, conversation.peer_key);
+        assert_eq!(sync_read.groups[0].timestamps, vec![10, 20]);
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.read_at, None, "syncRead never stamps rows locally");
+        assert_eq!(row.viewed_at, None);
+
+        // syncViewed: identical selection and the local first-stamp via the
+        // shared complete step.
+        let sync_viewed = service
+            .prepare_sync_viewed(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(sync_viewed.groups.len(), 1);
+        assert_eq!(sync_viewed.groups[0].timestamps, vec![10, 20]);
+        service.complete_mark_viewed(&sync_viewed).unwrap();
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, "s1")
+            .unwrap()
+            .unwrap();
+        assert!(row.viewed_at.is_some(), "syncViewed stamps locally");
+        // A replay keeps the first stamp.
+        let replay_at = row.viewed_at;
+        service
+            .complete_mark_viewed(
+                &service
+                    .prepare_sync_viewed(&account.id, &conversation.id, None)
+                    .unwrap(),
+            )
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, "s1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.viewed_at, replay_at, "first stamp wins");
+
+        // A group conversation's authors stay unresolvable locally: empty
+        // groups, skipped from the sync fan-out — but the viewed stamp is
+        // still the request's own effect.
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0y", "Group 2")
+            .unwrap();
+        let record = MessageRecord {
+            id: "sg1".into(),
+            account_id: account.id.clone(),
+            conversation_id: group.id.clone(),
+            direction: "incoming",
+            sender_id: "member-hash".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 30,
+            received_at: None,
+            text: Some("group body".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            rich: None,
+            edited_at: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+        };
+        assert!(
+            service
+                .store_ref()
+                .insert_message(&record, None, Some("group body"), true)
+                .unwrap()
+        );
+        let group_sync = service
+            .prepare_sync_read(&account.id, &group.id, None)
+            .unwrap();
+        assert!(group_sync.groups.is_empty());
+        let group_viewed = service
+            .prepare_sync_viewed(&account.id, &group.id, None)
+            .unwrap();
+        assert!(group_viewed.groups.is_empty());
+        service.complete_mark_viewed(&group_viewed).unwrap();
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &group.id, "sg1")
+            .unwrap()
+            .unwrap();
+        assert!(row.viewed_at.is_some(), "the group viewed stamp lands");
     }
 
     /// Contract 1.94 (§4.77) outgoing face: a VIEWED receipt rides the read

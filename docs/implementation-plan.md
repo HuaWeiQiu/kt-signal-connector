@@ -5,7 +5,23 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.107 (2026-10-11; the ingest key-list completion (§4.88): the connector's
+- Contract revision: 1.108 (2026-10-11; the read/viewed SELF-SYNC upstream legs (§4.89):
+  `messages.syncRead` / `messages.syncViewed` close the connector's silent second
+  read-state channel — the markRead pair spent its fan-out on the peer-facing
+  `sendReadReceipt`/`sendViewedReceipt` faces (gated by the account's `readReceipts`
+  flag, default off), so the account's own other linked devices never converged the
+  desktop's read state; the engine's `markRead`/`markViewed` SyncMessage faces (the
+  official syncReadMessages/syncView isomorphs) sat unconsumed. The two new methods
+  carry byte-identical addressing, selection bounds, and receipt-class
+  `{status: sent|unknown}` degradation to the markRead pair — one wire semantic per
+  method so the desktop picks the channel by name (the peer receipt leg stays
+  flag-gated, untouched) — and the supervisor spends the group on one engine
+  `markRead`/`markViewed` call (`{account, reads|viewed: [{sender, timestamp}...]}`, the
+  engine chunking 100/envelope); syncViewed keeps the §4.77 local-first `viewed_at`
+  stamp, syncRead stays stamp-free. Schema additive: two enum entries, two if/then
+  pairs, two `$defs`. Desktop call-site migration is a separate batch. Tests 640 → 641,
+  all green) —
+  previously 1.107 (2026-10-11; the ingest key-list completion (§4.88): the connector's
   ingest faces now consume the engine's P14 live-projection batch key-for-key — the faces the
   engine's live receive projects and the connector was silently dropping. (a) The attachment
   descriptor gains the render `caption` (text-budget truncated, empty = absent), the blur
@@ -7334,6 +7350,51 @@ discipline both directions); two service integrations
 on the row and on the emitted `message.upserted` record;
 `sent_mirror_transcript_faces_persist_on_the_mirror_row` — the three transcript faces
 verbatim onto the mirror row). Gates: 635 → 640, all green.
+
+### 4.89 Read/viewed SELF-SYNC upstream legs: `messages.syncRead` / `messages.syncViewed` (contract revision 1.108, 2026-10-11)
+
+The audit's N0 finding, closed: the connector never spoke the read-state SELF-SYNC
+channel. `messages.markRead`/`messages.markViewed` (§4.29) spend their fan-out on the
+engine's `sendReadReceipt`/`sendViewedReceipt` — the PEER-facing ReceiptMessage channel,
+gated by the account's `readReceipts` configuration flag (default off) — so the account's
+own other linked devices never learned what this desktop had read. The engine's
+`markRead`/`markViewed` faces (engine `methods.rs` P14 group 6, the official
+`syncReadMessages`/`syncView` isomorphs, SendMessage.preload.ts:2097/:2145 — the
+SyncMessage.read=5/viewed=16 self-send to the account's own ACI) sat unconsumed.
+
+Two new wire methods close the second channel. `messages.syncRead {accountId,
+conversationId, messageIds?}` and `messages.syncViewed {...}` carry byte-identical
+addressing to the markRead pair (one wire semantic per method, the 1.34 pair precedent —
+a `mode` parameter would conflate two protocol channels behind one name and complicate
+the schema's per-method if/then pinning), and the prepared selection is byte-identical
+to `prepare_receipt`: incoming rows only, both forms bounded at 512 (truncation, not
+rejection), ascending `sentAt` with same-timestamp collapse, direct-conversation author
+resolution only (group rows persist a local sender hash, §4.28 — their authors stay
+unresolvable and they skip from the fan-out, the same documented boundary the peer face
+carries). The supervisor spends the group on ONE engine `markRead`/`markViewed` call —
+`{account, reads|viewed: [{sender, timestamp}...]}`, the author inside each entry, the
+engine chunking 100 entries per envelope internally — where the peer face made one call
+per author. Receipt-class semantics end to end: `{status: sent|unknown}`, any failure
+degrades and nothing retries (AGENTS.md); zero eligible rows is the trivial `sent`
+no-op. `messages.syncViewed` keeps the §4.77 local-first discipline (the selected rows
+take their first `viewed_at` via the shared `complete_mark_viewed` before the sync);
+`messages.syncRead` stays stamp-free (the desktop owns its read state).
+
+Why the channels stay separate methods instead of widening `messages.markRead`: the
+desktop's conversation-open path should drive the self-sync leg on every open while the
+peer receipt leg stays flag-gated best-effort — one method per channel lets the desktop
+pick the channel by name and lets this contract describe each channel's gate, engine
+face, and degradation independently. The `send-receipts` capability and the send lane /
+account-scoped mutating classification carry over verbatim (the same write-lane mutex
+and delete drain barrier serialize the sync faces against sends on the same account).
+Schema: two method enum entries, two if/then pairs, two additive `$defs` param objects.
+The desktop call-site migration is a separate batch (this batch is the connector's
+semantic split only).
+
+Tests: one service integration (`sync_read_and_sync_viewed_prepare_mirror_the_receipt_faces`
+— the peer group mirrors the receipt face with ascending timestamps, syncViewed stamps
+locally with first-stamp-wins, syncRead never stamps, group conversations skip the
+fan-out but keep the viewed stamp). Gates: 640 → 641, all green.
 
 ## 5. signal-cli Boundary
 

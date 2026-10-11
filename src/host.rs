@@ -49,8 +49,9 @@ use crate::service::{
     MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
     MessagesSendAttachmentParams, MessagesSendPinMessageParams, MessagesSendReactionParams,
     MessagesSendStickerParams, MessagesSendStoryParams, MessagesSendTextParams,
-    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, PresenceSetTypingMessageParams,
-    SendTarget, StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
+    MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams, MessagesSyncReadParams,
+    MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
+    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
 };
@@ -2466,6 +2467,40 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid messages.markViewed params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Outbound read/viewed SELF-SYNC faces (contract revision 1.108,
+        // §4.89): the receipt dispatch shape — params shape errors answer
+        // INVALID_REQUEST, the answer is {status: sent|unknown}, a sync
+        // failure never fails the request (the supervisor degrades the
+        // answer; the SyncMessage.read/viewed self-sync channel is
+        // independent of the readReceipts-gated peer receipt face).
+        "messages.syncRead" => {
+            match serde_json::from_value::<MessagesSyncReadParams>(request.params) {
+                Ok(params) => match runtime.send_sync_read(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new("INVALID_REQUEST", "invalid messages.syncRead params", false),
+                ),
+            }
+        }
+        "messages.syncViewed" => {
+            match serde_json::from_value::<MessagesSyncViewedParams>(request.params) {
+                Ok(params) => match runtime.send_sync_viewed(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid messages.syncViewed params",
                         false,
                     ),
                 ),

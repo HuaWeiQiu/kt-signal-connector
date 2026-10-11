@@ -85,6 +85,12 @@ pub const METHODS: &[MethodRow] = &[
     // still serialize it against sends on the same account.
     ("messages.markRead", Lane::Send, true, "send"),
     ("messages.markViewed", Lane::Send, true, "send"),
+    // Outbound read/viewed SELF-SYNC faces (contract 1.108, §4.89): the
+    // engine markRead/markViewed SyncMessage channel — independent of the
+    // readReceipts-gated peer receipt face, same receipt-class discipline,
+    // so the same lane and mutex classification applies.
+    ("messages.syncRead", Lane::Send, true, "send"),
+    ("messages.syncViewed", Lane::Send, true, "send"),
     // View-once faces (contract 1.38): the bare open-sync passthrough and
     // the burn trigger are both receipt-class — mutating, send-lane upstream
     // traffic under the reaction-class write-lane mutex and delete barrier;
@@ -667,6 +673,8 @@ mod tests {
             "messages.sendAdminDelete",
             "messages.markRead",
             "messages.markViewed",
+            "messages.syncRead",
+            "messages.syncViewed",
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "contacts.setLocalAlias",
@@ -716,6 +724,8 @@ mod tests {
             "messages.sendAdminDelete",
             "messages.markRead",
             "messages.markViewed",
+            "messages.syncRead",
+            "messages.syncViewed",
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "contacts.sync",

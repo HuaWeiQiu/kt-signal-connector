@@ -80,6 +80,8 @@
             "messages.sendAdminDelete",
             "messages.markRead",
             "messages.markViewed",
+            "messages.syncRead",
+            "messages.syncViewed",
             "messages.sendViewOnceOpen",
             "messages.markViewOnceOpened",
             "messages.reportSpam",
@@ -639,6 +641,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/messagesMarkViewedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.syncRead" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSyncReadParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "messages.syncViewed" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/messagesSyncViewedParams" }
             }
           }
         },
@@ -1647,7 +1671,39 @@
         }
       }
     },
-    "messagesSendViewOnceOpenParams": {
+        "messagesSyncReadParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Send the read SELF-SYNC for messages the peers authored (contract revision 1.108, §4.89): the engine markRead face — SyncMessage.read to the account's own devices — so the account's other linked phones/desktops converge the read state. The channel is independent of the peer receipt (messages.markRead's sendReadReceipt face) and is NOT gated by the account's readReceipts configuration flag. Addressing, selection bounds (512 cap, truncation not rejection), direct-conversation author resolution, receipt-class {status: sent|unknown} aggregation, and the never-retry degradation are identical to messages.markRead; only the upstream face and its entry shape differ (the engine carries {sender, timestamp} per entry and chunks 100 per envelope internally). Zero eligible rows is a trivial {status: 'sent'} no-op; zero local writes (the desktop owns its read state).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageIds": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/opaqueId" },
+          "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
+        }
+      }
+    },
+    "messagesSyncViewedParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Send the viewed SELF-SYNC (contract revision 1.108, §4.89): identical addressing, selection bounds, and receipt-class aggregation as messages.syncRead, with the engine markViewed face (SyncMessage.viewed to the account's own devices). The selected incoming rows also take their first local viewedAt stamp (contract 1.94, §4.77 — this device played it) before the sync; the stamp is the request's own local effect, lands even when the selection is empty, survives an upstream failure, and never re-stamps.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": { "$ref": "#/$defs/opaqueId" },
+        "messageIds": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/opaqueId" },
+          "description": "Optional explicit selection; only incoming rows of this conversation qualify, others are skipped."
+        }
+      }
+    },
+"messagesSendViewOnceOpenParams": {
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "senderAci", "timestamp"],
