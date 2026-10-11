@@ -7329,6 +7329,7 @@ mod tests {
                 url: "https://example.com/a".into(),
                 title: Some("Title".into()),
                 description: None,
+                date: None,
                 image: None,
             }],
             mentions: vec![NormalizedMention {
@@ -7452,6 +7453,12 @@ mod tests {
             width: None,
             height: None,
             is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
             locator: None,
         };
         let row = |id: &str,
@@ -7654,6 +7661,12 @@ mod tests {
             width: None,
             height: None,
             is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
             locator: None,
         };
         let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
@@ -8252,6 +8265,12 @@ mod tests {
             width: Some(512),
             height: Some(512),
             is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
             locator: None,
         }];
         sticker_row.sticker = Some(crate::engine::NormalizedSticker {
@@ -8624,6 +8643,12 @@ mod tests {
                 width: None,
                 height: None,
                 is_voice_note,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
                 locator: None,
             };
         let kind = || {
@@ -12208,6 +12233,12 @@ mod tests {
                 width: Some(64),
                 height: Some(32),
                 is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
                 locator: None,
             }],
             rich: Some(NormalizedRich {
@@ -12511,6 +12542,12 @@ mod tests {
                 width: None,
                 height: None,
                 is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
                 locator,
             }
         };

@@ -2131,6 +2131,12 @@ impl ConnectorService {
             width: None,
             height: None,
             is_voice_note: voice_note,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
         };
         self.dispatch_send(
             &account,
@@ -2248,6 +2254,12 @@ impl ConnectorService {
                 width: None,
                 height: None,
                 is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
             });
         }
         self.dispatch_send(
@@ -2386,6 +2398,12 @@ impl ConnectorService {
             width: image.width,
             height: image.height,
             is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
         };
         let sticker = crate::engine::NormalizedSticker {
             pack_id: pack_id.to_string(),
@@ -11232,7 +11250,8 @@ mod tests {
 
     use super::*;
     use crate::engine::{
-        NormalizedAttachment, NormalizedQuote, NormalizedQuoteAttachment, ReceiptKind,
+        NormalizedAttachment, NormalizedPreview, NormalizedQuote, NormalizedQuoteAttachment,
+        NormalizedRich, NormalizedStoryRecipient, NormalizedUnidentifiedStatus, ReceiptKind,
     };
     use crate::store::StoreKey;
 
@@ -11328,6 +11347,12 @@ mod tests {
             width: None,
             height: None,
             is_voice_note: false,
+            caption: None,
+            blur_hash: None,
+            incremental_mac: None,
+            chunk_size: None,
+            is_borderless: false,
+            is_gif: false,
             locator: None,
         }];
         service
@@ -15484,6 +15509,12 @@ mod tests {
                 width: Some(64),
                 height: Some(32),
                 is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
                 locator: None,
             }],
             rich: Some(NormalizedRich {
@@ -21721,6 +21752,12 @@ mod tests {
                         width: Some(64),
                         height: Some(64),
                         is_voice_note: false,
+                        caption: None,
+                        blur_hash: None,
+                        incremental_mac: None,
+                        chunk_size: None,
+                        is_borderless: false,
+                        is_gif: false,
                         locator: None,
                     }),
                 }],
@@ -21733,6 +21770,12 @@ mod tests {
                 width: Some(64),
                 height: Some(32),
                 is_voice_note: false,
+                caption: None,
+                blur_hash: None,
+                incremental_mac: None,
+                chunk_size: None,
+                is_borderless: false,
+                is_gif: false,
                 locator: None,
             }],
             rich: None,
@@ -21774,6 +21817,184 @@ mod tests {
         assert_eq!(row.attachments[0].id, "att-1");
         assert_eq!(row.attachments[0].filename.as_deref(), Some("shot.png"));
         assert_eq!(row.attachments[0].size, Some(2048));
+    }
+
+    /// The engine's P14 metadata faces (contract 1.107, §4.88) ride the
+    /// message end to end: the descriptor's caption/blurHash/integrity
+    /// pair/flag booleans and the rich `expireTimerVersion`/preview date
+    /// persist on the row and carry the same values on the emitted
+    /// `message.upserted` record — the wire face the desktop consumes.
+    #[test]
+    fn ingest_receive_p14_metadata_rides_row_and_event() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let receive = NormalizedReceive {
+            timestamp: Some(400),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("with media".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            quote: None,
+            attachments: vec![NormalizedAttachment {
+                id: "att-p14".into(),
+                content_type: Some("image/png".into()),
+                filename: Some("sunset.png".into()),
+                size: Some(4096),
+                width: Some(640),
+                height: Some(480),
+                is_voice_note: false,
+                caption: Some("a sunset".into()),
+                blur_hash: Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj".into()),
+                incremental_mac: Some("AQIDBA==".into()),
+                chunk_size: Some(8192),
+                is_borderless: true,
+                is_gif: false,
+                locator: None,
+            }],
+            rich: Some(NormalizedRich {
+                previews: vec![NormalizedPreview {
+                    url: "https://example.com/a".into(),
+                    title: None,
+                    description: None,
+                    date: Some(1_600_000_000_000),
+                    image: None,
+                }],
+                expire_timer_version: Some(3),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+        };
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record),
+                _ => None,
+            })
+            .expect("one message.upserted event");
+        let descriptor = &upserted.attachments[0];
+        assert_eq!(descriptor.caption.as_deref(), Some("a sunset"));
+        assert_eq!(
+            descriptor.blur_hash.as_deref(),
+            Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj")
+        );
+        assert_eq!(descriptor.incremental_mac.as_deref(), Some("AQIDBA=="));
+        assert_eq!(descriptor.chunk_size, Some(8192));
+        assert!(descriptor.is_borderless);
+        assert!(!descriptor.is_gif);
+        let rich = upserted.rich.as_ref().expect("rich rides the event");
+        assert_eq!(rich.expire_timer_version, Some(3));
+        assert_eq!(rich.previews[0].date, Some(1_600_000_000_000));
+
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let stored = &row.attachments[0];
+        assert_eq!(stored.caption.as_deref(), Some("a sunset"));
+        assert_eq!(stored.chunk_size, Some(8192));
+        assert!(stored.is_borderless);
+        let stored_rich = row.rich.as_ref().expect("rich round-trips");
+        assert_eq!(stored_rich.expire_timer_version, Some(3));
+        assert_eq!(stored_rich.previews[0].date, Some(1_600_000_000_000));
+    }
+
+    /// The sent mirror's transcript faces (contract 1.107, §4.88) persist on
+    /// the outgoing mirror row: the recipient-update bit, the sealed-sender
+    /// statuses and the story distribution state ride `syncMessage.sentMessage`
+    /// → rich → row verbatim, with an event-less inbound row unaffected.
+    #[test]
+    fn sent_mirror_transcript_faces_persist_on_the_mirror_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let receive = NormalizedReceive {
+            timestamp: Some(500),
+            content_kind: "syncMessage",
+            direction: "outgoing",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("from the phone".into()),
+            text_bytes: Some(14),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(NormalizedRich {
+                is_recipient_update: true,
+                unidentified_status: vec![NormalizedUnidentifiedStatus {
+                    destination_uuid: Some("PNI:00000000-0000-0000-0000-000000000001".into()),
+                    unidentified: Some(true),
+                    destination_pni_identity_key: None,
+                }],
+                story_message_recipients: vec![NormalizedStoryRecipient {
+                    destination_uuid: Some("11111111-2222-4333-8444-555555555555".into()),
+                    distribution_list_ids: vec!["00000000-0000-0000-0000-000000000000".into()],
+                    is_allowed_to_reply: Some(false),
+                }],
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+        };
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let upserted = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record),
+                _ => None,
+            })
+            .expect("one mirror row event");
+        let rich = upserted.rich.as_ref().expect("transcript rich");
+        assert!(rich.is_recipient_update);
+        assert_eq!(rich.unidentified_status.len(), 1);
+        assert_eq!(
+            rich.unidentified_status[0].destination_uuid.as_deref(),
+            Some("PNI:00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(rich.story_message_recipients.len(), 1);
+        assert_eq!(
+            rich.story_message_recipients[0].distribution_list_ids,
+            ["00000000-0000-0000-0000-000000000000"]
+        );
+
+        let row = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items
+            .into_iter()
+            .next()
+            .unwrap();
+        let stored_rich = row.rich.as_ref().expect("transcript rich round-trips");
+        assert!(stored_rich.is_recipient_update);
+        assert_eq!(stored_rich.unidentified_status[0].unidentified, Some(true));
+        assert_eq!(
+            stored_rich.story_message_recipients[0].is_allowed_to_reply,
+            Some(false)
+        );
     }
 
     // ---- Media ingest (ADR 0002) -------------------------------------

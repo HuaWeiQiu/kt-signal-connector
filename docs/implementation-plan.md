@@ -5,7 +5,35 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.106 (2026-10-11; the sync seven-arm consume batch (§4.87): the engine's
+- Contract revision: 1.107 (2026-10-11; the ingest key-list completion (§4.88): the connector's
+  ingest faces now consume the engine's P14 live-projection batch key-for-key — the faces the
+  engine's live receive projects and the connector was silently dropping. (a) The attachment
+  descriptor gains the render `caption` (text-budget truncated, empty = absent), the blur
+  preview `blurHash` (non-empty only, 128-char bound), the streaming-integrity pair
+  `incrementalMac` + `chunkSize` (both or neither — the official filePointers.preload.ts:84-87
+  discipline; half a pair verifies nothing and drops whole) and the always-boolean
+  `isBorderless` / `isGif` projections beside `isVoiceNote` (no flag bit = false, the
+  three-boolean one-shape consumption form; the official isGIF contentType gate stays the
+  desktop's judgement). (b) The link-preview card gains its `date` publish stamp (positive
+  only — the official falsy posture). (c) The rich payload gains `dataMessage.expireTimerVersion`
+  (positive, u32-bounded; the timer value itself stays the row's `expireSeconds` face) and the
+  sent mirror's three transcript faces — `isRecipientUpdate` (true only), `unidentifiedStatus[]`
+  (the destinationUuid PNI-prefixed/UUID form, `unidentified`, the `destinationPniIdentityKey`
+  base64 within the identity-key bound) and `storyMessageRecipients[]` (`destinationUuid`,
+  `distributionListIds` verbatim including the empty-list narrowing semantics,
+  `isAllowedToReply` only when the proto stated one) — receive dataMessages never carry the
+  keys, so inbound rows keep their defaults; the outer lists take the sync receive family's
+  256-entry cap. (d) The archive import face parses the same-named keys and the same flag bits
+  (Borderless=2 / Gif=8), so imported and live descriptors share one wire form. (e) The
+  engine's typing `groupId` projection was verified already consumed since contract 1.15 (the
+  routing group leg resolves group typing onto its conversation) — verified, zero delta. All
+  parses are per-key fail-closed at the engine's own projection shapes; every pre-1.107 row
+  reads byte-identical (the optional keys deserialize through `serde(default)`; the boolean
+  trio serializes explicit false — the isVoiceNote shape); a bodyless, attachment-less
+  dataMessage carrying only preview/P14 material keeps the bodyless drop discipline (键位扩齐
+  不改行落位). No new method, event, error, or capability; the schema gains one additive
+  description paragraph on the read shape; tests 635 → 640, all green) —
+  previously 1.106 (2026-10-11; the sync seven-arm consume batch (§4.87): the engine's
   P14 group-5 sync projections — `configuration` / `fetchLatest` / `callLinkUpdate` /
   `callLogEvent` / `deviceNameChange` / `usernameChange` / `pniChangeNumber` — previously all
   falling to the plain `syncMessage` skip, now each consumed as one control routing plus one
@@ -7232,6 +7260,80 @@ one-event-no-convergence counts); two wire frames
 names, the flat camelCase shapes, the absent optionals); and four schema-pairing pins (the
 call-link `rootKey`/`adminKey` maxLengths ↔ `MAX_SYNC_CALL_LINK_KEY_CHARS`, the device/PNI
 registration-id maxima ↔ the parse's u32 `try_from` range gate). Gates: 624 → 635, all green.
+
+### 4.88 Ingest key-list completion: the P14 live-projection faces ride the descriptors (contract revision 1.107, 2026-10-11)
+
+The audit's ingest-side gap closes key-for-key. The engine's P14 live-projection batch
+taught its receive face to project five families of message metadata — attachment
+`caption` / `blurHash` / `incrementalMac` + `chunkSize` / `isBorderless` / `isGif`, the
+link-preview `date`, the dataMessage `expireTimerVersion`, the typing `groupId`, and the
+Sent transcript's three optional faces — and the connector's ingest key lists dropped every
+one of them: the keys arrived on the envelope, the bounded per-key parsers answered
+absent, and the row (and the wire record it feeds) carried none of them. This batch
+completes the lists; nothing else moves.
+
+**The attachment descriptor.** `normalized_attachment` (the §4.13 metadata-only parse,
+shared by message attachments, preview images, quote thumbnails and stickers) now carries
+the six P14 keys, each fail-closed at the engine's own projection shape: the `caption`
+rides as text material under the inbound-text budget (empty = absent — zero information
+projects nothing), the `blurHash` rides verbatim within a 128-char bound (never decoded —
+the desktop renders its own progressive placeholder), and the streaming-integrity pair
+`incrementalMac` + `chunkSize` survives only all-or-nothing (the official
+`filePointers.preload.ts:84-87` discipline the engine already projects: half a pair
+verifies nothing, so a half pair drops whole — never forwarded mangled). The two flag
+booleans answer false on any non-bool shape and serialize even when false — the
+`isVoiceNote` trio shape, so all three booleans read without key probing; the official
+`isGIF`'s additional `contentType video/*` gate stays the desktop's judgement (the engine
+projects the flag bit, the media class is the consumer's call — 宁多投不误判). The
+archive import face (`import_attachments`, §4.38) parses the same-named keys and the same
+flag bits (`Borderless` = 2, `Gif` = 8 — the enum members the live pointer projects), so
+an imported row and a live row of the same attachment share one descriptor wire form — the
+§4.38 test comment's own stated posture, now true in code.
+
+**The rich faces.** `normalized_rich` gains `expireTimerVersion` (the dataMessage's
+disappearing-message protocol stamp; positive, u32-bounded — the engine projects no key
+for 0, and the timer value itself remains the row's `expireSeconds` face) and the
+preview-card `date` (positive only — the official falsy posture verbatim). The three Sent
+transcript faces parse on the same function because the sent mirror runs it on
+`syncMessage.sentMessage`: `isRecipientUpdate` is true only when the proto stated true,
+`unidentifiedStatus[]` carries each destination's service-id string (the PNI-prefixed
+form for a PNI destination, the plain UUID for an ACI), its `unidentified` bit and its
+`destinationPniIdentityKey` (standard base64 within the identity-key bound) exactly as the
+engine resolved them (binary first, string fallback), and `storyMessageRecipients[]`
+carries the destination, the `distributionListIds` verbatim (an empty list is the
+official's list-narrowed semantics and stays an empty list) and `isAllowedToReply` only
+when stated. Receive dataMessages never carry the three keys, so inbound rows keep their
+defaults; every identity string takes the receive-id family bound and the outer lists the
+sync receive family's 256-entry cap — a hostile face degrades per-key, never the row.
+
+**The verified zero-delta.** The engine's typing `groupId` projection needed nothing: the
+connector's typing arm has routed the group leg through the shared conversation resolution
+since contract 1.15 — the projection and the consumption met years apart, and the audit
+item closes as verified-consumed, not newly wired. One discipline stays untouched
+(recorded): a bodyless, attachment-less dataMessage carrying only preview/P14 material
+keeps the bodyless drop — the key-list completion extends what rides a landing row, never
+which faces land one (键位扩齐不改行落位).
+
+**The wire and the store.** No new method, event, error, or capability: the keys ride the
+existing `message.upserted` record (serde — descriptor and rich serialize onto it
+directly), the row's `attachments_json`/`rich_json` columns, and every read shape. The
+old-row discipline holds two ways: pre-1.107 rows deserialize through `serde(default)`
+(no key → default) and their optional keys re-serialize absent — byte-identical reads —
+while the boolean trio serializes explicit `false`, the always-boolean shape every
+descriptor has carried since `isVoiceNote`. The schema gains one additive description
+paragraph on the read shape (no structural delta — the record face is prose-described by
+design).
+
+Tests: three engine units (`attachment_p14_metadata_keys_parse_per_key` — the full face,
+the half-pair drops, the zero-information and hostile shapes, the legacy byte-identity;
+`rich_p14_faces_parse_per_key` — the version/date/bitmap gates, the two transcript lists
+with their bounds and per-key degradation, the plain-row collapse;
+`legacy_attachment_and_rich_json_round_trip_without_p14_keys` — the old-row serde
+discipline both directions); two service integrations
+(`ingest_receive_p14_metadata_rides_row_and_event` — descriptor and rich faces identical
+on the row and on the emitted `message.upserted` record;
+`sent_mirror_transcript_faces_persist_on_the_mirror_row` — the three transcript faces
+verbatim onto the mirror row). Gates: 635 → 640, all green.
 
 ## 5. signal-cli Boundary
 

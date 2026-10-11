@@ -451,7 +451,12 @@ pub struct NormalizedQuoteAttachment {
 /// the pinned 0.14.8 signal-cli and the kt-engine receive face project
 /// metadata only today, so the field stays `None` until an engine ships the
 /// receive-side projection — the download face then becomes live without a
-/// further connector change.
+/// further connector change. Since contract revision 1.107 (§4.88) the
+/// descriptor also carries the engine's P14 metadata keys verbatim: the
+/// render `caption`, the blur preview `blurHash`, the streaming-integrity
+/// pair `incrementalMac` + `chunkSize` (both or neither — the official
+/// filePointers discipline), and the always-boolean `isBorderless` / `isGif`
+/// flag projections beside `isVoiceNote`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedAttachment {
@@ -467,6 +472,32 @@ pub struct NormalizedAttachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
     pub is_voice_note: bool,
+    /// Sender-stated media caption (contract 1.107, §4.88): mirror material
+    /// the desktop renders beside the bubble — the connector never merges it
+    /// into the row body (the two texts are distinct upstream facts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    /// Blur preview string (contract 1.107, §4.88): passed through verbatim
+    /// for the desktop's progressive media placeholder; never decoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blur_hash: Option<String>,
+    /// Streaming-integrity pair (contract 1.107, §4.88): the attachment's
+    /// incremental MAC (standard base64) and chunk size, both present or
+    /// both absent (the official filePointers.preload.ts:84-87 discipline —
+    /// half a pair verifies nothing and is dropped, never forwarded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_mac: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<u32>,
+    /// The engine's borderless/GIF flag projections (contract 1.107, §4.88):
+    /// always boolean on the live face (no flag bit = false, the isVoiceNote
+    /// shape), so the three booleans share one consumption form and the
+    /// media-type judgement (the official isGIF's contentType gate) stays
+    /// the desktop's.
+    #[serde(default)]
+    pub is_borderless: bool,
+    #[serde(default)]
+    pub is_gif: bool,
     /// Ingest-side transit pointer face, internal only — it rides the store's
     /// schema-19 live locator column and never the host wire (the §4.13
     /// metadata-only discipline covers it too). `None` on every engine face
@@ -486,6 +517,12 @@ pub struct NormalizedPreview {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The engine's P14 preview date (contract 1.107, §4.88): the card's
+    /// upstream publish stamp, forwarded verbatim when positive (the engine
+    /// projects no key for a 0 — zero information, the official falsy
+    /// posture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<NormalizedAttachment>,
 }
@@ -597,6 +634,26 @@ pub struct NormalizedRich {
     /// and pre-1.81 rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift_badge: Option<NormalizedGiftBadge>,
+    /// The engine's P14 dataMessage protocol-stamp (contract 1.107, §4.88):
+    /// `dataMessage.expireTimerVersion` forwarded when positive — the
+    /// disappearing-message protocol version the sender stated (the engine
+    /// projects no key for 0). The timer value itself stays the row's
+    /// `expireSeconds` face; this is the versioning fact beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_timer_version: Option<u32>,
+    /// Sent-transcript faces (contract 1.107, §4.88), the engine's P14 Sent
+    /// batch verbatim off `syncMessage.sentMessage`: the recipient-update
+    /// bit, the per-destination sealed-sender statuses and the story
+    /// distribution state. Receive dataMessages never carry the keys, so
+    /// inbound rows keep the defaults; only the sent mirror persists them.
+    /// Transcript facts, never acted on connector-side — the desktop's
+    /// transcript consumes them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_recipient_update: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unidentified_status: Vec<NormalizedUnidentifiedStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub story_message_recipients: Vec<NormalizedStoryRecipient>,
 }
 
 /// One story-reply context (contract 1.76, §4.67): the addressed story's
@@ -608,6 +665,39 @@ pub struct NormalizedRich {
 pub struct NormalizedStoryReply {
     pub author_aci: String,
     pub sent_timestamp: u64,
+}
+
+/// One sent-transcript sealed-sender entry (contract 1.107, §4.88): the
+/// engine's `Sent.unidentifiedStatus[]` item forwarded verbatim — the
+/// destination's service-id string (PNI-prefixed for a PNI destination, the
+/// plain UUID for an ACI), the sealed-sender bit when the proto carried one,
+/// and the destination PNI identity key (standard base64) when non-empty.
+/// All three keys are optional: an entry the engine could not resolve rides
+/// with only what it carried, and the connector drops nothing per-key.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedUnidentifiedStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unidentified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_pni_identity_key: Option<String>,
+}
+
+/// One sent-transcript story-distribution entry (contract 1.107, §4.88): the
+/// engine's `Sent.storyMessageRecipients[]` item verbatim — the destination
+/// service-id string, the distribution (playlist) ids verbatim (an empty
+/// list is the official's list-narrowed semantics and stays an empty list),
+/// and the reply-permission bit only when the proto stated one.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizedStoryRecipient {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_uuid: Option<String>,
+    pub distribution_list_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_allowed_to_reply: Option<bool>,
 }
 
 impl NormalizedRich {
@@ -626,6 +716,10 @@ impl NormalizedRich {
             && self.poll.is_none()
             && self.payment.is_none()
             && self.gift_badge.is_none()
+            && self.expire_timer_version.is_none()
+            && !self.is_recipient_update
+            && self.unidentified_status.is_empty()
+            && self.story_message_recipients.is_empty()
     }
 }
 
@@ -1271,6 +1365,13 @@ const MAX_TEXT_STYLES: usize = 64;
 const MAX_PREVIEW_URL_CHARS: usize = 2048;
 const MAX_PREVIEW_FIELD_BYTES: usize = 512;
 const MAX_MENTION_NAME_BYTES: usize = 128;
+/// Sent-transcript face bounds (contract 1.107, §4.88): the outer
+/// sealed-sender/story-recipient lists share the sync receive family's 256
+/// cap, each story entry's distribution-id list takes the 64-entry family
+/// cap, and the blur preview string takes the preview-field budget.
+const MAX_SYNC_SENT_STATUS_ENTRIES: usize = 256;
+const MAX_STORY_DISTRIBUTION_IDS: usize = 64;
+const MAX_ATTACHMENT_BLUR_HASH_CHARS: usize = 128;
 /// Sticker bounds (contract revision 1.35): the same face bounds the send
 /// method enforces — pack id 64 hex chars, pack key 128 base64 chars, emoji
 /// label 32 chars. `pub(crate)` since the §4.38 history import face parses
@@ -3161,7 +3262,13 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 /// One bounded attachment descriptor off an attachment-shaped object (§4.13,
 /// reused by message attachments and link-preview images alike). The transit
 /// locator face (contract revision 1.61) parses with the 1.56 import caps —
-/// wrong-shaped keys drop, never guess (the §4.38 ingest discipline).
+/// wrong-shaped keys drop, never guess (the §4.38 ingest discipline). The
+/// P14 metadata keys (contract 1.107, §4.88) parse per-key fail-closed:
+/// the caption is text material (the inbound-text budget), the blur preview
+/// a bounded verbatim string, the integrity pair survives only all-or-nothing
+/// (the official filePointers discipline — half a pair verifies nothing),
+/// and the two flag booleans answer false on any non-bool shape (the
+/// isVoiceNote posture: no flag bit = false).
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
     const MAX_LOCATOR_BASE64_CHARS: usize = 512;
     const MAX_LOCATOR_HEX_CHARS: usize = 128;
@@ -3186,6 +3293,36 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
         .and_then(Value::as_str)
         .map(|s| truncate_utf8_bytes(s, MAX_ATTACHMENT_FILENAME_BYTES))
         .filter(|s| !s.is_empty());
+    let caption = object
+        .get("caption")
+        .and_then(Value::as_str)
+        .map(|s| truncate_utf8_bytes(s, MAX_INBOUND_TEXT_BYTES))
+        .filter(|s| !s.is_empty());
+    let blur_hash = object
+        .get("blurHash")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.chars()
+                .take(MAX_ATTACHMENT_BLUR_HASH_CHARS)
+                .collect::<String>()
+        });
+    let mac = object
+        .get("incrementalMac")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty() && text.len() <= MAX_LOCATOR_BASE64_CHARS);
+    let chunk_size = object
+        .get("chunkSize")
+        .and_then(Value::as_u64)
+        .filter(|size| *size > 0 && *size <= u32::MAX as u64)
+        .map(|size| size as u32);
+    // 同进同退: the pair survives only together — the engine projects it
+    // that way and the official keeps both-or-neither alike.
+    let (incremental_mac, chunk_size) = match (mac, chunk_size) {
+        (Some(mac), Some(chunk_size)) => (Some(mac.to_string()), Some(chunk_size)),
+        _ => (None, None),
+    };
     let locator = object.get("locator").and_then(|raw| {
         let raw = raw.as_object()?;
         let bounded_b64 = |name: &str| {
@@ -3224,6 +3361,10 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
         id,
         content_type,
         filename,
+        caption,
+        blur_hash,
+        incremental_mac,
+        chunk_size,
         size: object.get("size").and_then(Value::as_u64),
         width: object
             .get("width")
@@ -3235,6 +3376,14 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
             .map(|value| value.min(u32::MAX as u64) as u32),
         is_voice_note: object
             .get("isVoiceNote")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_borderless: object
+            .get("isBorderless")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_gif: object
+            .get("isGif")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         locator,
@@ -3333,6 +3482,13 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
                         .and_then(Value::as_str)
                         .map(|s| truncate_utf8_bytes(s, MAX_PREVIEW_FIELD_BYTES))
                         .filter(|s| !s.is_empty()),
+                    // The engine projects the card's publish stamp only when
+                    // positive (a 0 is the official's falsy no-information
+                    // form); the same >0 filter runs here.
+                    date: object
+                        .get("date")
+                        .and_then(Value::as_u64)
+                        .filter(|date| *date > 0),
                     image: object
                         .get("image")
                         .and_then(Value::as_object)
@@ -3449,6 +3605,79 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
                     .take(GROUP_UPDATE_TITLE_MIRROR_CHARS)
                     .collect::<String>()
             });
+    }
+    // The engine's P14 dataMessage protocol stamp and Sent-transcript faces
+    // (contract 1.107, §4.88): `expireTimerVersion` forwards when positive
+    // (the engine projects no key for 0); the three Sent faces parse per-key
+    // (receive dataMessages never carry them, so inbound rows keep the
+    // defaults; the keys ride only the sent mirror). Every identity string
+    // takes the receive-id family bound, the outer lists the sync receive
+    // family cap, and each story entry's distribution ids the 64-entry list
+    // cap — a hostile or oversized face degrades per-key, never the row.
+    rich.expire_timer_version = message
+        .get("expireTimerVersion")
+        .and_then(Value::as_u64)
+        .filter(|version| *version > 0)
+        .and_then(|version| u32::try_from(version).ok());
+    rich.is_recipient_update =
+        message.get("isRecipientUpdate").and_then(Value::as_bool) == Some(true);
+    if let Some(entries) = message.get("unidentifiedStatus").and_then(Value::as_array) {
+        rich.unidentified_status = entries
+            .iter()
+            .take(MAX_SYNC_SENT_STATUS_ENTRIES)
+            .filter_map(|entry| {
+                let object = entry.as_object()?;
+                Some(NormalizedUnidentifiedStatus {
+                    destination_uuid: object
+                        .get("destinationUuid")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>()),
+                    unidentified: object.get("unidentified").and_then(Value::as_bool),
+                    destination_pni_identity_key: object
+                        .get("destinationPniIdentityKey")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && s.len() <= MAX_SYNC_IDENTITY_KEY_CHARS)
+                        .map(str::to_string),
+                })
+            })
+            .collect();
+    }
+    if let Some(entries) = message
+        .get("storyMessageRecipients")
+        .and_then(Value::as_array)
+    {
+        rich.story_message_recipients = entries
+            .iter()
+            .take(MAX_SYNC_SENT_STATUS_ENTRIES)
+            .filter_map(|entry| {
+                let object = entry.as_object()?;
+                Some(NormalizedStoryRecipient {
+                    destination_uuid: object
+                        .get("destinationUuid")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>()),
+                    distribution_list_ids: object
+                        .get("distributionListIds")
+                        .and_then(Value::as_array)
+                        .map(|ids| {
+                            ids.iter()
+                                .take(MAX_STORY_DISTRIBUTION_IDS)
+                                .filter_map(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    is_allowed_to_reply: object.get("isAllowedToReply").and_then(Value::as_bool),
+                })
+            })
+            .collect();
     }
     if rich.is_empty() {
         return None;
@@ -6420,6 +6649,225 @@ mod tests {
             "viewOnce": false,
         }));
         assert!(none.rich.is_none());
+    }
+
+    /// The engine's P14 attachment metadata keys (contract 1.107, §4.88)
+    /// parse per-key fail-closed: caption/blurHash verbatim when non-empty,
+    /// the integrity pair all-or-nothing, the two flag booleans answering
+    /// false on any hostile shape — and a legacy face without the keys keeps
+    /// the exact pre-1.107 descriptor.
+    #[test]
+    fn attachment_p14_metadata_keys_parse_per_key() {
+        let attachments = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": { "attachments": [data] },
+                },
+            }))
+            .unwrap()
+            .attachments
+        };
+        let full = &attachments(json!({
+            "id": "att-1",
+            "contentType": "image/png",
+            "filename": "shot.png",
+            "size": 2048,
+            "caption": "a sunset",
+            "blurHash": "LEHV6nWB2yk8pyo0adR*.7kCMdnj",
+            "incrementalMac": "AQIDBA==",
+            "chunkSize": 8192,
+            "isVoiceNote": false,
+            "isBorderless": true,
+            "isGif": true,
+        }))[0];
+        assert_eq!(full.caption.as_deref(), Some("a sunset"));
+        assert_eq!(
+            full.blur_hash.as_deref(),
+            Some("LEHV6nWB2yk8pyo0adR*.7kCMdnj")
+        );
+        assert_eq!(full.incremental_mac.as_deref(), Some("AQIDBA=="));
+        assert_eq!(full.chunk_size, Some(8192));
+        assert!(full.is_borderless);
+        assert!(full.is_gif);
+
+        // 同进同退: half a pair verifies nothing — both keys drop together.
+        let half = &attachments(json!({
+            "id": "att-2",
+            "incrementalMac": "AQIDBA==",
+            "chunkSize": 0,
+        }))[0];
+        assert_eq!(half.incremental_mac, None);
+        assert_eq!(half.chunk_size, None);
+        let other_half = &attachments(json!({ "id": "att-3", "chunkSize": 8 }))[0];
+        assert_eq!(other_half.incremental_mac, None);
+        assert_eq!(other_half.chunk_size, None);
+
+        // Zero-information and hostile shapes answer absent/false — never a
+        // mangled key.
+        let hostile = &attachments(json!({
+            "id": "att-4",
+            "caption": "",
+            "blurHash": 42,
+            "isBorderless": "yes",
+            "isGif": 1,
+        }))[0];
+        assert_eq!(hostile.caption, None);
+        assert_eq!(hostile.blur_hash, None);
+        assert!(!hostile.is_borderless);
+        assert!(!hostile.is_gif);
+
+        // A legacy face keeps the pre-1.107 descriptor byte-identical.
+        let legacy = &attachments(json!({ "id": "att-5", "size": 7 }))[0];
+        assert_eq!(legacy.caption, None);
+        assert_eq!(legacy.blur_hash, None);
+        assert_eq!(legacy.incremental_mac, None);
+        assert_eq!(legacy.chunk_size, None);
+        assert!(!legacy.is_borderless);
+        assert!(!legacy.is_gif);
+    }
+
+    /// The engine's P14 rich faces (contract 1.107, §4.88) parse per-key:
+    /// `expireTimerVersion` only when positive and in u32 range, the preview
+    /// date only when positive, the recipient-update bit only on `true`, and
+    /// the two Sent lists bounded with per-key degradation — while a face
+    /// carrying none of them stays an all-default (None) rich.
+    #[test]
+    fn rich_p14_faces_parse_per_key() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+        };
+        let rich = normalize(json!({
+            "message": "p14 carrier",
+            "expireTimerVersion": 3,
+            "previews": [{ "url": "https://example.com/a", "date": 1_600_000_000_000u64 }],
+            "isRecipientUpdate": true,
+            "unidentifiedStatus": [
+                {
+                    "destinationUuid": "PNI:00000000-0000-0000-0000-000000000001",
+                    "unidentified": true,
+                    "destinationPniIdentityKey": "iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+                },
+                { "unidentified": false },
+            ],
+            "storyMessageRecipients": [
+                {
+                    "destinationUuid": "11111111-2222-4333-8444-555555555555",
+                    "distributionListIds": ["00000000-0000-0000-0000-000000000000"],
+                    "isAllowedToReply": false,
+                },
+                { "destinationUuid": "22222222-2222-4333-8444-555555555555" },
+            ],
+        }))
+        .rich
+        .expect("p14 rich payload");
+        assert_eq!(rich.expire_timer_version, Some(3));
+        assert_eq!(rich.previews[0].date, Some(1_600_000_000_000));
+        assert!(rich.is_recipient_update);
+        assert_eq!(rich.unidentified_status.len(), 2);
+        assert_eq!(
+            rich.unidentified_status[0].destination_uuid.as_deref(),
+            Some("PNI:00000000-0000-0000-0000-000000000001")
+        );
+        assert_eq!(rich.unidentified_status[0].unidentified, Some(true));
+        assert_eq!(
+            rich.unidentified_status[0]
+                .destination_pni_identity_key
+                .as_deref(),
+            Some("iIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=")
+        );
+        assert_eq!(rich.unidentified_status[1].destination_uuid, None);
+        assert_eq!(rich.unidentified_status[1].unidentified, Some(false));
+        assert_eq!(rich.story_message_recipients.len(), 2);
+        assert_eq!(
+            rich.story_message_recipients[0].distribution_list_ids,
+            ["00000000-0000-0000-0000-000000000000"]
+        );
+        assert_eq!(
+            rich.story_message_recipients[0].is_allowed_to_reply,
+            Some(false)
+        );
+        assert!(
+            rich.story_message_recipients[1]
+                .distribution_list_ids
+                .is_empty()
+        );
+        assert_eq!(rich.story_message_recipients[1].is_allowed_to_reply, None);
+
+        // Zero-information and hostile shapes degrade per-key: 0 / absent
+        // version stamps, a false recipient-update bit, an over-bound PNI
+        // key, a version past the u32 ceiling.
+        let hostile = normalize(json!({
+            "message": "degraded carrier",
+            "expireTimerVersion": 4294967296u64,
+            "previews": [{ "url": "https://example.com/b", "date": 0 }],
+            "isRecipientUpdate": false,
+            "unidentifiedStatus": [{
+                "destinationPniIdentityKey": "x".repeat(200),
+            }],
+        }))
+        .rich
+        .expect("degraded rich payload");
+        assert_eq!(hostile.expire_timer_version, None);
+        assert_eq!(hostile.previews[0].date, None);
+        assert!(!hostile.is_recipient_update);
+        assert_eq!(
+            hostile.unidentified_status[0].destination_pni_identity_key,
+            None
+        );
+
+        // A plain dataMessage carries none of the faces — and the key-absent
+        // rich still collapses to None (the plain-row discipline holds).
+        let plain = normalize(json!({ "message": "hello" }));
+        assert!(plain.rich.is_none());
+    }
+
+    /// Old-row discipline (contract 1.107, §4.88): persisted pre-1.107
+    /// attachment and rich JSON — no P14 keys — deserializes cleanly and
+    /// re-serializes without the new keys, so historical rows read
+    /// byte-identical and the store read-back never invents defaults.
+    #[test]
+    fn legacy_attachment_and_rich_json_round_trip_without_p14_keys() {
+        let legacy_attachment =
+            r#"{"id":"att-1","contentType":"image/png","size":12,"isVoiceNote":false}"#;
+        let parsed: NormalizedAttachment = serde_json::from_str(legacy_attachment).unwrap();
+        assert_eq!(parsed.id, "att-1");
+        assert_eq!(parsed.caption, None);
+        assert_eq!(parsed.blur_hash, None);
+        assert_eq!(parsed.incremental_mac, None);
+        assert_eq!(parsed.chunk_size, None);
+        assert!(!parsed.is_borderless);
+        assert!(!parsed.is_gif);
+        let round = serde_json::to_string(&parsed).unwrap();
+        assert!(!round.contains("caption"));
+        assert!(!round.contains("blurHash"));
+        assert!(!round.contains("incrementalMac"));
+        assert!(!round.contains("chunkSize"));
+        // The two flag booleans share the isVoiceNote always-boolean shape:
+        // they serialize even when false, so the trio reads without key
+        // probing on every face.
+        assert!(round.contains("\"isBorderless\":false"));
+        assert!(round.contains("\"isGif\":false"));
+
+        let legacy_rich = r#"{"previews":[{"url":"https://example.com/a"}]}"#;
+        let rich: NormalizedRich = serde_json::from_str(legacy_rich).unwrap();
+        assert_eq!(rich.expire_timer_version, None);
+        assert!(!rich.is_recipient_update);
+        assert!(rich.unidentified_status.is_empty());
+        assert!(rich.story_message_recipients.is_empty());
+        let rich_round = serde_json::to_string(&rich).unwrap();
+        assert!(!rich_round.contains("expireTimerVersion"));
+        assert!(!rich_round.contains("isRecipientUpdate"));
+        assert!(!rich_round.contains("unidentifiedStatus"));
+        assert!(!rich_round.contains("storyMessageRecipients"));
     }
 
     /// The §4.40 authorAci promotion (contract 1.40): the ACI appears only

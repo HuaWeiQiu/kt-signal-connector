@@ -80,6 +80,12 @@ pub const LINK_WAIT_MS: u64 = 10 * 60 * 1000;
 /// The backup proto's mutually exclusive attachment flag for voice notes
 /// (engine `message_attachment::Flag::VoiceMessage`).
 const ATTACHMENT_FLAG_VOICE_MESSAGE: i64 = 1;
+/// The backup proto's attachment flag bits for the P14 metadata booleans
+/// (contract 1.107, §4.88; engine `message_attachment::Flag::Borderless` /
+/// `::Gif` — the same enum the live pointer face projects as `isBorderless`
+/// / `isGif`).
+const ATTACHMENT_FLAG_BORDERLESS: i64 = 2;
+const ATTACHMENT_FLAG_GIF: i64 = 8;
 /// Author display names ride the same bound the live receive ladder applies
 /// (engine-normalized `sourceName`, 64 chars).
 const SENDER_NAME_CHARS: usize = 64;
@@ -1250,6 +1256,26 @@ impl<'a> Importer<'a> {
         let mut descriptors = Vec::new();
         let mut locators = Vec::new();
         for (index, raw) in raws.iter().take(MAX_IMPORT_ATTACHMENTS).enumerate() {
+            // The P14 metadata keys (contract 1.107, §4.88) parse with the
+            // same names the live face carries — caption/blurHash verbatim
+            // (empty drops, the zero-information discipline), the integrity
+            // pair all-or-nothing, the flag bits the same enum members the
+            // live pointer projects — so imported and live descriptors share
+            // one wire form.
+            let mac = raw
+                .get("incrementalMac")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            let chunk_size = raw
+                .get("chunkSize")
+                .and_then(Value::as_u64)
+                .filter(|size| *size > 0 && *size <= u32::MAX as u64)
+                .map(|size| size as u32);
+            let (incremental_mac, chunk_size) = match (mac, chunk_size) {
+                (Some(mac), Some(chunk_size)) => (Some(mac.to_string()), Some(chunk_size)),
+                _ => (None, None),
+            };
+            let flag = raw.get("flag").and_then(Value::as_i64);
             descriptors.push(NormalizedAttachment {
                 id: stable_hash_id(&["history-attachment", message_id, &index.to_string()]),
                 content_type: raw
@@ -1265,8 +1291,21 @@ impl<'a> Importer<'a> {
                 size: raw.get("size").and_then(Value::as_u64),
                 width: None,
                 height: None,
-                is_voice_note: raw.get("flag").and_then(Value::as_i64)
-                    == Some(ATTACHMENT_FLAG_VOICE_MESSAGE),
+                is_voice_note: flag == Some(ATTACHMENT_FLAG_VOICE_MESSAGE),
+                caption: raw
+                    .get("caption")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string),
+                blur_hash: raw
+                    .get("blurHash")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string),
+                incremental_mac,
+                chunk_size,
+                is_borderless: flag == Some(ATTACHMENT_FLAG_BORDERLESS),
+                is_gif: flag == Some(ATTACHMENT_FLAG_GIF),
                 locator: None,
             });
             locators.push(import_locator(raw.get("locator")));
