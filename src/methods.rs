@@ -233,6 +233,28 @@ pub const METHODS: &[MethodRow] = &[
     // closed at the connector). Zero local writes: the roster converges
     // through contacts.sync like every group row.
     ("groups.revokeInvites", Lane::Send, true, "send"),
+    // Group invite-link family (contract revision 1.117, §4.98): the
+    // engine's link material and parse faces are account-less reads (the
+    // password is pure CSPRNG, the parse is pure proto decoding — the
+    // sticker-browse class), build and preview are account-scoped reads
+    // (the build's default arm reads the server group state; explicit
+    // password is pure construction), and join/cancel are the mutating
+    // upstream writes — the groups class verbatim, same-account mutex and
+    // delete barrier included. Zero local writes on every face: the
+    // membership state converges through contacts.sync. The link and
+    // password bytes are single-pass material — they ride the call they
+    // were asked for and are never logged or persisted connector-side.
+    (
+        "groups.generateInviteLinkPassword",
+        Lane::Read,
+        false,
+        "read",
+    ),
+    ("groups.buildInviteLink", Lane::Read, false, "read"),
+    ("groups.parseInviteLink", Lane::Read, false, "read"),
+    ("groups.previewViaLink", Lane::Read, false, "read"),
+    ("groups.joinViaLink", Lane::Send, true, "send"),
+    ("groups.cancelJoinRequest", Lane::Send, true, "send"),
     // Android local-backup export (contract revision 1.47, §4.46): the
     // engine's background export task is account-mutating state, so the
     // start face rides the send lane behind the reaction-class write-lane
@@ -576,7 +598,13 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// (`conversations.getState` read over the storage records'
 /// mutedUntilTimestamp/archived/markedUnread bits plus `conversations.setState`
 /// partial write — one capability for the read and write halves, the 1.53
-/// appendix discipline). They never
+/// appendix discipline); and `group-invite-links` (contract revision 1.117)
+/// marks the §4.98 group invite-link faces (`groups.generateInviteLinkPassword`
+/// / `groups.buildInviteLink` / `groups.parseInviteLink` material-and-parse
+/// reads plus `groups.previewViaLink` preview read and the
+/// `groups.joinViaLink` / `groups.cancelJoinRequest` join-family writes — one
+/// capability for the whole link life cycle, the 1.53 appendix discipline).
+/// They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -619,6 +647,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "stories",
     "chat-folders",
     "conversation-state",
+    "group-invite-links",
 ];
 
 #[cfg(test)]
@@ -670,6 +699,10 @@ mod tests {
             "calls.groupMembers",
             "calls.endorsementsPublicKey",
             "chatFolders.list",
+            "groups.generateInviteLinkPassword",
+            "groups.buildInviteLink",
+            "groups.parseInviteLink",
+            "groups.previewViaLink",
         ];
         let send_lane = [
             "messages.sendText",
@@ -702,6 +735,8 @@ mod tests {
             "groups.terminate",
             "groups.approveJoinRequests",
             "groups.revokeInvites",
+            "groups.joinViaLink",
+            "groups.cancelJoinRequest",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",
@@ -757,6 +792,8 @@ mod tests {
             "groups.terminate",
             "groups.approveJoinRequests",
             "groups.revokeInvites",
+            "groups.joinViaLink",
+            "groups.cancelJoinRequest",
             "messages.reportSpam",
             "stickerPacks.setSync",
             "backups.export",

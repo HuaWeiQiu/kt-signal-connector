@@ -1579,6 +1579,73 @@ impl ProxyGroupRuntime {
         slot.supervisor.revoke_invites(params).await
     }
 
+    /// groups.generateInviteLinkPassword / groups.parseInviteLink (contract
+    /// revision 1.117, §4.98, capability group-invite-links): the
+    /// account-less material-and-parse faces — no account routes them, so
+    /// they ride the default supervisor like the anonymous sticker-browse
+    /// faces.
+    pub async fn generate_group_invite_link_password(
+        &self,
+        params: crate::service::GroupsInviteLinkPasswordParams,
+    ) -> Result<crate::service::GroupInviteLinkPassword, ServiceError> {
+        let slot = self.default_slot()?;
+        slot.supervisor
+            .generate_group_invite_link_password(params)
+            .await
+    }
+
+    pub async fn parse_group_invite_link(
+        &self,
+        params: crate::service::GroupsParseInviteLinkParams,
+    ) -> Result<crate::service::GroupInviteLinkParse, ServiceError> {
+        let slot = self.default_slot()?;
+        slot.supervisor.parse_group_invite_link(params).await
+    }
+
+    /// groups.buildInviteLink (contract revision 1.117, §4.98, capability
+    /// group-invite-links): the group's link material lives with the
+    /// account's engine, so the read routes through the account's owning
+    /// supervisor.
+    pub async fn build_group_invite_link(
+        &self,
+        params: crate::service::GroupsBuildInviteLinkParams,
+    ) -> Result<crate::service::GroupInviteLink, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.build_group_invite_link(params).await
+    }
+
+    /// groups.previewViaLink (contract revision 1.117, §4.98, capability
+    /// group-invite-links): the link's pre-join state lives with the
+    /// account's engine — the account's owning supervisor, like the build
+    /// read.
+    pub async fn preview_group_via_link(
+        &self,
+        params: crate::service::GroupsPreviewViaLinkParams,
+    ) -> Result<crate::service::GroupInviteLinkPreview, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.preview_group_via_link(params).await
+    }
+
+    /// groups.joinViaLink / groups.cancelJoinRequest (contract revision
+    /// 1.117, §4.98, capability group-invite-links): the join-family
+    /// writes route through the account's owning supervisor like every
+    /// other mutating face.
+    pub async fn join_group_via_link(
+        &self,
+        params: crate::service::GroupsJoinViaLinkParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.join_group_via_link(params).await
+    }
+
+    pub async fn cancel_join_request(
+        &self,
+        params: crate::service::GroupsCancelJoinRequestParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.cancel_join_request(params).await
+    }
+
     /// messages.reportSpam (contract revision 1.49, §4.48, capability
     /// report-spam): the reported rows live with the account's engine, so
     /// the write routes through the account's owning supervisor like every

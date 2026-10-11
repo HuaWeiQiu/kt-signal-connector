@@ -28,7 +28,10 @@ use crate::service::{
     ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsSetBlockedParams,
     ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
     ConversationsSetPinnedParams, ConversationsSetStateParams, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
-    GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails, GroupsApproveJoinRequestsParams,
+    GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails, GroupInviteLink, GroupInviteLinkParse,
+    GroupInviteLinkPassword, GroupInviteLinkPreview, GroupsApproveJoinRequestsParams,
+    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsInviteLinkPasswordParams,
+    GroupsJoinViaLinkParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams,
     GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
@@ -43,11 +46,12 @@ use crate::service::{
     StoriesSetDisabledParams, StorySendRecipientResult, StorySendResult, StorySendSuccess,
     UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
     account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
-    chat_folder_syncs_result, conversation_state_from_engine, identity_from_engine,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
-    validate_account_delete_operation_id,
+    chat_folder_syncs_result, conversation_state_from_engine, group_invite_join_status_from_engine,
+    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
+    group_invite_link_preview_from_engine, identity_from_engine, pinned_conversations_result,
+    sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
+    store_get_message_text, store_list_contacts, store_list_conversations, store_list_messages,
+    store_search_messages, validate_account_delete_operation_id,
 };
 use crate::store::{
     AccountDeletePlan, AccountSummary, ContactSummary, ConversationSummary, EXPIRE_SWEEP_BATCH,
@@ -3625,6 +3629,214 @@ impl RuntimeSupervisor {
             // The bare -32603 face rejects the parameters before any write
             // lands — a deterministic refusal, retryable=false (the 1.115
             // groups discipline).
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.generateInviteLinkPassword (contract revision 1.117, §4.98,
+    /// capability group-invite-links): the account-less material face —
+    /// 16 CSPRNG bytes as standard base64, the official
+    /// GROUP_INVITE_LINK_PASSWORD_LENGTH. No dispatch record engine-side
+    /// (the material faces never log), and the bytes are single-pass:
+    /// they ride this answer and are never logged or persisted
+    /// connector-side.
+    pub async fn generate_group_invite_link_password(
+        &self,
+        _params: GroupsInviteLinkPasswordParams,
+    ) -> Result<GroupInviteLinkPassword, ServiceError> {
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("generateInviteLinkPassword", json!({}), CallClass::ReadOnly)
+            .await?;
+        group_invite_link_password_from_engine(&result)
+    }
+
+    /// groups.buildInviteLink (contract revision 1.117, §4.98, capability
+    /// group-invite-links): group resolution under the service lock, then
+    /// the read-only `buildInviteLink {account, groupId, password?}` — the
+    /// explicit-password arm is pure construction, the default arm reads
+    /// the server group state (a link the group has not enabled answers
+    /// GROUP_INVITE_LINK_UNAVAILABLE). Read lane, non-mutating; the link
+    /// and password bytes are single-pass material.
+    pub async fn build_group_invite_link(
+        &self,
+        params: GroupsBuildInviteLinkParams,
+    ) -> Result<GroupInviteLink, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_build_invite_link(
+                &params.account_id,
+                &params.conversation_id,
+                params.password.as_deref(),
+            )?
+        };
+        match engine
+            .call("buildInviteLink", upstream, CallClass::ReadOnly)
+            .await
+        {
+            Ok(result) => {
+                let invite_link = result
+                    .get("inviteLink")
+                    .and_then(Value::as_str)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+                Ok(GroupInviteLink {
+                    invite_link: invite_link.to_string(),
+                })
+            }
+            // The bare -32603 face (an account the engine no longer holds,
+            // a malformed parameter the typed ladder cannot produce) is a
+            // deterministic refusal — retryable=false, the 1.115
+            // discipline; the structured link families
+            // (GROUP_INVITE_LINK_UNAVAILABLE, STORAGE_UNAVAILABLE) map
+            // through the allowlist channels.
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.parseInviteLink (contract revision 1.117, §4.98, capability
+    /// group-invite-links): the account-less pure-parse face — the engine
+    /// decodes the official `https://signal.group/#<websafe>` shape (the
+    /// three URL forms and the bare invite code) to its master key +
+    /// password bytes; a malformed link is the engine's -32603 face, the
+    /// deterministic UPSTREAM_ERROR refusal. The decoded bytes are
+    /// single-pass material.
+    pub async fn parse_group_invite_link(
+        &self,
+        params: GroupsParseInviteLinkParams,
+    ) -> Result<GroupInviteLinkParse, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_parse_invite_link(&params.invite_link)?
+        };
+        match engine
+            .call("parseInviteLink", upstream, CallClass::ReadOnly)
+            .await
+        {
+            Ok(result) => group_invite_link_parse_from_engine(&result),
+            // The bare -32603 parse gate (a malformed link the engine's
+            // tolerance ladder refuses before anything goes upstream) is a
+            // deterministic refusal — retryable=false, a replay fails the
+            // same way.
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.previewViaLink (contract revision 1.117, §4.98, capability
+    /// group-invite-links): bounds + account resolution under the service
+    /// lock, then the read-only `previewGroupViaLink {account, inviteLink}`
+    /// — the engine's pre-join projection (the link's group without
+    /// membership). Read lane; a server refusal answers
+    /// GROUP_INVITE_LINK_PREVIEW_FAILED with data.status? verbatim.
+    pub async fn preview_group_via_link(
+        &self,
+        params: GroupsPreviewViaLinkParams,
+    ) -> Result<GroupInviteLinkPreview, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_link_addressed_face(&params.account_id, &params.invite_link)?
+        };
+        match engine
+            .call("previewGroupViaLink", upstream, CallClass::ReadOnly)
+            .await
+        {
+            Ok(result) => group_invite_link_preview_from_engine(&result),
+            // The bare -32603 face (a malformed link, an account the
+            // engine no longer holds) is a deterministic refusal —
+            // retryable=false; the structured faces
+            // (GROUP_INVITE_LINK_PREVIEW_FAILED, STORAGE_UNAVAILABLE) map
+            // through the allowlist channels.
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.joinViaLink (contract revision 1.117, §4.98, capability
+    /// group-invite-links): bounds + account resolution under the service
+    /// lock, then the mutating `joinGroupViaLink {account, inviteLink}` —
+    /// the reaction-class discipline with the timer face's unknown-outcome
+    /// honesty (an indeterminate answer is SEND_OUTCOME_UNKNOWN and is
+    /// never retried; the join may already have landed). The status verb
+    /// distinguishes the definite member add (`joined`) from the approval
+    /// gate's request (`requested`); a server rejection answers
+    /// GROUP_UPDATE_FAILED with data.status? verbatim (the 1.115 channel).
+    /// Zero local writes: the roster converges through contacts.sync.
+    pub async fn join_group_via_link(
+        &self,
+        params: GroupsJoinViaLinkParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_link_addressed_face(&params.account_id, &params.invite_link)?
+        };
+        match engine
+            .call("joinGroupViaLink", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => group_invite_join_status_from_engine(&result),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            // The bare -32603 face (a malformed link the engine's parse
+            // gate refuses before anything goes upstream) is a
+            // deterministic refusal — retryable=false.
+            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_ERROR",
+                "signal-cli returned an error",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// groups.cancelJoinRequest (contract revision 1.117, §4.98, capability
+    /// group-invite-links): the join write's withdrawal twin — the same
+    /// link-addressed ladder, the same reaction-class discipline, the
+    /// same `{"status": "cancelled"}` definite success. Zero local
+    /// writes: the roster converges through contacts.sync.
+    pub async fn cancel_join_request(
+        &self,
+        params: GroupsCancelJoinRequestParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_groups_link_addressed_face(&params.account_id, &params.invite_link)?
+        };
+        match engine
+            .call("cancelJoinRequest", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(_) => Ok("cancelled"),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "signal-cli returned an error",

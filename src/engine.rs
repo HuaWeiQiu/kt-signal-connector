@@ -2671,6 +2671,17 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // verbatim (the CALL_CREDENTIALS_FAILED channel); retryable=false —
     // a 409 revision race unblocks only after re-reading the group state.
     "GROUP_UPDATE_FAILED",
+    // §4.98 group invite-link faces (contract 1.117, the link-family wiring
+    // batch): UNAVAILABLE is the build face's server-rejection / link-not-set
+    // family (the group has no invite link, or the server refused the read —
+    // the engine's data.status? rides the CALL_CREDENTIALS_FAILED channel;
+    // retryable=false — the same group state answers the same way);
+    // PREVIEW_FAILED is the preview face's server-rejection family with the
+    // same data.status? pass-through (retryable=false — deterministic). The
+    // join/cancel writes fold their server rejections under the 1.115
+    // GROUP_UPDATE_FAILED code already above.
+    "GROUP_INVITE_LINK_UNAVAILABLE",
+    "GROUP_INVITE_LINK_PREVIEW_FAILED",
     // §4.73 call-link credential material faces (contract 1.88, engine
     // a3ae39b, P4c slice 1 — the registration the engine's compat §3 calls
     // rows assign to this connector batch): FAILED is the server-rejection /

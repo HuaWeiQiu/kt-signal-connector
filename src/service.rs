@@ -76,6 +76,15 @@ pub const MAX_PINNED_CONVERSATIONS: usize = 128;
 /// connector enforces only the bound — the grammar itself is the upstream's
 /// definite UserError, never a local re-derivation.
 pub const IDENTITY_SAFETY_NUMBER_MAX_CHARS: usize = 256;
+/// Group invite-link faces (contract revision 1.117, §4.98): the link string
+/// bound (the official `https://signal.group/#<websafe>` shape encodes a
+/// ~52-byte proto — roughly 95 chars end to end; 1024 keeps one wire frame
+/// bounded while any legitimate code-form variant fits with room to spare)
+/// and the explicit link-password bound (the official password is 16 bytes =
+/// 24 standard-base64 chars; 128 keeps the frame bounded and the grammar is
+/// the engine's decode gate, never a local re-derivation).
+pub const MAX_INVITE_LINK_CHARS: usize = 1024;
+pub const MAX_INVITE_LINK_PASSWORD_CHARS: usize = 128;
 /// Sticker pack sync bounds (contract revision 1.37, §4.34): the pack key
 /// when present is the §4.32 browse shape — exactly 32 bytes, whose padded
 /// standard-base64 encoding is exactly 44 characters — and the returned pack
@@ -453,6 +462,31 @@ impl ServiceError {
                         data,
                     );
                 }
+                // §4.98 group invite-link faces (contract 1.117): the same
+                // honest HTTP pass-through channel, link-faced — the build
+                // face's server-rejection / link-not-set family and the
+                // preview face's server-rejection family (the engine sends
+                // an empty object when the server gave no status). Both
+                // stay deterministic: the same group state answers the
+                // same way, retryable=false.
+                if code == "GROUP_INVITE_LINK_UNAVAILABLE"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "GROUP_INVITE_LINK_UNAVAILABLE",
+                        "the group's invite link is not available",
+                        data,
+                    );
+                }
+                if code == "GROUP_INVITE_LINK_PREVIEW_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "GROUP_INVITE_LINK_PREVIEW_FAILED",
+                        "the group link preview was rejected by the Signal server",
+                        data,
+                    );
+                }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
                         "STICKER_PACK_KEY_INVALID",
@@ -708,6 +742,20 @@ impl ServiceError {
                     "GROUP_UPDATE_FAILED" => ApiError::new(
                         "GROUP_UPDATE_FAILED",
                         "the group update was rejected by the Signal server",
+                        false,
+                    ),
+                    // §4.98 group invite-link faces (contract 1.117): the
+                    // data-less fallbacks for the two link families (and
+                    // the schema-consistency scanner's code-side anchors).
+                    // Deterministic: retryable=false.
+                    "GROUP_INVITE_LINK_UNAVAILABLE" => ApiError::new(
+                        "GROUP_INVITE_LINK_UNAVAILABLE",
+                        "the group's invite link is not available",
+                        false,
+                    ),
+                    "GROUP_INVITE_LINK_PREVIEW_FAILED" => ApiError::new(
+                        "GROUP_INVITE_LINK_PREVIEW_FAILED",
+                        "the group link preview was rejected by the Signal server",
                         false,
                     ),
                     _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
@@ -4377,6 +4425,108 @@ impl ConnectorService {
         validate_pinned_kind(kind)?;
         let account = self.resolve_account(account_id)?;
         Ok(account)
+    }
+
+    /// The §4.98 link-addressed pre-ladder (contract revision 1.117): the
+    /// account-bound + invite-link-bound resolution shared by the preview,
+    /// join, and cancel faces — everything that fails closed before the
+    /// engine sees the link. The link itself is never parsed or re-derived
+    /// connector-side: the engine owns the parse gate (a malformed link is
+    /// its -32603 face, the deterministic UPSTREAM_ERROR refusal).
+    pub fn prepare_groups_link_addressed_face(
+        &self,
+        account_id: &str,
+        invite_link: &str,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if invite_link.is_empty() || invite_link.chars().count() > MAX_INVITE_LINK_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "inviteLink must contain between 1 and 1024 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "inviteLink": invite_link,
+        }))
+    }
+
+    /// The §4.98 build-face ladder (contract revision 1.117): the group
+    /// resolution of groups.quit plus the optional explicit password — the
+    /// upstream `buildInviteLink {account, groupId, password?}` payload.
+    /// The conversation row's peer key is the group master key the engine's
+    /// link constructor encodes (the same reference listGroups addresses).
+    /// An absent password keeps the engine's read-the-server-state arm; the
+    /// password itself is single-pass material, forwarded verbatim and
+    /// never logged or persisted.
+    pub fn prepare_groups_build_invite_link(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        password: Option<&str>,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        if conversation_id.is_empty()
+            || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversationId must contain between 1 and 256 characters",
+                false,
+            )));
+        }
+        if let Some(password) = password
+            && (password.is_empty() || password.chars().count() > MAX_INVITE_LINK_PASSWORD_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "password must contain between 1 and 128 characters",
+                false,
+            )));
+        }
+        let account = self.resolve_account(account_id)?;
+        let conversation = self.resolve_conversation(account_id, conversation_id)?;
+        if conversation.kind != "group" {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "groups.buildInviteLink addresses a group conversation",
+                false,
+            )));
+        }
+        if conversation.peer_key.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "conversation has no upstream group reference",
+                false,
+            )));
+        }
+        let mut upstream = json!({
+            "account": account.signal_account,
+            "groupId": conversation.peer_key,
+        });
+        if let Some(password) = password {
+            upstream["password"] = json!(password);
+        }
+        Ok(upstream)
+    }
+
+    /// The §4.98 parse-face ladder (contract revision 1.117): the link
+    /// bound only — the parse is account-less, and the grammar is the
+    /// engine's.
+    pub fn prepare_groups_parse_invite_link(
+        &self,
+        invite_link: &str,
+    ) -> Result<Value, ServiceError> {
+        if invite_link.is_empty() || invite_link.chars().count() > MAX_INVITE_LINK_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "inviteLink must contain between 1 and 1024 characters",
+                false,
+            )));
+        }
+        Ok(json!({ "inviteLink": invite_link }))
     }
 
     /// conversations.acceptRequest / conversations.declineRequest (contract
@@ -10907,6 +11057,114 @@ pub struct GroupsRevokeInvitesParams {
     pub operation_id: Option<String>,
 }
 
+/// `groups.generateInviteLinkPassword` params (contract revision 1.117,
+/// §4.98): none — the password is account-less CSPRNG material (the official
+/// `generateGroupInviteLinkPassword`), so the host face takes an empty
+/// object; the deserializer keeps it that way.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsInviteLinkPasswordParams {}
+
+/// `groups.buildInviteLink` params (contract revision 1.117, §4.98): the
+/// addressing pair plus the optional explicit link password — absent keeps
+/// the engine's read-the-server-state arm. The password is single-pass
+/// material: forwarded verbatim, never logged or persisted.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsBuildInviteLinkParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub password: Option<String>,
+}
+
+/// `groups.parseInviteLink` params (contract revision 1.117, §4.98): the
+/// link string only — the parse is account-less pure proto decoding (the
+/// official `parseGroupLink`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsParseInviteLinkParams {
+    pub invite_link: String,
+}
+
+/// The shared §4.98 link-addressed params (contract revision 1.117): the
+/// preview, join, and cancel faces all address the group through the link
+/// itself — the engine parses the link to its master key + password, so no
+/// groupId crosses the host wire on these faces.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsPreviewViaLinkParams {
+    pub account_id: String,
+    pub invite_link: String,
+}
+
+/// `groups.joinViaLink` params (contract revision 1.117, §4.98): the
+/// §4.98 preview shape verbatim — the join is link-addressed like the
+/// preview it follows.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsJoinViaLinkParams {
+    pub account_id: String,
+    pub invite_link: String,
+}
+
+/// `groups.cancelJoinRequest` params (contract revision 1.117, §4.98): the
+/// same link-addressed shape — a requester is not yet a member, so the
+/// withdrawal is addressed by the link it joined through (the official
+/// `cancelJoinRequest` same posture).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupsCancelJoinRequestParams {
+    pub account_id: String,
+    pub invite_link: String,
+}
+
+/// The `groups.generateInviteLinkPassword` result (contract revision 1.117,
+/// §4.98): 16 CSPRNG bytes as standard base64 — the official
+/// GROUP_INVITE_LINK_PASSWORD_LENGTH material.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInviteLinkPassword {
+    pub password: String,
+}
+
+/// The `groups.buildInviteLink` result (contract revision 1.117, §4.98):
+/// the link string — `https://signal.group/#<websafe proto>` in the
+/// official shape.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInviteLink {
+    pub invite_link: String,
+}
+
+/// The `groups.parseInviteLink` result (contract revision 1.117, §4.98):
+/// the decoded master key and password bytes, standard base64 — the
+/// engine's parse projection verbatim.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInviteLinkParse {
+    pub group_id: String,
+    pub password: String,
+}
+
+/// The `groups.previewViaLink` result (contract revision 1.117, §4.98):
+/// the engine's pre-join projection — the decoded master key, the group's
+/// size/revision/link-access state, the two approval bits, and the
+/// optional profile title/description the link's group carries.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupInviteLinkPreview {
+    pub group_id: String,
+    pub member_count: u64,
+    pub revision: u64,
+    pub add_from_invite_link: String,
+    pub approval_required: bool,
+    pub pending_admin_approval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContactsSetLocalAliasParams {
@@ -11755,6 +12013,113 @@ pub(crate) fn conversation_state_from_engine(
         archived,
         marked_unread,
     })
+}
+
+/// Parse the engine's invite-link password answer (contract revision 1.117,
+/// §4.98): the base64 material string is the whole answer; a missing or
+/// non-string key is a protocol defect, not an empty password.
+pub(crate) fn group_invite_link_password_from_engine(
+    result: &Value,
+) -> Result<GroupInviteLinkPassword, ServiceError> {
+    let password = result
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(GroupInviteLinkPassword {
+        password: password.to_string(),
+    })
+}
+
+/// Parse the engine's link parse answer (contract revision 1.117, §4.98):
+/// the decoded master key and password ride as standard-base64 strings; a
+/// missing or non-string key is a protocol defect (the engine refuses its
+/// own malformed inputs before answering, so a short answer is not a
+/// parse failure to soften).
+pub(crate) fn group_invite_link_parse_from_engine(
+    result: &Value,
+) -> Result<GroupInviteLinkParse, ServiceError> {
+    let group_id = result
+        .get("groupId")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let password = result
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    Ok(GroupInviteLinkParse {
+        group_id: group_id.to_string(),
+        password: password.to_string(),
+    })
+}
+
+/// Parse the engine's pre-join preview projection (contract revision 1.117,
+/// §4.98): the six core keys always ride; the profile title/description are
+/// optional exactly as the engine's projection declares (a link-less group
+/// profile carries neither). A missing core key or a present-but-non-string
+/// optional key is a protocol defect, not a default.
+pub(crate) fn group_invite_link_preview_from_engine(
+    result: &Value,
+) -> Result<GroupInviteLinkPreview, ServiceError> {
+    let group_id = result
+        .get("groupId")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let member_count = result
+        .get("memberCount")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let revision = result
+        .get("revision")
+        .and_then(Value::as_u64)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let add_from_invite_link = result
+        .get("addFromInviteLink")
+        .and_then(Value::as_str)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let approval_required = result
+        .get("approvalRequired")
+        .and_then(Value::as_bool)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let pending_admin_approval = result
+        .get("pendingAdminApproval")
+        .and_then(Value::as_bool)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let name = match result.get("name") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(ServiceError::Engine(EngineError::Protocol)),
+    };
+    let description = match result.get("description") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(ServiceError::Engine(EngineError::Protocol)),
+    };
+    Ok(GroupInviteLinkPreview {
+        group_id: group_id.to_string(),
+        member_count,
+        revision,
+        add_from_invite_link: add_from_invite_link.to_string(),
+        approval_required,
+        pending_admin_approval,
+        name,
+        description,
+    })
+}
+
+/// Parse the engine's join outcome (contract revision 1.117, §4.98): the
+/// two-value status verb — `joined` (the member add landed) or `requested`
+/// (the group's approval gate turned the join into a request). Any other
+/// status is a protocol defect, not an unknown-state shrug.
+pub(crate) fn group_invite_join_status_from_engine(
+    result: &Value,
+) -> Result<&'static str, ServiceError> {
+    match result.get("status").and_then(Value::as_str) {
+        Some("joined") => Ok("joined"),
+        Some("requested") => Ok("requested"),
+        _ => Err(ServiceError::Engine(EngineError::Protocol)),
+    }
 }
 
 /// Project the engine's `engine.deviceCapabilities` answer onto the wire
@@ -17609,6 +17974,232 @@ mod tests {
         ));
     }
 
+    /// The §4.98 group invite-link faces (contract revision 1.117): the
+    /// build ladder resolves the group row and forwards the master key with
+    /// the optional password; the shared link-addressed ladder bounds and
+    /// resolves; the parse face bounds only. Every refusal answers before
+    /// any engine call.
+    #[test]
+    fn prepare_group_invite_link_faces_ladders_and_payloads() {
+        let (_temp, mut service) = service();
+        let (account, direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "group-id-1", "group")
+            .unwrap();
+
+        // Build: the master key is the row's peer reference, the explicit
+        // password rides verbatim, the absent password stays absent.
+        let upstream = service
+            .prepare_groups_build_invite_link(&account.id, &group.id, Some("cGFzc3dvcmQ="))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["groupId"], group.peer_key);
+        assert_eq!(upstream["password"], "cGFzc3dvcmQ=");
+        let upstream = service
+            .prepare_groups_build_invite_link(&account.id, &group.id, None)
+            .unwrap();
+        assert!(upstream.get("password").is_none());
+        assert_eq!(upstream["groupId"], group.peer_key);
+
+        // The shared link-addressed ladder: account + link only, forwarded
+        // verbatim (the grammar is the engine's parse gate).
+        let upstream = service
+            .prepare_groups_link_addressed_face(&account.id, "https://signal.group/#aGVsbG8")
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["inviteLink"], "https://signal.group/#aGVsbG8");
+
+        // The failure ladders in wire order: build bounds, the group-kind
+        // gate, unknown rows; the shared ladder's link bound; the parse
+        // face's bound.
+        let error = service
+            .prepare_groups_build_invite_link(&account.id, &group.id, Some(""))
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_build_invite_link(
+                &account.id,
+                &group.id,
+                Some(&"x".repeat(MAX_INVITE_LINK_PASSWORD_CHARS + 1)),
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_build_invite_link(&account.id, &direct.id, None)
+            .unwrap_err();
+        assert_eq!(
+            error.into_api().code,
+            "INVALID_REQUEST",
+            "a direct row is not link material"
+        );
+        let error = service
+            .prepare_groups_build_invite_link("no-such-account", &group.id, None)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+        let error = service
+            .prepare_groups_build_invite_link(&account.id, "no-such-conversation", None)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "CONVERSATION_NOT_FOUND");
+        for (label, link) in [
+            ("shared", &"x".repeat(MAX_INVITE_LINK_CHARS + 1)[..]),
+            ("parse", &"x".repeat(MAX_INVITE_LINK_CHARS + 1)[..]),
+        ] {
+            let error = if label == "shared" {
+                service
+                    .prepare_groups_link_addressed_face(&account.id, link)
+                    .unwrap_err()
+            } else {
+                service.prepare_groups_parse_invite_link(link).unwrap_err()
+            };
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label} bound");
+        }
+        let error = service
+            .prepare_groups_link_addressed_face(&account.id, "")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        let error = service
+            .prepare_groups_link_addressed_face("no-such-account", "https://signal.group/#aGVsbG8")
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// The §4.98 projection parsers: the preview's six core keys are strict
+    /// (missing/wrong-shaped = protocol defect), the two profile keys are
+    /// optional (string when present, null tolerated as absent), and the
+    /// join status verb is the two-value enum.
+    #[test]
+    fn group_invite_link_projections_parse_strictly() {
+        let full = serde_json::json!({
+            "groupId": "cGFzc3dvcmQ=",
+            "memberCount": 12,
+            "revision": 7,
+            "addFromInviteLink": "ANY",
+            "approvalRequired": false,
+            "pendingAdminApproval": false,
+            "name": "Fixture Link Group",
+            "description": "previewed",
+        });
+        let preview = group_invite_link_preview_from_engine(&full).unwrap();
+        assert_eq!(preview.group_id, "cGFzc3dvcmQ=");
+        assert_eq!(preview.member_count, 12);
+        assert_eq!(preview.revision, 7);
+        assert_eq!(preview.add_from_invite_link, "ANY");
+        assert!(!preview.approval_required);
+        assert!(!preview.pending_admin_approval);
+        assert_eq!(preview.name.as_deref(), Some("Fixture Link Group"));
+        assert_eq!(preview.description.as_deref(), Some("previewed"));
+
+        // The optional keys drop (absent or null both fold to None).
+        let minimal = serde_json::json!({
+            "groupId": "cGFzc3dvcmQ=",
+            "memberCount": 0,
+            "revision": 0,
+            "addFromInviteLink": "ADMINISTRATOR",
+            "approvalRequired": true,
+            "pendingAdminApproval": true,
+        });
+        let preview = group_invite_link_preview_from_engine(&minimal).unwrap();
+        assert!(preview.name.is_none());
+        assert!(preview.description.is_none());
+        let nulled = serde_json::json!({
+            "groupId": "cGFzc3dvcmQ=",
+            "memberCount": 0,
+            "revision": 0,
+            "addFromInviteLink": "ADMINISTRATOR",
+            "approvalRequired": true,
+            "pendingAdminApproval": true,
+            "name": null,
+            "description": null,
+        });
+        let preview = group_invite_link_preview_from_engine(&nulled).unwrap();
+        assert!(preview.name.is_none());
+
+        // Every core key is strict: missing or wrong-shaped = protocol
+        // defect.
+        for core in [
+            "groupId",
+            "memberCount",
+            "revision",
+            "addFromInviteLink",
+            "approvalRequired",
+            "pendingAdminApproval",
+        ] {
+            let mut broken = full.clone();
+            broken.as_object_mut().unwrap().remove(core);
+            assert!(
+                matches!(
+                    group_invite_link_preview_from_engine(&broken),
+                    Err(ServiceError::Engine(EngineError::Protocol))
+                ),
+                "{core} missing"
+            );
+        }
+        let wrong_optional = serde_json::json!({
+            "groupId": "cGFzc3dvcmQ=",
+            "memberCount": 12,
+            "revision": 7,
+            "addFromInviteLink": "ANY",
+            "approvalRequired": false,
+            "pendingAdminApproval": false,
+            "name": 12,
+        });
+        assert!(matches!(
+            group_invite_link_preview_from_engine(&wrong_optional),
+            Err(ServiceError::Engine(EngineError::Protocol))
+        ));
+
+        // The join status verb: the two-value enum, nothing else.
+        assert_eq!(
+            group_invite_join_status_from_engine(&serde_json::json!({
+                "status": "joined"
+            }))
+            .unwrap(),
+            "joined"
+        );
+        assert_eq!(
+            group_invite_join_status_from_engine(&serde_json::json!({
+                "status": "requested"
+            }))
+            .unwrap(),
+            "requested"
+        );
+        for broken in [
+            serde_json::json!({ "status": "cancelled" }),
+            serde_json::json!({ "status": 7 }),
+            serde_json::json!({}),
+        ] {
+            assert!(matches!(
+                group_invite_join_status_from_engine(&broken),
+                Err(ServiceError::Engine(EngineError::Protocol))
+            ));
+        }
+
+        // The password and parse projections are strict string pairs.
+        let password = group_invite_link_password_from_engine(&serde_json::json!({
+            "password": "cGFzc3dvcmQ="
+        }))
+        .unwrap();
+        assert_eq!(password.password, "cGFzc3dvcmQ=");
+        assert!(matches!(
+            group_invite_link_password_from_engine(&serde_json::json!({})),
+            Err(ServiceError::Engine(EngineError::Protocol))
+        ));
+        let parsed = group_invite_link_parse_from_engine(&serde_json::json!({
+            "groupId": "cGFzc3dvcmQ=",
+            "password": "cGFzc3dvcmQ=",
+        }))
+        .unwrap();
+        assert_eq!(parsed.group_id, "cGFzc3dvcmQ=");
+        assert_eq!(parsed.password, "cGFzc3dvcmQ=");
+        assert!(matches!(
+            group_invite_link_parse_from_engine(&serde_json::json!({
+                "groupId": "cGFzc3dvcmQ=",
+            })),
+            Err(ServiceError::Engine(EngineError::Protocol))
+        ));
+    }
+
     /// The message-request faces (contract revision 1.63, §4.56): the direct
     /// ladder forwards the resolved peer reference as `recipient`; a group
     /// conversation forwards the raw group master key as `groupId`; bounds
@@ -18086,6 +18677,43 @@ mod tests {
         assert_eq!(api.code, "GROUP_UPDATE_FAILED");
         assert_eq!(api.data, Some(json!({})), "the no-status object rides");
         assert!(!api.retryable);
+    }
+
+    /// §4.98 (contract 1.117): the two link families map to themselves with
+    /// the engine's data.status pass-through riding verbatim (the
+    /// CALL_CREDENTIALS_FAILED channel) and retryable=false — the same
+    /// group state answers the same way. The data-less faces stay
+    /// content-free and deterministic.
+    #[test]
+    fn group_invite_link_codes_map_with_the_status_pass_through() {
+        for code in [
+            "GROUP_INVITE_LINK_UNAVAILABLE",
+            "GROUP_INVITE_LINK_PREVIEW_FAILED",
+        ] {
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
+            assert_eq!(api.code, code);
+            assert!(!api.retryable);
+            assert!(api.data.is_none(), "no data, no face: {api:?}");
+
+            let api = ServiceError::Engine(EngineError::UpstreamCode {
+                code,
+                data: Some(json!({ "status": 403 })),
+            })
+            .into_api();
+            assert_eq!(api.code, code);
+            assert!(!api.retryable);
+            assert_eq!(api.data, Some(json!({ "status": 403 })));
+
+            let api = ServiceError::Engine(EngineError::UpstreamCode {
+                code,
+                data: Some(json!({})),
+            })
+            .into_api();
+            assert_eq!(api.code, code);
+            assert_eq!(api.data, Some(json!({})), "the no-status object rides");
+            assert!(!api.retryable);
+        }
     }
 
     /// Call signaling (contract revision 1.53, §4.49): the sendSignal shape

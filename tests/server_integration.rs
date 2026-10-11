@@ -6500,6 +6500,577 @@ async fn conversation_state_round_trip_and_guards() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.117 (§4.98): the group invite-link family round trip. The
+/// handshake advertises the six faces plus the `group-invite-links` tag;
+/// the password face answers 16-byte CSPRNG material; build → parse is a
+/// real proto round trip (the fixture mirrors the engine's group_link
+/// codec) across the three official URL forms plus the bare code; preview
+/// projects the full pre-join face; join answers both status verbs and
+/// records its dispatch (the record-before-parse discipline, pinned on the
+/// fixture log); cancel answers its verb; the two structured codes ride
+/// their data.status pass-through; the outage marker answers
+/// STORAGE_UNAVAILABLE; the local ladders (direct row, unknown rows,
+/// bounds) refuse before any engine call.
+#[tokio::test]
+async fn groups_invite_link_round_trip_and_guards() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [48_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    let (_challenge, handshake) = authenticate_capture(&mut client, &secret).await;
+    let capabilities = handshake["result"]["capabilities"].as_array().unwrap();
+    for advertised in [
+        "groups.generateInviteLinkPassword",
+        "groups.buildInviteLink",
+        "groups.parseInviteLink",
+        "groups.previewViaLink",
+        "groups.joinViaLink",
+        "groups.cancelJoinRequest",
+        "group-invite-links",
+    ] {
+        assert!(
+            capabilities
+                .iter()
+                .any(|value| value.as_str() == Some(advertised)),
+            "capabilities must advertise {advertised}: {capabilities:?}"
+        );
+    }
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-InviteLinks" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // The §4.58 factor probe rides the first conversations.list: burn it
+    // before the staged envelope is written.
+    let _ = request(
+        &mut client,
+        "probe-burn",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+
+    // Stage a 32-byte master-key group; its receive projection materializes
+    // the row with that peer reference — the link family's addressing
+    // material (the fixture group's 12-byte id is deliberately not link
+    // material, the §4.97 honesty mirror).
+    const LINK_GROUP_KEY: &str = "ERERERERERERERERERERERERERERERERERERERERERE=";
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 71,
+                "dataMessage": {
+                    "groupInfo": {
+                        "groupId": LINK_GROUP_KEY,
+                        "type": "UPDATE",
+                        "groupName": "Link Group",
+                        "revision": 2
+                    }
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let _ = request(
+        &mut client,
+        "list-groups",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+    )
+    .await;
+    let direct_setup = request(
+        &mut client,
+        "direct-setup",
+        "messages.sendText",
+        json!({
+            "accountId": account_id,
+            "kind": "contact",
+            "peerKey": "+15555550102",
+            "text": "link round trip",
+            "clientRequestId": "link-rt-0"
+        }),
+    )
+    .await;
+    let direct_conversation = direct_setup["result"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = request(
+        &mut client,
+        "flush-link",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "stop": true
+        }),
+    )
+    .await;
+    let mut link_group_conversation = None;
+    for _ in 0..16 {
+        let frame: Value = match timeout(HARNESS_REQUEST_TIMEOUT, async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the staged link group's conversation.changed never arrived within \
+                 {HARNESS_REQUEST_TIMEOUT:?}:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame["event"] == "conversation.changed" && frame["data"]["title"] == "Link Group" {
+            link_group_conversation = Some(frame["data"]["id"].as_str().unwrap().to_string());
+            break;
+        }
+    }
+    let link_group_conversation = link_group_conversation
+        .expect("the staged 32-byte link group must materialize with its mirrored title");
+
+    // The password face: 16 CSPRNG bytes as standard base64 (24 chars),
+    // two calls never coincide. The empty-params shape is part of the
+    // contract.
+    let password_one = request(
+        &mut client,
+        "link-password-1",
+        "groups.generateInviteLinkPassword",
+        json!({}),
+    )
+    .await;
+    let password_material = password_one["result"]["password"].as_str().unwrap();
+    assert_eq!(password_material.len(), 24, "{password_one}");
+    let password_two = request(
+        &mut client,
+        "link-password-2",
+        "groups.generateInviteLinkPassword",
+        json!({}),
+    )
+    .await;
+    assert_ne!(
+        password_material,
+        password_two["result"]["password"].as_str().unwrap()
+    );
+
+    // Build (explicit password) → the official link shape; parse is a real
+    // round trip back to the same key + password bytes, across the three
+    // official URL forms and the bare invite code.
+    let built = request(
+        &mut client,
+        "link-build",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "EREREREREREREREREREREQ=="
+        }),
+    )
+    .await;
+    let invite_link = built["result"]["inviteLink"].as_str().unwrap().to_string();
+    assert!(invite_link.starts_with("https://signal.group/#"), "{built}");
+    let code = invite_link.rsplit('#').next().unwrap().to_string();
+    assert!(!code.contains('+') && !code.contains('/') && !code.contains('='));
+    let parsed = request(
+        &mut client,
+        "link-parse",
+        "groups.parseInviteLink",
+        json!({ "inviteLink": invite_link }),
+    )
+    .await;
+    assert_eq!(
+        parsed["result"],
+        json!({
+            "groupId": LINK_GROUP_KEY,
+            "password": "EREREREREREREREREREREQ=="
+        }),
+        "{parsed}"
+    );
+    for (request_id, shape) in [
+        ("link-parse-sgnl", format!("sgnl://signal.group/#{code}")),
+        ("link-parse-join", format!("sgnl://joingroup#{code}")),
+        ("link-parse-bare", code.clone()),
+    ] {
+        let answer = request(
+            &mut client,
+            request_id,
+            "groups.parseInviteLink",
+            json!({ "inviteLink": shape }),
+        )
+        .await;
+        assert_eq!(
+            answer["result"]["groupId"], LINK_GROUP_KEY,
+            "{request_id}: {answer}"
+        );
+    }
+
+    // Preview: the full pre-join projection (both optional profile keys
+    // present), the same master key the parse decoded.
+    let preview = request(
+        &mut client,
+        "link-preview",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview["result"],
+        json!({
+            "groupId": LINK_GROUP_KEY,
+            "memberCount": 12,
+            "revision": 7,
+            "addFromInviteLink": "ANY",
+            "approvalRequired": false,
+            "pendingAdminApproval": false,
+            "name": "Fixture Link Group",
+            "description": "previewed through the invite link"
+        }),
+        "{preview}"
+    );
+
+    // Join: the definite verb, and the dispatch record rides the fixture
+    // log verbatim (the record-before-parse discipline — a refused join
+    // would leave its record too).
+    let joined = request(
+        &mut client,
+        "link-join",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(joined["result"], json!({ "status": "joined" }), "{joined}");
+    // The approval gate turns the same call into a request.
+    let requested_build = request(
+        &mut client,
+        "link-build-requested",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "9/f39/f39/f39/f39/f39w=="
+        }),
+    )
+    .await;
+    let requested_link = requested_build["result"]["inviteLink"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let requested = request(
+        &mut client,
+        "link-join-requested",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": requested_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        requested["result"],
+        json!({ "status": "requested" }),
+        "{requested}"
+    );
+    // Cancel: the definite verb.
+    let cancelled = request(
+        &mut client,
+        "link-cancel",
+        "groups.cancelJoinRequest",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        cancelled["result"],
+        json!({ "status": "cancelled" }),
+        "{cancelled}"
+    );
+
+    // The structured refusal faces ride the data.status pass-through: the
+    // preview's own code and the join/cancel server-rejection channel (the
+    // forged link carries the sentinel password bytes the fixture answers
+    // on).
+    let forged_build = request(
+        &mut client,
+        "link-build-forged",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "/v7+/v7+/v7+/v7+/v7+/g=="
+        }),
+    )
+    .await;
+    let forged_link = forged_build["result"]["inviteLink"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let preview_failed = request(
+        &mut client,
+        "link-preview-failed",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": forged_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview_failed["error"]["code"], "GROUP_INVITE_LINK_PREVIEW_FAILED",
+        "{preview_failed}"
+    );
+    assert_eq!(preview_failed["error"]["data"], json!({ "status": 404 }));
+    assert_eq!(preview_failed["error"]["retryable"], false);
+    let join_failed = request(
+        &mut client,
+        "link-join-failed",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": forged_link
+        }),
+    )
+    .await;
+    assert_eq!(join_failed["error"]["code"], "GROUP_UPDATE_FAILED");
+    assert_eq!(join_failed["error"]["data"], json!({ "status": 403 }));
+    assert_eq!(join_failed["error"]["retryable"], false);
+    let cancel_failed = request(
+        &mut client,
+        "link-cancel-failed",
+        "groups.cancelJoinRequest",
+        json!({
+            "accountId": account_id,
+            "inviteLink": forged_link
+        }),
+    )
+    .await;
+    assert_eq!(cancel_failed["error"]["code"], "GROUP_UPDATE_FAILED");
+    assert_eq!(cancel_failed["error"]["data"], json!({ "status": 409 }));
+    assert_eq!(cancel_failed["error"]["retryable"], false);
+
+    // The build face's own code, both arms: the server-rejection sentinel
+    // password (data.status) and the password-absent read-the-server-state
+    // arm (the engine fake's link-not-set face, no data).
+    let build_forbidden = request(
+        &mut client,
+        "link-build-forbidden",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation,
+            "password": "ra2tra2tra2tra2tra2trQ=="
+        }),
+    )
+    .await;
+    assert_eq!(
+        build_forbidden["error"]["code"], "GROUP_INVITE_LINK_UNAVAILABLE",
+        "{build_forbidden}"
+    );
+    assert_eq!(build_forbidden["error"]["data"], json!({ "status": 403 }));
+    assert_eq!(build_forbidden["error"]["retryable"], false);
+    let build_unset = request(
+        &mut client,
+        "link-build-unset",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": link_group_conversation
+        }),
+    )
+    .await;
+    assert_eq!(
+        build_unset["error"]["code"],
+        "GROUP_INVITE_LINK_UNAVAILABLE"
+    );
+    assert!(build_unset["error"].get("data").is_none(), "{build_unset}");
+    assert_eq!(build_unset["error"]["retryable"], false);
+
+    // The dispatch log pins the five writes' exact upstream payloads (the
+    // account + inviteLink verbatim; nothing else rides). This runs before
+    // the outage and malformed faces below so the log holds only the
+    // definite round trips.
+    let send_log = fs::read_to_string(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl"),
+    )
+    .expect("fixture must log the join dispatches");
+    let link_writes: Vec<Value> = send_log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|params| params.get("inviteLink").is_some())
+        .collect();
+    assert_eq!(link_writes.len(), 5, "{link_writes:?}");
+    for write in &link_writes {
+        assert_eq!(write["account"], "+15555550100", "{write}");
+    }
+    assert_eq!(link_writes[0]["inviteLink"], invite_link);
+    assert_eq!(link_writes[1]["inviteLink"], requested_link);
+    assert_eq!(link_writes[2]["inviteLink"], invite_link);
+    assert_eq!(link_writes[3]["inviteLink"], forged_link);
+    assert_eq!(link_writes[4]["inviteLink"], forged_link);
+
+    // The outage marker: the read and write faces answer STORAGE_UNAVAILABLE
+    // verbatim, retryable=true (the outage may clear).
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-invite-link-unavailable"),
+        b"outage",
+    )
+    .unwrap();
+    let outage_preview = request(
+        &mut client,
+        "link-outage-preview",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(
+        outage_preview["error"]["code"], "STORAGE_UNAVAILABLE",
+        "{outage_preview}"
+    );
+    assert_eq!(outage_preview["error"]["retryable"], true);
+    let outage_join = request(
+        &mut client,
+        "link-outage-join",
+        "groups.joinViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(outage_join["error"]["code"], "STORAGE_UNAVAILABLE");
+    assert_eq!(outage_join["error"]["retryable"], true);
+    fs::remove_file(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-invite-link-unavailable"),
+    )
+    .unwrap();
+
+    // The malformed-link face: the engine's -32603 parse gate folds into
+    // the deterministic UPSTREAM_ERROR (retryable=false).
+    let malformed = request(
+        &mut client,
+        "link-parse-malformed",
+        "groups.parseInviteLink",
+        json!({ "inviteLink": "https://signal.group/#@@@" }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "UPSTREAM_ERROR", "{malformed}");
+    assert_eq!(malformed["error"]["retryable"], false);
+    let malformed_join = request(
+        &mut client,
+        "link-join-malformed",
+        "groups.joinViaLink",
+        json!({ "accountId": account_id, "inviteLink": "not-a-link" }),
+    )
+    .await;
+    assert_eq!(malformed_join["error"]["code"], "UPSTREAM_ERROR");
+    assert_eq!(malformed_join["error"]["retryable"], false);
+
+    // The local refusal ladder, each before any engine call: the direct row
+    // is not link material, unknown rows, and the link bounds.
+    let direct_build = request(
+        &mut client,
+        "link-build-direct",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct_conversation,
+            "password": "EREREREREREREREREREREQ=="
+        }),
+    )
+    .await;
+    assert_eq!(direct_build["error"]["code"], "INVALID_REQUEST");
+    let unknown_conversation = request(
+        &mut client,
+        "link-build-unknown",
+        "groups.buildInviteLink",
+        json!({
+            "accountId": account_id,
+            "conversationId": "no-such-conversation"
+        }),
+    )
+    .await;
+    assert_eq!(
+        unknown_conversation["error"]["code"], "CONVERSATION_NOT_FOUND",
+        "{unknown_conversation}"
+    );
+    let unknown_account = request(
+        &mut client,
+        "link-preview-unknown-account",
+        "groups.previewViaLink",
+        json!({
+            "accountId": "no-such-account",
+            "inviteLink": invite_link
+        }),
+    )
+    .await;
+    assert_eq!(unknown_account["error"]["code"], "ACCOUNT_NOT_FOUND");
+    let empty_link = request(
+        &mut client,
+        "link-preview-empty",
+        "groups.previewViaLink",
+        json!({
+            "accountId": account_id,
+            "inviteLink": ""
+        }),
+    )
+    .await;
+    assert_eq!(empty_link["error"]["code"], "INVALID_REQUEST");
+    let oversized_link = request(
+        &mut client,
+        "link-preview-oversized",
+        "groups.parseInviteLink",
+        json!({ "inviteLink": "x".repeat(1025) }),
+    )
+    .await;
+    assert_eq!(oversized_link["error"]["code"], "INVALID_REQUEST");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+/// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
 /// Contract 1.49 (§4.48): the reportSpam round trip. Envelopes staged
 /// through the fixture's `.fixture-extra-receives.json` carry `serverGuid`
 /// values; the report addresses the persisted rows, guid-less rows answer

@@ -92,6 +92,121 @@ def canonical_conversation_reference(kind, conversation_id):
         return bool(conversation_id)
     return None
 
+
+# Contract 1.117 §4.98 group invite-link family: the fixture mirrors the
+# engine's group_link.rs pure-function face with a minimal proto codec —
+# the GroupInviteLink wire shape is field 1 = contentsV1 (nested), whose
+# fields are 1 = groupMasterKey (32B) and 2 = inviteLinkPassword. Build =
+# the official buildGroupLink shape (proto → standard base64 → websafe →
+# https://signal.group/#<code>); parse accepts the three official URL
+# forms plus the bare invite code and answers None on every tolerance
+# failure (empty/malformed/versionless/short-key/empty-password — the
+# engine answers -32603 for the whole family, so the fixture folds them).
+LINK_PASSWORD_FORBIDDEN = b"\xad" * 16
+LINK_PASSWORD_PREVIEW_FAILED = b"\xfe" * 16
+LINK_PASSWORD_JOIN_REQUESTED = b"\xf7" * 16
+
+
+def _fixture_varint(value):
+    out = b""
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out += bytes([byte | 0x80])
+        else:
+            return out + bytes([byte])
+
+
+def _fixture_parse_varint(buf, pos):
+    shift = 0
+    value = 0
+    while True:
+        if pos >= len(buf):
+            raise ValueError("truncated varint")
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("varint too long")
+
+
+def _fixture_proto_fields(buf):
+    """Decode one length-delimited proto message into {field: bytes} (the
+    GroupInviteLink shape carries only length-delimited fields; anything
+    else is malformed for this face)."""
+    fields = {}
+    pos = 0
+    while pos < len(buf):
+        tag, pos = _fixture_parse_varint(buf, pos)
+        if tag & 0x07 != 2:
+            raise ValueError("unsupported wire type")
+        length, pos = _fixture_parse_varint(buf, pos)
+        if pos + length > len(buf):
+            raise ValueError("truncated field")
+        number = tag >> 3
+        if number in fields:
+            raise ValueError("duplicate field")
+        fields[number] = buf[pos : pos + length]
+        pos += length
+    return fields
+
+
+def _fixture_from_web_safe(code):
+    restored = code.replace("_", "/").replace("-", "+")
+    return restored + "=" * ((-len(restored)) % 4)
+
+
+def fixture_parse_invite_link(value):
+    """Engine parse_invite_link parity: the '#' code segment (or the whole
+    trimmed value as the bare invite code) → websafe restore → standard
+    base64 → proto → contentsV1 must be present → masterKey exactly 32B,
+    password non-empty. Answers None on every tolerance failure."""
+    trimmed = value.strip()
+    if "#" in trimmed:
+        code = trimmed.split("#", 1)[1].strip()
+    elif trimmed:
+        code = trimmed
+    else:
+        return None
+    try:
+        raw = base64.b64decode(_fixture_from_web_safe(code), validate=True)
+        link_fields = _fixture_proto_fields(raw)
+    except Exception:
+        return None
+    contents = link_fields.get(1)
+    if contents is None:
+        return None
+    try:
+        inner = _fixture_proto_fields(contents)
+    except Exception:
+        return None
+    master_key = inner.get(1)
+    password = inner.get(2)
+    if master_key is None or len(master_key) != 32 or not password:
+        return None
+    return master_key, password
+
+
+def fixture_build_invite_link(master_key, password):
+    contents = (
+        b"\x0a"
+        + _fixture_varint(len(master_key))
+        + master_key
+        + b"\x12"
+        + _fixture_varint(len(password))
+        + password
+    )
+    raw = b"\x0a" + _fixture_varint(len(contents)) + contents
+    web_safe = (
+        base64.b64encode(raw).decode().replace("/", "_").replace("+", "-").replace("=", "")
+    )
+    return "https://signal.group/#" + web_safe
+
+
 # Contract 1.95 chat-folder sync fixture state: the Storage Service
 # ChatFolderRecordJson projection in storage order — the full 11-key record
 # face the engine projects (id/name/position/booleans/folderType/both
@@ -2451,6 +2566,218 @@ for line in sys.stdin:
             },
             "calls.endorsementsPublicKey": {"endorsementPublicKey": _b64_fixed(5)},
         }[method]
+    elif method == "generateInviteLinkPassword":
+        # Contract 1.117 §4.98: the account-less material face. No dispatch
+        # record (the engine's material faces never log), no account: 16
+        # CSPRNG bytes as standard base64 — the official
+        # GROUP_INVITE_LINK_PASSWORD_LENGTH shape.
+        result = {"password": base64.b64encode(os.urandom(16)).decode()}
+    elif method == "buildInviteLink":
+        # Contract 1.117 §4.98: the build face, read side, no dispatch
+        # record. Engine-parity parameter gates: groupId standard base64 of
+        # exactly 32 bytes, password (when present) standard base64 decoding
+        # to a non-empty byte string — anything else answers -32603. The
+        # explicit-password arm is pure construction (a real proto link, the
+        # engine fake/real shared code path); the password-absent arm
+        # mirrors the engine fake's no-group-state face —
+        # GROUP_INVITE_LINK_UNAVAILABLE with no data. The
+        # LINK_PASSWORD_FORBIDDEN bytes answer the same code's data.status
+        # face (the server-rejection channel).
+        try:
+            master_key = base64.b64decode(params.get("groupId") or "", validate=True)
+            password_raw = params.get("password")
+            password_bytes = (
+                None
+                if password_raw is None
+                else base64.b64decode(password_raw, validate=True)
+            )
+        except Exception:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        if len(master_key) != 32 or password_bytes == b"":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        if password_bytes == LINK_PASSWORD_FORBIDDEN:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_INVITE_LINK_UNAVAILABLE",
+                    "data": {"status": 403},
+                },
+            }
+            emit_json(response)
+            continue
+        if password_bytes is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "GROUP_INVITE_LINK_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        result = {"inviteLink": fixture_build_invite_link(master_key, password_bytes)}
+    elif method == "parseInviteLink":
+        # Contract 1.117 §4.98: the account-less pure-parse face. Every
+        # tolerance failure (empty, bad base64, bad proto, versionless,
+        # short key, empty password) answers -32603 — the engine folds the
+        # whole parse family there.
+        parsed_link = fixture_parse_invite_link(params.get("inviteLink") or "")
+        if parsed_link is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        master_key, link_password = parsed_link
+        result = {
+            "groupId": base64.b64encode(master_key).decode(),
+            "password": base64.b64encode(link_password).decode(),
+        }
+    elif method == "previewGroupViaLink":
+        # Contract 1.117 §4.98: the pre-join read face, no dispatch record.
+        # The `.fixture-invite-link-unavailable` marker answers
+        # STORAGE_UNAVAILABLE for all four account-scoped faces. Parse
+        # failure answers -32603; the LINK_PASSWORD_PREVIEW_FAILED bytes
+        # answer GROUP_INVITE_LINK_PREVIEW_FAILED with data.status (the
+        # server-rejection channel); the happy path answers the full
+        # 8-key projection (both optional profile keys present).
+        if (SIGNAL_DATA_DIR / ".fixture-invite-link-unavailable").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        parsed_link = fixture_parse_invite_link(params.get("inviteLink") or "")
+        if parsed_link is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        master_key, link_password = parsed_link
+        if link_password == LINK_PASSWORD_PREVIEW_FAILED:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_INVITE_LINK_PREVIEW_FAILED",
+                    "data": {"status": 404},
+                },
+            }
+            emit_json(response)
+            continue
+        result = {
+            "groupId": base64.b64encode(master_key).decode(),
+            "memberCount": 12,
+            "revision": 7,
+            "addFromInviteLink": "ANY",
+            "approvalRequired": False,
+            "pendingAdminApproval": False,
+            "name": "Fixture Link Group",
+            "description": "previewed through the invite link",
+        }
+    elif method == "joinGroupViaLink":
+        # Contract 1.117 §4.98: the join write face — the engine appends
+        # the dispatch record BEFORE the parse (a refused write still
+        # records its dispatch), so the fixture logs first. The
+        # LINK_PASSWORD_PREVIEW_FAILED bytes answer the GROUP_UPDATE_FAILED
+        # data.status face; the LINK_PASSWORD_JOIN_REQUESTED bytes answer
+        # the approval-gate verb; every other parseable link joins.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if (SIGNAL_DATA_DIR / ".fixture-invite-link-unavailable").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        parsed_link = fixture_parse_invite_link(params.get("inviteLink") or "")
+        if parsed_link is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        _, link_password = parsed_link
+        if link_password == LINK_PASSWORD_PREVIEW_FAILED:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_UPDATE_FAILED",
+                    "data": {"status": 403},
+                },
+            }
+            emit_json(response)
+            continue
+        status = (
+            "requested" if link_password == LINK_PASSWORD_JOIN_REQUESTED else "joined"
+        )
+        result = {"status": status}
+    elif method == "cancelJoinRequest":
+        # Contract 1.117 §4.98: the withdrawal write face — the same
+        # record-before-parse discipline as the join; the
+        # LINK_PASSWORD_PREVIEW_FAILED bytes answer GROUP_UPDATE_FAILED
+        # data.status=409; every other parseable link cancels.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        if (SIGNAL_DATA_DIR / ".fixture-invite-link-unavailable").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        parsed_link = fixture_parse_invite_link(params.get("inviteLink") or "")
+        if parsed_link is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        _, link_password = parsed_link
+        if link_password == LINK_PASSWORD_PREVIEW_FAILED:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "GROUP_UPDATE_FAILED",
+                    "data": {"status": 409},
+                },
+            }
+            emit_json(response)
+            continue
+        result = {"status": "cancelled"}
     elif method == "getUserStatus":
         if AUTH_FAILED_MARKER.exists():
             # Contract 1.21: the account holder unlinked this device. The

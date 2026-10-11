@@ -104,6 +104,12 @@
             "groups.terminate",
             "groups.approveJoinRequests",
             "groups.revokeInvites",
+            "groups.generateInviteLinkPassword",
+            "groups.buildInviteLink",
+            "groups.parseInviteLink",
+            "groups.previewViaLink",
+            "groups.joinViaLink",
+            "groups.cancelJoinRequest",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "history.importStatus",
@@ -841,6 +847,80 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/groupsRevokeInvitesParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "groups.generateInviteLinkPassword" }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": {
+                "type": "object",
+                "maxProperties": 0,
+                "description": "No parameters (contract revision 1.117, \u00a74.98, capability group-invite-links): the 16-byte CSPRNG link password is account-less material (the official generateGroupInviteLinkPassword). Read lane; the bytes are single-pass material — they ride the answer and are never logged or persisted. The result is {password} — standard base64 of exactly 16 bytes (24 chars)."
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.buildInviteLink" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsBuildInviteLinkParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.parseInviteLink" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsParseInviteLinkParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.previewViaLink" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsPreviewViaLinkParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "groups.joinViaLink" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsJoinViaLinkParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "method": { "const": "groups.cancelJoinRequest" }
+            },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/groupsCancelJoinRequestParams" }
             }
           }
         },
@@ -2757,6 +2837,86 @@
         }
       }
     },
+    "groupsBuildInviteLinkParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Build one group's invite link (contract revision 1.117, \u00a74.98, capability group-invite-links; engine alignment batch P13): the engine encodes the official GroupInviteLink proto (contentsV1{groupMasterKey, inviteLinkPassword}) \u2192 standard base64 \u2192 websafe \u2192 https://signal.group/#<code> (the official buildGroupLink shape). With an explicit password the build is pure construction (the official explicit-password arm \u2014 fake/real same code path); without one the engine reads the server group state's link password, and a group that has not enabled its invite link answers GROUP_INVITE_LINK_UNAVAILABLE (retryable=false, the honest not-set state). conversationId must resolve to a kind='group' row before any engine call (direct answers INVALID_REQUEST, unknown answers CONVERSATION_NOT_FOUND). The password is single-pass material: standard base64 of 1-64 bytes (the official password is 16 bytes = 24 chars), forwarded verbatim \u2014 the engine's decode gate refuses other shapes (UPSTREAM_ERROR), the connector never re-derives it, and neither the password nor the link is logged or persisted. Read lane, non-mutating (both arms only read or construct); the result is {inviteLink}.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The group conversation to build the link for; resolved against the account before any engine call \u2014 the row's peer reference is the group master key the link encodes."
+        },
+        "password": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Optional explicit link password, standard base64 (generate one with groups.generateInviteLinkPassword). Absent = the engine reads the group's server-side link state. Single-pass material: never logged, never persisted."
+        }
+      }
+    },
+    "groupsParseInviteLinkParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inviteLink"],
+      "description": "Parse one group invite link (contract revision 1.117, \u00a74.98, capability group-invite-links): account-less pure proto decoding (the official parseGroupLink) \u2014 the engine accepts the three official URL forms (https://signal.group/#\u2026, sgnl://signal.group/#\u2026, sgnl://joingroup#\u2026) and the bare invite code, restores websafe base64, decodes the GroupInviteLink proto, and answers {groupId, password} \u2014 the master key and password bytes as standard base64 (the master key is exactly 32 bytes = 44 chars). A link that fails any tolerance \u2014 empty/no code segment, bad base64, undecodable proto, missing contentsV1 (the official LINK_VERSION_ERROR family), wrong key length, empty password \u2014 answers the engine's -32603 face, folded into UPSTREAM_ERROR retryable=false (deterministic). Read lane; the decoded bytes are single-pass material \u2014 never logged, never persisted.",
+      "properties": {
+        "inviteLink": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "The link as the user pasted it \u2014 any official URL form or the bare invite code. The connector only bounds the string; the grammar is the engine's."
+        }
+      }
+    },
+    "groupsPreviewViaLinkParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "inviteLink"],
+      "description": "Preview the group behind one invite link (contract revision 1.117, \u00a74.98, capability group-invite-links; the official getPreJoinGroupInfo posture): the engine parses the link and reads the group's pre-join projection \u2014 {groupId, memberCount, revision, addFromInviteLink, approvalRequired, pendingAdminApproval, name?, description?} (the profile title/description ride only when the group carries them). Read lane, non-mutating; the connector persists nothing \u2014 the preview is the answer. The link is single-pass material. Structured engine errors: GROUP_INVITE_LINK_PREVIEW_FAILED (the server refused the pre-join read \u2014 data {status?} passes through verbatim, retryable=false), STORAGE_UNAVAILABLE (retryable=true), and the bare -32603 parameter face (a malformed link) folded into UPSTREAM_ERROR retryable=false.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "inviteLink": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "The link to preview \u2014 any official URL form or the bare invite code; the engine parses it."
+        }
+      }
+    },
+    "groupsJoinViaLinkParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "inviteLink"],
+      "description": "Join the group behind one invite link (contract revision 1.117, \u00a74.98, capability group-invite-links; the official joinGroupV2ViaLink posture): the engine parses the link and applies the join \u2014 the answer's status verb distinguishes the definite member add ('joined') from the approval gate's request ('requested'). Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried (the join may already have landed). A server rejection answers GROUP_UPDATE_FAILED with data {status?} verbatim (the 1.115 channel, retryable=false); STORAGE_UNAVAILABLE is retryable=true; a malformed link is the engine's -32603 face folded into UPSTREAM_ERROR retryable=false (refused before anything goes upstream). Zero local writes: the roster converges through contacts.sync.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "inviteLink": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "The link to join through \u2014 any official URL form or the bare invite code; the engine parses it."
+        }
+      }
+    },
+    "groupsCancelJoinRequestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "inviteLink"],
+      "description": "Withdraw one join request (contract revision 1.117, \u00a74.98, capability group-invite-links; the official cancelJoinRequest posture): a requester is not yet a member, so the withdrawal is addressed by the link the join went through \u2014 the same link-addressed shape as groups.joinViaLink. The definite success is {status: 'cancelled'}. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried; a server rejection answers GROUP_UPDATE_FAILED with data {status?} verbatim (retryable=false); STORAGE_UNAVAILABLE is retryable=true; a malformed link folds into UPSTREAM_ERROR retryable=false. Zero local writes: the roster converges through contacts.sync.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "inviteLink": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "The link the join went through \u2014 any official URL form or the bare invite code; the engine parses it."
+        }
+      }
+    },
     "contactsSetLocalAliasParams": {
       "type": "object",
       "additionalProperties": false,
@@ -4088,6 +4248,8 @@
             "PROFILE_UPLOAD_FAILED",
             "GROUP_AVATAR_UPLOAD_FAILED",
             "GROUP_UPDATE_FAILED",
+            "GROUP_INVITE_LINK_UNAVAILABLE",
+            "GROUP_INVITE_LINK_PREVIEW_FAILED",
             "USERNAME_TAKEN",
             "USERNAME_RESERVATION_GONE",
             "USERNAME_RATE_LIMITED",
@@ -4124,7 +4286,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

@@ -39,7 +39,9 @@ use crate::service::{
     ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
     ConversationsListParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
     ConversationsSetPinnedParams, ConversationsSetStateParams, GroupsApproveJoinRequestsParams,
-    GroupsGetParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsGetParams,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsParseInviteLinkParams,
+    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
     GroupsUpdateParams, HistoryAttachmentDownloadParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     LinkSessionParams, LinkStartParams, MessageGetTextParams, MessageRequestParams,
@@ -2771,6 +2773,120 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid groups.revokeInvites params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Group invite-link family (contract revision 1.117, §4.98,
+        // capability group-invite-links): the material/parse faces take no
+        // account; the account-scoped faces share the groups.dispatch
+        // shape — params shape errors answer INVALID_REQUEST, the reads
+        // are plain projections, and the join-family writes keep the
+        // groups.quit status verb.
+        "groups.generateInviteLinkPassword" => {
+            match serde_json::from_value::<GroupsInviteLinkPasswordParams>(request.params) {
+                Ok(params) => match runtime.generate_group_invite_link_password(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.generateInviteLinkPassword params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "groups.buildInviteLink" => {
+            match serde_json::from_value::<GroupsBuildInviteLinkParams>(request.params) {
+                Ok(params) => match runtime.build_group_invite_link(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.buildInviteLink params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "groups.parseInviteLink" => {
+            match serde_json::from_value::<GroupsParseInviteLinkParams>(request.params) {
+                Ok(params) => match runtime.parse_group_invite_link(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.parseInviteLink params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "groups.previewViaLink" => {
+            match serde_json::from_value::<GroupsPreviewViaLinkParams>(request.params) {
+                Ok(params) => match runtime.preview_group_via_link(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.previewViaLink params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "groups.joinViaLink" => {
+            match serde_json::from_value::<GroupsJoinViaLinkParams>(request.params) {
+                Ok(params) => match runtime.join_group_via_link(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.joinViaLink params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "groups.cancelJoinRequest" => {
+            match serde_json::from_value::<GroupsCancelJoinRequestParams>(request.params) {
+                Ok(params) => match runtime.cancel_join_request(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid groups.cancelJoinRequest params",
                         false,
                     ),
                 ),

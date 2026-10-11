@@ -5,7 +5,30 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.116 (2026-10-12; the conversation-state trio rides
+- Contract revision: 1.117 (2026-10-12; the group invite-link family rides
+  the engine link faces (§4.98): six methods behind the new
+  `group-invite-links` capability tag. The account-less read faces ride
+  the default group's engine (the §4.32 anonymous-face discipline):
+  `groups.generateInviteLinkPassword` (empty params → a fresh 16-byte
+  password, standard base64) and `groups.parseInviteLink` (link →
+  {groupId, password}, the three official URL forms plus the bare code).
+  `groups.buildInviteLink` resolves the group row through the shared
+  ladder and takes the optional password — explicit = pure construction;
+  absent = the engine reads the server group state's link password, an
+  unset link answering GROUP_INVITE_LINK_UNAVAILABLE (retryable=false,
+  the honest not-set state). `groups.previewViaLink` answers the
+  official pre-join projection; `groups.joinViaLink` answers
+  {status: joined|requested} and `groups.cancelJoinRequest` answers
+  {status: cancelled} — both send-lane Mutating with the
+  SEND_OUTCOME_UNKNOWN no-retry discipline and the record-before-parse
+  dispatch log. Password and link are single-pass material forwarded
+  verbatim — never shape-gated, logged, or persisted connector-side; a
+  malformed link folds into UPSTREAM_ERROR retryable=false. New
+  allowlist codes GROUP_INVITE_LINK_UNAVAILABLE and
+  GROUP_INVITE_LINK_PREVIEW_FAILED (retryable=false, data.status?
+  verbatim); the join/cancel server-rejection channel rides the existing
+  GROUP_UPDATE_FAILED code. Tests 657 → 661 (lib 501 → 504), all green) —
+  previously 1.116 (2026-10-12; the conversation-state trio rides
   the storage face (§4.97): `conversations.getState` /
   `conversations.setState` carry the engine's
   getConversationState/setConversationState faces — the official Storage
@@ -7927,6 +7950,82 @@ the engine's canonicalization faces and the
 `[fixture-state-unavailable]` outage sentinel. Gates: 654 → 657 (lib
 499 → 501), all green — the total recalibrates at this revision (§1):
 the per-batch deltas were honest, the running total was not.
+
+### 4.98 The group invite-link family rides the engine link faces (contract revision 1.117, 2026-10-12)
+
+The engine's P13 batch landed the full group invite-link family —
+`generateInviteLinkPassword`, `buildInviteLink`, `parseInviteLink`,
+`previewGroupViaLink`, `joinGroupViaLink`, `cancelJoinRequest` — the
+official GroupInviteLink proto round trip (contentsV1{groupMasterKey,
+inviteLinkPassword} → standard base64 → web-safe → the official
+`https://signal.group/#<code>` URL, web-safe alphabet throughout the
+code). Until this revision the desktop had no honest channel to mint,
+share, decode, preview, join through, or withdraw a join request on a
+group link: the material lived only engine-side.
+
+**The faces.** Six methods behind the new `group-invite-links`
+capability tag. `groups.generateInviteLinkPassword` takes the
+empty-params shape and answers `{password}` — a fresh 16 CSPRNG bytes as
+standard base64 (24 chars), two calls never coincide;
+`groups.parseInviteLink` takes only the link and answers
+`{groupId, password}` — a pure decode across the three official URL
+forms and the bare invite code. Both are account-less read faces riding
+the default group's engine (the §4.32 getStickerPackManifest
+anonymous-face discipline). `groups.buildInviteLink` resolves the group
+row through the shared ladder before any engine call (a direct row
+answers INVALID_REQUEST, an unknown id CONVERSATION_NOT_FOUND) and
+takes the optional password: with one the build is pure construction
+(the official explicit-password arm — fake and real same code path);
+without one the engine reads the server group state's link password and
+a group that has not enabled its link answers GROUP_INVITE_LINK_UNAVAILABLE
+— the honest not-set state, no data. The password (standard base64 of
+1–64 bytes, the official password is 16) and the link are single-pass
+material forwarded verbatim: the connector never re-derives, re-encodes,
+shape-gates, logs, or persists either — the engine's decode gate
+refusing other shapes is the deterministic UPSTREAM_ERROR face
+(retryable=false, the 1.115 discipline). `groups.previewViaLink`
+(accountId + link) answers the official pre-join projection
+{groupId, memberCount, revision, addFromInviteLink, approvalRequired,
+pendingAdminApproval, name?, description?} — the connector persists
+nothing, the preview is the answer. `groups.joinViaLink` (accountId +
+link) answers `{status: "joined" | "requested"}` per the group's
+approval gate, and `groups.cancelJoinRequest` answers
+`{status: "cancelled"}`; both are send-lane Mutating calls whose
+dispatch records ride record-before-parse — a refused join still leaves
+its dispatch record, the honest log of what the engine was asked.
+
+**The error faces.** Two new structured-allowlist codes, both
+retryable=false: GROUP_INVITE_LINK_UNAVAILABLE (the build's not-set /
+forbidden face, `data.status?` verbatim when the engine attaches it,
+data-less otherwise) and GROUP_INVITE_LINK_PREVIEW_FAILED (the server
+refused the pre-join read, `data.status?` verbatim). The join/cancel
+server-rejection channel rides the existing GROUP_UPDATE_FAILED code
+(the join is a group-state write; `data.status` verbatim). The outage
+family answers STORAGE_UNAVAILABLE verbatim, retryable=true, on all
+four account-scoped faces. Malformed links — every parse-family
+tolerance failure — fold into UPSTREAM_ERROR retryable=false on the
+parse, preview, join, and cancel faces alike. The mutating pair keeps
+the reaction-class discipline: an indeterminate outcome answers
+SEND_OUTCOME_UNKNOWN and is never retried — the join request may
+already sit on the group's admin queue.
+
+Tests: `groups_invite_link_round_trip_and_guards` — the handshake
+advertises the six methods plus the tag, the password face's uniqueness
+pair, the build → parse round trip across the three official URL forms
+and the bare code, the full preview projection, the joined and
+approval-gated requested verbs plus the cancel, the five-write dispatch
+log pinned before the failure faces (record-before-parse), the
+structured refusal ladder (preview 404, join 403, cancel 409, build
+403, build data-less unset), the outage sentinel pair with
+retryable=true, and the malformed-link pair folding into UPSTREAM_ERROR
+retryable=false on both the parse and the join face. Lib tests join:
+`prepare_group_invite_link_faces_ladders_and_payloads`,
+`group_invite_link_projections_parse_strictly`, and
+`group_invite_link_codes_map_with_the_status_pass_through`. The fixture
+gains a module-level proto codec (varint fields, web-safe base64) with
+the build/parse engines and the three 16-byte password sentinels
+(forbidden / preview-failed / approval-requested). Gates: 657 → 661
+(lib 501 → 504), all green.
 
 ## 5. signal-cli Boundary
 
