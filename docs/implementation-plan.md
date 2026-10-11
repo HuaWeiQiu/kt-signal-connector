@@ -5,7 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.109 (2026-10-11; the remoteDelete author and age gates (§4.90):
+- Contract revision: 1.110 (2026-10-11; the early-arrival edit/remoteDelete buffer (§4.91):
+  the control plane's never-create discipline gave an edit or remoteDelete whose original
+  row had not landed yet exactly one fate — a silent drop — and the engine's cold-start
+  receive race makes that a real convergence loss (the row lands later with yesterday's
+  body, or stands after its author deleted it). A bounded in-memory table now admits
+  early RemoteDelete and body-carrying Edit control envelopes (512 entries, 5-minute TTL,
+  oldest-eviction + lazy sweeps — the typing limiter's discipline at buffer scale; every
+  other family and every conversation-resolving receive keeps the live arms
+  byte-identical). Entries key to the identity the original will carry — (account, kind,
+  peer_key, target_sent_at, author) — so the flush only ever applies to the author's own
+  row (the §4.90 store scoping rides under it), and the drain runs at the landing insert
+  with land-then-converge event order, applying the live arms' store paths verbatim so a
+  converged row is byte-identical whether its envelope arrived early or late. The buffer
+  rides the §4.90 age gate; expired entries leave silently. No wire change. Tests 648 →
+  652 (lib 489 → 493), all green) —
+  previously 1.109 (2026-10-11; the remoteDelete author and age gates (§4.90):
   the inbound remoteDelete control applied without checking who was speaking or how old
   the target was — the store's delete matched (account, conversation, sent_at) alone, so
   in a group author A's delete wiped author B's row that shared the per-sender timestamp,
@@ -7463,6 +7478,76 @@ ingest ladder with the replay and the foreign-author silent faces;
 drops, one millisecond inside applies, the boundary is the window itself);
 the two pre-existing summary tests now pin the author-scoped call shape.
 Gates: 645 → 648 (lib 486 → 489), all green.
+
+### 4.91 Early-arrival edit/remoteDelete buffer (contract revision 1.110, 2026-10-11)
+
+The control plane's contract-1.15 discipline is "control receives never
+create a conversation, never create a message row" — so an edit or a
+remoteDelete whose original row (and sometimes the whole conversation) has
+not landed yet had exactly one fate: a silent drop. On a cold start the
+engine's receives race each other, and Signal delivers the control envelopes
+on the same per-sender stream as the originals, so the race is real: the
+edit/delete lands first, the drop eats it, and the row converges later with
+yesterday's body — or stays standing that the author deleted. The §4.90
+author gate made the drop deterministic (only the author's own absence is
+the early-arrival question); this batch makes the absence recoverable.
+
+**The buffer (the admit face).** One bounded flat table per connector
+service, `EARLY_CONTROL_BUFFER_CAPACITY = 512` entries with a
+`EARLY_CONTROL_BUFFER_TTL_MS = 5 * 60 * 1_000` millisecond TTL — the
+256-entry typing limiter's flat-map discipline scaled to the batch shape:
+every touch first sweeps expired entries (lazy, no timer), then a full
+table evicts the single oldest entry, so the table never holds more than
+the capacity and every entry dies at the TTL. Only two control families
+admit: `RemoteDelete` (payload-free) and `Edit` with a body (the direction
+and the verbatim text ride the entry; a bodyless edit keeps the historical
+silent skip — nothing to apply later). Every other family, and a control
+receive whose conversation resolves, never sees the buffer: the live arms
+are byte-identical to the pre-§4.91 behavior.
+
+**The key (the identity face).** An entry is keyed to the identity the
+original row will carry when it lands: `(account, kind, peer_key,
+target_sent_at, author_sender_id)` — the conversation resolves through the
+same ladder `ensure_conversation` uses (the conversation row itself may not
+exist yet), and the author projection is the exact `sender_id` derivation
+§4.90 pinned (the account id for the outgoing multi-device mirrors, the
+envelope source's peer hash for peers). The author component doubles as the
+flush-time gate: an entry only ever applies to the row its own author sent,
+so in a group author A's early delete still never touches author B's row —
+the §4.90 store scoping rides under the flush.
+
+**The flush (the apply face).** The message-landing path drains the table
+the moment the original row inserts, before the original's upsert event is
+minted but with the drained events riding after it — the desktop sees
+land-then-converge in order on one event stream. The application is the
+live control arms' store path verbatim: a delete rides the author-scoped
+`mark_remote_deleted`, an edit rides `apply_inbound_edit` /
+`apply_outgoing_edit_by_signal` with the same reactions/edits attach and
+the same event shapes, so a converged row is byte-identical whether its
+control envelope arrived early or late. The flush matches fresh entries
+only (TTL-expired ones leave silently — the original they waited for never
+arrived, and applying a 6-minute-old edit is exactly the stale-write the
+TTL exists to prevent); entries keyed to other rows stay buffered. The
+buffer rides the §4.90 age gate (an aged delete is refused before it can
+buffer), and the flush needs no age re-check of its own: entries live at
+most 5 minutes, far inside the 24-hour window. Both faces stay bounded:
+capacity + oldest-eviction + lazy TTL sweeps at every touch, so an original
+that never arrives costs one self-expiring slot.
+
+No wire change: the method/event/error enums are untouched, no new
+capability, and `tests/schema_consistency.rs` stays green unchanged.
+
+Tests: `early_remote_delete_buffers_and_applies_when_the_original_lands`
+(the buffer's empty answer, the land-then-converge event order, the
+converged row's status, the replay's silence); 
+`early_edit_buffers_and_applies_when_the_original_lands` (the body rides
+the entry, the flush rewrites the row in place — same id, new body,
+editedAt set, two upserts on one stream);
+`early_group_delete_applies_only_to_its_own_authors_row` (author B's row
+landing first at the shared timestamp is never the target, author A's own
+row converges); `early_control_buffer_stays_bounded_and_expires` (the
+capacity eviction at 513, the backdated TTL sweep at the next touch).
+Gates: 648 → 652 (lib 489 → 493), all green.
 
 ## 5. signal-cli Boundary
 

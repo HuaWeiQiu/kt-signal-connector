@@ -1278,11 +1278,63 @@ fn outgoing_status_is_addressable(status: &str) -> bool {
     matches!(status, "sent" | "delivered" | "read")
 }
 
+/// Early-arrival edit/remoteDelete buffer (contract revision 1.110, §4.91):
+/// the bounded in-memory table a control receive falls into when its target
+/// row has not landed yet. Capacity and TTL follow the store's cache
+/// discipline — the 256-entry typing limiter's flat-map shape scaled to the
+/// batch nature of the buffer, and the 5-minute link-session TTL
+/// ([`crate::link::LINK_SESSION_TTL`]) — so an entry lives at most
+/// `EARLY_CONTROL_BUFFER_CAPACITY` peers or `EARLY_CONTROL_BUFFER_TTL_MS`
+/// milliseconds, whichever ends first, and an original that never arrives
+/// costs a bounded, self-expiring slot.
+const EARLY_CONTROL_BUFFER_CAPACITY: usize = 512;
+const EARLY_CONTROL_BUFFER_TTL_MS: u64 = 5 * 60 * 1_000;
+
+/// One buffered early arrival (contract revision 1.110, §4.91). The key
+/// faces are the identity the original row will carry when it lands:
+/// (account, kind, peer_key) resolves the conversation deterministically
+/// (the same ladder `ensure_conversation` uses — the conversation row itself
+/// may not exist yet), `target_sent_at` is the upstream timestamp the
+/// control envelope named, and `author_sender_id` is the envelope source's
+/// receive-identity projection — the same `stable_hash_id` the arriving row
+/// stores as its `sender_id` (the account id itself for the outgoing
+/// multi-device mirrors). The author component doubles as the flush-time
+/// author gate: an entry only ever applies to the row its own author sent.
+#[derive(Debug)]
+struct EarlyControlEntry {
+    account_id: String,
+    kind: &'static str,
+    peer_key: String,
+    target_sent_at: u64,
+    author_sender_id: String,
+    buffered_at: u64,
+    payload: EarlyControlPayload,
+}
+
+/// What to apply when the target row lands. `Edit` carries the direction
+/// (peer edit vs own multi-device mirror — the two store paths differ) and
+/// the verbatim body the live arm would have written; the texts arrive
+/// engine-bounded and the whole table is capacity- and TTL-bounded, so no
+/// per-entry text budget is re-imposed here (the live edit path stores the
+/// same bytes).
+#[derive(Debug)]
+enum EarlyControlPayload {
+    RemoteDelete,
+    Edit {
+        direction: &'static str,
+        new_text: String,
+        new_bytes: u32,
+    },
+}
+
 pub struct ConnectorService {
     store: Arc<Store>,
     link: Option<ActiveLinkSession>,
     /// Typing rate limiter: (account_id, conversation_id) → last emission.
     typing_last_emission: std::collections::HashMap<(String, String), u64>,
+    /// Early-arrival edit/remoteDelete buffer (§4.91): flat table, bounded
+    /// by capacity with oldest-eviction and lazy TTL sweeps at every touch.
+    early_controls: Vec<EarlyControlEntry>,
     /// Media ingest backing (ADR 0002); `None` keeps every media method on
     /// the pre-PoC `CAPABILITY_UNAVAILABLE` answer.
     media: Option<MediaIngest>,
@@ -1302,6 +1354,7 @@ impl ConnectorService {
             store,
             link: None,
             typing_last_emission: std::collections::HashMap::new(),
+            early_controls: Vec::new(),
             media,
         }
     }
@@ -6196,6 +6249,9 @@ impl ConnectorService {
                 receive.source.as_deref().unwrap_or(&peer_key),
             ])
         };
+        // §4.91: the flush key the landed row's sender projects — captured
+        // before the record consumes `sender_id` by move.
+        let flush_sender_id = sender_id.clone();
         if self
             .store
             .message_by_signal_identity(
@@ -6355,9 +6411,24 @@ impl ConnectorService {
         if !inserted {
             return Ok(Vec::new());
         }
+        // §4.91: the row just landed — apply any edit/remoteDelete that
+        // arrived before it. The drain runs before the original's upsert
+        // event is minted (the record consumes `sender_id` by move) but its
+        // events ride after the upsert, so the desktop sees
+        // land-then-converge in order; the conversation/account summaries
+        // below already reflect the flushed state.
+        let landed_events = self.drain_early_controls(
+            &account.id,
+            &conversation.id,
+            kind,
+            &peer_key,
+            sent_at,
+            &flush_sender_id,
+        )?;
         let mut events = vec![HostSideEvent::MessageUpserted(project_message_for_host(
             message,
         ))];
+        events.extend(landed_events);
         // §4.37: record the ACI→peer-key identity the envelope revealed, so a
         // later view-once open sync (which names the author by ACI only) can
         // find this conversation. One bounded row per (account, ACI); only
@@ -6380,6 +6451,130 @@ impl ConnectorService {
             events.push(HostSideEvent::AccountChanged(account));
         }
         Ok(events)
+    }
+
+    /// §4.91: admit one early-arrival entry into the bounded buffer. The
+    /// lazy TTL sweep runs first (expired entries leave without ever
+    /// applying), then the capacity guard evicts the single oldest entry —
+    /// the typing limiter's flat-eviction shape at buffer scale — so the
+    /// table never holds more than `EARLY_CONTROL_BUFFER_CAPACITY` entries
+    /// and every entry dies at the TTL.
+    fn buffer_early_control(&mut self, entry: EarlyControlEntry) {
+        let now = now_ms();
+        self.early_controls
+            .retain(|entry| now.saturating_sub(entry.buffered_at) < EARLY_CONTROL_BUFFER_TTL_MS);
+        if self.early_controls.len() >= EARLY_CONTROL_BUFFER_CAPACITY
+            && let Some(oldest) = self
+                .early_controls
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.buffered_at)
+                .map(|(index, _)| index)
+        {
+            self.early_controls.remove(oldest);
+        }
+        self.early_controls.push(entry);
+    }
+
+    /// §4.91: the flush half — the original row just landed, so every fresh
+    /// buffered entry keyed to its (conversation, sentAt, author) identity
+    /// applies now, in buffer order. The application is the live control
+    /// arms' store path verbatim (a delete rides `mark_remote_deleted`, an
+    /// edit rides `apply_inbound_edit`/`apply_outgoing_edit_by_signal` with
+    /// the same reactions/edits attach and the same event shapes), so a
+    /// converged row is byte-identical whether its control envelope arrived
+    /// early or late. Stale entries (TTL-expired while waiting) leave
+    /// silently here; entries keyed to other rows stay buffered.
+    fn drain_early_controls(
+        &mut self,
+        account_id: &str,
+        conversation_id: &str,
+        kind: &str,
+        peer_key: &str,
+        sent_at: u64,
+        sender_id: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if self.early_controls.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = now_ms();
+        let table = std::mem::take(&mut self.early_controls);
+        let mut drained = Vec::new();
+        let mut remaining = Vec::new();
+        for entry in table {
+            let fresh = now.saturating_sub(entry.buffered_at) < EARLY_CONTROL_BUFFER_TTL_MS;
+            let matches = fresh
+                && entry.account_id == account_id
+                && entry.kind == kind
+                && entry.peer_key == peer_key
+                && entry.target_sent_at == sent_at
+                && entry.author_sender_id == sender_id;
+            if !matches {
+                if fresh {
+                    remaining.push(entry);
+                }
+                continue;
+            }
+            match entry.payload {
+                EarlyControlPayload::RemoteDelete => {
+                    // The entry's own author keys the author-scoped store
+                    // delete (§4.90): the flush only fires when the landed
+                    // row's sender projection equals this author, so the
+                    // scoped update converges exactly the row that just
+                    // landed — never a foreign member's row sharing the
+                    // per-sender timestamp.
+                    if let Some((record, true)) = self.store.mark_remote_deleted(
+                        account_id,
+                        conversation_id,
+                        sent_at,
+                        &entry.author_sender_id,
+                    )? {
+                        drained.push(HostSideEvent::MessageStatusChanged {
+                            account_id: record.account_id,
+                            message_id: record.id,
+                            status: record.status,
+                            delivered_at: None,
+                            read_at: None,
+                            viewed_at: None,
+                        });
+                    }
+                }
+                EarlyControlPayload::Edit {
+                    direction,
+                    new_text,
+                    new_bytes,
+                } => {
+                    let applied = if direction == "incoming" {
+                        self.store.apply_inbound_edit(
+                            account_id,
+                            conversation_id,
+                            sent_at,
+                            sender_id,
+                            &legacy_sender_id(kind, peer_key, account_id),
+                            &new_text,
+                            new_bytes,
+                        )?
+                    } else {
+                        self.store.apply_outgoing_edit_by_signal(
+                            account_id,
+                            conversation_id,
+                            sent_at,
+                            &new_text,
+                            new_bytes,
+                        )?
+                    };
+                    if let Some(mut record) = applied {
+                        self.store
+                            .attach_reactions(account_id, std::slice::from_mut(&mut record))?;
+                        self.store
+                            .attach_edits(account_id, std::slice::from_mut(&mut record))?;
+                        drained.push(HostSideEvent::MessageUpserted(record));
+                    }
+                }
+            }
+        }
+        self.early_controls = remaining;
+        Ok(drained)
     }
 
     /// Persist-and-notify one control-plane receive (contract 1.15): reaction
@@ -6630,6 +6825,21 @@ impl ConnectorService {
             // discipline (宁缺勿错), and the groupUpdated projection keeps
             // its warn-only drop (better to converge late than to invent a
             // row).
+            // §4.91: an early edit/remoteDelete buffers instead of dropping —
+            // the original row (and with it possibly the whole conversation)
+            // has not landed yet, and the buffer flushes the moment it does.
+            if let Some(entry) = early_control_entry(
+                &account.id,
+                kind,
+                peer_key,
+                receive.direction,
+                receive.source.as_deref(),
+                receive.text.as_deref(),
+                &control,
+            ) {
+                self.buffer_early_control(entry);
+                return Ok(Vec::new());
+            }
             if let Some(event) =
                 group_incoming_face(&control, &account.id, receive.source.as_deref())
             {
@@ -6744,11 +6954,26 @@ impl ConnectorService {
                         read_at: None,
                         viewed_at: None,
                     }]),
-                    // A replay (the row is already remote-deleted) stays
-                    // silent; no row by this author at this timestamp keeps
-                    // the historical silent skip (the §4.91 early-arrival
-                    // buffer owns that case).
-                    _ => Ok(Vec::new()),
+                    // A replay (the row is already remote-deleted by this
+                    // author) stays silent. §4.91: no row by this author at
+                    // this timestamp means the original has not landed —
+                    // buffer the delete (the author's own identity keys it)
+                    // instead of dropping it, so a late original converges.
+                    // The age gate above already refused the aged faces, so
+                    // only a delete that could still honestly compose is
+                    // ever buffered.
+                    _ => {
+                        self.buffer_early_control(EarlyControlEntry {
+                            account_id: account.id.clone(),
+                            kind: if kind == "group" { "group" } else { "direct" },
+                            peer_key: peer_key.to_string(),
+                            target_sent_at: target_timestamp,
+                            author_sender_id,
+                            buffered_at: now_ms(),
+                            payload: EarlyControlPayload::RemoteDelete,
+                        });
+                        Ok(Vec::new())
+                    }
                 }
             }
             ControlReceive::Edit { target_timestamp } => {
@@ -6782,7 +7007,27 @@ impl ConnectorService {
                                     .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
                                 Ok(vec![HostSideEvent::MessageUpserted(record)])
                             }
-                            None => Ok(Vec::new()),
+                            // §4.91: the addressed row has not landed (or
+                            // names another author's row) — buffer the edit
+                            // under the editor's own identity; if the
+                            // editor's own row arrives at this timestamp the
+                            // flush applies it, otherwise the TTL expires it.
+                            None => {
+                                self.buffer_early_control(EarlyControlEntry {
+                                    account_id: account.id.clone(),
+                                    kind: if kind == "group" { "group" } else { "direct" },
+                                    peer_key: peer_key.to_string(),
+                                    target_sent_at: target_timestamp,
+                                    author_sender_id: sender_id.clone(),
+                                    buffered_at: now_ms(),
+                                    payload: EarlyControlPayload::Edit {
+                                        direction: "incoming",
+                                        new_text,
+                                        new_bytes,
+                                    },
+                                });
+                                Ok(Vec::new())
+                            }
                         }
                     }
                     // Our own multi-device edit of a phone-sent message: the
@@ -6805,7 +7050,25 @@ impl ConnectorService {
                                     .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
                                 Ok(vec![HostSideEvent::MessageUpserted(record)])
                             }
-                            None => Ok(Vec::new()),
+                            // §4.91: same early-arrival buffer, keyed to the
+                            // account itself — the flush matches the outgoing
+                            // mirror row's sender projection.
+                            None => {
+                                self.buffer_early_control(EarlyControlEntry {
+                                    account_id: account.id.clone(),
+                                    kind: if kind == "group" { "group" } else { "direct" },
+                                    peer_key: peer_key.to_string(),
+                                    target_sent_at: target_timestamp,
+                                    author_sender_id: account.id.clone(),
+                                    buffered_at: now_ms(),
+                                    payload: EarlyControlPayload::Edit {
+                                        direction: "outgoing",
+                                        new_text,
+                                        new_bytes,
+                                    },
+                                });
+                                Ok(Vec::new())
+                            }
                         }
                     }
                 }
@@ -8412,6 +8675,73 @@ pub(crate) fn store_get_message_text(
 /// peer (receive dedupe pairs the current and legacy hash).
 fn legacy_sender_id(kind: &str, peer_key: &str, account_id: &str) -> String {
     stable_hash_id(&[account_id, kind, peer_key])
+}
+
+/// §4.91: the receive-identity projection an early control envelope's
+/// author carries — the same derivation the original row will store as its
+/// `sender_id` when it lands (the account id for the outgoing multi-device
+/// mirrors, the envelope source's peer hash for peers). The flush matches
+/// on exactly this identity, so a buffered entry can only ever apply to the
+/// row its own author sent.
+fn early_control_author(
+    account_id: &str,
+    kind: &str,
+    direction: &str,
+    source: Option<&str>,
+    peer_key: &str,
+) -> String {
+    if direction == "outgoing" {
+        account_id.to_string()
+    } else {
+        stable_hash_id(&[account_id, kind, source.unwrap_or(peer_key)])
+    }
+}
+
+/// §4.91: the buffered entry an early RemoteDelete/Edit control envelope
+/// falls into, or `None` for every other control family (they keep their
+/// silent skip) and for a bodyless edit (nothing to apply later). The kind
+/// string is pinned to the ladder's two literals.
+fn early_control_entry(
+    account_id: &str,
+    kind: &str,
+    peer_key: &str,
+    direction: &str,
+    source: Option<&str>,
+    text: Option<&str>,
+    control: &ControlReceive,
+) -> Option<EarlyControlEntry> {
+    let kind = if kind == "group" { "group" } else { "direct" };
+    let (target_sent_at, payload) = match control {
+        ControlReceive::RemoteDelete { target_timestamp } => {
+            (*target_timestamp, EarlyControlPayload::RemoteDelete)
+        }
+        ControlReceive::Edit { target_timestamp } => {
+            let text = text?;
+            let new_bytes = text.len().min(u32::MAX as usize) as u32;
+            (
+                *target_timestamp,
+                EarlyControlPayload::Edit {
+                    direction: if direction == "outgoing" {
+                        "outgoing"
+                    } else {
+                        "incoming"
+                    },
+                    new_text: text.to_string(),
+                    new_bytes,
+                },
+            )
+        }
+        _ => return None,
+    };
+    Some(EarlyControlEntry {
+        account_id: account_id.to_string(),
+        kind,
+        peer_key: peer_key.to_string(),
+        target_sent_at,
+        author_sender_id: early_control_author(account_id, kind, direction, source, peer_key),
+        buffered_at: crate::link::now_ms(),
+        payload,
+    })
 }
 
 impl ConnectorService {
@@ -21717,6 +22047,287 @@ mod tests {
             .unwrap();
         assert_eq!(row.sent_at, 420, "protocol identity is untouched");
         assert!(row.edited_at.is_some());
+    }
+
+    /// Contract 1.110 (§4.91): an early remoteDelete — the original row has
+    /// not landed — buffers silently, and the buffered delete converges the
+    /// row the moment the original arrives, on the same event stream
+    /// (land, then the status change).
+    #[test]
+    fn early_remote_delete_buffers_and_applies_when_the_original_lands() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let early = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::RemoteDelete {
+                        target_timestamp: 500,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(early.is_empty(), "an early delete is buffered, not applied");
+
+        let original = NormalizedReceive {
+            timestamp: Some(500),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("late original".into()),
+            text_bytes: Some(13),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+        };
+        let events = service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            matches!(&events[0], HostSideEvent::MessageUpserted(_)),
+            "the original lands first, got {:?}",
+            events[0]
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                HostSideEvent::MessageStatusChanged { status, .. } if *status == "remote-deleted"
+            )),
+            "the buffered delete converges the landed row, got {events:?}"
+        );
+
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].status, "remote-deleted");
+
+        // A later replay of the same delete stays silent (the flush already
+        // consumed the buffered entry; the live arm answers the replay).
+        let replay = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550101",
+                    ControlReceive::RemoteDelete {
+                        target_timestamp: 500,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(replay.is_empty(), "a replayed delete never re-emits");
+    }
+
+    /// Contract 1.110 (§4.91): an early edit buffers with its body and the
+    /// flush rewrites the landed row in place (same id, new body,
+    /// editedAt set).
+    #[test]
+    fn early_edit_buffers_and_applies_when_the_original_lands() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let mut early = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::Edit {
+                target_timestamp: 510,
+            },
+        );
+        early.direction = "incoming";
+        early.text = Some("early edit".into());
+        early.text_bytes = Some(10);
+        let buffered = service
+            .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            buffered.is_empty(),
+            "an early edit is buffered, not applied"
+        );
+
+        let original = NormalizedReceive {
+            timestamp: Some(510),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("original body".into()),
+            text_bytes: Some(13),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+        };
+        let events = service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let applied = events
+            .iter()
+            .filter_map(|event| match event {
+                HostSideEvent::MessageUpserted(record) => Some(record),
+                _ => None,
+            })
+            .count();
+        assert_eq!(
+            applied, 2,
+            "the original and the converged edit both upsert"
+        );
+
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(messages.len(), 1, "the edit rewrites the row in place");
+        assert_eq!(messages[0].text.as_deref(), Some("early edit"));
+        assert!(messages[0].edited_at.is_some());
+    }
+
+    /// Contract 1.110 (§4.91): the buffered delete is keyed to its author —
+    /// in a group conversation, author A's early delete never touches
+    /// author B's row at the same timestamp; it applies when A's own row
+    /// lands.
+    #[test]
+    fn early_group_delete_applies_only_to_its_own_authors_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtYnVmZmVy", "Buffer Group")
+            .unwrap();
+        let _ = conversation;
+        // Author A's delete arrives first — buffered.
+        let mut early = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 600,
+            },
+        );
+        early.group_id = Some("Z3JvdXAtYnVmZmVy".into());
+        assert!(
+            service
+                .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+
+        let seed_row = |service: &mut ConnectorService, source: &str| {
+            let incoming = NormalizedReceive {
+                timestamp: Some(600),
+                content_kind: "dataMessage",
+                direction: "incoming",
+                account_present: true,
+                account: Some("+15555550100".into()),
+                source: Some(source.into()),
+                source_uuid: None,
+                peer_name: None,
+                group_id: Some("Z3JvdXAtYnVmZmVy".into()),
+                text: Some(format!("from {source}")),
+                text_bytes: None,
+                text_truncated: false,
+                quote: None,
+                attachments: Vec::new(),
+                rich: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                control: None,
+                server_guid: None,
+            };
+            service
+                .ingest_receive(incoming, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+        };
+        // Author B's row at the same timestamp: NOT the delete's target.
+        let events_b = seed_row(&mut service, "+15555550102");
+        assert!(
+            !events_b.iter().any(|event| matches!(
+                event,
+                HostSideEvent::MessageStatusChanged { status, .. } if *status == "remote-deleted"
+            )),
+            "a foreign author's row is never the buffered delete's target"
+        );
+        // Author A's own row: the delete converges it.
+        let events_a = seed_row(&mut service, "+15555550101");
+        assert!(
+            events_a.iter().any(|event| matches!(
+                event,
+                HostSideEvent::MessageStatusChanged { status, .. } if *status == "remote-deleted"
+            )),
+            "the delete applies to its own author's row"
+        );
+
+        let rows = service
+            .list_messages(&account.id, &group.id, 10, None)
+            .unwrap()
+            .items;
+        let status_of = |source: &str| {
+            rows.iter()
+                .find(|row| row.text.as_deref() == Some(&format!("from {source}")))
+                .map(|row| row.status)
+        };
+        assert_eq!(status_of("+15555550102"), Some("delivered"));
+        assert_eq!(status_of("+15555550101"), Some("remote-deleted"));
+    }
+
+    /// Contract 1.110 (§4.91) bounds: the buffer holds at most 512 entries
+    /// (the oldest leaves when a 513th arrives) and the lazy TTL sweep
+    /// drops expired entries at the next touch.
+    #[test]
+    fn early_control_buffer_stays_bounded_and_expires() {
+        let (_temp, mut service) = service();
+        let entry = |sent_at: u64, author: &str| EarlyControlEntry {
+            account_id: "a".into(),
+            kind: "direct",
+            peer_key: "+15555550101".into(),
+            target_sent_at: sent_at,
+            author_sender_id: author.into(),
+            buffered_at: now_ms(),
+            payload: EarlyControlPayload::RemoteDelete,
+        };
+        for index in 0..EARLY_CONTROL_BUFFER_CAPACITY {
+            service.buffer_early_control(entry(index as u64, "peer"));
+        }
+        assert_eq!(service.early_controls.len(), EARLY_CONTROL_BUFFER_CAPACITY);
+        // One more: the oldest (sent_at 0) leaves, the table stays bounded.
+        service.buffer_early_control(entry(999, "peer"));
+        assert_eq!(service.early_controls.len(), EARLY_CONTROL_BUFFER_CAPACITY);
+        assert!(
+            service
+                .early_controls
+                .iter()
+                .all(|entry| entry.target_sent_at != 0)
+        );
+
+        // The TTL: backdating every entry makes the next touch sweep them.
+        for entry in service.early_controls.iter_mut() {
+            entry.buffered_at = now_ms().saturating_sub(EARLY_CONTROL_BUFFER_TTL_MS + 1);
+        }
+        service.buffer_early_control(entry(1000, "peer"));
+        assert_eq!(service.early_controls.len(), 1, "expired entries swept");
+        assert_eq!(service.early_controls[0].target_sent_at, 1000);
     }
 
     /// Typing START passes through as conversation.typing; an immediate
