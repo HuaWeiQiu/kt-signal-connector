@@ -902,6 +902,28 @@ impl ProxyGroupRuntime {
         slot.supervisor.chat_folders_set_records(params).await
     }
 
+    /// Notification-profile sync (contract revision 1.129, §4.110): the
+    /// §4.78 routing shape — the profile records live in the account's
+    /// storage session, so both faces route through the account's owning
+    /// engine.
+    pub async fn notification_profiles_list(
+        &self,
+        params: crate::service::NotificationProfilesListParams,
+    ) -> Result<crate::service::NotificationProfileSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.notification_profiles_list(params).await
+    }
+
+    pub async fn notification_profiles_set_records(
+        &self,
+        params: crate::service::NotificationProfilesSetRecordsParams,
+    ) -> Result<crate::service::NotificationProfileSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor
+            .notification_profiles_set_records(params)
+            .await
+    }
+
     /// Account settings writes (contract 1.46, §4.45): account-record state —
     /// the writes live in the account's storage session, so all three route
     /// through the account's owning engine like every other mutating face.

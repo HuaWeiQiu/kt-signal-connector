@@ -55,7 +55,8 @@ use crate::service::{
     MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
     MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
     MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    MessagesSyncReadParams, MessagesSyncViewedParams, PresenceSetTypingMessageParams, SendTarget,
+    MessagesSyncReadParams, MessagesSyncViewedParams, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
     StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSendReactionParams, StoriesSetDisabledParams, UsernameLookupParams,
@@ -2434,6 +2435,44 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid chatFolders.setRecords params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "notificationProfiles.list" => {
+            match serde_json::from_value::<NotificationProfilesListParams>(request.params) {
+                Ok(params) => match runtime.notification_profiles_list(params).await {
+                    Ok(profiles) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(profiles).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid notificationProfiles.list params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "notificationProfiles.setRecords" => {
+            match serde_json::from_value::<NotificationProfilesSetRecordsParams>(request.params) {
+                Ok(params) => match runtime.notification_profiles_set_records(params).await {
+                    Ok(profiles) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(profiles).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid notificationProfiles.setRecords params",
                         false,
                     ),
                 ),

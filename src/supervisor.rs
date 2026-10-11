@@ -41,7 +41,8 @@ use crate::service::{
     MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeParams,
     MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
     MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
-    MessagesSendStoryParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
+    MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
+    NotificationProfilesSetRecordsParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
     PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
     SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
     StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
@@ -54,9 +55,9 @@ use crate::service::{
     group_create_result_from_engine, group_invite_join_status_from_engine,
     group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
     group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
+    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
     validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -3123,6 +3124,72 @@ impl RuntimeSupervisor {
             Ok(result) => Ok(chat_folder_syncs_result(
                 result
                     .get("folders")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// notificationProfiles.list (contract revision 1.129, §4.110): the
+    /// §4.78 read shape — bounds and account resolution under the service
+    /// lock, then the read-only engine call; the profile list projects
+    /// straight from the engine result with the KT entry cap, record bodies
+    /// verbatim.
+    pub async fn notification_profiles_list(
+        &self,
+        params: NotificationProfilesListParams,
+    ) -> Result<NotificationProfileSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_notification_profiles_list(&params.account_id)?
+        };
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("notificationProfiles.list", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(notification_profile_syncs_result(
+            result
+                .get("profiles")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
+    }
+
+    /// notificationProfiles.setRecords (contract revision 1.129, §4.110):
+    /// the §4.78 write shape — bounds under the service lock, then the
+    /// mutating engine call with the reaction-class unknown-outcome
+    /// discipline; the success result is the post-write cloud state read
+    /// back, not a local echo.
+    pub async fn notification_profiles_set_records(
+        &self,
+        params: NotificationProfilesSetRecordsParams,
+    ) -> Result<NotificationProfileSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_notification_profiles_set_records(
+                &params.account_id,
+                params.records.as_deref().unwrap_or(&[]),
+                params.remove_ids.as_deref().unwrap_or(&[]),
+            )?
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call(
+                "notificationProfiles.setRecords",
+                upstream,
+                CallClass::Mutating,
+            )
+            .await
+        {
+            Ok(result) => Ok(notification_profile_syncs_result(
+                result
+                    .get("profiles")
                     .and_then(Value::as_array)
                     .ok_or(ServiceError::Engine(EngineError::Protocol))?,
             )),

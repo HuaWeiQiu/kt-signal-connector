@@ -509,6 +509,16 @@ pub const METHODS: &[MethodRow] = &[
     // counterpart; advertised through `chat-folders`.
     ("chatFolders.list", Lane::Read, false, "read"),
     ("chatFolders.setRecords", Lane::Send, true, "send"),
+    // Notification-profile sync (contract revision 1.129, §4.110):
+    // notificationProfiles.list is a bounded cloud-backed read of the
+    // account's NotificationProfile set; notificationProfiles.setRecords is
+    // the mutating storage-service write — reaction-class write-lane mutex
+    // and delete barrier, no local persistence on either side (records cross
+    // verbatim; the connector neither interprets nor re-keys them).
+    // KT-extension, no upstream counterpart; advertised through
+    // `notification-profiles`.
+    ("notificationProfiles.list", Lane::Read, false, "read"),
+    ("notificationProfiles.setRecords", Lane::Send, true, "send"),
     // Read-only runtime diagnostic face (contract 1.97, §4.79): one payload
     // answering the whole chain — connector/engine versions plus the
     // engine's self-certification baseline, per-group data-dir and
@@ -654,7 +664,12 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// marks the §4.78 chat-folder sync faces (`chatFolders.list` read over the
 /// account's ChatFolderRecord set plus the `chatFolders.setRecords`
 /// storage-service write — one capability for the read and write halves,
-/// the 1.36/1.37 sync-face discipline); and `conversation-state` (contract
+/// the 1.36/1.37 sync-face discipline); and `notification-profiles`
+/// (contract revision 1.129) marks the §4.110 notification-profile sync
+/// faces (`notificationProfiles.list` read over the account's
+/// NotificationProfile set plus the `notificationProfiles.setRecords`
+/// storage-service write — one capability for the read and write halves,
+/// the 1.53 appendix discipline); and `conversation-state` (contract
 /// revision 1.116) marks the §4.97 conversation-state faces
 /// (`conversations.getState` read over the storage records'
 /// mutedUntilTimestamp/archived/markedUnread bits plus `conversations.setState`
@@ -723,6 +738,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "safety-number",
     "stories",
     "chat-folders",
+    "notification-profiles",
     "conversation-state",
     "group-invite-links",
     "device-management",
@@ -781,6 +797,7 @@ mod tests {
             "calls.groupMembers",
             "calls.endorsementsPublicKey",
             "chatFolders.list",
+            "notificationProfiles.list",
             "groups.generateInviteLinkPassword",
             "groups.buildInviteLink",
             "groups.parseInviteLink",
@@ -847,6 +864,7 @@ mod tests {
             "stories.sendReaction",
             "stories.downloadAttachment",
             "chatFolders.setRecords",
+            "notificationProfiles.setRecords",
             "messages.deleteForMe",
         ];
         let mutating = [
@@ -913,6 +931,7 @@ mod tests {
             "stories.sendReaction",
             "stories.downloadAttachment",
             "chatFolders.setRecords",
+            "notificationProfiles.setRecords",
             "messages.deleteForMe",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

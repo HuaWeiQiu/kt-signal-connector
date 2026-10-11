@@ -45,13 +45,13 @@ use kt_signal_connector::service::{
     MAX_ATTACHMENT_FILENAME_BYTES, MAX_ATTACHMENT_ID_BYTES, MAX_AVATAR_DATA_URI_CHARS,
     MAX_CHAT_FOLDER_BATCH, MAX_CHAT_FOLDER_ID_CHARS, MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES,
     MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_LOCATOR_FIELD_CHARS, MAX_LOCATOR_HASH_CHARS,
-    MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES,
-    MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS,
-    MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS,
-    MAX_STORY_PREVIEW_TITLE_BYTES, MAX_STORY_PREVIEW_URL_CHARS, MAX_TEXT_BYTES,
-    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
-    STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
-    USERNAME_MAX_WIRE_CHARS,
+    MAX_NOTIFICATION_PROFILE_BATCH, MAX_NOTIFICATION_PROFILE_ID_CHARS, MAX_OPAQUE_ID_BYTES,
+    MAX_PIN_CONVERSATION_ID_CHARS, MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES,
+    MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
+    MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_STORY_PREVIEW_TITLE_BYTES,
+    MAX_STORY_PREVIEW_URL_CHARS, MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT,
+    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
+    USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES, USERNAME_MAX_WIRE_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -958,6 +958,28 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/chatFoldersSetRecordsParams/properties/removeIds/items",
             "maxLength",
             MAX_CHAT_FOLDER_ID_CHARS as u64,
+        ),
+        // Notification-profile sync (contract 1.129, §4.110): the §4.78
+        // pair set verbatim over the profile identity key.
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/records",
+            "maxItems",
+            MAX_NOTIFICATION_PROFILE_BATCH as u64,
+        ),
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/removeIds",
+            "maxItems",
+            MAX_NOTIFICATION_PROFILE_BATCH as u64,
+        ),
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/records/items/properties/id",
+            "maxLength",
+            MAX_NOTIFICATION_PROFILE_ID_CHARS as u64,
+        ),
+        (
+            "/$defs/notificationProfilesSetRecordsParams/properties/removeIds/items",
+            "maxLength",
+            MAX_NOTIFICATION_PROFILE_ID_CHARS as u64,
         ),
     ];
     assert!(!pairs.is_empty());

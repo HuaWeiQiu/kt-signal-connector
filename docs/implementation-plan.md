@@ -8697,6 +8697,99 @@ exercise ingest) cover the lane. Gated behind the full local gate
 suite (fmt + clippy -D warnings + cargo test + release build), all
 green.
 
+### 4.110 The notification profiles reach the host: `notificationProfiles.list` / `notificationProfiles.setRecords` (contract revision 1.129, 2026-10-12)
+
+The engine's Storage 跨设备同步批 shipped the notification-profile face
+pair — the official NotificationProfile record surface (manifest
+NOTIFICATION_PROFILE=9, the official mergeNotificationProfileRecord
+read/write faces, the desktop's notification-profile picker's own sync
+pipe). This batch wires both into the host contract as
+`notificationProfiles.list` / `notificationProfiles.setRecords`,
+advertised through the new `notification-profiles` capability tag (the
+1.34 discipline; one capability for the read and write halves, the
+1.36/1.37 sync-face discipline). Until now the desktop could manage
+chat folders (§4.78) but had no notification-profile surface; the
+profile set had no host leg. The wiring template is the §4.78
+chat-folder batch verbatim — same lanes, same gates, same
+zero-local-footprint contract.
+
+**The shape.** `notificationProfiles.list {accountId}` →
+`{profiles: [...]}` — the engine's NotificationProfileJson entries
+verbatim (the official mergeNotificationProfileRecord output face:
+`id` (32-char lowercase hex), `name`, optional `emoji`, `color`,
+`createdAtMs`, `allowAllCalls`, `allowAllMentions`, `allowedMembers`
+(entries `{conversationId, kind: contact|group|legacyGroup}` — the
+§4.78 recipient taxonomy), `scheduleEnabled`, the optional
+`scheduleStartTime` / `scheduleEndTime` u32 windows (present only when
+non-zero), `scheduleDaysEnabled` (the 1..=7 weekday array, always
+present), and `deletedAtTimestampMs` present only when non-zero — the
+tombstone key). Read lane, non-mutating, metrics `read`; the array is
+capped at `MAX_NOTIFICATION_PROFILES` (64, the §4.78 cap verbatim) and
+entries without a usable identity (a string `id`) drop (the §4.34
+discipline). The engine's no-master-key / unknown-account face answers
+the honest empty array.
+
+`notificationProfiles.setRecords {accountId, records?, removeIds?}` →
+the same `{profiles: [...]}` projection — the engine answers with the
+post-write manifest, so the caller sees the resulting set without a
+second read. Send lane, account-scoped mutating, metrics `send`, the
+reaction class: a definite upstream error propagates, an unknown
+outcome answers SEND_OUTCOME_UNKNOWN (retryable=false) and is never
+retried. Local gates (all INVALID_REQUEST, retryable=false) mirror the
+§4.78 ladder: at least one half non-empty (the
+accounts.updateConfiguration rule), each half at most
+`MAX_NOTIFICATION_PROFILE_BATCH` (64), every `records` entry an object
+carrying a non-empty string `id` of at most
+`MAX_NOTIFICATION_PROFILE_ID_CHARS` (128), every `removeIds` entry a
+non-empty string of at most 128 chars — the identity face only; the
+profile grammar (the 32-hex id word, the non-empty name, the
+scheduleDaysEnabled 1..=7 domain) stays the engine's audit, never a
+local re-derivation. The upstream frame carries only the non-empty half
+(`records` / `removeIds` keys appear as needed), values verbatim.
+
+**Zero local footprint, idempotency, and the error face** are the
+§4.78 contract verbatim: no record content lands in the connector
+store; the store's account id never rides the wire (resolved to the
+upstream `account` at prepare, the §4.33 discipline); the idempotency
+is the engine's own documented upload semantics (upsert by record id, a
+non-zero `deletedAtTimestampMs` as tombstone, `removeIds` as the
+official deleteKey face, a same-value rewrite as the engine's no-bump
+no-op); and the error face is transparent — the engine's
+STORAGE_WRITE_FAILED / STORAGE_READ_FAILED / STORAGE_UNAVAILABLE ride
+the wire verbatim (already allowlisted, retryable=true) and the
+engine's `-32603` folds to UPSTREAM_ERROR (retryable=true) through the
+existing `into_api` face. The ladder order holds (shape gates →
+resolve_account → engine): a bad record with an unknown account still
+answers the shape, an unknown account with a clean frame answers
+ACCOUNT_NOT_FOUND.
+
+Tests: the service unit pins the prepare ladder (the batch caps on both
+halves, the records identity face, the removeId bounds, the
+at-least-one rule, the resolved non-empty-half frame with the store
+account id never riding); the methods-table test pins the lane and
+mutating classification and the capability list; the integration tests
+(`tests/notification_profiles.rs`: `notification_profile_faces_pass_through_verbatim`
+— the fixture's two profiles (a schedule-less one and a scheduled one
+carrying emoji, windows, and an allowed member) read byte-faithfully, a
+records-only write crossing verbatim and reading back the post-write
+manifest with the `removeIds` key absent, a removeIds-only write reading
+back the shrunk manifest with the `records` key absent;
+`notification_profile_error_ladder_rides_the_wire` — the fixture's
+failure markers landing STORAGE_WRITE_FAILED on the write,
+STORAGE_READ_FAILED on the read, STORAGE_UNAVAILABLE on both, the
+engine's grammar refusal degrading to UPSTREAM_ERROR;
+`notification_profile_gates_answer_locally` — the at-least-one rule,
+the non-object / `id`-less / empty-`id` / non-string-`id` entries, the
+129-char ids on both halves, the 65-entry batches, the
+shape-over-resolution and resolution ladder, and the engine-unknown
+account degrading to UPSTREAM_ERROR;
+`notification_profile_crash_answers_unknown_and_never_retries` — the
+crash sentinel answering SEND_OUTCOME_UNKNOWN (retryable=false) with
+exactly one dispatch frame in the log); plus the schema-consistency
+bound pairs and the server handshake advertisement. Gated behind the
+full local gate suite (fmt + clippy -D warnings + cargo test + release
+build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

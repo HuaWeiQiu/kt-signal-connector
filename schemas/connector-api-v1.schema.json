@@ -103,6 +103,8 @@
             "stickerPacks.setSync",
             "chatFolders.list",
             "chatFolders.setRecords",
+            "notificationProfiles.list",
+            "notificationProfiles.setRecords",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -527,6 +529,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/chatFoldersSetRecordsParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "notificationProfiles.list" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/notificationProfilesListParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "notificationProfiles.setRecords" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/notificationProfilesSetRecordsParams" }
             }
           }
         },
@@ -2828,6 +2852,52 @@
             "maxLength": 128
           },
           "description": "The official deleteKey half of the write batch (KT bound 64 entries): folder record ids to remove from the manifest; optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
+        }
+      }
+    },
+    "notificationProfilesListParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's notification profiles (contract revision 1.129, \u00a74.110, capability notification-profiles): the engine reads the official Storage Service NotificationProfile set (manifest NOTIFICATION_PROFILE=9 identifiers, storage order) and the result projects {profiles: [record...]} \u2014 each record the engine's NotificationProfileJson verbatim: {id (32-char lowercase hex string), name, emoji (optional), color (u32), createdAtMs (u64), allowAllCalls, allowAllMentions, allowedMembers (array of {conversationId, kind: contact|group|legacyGroup}), scheduleEnabled, scheduleStartTime / scheduleEndTime (optional u32, present only when non-zero), scheduleDaysEnabled (array of 1..=7 integers, always present), deletedAtTimestampMs (optional, present only when non-zero \u2014 a non-zero value is the tombstone)}. Entries the engine cannot decode drop engine-side (broken entries never break the read); the connector caps the list at 64 entries (KT bound, overflow truncated) and drops entries missing id. A cloud state with no profiles answers {profiles: []} \u2014 the empty state is the answer, not an error. Structured engine errors: STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Read lane, non-mutating; the connector persists nothing \u2014 the cloud record plus the desktop's own cache is the whole story.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "notificationProfilesSetRecordsParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Write the account's notification-profile records (contract revision 1.129, \u00a74.110, capability notification-profiles): the official storage upload semantics \u2014 records upsert by id, a non-zero deletedAtTimestampMs is the tombstone write, removeIds is the official deleteKey face, and a record identical to the cloud state is an idempotent no-write (the whole batch replaying is safe). At least one of records / removeIds must be non-empty (INVALID_REQUEST before any upstream call); only the non-empty half rides the upstream frame. Each records entry is the engine's NotificationProfileJson (the notificationProfiles.list description carries the full key face) \u2014 forwarded verbatim: the connector enforces only the identity face (an object carrying a non-empty string id \u2264 128 chars); the record grammar is the engine's definite -32603, never a local re-derivation. The result is the post-write cloud state {profiles: [...]} read back \u2014 not a local echo. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: STORAGE_WRITE_FAILED / STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Zero local persistence.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "records": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "The profile's record id (a 32-char lowercase hex string on the official face) \u2014 the upsert key and the identity the projection gate keeps."
+              }
+            },
+            "description": "One NotificationProfileJson, forwarded to the engine verbatim (see the notificationProfiles.list params description for the key face); only the id gate is connector-enforced, the grammar is the engine's."
+          },
+          "description": "The upsert half of the write batch (KT bound 64 entries); optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
+        },
+        "removeIds": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "description": "The official deleteKey half of the write batch (KT bound 64 entries): profile record ids to remove from the manifest; optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
         }
       }
     },

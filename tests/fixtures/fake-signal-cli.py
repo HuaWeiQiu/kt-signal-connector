@@ -248,6 +248,42 @@ CHAT_FOLDER_STATE = [
         "deletedAtTimestampMs": 0,
     },
 ]
+# Contract 1.129 notification-profile sync fixture state: the Storage Service
+# NotificationProfileJson projection in storage order — the engine's read
+# face keys (id 32-hex / name / emoji / color / createdAtMs / booleans /
+# allowedMembers / schedule keys / tombstone key present only when non-zero);
+# notificationProfiles.setRecords mutates it in place so a read-back after a
+# write observes the write.
+NOTIFICATION_PROFILE_STATE = [
+    {
+        "id": "a3f1c2d4e5b6478901a2b3c4d5e6f701",
+        "name": "Work",
+        "color": 4,
+        "createdAtMs": 1720000000000,
+        "allowAllCalls": False,
+        "allowAllMentions": True,
+        "allowedMembers": [],
+        "scheduleEnabled": False,
+        "scheduleDaysEnabled": [],
+    },
+    {
+        "id": "b7e2d3c4f5a6081922b3c4d5e6f70812",
+        "name": "Sleep",
+        "emoji": "🌙",
+        "color": 9,
+        "createdAtMs": 1720000100000,
+        "allowAllCalls": True,
+        "allowAllMentions": False,
+        "allowedMembers": [
+            {"conversationId": "6e08f0b6-1c2d-4e5f-8a9b-0c1d2e3f4a5b", "kind": "contact"},
+        ],
+        "scheduleEnabled": True,
+        "scheduleStartTime": 1320,
+        "scheduleEndTime": 420,
+        "scheduleDaysEnabled": [1, 2, 3, 4, 5],
+        "deletedAtTimestampMs": 0,
+    },
+]
 # Contract 1.48 §4.47 avatar fixture: a tiny PNG magic payload — the engine
 # sniffs the MIME from the magic bytes and answers a data URI plus the
 # decoded byte count; getAvatar's sentinel conversationId answers the
@@ -1243,6 +1279,174 @@ for line in sys.stdin:
                     folders.append(record)
             CHAT_FOLDER_STATE[:] = folders
         result = {"folders": list(CHAT_FOLDER_STATE)}
+    elif method == "notificationProfiles.list":
+        # Contract 1.129 notification-profile sync read: the storage-order
+        # record projection as a fixture constant (one schedule-less profile
+        # + one scheduled profile with an allowed member). Account gate
+        # mirrors the engine (-32603 on an unregistered account). Markers
+        # the driving test writes steer the structured storage ladder:
+        # `.fixture-profile-read-failed` answers STORAGE_READ_FAILED,
+        # `.fixture-profile-unavailable` answers STORAGE_UNAVAILABLE.
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-profile-read-failed").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_READ_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-profile-unavailable").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "STORAGE_UNAVAILABLE"},
+            }
+            emit_json(response)
+            continue
+        result = {"profiles": list(NOTIFICATION_PROFILE_STATE)}
+    elif method == "notificationProfiles.setRecords":
+        # Contract 1.129 notification-profile sync write: record the exact
+        # upstream params (tests assert the resolved account and the
+        # verbatim records/removeIds contract), apply the official upload
+        # semantics — upsert by id in place, removeIds out of the set — and
+        # answer the post-write cloud state. Account gate mirrors the
+        # engine (-32603 on an unregistered account); the structured ladder
+        # steers from markers: `.fixture-profile-write-failed` answers
+        # STORAGE_WRITE_FAILED, `.fixture-profile-read-failed` answers
+        # STORAGE_READ_FAILED (the engine reads before it writes),
+        # `.fixture-profile-unavailable` answers STORAGE_UNAVAILABLE.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        marker_errors = (
+            (".fixture-profile-write-failed", "STORAGE_WRITE_FAILED"),
+            (".fixture-profile-read-failed", "STORAGE_READ_FAILED"),
+            (".fixture-profile-unavailable", "STORAGE_UNAVAILABLE"),
+        )
+        for marker, code in marker_errors:
+            if (SIGNAL_DATA_DIR / marker).exists():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": code},
+                }
+                emit_json(response)
+                continue
+        # The mutating-crash sentinel (record id magic; exit 31 = the shared
+        # mutating-in-flight crash code, disjoint from every other face by
+        # trigger): the connector must answer SEND_OUTCOME_UNKNOWN and never
+        # retry.
+        if any(
+            isinstance(record, dict)
+            and record.get("id") == "cede000000000000400080000000000032"
+            for record in params.get("records") or []
+        ):
+            os._exit(31)
+        # The engine's strict record grammar (parse_profile): every record
+        # must carry the required keys with the right shapes — id (32-char
+        # lowercase hex), name (non-empty string), color/createdAtMs (u64),
+        # the three booleans, allowedMembers (entries {conversationId,
+        # kind}), scheduleEnabled — else the engine answers -32603.
+        # Optional: emoji, scheduleStartTime/scheduleEndTime (u32 or
+        # absent), scheduleDaysEnabled (1..=7), deletedAtTimestampMs (u64
+        # or absent).
+        def _profile_shape_ok(record):
+            if not isinstance(record, dict):
+                return False
+            profile_id = record.get("id")
+            if (
+                not isinstance(profile_id, str)
+                or len(profile_id) != 32
+                or any(char not in "0123456789abcdef" for char in profile_id)
+            ):
+                return False
+            if not isinstance(record.get("name"), str) or not record.get("name"):
+                return False
+            for key in ("color", "createdAtMs"):
+                value = record.get(key)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    return False
+            for key in ("allowAllCalls", "allowAllMentions", "scheduleEnabled"):
+                if not isinstance(record.get(key), bool):
+                    return False
+            members = record.get("allowedMembers")
+            if not isinstance(members, list):
+                return False
+            for member in members:
+                if not isinstance(member, dict):
+                    return False
+                if not isinstance(member.get("conversationId"), str):
+                    return False
+                if member.get("kind") not in ("contact", "group", "legacyGroup"):
+                    return False
+            days = record.get("scheduleDaysEnabled")
+            if days is not None:
+                if not isinstance(days, list):
+                    return False
+                for day in days:
+                    if not isinstance(day, int) or isinstance(day, bool):
+                        return False
+                    if not 1 <= day <= 7:
+                        return False
+            return True
+
+        records = params.get("records") or []
+        if any(not _profile_shape_ok(record) for record in records):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        with WRITE_LOCK:
+            profiles = [
+                entry
+                for entry in NOTIFICATION_PROFILE_STATE
+                if entry["id"] not in set(params.get("removeIds") or [])
+            ]
+            for record in params.get("records") or []:
+                record = json.loads(json.dumps(record))
+                for index, entry in enumerate(profiles):
+                    if entry["id"] == record["id"]:
+                        profiles[index] = record
+                        break
+                else:
+                    profiles.append(record)
+            NOTIFICATION_PROFILE_STATE[:] = profiles
+        result = {"profiles": list(NOTIFICATION_PROFILE_STATE)}
     elif method == "setAccountConfiguration":
         # Contract 1.46 §4.45 account settings write: record the exact
         # upstream params (tests assert only the provided keys appear — the
