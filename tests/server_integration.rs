@@ -8554,6 +8554,178 @@ async fn device_capabilities_strips_the_bare_identity() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract revision 1.122 (§4.103): the device-plane faces — accounts.getDevices
+/// (the resolved account rides upstream; the bounded projection drops the
+/// ghost string-deviceId entry, keeps the nameless primary and the
+/// absent-optional-keys linked device) and accounts.unlinkDevice (the write
+/// round-trip with the exact upstream frame, the DEVICES_FAILED data.status
+/// pass-through, the local deviceId=0 refusal, and the crash-in-flight
+/// unknown outcome that is never retried).
+#[tokio::test]
+async fn device_plane_faces_read_and_unlink() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [44_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-DevicePlane" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let frames = || -> Vec<Value> {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    };
+
+    // The read face: two real entries project (the ghost string-deviceId
+    // entry drops), the nameless primary answers no `name` key (the honest
+    // no-name face), the linked device's absent optionals stay absent.
+    let devices = request(
+        &mut client,
+        "get-devices",
+        "accounts.getDevices",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    let list = devices["result"]["devices"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{devices}");
+    assert_eq!(list[0]["deviceId"], 1);
+    assert!(
+        list[0].get("name").is_none(),
+        "an undecryptable/absent device name projects no key: {}",
+        list[0]
+    );
+    assert_eq!(list[0]["registrationId"], 111);
+    assert_eq!(list[0]["lastSeenMs"], 1728000000000u64);
+    assert_eq!(list[0]["createdAtCiphertext"], "Zml4dHVyZS1jcmVk");
+    assert_eq!(list[1]["deviceId"], 2);
+    assert_eq!(list[1]["name"], "KT-Desktop");
+    assert!(list[1].get("registrationId").is_none());
+    assert!(list[1].get("lastSeenMs").is_none());
+    // The upstream frame carried exactly the resolved account key.
+    assert_eq!(
+        frames()
+            .iter()
+            .filter(|frame| **frame == json!({ "account": "+15555550100" }))
+            .count(),
+        1,
+        "expected exactly one resolved-account read frame"
+    );
+
+    // The write round-trip: the definite success answers {status: unlinked}
+    // and the upstream frame carried the resolved account and the deviceId.
+    let unlink = request(
+        &mut client,
+        "unlink-2",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 2 }),
+    )
+    .await;
+    assert_eq!(unlink["result"]["status"], "unlinked", "{unlink}");
+    assert!(
+        frames()
+            .iter()
+            .any(|frame| { *frame == json!({ "account": "+15555550100", "deviceId": 2 }) }),
+        "expected the unlink upstream frame: {:#?}",
+        frames()
+    );
+
+    // The server-rejection family rides the engine's data.status verbatim,
+    // deterministic (retryable=false).
+    let refused = request(
+        &mut client,
+        "unlink-refused",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 4294967295u32 }),
+    )
+    .await;
+    assert_eq!(refused["error"]["code"], "DEVICES_FAILED", "{refused}");
+    assert_eq!(refused["error"]["retryable"], false);
+    assert_eq!(refused["error"]["data"]["status"], 409);
+
+    // The local ladder: deviceId 0 refuses INVALID_REQUEST before any
+    // upstream call (no frame), malformed params refuse at the shape gate.
+    let zero = request(
+        &mut client,
+        "unlink-zero",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 0 }),
+    )
+    .await;
+    assert_eq!(zero["error"]["code"], "INVALID_REQUEST", "{zero}");
+    let malformed = request(
+        &mut client,
+        "unlink-malformed",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "INVALID_REQUEST");
+    let missing = request(
+        &mut client,
+        "unlink-missing-account",
+        "accounts.unlinkDevice",
+        json!({ "accountId": "no-such-account", "deviceId": 2 }),
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "ACCOUNT_NOT_FOUND");
+
+    // The red line: a crash with the mutating call in flight answers
+    // SEND_OUTCOME_UNKNOWN and is never retried — exactly one crashing frame
+    // across the restart.
+    let crash = request(
+        &mut client,
+        "unlink-crash",
+        "accounts.unlinkDevice",
+        json!({ "accountId": account_id, "deviceId": 4294967294u32 }),
+    )
+    .await;
+    assert_eq!(crash["error"]["code"], "SEND_OUTCOME_UNKNOWN", "{crash}");
+    wait_for_process_exit(engine_pid).await;
+    let restarted = request(&mut client, "restart-unlink", "runtime.start", json!({})).await;
+    assert_eq!(restarted["result"]["state"], "running");
+    let recovered_pid = restarted["result"]["pid"].as_u64().unwrap() as u32;
+    assert_eq!(
+        frames()
+            .iter()
+            .filter(|frame| frame["deviceId"] == 4294967294u64)
+            .count(),
+        1,
+        "an unknown unlink outcome is never retried"
+    );
+
+    drop(client);
+    wait_for_process_exit(recovered_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract revision 1.68: the §4.61 safety-number faces — identities.get
 /// (the pinned listIdentities read narrowed to the resolved peer reference,
 /// the honest empty-list no-identity face) and identities.verify (the pinned

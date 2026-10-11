@@ -342,6 +342,16 @@ pub const METHODS: &[MethodRow] = &[
     // the upstream face is a PUT), no local persistence. The result strips
     // the engine's bare `account` identity before it crosses the connector.
     ("accounts.deviceCapabilities", Lane::Read, true, "accounts"),
+    // Device-plane faces (contract revision 1.122, §4.103, capability
+    // device-management): getDevices is the bounded device-list read — one
+    // GET v1/devices projection with engine-side device-name decryption, read
+    // lane, non-mutating, no local persistence; unlinkDevice is the mutating
+    // upstream DELETE v1/devices/{id} — the groups class verbatim,
+    // same-account mutex and delete barrier included. The unlink's
+    // indeterminate outcome face answers SEND_OUTCOME_UNKNOWN and is never
+    // retried.
+    ("accounts.getDevices", Lane::Read, false, "read"),
+    ("accounts.unlinkDevice", Lane::Send, true, "accounts"),
     // Username lookup (contract revision 1.59, §4.55): upstream `getUserStatus
     // --username` passthrough (0.14.8 GetUserStatusCommand.java:41,69) — one
     // bounded cloud read, no mutation, no local state; the candidate bounds
@@ -609,8 +619,12 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// / `groups.buildInviteLink` / `groups.parseInviteLink` material-and-parse
 /// reads plus `groups.previewViaLink` preview read and the
 /// `groups.joinViaLink` / `groups.cancelJoinRequest` join-family writes — one
-/// capability for the whole link life cycle, the 1.53 appendix discipline).
-/// They never
+/// capability for the whole link life cycle, the 1.53 appendix discipline);
+/// and `device-management` (contract revision 1.122) marks the §4.103
+/// device-plane faces (`accounts.getDevices` — the bounded device-list read
+/// with engine-side device-name decryption — plus the `accounts.unlinkDevice`
+/// server-side unlink write; one capability for the read and write halves,
+/// the 1.53 appendix discipline). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -655,6 +669,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "chat-folders",
     "conversation-state",
     "group-invite-links",
+    "device-management",
     "delete-for-me",
 ];
 
@@ -682,6 +697,7 @@ mod tests {
             "contacts.list",
             "groups.get",
             "accounts.deviceCapabilities",
+            "accounts.getDevices",
             "stickerPacks.getManifest",
             "stickerPacks.getImage",
             "conversations.getPinned",
@@ -717,6 +733,7 @@ mod tests {
             "accounts.setExpireTimer",
             "accounts.setProfile",
             "accounts.updateConfiguration",
+            "accounts.unlinkDevice",
             "messages.retryText",
             "messages.attachments.send",
             "messages.sendSticker",
@@ -789,6 +806,7 @@ mod tests {
             "messages.markViewOnceOpened",
             "contacts.sync",
             "accounts.deviceCapabilities",
+            "accounts.unlinkDevice",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "accounts.deleteLocalData",

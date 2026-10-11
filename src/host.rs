@@ -25,10 +25,10 @@ use crate::metrics;
 use crate::protocol::{ApiError, HostEvent, HostRequest, HostResponse};
 use crate::registry::{ProxyGroupRuntime, RegistryEvent, StartFailure, StopFailure};
 use crate::service::{
-    AccountDeleteLocalDataParams, AccountsDeviceCapabilitiesParams, AccountsGetUsernameParams,
-    AccountsSetExpireTimerParams, AccountsSetProfileParams, AccountsSetUsernameParams,
-    AccountsUpdateConfigurationParams, BackupsCloudStatusParams,
-    BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
+    AccountDeleteLocalDataParams, AccountsDeviceCapabilitiesParams, AccountsGetDevicesParams,
+    AccountsGetUsernameParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
+    AccountsSetUsernameParams, AccountsUnlinkDeviceParams, AccountsUpdateConfigurationParams,
+    BackupsCloudStatusParams, BackupsExportFileCloseHandleParams, BackupsExportFileOpenParams,
     BackupsExportFileReadChunkParams, BackupsExportParams, BackupsExportStatusParams,
     BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams, BackupsRestoreFromCloudParams,
     BackupsUploadStatusParams, BackupsUploadToCloudParams, CallsCreateLinkAuthParams,
@@ -1092,6 +1092,47 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid accounts.deviceCapabilities params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Device-plane faces (contract revision 1.122, §4.103): the read
+        // projects the bounded device list verbatim (the engine's bare
+        // `account` identity never crosses — the answer strips it); the write
+        // answers {status: unlinked} on the definite success, with the
+        // indeterminate outcome folding to SEND_OUTCOME_UNKNOWN and never
+        // retried.
+        "accounts.getDevices" => {
+            match serde_json::from_value::<AccountsGetDevicesParams>(request.params) {
+                Ok(params) => match runtime.get_devices(params).await {
+                    Ok(result) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(result).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.getDevices params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "accounts.unlinkDevice" => {
+            match serde_json::from_value::<AccountsUnlinkDeviceParams>(request.params) {
+                Ok(params) => match runtime.unlink_device(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid accounts.unlinkDevice params",
                         false,
                     ),
                 ),

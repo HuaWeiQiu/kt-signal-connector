@@ -149,6 +149,12 @@ pub const MAX_BLOCKED_CONVERSATIONS: usize = 256;
 /// truncated lie).
 pub const MAX_DEVICE_CAPABILITY_ENTRIES: usize = 16;
 pub const MAX_DEVICE_CAPABILITIES_BYTES: usize = 4 * 1024;
+/// `accounts.getDevices` result-face bound (contract revision 1.122, §4.103):
+/// the device list projects at most 32 entries — the official device ceiling
+/// per account is a small handful and grows only by explicit linking, so the
+/// cap is a hostile/broken-engine guard, not a working-set size; entries
+/// beyond it truncate (the §4.45 blocked-list cap discipline).
+pub const MAX_DEVICE_LIST_ENTRIES: usize = 32;
 /// Call signaling (contract revision 1.50, §4.48): the `calls.sendSignal`
 /// shape gate. `type` is the five-value RingRTC frame-family enum, `callId`
 /// is a positive u32 (the legacy frames' `id` face and the state machines'
@@ -487,6 +493,20 @@ impl ServiceError {
                         data,
                     );
                 }
+                // §4.103 device-plane faces (contract 1.122, engine 窗D B13):
+                // the same honest HTTP pass-through channel, device-faced —
+                // the server refused the GET/DELETE v1/devices call (the
+                // engine sends an empty object when the server gave no
+                // status). Deterministic: retryable=false.
+                if code == "DEVICES_FAILED"
+                    && let Some(data) = data
+                {
+                    return ApiError::with_data(
+                        "DEVICES_FAILED",
+                        "the Signal server refused the device request",
+                        data,
+                    );
+                }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
                         "STICKER_PACK_KEY_INVALID",
@@ -714,6 +734,23 @@ impl ServiceError {
                     "CALL_CREDENTIALS_UNAVAILABLE" => ApiError::new(
                         "CALL_CREDENTIALS_UNAVAILABLE",
                         "the call-link credential server is unreachable",
+                        true,
+                    ),
+                    // §4.103 device-plane faces (contract 1.122, engine 窗D
+                    // B13 getDevices/unlinkDevice): FAILED is the
+                    // server-rejection family — the same server state refuses
+                    // the same way, retryable=false, `data.status?` rides via
+                    // the pre-match arm above. UNAVAILABLE is the
+                    // network/transport family — may succeed on a later
+                    // attempt.
+                    "DEVICES_FAILED" => ApiError::new(
+                        "DEVICES_FAILED",
+                        "the Signal server refused the device request",
+                        false,
+                    ),
+                    "DEVICES_UNAVAILABLE" => ApiError::new(
+                        "DEVICES_UNAVAILABLE",
+                        "the Signal server is unreachable",
                         true,
                     ),
                     "REPORT_SPAM_FAILED" => {
@@ -3814,6 +3851,37 @@ impl ConnectorService {
         validate_opaque_id(account_id, "accountId")?;
         let account = self.resolve_account(account_id)?;
         Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// accounts.getDevices (contract revision 1.122, §4.103): account bounds
+    /// and existence — the device list is the account's own upstream state,
+    /// the service reads nothing locally.
+    pub fn prepare_accounts_get_devices(&self, account_id: &str) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// accounts.unlinkDevice (contract revision 1.122, §4.103): account
+    /// bounds and existence, plus the local deviceId=0 refusal (0 is the
+    /// libsignal "no device" hole — the engine would answer its plain -32603;
+    /// the connector fails closed with INVALID_REQUEST before any upstream
+    /// call instead of folding it into the generic upstream family).
+    pub fn prepare_accounts_unlink_device(
+        &self,
+        account_id: &str,
+        device_id: u32,
+    ) -> Result<Value, ServiceError> {
+        if device_id == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "deviceId 0 is not a real device",
+                false,
+            )));
+        }
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account, "deviceId": device_id }))
     }
 
     /// accounts.setUsername (contract revision 1.59, §4.55; the kt-engine
@@ -9647,6 +9715,34 @@ pub struct AccountDeviceCapabilities {
     pub capabilities: Value,
 }
 
+/// One §4.103 device entry (contract revision 1.122): the GET v1/devices
+/// projection verbatim — `deviceId` (the positive server id; the projection
+/// drops malformed entries and never emits 0), the engine-decrypted `name`
+/// (absent when the encrypted name was missing or undecryptable — the honest
+/// no-name face, the official decrypt-failure domain), and the three optional
+/// server fields the upstream may omit.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceEntry {
+    pub device_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at_ciphertext: Option<String>,
+}
+
+/// The §4.103 result of `accounts.getDevices`: entries in server order,
+/// capped at [`MAX_DEVICE_LIST_ENTRIES`].
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceList {
+    pub devices: Vec<DeviceEntry>,
+}
+
 /// The §4.47 result of `conversations.getAvatar` (contract revision 1.48):
 /// the decrypted avatar as a data URI (MIME sniffed engine-side from the
 /// magic bytes, `application/octet-stream` when unrecognized) plus the
@@ -10523,6 +10619,25 @@ pub struct ConversationsGetBlockedParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountsDeviceCapabilitiesParams {
     pub account_id: String,
+}
+
+/// `accounts.getDevices` params (contract revision 1.122, §4.103).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsGetDevicesParams {
+    pub account_id: String,
+}
+
+/// `accounts.unlinkDevice` params (contract revision 1.122, §4.103):
+/// `deviceId` is the positive server device id — the u32 type fails negative,
+/// fractional and over-range values at params deserialization; `0` is the
+/// libsignal "no device" hole, never a real device, and the prepare ladder
+/// refuses it locally (`INVALID_REQUEST`) before any upstream call.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountsUnlinkDeviceParams {
+    pub account_id: String,
+    pub device_id: u32,
 }
 
 /// `accounts.setUsername` params (contract revision 1.59, §4.55): `username`
@@ -12351,6 +12466,58 @@ pub(crate) fn account_device_capabilities_from_engine(
     })
 }
 
+/// Project the engine's `getDevices` answer onto the wire shape (contract
+/// revision 1.122, §4.103): entries ride in server order under the
+/// [`MAX_DEVICE_LIST_ENTRIES`] cap (beyond it truncate — the §4.45 blocked-list
+/// cap discipline). A non-numeric `deviceId` drops the entry (the tolerant
+/// read-face rule); a projected `deviceId` of `0` is a protocol defect answered
+/// `INVALID_REQUEST` fail-closed — 0 is the libsignal "no device" hole, never a
+/// real server device, and a list claiming it must not cross the connector as
+/// if it were one. A missing or non-array `devices` is a protocol defect.
+pub(crate) fn device_list_from_engine(result: &Value) -> Result<DeviceList, ServiceError> {
+    let devices = result
+        .get("devices")
+        .and_then(Value::as_array)
+        .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+    let mut projected: Vec<DeviceEntry> = Vec::with_capacity(devices.len());
+    for entry in devices {
+        let Some(device_id) = entry
+            .get("deviceId")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+        else {
+            continue;
+        };
+        if device_id == 0 {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "the engine projected device id 0",
+                false,
+            )));
+        }
+        projected.push(DeviceEntry {
+            device_id,
+            name: entry
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            registration_id: entry
+                .get("registrationId")
+                .and_then(Value::as_i64)
+                .and_then(|id| i32::try_from(id).ok()),
+            last_seen_ms: entry.get("lastSeenMs").and_then(Value::as_u64),
+            created_at_ciphertext: entry
+                .get("createdAtCiphertext")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+        if projected.len() == MAX_DEVICE_LIST_ENTRIES {
+            break;
+        }
+    }
+    Ok(DeviceList { devices: projected })
+}
+
 /// Project the engine's `listIdentities` answer onto the wire shape (contract
 /// revision 1.68, §4.61): the pinned upstream writes one JSON array of
 /// `JsonIdentity` records (ListIdentitiesCommand.java:68-84); the read is
@@ -12981,6 +13148,79 @@ mod tests {
             assert_eq!(api.retryable, retryable, "{code} retryable face");
             assert!(api.data.is_none(), "{code} stays content-free without data");
         }
+        // The §4.103 device-plane faces (contract 1.122): the server-rejection
+        // family is deterministic (retryable=false) and the transport family
+        // may succeed on a later attempt.
+        for (code, retryable) in [("DEVICES_FAILED", false), ("DEVICES_UNAVAILABLE", true)] {
+            let api =
+                ServiceError::Engine(EngineError::UpstreamCode { code, data: None }).into_api();
+            assert_eq!(api.code, code, "{code}");
+            assert_eq!(api.retryable, retryable, "{code} retryable face");
+            assert!(api.data.is_none(), "{code} stays content-free without data");
+        }
+    }
+
+    /// §4.103 device faces (contract 1.122): DEVICES_FAILED passes the
+    /// engine's `data.status` verbatim (the honest HTTP pass-through, the
+    /// CALL_CREDENTIALS_FAILED channel); without data it stays content-free.
+    #[test]
+    fn device_failed_carries_the_server_status_verbatim() {
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "DEVICES_FAILED",
+            data: Some(json!({ "status": 409 })),
+        })
+        .into_api();
+        assert_eq!(api.code, "DEVICES_FAILED");
+        assert!(!api.retryable);
+        assert_eq!(api.data, Some(json!({ "status": 409 })));
+        let api = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "DEVICES_FAILED",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(api.code, "DEVICES_FAILED");
+        assert!(api.data.is_none());
+    }
+
+    /// §4.103 projection (contract 1.122): entries ride in order under the
+    /// 32-entry cap; a non-numeric deviceId drops the entry; a projected
+    /// deviceId of 0 fails INVALID_REQUEST; a missing/non-array devices is a
+    /// protocol defect; the optional server fields stay optional.
+    #[test]
+    fn device_list_projection_caps_drops_and_refuses() {
+        let result = device_list_from_engine(&json!({
+            "devices": [
+                { "deviceId": 1, "name": null, "registrationId": 111,
+                  "lastSeenMs": 1728000000000u64, "createdAtCiphertext": "abc" },
+                { "deviceId": "2", "name": "ghost" },
+                { "deviceId": 3, "name": "Linked" },
+            ]
+        }))
+        .unwrap();
+        assert_eq!(result.devices.len(), 2);
+        assert_eq!(result.devices[0].device_id, 1);
+        assert_eq!(result.devices[0].name, None);
+        assert_eq!(result.devices[0].registration_id, Some(111));
+        assert_eq!(result.devices[0].last_seen_ms, Some(1728000000000));
+        assert_eq!(
+            result.devices[0].created_at_ciphertext.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(result.devices[1].device_id, 3);
+        assert_eq!(result.devices[1].name.as_deref(), Some("Linked"));
+        assert!(result.devices[1].registration_id.is_none());
+
+        let zero = device_list_from_engine(&json!({ "devices": [{ "deviceId": 0 }] }))
+            .err()
+            .unwrap();
+        assert_eq!(zero.into_api().code, "INVALID_REQUEST");
+        assert!(device_list_from_engine(&json!({})).is_err());
+        assert!(device_list_from_engine(&json!({ "devices": "no" })).is_err());
+
+        let over: Vec<Value> = (1..=40).map(|id| json!({ "deviceId": id })).collect();
+        let capped = device_list_from_engine(&json!({ "devices": over })).unwrap();
+        assert_eq!(capped.devices.len(), MAX_DEVICE_LIST_ENTRIES);
+        assert_eq!(capped.devices[31].device_id, 32);
     }
 
     /// §4.69: the four message-carrying cloud-restore families pass the

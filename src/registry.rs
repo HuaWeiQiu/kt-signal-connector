@@ -951,6 +951,28 @@ impl ProxyGroupRuntime {
         slot.supervisor.get_device_capabilities(params).await
     }
 
+    /// accounts.getDevices (contract revision 1.122, §4.103): the device list
+    /// is the account's own upstream state, so the read routes through the
+    /// account's owning engine.
+    pub async fn get_devices(
+        &self,
+        params: crate::service::AccountsGetDevicesParams,
+    ) -> Result<crate::service::DeviceList, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.get_devices(params).await
+    }
+
+    /// accounts.unlinkDevice (contract revision 1.122, §4.103): the unlink is
+    /// the account's own upstream state write, so it routes through the
+    /// account's owning engine.
+    pub async fn unlink_device(
+        &self,
+        params: crate::service::AccountsUnlinkDeviceParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.unlink_device(params).await
+    }
+
     /// accounts.setUsername (contract 1.59, §4.55): the username is
     /// account-record upstream state, so the write routes through the
     /// account's owning engine like every other mutating face.

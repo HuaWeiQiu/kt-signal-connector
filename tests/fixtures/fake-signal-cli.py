@@ -1385,6 +1385,57 @@ for line in sys.stdin:
                 "optionalPhoneNumber": False,
             },
         }
+    elif method == "getDevices":
+        # Contract 1.122 §4.103: the device-list read. Record the exact
+        # upstream params (the test asserts the resolved account key). The
+        # fixture answers three entries: the nameless primary (deviceId 1, all
+        # optional server fields present), a linked device carrying only
+        # deviceId+name (the absent-optional-keys face), and a ghost entry
+        # whose deviceId is a string — the malformed-entry shape the
+        # connector's drop rule must never project.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        result = {
+            "devices": [
+                {
+                    "deviceId": 1,
+                    "name": None,
+                    "registrationId": 111,
+                    "lastSeenMs": 1728000000000,
+                    "createdAtCiphertext": "Zml4dHVyZS1jcmVk",
+                },
+                {"deviceId": 2, "name": "KT-Desktop"},
+                {"deviceId": "3", "name": "ghost"},
+            ]
+        }
+    elif method == "unlinkDevice":
+        # Contract 1.122 §4.103: the server-side unlink write. Record the
+        # exact upstream params (the test asserts the resolved account and the
+        # deviceId). Sentinels (grammar-legal, they pass the connector's local
+        # shape gate): deviceId 4294967295 answers the server-rejection face
+        # (-1 DEVICES_FAILED, data.status 409); 4294967294 crashes with the
+        # mutating call in flight (os._exit(31), the 1.42 timer-face
+        # discipline) — the unknown-outcome shape; anything else succeeds.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        device_id = params.get("deviceId")
+        if device_id == 4294967295:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "DEVICES_FAILED",
+                    "data": {"status": 409},
+                },
+            }
+            emit_json(response)
+            continue
+        if device_id == 4294967294:
+            os._exit(31)
+        result = {}
     elif method == "usernameLookup":
         # Contract 1.74 §4.65: the kt-engine lookup route — the same top-level
         # array contract as the getUserStatus --username face (first entry

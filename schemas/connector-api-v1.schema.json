@@ -49,6 +49,8 @@
             "accounts.setUsername",
             "accounts.getUsername",
             "accounts.deviceCapabilities",
+            "accounts.getDevices",
+            "accounts.unlinkDevice",
             "username.lookup",
             "link.start",
             "link.finish",
@@ -252,6 +254,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/accountsDeviceCapabilitiesParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.getDevices" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsGetDevicesParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "accounts.unlinkDevice" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/accountsUnlinkDeviceParams" }
             }
           }
         },
@@ -1447,6 +1471,30 @@
       "description": "Register and read back the account's device-face capabilities (contract revision 1.100, \u00a74.81). The face dispatches the engine's idempotent deviceCapabilities registration (the official registerCapabilities endpoint, PUT \u2014 repeating the call repeats the same server-side declaration, the official every-start semantics) and answers {registered, capabilities}: the engine's bare account identity never crosses the connector (the answer strips the account key), and the capability bits ride verbatim \u2014 the connector invents no keys and strips none (the official CapabilitiesUploadType key set, additive). Every engine failure folds to UPSTREAM_ERROR (unknown/unregistered account, 401 unlink, server failure all collapse engine-side); this face extends no matcher of its own \u2014 the \u00a74.17 unlink chain stays the engine-event worker's job. Read lane, account-scoped mutating serialization (the contacts.sync precedent: the upstream face is a PUT). No local persistence.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "accountsGetDevicesParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "List the account's linked devices (contract revision 1.122, \u00a74.103, capability device-management): the engine GET v1/devices projection \u2014 the server list in server order, including the account's own primary device \u2014 with the engine-side device-name decryption (the official encryptDeviceName pair, decrypted with the account's own ACI identity key; an encrypted name that is absent or undecryptable answers no `name` key \u2014 the honest no-name face, the official decrypt-failure domain). The result is {devices: [{deviceId, name?, registrationId?, lastSeenMs?, createdAtCiphertext?}]}: deviceId is the positive server id (1..4294967295), lastSeenMs is the epoch-ms server stamp, createdAtCiphertext is the server's opaque base64 flag material riding verbatim. Bounded projection: at most 32 entries (entries beyond truncate); an entry whose deviceId is non-numeric drops; a projected deviceId of 0 fails the whole face INVALID_REQUEST \u2014 0 is the libsignal no-device hole, never a real server device, and a list claiming it must not cross the connector. Unknown account answers ACCOUNT_NOT_FOUND. Structured engine errors: DEVICES_FAILED (server refusal, retryable=false; error.data.status carries the server HTTP status verbatim when the server gave one), DEVICES_UNAVAILABLE (network/transport, retryable=true). Read lane, non-mutating; no local persistence, no logging.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "accountsUnlinkDeviceParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "deviceId"],
+      "description": "Unlink one linked device server-side (contract revision 1.122, \u00a74.103, capability device-management): the engine DELETE v1/devices/{id} \u2014 the official unlink endpoint \u2014 with the server owning the authorization (a primary unlinks any linked device, a linked device unlinks only itself; the over-reach and primary-delete refusals surface as DEVICES_FAILED with error.data.status carrying the server HTTP status). deviceId is the positive server device id as accounts.getDevices projected it (1..4294967295); 0 is refused INVALID_REQUEST before any upstream call (the libsignal no-device hole, never a real device). The result is {status: 'unlinked'} on the definite success. The unlink converges to the account's other devices through the official device-link sync \u2014 the connector adds no local unlink mirror and answers no local device list beyond accounts.getDevices; the \u00a74.17 unlink chain (the account's own device being unlinked remotely) stays the engine-event worker's job. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried (an unlink whose delivery is unknown may already have happened server-side). Structured engine errors: DEVICES_FAILED (server refusal, retryable=false, data.status? verbatim), DEVICES_UNAVAILABLE (network/transport, retryable=true).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "deviceId": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "description": "The positive server device id to unlink, as accounts.getDevices projected it."
+        }
       }
     },
     "usernameLookupParams": {
@@ -4323,6 +4371,8 @@
             "USERNAME_SERVER_FAILED",
             "CALL_CREDENTIALS_FAILED",
             "CALL_CREDENTIALS_UNAVAILABLE",
+            "DEVICES_FAILED",
+            "DEVICES_UNAVAILABLE",
             "UPSTREAM_TIMEOUT",
             "UPSTREAM_EXITED",
             "UPSTREAM_PROTOCOL_ERROR",
@@ -4353,7 +4403,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one; since contract 1.122 DEVICES_FAILED carries {status?} the same way (the device-plane server-rejection family). The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

@@ -8299,6 +8299,85 @@ omitted it (unarmed), and `messages.attachments.open` answered
 observable faces end to end. Gated behind the full local gate suite
 (fmt + clippy -D warnings + cargo test + release build), all green.
 
+### 4.103 The device plane reaches the host: `accounts.getDevices` / `accounts.unlinkDevice` (contract revision 1.122, 2026-10-12)
+
+The engine's 窗D B13 batch shipped the device-plane faces — the GET
+v1/devices projection with the engine-side device-name decryption
+(the official `encryptDeviceName` pair, decrypted with the account's own
+ACI identity key) and the server-side unlink (DELETE v1/devices/{id},
+the official unlink endpoint) — and this batch wires both into the
+host contract as `accounts.getDevices` and `accounts.unlinkDevice`,
+advertised through the new `device-management` capability tag (one
+capability for the read and write halves, the 1.53 appendix
+discipline). Until now the desktop could register device capabilities
+(§4.81) but could neither list nor unlink the account's devices; the
+unlink decision previously had only the §4.17 chain (the account's own
+device being unlinked remotely, an engine-event worker concern), with
+no outbound leg for the user's own choice.
+
+**The read face.** `accounts.getDevices {accountId}` answers
+`{devices: [{deviceId, name?, registrationId?, lastSeenMs?,
+createdAtCiphertext?}]}` in server order, including the account's own
+primary device. The engine's bare `account` identity never crosses the
+connector; the decrypted device name is the honest optional — an
+encrypted name that is absent or undecryptable answers no `name` key
+(the official decrypt-failure domain, where the desktop warns and moves
+on). The projection is bounded: at most 32 entries (`MAX_DEVICE_LIST_
+ENTRIES`; the official per-account device ceiling is a small handful,
+so the cap is a hostile/broken-engine guard, not a working-set size —
+entries beyond it truncate, the §4.45 blocked-list cap discipline); an
+entry whose `deviceId` is non-numeric drops (the tolerant read-face
+rule); and a projected `deviceId` of `0` fails the whole face
+INVALID_REQUEST fail-closed — 0 is the libsignal "no device" hole,
+never a real server device, and a list claiming it must not cross the
+connector as if it were one. Read lane, non-mutating, no local
+persistence, no logging.
+
+**The write face.** `accounts.unlinkDevice {accountId, deviceId}`
+answers `{status: "unlinked"}` on the definite success. The server
+owns the authorization (a primary unlinks any linked device, a linked
+device unlinks only itself); the over-reach and primary-delete
+refusals surface as DEVICES_FAILED with `error.data.status` carrying
+the server HTTP status verbatim (the CALL_CREDENTIALS_FAILED honest
+pass-through channel). `deviceId` 0 is refused INVALID_REQUEST
+locally, before any upstream call — the engine would answer its plain
+-32603 there, and the connector prefers the precise local answer over
+folding it into the generic upstream family. The upstream DELETE is
+mutating and its outcome can be lost in transport: an indeterminate
+outcome answers SEND_OUTCOME_UNKNOWN and is never retried (the
+AGENTS.md red line — an unlink whose delivery is unknown may already
+have happened server-side, and a blind replay could unlink a device
+the user did not choose). Send lane, account-scoped mutating (the
+same-account mutex and the delete drain barrier serialize it); the
+unlink converges to the account's other devices through the official
+device-link sync — the connector adds no local unlink mirror.
+
+**The wire (contract 1.122).** Additive-only: two methods
+(`accounts.getDevices`, `accounts.unlinkDevice`) join the request
+enum with their params shapes (`accountsGetDevicesParams`,
+`accountsUnlinkDeviceParams` — `deviceId` integer 1..4294967295); two
+error codes join the schema enum — DEVICES_FAILED (retryable=false,
+`data.status?` verbatim) and DEVICES_UNAVAILABLE (retryable=true, the
+network/transport family) — mirrored verbatim into the engine.rs
+allowlist (`ENGINE_STRUCTURED_ERROR_CODES`, the two-sides-total test
+keeps both faces honest); the `device-management` feature tag rides
+the handshake; the error-`data` description gains the 1.122 member.
+No event, no store move, no engine-method gap: the connector calls
+the engine's `getDevices`/`unlinkDevice` exactly as the B13 batch
+pinned them.
+
+Tests: the service unit pins the projection (cap, drop, id-0 refusal,
+protocol-defect answers) and both retryability faces plus the
+`data.status` pass-through; the methods-table test pins the lane and
+mutating classification; the integration test round-trips the read
+(ghost entry drops, nameless primary and absent-optionals project,
+resolved account rides upstream), the write (exact upstream frame,
+DEVICES_FAILED data.status, the local id-0 ladder, unknown account),
+and the red line (crash-in-flight answers SEND_OUTCOME_UNKNOWN across
+the restart, exactly one crashing frame). Gated behind the full local
+gate suite (fmt + clippy -D warnings + cargo test + release build),
+all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

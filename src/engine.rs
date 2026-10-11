@@ -2691,6 +2691,15 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // family (retryable=true — a later attempt may reach the server).
     "CALL_CREDENTIALS_FAILED",
     "CALL_CREDENTIALS_UNAVAILABLE",
+    // §4.103 device-plane faces (contract 1.122, engine 窗D B13
+    // getDevices/unlinkDevice): FAILED is the server-rejection family (the
+    // GET/DELETE v1/devices call was refused upstream) with the engine's
+    // `data.status?` honest HTTP pass-through riding the CALL_CREDENTIALS_
+    // FAILED channel; retryable=false — the same server state refuses the
+    // same way. UNAVAILABLE is the network/transport family; retryable=true —
+    // a later attempt may reach the server.
+    "DEVICES_FAILED",
+    "DEVICES_UNAVAILABLE",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.

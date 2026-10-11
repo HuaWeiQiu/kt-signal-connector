@@ -20,19 +20,20 @@ use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
 use crate::service::{
     AccountDeviceCapabilities, AccountUsername, AccountsDeviceCapabilitiesParams,
-    AccountsGetUsernameParams, AccountsSetExpireTimerParams, AccountsSetProfileParams,
-    AccountsSetUsernameParams, AccountsUpdateConfigurationParams, AttachmentSendTarget,
-    AvatarDownload, BlockedConversations, CallsSendSignalParams, ChatFolderSyncs,
-    ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome,
-    ConversationState, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
-    ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
-    ConversationsSetPinnedParams, ConversationsSetStateParams, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES,
-    GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails, GroupInviteLink, GroupInviteLinkParse,
-    GroupInviteLinkPassword, GroupInviteLinkPreview, GroupsApproveJoinRequestsParams,
-    GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams, GroupsInviteLinkPasswordParams,
-    GroupsJoinViaLinkParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams,
-    GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
+    AccountsGetDevicesParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
+    AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
+    AccountsUpdateConfigurationParams, AttachmentSendTarget, AvatarDownload, BlockedConversations,
+    CallsSendSignalParams, ChatFolderSyncs, ChatFoldersListParams, ChatFoldersSetRecordsParams,
+    ConnectorService, ContactsSyncOutcome, ConversationState, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
+    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
+    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
+    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
+    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
+    GroupsCancelJoinRequestParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
+    GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
     IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
     MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest,
@@ -47,7 +48,7 @@ use crate::service::{
     StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
     UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
     account_limit_error, blocked_conversations_result, chat_folder_syncs_result,
-    conversation_state_from_engine, group_invite_join_status_from_engine,
+    conversation_state_from_engine, device_list_from_engine, group_invite_join_status_from_engine,
     group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
     group_invite_link_preview_from_engine, identity_from_engine, pinned_conversations_result,
     sticker_pack_syncs_result, store_adjacent_media, store_get_group_with_requesting,
@@ -3257,6 +3258,51 @@ impl RuntimeSupervisor {
             .call("engine.deviceCapabilities", upstream, CallClass::ReadOnly)
             .await?;
         account_device_capabilities_from_engine(&result)
+    }
+
+    /// accounts.getDevices (contract revision 1.122, §4.103, capability
+    /// device-management): account resolution then the read-only engine call —
+    /// the GET v1/devices projection with the engine-side device-name
+    /// decryption — and the bounded projection (the 32-entry cap, the
+    /// malformed-entry drops, the id-0 fail-closed refusal). Nothing persists,
+    /// nothing logs.
+    pub async fn get_devices(
+        &self,
+        params: AccountsGetDevicesParams,
+    ) -> Result<DeviceList, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_get_devices(&params.account_id)?
+        };
+        let result = engine
+            .call("getDevices", upstream, CallClass::ReadOnly)
+            .await?;
+        device_list_from_engine(&result)
+    }
+
+    /// accounts.unlinkDevice (contract revision 1.122, §4.103, capability
+    /// device-management): the server-side unlink — the engine DELETE
+    /// v1/devices/{id}, the official unlink endpoint; the server owns the
+    /// authorization (a primary unlinks any linked device, a linked device
+    /// unlinks only itself, and the over-reach/primary-delete refusals surface
+    /// as DEVICES_FAILED with the engine's `data.status?`). A mutating call
+    /// whose outcome can be lost in transport: `EngineError::UnknownOutcome`
+    /// folds to SEND_OUTCOME_UNKNOWN (retryable=false — the AGENTS.md red
+    /// line, never auto-retried) through the global into_api face.
+    pub async fn unlink_device(
+        &self,
+        params: AccountsUnlinkDeviceParams,
+    ) -> Result<&'static str, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_accounts_unlink_device(&params.account_id, params.device_id)?
+        };
+        engine
+            .call("unlinkDevice", upstream, CallClass::Mutating)
+            .await?;
+        Ok("unlinked")
     }
 
     /// conversations.getAvatar (contract revision 1.48, §4.47, capability
