@@ -1333,7 +1333,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId"],
-      "description": "Update the account's official settings (contract revision 1.46, \u00a74.45, capability account-settings): at least one of readReceipts / typingIndicators / phoneNumberSharingMode / unlistedPhoneNumber must be present; only the provided keys are forwarded upstream and written (official updateConfiguration partial-write semantics \u2014 the upstream writes exactly the provided fields, reads the rest back untouched), and an all-fields-satisfied call is an idempotent no-write success. A call with no writable key answers INVALID_REQUEST before any upstream call. phoneNumberSharingMode takes \"everybody\" | \"nobody\" (the official AccountRecord PhoneNumberSharingMode values; the old CONTACTS_ONLY has been removed from the official proto and is not accepted). The result is {status: 'saved'} on a definite success. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: the STORAGE_* family passed through verbatim (retryable).",
+      "description": "Update the account's official settings (contract revision 1.46, \u00a74.45; linkPreviews since 1.120 \u00a74.101, capability account-settings): at least one of readReceipts / typingIndicators / phoneNumberSharingMode / unlistedPhoneNumber / linkPreviews must be present; only the provided keys are forwarded upstream and written (official updateConfiguration partial-write semantics \u2014 the upstream writes exactly the provided fields, reads the rest back untouched), and an all-fields-satisfied call is an idempotent no-write success. A call with no writable key answers INVALID_REQUEST before any upstream call. phoneNumberSharingMode takes \"everybody\" | \"nobody\" (the official AccountRecord PhoneNumberSharingMode values; the old CONTACTS_ONLY has been removed from the official proto and is not accepted). linkPreviews is the account-level link-preview auto-generation bit (the official AccountRecord field 11; a change made by another linked device arrives through the settings.configurationSync event). The result is {status: 'saved'} on a definite success. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: the STORAGE_* family passed through verbatim (retryable).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "readReceipts": {
@@ -1352,6 +1352,10 @@
         "unlistedPhoneNumber": {
           "type": "boolean",
           "description": "Whether the phone number is unlisted from discovery. Optional; omitted means no change upstream."
+        },
+        "linkPreviews": {
+          "type": "boolean",
+          "description": "Whether the account auto-generates link previews (official AccountRecord field 11; contract 1.120, \u00a74.101). Optional; omitted means no change upstream. The §4.87 settings.configurationSync event carries the same key when another linked device changes it."
         }
       }
     },

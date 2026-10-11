@@ -1249,7 +1249,17 @@ for line in sys.stdin:
         # partial-write contract) and answer the engine's bare success. No
         # free-text param exists on this face, so the STORAGE_* sentinels ride
         # the pin/sticker/profile faces; the shared UpstreamCode mapping is
-        # already integration-proven there.
+        # already integration-proven there. The 1.120 §4.101 linkPreviews bit
+        # is type-gated like the engine's own bool fields: a non-boolean is a
+        # shape failure (-32603), never a silent store.
+        if "linkPreviews" in params and not isinstance(params.get("linkPreviews"), bool):
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")

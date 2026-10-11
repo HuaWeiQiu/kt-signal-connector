@@ -3642,12 +3642,13 @@ impl ConnectorService {
         Ok(Value::Object(upstream))
     }
 
-    /// accounts.updateConfiguration (contract revision 1.46, §4.45):
-    /// at-least-one-writable-key fail-closed, the sharing-mode enum, and
-    /// account resolution under the service lock; only the provided keys are
-    /// forwarded so the upstream partial-write semantics (official
-    /// updateConfiguration: write exactly the provided fields, read the rest
-    /// back untouched) survive the hop. No local row is written.
+    /// accounts.updateConfiguration (contract revision 1.46, §4.45; the
+    /// 1.120 §4.101 linkPreviews bit): at-least-one-writable-key fail-closed,
+    /// the sharing-mode enum, and account resolution under the service lock;
+    /// only the provided keys are forwarded so the upstream partial-write
+    /// semantics (official updateConfiguration: write exactly the provided
+    /// fields, read the rest back untouched) survive the hop. No local row is
+    /// written.
     pub fn prepare_accounts_update_configuration(
         &self,
         params: &AccountsUpdateConfigurationParams,
@@ -3658,11 +3659,12 @@ impl ConnectorService {
             params.typing_indicators.is_some(),
             params.phone_number_sharing_mode.is_some(),
             params.unlisted_phone_number.is_some(),
+            params.link_previews.is_some(),
         ];
         if !provided.iter().any(|present| *present) {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "at least one of readReceipts, typingIndicators, phoneNumberSharingMode, unlistedPhoneNumber is required",
+                "at least one of readReceipts, typingIndicators, phoneNumberSharingMode, unlistedPhoneNumber, linkPreviews is required",
                 false,
             )));
         }
@@ -3688,6 +3690,9 @@ impl ConnectorService {
         }
         if let Some(unlisted_phone_number) = params.unlisted_phone_number {
             upstream["unlistedPhoneNumber"] = json!(unlisted_phone_number);
+        }
+        if let Some(link_previews) = params.link_previews {
+            upstream["linkPreviews"] = json!(link_previews);
         }
         Ok(upstream)
     }
@@ -10460,7 +10465,10 @@ pub struct ChatFoldersSetRecordsParams {
 /// `accounts.updateConfiguration` params (contract revision 1.46, §4.45):
 /// every settings key is optional — at least one must be present, which the
 /// service enforces (the schema cannot express "at least one of"); only the
-/// provided keys are forwarded upstream.
+/// provided keys are forwarded upstream. Contract revision 1.120 (§4.101)
+/// adds the optional `linkPreviews` bit (the engine's 窗D B6 batch: the
+/// official AccountRecord field 11, read back through the §4.87
+/// `settings.configurationSync` projection).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountsUpdateConfigurationParams {
@@ -10469,6 +10477,7 @@ pub struct AccountsUpdateConfigurationParams {
     pub typing_indicators: Option<bool>,
     pub phone_number_sharing_mode: Option<String>,
     pub unlisted_phone_number: Option<bool>,
+    pub link_previews: Option<bool>,
 }
 
 /// `accounts.setProfile` params (contract revision 1.46, §4.45): the text
@@ -17592,47 +17601,63 @@ mod tests {
     /// least one writable key is required (zero keys fail closed locally —
     /// the engine would answer -32603), the sharing-mode enum is the official
     /// two-value proto set, and only the provided keys forward upstream so
-    /// the partial-write semantics survive the hop.
+    /// the partial-write semantics survive the hop. The 1.120 §4.101
+    /// linkPreviews bit rides the same ladder: absent forwards nothing, a
+    /// lone linkPreviews satisfies the at-least-one rule, and the key
+    /// forwards verbatim beside the resolved account.
     #[test]
     fn prepare_account_configuration_validates_and_forwards_only_provided_keys() {
         let (_temp, mut service) = service();
         let (account, _conversation) = linked_account_and_conversation(&mut service);
-        let params =
-            |read_receipts: Option<bool>, sharing: Option<&str>, unlisted: Option<bool>| {
-                AccountsUpdateConfigurationParams {
-                    account_id: account.id.clone(),
-                    read_receipts,
-                    typing_indicators: None,
-                    phone_number_sharing_mode: sharing.map(str::to_string),
-                    unlisted_phone_number: unlisted,
-                }
-            };
+        let params = |read_receipts: Option<bool>,
+                      sharing: Option<&str>,
+                      unlisted: Option<bool>,
+                      link_previews: Option<bool>| {
+            AccountsUpdateConfigurationParams {
+                account_id: account.id.clone(),
+                read_receipts,
+                typing_indicators: None,
+                phone_number_sharing_mode: sharing.map(str::to_string),
+                unlisted_phone_number: unlisted,
+                link_previews,
+            }
+        };
 
         // Happy partial write: exactly the provided keys ride the upstream
         // payload beside the resolved account.
         let upstream = service
-            .prepare_accounts_update_configuration(&params(Some(true), Some("nobody"), None))
+            .prepare_accounts_update_configuration(&params(Some(true), Some("nobody"), None, None))
             .unwrap();
         assert_eq!(upstream["account"], "+15555550100");
         assert_eq!(upstream["readReceipts"], true);
         assert_eq!(upstream["phoneNumberSharingMode"], "nobody");
         assert!(upstream.get("typingIndicators").is_none());
         assert!(upstream.get("unlistedPhoneNumber").is_none());
+        assert!(upstream.get("linkPreviews").is_none());
+
+        // The 1.120 bit: a lone linkPreviews write satisfies at-least-one and
+        // forwards verbatim (the §4.87 read-mirror key name, same face).
+        let upstream = service
+            .prepare_accounts_update_configuration(&params(None, None, None, Some(false)))
+            .unwrap();
+        assert_eq!(upstream["account"], "+15555550100");
+        assert_eq!(upstream["linkPreviews"], false);
+        assert!(upstream.get("readReceipts").is_none());
 
         // Zero writable keys: deterministic local refusal, not a silent no-op.
         let error = service
-            .prepare_accounts_update_configuration(&params(None, None, None))
+            .prepare_accounts_update_configuration(&params(None, None, None, None))
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
 
         // The old CONTACTS_ONLY value is gone from the official proto.
         let error = service
-            .prepare_accounts_update_configuration(&params(None, Some("contactsOnly"), None))
+            .prepare_accounts_update_configuration(&params(None, Some("contactsOnly"), None, None))
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
 
         // Unknown account answers ACCOUNT_NOT_FOUND before any upstream call.
-        let mut unknown = params(Some(true), None, None);
+        let mut unknown = params(Some(true), None, None, None);
         unknown.account_id = "no-such-account".to_string();
         let error = service
             .prepare_accounts_update_configuration(&unknown)

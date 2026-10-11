@@ -7957,13 +7957,17 @@ async fn sticker_and_pin_methods_surface_engine_errors() {
     assert_clean_exit(&mut connector).await;
 }
 
-/// Contract revision 1.46: the §4.45 account-settings write faces
-/// (accounts.updateConfiguration partial-write forwarding, accounts.setProfile
+/// Contract revisions 1.46 + 1.120: the §4.45 account-settings write faces
+/// (accounts.updateConfiguration partial-write forwarding — the 1.120 §4.101
+/// linkPreviews bit included — accounts.setProfile
 /// text full-write + avatar tri-state + bounds, accounts.setExpireTimer u32
 /// engine face) and the conversations.getBlocked read face — success shapes,
 /// the deterministic fail-closed ladder, the structured STORAGE_* passthrough
 /// riding the profile face's sentinels, and the crash-with-in-flight-write
 /// unknown outcome on both mutating faces (no retry, exactly-once dispatch).
+/// The 1.120 read-mirror linkage: another linked device's configuration sync
+/// lands as the §4.87 settings.configurationSync event carrying the same
+/// linkPreviews key the write face takes.
 #[tokio::test]
 async fn account_settings_and_blocked_faces_round_trip() {
     let temp = TempDir::new().unwrap();
@@ -8036,6 +8040,7 @@ async fn account_settings_and_blocked_faces_round_trip() {
     assert_eq!(missing_account["error"]["code"], "INVALID_REQUEST");
 
     // Configuration partial write: only the provided keys reach upstream.
+    // Contract 1.120 (§4.101): the linkPreviews bit rides the same face.
     let configured = request(
         &mut client,
         "config-partial",
@@ -8043,7 +8048,8 @@ async fn account_settings_and_blocked_faces_round_trip() {
         json!({
             "accountId": account_id,
             "readReceipts": true,
-            "phoneNumberSharingMode": "nobody"
+            "phoneNumberSharingMode": "nobody",
+            "linkPreviews": true
         }),
     )
     .await;
@@ -8056,11 +8062,36 @@ async fn account_settings_and_blocked_faces_round_trip() {
     assert_eq!(config_calls[0]["account"], "+15555550100");
     assert_eq!(config_calls[0]["readReceipts"], true);
     assert_eq!(config_calls[0]["phoneNumberSharingMode"], "nobody");
+    assert_eq!(config_calls[0]["linkPreviews"], true);
     assert!(config_calls[0].get("typingIndicators").is_none());
     assert!(config_calls[0].get("unlistedPhoneNumber").is_none());
 
+    // A lone linkPreviews write satisfies the at-least-one rule by itself and
+    // forwards only its own key (the partial-write contract, new member).
+    let link_only = request(
+        &mut client,
+        "config-link-only",
+        "accounts.updateConfiguration",
+        json!({
+            "accountId": account_id,
+            "linkPreviews": false
+        }),
+    )
+    .await;
+    assert_eq!(link_only["result"]["status"], "saved");
+    let link_calls: Vec<Value> = send_log()
+        .into_iter()
+        .filter(|params| {
+            params.get("linkPreviews").is_some() && params.get("readReceipts").is_none()
+        })
+        .collect();
+    assert_eq!(link_calls.len(), 1, "{link_calls:?}");
+    assert_eq!(link_calls[0]["account"], "+15555550100");
+    assert_eq!(link_calls[0]["linkPreviews"], false);
+    assert!(link_calls[0].get("readReceipts").is_none());
+
     // Fail-closed ladder: zero writable keys, the retired CONTACTS_ONLY enum
-    // value, an unknown key, a non-boolean.
+    // value, an unknown key, a non-boolean, a non-boolean linkPreviews.
     for (request_id, params) in [
         ("config-empty", json!({ "accountId": account_id })),
         (
@@ -8085,6 +8116,13 @@ async fn account_settings_and_blocked_faces_round_trip() {
                 "readReceipts": "yes"
             }),
         ),
+        (
+            "config-link-non-bool",
+            json!({
+                "accountId": account_id,
+                "linkPreviews": "yes"
+            }),
+        ),
     ] {
         let rejected = request(
             &mut client,
@@ -8103,6 +8141,57 @@ async fn account_settings_and_blocked_faces_round_trip() {
         .filter(|params| params.get("readReceipts").is_some())
         .collect();
     assert_eq!(config_calls_after.len(), 1, "refusals never dial upstream");
+
+    // The 1.120 read-mirror linkage: another linked device's configuration
+    // sync lands as the §4.87 settings.configurationSync event with the
+    // linkPreviews key in place — the write face and the read projection
+    // speak the same key name.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [{
+            "source": "+15555550100",
+            "timestamp": 5000000123_u64,
+            "syncMessage": {
+                "configuration": {
+                    "readReceipts": true,
+                    "linkPreviews": false
+                }
+            }
+        }] })
+        .to_string(),
+    )
+    .unwrap();
+    // The marker-file trigger is asynchronous (the fixture watcher polls the
+    // file), so the wait side is a deadline loop for the event itself — the
+    // drain_until pattern without a response barrier.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mirrored = loop {
+        let frame: Value = match timeout(Duration::from_secs(2), async {
+            serde_json::from_str::<Value>(&client.next().await.unwrap().unwrap()).unwrap()
+        })
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => panic!(
+                "the configurationSync mirror must arrive within the deadline:\n{}",
+                dump_connector_crash_scene()
+            ),
+        };
+        if frame.get("event").and_then(Value::as_str) == Some("settings.configurationSync") {
+            break frame["data"].clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only unrelated frames arrived before the deadline: {frame}"
+        );
+    };
+    assert_eq!(mirrored["accountId"], account_id);
+    assert_eq!(mirrored["readReceipts"], true);
+    assert_eq!(mirrored["linkPreviews"], false);
+    assert!(mirrored.get("typingIndicators").is_none());
+    assert!(mirrored.get("unidentifiedDeliveryIndicators").is_none());
 
     // Profile full-write: text keys forward verbatim, absent keys stay absent
     // (the caller's clear instruction), the avatar replace forwards verbatim.

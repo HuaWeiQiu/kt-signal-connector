@@ -5,7 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.119 (2026-10-12; the blocked read carries the
+- Contract revision: 1.120 (2026-10-12; the account-settings write face
+  gains the linkPreviews bit (§4.101): the engine's 窗D B6 批1 landed
+  `setAccountConfiguration`'s optional linkPreviews write (the official
+  AccountRecord field 11) plus the five-boolean getConfiguration read
+  projection; the connector's §4.45 `accounts.updateConfiguration` was
+  keyed to the four-key shape, so the desktop could not write the
+  link-preview auto-generation bit at all. The optional boolean joins the
+  at-least-one ladder (a lone linkPreviews is a legal write), forwards
+  only when provided (the partial-write semantics unchanged), and shares
+  one wire key with the read side — the §4.87
+  `settings.configurationSync` projection has carried `linkPreviews`
+  since 1.106, so the 1.120 linkage test pins write-face key and
+  read-mirror key as the same name end to end. No new method, error, or
+  capability; no store shape. Tests 663 held (lib 505 held; the two
+  extended tests grow assertions in place), all green) —
+  previously 1.119 (2026-10-12; the blocked read carries the
   block stamp (§4.100): the engine's 窗D B7 read-projection
   `blockedAtTimestampMs` rides the §4.45 `conversations.getBlocked`
   entries additively — present only when the record holds a positive
@@ -8156,6 +8171,52 @@ the legacyGroup entry never does). The fixture's BLOCKED_STATE contact
 entry gains the stamp. Gates: 663 held (lib 505 held — the projection
 ladder and the pass-through pair extend two existing tests in place,
 the baseline grows in assertions, not in test count), all green.
+
+### 4.101 The account-settings write face gains the linkPreviews bit (contract revision 1.120, 2026-10-12)
+
+The engine's 窗D B6 批1 (48bc273) closed the engine half of the
+link-preview account setting: `setAccountConfiguration` accepts the
+optional `linkPreviews` boolean (the official AccountRecord field 11)
+and `getConfiguration` projects it back with the four existing flags
+(the five-boolean read face). The connector's §4.45 write face was
+keyed to the old four-key shape, so the desktop could not express the
+bit at all — a settings pane carrying the link-preview toggle would
+silently lose it at the connector boundary.
+
+**The shape.** `AccountsUpdateConfigurationParams` gains the optional
+`link_previews` (`linkPreviews` on the wire). It rides the existing
+ladder unchanged: the at-least-one rule now counts five keys (a lone
+`linkPreviews` write is legal), the key forwards upstream only when
+provided (`upstream["linkPreviews"]`, the partial-write semantics — the
+engine writes exactly the provided fields), and the non-boolean shape
+fails params deserialization with INVALID_REQUEST before anything runs.
+No local row: the setting lives in the engine-side account record, the
+same no-local-persistence discipline as the other four keys.
+
+**The read mirror already spoke the name.** The §4.87
+`settings.configurationSync` event has carried the `linkPreviews` key
+since contract 1.106 (the engine's syncMessage.configuration
+projection), so the 1.120 work is the write half only — but the
+integration now pins the linkage explicitly: the fixture delivers one
+cross-device configuration sync beside the write assertions, and the
+test asserts the event's `linkPreviews` key lands with the same name
+the write face takes. One concept, one wire word, both directions.
+
+**The wire.** Additive only: one optional boolean on an existing params
+def (old hosts ignore it as an unknown member — `deny_unknown_fields`
+is a connector-side gate, not a host-side one). No new method, error
+code, or capability tag; the face stays behind `account-settings`. The
+fake fixture type-gates the key mirror of the engine's own bool face
+(non-boolean → -32603), defense in depth behind the connector's serde
+gate.
+
+Tests: the lib prepare ladder gains the lone-linkPreviews arm (a legal
+at-least-one satisfier forwarding only its key) and the absent-key arm;
+the integration gains the forwarded pair (the mixed write carries
+`linkPreviews: true` beside readReceipts, the lone write forwards only
+`linkPreviews: false`), the non-boolean refusal, and the read-mirror
+linkage block. Gates: 663 held (lib 505 held — assertions extend the
+two existing tests in place), all green.
 
 ## 5. signal-cli Boundary
 
