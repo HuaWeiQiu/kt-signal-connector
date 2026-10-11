@@ -5,7 +5,39 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.105 (2026-10-11; the edit-send migration (§4.86): `messages.edit`'s
+- Contract revision: 1.106 (2026-10-11; the sync seven-arm consume batch (§4.87): the engine's
+  P14 group-5 sync projections — `configuration` / `fetchLatest` / `callLinkUpdate` /
+  `callLogEvent` / `deviceNameChange` / `usernameChange` / `pniChangeNumber` — previously all
+  falling to the plain `syncMessage` skip, now each consumed as one control routing plus one
+  host event, the §4.84/§4.85 paradigm arm-for-arm. (a) The receives: every arm is fail-closed
+  at its own facts — the configuration flags read per-key (a hostile shape answers absent; a
+  face with no surviving flag skips), the fetchLatest/usernameChange arms route on presence
+  alone (the official fires the trigger even type-less; the word keys ride the engine's
+  SCREAMING enum whitelists per-key), the call-link update hard-gates exactly where the
+  official handler throws (type must be the projection's only known member UPDATE, the
+  rootKey must be present in bound — an over-bound key drops the record whole, never
+  truncated) with the admin key per-key, the call-log mutation hard-gates its verb word
+  (CLEAR / MARKED_AS_READ / MARKED_AS_READ_IN_CONVERSATION / CLEAR_IN_CONVERSATION — the
+  record's whole meaning) with the rest per-key, the device-name change hard-gates the
+  deviceId in u32 range (the official's own absent-key drop), and the PNI change forwards
+  only the engine's stripped `{registrationId?, newE164?}` face (the key material never
+  crosses the engine boundary; a zero-content face skips). (b) The forwards: seven new host
+  events — `settings.configurationSync`, `sync.fetchLatest`, `call.linkUpdate`,
+  `call.logEvent` (the raw identity riding `peerId`, the §4.85-ladder hit riding
+  `conversationId`), `account.deviceNameChanged`, `account.usernameChanged`,
+  `identity.pniChanged` — all flat, absent optionals staying absent (the story.received
+  conditional-insert style). Store adjudications, per arm recorded in §4.87: no mirror
+  anywhere — the account-level arms are trigger semantics with nothing to mirror
+  (configuration/fetchLatest/deviceName/username/pni), the data-plane arms keep no store
+  the official consumer does not already own (the connector holds no call-history store —
+  the §4.85 discretion verbatim — and no call-link store, the §4.73 passthrough
+  discipline); every record is transient, a missed delivery losing exactly what an official
+  client loses offline. Desktop consumption stays out of this batch. No new method, error,
+  or capability; the schema gains seven event enum entries, seven allOf data blocks, and
+  four schema-pairing bounds (the call-link keys' 128 ↔ `MAX_SYNC_CALL_LINK_KEY_CHARS`, the
+  device/PNI registration ids' u32 ceiling ↔ the parse's `try_from` range gate); tests
+  624 → 635, all green) —
+  previously 1.105 (2026-10-11; the edit-send migration (§4.86): `messages.edit`'s
   upstream face moved off the signal-cli-era `send` + `editTimestamp` dispatch onto the
   engine's native `editMessage` wire method (the 2026-10-11 six-questions batch, official
   edit send face `Content.editMessage{targetSentTimestamp, dataMessage}`). The old call was
@@ -7093,6 +7125,113 @@ the `targetTimestamp` key on the prepared params (the one assertion the migratio
 the host/registry/lane surfaces are covered by their existing tables (`messages.edit` keeps
 its `messages.edit` row: send lane, account-scoped mutating, `send` metrics class). Gates:
 624 → 624, all green.
+
+### 4.87 Sync seven-arm consume: the plain-skip batch speaks its projections (contract revision 1.106, 2026-10-11)
+
+The audit's receive-side gap closes arm-for-arm. Seven engine sync projections —
+`syncMessage.configuration` / `fetchLatest` / `callLinkUpdate` / `callLogEvent` /
+`deviceNameChange` / `usernameChange` / `pniChangeNumber` — all fell to the plain
+`syncMessage` skip: the envelopes arrived, the connector logged the skip, and the faces the
+official client acts on (`MessageReceiver.preload.ts`'s `#handleConfiguration` through
+`#handlePNIChangeNumber`) never reached the desktop. Each arm now follows the §4.84/§4.85
+paradigm exactly: one fail-closed engine parse, one `control_routing` interception before the
+plain skip, one transient host event. All seven ride the account's own sync envelope — every
+arm routes with `direction: "incoming"`, `source: None`, `group_id: None` — and the queue
+budget charges each arm its fixed struct width (the §4.13 discipline; the two bare-signal
+triggers charge nothing).
+
+**The receive — seven arms, each fail-closed at its own facts.**
+
+- `configuration` (`settings.configurationSync`) — the official
+  SyncMessage.Configuration flags, projected key-for-key:
+  `{readReceipts?, unidentifiedDeliveryIndicators?, typingIndicators?, linkPreviews?}`.
+  The read is per-key (a non-bool shape answers absent — a mangled flag is never
+  forwarded); a face where no key survived is a zero-content sync and keeps the plain
+  skip.
+- `fetchLatest` (`sync.fetchLatest`) — the official handleFetchLatest trigger routes on
+  presence alone: the official fires FetchLatestEvent even with the type unset (UNKNOWN
+  is the downstream no-op), so this face hard-gates nothing. The optional
+  `{type?}` word rides the engine's SCREAMING enum whitelist per-key
+  (`UNKNOWN` / `LOCAL_PROFILE` / `STORAGE_MANIFEST` / `SUBSCRIPTION_STATUS`; a hostile
+  word answers absent, never mangled).
+- `callLinkUpdate` (`call.linkUpdate`) — two hard gates, exactly the facts the official
+  handler throws over: the type must be present and the projection's only known member
+  `UPDATE` (a null or unknown word drops the record), and the `rootKey` must be present,
+  non-empty, within `MAX_SYNC_CALL_LINK_KEY_CHARS` = 128 — an over-bound key drops the
+  record whole, never truncated (a shortened key would address a different call link).
+  The `adminKey` is per-key fail-closed. Both keys are material, never parsed: the base64
+  rides verbatim (the §4.73 call-link zero-parsing discipline; the connector runs no call
+  link, so there is nothing to verify the material against).
+- `callLogEvent` (`call.logEvent`) — one hard gate on the record's whole meaning: the
+  type verb must be a whitelist member (`CLEAR` / `MARKED_AS_READ` /
+  `MARKED_AS_READ_IN_CONVERSATION` / `CLEAR_IN_CONVERSATION` — the engine's SCREAMING
+  projections; the official zod enum parse fails the same face, and an absent or hostile
+  verb drops the record whole). The remaining keys are per-key optionals exactly as the
+  official loose parse carries them: the `timestamp` and `callId` ride the engine's u64
+  numbers verbatim, and the conversation identity rides the §4.85 three-form input
+  (hex room id / ServiceId UUID / group master key base64) un-re-encoded.
+- `deviceNameChange` (`account.deviceNameChanged`) — one hard gate: the `deviceId` must
+  be present in u32 range (the official handler warns and drops the sync when the key is
+  absent — nothing to address; the parse's `try_from` is the same bound). The id forwards
+  verbatim; the local-device comparison stays the desktop's own decision.
+- `usernameChange` (`account.usernameChanged`) — the official handleUsernameChangeSync
+  face, an empty pure-signal sync whose presence alone is the event (the new value
+  converges through the host's own profile read; the projection carries no payload and
+  the connector invents none). A non-object shape (`"renamed"`, a number) is not the
+  face and keeps the plain skip.
+- `pniChangeNumber` (`identity.pniChanged`) — the engine projects only the stripped
+  `{registrationId?, newE164?}` face — the change's key material never crosses the
+  engine boundary and the connector never sees it. Per-key fail-closed (the
+  registration id through the same u32 `try_from` bound); a face where neither key
+  survived is the official's own empty-sync warning shape and keeps the plain skip.
+
+**The store mirror — deliberately none, per arm.** The five account-level arms
+(configuration / fetchLatest / deviceName / username / pni) are trigger semantics: they
+name an event about the account, not a row in any store, and there is nothing to mirror.
+The two data-plane arms keep no store the official consumer does not already own: the
+connector holds no call-history store (the §4.85 discretion verbatim — the desktop's log
+is the authoritative writer) and no call-link store (the §4.73 passthrough discipline —
+the material is consumed by the official call-link stack, never by connector state).
+Every record is transient: a missed delivery loses exactly what an official client loses
+offline, and no self-heal, replay, or summary convergence rides beside the events.
+
+**The forward.** Seven new flat host events (the story.received conditional-insert
+style — absent optionals staying absent, no nulls invented):
+
+- `settings.configurationSync` `{accountId, readReceipts?, unidentifiedDeliveryIndicators?,
+  typingIndicators?, linkPreviews?}` — at least one flag present (the parse guarantees it).
+- `sync.fetchLatest` `{accountId, type?}` — the SCREAMING word verbatim when carried.
+- `call.linkUpdate` `{accountId, type: "UPDATE", rootKey, adminKey?}` — the record's
+  subject always present (the parse guarantees it).
+- `call.logEvent` `{accountId, type, timestamp?, peerId?, callId?, conversationId?}` —
+  the projection's raw identity rides `peerId` (the official CallLogEventDetails name the
+  desktop's join reads) while the §4.85 ladder's hit rides `conversationId`: across the
+  whole event surface that key always means the resolved local conversation id, so the
+  desktop can take the shortcut or run its own join over `peerId`.
+- `account.deviceNameChanged` `{accountId, deviceId}`.
+- `account.usernameChanged` `{accountId}` — the fact alone.
+- `identity.pniChanged` `{accountId, registrationId?, newE164?}` — at least one key
+  present; no key material ever rides the event either.
+
+No new method, error code, or capability tag (the §4.84/§4.85 precedent for core consume
+events); the schema gains the seven event enum entries, seven allOf data blocks, and four
+pairing bounds inventoried below.
+
+Tests: seven engine units (`sync_configuration_routes_the_flag_face`,
+`sync_fetch_latest_routes_on_presence`, `sync_call_link_update_routes_the_root_keyed_record`,
+`sync_call_log_event_routes_the_gated_record`,
+`sync_device_name_change_routes_the_device_id`,
+`sync_username_change_routes_the_bare_signal`,
+`sync_pni_change_number_routes_the_stripped_projection` — each arm's gates, whitelists,
+and plain-skip fall-through); two service integrations
+(`sync_account_level_arms_forward_transient_events`,
+`sync_data_plane_arms_forward_with_their_own_identities` — the five trigger forwards with
+zero store delta, the two data-plane forwards each resolved against its own identity, the
+one-event-no-convergence counts); two wire frames
+(`account_level_sync_events_ride_flat`, `data_plane_sync_events_ride_flat` — the event
+names, the flat camelCase shapes, the absent optionals); and four schema-pairing pins (the
+call-link `rootKey`/`adminKey` maxLengths ↔ `MAX_SYNC_CALL_LINK_KEY_CHARS`, the device/PNI
+registration-id maxima ↔ the parse's u32 `try_from` range gate). Gates: 624 → 635, all green.
 
 ## 5. signal-cli Boundary
 

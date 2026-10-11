@@ -983,6 +983,71 @@ pub enum ControlReceive {
     SyncCallEvent {
         event: SyncCallEvent,
     },
+    /// The engine's `syncMessage.configuration` projection (contract 1.106,
+    /// §4.87): the account's own linked device changed the account's four
+    /// official settings flags — the official handleConfiguration face. The
+    /// parser keeps only the bool-keyed faces that survive the per-key
+    /// fail-closed read; a face with no surviving key never reaches this
+    /// variant — the envelope keeps the plain syncMessage skip.
+    SyncConfiguration {
+        configuration: SyncConfigurationFlags,
+    },
+    /// The engine's `syncMessage.fetchLatest` projection (contract 1.106,
+    /// §4.87): the account's own linked device asked the receiving client to
+    /// refresh one named surface — the official handleFetchLatest trigger.
+    /// The optional type word is the engine's SCREAMING projection whitelist
+    /// member; the official fires the trigger even for an absent type (the
+    /// UNKNOWN member is the downstream no-op), so the arm's presence alone
+    /// is the signal and this variant carries no hard gate.
+    SyncFetchLatest {
+        kind: Option<&'static str>,
+    },
+    /// The engine's `syncMessage.callLinkUpdate` projection (contract 1.106,
+    /// §4.87): the account's own linked device updated one call link's
+    /// credential material — the official handleCallLinkUpdate face. The
+    /// record hard-gates on the two facts the official handler throws over
+    /// (the type word must be the projection's only known member UPDATE, and
+    /// the rootKey the update is about must be present); the admin key rides
+    /// per-key fail-closed. A face failing a hard gate never reaches this
+    /// variant — the envelope keeps the plain syncMessage skip.
+    SyncCallLinkUpdate {
+        update: SyncCallLinkUpdate,
+    },
+    /// The engine's `syncMessage.callLogEvent` projection (contract 1.106,
+    /// §4.87): the account's own linked device mutated one call-history
+    /// record (clear / marked-as-read family) — the official
+    /// handleCallLogEvent face. The type word is the record's verb and
+    /// hard-gates on the engine's SCREAMING whitelist; the remaining keys are
+    /// per-key optional exactly as the official loose parse carries them.
+    SyncCallLogEvent {
+        event: SyncCallLogEvent,
+    },
+    /// The engine's `syncMessage.deviceNameChange` projection (contract
+    /// 1.106, §4.87): the account renamed one linked device — the official
+    /// handleDeviceNameChangeSync face. The official handler drops the sync
+    /// when the deviceId is absent (nothing to address), so the connector
+    /// hard-gates on the same key; the local-device-id comparison stays the
+    /// desktop's own decision.
+    SyncDeviceNameChange {
+        device_id: u32,
+    },
+    /// The engine's `syncMessage.usernameChange` projection (contract 1.106,
+    /// §4.87): the account's own linked device changed the account username —
+    /// the official handleUsernameChangeSync face, an empty pure-signal sync
+    /// whose only consumption is a profile re-fetch. The arm's presence is
+    /// the whole content.
+    SyncUsernameChange,
+    /// The engine's `syncMessage.pniChangeNumber` projection (contract
+    /// 1.106, §4.87): the account's own number re-registration moved its PNI
+    /// identity — the official handlePNIChangeNumber face. The engine
+    /// guarantees the key material never crosses its boundary (the official
+    /// re-keys from the same sync; the engine's non-consumption is its §5
+    /// gap), so the connector forwards only the stripped `{registrationId?,
+    /// newE164?}` face; a face with no surviving key is a zero-content sync
+    /// and keeps the plain syncMessage skip.
+    SyncPniChangeNumber {
+        change: SyncPniChangeNumber,
+    },
     /// The engine's `groupChanged {groupId, revision, changes[], editor?,
     /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
     /// official GroupV2ChangeDetailType word list the engine decrypted out
@@ -1076,6 +1141,63 @@ pub struct SyncCallEvent {
     pub conversation_id: Option<String>,
 }
 
+/// The four official settings flags off the engine's `syncMessage.
+/// configuration` projection (contract 1.106, §4.87): each rides only when
+/// the projection carried it (the engine projects its optional proto bools
+/// key-for-key) and the parse's per-key fail-closed read kept it. A face
+/// where no key survived never reaches the routing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncConfigurationFlags {
+    pub read_receipts: Option<bool>,
+    pub unidentified_delivery_indicators: Option<bool>,
+    pub typing_indicators: Option<bool>,
+    pub link_previews: Option<bool>,
+}
+
+/// One call-link update off the engine's `syncMessage.callLinkUpdate`
+/// projection (contract 1.106, §4.87): the update verb (the engine's only
+/// known word — the parser hard-gates on it, so the field is the whitelist
+/// member verbatim) plus the call link's root key and the optional admin
+/// key, both standard-base64 strings the connector never decodes (the §4.73
+/// call-link material discipline: zero parsing, zero logging — the desktop
+/// owns the zkgroup chain).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncCallLinkUpdate {
+    pub kind: &'static str,
+    pub root_key: String,
+    pub admin_key: Option<String>,
+}
+
+/// One call-history mutation off the engine's `syncMessage.callLogEvent`
+/// projection (contract 1.106, §4.87): the verb word (the parser's SCREAMING
+/// whitelist — CLEAR / MARKED_AS_READ / MARKED_AS_READ_IN_CONVERSATION /
+/// CLEAR_IN_CONVERSATION — hard-gated, the record's whole meaning), the
+/// target record's timestamp and call id in the engine's verbatim shapes
+/// (the u64 number form — the desktop's own longToString join reads the
+/// projection), and the optional conversation identity in the same three-form
+/// shape the §4.85 call-event record carries (hex room id / ServiceId UUID /
+/// standard-base64 group master key — the §4.85 resolution ladder reads the
+/// form).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncCallLogEvent {
+    pub kind: &'static str,
+    pub timestamp: Option<u64>,
+    pub conversation_id: Option<String>,
+    pub call_id: Option<u64>,
+}
+
+/// One PNI change-number sync off the engine's `syncMessage.pniChangeNumber`
+/// projection (contract 1.106, §4.87): the stripped face only — the engine
+/// never projects the sync's key material (identityKeyPair / signed prekey /
+/// last-resort kyber prekey stay inside the engine boundary, the backup-key
+/// discipline), so the connector carries the registration id and the new
+/// e164 when the projection stated them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncPniChangeNumber {
+    pub registration_id: Option<u32>,
+    pub new_e164: Option<String>,
+}
+
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
@@ -1121,6 +1243,15 @@ pub const MAX_SYNC_IDENTITY_KEY_CHARS: usize = 128;
 /// since the §4.85 host-event data shape mirrors the bound (the
 /// schema-pairing test pins the two together).
 pub const MAX_SYNC_CALL_ID_CHARS: usize = 20;
+/// One call-link update's base64 key material carries at most this many
+/// characters (contract 1.106, §4.87): the root key's 32 bytes project 44
+/// standard-base64 chars, so the bound only ever bites on a hostile face —
+/// and on the root key it bites by dropping the whole record (the update
+/// names nothing without its subject; a truncated key would address a
+/// different call link), on the admin key by dropping the key (the §4.84
+/// fingerprint discipline). `pub` since the §4.87 host-event data shape
+/// mirrors the bound (the schema-pairing test pins the two together).
+pub const MAX_SYNC_CALL_LINK_KEY_CHARS: usize = 128;
 /// One quote carries at most this many attachment metadata entries (contract
 /// 1.100, §4.81): real quoted-media batches are small and Signal Desktop
 /// renders the pill metadata-only; entries past the cap drop (the same
@@ -1332,6 +1463,44 @@ impl NormalizedReceive {
                     std::mem::size_of::<SyncCallEvent>()
                         + event.call_id.len()
                         + event.conversation_id.as_ref().map_or(0, String::len)
+                }
+                // The configuration sync is fixed-width bools — nothing heap
+                // to count beyond the struct (§4.13).
+                Some(ControlReceive::SyncConfiguration { configuration }) => {
+                    std::mem::size_of::<SyncConfigurationFlags>()
+                        + std::mem::size_of_val(&configuration.read_receipts)
+                        + std::mem::size_of_val(&configuration.unidentified_delivery_indicators)
+                        + std::mem::size_of_val(&configuration.typing_indicators)
+                        + std::mem::size_of_val(&configuration.link_previews)
+                }
+                // The fetch-latest trigger carries at most one word pointer —
+                // the &'static str points at the binary's word table, no heap
+                // (§4.13).
+                Some(ControlReceive::SyncFetchLatest { .. }) => {
+                    std::mem::size_of::<Option<&'static str>>()
+                }
+                // The call-link update carries bounded base64 material — the
+                // heap strings count here (§4.13).
+                Some(ControlReceive::SyncCallLinkUpdate { update }) => {
+                    std::mem::size_of::<SyncCallLinkUpdate>()
+                        + update.root_key.len()
+                        + update.admin_key.as_ref().map_or(0, String::len)
+                }
+                // The call-log mutation carries one bounded conversation
+                // identity — the heap string counts here (§4.13).
+                Some(ControlReceive::SyncCallLogEvent { event }) => {
+                    std::mem::size_of::<SyncCallLogEvent>()
+                        + event.conversation_id.as_ref().map_or(0, String::len)
+                }
+                // The device-name/username triggers are fixed-width (the
+                // word pointer is binary-resident) — nothing heap (§4.13).
+                Some(ControlReceive::SyncDeviceNameChange { .. })
+                | Some(ControlReceive::SyncUsernameChange) => 0,
+                // The PNI change carries one bounded e164 — the heap string
+                // counts here (§4.13).
+                Some(ControlReceive::SyncPniChangeNumber { change }) => {
+                    std::mem::size_of::<SyncPniChangeNumber>()
+                        + change.new_e164.as_ref().map_or(0, String::len)
                 }
                 _ => 0,
             }
@@ -2694,6 +2863,163 @@ fn normalized_sync_call_event(value: Option<&Value>) -> Option<SyncCallEvent> {
     })
 }
 
+/// The engine's `syncMessage.configuration` face (contract 1.106, §4.87):
+/// the wire shape is `{readReceipts?, unidentifiedDeliveryIndicators?,
+/// typingIndicators?, linkPreviews?}` — the official
+/// SyncMessage.Configuration flags, the engine projects its optional proto
+/// bools key-for-key. Per-key fail-closed: a non-bool shape answers absent
+/// (a mangled flag is never forwarded); a face where no key survived is a
+/// zero-content sync and answers None — the envelope keeps the plain
+/// syncMessage skip.
+fn normalized_sync_configuration(value: Option<&Value>) -> Option<SyncConfigurationFlags> {
+    let object = value?.as_object()?;
+    let flag = |key: &str| object.get(key).and_then(Value::as_bool);
+    let configuration = SyncConfigurationFlags {
+        read_receipts: flag("readReceipts"),
+        unidentified_delivery_indicators: flag("unidentifiedDeliveryIndicators"),
+        typing_indicators: flag("typingIndicators"),
+        link_previews: flag("linkPreviews"),
+    };
+    let SyncConfigurationFlags {
+        read_receipts,
+        unidentified_delivery_indicators,
+        typing_indicators,
+        link_previews,
+    } = configuration;
+    if read_receipts.is_none()
+        && unidentified_delivery_indicators.is_none()
+        && typing_indicators.is_none()
+        && link_previews.is_none()
+    {
+        return None;
+    }
+    Some(configuration)
+}
+
+/// The engine's `syncMessage.fetchLatest` face (contract 1.106, §4.87): the
+/// wire shape is `{type?}` — the SCREAMING word the engine projects from its
+/// enum members (UNKNOWN / LOCAL_PROFILE / STORAGE_MANIFEST /
+/// SUBSCRIPTION_STATUS; an absent or unknown i32 projects no key). The
+/// per-key read is fail-closed (a hostile word answers absent); the arm's
+/// presence alone is the trigger — the official fires FetchLatestEvent even
+/// with the type unset (the UNKNOWN member is the downstream no-op), so
+/// this face hard-gates nothing and routes on presence.
+fn normalized_sync_fetch_latest(value: Option<&Value>) -> Option<Option<&'static str>> {
+    let object = value?.as_object()?;
+    Some(object.get("type").and_then(Value::as_str).and_then(|word| {
+        [
+            "UNKNOWN",
+            "LOCAL_PROFILE",
+            "STORAGE_MANIFEST",
+            "SUBSCRIPTION_STATUS",
+        ]
+        .iter()
+        .copied()
+        .find(|member| *member == word)
+    }))
+}
+
+/// The engine's `syncMessage.callLinkUpdate` face (contract 1.106, §4.87):
+/// the wire shape is `{type?, rootKey?, adminKey?}` — the official
+/// handleCallLinkUpdate face. Two hard gates, exactly the facts the official
+/// handler throws over: the type must be present and the projection's only
+/// known word (`UPDATE` — the official throws on a null type and on any
+/// unknown member alike) and the rootKey must be present within the bound
+/// (the update's subject; absent/over-bound = the record names nothing and
+/// is dropped whole — a truncated key would address a different call link).
+/// The keys are material, never parsed: the connector carries the base64
+/// strings verbatim (the §4.73 call-link zero-parsing discipline); the
+/// admin key is per-key fail-closed (a hostile or over-bound shape answers
+/// absent — the §4.84 fingerprint discipline).
+fn normalized_sync_call_link_update(value: Option<&Value>) -> Option<SyncCallLinkUpdate> {
+    let object = value?.as_object()?;
+    let kind = match object.get("type").and_then(Value::as_str)? {
+        "UPDATE" => "UPDATE",
+        _ => return None,
+    };
+    let root_key = object
+        .get("rootKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && key.chars().count() <= MAX_SYNC_CALL_LINK_KEY_CHARS)
+        .map(str::to_string)?;
+    let admin_key = object
+        .get("adminKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty() && key.chars().count() <= MAX_SYNC_CALL_LINK_KEY_CHARS)
+        .map(str::to_string);
+    Some(SyncCallLinkUpdate {
+        kind,
+        root_key,
+        admin_key,
+    })
+}
+
+/// The engine's `syncMessage.callLogEvent` face (contract 1.106, §4.87):
+/// the wire shape is `{type?, timestamp?, conversationId?, callId?}` — the
+/// official handleCallLogEvent mutation of one call-history record. One hard
+/// gate: the type is the record's verb (CLEAR / MARKED_AS_READ /
+/// MARKED_AS_READ_IN_CONVERSATION / CLEAR_IN_CONVERSATION — the engine's
+/// SCREAMING projections) and must be a whitelist member; a hostile or
+/// absent word is not a call-log mutation and drops the record whole (the
+/// official zod enum parse fails the same face). The remaining keys are
+/// per-key fail-closed optionals exactly as the official loose parse carries
+/// them: the timestamp and call id ride the engine's verbatim u64 shapes,
+/// the conversation identity rides the §4.85 three-form ladder input.
+fn normalized_sync_call_log_event(value: Option<&Value>) -> Option<SyncCallLogEvent> {
+    let object = value?.as_object()?;
+    let kind = match object.get("type").and_then(Value::as_str)? {
+        "CLEAR" => "CLEAR",
+        "MARKED_AS_READ" => "MARKED_AS_READ",
+        "MARKED_AS_READ_IN_CONVERSATION" => "MARKED_AS_READ_IN_CONVERSATION",
+        "CLEAR_IN_CONVERSATION" => "CLEAR_IN_CONVERSATION",
+        _ => return None,
+    };
+    Some(SyncCallLogEvent {
+        kind,
+        timestamp: object.get("timestamp").and_then(Value::as_u64),
+        conversation_id: optional_bounded_string(object.get("conversationId")),
+        call_id: object.get("callId").and_then(Value::as_u64),
+    })
+}
+
+/// The engine's `syncMessage.deviceNameChange` face (contract 1.106, §4.87):
+/// the wire shape is `{deviceId?}` — the linked device the rename addresses.
+/// One hard gate: the deviceId must be present in u32 range (the official
+/// handler warns and drops the sync when the key is absent — nothing to
+/// address); the local-device-id comparison stays the desktop's own
+/// decision, so the forwarded id is verbatim.
+fn normalized_sync_device_name_change(value: Option<&Value>) -> Option<u32> {
+    let object = value?.as_object()?;
+    object
+        .get("deviceId")
+        .and_then(Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+}
+
+/// The engine's `syncMessage.pniChangeNumber` face (contract 1.106, §4.87):
+/// the wire shape is `{registrationId?, newE164?}` — the stripped face the
+/// engine projects after keeping its key material inside its boundary. The
+/// keys are per-key fail-closed (a hostile shape answers absent); a face
+/// where neither key survived is a zero-content sync (the official's own
+/// empty-sync warning face) and answers None — the envelope keeps the plain
+/// syncMessage skip.
+fn normalized_sync_pni_change_number(value: Option<&Value>) -> Option<SyncPniChangeNumber> {
+    let object = value?.as_object()?;
+    let change = SyncPniChangeNumber {
+        registration_id: object
+            .get("registrationId")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok()),
+        new_e164: optional_bounded_string(object.get("newE164")),
+    };
+    if change.registration_id.is_none() && change.new_e164.is_none() {
+        return None;
+    }
+    Some(change)
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -3591,6 +3917,118 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             source: None,
             group_id: None,
             control: ControlReceive::SyncCallEvent { event },
+        });
+    }
+    // The engine's `syncMessage.configuration` projection (contract 1.106,
+    // §4.87): the account's own linked device changed the four official
+    // settings flags — the official handleConfiguration face. Intercepted
+    // before the plain syncMessage skip like its verified/callEvent
+    // siblings; a face whose flags all failed the per-key reads falls
+    // through to that skip. The routing source stays None — the envelope is
+    // our own account (the read/viewed precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(configuration) = normalized_sync_configuration(sync.get("configuration"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncConfiguration { configuration },
+        });
+    }
+    // The engine's `syncMessage.fetchLatest` projection (contract 1.106,
+    // §4.87): the account's own linked device asked this client to refresh
+    // one named surface — the official handleFetchLatest trigger. The arm's
+    // presence is the signal (the official fires the event even with the
+    // type unset); the optional word rides the SCREAMING whitelist
+    // per-key-fail-closed. The routing source stays None (the same own-
+    // account precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(kind) = normalized_sync_fetch_latest(sync.get("fetchLatest"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncFetchLatest { kind },
+        });
+    }
+    // The engine's `syncMessage.callLinkUpdate` projection (contract 1.106,
+    // §4.87): the account's own linked device updated one call link's
+    // credential material — the official handleCallLinkUpdate face. The
+    // verb/rootKey hard gates drop a face that names nothing; the routing
+    // source stays None (the own-account precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(update) = normalized_sync_call_link_update(sync.get("callLinkUpdate"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncCallLinkUpdate { update },
+        });
+    }
+    // The engine's `syncMessage.callLogEvent` projection (contract 1.106,
+    // §4.87): the account's own linked device mutated one call-history
+    // record — the official handleCallLogEvent face. The verb hard gate
+    // drops a face that is no mutation; the routing source stays None (the
+    // own-account precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(event) = normalized_sync_call_log_event(sync.get("callLogEvent"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncCallLogEvent { event },
+        });
+    }
+    // The engine's `syncMessage.deviceNameChange` projection (contract
+    // 1.106, §4.87): the account renamed one linked device — the official
+    // handleDeviceNameChangeSync face. The deviceId hard gate mirrors the
+    // official's own absent-key drop; the local-device-id comparison stays
+    // the desktop's decision. The routing source stays None (the own-account
+    // precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(device_id) = normalized_sync_device_name_change(sync.get("deviceNameChange"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncDeviceNameChange { device_id },
+        });
+    }
+    // The engine's `syncMessage.usernameChange` projection (contract 1.106,
+    // §4.87): the account's own linked device changed the username — the
+    // official handleUsernameChangeSync face, an empty pure-signal sync whose
+    // consumption is one profile re-fetch. The arm's presence is the whole
+    // content; the routing source stays None (the own-account precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(_face) = sync.get("usernameChange").and_then(Value::as_object)
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncUsernameChange,
+        });
+    }
+    // The engine's `syncMessage.pniChangeNumber` projection (contract
+    // 1.106, §4.87): the account's own number re-registration moved its PNI
+    // identity — the official handlePNIChangeNumber face, forwarded as the
+    // engine's stripped `{registrationId?, newE164?}` face (the key material
+    // never crosses the engine boundary). A face with no surviving key is a
+    // zero-content sync and falls through to the plain skip. The routing
+    // source stays None (the own-account precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(change) = normalized_sync_pni_change_number(sync.get("pniChangeNumber"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncPniChangeNumber { change },
         });
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
@@ -6487,6 +6925,437 @@ mod tests {
             // The timestamp gate: the engine's zero marker is not a record.
             json!({ "callEvent": { "callId": "42", "timestamp": 0u64 } }),
             json!({ "callEvent": { "callId": "42" } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.configuration`
+    /// projection routes as one control receive — the bool flags ride the
+    /// per-key fail-closed read (a hostile shape answers absent, the record
+    /// survives), and a face with no surviving key falls through to the
+    /// plain syncMessage skip.
+    #[test]
+    fn sync_configuration_routes_the_flag_face() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncConfiguration { configuration }, source)) = routing(json!({
+            "configuration": {
+                "readReceipts": true,
+                "unidentifiedDeliveryIndicators": false,
+                "typingIndicators": true,
+                "linkPreviews": false,
+            },
+        })) else {
+            panic!("expected a configuration control routing");
+        };
+        assert_eq!(configuration.read_receipts, Some(true));
+        assert_eq!(configuration.unidentified_delivery_indicators, Some(false));
+        assert_eq!(configuration.typing_indicators, Some(true));
+        assert_eq!(configuration.link_previews, Some(false));
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The flags fail per-key: a hostile shape answers absent while the
+        // surviving flags carry the record.
+        let Some((ControlReceive::SyncConfiguration { configuration }, _)) = routing(json!({
+            "configuration": {
+                "readReceipts": "yes",
+                "typingIndicators": 1u64,
+                "linkPreviews": false,
+            },
+        })) else {
+            panic!("expected the routing to survive hostile flags");
+        };
+        assert_eq!(configuration.read_receipts, None);
+        assert_eq!(configuration.typing_indicators, None);
+        assert_eq!(configuration.link_previews, Some(false));
+
+        // No surviving flag at all → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "configuration": {} }),
+            json!({ "configuration": { "readReceipts": null } }),
+            json!({ "configuration": { "typingIndicators": "on" } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.fetchLatest`
+    /// projection routes on the arm's presence — the type word rides the
+    /// SCREAMING whitelist per-key fail-closed (a hostile word answers
+    /// absent, the trigger still fires; the official fires the same
+    /// type-less event), and a non-object face falls through to the plain
+    /// syncMessage skip.
+    #[test]
+    fn sync_fetch_latest_routes_on_presence() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncFetchLatest { kind }, source)) = routing(json!({
+            "fetchLatest": { "type": "STORAGE_MANIFEST" },
+        })) else {
+            panic!("expected a fetch-latest control routing");
+        };
+        assert_eq!(kind, Some("STORAGE_MANIFEST"));
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The type-less face still routes (the official's own shape).
+        let Some((ControlReceive::SyncFetchLatest { kind }, _)) = routing(json!({
+            "fetchLatest": {},
+        })) else {
+            panic!("expected the type-less routing");
+        };
+        assert!(kind.is_none());
+
+        // A hostile word answers absent while the trigger survives.
+        let Some((ControlReceive::SyncFetchLatest { kind }, _)) = routing(json!({
+            "fetchLatest": { "type": "EVERYTHING" },
+        })) else {
+            panic!("expected the routing to survive a hostile word");
+        };
+        assert!(kind.is_none());
+
+        // A non-object face is not the projection → the plain skip.
+        for sync in [json!({}), json!({ "fetchLatest": "STORAGE_MANIFEST" })] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.callLinkUpdate`
+    /// projection routes as one control receive — the type word hard-gates
+    /// on the projection's only known member, the rootKey hard-gates present
+    /// within its bound (the update's subject; an over-bound key drops the
+    /// record whole), the admin key fails per-key, and any hard-gate failure
+    /// falls through to the plain syncMessage skip.
+    #[test]
+    fn sync_call_link_update_routes_the_root_keyed_record() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncCallLinkUpdate { update }, source)) = routing(json!({
+            "callLinkUpdate": {
+                "type": "UPDATE",
+                "rootKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "adminKey": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+            },
+        })) else {
+            panic!("expected a call-link-update control routing");
+        };
+        assert_eq!(update.kind, "UPDATE");
+        assert_eq!(
+            update.root_key,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(
+            update.admin_key.as_deref(),
+            Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=")
+        );
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The admin key fails per-key: a hostile shape answers absent while
+        // the record survives.
+        let Some((ControlReceive::SyncCallLinkUpdate { update }, _)) = routing(json!({
+            "callLinkUpdate": {
+                "type": "UPDATE",
+                "rootKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "adminKey": 42u64,
+            },
+        })) else {
+            panic!("expected the routing to survive a hostile admin key");
+        };
+        assert!(update.admin_key.is_none());
+
+        // Hard-gate failures drop the record whole → the plain skip: a
+        // missing/hostile type word, a missing/over-bound root key.
+        for sync in [
+            json!({}),
+            json!({ "callLinkUpdate": {} }),
+            json!({ "callLinkUpdate": { "rootKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } }),
+            json!({ "callLinkUpdate": { "type": "DELETE", "rootKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } }),
+            json!({ "callLinkUpdate": { "type": 0u64, "rootKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" } }),
+            json!({ "callLinkUpdate": { "type": "UPDATE" } }),
+            json!({ "callLinkUpdate": { "type": "UPDATE", "rootKey": "" } }),
+            json!({ "callLinkUpdate": { "type": "UPDATE", "rootKey": 42u64 } }),
+            json!({ "callLinkUpdate": { "type": "UPDATE", "rootKey": "A".repeat(129) } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.callLogEvent`
+    /// projection routes as one control receive — the verb hard-gates on the
+    /// SCREAMING whitelist (the record's whole meaning), the remaining keys
+    /// ride per-key optional in the engine's verbatim shapes, and a verb
+    /// failure falls through to the plain syncMessage skip.
+    #[test]
+    fn sync_call_log_event_routes_the_gated_record() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncCallLogEvent { event }, source)) = routing(json!({
+            "callLogEvent": {
+                "type": "MARKED_AS_READ",
+                "timestamp": 1726999999000u64,
+                "conversationId": "11111111-1111-1111-1111-111111111111",
+                "callId": 18446744073709551615u64,
+            },
+        })) else {
+            panic!("expected a call-log-event control routing");
+        };
+        assert_eq!(event.kind, "MARKED_AS_READ");
+        assert_eq!(event.timestamp, Some(1726999999000));
+        assert_eq!(
+            event.conversation_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(event.call_id, Some(u64::MAX));
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The keys fail per-key: hostile shapes answer absent while the
+        // verb carries the record.
+        let Some((ControlReceive::SyncCallLogEvent { event }, _)) = routing(json!({
+            "callLogEvent": {
+                "type": "CLEAR",
+                "timestamp": "recently",
+                "conversationId": 42u64,
+                "callId": "18446744073709551615",
+            },
+        })) else {
+            panic!("expected the routing to survive hostile keys");
+        };
+        assert_eq!(event.kind, "CLEAR");
+        assert!(event.timestamp.is_none());
+        assert!(event.conversation_id.is_none());
+        assert!(event.call_id.is_none());
+
+        // The other whitelist members resolve verbatim.
+        for (word, expected) in [
+            ("CLEAR", "CLEAR"),
+            (
+                "MARKED_AS_READ_IN_CONVERSATION",
+                "MARKED_AS_READ_IN_CONVERSATION",
+            ),
+            ("CLEAR_IN_CONVERSATION", "CLEAR_IN_CONVERSATION"),
+        ] {
+            let Some((ControlReceive::SyncCallLogEvent { event }, _)) = routing(json!({
+                "callLogEvent": { "type": word },
+            })) else {
+                panic!("expected the {word} routing");
+            };
+            assert_eq!(event.kind, expected);
+        }
+
+        // No usable verb at all → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "callLogEvent": {} }),
+            json!({ "callLogEvent": { "timestamp": 1726999999000u64 } }),
+            json!({ "callLogEvent": { "type": "DELETE_ALL" } }),
+            json!({ "callLogEvent": { "type": 1u64 } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.deviceNameChange`
+    /// projection routes as one control receive — the deviceId hard-gates
+    /// present in u32 range (the official's own absent-key drop), and a face
+    /// without it falls through to the plain syncMessage skip.
+    #[test]
+    fn sync_device_name_change_routes_the_device_id() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncDeviceNameChange { device_id }, source)) = routing(json!({
+            "deviceNameChange": { "deviceId": 2u64 },
+        })) else {
+            panic!("expected a device-name-change control routing");
+        };
+        assert_eq!(device_id, 2);
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The u32 ceiling routes; out of range does not.
+        let Some((ControlReceive::SyncDeviceNameChange { device_id }, _)) = routing(json!({
+            "deviceNameChange": { "deviceId": 4294967295u64 },
+        })) else {
+            panic!("expected the u32-ceiling routing");
+        };
+        assert_eq!(device_id, u32::MAX);
+
+        // No addressable device → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "deviceNameChange": {} }),
+            json!({ "deviceNameChange": { "deviceId": 4294967296u64 } }),
+            json!({ "deviceNameChange": { "deviceId": "2" } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.usernameChange`
+    /// projection routes on the arm's presence — the empty pure-signal face
+    /// is the whole content, a non-object face falls through to the plain
+    /// syncMessage skip.
+    #[test]
+    fn sync_username_change_routes_the_bare_signal() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncUsernameChange, source)) = routing(json!({
+            "usernameChange": {},
+        })) else {
+            panic!("expected a username-change control routing");
+        };
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // A non-object face is not the projection → the plain skip.
+        for sync in [json!({}), json!({ "usernameChange": "renamed" })] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.106 (§4.87): the engine's `syncMessage.pniChangeNumber`
+    /// projection routes as one control receive carrying only the stripped
+    /// face — the keys fail per-key, a face with no surviving key falls
+    /// through to the plain syncMessage skip, and no key material can exist
+    /// on the struct (the engine never projects it).
+    #[test]
+    fn sync_pni_change_number_routes_the_stripped_projection() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncPniChangeNumber { change }, source)) = routing(json!({
+            "pniChangeNumber": {
+                "registrationId": 2718u64,
+                "newE164": "+15555550199",
+            },
+        })) else {
+            panic!("expected a pni-change-number control routing");
+        };
+        assert_eq!(change.registration_id, Some(2718));
+        assert_eq!(change.new_e164.as_deref(), Some("+15555550199"));
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The keys fail per-key: a hostile shape answers absent while the
+        // survivor carries the record.
+        let Some((ControlReceive::SyncPniChangeNumber { change }, _)) = routing(json!({
+            "pniChangeNumber": {
+                "registrationId": 4294967296u64,
+                "newE164": "+15555550199",
+            },
+        })) else {
+            panic!("expected the routing to survive a hostile id");
+        };
+        assert_eq!(change.registration_id, None);
+        assert_eq!(change.new_e164.as_deref(), Some("+15555550199"));
+
+        // No surviving key at all → the plain syncMessage skip.
+        for sync in [
+            json!({}),
+            json!({ "pniChangeNumber": {} }),
+            json!({ "pniChangeNumber": { "registrationId": 4294967296u64 } }),
+            json!({ "pniChangeNumber": { "newE164": 15555550199u64 } }),
         ] {
             let routing = control_routing(
                 json!({ "timestamp": 1727000000000u64, "syncMessage": sync })

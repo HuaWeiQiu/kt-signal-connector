@@ -1017,6 +1017,103 @@ pub enum HostSideEvent {
         outcome: Option<&'static str>,
         conversation_id: Option<String>,
     },
+    /// The engine's `syncMessage.configuration` projection forwarded
+    /// (contract 1.106, §4.87): the account's own linked device changed the
+    /// four official settings flags — the official handleConfiguration face.
+    /// Pure transient notify: the flags are the engine-side account
+    /// configuration's own reads (the §4.45 write face is no-local-
+    /// persistence by the same discipline), the connector keeps no settings
+    /// store to mirror into, and the event's job is to tell the host when to
+    /// refresh its own view. Every flag rides only when the projection
+    /// carried it; the parse guarantees at least one.
+    SettingsConfigurationSync {
+        account_id: String,
+        read_receipts: Option<bool>,
+        unidentified_delivery_indicators: Option<bool>,
+        typing_indicators: Option<bool>,
+        link_previews: Option<bool>,
+    },
+    /// The engine's `syncMessage.fetchLatest` projection forwarded (contract
+    /// 1.106, §4.87): the account's own linked device asked this client to
+    /// refresh one named surface — the official handleFetchLatest trigger.
+    /// Pure trigger semantics: the official desktop's handler fires the
+    /// fetch task and nothing else; there is no data to mirror and no
+    /// conversation to resolve. The SCREAMING word rides verbatim (absent
+    /// when the projection carried none — the official fires the same
+    /// type-less event); the UNKNOWN member is the downstream no-op.
+    FetchLatestSync {
+        account_id: String,
+        kind: Option<&'static str>,
+    },
+    /// The engine's `syncMessage.callLinkUpdate` projection forwarded
+    /// (contract 1.106, §4.87): the account's own linked device updated one
+    /// call link's credential material — the official handleCallLinkUpdate
+    /// face. Data-plane but rowless: the connector keeps no call-link store
+    /// (the §4.73 credential faces are pure passthrough by the same
+    /// discretion), and the desktop's own call-link cache is the
+    /// authoritative store its official consumer writes — inventing a
+    /// connector-side store would fork it. The base64 material rides
+    /// verbatim, never parsed (the §4.73 zero-parsing discipline).
+    CallLinkUpdate {
+        account_id: String,
+        kind: &'static str,
+        root_key: String,
+        admin_key: Option<String>,
+    },
+    /// The engine's `syncMessage.callLogEvent` projection forwarded
+    /// (contract 1.106, §4.87): the account's own linked device mutated one
+    /// call-history record (clear / marked-as-read family) — the official
+    /// handleCallLogEvent face. No store mirror, by the §4.85 call-event
+    /// discretion verbatim: the connector keeps no call-history store, the
+    /// desktop's own call log is the authoritative store, and the record is
+    /// transient — a missed delivery converges however the desktop
+    /// reconciles its own log. The one enrichment is the §4.85 conversation
+    /// ladder (the 32-byte group form addressing its group row directly, the
+    /// UUID/e164 forms through the §4.81 resolution family); an unresolved
+    /// mutation forwards conversation-less, the verb word enough for the
+    /// desktop to decide.
+    CallLogEvent {
+        account_id: String,
+        kind: &'static str,
+        timestamp: Option<u64>,
+        conversation_id: Option<String>,
+        call_id: Option<u64>,
+        resolved_conversation_id: Option<String>,
+    },
+    /// The engine's `syncMessage.deviceNameChange` projection forwarded
+    /// (contract 1.106, §4.87): the account renamed one linked device — the
+    /// official handleDeviceNameChangeSync face. Pure trigger semantics: the
+    /// official handler compares the deviceId against its own local device
+    /// id and no-ops for the others, so the connector forwards the id
+    /// verbatim and the desktop keeps that comparison. No store, no
+    /// conversation, transient.
+    DeviceNameChanged {
+        account_id: String,
+        device_id: u32,
+    },
+    /// The engine's `syncMessage.usernameChange` projection forwarded
+    /// (contract 1.106, §4.87): the account's own linked device changed the
+    /// username — the official handleUsernameChangeSync face, an empty
+    /// pure-signal sync whose only consumption is one profile re-fetch. The
+    /// event carries the fact alone; the new value converges through the
+    /// host's own profile read. Transient.
+    UsernameChanged {
+        account_id: String,
+    },
+    /// The engine's `syncMessage.pniChangeNumber` projection forwarded
+    /// (contract 1.106, §4.87): the account's own number re-registration
+    /// moved its PNI identity — the official handlePNIChangeNumber face. No
+    /// mirror by the identity-face discipline: the official re-keys from the
+    /// sync's key material, the engine keeps that material inside its
+    /// boundary (the connector would have nothing honest to write), and the
+    /// official's own identity reads remain the reconciliation path. The
+    /// stripped face rides verbatim ({registrationId?, newE164?}); the
+    /// parse guarantees at least one key.
+    PniChanged {
+        account_id: String,
+        registration_id: Option<u32>,
+        new_e164: Option<String>,
+    },
 }
 
 /// One conversation-scoped delete group on the `message.deleteForMe` event
@@ -6309,6 +6406,33 @@ impl ConnectorService {
         if let ControlReceive::SyncCallEvent { event } = &control {
             return self.apply_sync_call_event(&account, event);
         }
+        // Contract 1.106 (§4.87 consume batch): the seven sync arms address
+        // their own facts, never an envelope source (the envelope is our own
+        // account) — the same interception family as the verified/call-event
+        // siblings above. The account-level arms resolve no conversation at
+        // all; the call-log mutation walks the §4.85 ladder with the
+        // call-event's identity input.
+        if let ControlReceive::SyncConfiguration { configuration } = &control {
+            return self.apply_sync_configuration(&account, configuration);
+        }
+        if let ControlReceive::SyncFetchLatest { kind } = &control {
+            return self.apply_sync_fetch_latest(&account, *kind);
+        }
+        if let ControlReceive::SyncCallLinkUpdate { update } = &control {
+            return self.apply_sync_call_link_update(&account, update);
+        }
+        if let ControlReceive::SyncCallLogEvent { event } = &control {
+            return self.apply_sync_call_log_event(&account, event);
+        }
+        if let ControlReceive::SyncDeviceNameChange { device_id } = &control {
+            return self.apply_sync_device_name_change(&account, *device_id);
+        }
+        if let ControlReceive::SyncUsernameChange = &control {
+            return self.apply_sync_username_change(&account);
+        }
+        if let ControlReceive::SyncPniChangeNumber { change } = &control {
+            return self.apply_sync_pni_change_number(&account, change);
+        }
         // Story receives (contract 1.76, §4.67): a story addresses no
         // conversation — the bounded projection forwards as the transient
         // `story.received` event and the connector keeps no row. The
@@ -6965,6 +7089,16 @@ impl ConnectorService {
             // its own conversation); this arm is the same
             // unreachable-in-practice guard too.
             ControlReceive::SyncCallEvent { .. } => Ok(Vec::new()),
+            // The §4.87 seven-arm family is intercepted the same way (each
+            // arm addresses its own fact, never an envelope source); these
+            // arms are the same unreachable-in-practice guards.
+            ControlReceive::SyncConfiguration { .. }
+            | ControlReceive::SyncFetchLatest { .. }
+            | ControlReceive::SyncCallLinkUpdate { .. }
+            | ControlReceive::SyncCallLogEvent { .. }
+            | ControlReceive::SyncDeviceNameChange { .. }
+            | ControlReceive::SyncUsernameChange
+            | ControlReceive::SyncPniChangeNumber { .. } => Ok(Vec::new()),
         }
     }
 
@@ -7472,6 +7606,151 @@ impl ConnectorService {
             direction: event.direction,
             outcome: event.outcome,
             conversation_id: conversation.map(|conversation| conversation.id),
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.configuration`
+    /// projection — the account's own linked device changed the four
+    /// official settings flags (the official handleConfiguration face). Pure
+    /// forwarding, no store mirror: the flags live in the engine-side account
+    /// configuration (the §4.45 write face reads them back from there and is
+    /// no-local-persistence by the same discipline), so the connector keeps
+    /// no settings row to mirror into and the event's whole job is to tell
+    /// the host when its own view is stale. Transient.
+    fn apply_sync_configuration(
+        &mut self,
+        account: &AccountRow,
+        configuration: &crate::engine::SyncConfigurationFlags,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(vec![HostSideEvent::SettingsConfigurationSync {
+            account_id: account.id.clone(),
+            read_receipts: configuration.read_receipts,
+            unidentified_delivery_indicators: configuration.unidentified_delivery_indicators,
+            typing_indicators: configuration.typing_indicators,
+            link_previews: configuration.link_previews,
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.fetchLatest`
+    /// projection — the account's own linked device asked this client to
+    /// refresh one named surface (the official handleFetchLatest trigger).
+    /// Pure trigger semantics: the official handler fires the fetch task and
+    /// touches nothing else, so there is no data to mirror and no
+    /// conversation to resolve; the word rides verbatim, absent riding
+    /// absent (the official fires the same type-less event).
+    fn apply_sync_fetch_latest(
+        &mut self,
+        account: &AccountRow,
+        kind: Option<&'static str>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(vec![HostSideEvent::FetchLatestSync {
+            account_id: account.id.clone(),
+            kind,
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.callLinkUpdate`
+    /// projection — the account's own linked device updated one call link's
+    /// credential material (the official handleCallLinkUpdate face).
+    /// Data-plane but rowless, no store mirror: the connector keeps no
+    /// call-link store (the §4.73 credential faces are pure passthrough by
+    /// the same discretion), and the desktop's own call-link cache is the
+    /// authoritative store its official consumer writes — a connector-side
+    /// copy would only fork it. The material rides verbatim, never parsed
+    /// (the §4.73 zero-parsing discipline); transient — a missed delivery
+    /// loses exactly what an official client loses offline.
+    fn apply_sync_call_link_update(
+        &mut self,
+        account: &AccountRow,
+        update: &crate::engine::SyncCallLinkUpdate,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(vec![HostSideEvent::CallLinkUpdate {
+            account_id: account.id.clone(),
+            kind: update.kind,
+            root_key: update.root_key.clone(),
+            admin_key: update.admin_key.clone(),
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.callLogEvent`
+    /// projection — the account's own linked device mutated one call-history
+    /// record (clear / marked-as-read family, the official
+    /// handleCallLogEvent face). No store mirror, by the §4.85 call-event
+    /// discretion verbatim: the connector keeps no call-history store, the
+    /// desktop's own call log is the authoritative store, and the record is
+    /// transient. The one enrichment is the §4.85 conversation ladder (the
+    /// projection's own conversation identity: the 32-byte group form
+    /// addresses its group row directly, the UUID/e164 forms walk the §4.81
+    /// resolution family); an unresolved mutation forwards conversation-less.
+    fn apply_sync_call_log_event(
+        &mut self,
+        account: &AccountRow,
+        event: &crate::engine::SyncCallLogEvent,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let conversation = match event.conversation_id.as_deref() {
+            Some(id) => self.sync_call_event_conversation(account, id)?,
+            None => None,
+        };
+        Ok(vec![HostSideEvent::CallLogEvent {
+            account_id: account.id.clone(),
+            kind: event.kind,
+            timestamp: event.timestamp,
+            conversation_id: event.conversation_id.clone(),
+            call_id: event.call_id,
+            resolved_conversation_id: conversation.map(|conversation| conversation.id),
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.deviceNameChange`
+    /// projection — the account renamed one linked device (the official
+    /// handleDeviceNameChangeSync face). Pure trigger semantics: the
+    /// official handler compares the deviceId against its own local device
+    /// id and no-ops for the others, so the connector forwards the id
+    /// verbatim and the comparison stays the desktop's. Transient.
+    fn apply_sync_device_name_change(
+        &mut self,
+        account: &AccountRow,
+        device_id: u32,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(vec![HostSideEvent::DeviceNameChanged {
+            account_id: account.id.clone(),
+            device_id,
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.usernameChange`
+    /// projection — the account's own linked device changed the username
+    /// (the official handleUsernameChangeSync face, an empty pure-signal
+    /// sync). The event carries the fact alone; the new value converges
+    /// through the host's own profile read. Transient.
+    fn apply_sync_username_change(
+        &mut self,
+        account: &AccountRow,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(vec![HostSideEvent::UsernameChanged {
+            account_id: account.id.clone(),
+        }])
+    }
+
+    /// Contract 1.106 (§4.87): forward one `syncMessage.pniChangeNumber`
+    /// projection — the account's own number re-registration moved its PNI
+    /// identity (the official handlePNIChangeNumber face). No mirror by the
+    /// identity-face discipline: the official re-keys from the sync's key
+    /// material, the engine keeps that material inside its boundary (the
+    /// backup-key discipline; its own non-consumption is its §5 gap), and a
+    /// connector-side partial mirror (registration id / e164 without keys)
+    /// would be a crippled second authority. The stripped face rides
+    /// verbatim; the official's own identity reads stay the reconciliation
+    /// path. Transient.
+    fn apply_sync_pni_change_number(
+        &mut self,
+        account: &AccountRow,
+        change: &crate::engine::SyncPniChangeNumber,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        Ok(vec![HostSideEvent::PniChanged {
+            account_id: account.id.clone(),
+            registration_id: change.registration_id,
+            new_e164: change.new_e164.clone(),
         }])
     }
 
@@ -19801,6 +20080,273 @@ mod tests {
                 .unwrap(),
         );
         assert!(conversation_id.is_none());
+    }
+
+    /// Contract 1.106 (§4.87): the five account-level sync arms forward as
+    /// one transient event each — configuration flags, the fetch-latest
+    /// trigger, the device-name id, the bare username signal, the stripped
+    /// PNI face. No conversation is resolved anywhere (none of the arms
+    /// addresses one), nothing mirrors, nothing converges beside the events.
+    #[test]
+    fn sync_account_level_arms_forward_transient_events() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let own = |control| {
+            let mut receive = control_receive("+15555550100", "+15555550100", control);
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+
+        // The configuration flags ride verbatim.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncConfiguration {
+                    configuration: crate::engine::SyncConfigurationFlags {
+                        read_receipts: None,
+                        unidentified_delivery_indicators: Some(true),
+                        typing_indicators: None,
+                        link_previews: Some(false),
+                    },
+                }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::SettingsConfigurationSync {
+            account_id: event_account,
+            unidentified_delivery_indicators,
+            link_previews,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected the configuration event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(*unidentified_delivery_indicators, Some(true));
+        assert_eq!(*link_previews, Some(false));
+
+        // The fetch-latest trigger rides with and without its word.
+        for (kind, expected) in [(Some("LOCAL_PROFILE"), Some("LOCAL_PROFILE")), (None, None)] {
+            let events = service
+                .ingest_receive(
+                    own(ControlReceive::SyncFetchLatest { kind }),
+                    crate::DEFAULT_PROXY_GROUP_ID,
+                )
+                .unwrap();
+            assert_eq!(events.len(), 1, "{events:?}");
+            let HostSideEvent::FetchLatestSync {
+                account_id: event_account,
+                kind: event_kind,
+            } = &events[0]
+            else {
+                panic!("expected the fetch-latest event: {:?}", events[0]);
+            };
+            assert_eq!(event_account, &account.id);
+            assert_eq!(*event_kind, expected);
+        }
+
+        // The device-name id rides verbatim.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncDeviceNameChange { device_id: 3 }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::DeviceNameChanged {
+            account_id: event_account,
+            device_id,
+        } = &events[0]
+        else {
+            panic!("expected the device-name event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(*device_id, 3);
+
+        // The username signal carries the fact alone.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncUsernameChange),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::UsernameChanged {
+            account_id: event_account,
+        } = &events[0]
+        else {
+            panic!("expected the username event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+
+        // The PNI face rides the stripped keys only.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncPniChangeNumber {
+                    change: crate::engine::SyncPniChangeNumber {
+                        registration_id: Some(2718),
+                        new_e164: Some("+15555550199".into()),
+                    },
+                }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::PniChanged {
+            account_id: event_account,
+            registration_id,
+            new_e164,
+        } = &events[0]
+        else {
+            panic!("expected the pni event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(*registration_id, Some(2718));
+        assert_eq!(new_e164.as_deref(), Some("+15555550199"));
+    }
+
+    /// Contract 1.106 (§4.87): the two data-plane sync arms forward with
+    /// their own identities — the call-link update is rowless (no
+    /// conversation resolution, the material verbatim) and the call-log
+    /// mutation walks the §4.85 ladder (the 32-byte group form addresses its
+    /// group row directly, the UUID form ladders to the direct thread, an
+    /// ad-hoc hex room id stays honestly unresolved). Nothing mirrors and
+    /// nothing converges beside the events.
+    #[test]
+    fn sync_data_plane_arms_forward_with_their_own_identities() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        const ACI: &str = "11111111-1111-1111-1111-111111111111";
+        service
+            .store_ref()
+            .upsert_peer_identity(&account.id, ACI, &conversation.peer_key)
+            .unwrap();
+        const GROUP_ID_32B: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", GROUP_ID_32B, "G")
+            .unwrap();
+        let own = |control| {
+            let mut receive = control_receive("+15555550100", "+15555550100", control);
+            receive.source = None;
+            receive.source_uuid = None;
+            receive
+        };
+
+        // The call-link update is rowless: no conversation key anywhere.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncCallLinkUpdate {
+                    update: crate::engine::SyncCallLinkUpdate {
+                        kind: "UPDATE",
+                        root_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                        admin_key: None,
+                    },
+                }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallLinkUpdate {
+            account_id: event_account,
+            kind,
+            root_key,
+            admin_key,
+        } = &events[0]
+        else {
+            panic!("expected the call-link event: {:?}", events[0]);
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(*kind, "UPDATE");
+        assert_eq!(root_key, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert!(admin_key.is_none());
+
+        // The call-log mutation: the 32-byte group form addresses the group
+        // row directly.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncCallLogEvent {
+                    event: crate::engine::SyncCallLogEvent {
+                        kind: "MARKED_AS_READ",
+                        timestamp: Some(1726999999000),
+                        conversation_id: Some(GROUP_ID_32B.into()),
+                        call_id: Some(u64::MAX),
+                    },
+                }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallLogEvent {
+            kind,
+            conversation_id,
+            call_id,
+            resolved_conversation_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected the call-log event: {:?}", events[0]);
+        };
+        assert_eq!(*kind, "MARKED_AS_READ");
+        assert_eq!(conversation_id.as_deref(), Some(GROUP_ID_32B));
+        assert_eq!(*call_id, Some(u64::MAX));
+        assert_eq!(resolved_conversation_id.as_deref(), Some(group.id.as_str()));
+
+        // The UUID form ladders to the direct thread through the recorded
+        // ACI→peer-key mapping.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncCallLogEvent {
+                    event: crate::engine::SyncCallLogEvent {
+                        kind: "CLEAR_IN_CONVERSATION",
+                        timestamp: None,
+                        conversation_id: Some(ACI.into()),
+                        call_id: None,
+                    },
+                }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallLogEvent {
+            resolved_conversation_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected the call-log event: {:?}", events[0]);
+        };
+        assert_eq!(
+            resolved_conversation_id.as_deref(),
+            Some(conversation.id.as_str())
+        );
+
+        // An ad-hoc hex room id resolves nothing local — the mutation
+        // forwards with the raw identity alone.
+        let events = service
+            .ingest_receive(
+                own(ControlReceive::SyncCallLogEvent {
+                    event: crate::engine::SyncCallLogEvent {
+                        kind: "CLEAR",
+                        timestamp: None,
+                        conversation_id: Some("deadbeef".into()),
+                        call_id: None,
+                    },
+                }),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::CallLogEvent {
+            conversation_id,
+            resolved_conversation_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected the call-log event: {:?}", events[0]);
+        };
+        assert_eq!(conversation_id.as_deref(), Some("deadbeef"));
+        assert!(resolved_conversation_id.is_none());
     }
 
     /// Contract 1.100 (§4.81 D3): the groupChanged batch forwards verbatim

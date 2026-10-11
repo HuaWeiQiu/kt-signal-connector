@@ -32,8 +32,8 @@ use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::engine::{
-    MAX_RECEIVE_ID_CHARS, MAX_SYNC_CALL_ID_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES,
-    MAX_SYNC_DELETE_GROUPS, MAX_SYNC_IDENTITY_KEY_CHARS,
+    MAX_RECEIVE_ID_CHARS, MAX_SYNC_CALL_ID_CHARS, MAX_SYNC_CALL_LINK_KEY_CHARS,
+    MAX_SYNC_DELETE_GROUP_MESSAGES, MAX_SYNC_DELETE_GROUPS, MAX_SYNC_IDENTITY_KEY_CHARS,
 };
 use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
@@ -634,6 +634,31 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/event/allOf/13/then/properties/data/properties/callId",
             "maxLength",
             MAX_SYNC_CALL_ID_CHARS as u64,
+        ),
+        // Call-link update (contract 1.106, §4.87): both base64 keys mirror
+        // their own bound — the root key drops the record whole over it, the
+        // admin key drops per-key (never a truncated call-link address).
+        (
+            "/$defs/event/allOf/16/then/properties/data/properties/rootKey",
+            "maxLength",
+            MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
+        ),
+        (
+            "/$defs/event/allOf/16/then/properties/data/properties/adminKey",
+            "maxLength",
+            MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
+        ),
+        // The device-name/PNI registration ids mirror the parse's u32 range
+        // gate (the std bound the parse enforces through try_from).
+        (
+            "/$defs/event/allOf/18/then/properties/data/properties/deviceId",
+            "maximum",
+            u32::MAX as u64,
+        ),
+        (
+            "/$defs/event/allOf/20/then/properties/data/properties/registrationId",
+            "maximum",
+            u32::MAX as u64,
         ),
         // Account settings (contract 1.46, §4.45): the profile text budgets
         // mirror the official desktop ProfileEditor; the emoji label reuses

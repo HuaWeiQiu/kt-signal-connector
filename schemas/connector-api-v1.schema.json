@@ -3132,7 +3132,14 @@
             "group.changed",
             "message.deleteForMe",
             "identity.verifiedChanged",
-            "call.historyEvent"
+            "call.historyEvent",
+            "settings.configurationSync",
+            "sync.fetchLatest",
+            "call.linkUpdate",
+            "call.logEvent",
+            "account.deviceNameChanged",
+            "account.usernameChanged",
+            "identity.pniChanged"
           ]
         },
         "data": {
@@ -3660,6 +3667,221 @@
                   "conversationId": {
                     "$ref": "#/$defs/opaqueId",
                     "description": "The record's resolved local conversation — the id form the desktop addresses; absent when the projection named none or its identity resolved to nothing (the desktop joins by its own map)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "settings.configurationSync" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "One settings-flags sync forwarded (contract 1.106, §4.87): the engine's syncMessage.configuration projection — the account's own linked device changed the official settings flags, the official handleConfiguration face. Pure transient notify: the flags live in the engine-side account configuration (the accounts.updateConfiguration write face is no-local-persistence by the same discipline), so the event's job is to tell the host when its own view is stale. Each flag rides only when the projection carried it (absent stays absent); the parse guarantees at least one survivor — a zero-content sync never leaves the plain syncMessage skip.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "readReceipts": {
+                    "type": "boolean",
+                    "description": "The read-receipts flag when the projection carried it."
+                  },
+                  "unidentifiedDeliveryIndicators": {
+                    "type": "boolean",
+                    "description": "The unidentified-delivery-indicators flag when the projection carried it."
+                  },
+                  "typingIndicators": {
+                    "type": "boolean",
+                    "description": "The typing-indicators flag when the projection carried it."
+                  },
+                  "linkPreviews": {
+                    "type": "boolean",
+                    "description": "The link-previews flag when the projection carried it."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "sync.fetchLatest" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "One fetch-latest trigger forwarded (contract 1.106, §4.87): the engine's syncMessage.fetchLatest projection — the account's own linked device asked this client to refresh one named surface, the official handleFetchLatest face. Pure trigger semantics: the official handler fires the fetch task and nothing else. The SCREAMING type word rides verbatim when the projection carried one; absent stays absent and the event still fires (the official fires the same type-less event, the UNKNOWN member being the downstream no-op).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "type": {
+                    "type": "string",
+                    "enum": ["UNKNOWN", "LOCAL_PROFILE", "STORAGE_MANIFEST", "SUBSCRIPTION_STATUS"],
+                    "description": "The surface to refresh — the engine's SCREAMING enum projection verbatim; absent when the projection carried none."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "call.linkUpdate" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "type", "rootKey"],
+                "description": "One call-link update forwarded (contract 1.106, §4.87): the engine's syncMessage.callLinkUpdate projection — the account's own linked device updated one call link's credential material, the official handleCallLinkUpdate face. Data-plane but rowless, no store mirror by recorded discretion: the connector keeps no call-link store (the §4.73 credential faces are pure passthrough by the same discipline) and the desktop's own call-link cache is the authoritative store its official consumer writes. The base64 material is forwarded verbatim, never parsed or logged (the §4.73 zero-parsing discipline); transient — a missed delivery loses exactly what an official client loses offline.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "type": {
+                    "type": "string",
+                    "enum": ["UPDATE"],
+                    "description": "The update verb — the engine projection's only known member, hard-gated connector-side exactly where the official handler throws (a null or unknown type drops the record whole)."
+                  },
+                  "rootKey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The call link's root key — the standard-base64 projection verbatim, never decoded connector-side. Hard-gated present: the update's subject; an over-bound key drops the record whole (a truncated key would address a different call link)."
+                  },
+                  "adminKey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The call link's admin key when the projection carried it — the standard-base64 projection verbatim; a hostile or over-bound shape answers absent (the per-key fail-closed fingerprint discipline)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "call.logEvent" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "type"],
+                "description": "One call-history mutation forwarded (contract 1.106, §4.87): the engine's syncMessage.callLogEvent projection — the account's own linked device cleared or read-marked one call-history record, the official handleCallLogEvent face. No store mirror, by the §4.85 call-event discretion verbatim: the connector keeps no call-history store, the desktop's own call log is the authoritative store, and the record is transient. The raw conversation identity rides peerId (the official CallLogEventDetails name the desktop's own join reads) and the §4.85-ladder hit rides conversationId — across the event surface that key always means the resolved local conversation id. Absent optionals stay absent.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "CLEAR",
+                      "MARKED_AS_READ",
+                      "MARKED_AS_READ_IN_CONVERSATION",
+                      "CLEAR_IN_CONVERSATION"
+                    ],
+                    "description": "The mutation verb — the engine's SCREAMING enum projection, hard-gated to the whitelist (the record's whole meaning; a hostile or absent word is no mutation and drops the record whole, the official zod enum parse failing the same face)."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The target record's timestamp when the projection carried it — the engine's verbatim u64 projection."
+                  },
+                  "peerId": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The projection's raw conversation identity — the same three-form shape the §4.85 call-event record carries (hex room id / ServiceId UUID / standard-base64 group master key), forwarded verbatim for the desktop's own official join."
+                  },
+                  "callId": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The target call's id when the projection carried it — the engine's verbatim u64 number projection."
+                  },
+                  "conversationId": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The mutation's resolved local conversation — the id form the desktop addresses (the §4.85 ladder over the peerId); absent when the identity resolved to nothing (the desktop joins by peerId alone)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "account.deviceNameChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "deviceId"],
+                "description": "One device-name-change sync forwarded (contract 1.106, §4.87): the engine's syncMessage.deviceNameChange projection — the account renamed one linked device, the official handleDeviceNameChangeSync face. Pure trigger semantics: the official handler compares the deviceId against its own local device id and no-ops for the others, so the comparison stays the desktop's. The id is hard-gated present in u32 range (the official's own absent-key drop); transient.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "deviceId": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295,
+                    "description": "The renamed linked device's id — the projection's verbatim u32, forwarded for the desktop's own local-device comparison."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "account.usernameChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "One username-change sync forwarded (contract 1.106, §4.87): the engine's syncMessage.usernameChange projection — the account's own linked device changed the username, the official handleUsernameChangeSync face. The projection is an empty pure-signal sync (the engine projects {}) and the event carries the fact alone: the new value converges through the host's own profile read. Transient.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "identity.pniChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "One PNI change-number sync forwarded (contract 1.106, §4.87): the engine's syncMessage.pniChangeNumber projection — the account's own number re-registration moved its PNI identity, the official handlePNIChangeNumber face. No mirror by the identity-face discipline: the official re-keys from the sync's key material, the engine keeps that material inside its boundary (the backup-key discipline), and a connector-side partial mirror would be a crippled second authority. Only the engine's stripped face rides ({registrationId?, newE164?}, at least one guaranteed — a zero-content sync never leaves the plain syncMessage skip); the official's own identity reads stay the reconciliation path.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "registrationId": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295,
+                    "description": "The new PNI identity's registration id when the projection carried it."
+                  },
+                  "newE164": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The account's new number when the projection carried it."
                   }
                 }
               }

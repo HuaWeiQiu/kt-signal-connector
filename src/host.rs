@@ -3115,6 +3115,154 @@ where
             }
             send_shared(writer, &HostEvent::new("call.historyEvent", payload)).await
         }
+        HostSideEvent::SettingsConfigurationSync {
+            account_id,
+            read_receipts,
+            unidentified_delivery_indicators,
+            typing_indicators,
+            link_previews,
+        } => {
+            // Contract 1.106, §4.87: the flags forward flat with the
+            // absent-optional discipline — a flag the projection did not
+            // carry stays an absent key (the parse guarantees at least one
+            // survivor).
+            let mut payload = json!({ "accountId": account_id });
+            if let Some(flag) = read_receipts {
+                payload["readReceipts"] = json!(flag);
+            }
+            if let Some(flag) = unidentified_delivery_indicators {
+                payload["unidentifiedDeliveryIndicators"] = json!(flag);
+            }
+            if let Some(flag) = typing_indicators {
+                payload["typingIndicators"] = json!(flag);
+            }
+            if let Some(flag) = link_previews {
+                payload["linkPreviews"] = json!(flag);
+            }
+            send_shared(
+                writer,
+                &HostEvent::new("settings.configurationSync", payload),
+            )
+            .await
+        }
+        HostSideEvent::FetchLatestSync {
+            account_id,
+            kind,
+        } => {
+            // Contract 1.106, §4.87: the trigger forwards flat — the
+            // SCREAMING word rides verbatim when the projection carried it,
+            // absent otherwise (the official fires the same type-less event).
+            let mut payload = json!({ "accountId": account_id });
+            if let Some(kind) = kind {
+                payload["type"] = json!(kind);
+            }
+            send_shared(writer, &HostEvent::new("sync.fetchLatest", payload)).await
+        }
+        HostSideEvent::CallLinkUpdate {
+            account_id,
+            kind,
+            root_key,
+            admin_key,
+        } => {
+            // Contract 1.106, §4.87: the record forwards flat — the verb is
+            // the parser's single-member whitelist verbatim, the root key is
+            // the hard-gated subject, the admin key rides only when the
+            // projection carried it. The material is never touched beyond
+            // the pass-through (the §4.73 zero-parsing discipline).
+            let mut payload = json!({
+                "accountId": account_id,
+                "type": kind,
+                "rootKey": root_key,
+            });
+            if let Some(key) = admin_key {
+                payload["adminKey"] = json!(key);
+            }
+            send_shared(writer, &HostEvent::new("call.linkUpdate", payload)).await
+        }
+        HostSideEvent::CallLogEvent {
+            account_id,
+            kind,
+            timestamp,
+            conversation_id,
+            call_id,
+            resolved_conversation_id,
+        } => {
+            // Contract 1.106, §4.87: the mutation forwards flat — the verb
+            // is the parser's hard-gated whitelist member, the projection's
+            // own keys ride verbatim (absent staying absent). The raw
+            // conversation identity rides `peerId` (the official
+            // CallLogEventDetails name — the desktop's own official join
+            // reads it), and the §4.85-ladder hit rides `conversationId` —
+            // across the whole event surface that key always means the
+            // resolved local conversation id, so the desktop can take the
+            // shortcut or run its own join.
+            let mut payload = json!({
+                "accountId": account_id,
+                "type": kind,
+            });
+            if let Some(timestamp) = timestamp {
+                payload["timestamp"] = json!(timestamp);
+            }
+            if let Some(identity) = conversation_id {
+                payload["peerId"] = json!(identity);
+            }
+            if let Some(call_id) = call_id {
+                payload["callId"] = json!(call_id);
+            }
+            if let Some(conversation_id) = resolved_conversation_id {
+                payload["conversationId"] = json!(conversation_id);
+            }
+            send_shared(writer, &HostEvent::new("call.logEvent", payload)).await
+        }
+        HostSideEvent::DeviceNameChanged {
+            account_id,
+            device_id,
+        } => {
+            // Contract 1.106, §4.87: the id forwards flat; the local-device
+            // comparison stays the desktop's.
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "account.deviceNameChanged",
+                    json!({
+                        "accountId": account_id,
+                        "deviceId": device_id,
+                    }),
+                ),
+            )
+            .await
+        }
+        HostSideEvent::UsernameChanged { account_id } => {
+            // Contract 1.106, §4.87: the empty pure-signal sync forwards as
+            // the fact alone; the new value converges through the host's own
+            // profile read.
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "account.usernameChanged",
+                    json!({ "accountId": account_id }),
+                ),
+            )
+            .await
+        }
+        HostSideEvent::PniChanged {
+            account_id,
+            registration_id,
+            new_e164,
+        } => {
+            // Contract 1.106, §4.87: the stripped face forwards flat with
+            // the absent-optional discipline (the parse guarantees at least
+            // one survivor; the key material never crossed the engine
+            // boundary and the event carries none either).
+            let mut payload = json!({ "accountId": account_id });
+            if let Some(id) = registration_id {
+                payload["registrationId"] = json!(id);
+            }
+            if let Some(number) = new_e164 {
+                payload["newE164"] = json!(number);
+            }
+            send_shared(writer, &HostEvent::new("identity.pniChanged", payload)).await
+        }
     }
 }
 
@@ -4202,6 +4350,234 @@ mod tests {
         assert!(frame["data"].get("type").is_none());
         assert!(frame["data"].get("direction").is_none());
         assert!(frame["data"].get("event").is_none());
+        assert!(frame["data"].get("conversationId").is_none());
+    }
+
+    /// Contract 1.106 (§4.87): the account-level sync frames ride flat with
+    /// the absent-optional discipline — the configuration flags exist only
+    /// when the projection carried them, the fetch-latest word likewise, and
+    /// the device-name/username/PNI frames carry their facts alone.
+    #[tokio::test]
+    async fn account_level_sync_events_ride_flat() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::SettingsConfigurationSync {
+                account_id: "acct-1".into(),
+                read_receipts: None,
+                unidentified_delivery_indicators: Some(true),
+                typing_indicators: None,
+                link_previews: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::FetchLatestSync {
+                account_id: "acct-1".into(),
+                kind: Some("STORAGE_MANIFEST"),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::FetchLatestSync {
+                account_id: "acct-1".into(),
+                kind: None,
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::DeviceNameChanged {
+                account_id: "acct-1".into(),
+                device_id: 3,
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::UsernameChanged {
+                account_id: "acct-1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::PniChanged {
+                account_id: "acct-1".into(),
+                registration_id: Some(2718),
+                new_e164: Some("+15555550199".into()),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::PniChanged {
+                account_id: "acct-1".into(),
+                registration_id: None,
+                new_e164: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut lines = Framed::new(&mut server, LinesCodec::new());
+        macro_rules! next_frame {
+            () => {{
+                let line = timeout(Duration::from_millis(500), lines.next())
+                    .await
+                    .expect("the event frame must flush")
+                    .unwrap()
+                    .unwrap();
+                let frame: Value = serde_json::from_str(&line).unwrap();
+                frame
+            }};
+        }
+
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "settings.configurationSync");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["unidentifiedDeliveryIndicators"], true);
+        assert_eq!(frame["data"]["linkPreviews"], false);
+        assert!(frame["data"].get("readReceipts").is_none());
+        assert!(frame["data"].get("typingIndicators").is_none());
+
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "sync.fetchLatest");
+        assert_eq!(frame["data"]["type"], "STORAGE_MANIFEST");
+
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "sync.fetchLatest");
+        assert!(frame["data"].get("type").is_none());
+
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "account.deviceNameChanged");
+        assert_eq!(frame["data"]["deviceId"], 3);
+
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "account.usernameChanged");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "identity.pniChanged");
+        assert_eq!(frame["data"]["registrationId"], 2718);
+        assert_eq!(frame["data"]["newE164"], "+15555550199");
+
+        // The parse guarantees at least one PNI key, but the wire discipline
+        // is conditional-insert either way: an absent-both face would carry
+        // the bare accountId (the schema pins the parse guarantee, not the
+        // serializer).
+        let frame = next_frame!();
+        assert_eq!(frame["event"], "identity.pniChanged");
+        assert!(frame["data"].get("registrationId").is_none());
+        assert!(frame["data"].get("newE164").is_none());
+    }
+
+    /// Contract 1.106 (§4.87): the data-plane sync frames ride flat — the
+    /// call-link update carries its verb and verbatim material, the call-log
+    /// mutation carries its verb, the raw `peerId` and the resolved
+    /// `conversationId` beside it.
+    #[tokio::test]
+    async fn data_plane_sync_events_ride_flat() {
+        let (client, mut server) = duplex(64 * 1024);
+        let framed = Framed::new(client, LinesCodec::new());
+        let (sink, _stream) = framed.split();
+        let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+        send_host_event(
+            &writer,
+            HostSideEvent::CallLinkUpdate {
+                account_id: "acct-1".into(),
+                kind: "UPDATE",
+                root_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                admin_key: Some("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=".into()),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::CallLogEvent {
+                account_id: "acct-1".into(),
+                kind: "MARKED_AS_READ",
+                timestamp: Some(1726999999000),
+                conversation_id: Some("11111111-1111-1111-1111-111111111111".into()),
+                call_id: Some(18446744073709551615),
+                resolved_conversation_id: Some("conv-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+        send_host_event(
+            &writer,
+            HostSideEvent::CallLogEvent {
+                account_id: "acct-1".into(),
+                kind: "CLEAR",
+                timestamp: None,
+                conversation_id: None,
+                call_id: None,
+                resolved_conversation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut lines = Framed::new(&mut server, LinesCodec::new());
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the event frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "call.linkUpdate");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["type"], "UPDATE");
+        assert_eq!(
+            frame["data"]["rootKey"],
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(
+            frame["data"]["adminKey"],
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB="
+        );
+
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the second frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["event"], "call.logEvent");
+        assert_eq!(frame["data"]["type"], "MARKED_AS_READ");
+        assert_eq!(frame["data"]["timestamp"], 1726999999000u64);
+        assert_eq!(
+            frame["data"]["peerId"],
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(frame["data"]["callId"], u64::MAX);
+        assert_eq!(frame["data"]["conversationId"], "conv-1");
+
+        let line = timeout(Duration::from_millis(500), lines.next())
+            .await
+            .expect("the third frame must flush")
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(frame["data"]["type"], "CLEAR");
+        // The absent-optional discipline: an unprojected mutation carries
+        // only its verb.
+        assert!(frame["data"].get("timestamp").is_none());
+        assert!(frame["data"].get("peerId").is_none());
+        assert!(frame["data"].get("callId").is_none());
         assert!(frame["data"].get("conversationId").is_none());
     }
 }
