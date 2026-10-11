@@ -8999,6 +8999,79 @@ the §4.97 section gains its inbound leg through the same
 ControlReceive interception family the other record-sync faces use
 (the §4.81–§4.87 pattern), and this section's gap closes.
 
+### 4.114 The four engine notifications wait at the door: the emptied / clockskew / groupTerminated / contactProfileUpdated forwarding batch (verification record, 2026-10-12)
+
+The engine's window-D/G batches shipped four account-scoped stream
+notifications the connector does not consume yet. This section records
+the verified emit faces and the current connector-side consumption
+(today: all four dropped) so the forwarding batch can wire them
+without re-deriving the engine side. No connector code, no schema
+change, no capability tag, no contract revision this round.
+
+**The emit faces** (kt-signal-engine `src/service/mod.rs`, verified
+2026-10-12):
+
+- `receive.emptied` `{account}` (line ~4046) — the history-queue
+  drained (`Received::QueueEmpty`, the official
+  ApiEmptyQueue→EmptyEvent peer); emitted once per drain at :4766.
+  Standalone JSON-RPC method.
+- `receive.clockskew` `{account, skewMs, serverTimestamp}` (line
+  ~4118) — the local clock sits more than the official 24h threshold
+  from the server stamp; edge-triggered (one alert per threshold
+  crossing, sustained skew silent). Standalone method.
+- `contactProfileUpdated` `{aci}` (line ~5839) — a peer's
+  profileKeyUpdate batch landed a new profile key in the engine's
+  store; rides the `receive` envelope as a key (the
+  `identityChanged` shape family).
+- `groupTerminated` `{groupId, terminator?, timestamp}` (line ~5687) —
+  a decrypted group-change names the group terminated; the engine
+  replaces the whole envelope with the event (change-only projection,
+  `receive_projects_group_terminated_change_only`).
+
+**The current consumption.** The two standalone methods fall into the
+`handle_upstream_line` default arm and answer
+`ProtocolWarning::unknownNotification` — warned, dropped. The two
+envelope keys match no `control_routing` arm and land in
+`normalize_receive_fields`'s terminal default as `direction: "skip"`
+receives — silently dropped by the service layer. Nothing of the four
+reaches a host frame today.
+
+**The wiring plan** (the batch this section front-runs):
+
+1. The two envelope keys join the `control_routing` ladder as
+   `ControlReceive` variants — `groupTerminated` routes by its own
+   groupId (the conversation-less transient family like `story`,
+   though the groupId names its subject), `contactProfileUpdated` is
+   conversation-less (the `aci` names its subject); the service layer
+   forwards both as transient host events through the §4.67
+   `StoryReceived` shape (no row, nothing persisted).
+2. The two standalone methods need the account-scoped transient-event
+   lane that does not exist yet: `EngineEvent` today carries only
+   group-level facts, and the one account-scoped precedent
+   (`AccountUnauthorized`) is consumed by the supervisor's unlink
+   watcher, not projected to a host frame. The lane: a new attributed
+   event variant carrying the signal account, resolved to the
+   connector's opaque `accountId` through the store (the
+   `accountUnbound` attribution discipline — a malformed or unmatchable
+   account stays unattributed and warn-only), then the host frame.
+3. The host frames: transient events on the shared host event stream
+   (`receive.emptied` / `receive.clockSkew` /
+   `contact.profileUpdated` / `group.terminated` provisional names,
+   §4.74 naming family), schema event definitions with the
+   `$defs` shapes, the fixture branches emitting all four (the
+   crash-sentry discipline does not apply — notifications are not
+   request/response), and the four-lane test set (pass-through, error
+   face, local gate n/a — the events carry no request, crash n/a —
+   the engine staying alive is the assertion).
+
+**The disposition.** Deferred as a scoped batch, not a gap: the engine
+side is complete and stable (the shapes above), the connector side is
+planned to the arm level. The next storage/notification batch picks
+this section up; until then the four notifications keep their current
+drop behavior, which is safe (nothing is lost that the desktop waits
+for — queue-drain and skew are advisory; profile-key and
+group-termination refreshes ride the next full pull).
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
