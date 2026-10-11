@@ -23,22 +23,23 @@ use crate::service::{
     AccountsGetDevicesParams, AccountsGetUsernameParams, AccountsSetExpireTimerParams,
     AccountsSetProfileParams, AccountsSetUsernameParams, AccountsUnlinkDeviceParams,
     AccountsUpdateConfigurationParams, AttachmentSendTarget, AvatarDownload, BlockedConversations,
-    CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFolderSyncs, ChatFoldersListParams,
-    ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome, ConversationState,
-    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
-    ConversationsGetStateParams, ConversationsSetBlockedParams, ConversationsSetExpireTimerParams,
-    ConversationsSetExpireTimerResult, ConversationsSetPinnedParams, ConversationsSetStateParams,
-    DeviceList, GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES,
-    GroupDetails, GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword,
-    GroupInviteLinkPreview, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
-    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsCreateResult,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
-    GroupsMigrateResult, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
-    GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
-    IdentityRead, IdentityVerifyOutcome, MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS,
-    MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS, MediaChunkView, MediaCloseView, MediaIngest,
-    MediaOpenView, MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeParams,
+    CallLinkSyncs, CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFolderSyncs,
+    ChatFoldersListParams, ChatFoldersSetRecordsParams, ConnectorService, ContactsSyncOutcome,
+    ConversationState, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
+    ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetExpireTimerResult,
+    ConversationsSetPinnedParams, ConversationsSetStateParams, DeviceList,
+    GROUP_MEMBER_LABEL_EMOJI_MAX_BYTES, GROUP_MEMBER_LABEL_SERVER_MAX_BYTES, GroupDetails,
+    GroupInviteLink, GroupInviteLinkParse, GroupInviteLinkPassword, GroupInviteLinkPreview,
+    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
+    GroupsCreateParams, GroupsCreateResult, GroupsInviteLinkPasswordParams,
+    GroupsJoinViaLinkParams, GroupsMigrateParams, GroupsMigrateResult, GroupsParseInviteLinkParams,
+    GroupsPreviewViaLinkParams, GroupsQuitParams, GroupsRevokeInvitesParams, GroupsTerminateParams,
+    GroupsUpdateParams, HistoryAttachmentDownloadView, HostSideEvent, IdentitiesGetParams,
+    IdentitiesVerifyParams, IdentityRead, IdentityVerifyOutcome, ImportGroupsSummary,
+    MAX_AVATAR_DATA_URI_CHARS, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS, MAX_STORY_RECIPIENTS,
+    MediaChunkView, MediaCloseView, MediaIngest, MediaOpenView, MergeContactsSummary,
+    MessageRequestOutcome, MessageRequestParams, MessagesDeleteForMeParams,
     MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
     MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
     MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
@@ -46,16 +47,18 @@ use crate::service::{
     PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
     SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
     StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs, StoriesDisabled,
+    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
+    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
     StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
     StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
     StoryDistributionListsSetRecordsParams, StorySendRecipientResult, StorySendResult,
     StorySendSuccess, UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
     account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
-    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
-    group_create_result_from_engine, group_invite_join_status_from_engine,
+    call_link_syncs_result, chat_folder_syncs_result, conversation_state_from_engine,
+    device_list_from_engine, group_create_result_from_engine, group_invite_join_status_from_engine,
     group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
     group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
+    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
     notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
     store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
     store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
@@ -3257,6 +3260,99 @@ impl RuntimeSupervisor {
             Ok(result) => Ok(story_distribution_lists_result(
                 result
                     .get("lists")
+                    .and_then(Value::as_array)
+                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            )),
+            Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
+                "SEND_OUTCOME_UNKNOWN",
+                "mutating request has an unknown outcome",
+                false,
+            ))),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// storage.mergeContacts (contract revision 1.131, §4.112): the
+    /// engine-local ingest read — account resolution under the service
+    /// lock, then the read-only engine call; the summary tallies ride
+    /// verbatim (the contacts.sync class: the ingest lands engine state, so
+    /// the account mutex serializes it).
+    pub async fn storage_merge_contacts(
+        &self,
+        params: StorageIngestParams,
+    ) -> Result<MergeContactsSummary, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_storage_ingest_read(&params.account_id)?
+        };
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("storage.mergeContacts", upstream, CallClass::ReadOnly)
+            .await?;
+        merge_contacts_summary_from_engine(result)
+    }
+
+    /// storage.importGroups (contract revision 1.131, §4.112): the
+    /// mergeContacts class verbatim — the manifest GROUPV2 ingest read, the
+    /// summary tallies ride verbatim.
+    pub async fn storage_import_groups(
+        &self,
+        params: StorageIngestParams,
+    ) -> Result<ImportGroupsSummary, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_storage_ingest_read(&params.account_id)?
+        };
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("storage.importGroups", upstream, CallClass::ReadOnly)
+            .await?;
+        import_groups_summary_from_engine(result)
+    }
+
+    /// storage.getCallLinks (contract revision 1.131, §4.112): the bounded
+    /// cloud read — the link list projects straight from the engine result
+    /// with the KT entry cap, entry bodies verbatim.
+    pub async fn storage_get_call_links(
+        &self,
+        params: StorageGetCallLinksParams,
+    ) -> Result<CallLinkSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_storage_ingest_read(&params.account_id)?
+        };
+        let engine = self.running_engine().await?;
+        let result = engine
+            .call("storage.getCallLinks", upstream, CallClass::ReadOnly)
+            .await?;
+        Ok(call_link_syncs_result(
+            result
+                .get("callLinks")
+                .and_then(Value::as_array)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        ))
+    }
+
+    /// storage.setCallLink (contract revision 1.131, §4.112): the intent
+    /// gates under the service lock, then the mutating engine call — the
+    /// reaction-class unknown-outcome discipline; the success result is the
+    /// post-write cloud state read back, not a local echo.
+    pub async fn storage_set_call_link(
+        &self,
+        params: StorageSetCallLinkParams,
+    ) -> Result<CallLinkSyncs, ServiceError> {
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_storage_set_call_link(&params)?
+        };
+        let engine = self.running_engine().await?;
+        match engine
+            .call("storage.setCallLink", upstream, CallClass::Mutating)
+            .await
+        {
+            Ok(result) => Ok(call_link_syncs_result(
+                result
+                    .get("callLinks")
                     .and_then(Value::as_array)
                     .ok_or(ServiceError::Engine(EngineError::Protocol))?,
             )),

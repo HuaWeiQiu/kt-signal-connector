@@ -315,6 +315,22 @@ STORY_LIST_STATE = [
         "isBlockList": False,
     },
 ]
+# Contract 1.131 storage sync fixture state: the call-link projection — the
+# engine's {rootKey, adminPasskey, deletedAtTimestampMs} face (keys ride
+# null when absent); storage.setCallLink upserts by rootKey in place so a
+# read-back after a write observes the write.
+CALL_LINK_STATE = [
+    {
+        "rootKey": "Zml4dHVyZS1jYWxsLWxpbmtcm9vdGtleTE=",
+        "adminPasskey": "cGFzc2tleS1ieXRlcy0xNg==",
+        "deletedAtTimestampMs": None,
+    },
+    {
+        "rootKey": "Zml4dHVyZS10b21ic3RvbmUtbGluaw==",
+        "adminPasskey": None,
+        "deletedAtTimestampMs": 1720000600000,
+    },
+]
 # Contract 1.48 §4.47 avatar fixture: a tiny PNG magic payload — the engine
 # sniffs the MIME from the magic bytes and answers a data URI plus the
 # decoded byte count; getAvatar's sentinel conversationId answers the
@@ -1632,6 +1648,151 @@ for line in sys.stdin:
                     lists.append(record)
             STORY_LIST_STATE[:] = lists
         result = {"lists": list(STORY_LIST_STATE)}
+    elif method in ("storage.mergeContacts", "storage.importGroups"):
+        # Contract 1.131 storage ingest reads: the engine's own camelCase
+        # summary tallies (non-zero here so the pass-through test pins the
+        # verbatim key face). Account gate mirrors the engine (-32603 on an
+        # unregistered account); the structured ladder steers from markers:
+        # `.fixture-storage-sync-read-failed` answers STORAGE_READ_FAILED,
+        # `.fixture-storage-sync-unavailable` answers STORAGE_UNAVAILABLE.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        for marker, code in (
+            (".fixture-storage-sync-read-failed", "STORAGE_READ_FAILED"),
+            (".fixture-storage-sync-unavailable", "STORAGE_UNAVAILABLE"),
+        ):
+            if (SIGNAL_DATA_DIR / marker).exists():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": code},
+                }
+                emit_json(response)
+                continue
+        if method == "storage.mergeContacts":
+            result = {
+                "recordsRead": 12,
+                "skipped": 1,
+                "identitiesNew": 3,
+                "identitiesReplaced": 0,
+                "profileKeysSet": 2,
+                "contactsCreated": 4,
+                "trustStatesSynced": 5,
+            }
+        else:
+            result = {"recordsRead": 7, "imported": 5, "alreadyKnown": 1, "failed": 1}
+    elif method == "storage.getCallLinks":
+        # Contract 1.131 call-link read: the projection as a fixture
+        # constant (one live link with an admin passkey + one tombstoned
+        # link without). Account gate and markers as the ingest reads.
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        for marker, code in (
+            (".fixture-storage-sync-read-failed", "STORAGE_READ_FAILED"),
+            (".fixture-storage-sync-unavailable", "STORAGE_UNAVAILABLE"),
+        ):
+            if (SIGNAL_DATA_DIR / marker).exists():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": code},
+                }
+                emit_json(response)
+                continue
+        result = {"callLinks": list(CALL_LINK_STATE)}
+    elif method == "storage.setCallLink":
+        # Contract 1.131 call-link write: record the exact upstream params
+        # (tests assert the resolved account, the verbatim rootKey, and the
+        # arms-only-when-present contract), upsert by rootKey in place, and
+        # answer the post-write cloud state. Markers:
+        # `.fixture-storage-sync-write-failed` answers STORAGE_WRITE_FAILED,
+        # `.fixture-storage-sync-read-failed` answers STORAGE_READ_FAILED
+        # (the engine reads before it writes),
+        # `.fixture-storage-sync-unavailable` answers STORAGE_UNAVAILABLE.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            numbers = {
+                entry.get("number")
+                for entry in state.get("accounts") or []
+            }
+        except (OSError, ValueError, AttributeError):
+            numbers = set()
+        if params.get("account") not in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "account is not registered"},
+            }
+            emit_json(response)
+            continue
+        for marker, code in (
+            (".fixture-storage-sync-write-failed", "STORAGE_WRITE_FAILED"),
+            (".fixture-storage-sync-read-failed", "STORAGE_READ_FAILED"),
+            (".fixture-storage-sync-unavailable", "STORAGE_UNAVAILABLE"),
+        ):
+            if (SIGNAL_DATA_DIR / marker).exists():
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -1, "message": code},
+                }
+                emit_json(response)
+                continue
+        # The mutating-crash sentinel (rootKey magic; exit 31 = the shared
+        # mutating-in-flight crash code, disjoint from every other face by
+        # trigger): the connector must answer SEND_OUTCOME_UNKNOWN and never
+        # retry.
+        if params.get("rootKey") == "Zml4dHVyZS1jcmFzaC0zMg==":
+            os._exit(31)
+        with WRITE_LOCK:
+            links = [
+                entry
+                for entry in CALL_LINK_STATE
+                if entry["rootKey"] != params.get("rootKey")
+            ]
+            links.append(
+                {
+                    "rootKey": params.get("rootKey"),
+                    "adminPasskey": params.get("adminPasskey"),
+                    "deletedAtTimestampMs": params.get("deletedAtTimestampMs"),
+                }
+            )
+            CALL_LINK_STATE[:] = links
+        result = {"callLinks": list(CALL_LINK_STATE)}
     elif method == "setAccountConfiguration":
         # Contract 1.46 §4.45 account settings write: record the exact
         # upstream params (tests assert only the provided keys appear — the

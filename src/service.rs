@@ -120,6 +120,13 @@ pub const MAX_NOTIFICATION_PROFILE_ID_CHARS: usize = 128;
 pub const MAX_STORY_DISTRIBUTION_LISTS: usize = 64;
 pub const MAX_STORY_LIST_BATCH: usize = 64;
 pub const MAX_STORY_LIST_ID_CHARS: usize = 128;
+/// Storage merge/import/call-link bounds (contract revision 1.131,
+/// §4.112): the merge/import faces are single-parameter summary reads with
+/// no batch to bound; the call-link faces carry the §4.78 bounds verbatim —
+/// the returned link list capped at 64, the per-link key bound 128
+/// characters (identity face only; the key grammars stay the engine's).
+pub const MAX_CALL_LINK_SYNCS: usize = 64;
+pub const MAX_CALL_LINK_KEY_CHARS: usize = 128;
 /// Account settings bounds (contract revision 1.46, §4.45): the profile text
 /// budgets mirror the official desktop ProfileEditor (v8.31
 /// `ts/components/ProfileEditor.dom.tsx`) — both name components maxBytes 128,
@@ -4307,6 +4314,93 @@ impl ConnectorService {
                         .collect(),
                 ),
             );
+        }
+        Ok(Value::Object(upstream))
+    }
+
+    /// storage.mergeContacts / storage.importGroups / storage.getCallLinks
+    /// (contract revision 1.131, §4.112): the single-parameter ladder —
+    /// account bounds and resolution, the service reads nothing locally.
+    /// mergeContacts/importGroups are engine-local ingest reads (the
+    /// engine's own Storage Service contact/group merge); getCallLinks is
+    /// the cloud call-link read. The record grammars stay the engine's.
+    pub fn prepare_storage_ingest_read(&self, account_id: &str) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({ "account": account.signal_account }))
+    }
+
+    /// storage.setCallLink (contract revision 1.131, §4.112): the local
+    /// intent gates before any upstream call — the rootKey identity face
+    /// (non-empty, bounded 128 characters; the 32-byte base64 grammar stays
+    /// the engine's), the optional arms shape-gated (adminPasskey string,
+    /// deletedAtTimestampMs a positive integer — 0 is the engine's own
+    /// no-action refusal mirrored), and the exactly-one intent rule (both
+    /// arms present is the official same-position contradiction, neither is
+    /// the empty intent the official upload never writes). The frame
+    /// carries only the provided arms; null folds to absent (the engine
+    /// reads both the same way).
+    pub fn prepare_storage_set_call_link(
+        &self,
+        params: &StorageSetCallLinkParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if params.root_key.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "rootKey is required",
+                false,
+            )));
+        }
+        if params.root_key.chars().count() > MAX_CALL_LINK_KEY_CHARS {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "rootKey exceeds 128 characters",
+                false,
+            )));
+        }
+        if let Some(passkey) = params.admin_passkey.as_deref()
+            && (passkey.is_empty() || passkey.chars().count() > MAX_CALL_LINK_KEY_CHARS)
+        {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "adminPasskey must be a non-empty string of at most 128 characters",
+                false,
+            )));
+        }
+        if params.deleted_at_timestamp_ms == Some(0) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "deletedAtTimestampMs must be a positive integer (0 carries no delete intent)",
+                false,
+            )));
+        }
+        if params.admin_passkey.is_some() && params.deleted_at_timestamp_ms.is_some() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "adminPasskey and deletedAtTimestampMs are contradictory intents; send exactly one",
+                false,
+            )));
+        }
+        if params.admin_passkey.is_none() && params.deleted_at_timestamp_ms.is_none() {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "one of adminPasskey, deletedAtTimestampMs is required",
+                false,
+            )));
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let mut upstream = serde_json::Map::new();
+        upstream.insert(
+            "account".into(),
+            Value::String(account.signal_account.clone()),
+        );
+        upstream.insert("rootKey".into(), Value::String(params.root_key.clone()));
+        if let Some(passkey) = params.admin_passkey.as_deref() {
+            upstream.insert("adminPasskey".into(), Value::String(passkey.to_string()));
+        }
+        if let Some(stamp) = params.deleted_at_timestamp_ms {
+            upstream.insert("deletedAtTimestampMs".into(), json!(stamp));
         }
         Ok(Value::Object(upstream))
     }
@@ -10387,6 +10481,57 @@ pub struct StoryDistributionListSyncs {
     pub lists: Vec<Value>,
 }
 
+/// The §4.112 result of `storage.mergeContacts`: the engine's ingest
+/// summary verbatim — the official mergeContactRecord engine leg's
+/// per-record tallies (camelCase wire keys, the engine's own numbers).
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeContactsSummary {
+    #[serde(default)]
+    pub records_read: u64,
+    #[serde(default)]
+    pub skipped: u64,
+    #[serde(default)]
+    pub identities_new: u64,
+    #[serde(default)]
+    pub identities_replaced: u64,
+    #[serde(default)]
+    pub profile_keys_set: u64,
+    #[serde(default)]
+    pub contacts_created: u64,
+    #[serde(default)]
+    pub trust_states_synced: u64,
+}
+
+/// The §4.112 result of `storage.importGroups`: the engine's import
+/// summary verbatim — the official mergeGroupV2Record engine leg's
+/// manifest tallies.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportGroupsSummary {
+    #[serde(default)]
+    pub records_read: u64,
+    #[serde(default)]
+    pub imported: u64,
+    #[serde(default)]
+    pub already_known: u64,
+    #[serde(default)]
+    pub failed: u64,
+}
+
+/// The §4.112 result shape shared by `storage.getCallLinks` and
+/// `storage.setCallLink`: the engine's call-link sync entries verbatim, in
+/// storage order, capped at [`MAX_CALL_LINK_SYNCS`]. Each entry is the
+/// engine's `{rootKey (standard base64), adminPasskey (base64 or null),
+/// deletedAtTimestampMs (u64 or null)}` — the connector neither interprets
+/// nor re-keys it; an entry without a usable `rootKey` (a non-empty
+/// string) drops rather than half-carries, the §4.34 identity discipline.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallLinkSyncs {
+    pub call_links: Vec<Value>,
+}
+
 /// One blocked-conversation entry of the §4.45 result: the storage record's
 /// blocked-bit projection, the same shape and kind taxonomy as the §4.33
 /// pinned entry. `blocked_at_timestamp_ms` rides the engine's 窗D B7
@@ -11323,6 +11468,37 @@ pub struct StoryDistributionListsSetRecordsParams {
     pub account_id: String,
     pub records: Option<Vec<Value>>,
     pub remove_ids: Option<Vec<String>>,
+}
+
+/// `storage.mergeContacts` / `storage.importGroups` params (contract
+/// revision 1.131, §4.112): single-parameter engine-local ingest reads.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageIngestParams {
+    pub account_id: String,
+}
+
+/// `storage.getCallLinks` params (contract revision 1.131, §4.112).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageGetCallLinksParams {
+    pub account_id: String,
+}
+
+/// `storage.setCallLink` params (contract revision 1.131, §4.112): the
+/// official toCallLinkRecord write posture — active = rootKey +
+/// adminPasskey, deleted = rootKey + deletedAtTimestampMs. The intent arms
+/// are exactly-one (both present is the official isBadRemoteData
+/// same-position contradiction; neither is the empty intent the official
+/// upload never writes) — the service enforces the pair and the value
+/// shapes before any upstream call; the key grammars stay the engine's.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StorageSetCallLinkParams {
+    pub account_id: String,
+    pub root_key: String,
+    pub admin_passkey: Option<String>,
+    pub deleted_at_timestamp_ms: Option<u64>,
 }
 
 /// `accounts.updateConfiguration` params (contract revision 1.46, §4.45):
@@ -13492,6 +13668,44 @@ pub(crate) fn story_distribution_lists_result(entries: &[Value]) -> StoryDistrib
         .cloned()
         .collect();
     StoryDistributionListSyncs { lists }
+}
+
+/// Project the engine's call-link sync list onto the wire shape with the KT
+/// entry cap (§4.112): storage order, entries beyond 64 truncated, entry
+/// bodies verbatim, an entry that is not an object carrying a non-empty
+/// string `rootKey` drops rather than half-carries.
+pub(crate) fn call_link_syncs_result(entries: &[Value]) -> CallLinkSyncs {
+    let call_links = entries
+        .iter()
+        .take(MAX_CALL_LINK_SYNCS)
+        .filter(|entry| {
+            entry
+                .get("rootKey")
+                .and_then(Value::as_str)
+                .is_some_and(|key| !key.is_empty())
+        })
+        .cloned()
+        .collect();
+    CallLinkSyncs { call_links }
+}
+
+/// Parse the engine's ingest summary (§4.112): the camelCase tallies ride
+/// verbatim; a missing key degrades to the struct default (the engine's
+/// own counters are total on every answer — the default only keeps the
+/// projection total for additive engine growth) while a wrong-typed key is
+/// the engine contract breaking and answers the protocol error.
+pub(crate) fn merge_contacts_summary_from_engine(
+    result: Value,
+) -> Result<MergeContactsSummary, ServiceError> {
+    serde_json::from_value(result)
+        .map_err(|_| ServiceError::Engine(crate::engine::EngineError::Protocol))
+}
+
+pub(crate) fn import_groups_summary_from_engine(
+    result: Value,
+) -> Result<ImportGroupsSummary, ServiceError> {
+    serde_json::from_value(result)
+        .map_err(|_| ServiceError::Engine(crate::engine::EngineError::Protocol))
 }
 
 /// Project the engine's blocked list onto the wire shape with the KT entry
@@ -19427,7 +19641,6 @@ mod tests {
         let (_temp, mut service) = service();
         let (account, _conversation) = linked_account_and_conversation(&mut service);
         let id = "0d6d50f5-7f9e-4a1b-9c2d-3e4f5a6b7c8d";
-
         // The read: the resolved upstream account rides alone.
         let params = service.prepare_chat_folders_list(&account.id).unwrap();
         assert_eq!(params["account"], "+15555550100");
@@ -19517,6 +19730,77 @@ mod tests {
             .prepare_chat_folders_list("no-such-account")
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// The storage.setCallLink intent ladder (contract revision 1.131,
+    /// §4.112): the exactly-one rule both ways, the zero-timestamp refusal,
+    /// the rootKey identity face, the arms-only-when-present frame, and the
+    /// resolved account riding instead of the store id.
+    #[test]
+    fn prepare_storage_set_call_link_gates_and_frame() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let params = |root_key: &str,
+                      admin_passkey: Option<&str>,
+                      deleted_at: Option<u64>|
+         -> StorageSetCallLinkParams {
+            StorageSetCallLinkParams {
+                account_id: account.id.clone(),
+                root_key: root_key.to_string(),
+                admin_passkey: admin_passkey.map(str::to_string),
+                deleted_at_timestamp_ms: deleted_at,
+            }
+        };
+        let invalid = |params: StorageSetCallLinkParams| {
+            let error = service
+                .prepare_storage_set_call_link(&params)
+                .err()
+                .unwrap()
+                .into_api();
+            assert_eq!(error.code, "INVALID_REQUEST");
+            assert!(!error.retryable);
+        };
+
+        // The exactly-one rule both ways (the official isBadRemoteData
+        // same-position contradiction and the empty intent the official
+        // upload never writes), the zero-timestamp no-action refusal, and
+        // the rootKey identity face (empty, over-bound).
+        invalid(params("c29tZS1yb290LWtleQ==", Some("cGFzcw=="), Some(1)));
+        invalid(params("c29tZS1yb290LWtleQ==", None, None));
+        invalid(params("c29tZS1yb290LWtleQ==", None, Some(0)));
+        invalid(params("", Some("cGFzcw=="), None));
+        invalid(params(&"a".repeat(129), Some("cGFzcw=="), None));
+        invalid(params("c29tZS1yb290LWtleQ==", Some(""), None));
+        invalid(params("c29tZS1yb290LWtleQ==", Some(&"a".repeat(129)), None));
+
+        // The active arm: account + rootKey + adminPasskey, no tombstone key.
+        let frame = service
+            .prepare_storage_set_call_link(&params("c29tZS1yb290LWtleQ==", Some("cGFzcw=="), None))
+            .unwrap();
+        assert_eq!(frame["account"], "+15555550100");
+        assert_eq!(frame["rootKey"], "c29tZS1yb290LWtleQ==");
+        assert_eq!(frame["adminPasskey"], "cGFzcw==");
+        assert!(frame.get("deletedAtTimestampMs").is_none());
+
+        // The delete arm: symmetric framing — the tombstone key rides, the
+        // passkey key stays absent.
+        let frame = service
+            .prepare_storage_set_call_link(&params("c29tZS1yb290LWtleQ==", None, Some(7)))
+            .unwrap();
+        assert_eq!(frame["account"], "+15555550100");
+        assert_eq!(frame["deletedAtTimestampMs"], 7);
+        assert!(frame.get("adminPasskey").is_none());
+
+        // The ingest read ladder: the resolved account rides alone, and the
+        // unknown account answers ACCOUNT_NOT_FOUND.
+        let frame = service.prepare_storage_ingest_read(&account.id).unwrap();
+        assert_eq!(frame, json!({ "account": "+15555550100" }));
+        let error = service
+            .prepare_storage_ingest_read("kt-acct-missing")
+            .err()
+            .unwrap()
+            .into_api();
+        assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
     }
 
     /// The chat-folder projection (contract revision 1.95, §4.78): storage

@@ -58,7 +58,8 @@ use crate::service::{
     MessagesSyncReadParams, MessagesSyncViewedParams, NotificationProfilesListParams,
     NotificationProfilesSetRecordsParams, PresenceSetTypingMessageParams, SendTarget,
     StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StickerPackSetSyncParams, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
     StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListsListParams,
     StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
@@ -2512,6 +2513,82 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid storyDistributionLists.setRecords params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "storage.mergeContacts" => {
+            match serde_json::from_value::<StorageIngestParams>(request.params) {
+                Ok(params) => match runtime.storage_merge_contacts(params).await {
+                    Ok(summary) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(summary).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid storage.mergeContacts params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "storage.importGroups" => {
+            match serde_json::from_value::<StorageIngestParams>(request.params) {
+                Ok(params) => match runtime.storage_import_groups(params).await {
+                    Ok(summary) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(summary).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid storage.importGroups params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "storage.getCallLinks" => {
+            match serde_json::from_value::<StorageGetCallLinksParams>(request.params) {
+                Ok(params) => match runtime.storage_get_call_links(params).await {
+                    Ok(links) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(links).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid storage.getCallLinks params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "storage.setCallLink" => {
+            match serde_json::from_value::<StorageSetCallLinkParams>(request.params) {
+                Ok(params) => match runtime.storage_set_call_link(params).await {
+                    Ok(links) => HostResponse::success(
+                        request_id,
+                        serde_json::to_value(links).unwrap_or(Value::Null),
+                    ),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid storage.setCallLink params",
                         false,
                     ),
                 ),

@@ -107,6 +107,10 @@
             "notificationProfiles.setRecords",
             "storyDistributionLists.list",
             "storyDistributionLists.setRecords",
+            "storage.mergeContacts",
+            "storage.importGroups",
+            "storage.getCallLinks",
+            "storage.setCallLink",
             "contacts.sync",
             "contacts.list",
             "groups.get",
@@ -575,6 +579,50 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/storyDistributionListsSetRecordsParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "storage.mergeContacts" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storageIngestParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "storage.importGroups" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storageIngestParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "storage.getCallLinks" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storageGetCallLinksParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "storage.setCallLink" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storageSetCallLinkParams" }
             }
           }
         },
@@ -2968,6 +3016,50 @@
             "maxLength": 128
           },
           "description": "The official deleteKey half of the write batch (KT bound 64 entries): list identifiers to remove from the manifest; optional \u2014 at least one of records / removeIds must be non-empty, enforced by the service."
+        }
+      }
+    },
+    "storageIngestParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Run one engine-local Storage Service ingest (contract revision 1.131, \u00a74.112, capability storage-sync): storage.mergeContacts walks the account's official ContactRecord set and merges it engine-side (identity keys into the identity store, trust states, profile keys, contact rows \u2014 the official mergeContactRecord engine leg, idempotent: a same-key rerun is a full no-op); storage.importGroups walks the manifest GROUPV2 records and lands the group state engine-side (the official mergeGroupV2Record engine leg: listGroups-ready groups, already-known groups skipped). Both answer the engine's own camelCase summary tallies verbatim \u2014 mergeContacts: {recordsRead, skipped, identitiesNew, identitiesReplaced, profileKeysSet, contactsCreated, trustStatesSynced}; importGroups: {recordsRead, imported, alreadyKnown, failed}. The connector adds no numbers and renames no keys. Read lane, account-scoped mutating (the ingest lands engine state, so the same-account mutex and delete barrier serialize it \u2014 the contacts.sync class), metrics contacts. Structured engine errors: STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Zero connector-side persistence.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "storageGetCallLinksParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Read the account's call links from the Storage Service (contract revision 1.131, \u00a74.112, capability storage-sync; the official mergeCallLinkRecord read leg): the result projects {callLinks: [entry...]} \u2014 each entry the engine's projection verbatim: {rootKey (standard base64, 32 bytes), adminPasskey (standard base64 or null \u2014 a link without an admin key is the official deleted-or-bad-remote posture), deletedAtTimestampMs (u64 or null; a non-null value is the tombstone)}. Entries the engine cannot decode drop engine-side; the connector caps the list at 64 entries (KT bound, overflow truncated) and drops entries missing rootKey. A cloud state with no call links answers {callLinks: []} \u2014 the empty state is the answer, not an error. Structured engine errors: STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Read lane, non-mutating; the connector persists nothing.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "storageSetCallLinkParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "rootKey"],
+      "description": "Write one call-link record (contract revision 1.131, \u00a74.112, capability storage-sync; the official toCallLinkRecord write leg): active = rootKey + adminPasskey, deleted = rootKey + deletedAtTimestampMs. The intent arms are exactly-one \u2014 both present is the official isBadRemoteData same-position contradiction and neither is the empty intent the official upload never writes (both INVALID_REQUEST before any upstream call); deletedAtTimestampMs must be a positive integer (0 carries no delete intent); rootKey is the identity face (non-empty, \u2264 128 chars \u2014 the 32-byte base64 grammar is the engine's definite -32603, never a local re-derivation). Only the provided arms ride the upstream frame; a null arm folds to absent (the engine reads both the same way). The result is the post-write cloud state {callLinks: [...]} read back \u2014 not a local echo. Send lane, account-scoped mutating: an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried. Structured engine errors: STORAGE_WRITE_FAILED / STORAGE_UNAVAILABLE / STORAGE_READ_FAILED passed through verbatim (retryable). Zero local persistence; the key bytes ride the one call they were asked for and are never logged or persisted connector-side.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "rootKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The call link's root key (standard base64 of the 32-byte root key on the official face) \u2014 the record's identity; forwarded verbatim, never logged."
+        },
+        "adminPasskey": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The admin passkey (standard base64) for the active-arm write; omit for the delete arm. Exactly one of adminPasskey / deletedAtTimestampMs must be present."
+        },
+        "deletedAtTimestampMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The tombstone timestamp for the delete-arm write (positive; 0 is refused \u2014 the engine reads 0 as no action); omit for the active arm. Exactly one of adminPasskey / deletedAtTimestampMs must be present."
         }
       }
     },

@@ -945,6 +945,41 @@ impl ProxyGroupRuntime {
             .await
     }
 
+    /// Storage merge/import/call-link faces (contract revision 1.131,
+    /// §4.112): the §4.78 routing shape — the storage session lives in the
+    /// account's owning engine, so all four route through its slot.
+    pub async fn storage_merge_contacts(
+        &self,
+        params: crate::service::StorageIngestParams,
+    ) -> Result<crate::service::MergeContactsSummary, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.storage_merge_contacts(params).await
+    }
+
+    pub async fn storage_import_groups(
+        &self,
+        params: crate::service::StorageIngestParams,
+    ) -> Result<crate::service::ImportGroupsSummary, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.storage_import_groups(params).await
+    }
+
+    pub async fn storage_get_call_links(
+        &self,
+        params: crate::service::StorageGetCallLinksParams,
+    ) -> Result<crate::service::CallLinkSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.storage_get_call_links(params).await
+    }
+
+    pub async fn storage_set_call_link(
+        &self,
+        params: crate::service::StorageSetCallLinkParams,
+    ) -> Result<crate::service::CallLinkSyncs, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.storage_set_call_link(params).await
+    }
+
     /// Account settings writes (contract 1.46, §4.45): account-record state —
     /// the writes live in the account's storage session, so all three route
     /// through the account's owning engine like every other mutating face.

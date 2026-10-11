@@ -535,6 +535,20 @@ pub const METHODS: &[MethodRow] = &[
         true,
         "send",
     ),
+    // Storage merge/import/call-link faces (contract revision 1.131,
+    // §4.112): storage.mergeContacts / storage.importGroups are the
+    // engine-local Storage Service ingest reads — the contacts.sync class
+    // (read lane, account-scoped mutating: the ingest lands engine state,
+    // so the same-account mutex and delete barrier serialize it; metrics
+    // contacts). storage.getCallLinks is the bounded cloud read;
+    // storage.setCallLink is the mutating storage-service write — the
+    // reaction class verbatim, unknown outcome answers SEND_OUTCOME_UNKNOWN
+    // and is never retried. KT-extension, no upstream counterpart;
+    // advertised through `storage-sync`.
+    ("storage.mergeContacts", Lane::Read, true, "contacts"),
+    ("storage.importGroups", Lane::Read, true, "contacts"),
+    ("storage.getCallLinks", Lane::Read, false, "read"),
+    ("storage.setCallLink", Lane::Send, true, "send"),
     // Read-only runtime diagnostic face (contract 1.97, §4.79): one payload
     // answering the whole chain — connector/engine versions plus the
     // engine's self-certification baseline, per-group data-dir and
@@ -689,7 +703,12 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// faces (`notificationProfiles.list` read over the account's
 /// NotificationProfile set plus the `notificationProfiles.setRecords`
 /// storage-service write — one capability for the read and write halves,
-/// the 1.53 appendix discipline); and `conversation-state` (contract
+/// the 1.53 appendix discipline); and `storage-sync` (contract revision
+/// 1.131) marks the §4.112 storage merge/import/call-link faces
+/// (`storage.mergeContacts` / `storage.importGroups` engine-local ingest
+/// reads plus `storage.getCallLinks` cloud read and `storage.setCallLink`
+/// write — one capability for the whole storage-sync family, the 1.53
+/// appendix discipline); and `conversation-state` (contract
 /// revision 1.116) marks the §4.97 conversation-state faces
 /// (`conversations.getState` read over the storage records'
 /// mutedUntilTimestamp/archived/markedUnread bits plus `conversations.setState`
@@ -765,6 +784,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "send-contact",
     "polls",
     "delete-for-me",
+    "storage-sync",
 ];
 
 #[cfg(test)]
@@ -819,6 +839,9 @@ mod tests {
             "chatFolders.list",
             "notificationProfiles.list",
             "storyDistributionLists.list",
+            "storage.mergeContacts",
+            "storage.importGroups",
+            "storage.getCallLinks",
             "groups.generateInviteLinkPassword",
             "groups.buildInviteLink",
             "groups.parseInviteLink",
@@ -887,6 +910,7 @@ mod tests {
             "chatFolders.setRecords",
             "notificationProfiles.setRecords",
             "storyDistributionLists.setRecords",
+            "storage.setCallLink",
             "messages.deleteForMe",
         ];
         let mutating = [
@@ -916,6 +940,8 @@ mod tests {
             "contacts.sync",
             "accounts.deviceCapabilities",
             "accounts.unlinkDevice",
+            "storage.mergeContacts",
+            "storage.importGroups",
             "contacts.setLocalAlias",
             "presence.setTypingMessage",
             "accounts.deleteLocalData",
@@ -955,6 +981,7 @@ mod tests {
             "chatFolders.setRecords",
             "notificationProfiles.setRecords",
             "storyDistributionLists.setRecords",
+            "storage.setCallLink",
             "messages.deleteForMe",
         ];
         for (name, row_lane, row_mutating, _) in METHODS {

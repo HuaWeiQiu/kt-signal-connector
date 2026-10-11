@@ -8867,6 +8867,86 @@ schema-consistency bound pairs and the server handshake advertisement.
 Gated behind the full local gate suite (fmt + clippy -D warnings +
 cargo test + release build), all green.
 
+### 4.112 The storage merge/import and call-link faces reach the host: `storage.mergeContacts` / `storage.importGroups` / `storage.getCallLinks` / `storage.setCallLink` (contract revision 1.131, 2026-10-12)
+
+The engine's window-D batches shipped the four storage-service faces the
+desktop's first-run and call-link surfaces walk: the official
+mergeContactRecord engine leg (`storage.mergeContacts` — the account's
+ContactRecord set merged engine-side: identity keys into the identity
+store, trust states, profile keys, contact rows; idempotent, a
+same-key rerun a full no-op), the official mergeGroupV2Record engine
+leg (`storage.importGroups` — the manifest GROUPV2 records landed
+listGroups-ready, already-known groups skipped), and the official call
+link record pair (`storage.getCallLinks` read leg /
+`storage.setCallLink` write leg). This batch wires all four into the
+host contract under one capability tag, `storage-sync` (the 1.34
+discipline; one capability for the whole storage-sync family, the 1.53
+appendix discipline). Until now the desktop had the record-list sync
+faces (§4.78/§4.110/§4.111) but no merge/import trigger and no
+call-link sync leg.
+
+**The shapes.** `storage.mergeContacts {accountId}` → the engine's
+camelCase summary verbatim — `{recordsRead, skipped, identitiesNew,
+identitiesReplaced, profileKeysSet, contactsCreated,
+trustStatesSynced}`; `storage.importGroups {accountId}` →
+`{recordsRead, imported, alreadyKnown, failed}`; the connector adds no
+numbers and renames no keys (a missing tally degrades to the struct
+default keeping the projection total for additive engine growth; a
+wrong-typed tally is the engine contract breaking and answers the
+protocol error). Both are the contacts.sync class: read lane,
+account-scoped mutating — the ingest lands engine state, so the
+same-account mutex and delete barrier serialize it — metrics
+`contacts`. `storage.getCallLinks {accountId}` → `{callLinks:
+[entry...]}`, each entry the engine's `{rootKey (standard base64, 32
+bytes), adminPasskey (base64 or null), deletedAtTimestampMs (u64 or
+null)}` verbatim, capped at `MAX_CALL_LINK_SYNCS` (64), entries
+without a usable `rootKey` dropping (the §4.34 discipline); read lane,
+non-mutating. `storage.setCallLink {accountId, rootKey,
+adminPasskey?, deletedAtTimestampMs?}` → the same `{callLinks: [...]}`
+post-write projection; send lane, account-scoped mutating, metrics
+`send`, the reaction class — an indeterminate outcome answers
+SEND_OUTCOME_UNKNOWN (retryable=false) and is never retried.
+
+**The local gates** (all INVALID_REQUEST, retryable=false, before any
+upstream call): the rootKey identity face (non-empty, bounded 128
+characters — the 32-byte base64 grammar stays the engine's definite
+-32603, never a local re-derivation); the arms shape-gated
+(adminPasskey a non-empty string ≤128, deletedAtTimestampMs a positive
+integer — 0 is the engine's own no-action refusal mirrored); and the
+exactly-one intent rule — both arms present is the official
+isBadRemoteData same-position contradiction, neither is the empty
+intent the official upload never writes. Only the provided arms ride
+the upstream frame; a null arm folds to absent (the engine reads both
+the same way). The key bytes ride the one call they were asked for and
+are never logged or persisted connector-side.
+
+**The error face** is the family contract verbatim: the engine's
+STORAGE_WRITE_FAILED / STORAGE_READ_FAILED / STORAGE_UNAVAILABLE ride
+the wire verbatim (retryable=true), the engine's `-32603` folds to
+UPSTREAM_ERROR (retryable=true), and the ladder order holds (shape
+gates → resolve_account → engine).
+
+Tests: the service unit pins the setCallLink intent ladder (the
+exactly-one rule both ways, the zero-timestamp refusal, the rootKey
+identity face, the arms-only-when-present frame); the methods-table
+test pins the four lanes and the mutating classifications and the
+capability list; the integration tests (`tests/storage_sync.rs`:
+`storage_ingest_summaries_pass_through_verbatim` — both summaries key
+for key, the frames carrying exactly the resolved account;
+`storage_call_link_faces_round_trip` — the read pinning the live and
+tombstoned fixture links verbatim, the active-arm and delete-arm
+writes each forwarding exactly their arms and reading back the
+post-write state, the five-way local refusal ladder with a frozen
+dispatch log, and the unknown-account faces;
+`storage_error_ladder_rides_the_wire` — the three markers across the
+four faces plus the engine-unknown account degrading to
+UPSTREAM_ERROR;
+`storage_set_call_link_crash_answers_unknown_and_never_retries` — the
+crash sentinel with exactly one dispatch frame); plus the
+schema-consistency bound pairs and the server handshake advertisement.
+Gated behind the full local gate suite (fmt + clippy -D warnings +
+cargo test + release build), all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
