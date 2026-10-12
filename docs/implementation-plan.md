@@ -5,7 +5,43 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.134 (2026-10-12; the §4.114 front-run batch lands
+- Contract revision: 1.135 (2026-10-12; the live poll receive chain lands
+  (§4.118): the engine's six-question-batch Q3 poll receive faces —
+  `dataMessage.poll {question, options, allowMultiple}` /
+  `pollVote {targetAuthor, targetSentTimestamp, optionIndexes, voteCount}` /
+  `pollTerminate {targetSentTimestamp}` (engine jsonrpc-compat Q3 收投影,
+  official `processDataMessage.preload.ts:395-441` behavior anchor) —
+  reach the receive chain. The bodyless poll create is a real message row
+  landing the exact `NormalizedPoll` the §4.38 import chain lands (one
+  struct, one serde face — the wire `poll` key byte-identical, the
+  desktop's history-shape consumer unchanged); the vote and the
+  termination are control receives that fold onto the row they address
+  (never a row of their own) and re-emit it on `message.upserted` (the
+  edit arm's event shape). Row addressing is the (sentAt, author-pair)
+  §4.6 identity with three author candidates — the account's own
+  outgoing mirror, the anchor's sender hash, and the §4.37
+  `peer_identities` reconciliation for an ACI-shaped anchor — failing
+  closed on absent/ambiguous/non-poll rows; an early fold buffers
+  §4.91-style per candidate and converges on the create's landing.
+  Vote semantics are the official replace-on-vote (the voter's full
+  selection replaces in place, an empty selection clears, out-of-range
+  indexes never render and never erase), the voter being the envelope
+  source or the account itself on the own echo (the 自发回声归属: the
+  multi-device echo lands the outgoing mirror row, never an unread,
+  never someone else's event); `voteCount` never transports (the §4.38
+  projection gap verbatim). The termination anchors the envelope sender
+  = the poll author (the official `onPollTerminate` posture) and is
+  idempotent. The dedupe is the import chain's own: a history refresh
+  after a live landing skips at `insert_history_batch`'s number/ACI
+  duality identity — no duplicate row, and the shared row-level skip
+  boundary (archived votes do not merge into a live-landed row) rides
+  the same discipline every face already rides. The 1.81-era
+  import-only comments on the poll face are repaired to describe both
+  chains. Wire additive-only: zero new keys (the face has ridden rows
+  since 1.81), no new method, error, or capability, no schema JSON
+  change, zero send-side coupling (the §4.106 send faces untouched).
+  Tests 717 → 729 (lib 539 → 550), all green) —
+  previously 1.134 (2026-10-12; the §4.114 front-run batch lands
   (§4.117): the engine's four account-scoped stream notifications the
   connector used to drop — `receive.emptied`, `receive.clockskew`,
   `groupTerminated`, `contactProfileUpdated` — joined by the fifth the
@@ -9518,6 +9554,123 @@ runtime.protocolWarning. The §4.114 four-lane set: pass-through and
 the error face are exercised; local gate is n/a (the events carry no
 request) and crash is n/a (the engine staying alive is the
 assertion). Tests 709 → 717 (lib 532 → 539).
+
+### 4.118 The polls arrive live: the engine's Q3 receive faces join the projection chain (contract revision 1.135, 2026-10-12)
+
+The §4.106 batch gave the desktop the poll send trio; until now a poll
+still only reached the host through the §4.38 archive import — a poll
+created after the link surfaced only at the next import, and votes and
+terminations never arrived live at all. This batch closes the receive
+side: the engine's six-question-batch Q3 poll faces (verified
+2026-10-12 against `kt-signal-engine` `docs/jsonrpc-compat.md` and the
+official `processDataMessage.preload.ts:395-441` — behavior reference,
+zero code copied) ride the live receive chain. Wire additive-only: the
+`poll` row key has existed since 1.81 and the live chain lands the
+identical face, so the desktop's history-shape consumer (engine
+`4b6fa633` lineage) is untouched — no new method, error, capability, or
+schema JSON, and zero send-side coupling (the §4.106 shapes stay
+byte-still).
+
+**The three faces and where they land.**
+
+- `dataMessage.poll {question, options, allowMultiple}` — the create
+  is a **message row**, not a control: the bodyless dataMessage ladder
+  grows one arm (after the text/attachment ladders, beside the
+  §4.41/§4.44 system-row arms) landing the outgoing timeline's poll
+  bubble. The parse is structural (the official bare-poll posture:
+  `question ?? ''`, `options ?? []`, `Boolean(allowMultiple)`):
+  option entries keep their position so vote indexes stay addressable
+  (a mistyped label rides empty, never shifts the list), a non-object
+  face is no face and the envelope keeps the bodyless skip. The face
+  is the §4.38 import's exact `NormalizedPoll` — `terminated` false,
+  no votes — so the two chains render identically; the caps are the
+  import family's values verbatim (question/option 256 chars, 32
+  options), so a poll renders the same no matter which chain landed it.
+- `dataMessage.pollVote {targetAuthor, targetSentTimestamp,
+  optionIndexes, voteCount}` — a **control receive** (the
+  reaction/remoteDelete family posture): it folds onto the poll row it
+  addresses and never mints a row. The guaranteed faces gate
+  fail-closed (a missing/blank targetAuthor, a 0 or absent target
+  timestamp, a non-array optionIndexes → the plain skip); the
+  selection dedupes preserving poll order (the official
+  replace-on-vote set semantics) and caps at the §4.38 bound (32);
+  `voteCount` has no desktop face and does not transport — the §4.38
+  projection gap verbatim. The fold is the official vote semantics:
+  the voter's full selection replaces their entry in place, an empty
+  selection is the clear-vote action, an index past the poll's own
+  option bound filters out (a selection that filters to nothing never
+  lands — a hostile selection cannot erase a legitimate vote under the
+  clear shape), and the §4.38 64-voter cap holds. The voter is never
+  carried on the wire face: the service layer attributes the envelope
+  source (a peer's vote) or the account itself (the multi-device sent
+  echo) — the same identity family the import fold's `voterId` carries.
+- `dataMessage.pollTerminate {targetSentTimestamp}` — a **control
+  receive** flipping the addressed row's `terminated` bit, idempotent
+  (a replay is an honest no-op). The proto carries no author: the
+  official terminate send is the poll author's own dataMessage and the
+  official consumer anchors the poll creator by the envelope sender
+  (`onPollTerminate`: "the fromConversationId must be the poll
+  creator"), so the connector anchors the same way — the account on
+  the sent echo, the envelope source on a peer's terminate; a peer
+  terminate with no attributable source drops (宁缺勿错).
+
+**Row addressing.** The fold resolves the poll row through the §4.6
+(sentAt, author-pair) identity — the receive-dedupe/edit-arm family —
+trying the author candidates in order: the account's own outgoing
+mirror when the anchor names the account (the row's sender projection
+is the account id / `self` legacy pair), the sender hash built
+straight off the anchor string (the engine's `targetAuthor` and the
+create envelope's `source` flip between E.164 and ACI through the same
+contacts state, so the direct hash matches whichever form landed the
+row), and — for an ACI-shaped anchor — the §4.37 `peer_identities`
+reconciliation for a row that landed under the number form. The store
+half fails closed everywhere: an absent row, a two-rows-at-one-identity
+ambiguity (the `message_by_signal_identity` refusal), a row without a
+rich column or without a poll face, and `system`-status rows all
+answer no-fold and mutate nothing — a vote can never invent a poll
+face on a foreign row. A fold whose row has not landed buffers
+§4.91-style, one entry per candidate keyed to each candidate's sender
+projection, and the create's landing flush applies it — the event
+stream reads land-then-converge (the create's upsert, then the folded
+upsert), bounded by the shared TTL/capacity table.
+
+**The live/history dedupe and the echo posture.** The live chain only
+accelerates arrival; the archive remains the bulk truth and the two
+never duplicate. A history refresh after a live landing skips at
+`insert_history_batch`'s existing identity dedupe (the number/ACI
+duality: both candidate sender hashes qualify as "already stored") —
+no second row, the summary never regresses. The shared boundary rides
+unchanged: the skip is row-level, so votes archived in the backup do
+not merge into a live-landed row — the same discipline every rich face
+already rides (live state is never regressed by a backfill). The
+self-echo posture (自发回声归属): the account's own group-send
+transcript carries the full dataMessage, so the own create lands the
+outgoing mirror row (never an unread, the self send's own timestamp)
+and the own vote/terminate echoes attribute the account itself — the
+account's own vote renders as the account's, never as someone else's
+event.
+
+The 1.81-era "no live-receive counterpart" comments on the poll
+face (the `NormalizedRich.poll`/`NormalizedPoll` docs) are repaired to
+describe both chains.
+
+Tests: the engine parse arms (the create landing the history-shape row
+with the wire face byte-equal to the import chain's keys; the
+degradation family — structural defaults, positional option
+integrity, the non-object no-face; the vote/terminate control routings
+with the dedupe-keeps-poll-order selection and the eight-face
+fail-closed ladder; the three sent echoes landing outgoing); the
+service arms (create-then-vote-then-terminate converging one row with
+no minted control rows; the vote-before-create buffering and folding
+on landing; the own echo landing the outgoing mirror with the account
+voter and no unread; the non-poll-row refusal); the store arms (the
+replace/clear/out-of-range semantics, the fail-closed
+missing/ambiguous/unpollable/system ladder with the incoming/outgoing
+leg disambiguation, the 64-voter cap with the capped-voter
+replace-through); and one end-to-end harness test over the real engine
+process (create lands the history shape, the vote+terminate emission
+converges the same row on `messages.list`, one row total). Tests 717 →
+729 (lib 539 → 550), all green.
 
 ## 5. signal-cli Boundary
 

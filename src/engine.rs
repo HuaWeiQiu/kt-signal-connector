@@ -671,11 +671,14 @@ pub struct NormalizedRich {
     /// descriptor list, never this shape. Absent on plain and pre-1.78 rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<NormalizedContact>,
-    /// Backfill poll face (contract 1.81, §4.38): the archive's per-message
-    /// `poll` item, aggregated onto the desktop's read-only render face —
-    /// question, options, the aggregate flag, the per-voter projection and
-    /// the ended bit. No live-receive counterpart exists (the connector has
-    /// no poll face), so the shape is import-only material. Absent on plain
+    /// Poll face (contract 1.81, §4.38 import chain; live chain contract
+    /// 1.134 §4.118): the aggregated read-only render face — question,
+    /// options, the aggregate flag, the per-voter projection and the ended
+    /// bit. Two arrival chains land the exact same shape: the archive's
+    /// per-message `poll` item folds through the §4.38 import, and the
+    /// engine's live `dataMessage.poll` projection parses through
+    /// [`normalized_live_poll`] (votes/termination arrive as their own
+    /// envelopes and fold onto the landed row — §4.118). Absent on plain
     /// and pre-1.81 rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll: Option<NormalizedPoll>,
@@ -854,20 +857,22 @@ pub struct NormalizedContactField {
     pub label: Option<String>,
 }
 
-/// Backfill poll face (contract revision 1.81, §4.38): the archive's
-/// per-message `poll` item folded onto the desktop's read-only render face
-/// (engine 592b1d3 projects the official import's poll face verbatim —
-/// options carry their votes nested as `{voterId, voteCount}` — and the
-/// connector aggregates; behavior reference, zero code copied). The fold is
-/// exactly the official import's: one entry per voter in first-seen order
-/// with the option indexes they picked, a voter the §4.38 recipient ladder
-/// cannot resolve dropping vote-level (the official unknown-voterId
+/// Poll face (contract 1.81, §4.38 import chain; live chain §4.118): the
+/// archive's per-message `poll` item folded onto the desktop's read-only
+/// render face (engine 592b1d3 projects the official import's poll face
+/// verbatim — options carry their votes nested as `{voterId, voteCount}` —
+/// and the connector aggregates; behavior reference, zero code copied). The
+/// fold is exactly the official import's: one entry per voter in first-seen
+/// order with the option indexes they picked, a voter the §4.38 recipient
+/// ladder cannot resolve dropping vote-level (the official unknown-voterId
 /// warn-and-skip, never the row). The engine drops empty option entries, so
 /// the projected option list is self-consistent for index addressing.
 /// `terminated` is the desktop's boolean face of `hasEnded` — the official
 /// `terminatedAt` stamp is the poll message's own timestamp (the row's
-/// `sentAt`), so it is not repeated. No live-receive counterpart exists, so
-/// the shape is import-only material riding [`NormalizedRich`].
+/// `sentAt`), so it is not repeated. The live chain lands the identical
+/// shape off the engine's `dataMessage.poll` projection (the live parse in
+/// this module), votes and termination folding onto the landed row as they
+/// arrive (§4.118).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedPoll {
@@ -957,8 +962,10 @@ impl ReceiptKind {
 }
 
 /// Control-plane receive payloads that are not messages: reaction add/remove,
-/// remote delete of an earlier message, typing START/STOP, and edit of an
-/// earlier message (new body rides `NormalizedReceive.text`).
+/// remote delete of an earlier message, typing START/STOP, edit of an
+/// earlier message (new body rides `NormalizedReceive.text`), and the poll
+/// vote/terminate folds (§4.118 — they mutate the poll row they address,
+/// never a row of their own).
 #[derive(Clone, Debug)]
 pub enum ControlReceive {
     Reaction {
@@ -1001,6 +1008,32 @@ pub enum ControlReceive {
     /// Group admin removed the earlier message it names (contract 1.33).
     AdminDelete {
         target_author: String,
+        target_timestamp: u64,
+    },
+    /// A poll vote (live poll chain, §4.118): the engine's
+    /// `dataMessage.pollVote {targetAuthor, targetSentTimestamp,
+    /// optionIndexes, voteCount}` projection folds onto the poll row it
+    /// addresses. `target_author` names the poll's author (E.164 when the
+    /// engine resolved it, the ACI string otherwise), `target_timestamp`
+    /// the poll row's upstream timestamp; `option_indexes` is the voter's
+    /// full selection after this vote (empty = the official clear-vote
+    /// action). The engine's `voteCount` per-vote tally has no desktop
+    /// timeline face and is not transported — the same gap the §4.38
+    /// import chain records. The voter is never carried here: the service
+    /// layer attributes the envelope source (incoming) or the account
+    /// itself (the multi-device sent echo).
+    PollVote {
+        target_author: String,
+        target_timestamp: u64,
+        option_indexes: Vec<u32>,
+    },
+    /// A poll termination (live poll chain, §4.118): the engine's
+    /// `dataMessage.pollTerminate {targetSentTimestamp}` projection flips
+    /// the addressed poll row's `terminated` bit. The proto carries no
+    /// author — the official terminate send is the poll author's own
+    /// dataMessage, so the service layer addresses the row through the
+    /// envelope's own sender identity (or the account on the sent echo).
+    PollTerminate {
         target_timestamp: u64,
     },
     /// A peer's client notified us their view-once message was viewed on one
@@ -3693,7 +3726,7 @@ fn normalized_sticker(
 /// Strict UUID grammar (8-4-4-4-12 hex, case-insensitive) — the §4.40
 /// promotion test before an identity string is treated as an ACI. A phone
 /// number never matches, and neither does a truncated or decorated value.
-fn is_uuid_shaped(value: &str) -> bool {
+pub(crate) fn is_uuid_shaped(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
         && bytes.iter().enumerate().all(|(index, byte)| match index {
@@ -3825,6 +3858,16 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
                 sent_timestamp,
             });
     }
+    // Live poll face (§4.118): `dataMessage.poll {question, options,
+    // allowMultiple}` — the engine's Q3 projection — parses onto the same
+    // NormalizedPoll the §4.38 import chain lands. The live face carries no
+    // votes and no terminated bit: they arrive as their own vote/terminate
+    // envelopes and fold onto the landed row at the service layer. A
+    // non-object face is no face; a structurally valid one always answers
+    // (the official bare-poll posture: `question ?? ''`, `options ?? []`).
+    if let Some(poll) = message.get("poll").and_then(Value::as_object) {
+        rich.poll = normalized_live_poll(poll);
+    }
     rich.view_once = message
         .get("viewOnce")
         .and_then(Value::as_bool)
@@ -3933,6 +3976,104 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
         return None;
     }
     Some(rich)
+}
+
+/// Ingest caps for the live poll faces (§4.118): the §4.38 import family's
+/// values verbatim, so a poll renders identically no matter which chain
+/// landed it. String faces truncate at the cap (renderable-prefix honesty);
+/// option entries past the cap drop whole (their votes would dangle — the
+/// index addressing must stay self-consistent).
+const MAX_LIVE_POLL_QUESTION_CHARS: usize = 256;
+const MAX_LIVE_POLL_OPTION_CHARS: usize = 256;
+const MAX_LIVE_POLL_OPTIONS: usize = 32;
+const MAX_LIVE_POLL_VOTE_INDEXES: usize = 32;
+
+/// The engine's live poll-create face (§4.118): `dataMessage.poll
+/// {question, options, allowMultiple}` — the Q3 projection, proto-verbatim —
+/// parses onto the exact NormalizedPoll the §4.38 import chain lands:
+/// `terminated` false (a termination arrives as its own envelope and folds
+/// later) and no votes yet. The face is structural — an object answers a
+/// poll even when every field is absent or mistyped (the official
+/// bare-poll posture: `question ?? ''`, `options ?? []`); option entries
+/// keep their position so vote indexes stay addressable (a mistyped label
+/// rides empty, never shifts the list).
+fn normalized_live_poll(poll: &serde_json::Map<String, Value>) -> Option<NormalizedPoll> {
+    let options: Vec<String> = poll
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_LIVE_POLL_OPTIONS)
+        .map(|option| {
+            option
+                .as_str()
+                .map(|text| {
+                    text.chars()
+                        .take(MAX_LIVE_POLL_OPTION_CHARS)
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+    Some(NormalizedPoll {
+        question: poll
+            .get("question")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .take(MAX_LIVE_POLL_QUESTION_CHARS)
+            .collect(),
+        options,
+        allow_multiple: poll
+            .get("allowMultiple")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        terminated: false,
+        votes: Vec::new(),
+    })
+}
+
+/// The engine's live poll-vote face (§4.118): `dataMessage.pollVote
+/// {targetAuthor, targetSentTimestamp, optionIndexes}` — `voteCount` has no
+/// desktop face and is ignored, the §4.38 gap verbatim. The guaranteed
+/// faces gate fail-closed (a missing or blank targetAuthor, a 0 target
+/// timestamp — the proto-absent sentinel — or a non-array optionIndexes
+/// answers None, the envelope falls to the plain skip); the selection
+/// entries cap at the §4.38 bound and entries past u32 drop the face (an
+/// index that cannot render is not a vote). The engine dedups the
+/// selection upstream; a hostile duplicate still folds harmlessly.
+fn normalized_poll_vote(vote: &serde_json::Map<String, Value>) -> Option<ControlReceive> {
+    let target_author = vote
+        .get("targetAuthor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+    let target_timestamp = vote.get("targetSentTimestamp").and_then(Value::as_u64)?;
+    if target_timestamp == 0 {
+        return None;
+    }
+    let entries = vote.get("optionIndexes").and_then(Value::as_array)?;
+    if entries.len() > MAX_LIVE_POLL_VOTE_INDEXES {
+        return None;
+    }
+    // The selection is a set (the official replace-on-vote semantics): a
+    // repeated index carries no extra state, and the §4.38 import chain can
+    // never emit one — dedupe preserving poll order so both chains land the
+    // identical face.
+    let mut option_indexes = Vec::with_capacity(entries.len());
+    for index in entries {
+        let index = index.as_u64()?;
+        let index = u32::try_from(index).ok()?;
+        if !option_indexes.contains(&index) {
+            option_indexes.push(index);
+        }
+    }
+    Some(ControlReceive::PollVote {
+        target_author,
+        target_timestamp,
+        option_indexes,
+    })
 }
 
 /// One protocol range coordinate: missing, non-numeric or out-of-u32 values
@@ -4204,6 +4345,39 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 source: envelope_peer_source(envelope),
                 group_id,
                 control: admin_delete,
+            });
+        }
+        // Poll vote / terminate (§4.118): the two bodyless poll-control
+        // envelopes fold onto the poll row they address. The create face is
+        // deliberately absent here — it is a message row, routed by the
+        // message ladder below (the fold targets it through the vote's own
+        // anchor). A malformed face falls through to the plain skip arm.
+        if let Some(vote) = data_message
+            .get("pollVote")
+            .and_then(Value::as_object)
+            .and_then(normalized_poll_vote)
+        {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: vote,
+            });
+        }
+        if let Some(target) = data_message
+            .get("pollTerminate")
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("targetSentTimestamp"))
+            .and_then(Value::as_u64)
+            .filter(|target| *target > 0)
+        {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: envelope_peer_source(envelope),
+                group_id,
+                control: ControlReceive::PollTerminate {
+                    target_timestamp: target,
+                },
             });
         }
         // A body-less editUpdate rides editMessage at the envelope level; a
@@ -4733,6 +4907,24 @@ fn sync_sent_control(sent: &serde_json::Map<String, Value>) -> Option<ControlRec
             target_timestamp: target,
         });
     }
+    if let Some(target) = sent
+        .get("pollTerminate")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("targetSentTimestamp"))
+        .and_then(Value::as_u64)
+        .filter(|target| *target > 0)
+    {
+        return Some(ControlReceive::PollTerminate {
+            target_timestamp: target,
+        });
+    }
+    if let Some(vote) = sent
+        .get("pollVote")
+        .and_then(Value::as_object)
+        .and_then(normalized_poll_vote)
+    {
+        return Some(vote);
+    }
     sent.get("reaction").and_then(normalized_reaction)
 }
 
@@ -5015,6 +5207,34 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     None,
                 ));
             }
+            // Our own poll create (§4.118): the group-send transcript's
+            // `poll` face rides the bodyless mirror — the same outgoing
+            // row a peer's create lands as, in the account's own direction
+            // (the 自发同步 posture: never an unread, the self send's own
+            // timestamp). The face is the identical §4.38 shape; votes and
+            // termination fold onto it as they arrive.
+            if text.is_none()
+                && quote.is_none()
+                && attachments.is_empty()
+                && rich.as_ref().is_some_and(|rich| rich.poll.is_some())
+            {
+                return Ok(with_expire(
+                    make(
+                        sent_ts,
+                        "syncMessage",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        None,
+                        None,
+                        Vec::new(),
+                        rich,
+                        None,
+                    ),
+                    expire_seconds,
+                    expire_start_at,
+                ));
+            }
             if let Some(text) = text {
                 return Ok(with_expire(
                     make(
@@ -5193,6 +5413,29 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     rich.as_ref().and_then(|rich| rich.group_name.clone()),
                 )),
                 None,
+            ));
+        }
+        // Live poll create (§4.118): the bodyless `dataMessage.poll`
+        // envelope is a real message row — the poll bubble the official
+        // timeline renders — carrying the same NormalizedPoll face the
+        // §4.38 import chain lands (votes/termination fold in later).
+        // Anything else bodyless keeps the skip.
+        if rich.as_ref().is_some_and(|rich| rich.poll.is_some()) {
+            return Ok(with_expire(
+                make(
+                    timestamp,
+                    "dataMessage",
+                    "incoming",
+                    peer_source,
+                    group_id,
+                    None,
+                    quote,
+                    attachments,
+                    rich,
+                    None,
+                ),
+                expire_seconds,
+                expire_start_at,
             ));
         }
         return Ok(make(
@@ -9089,6 +9332,280 @@ mod tests {
         let bare = normalize(json!({ "viewOnceInvalid": true }));
         assert_eq!(bare.direction, "skip");
         assert!(bare.rich.is_none());
+    }
+
+    /// Live poll create (§4.118): the engine's `dataMessage.poll` face
+    /// parses onto the exact NormalizedPoll the §4.38 import chain lands —
+    /// terminated false, no votes yet — and the bodyless envelope lands as
+    /// a real incoming message row (never the skip). The wire JSON of the
+    /// face is byte-identical to the history chain's: same struct, same
+    /// serde skips.
+    #[test]
+    fn live_poll_create_lands_a_message_row_in_the_history_shape() {
+        let normalize = |mut data: serde_json::Value| {
+            if let Some(object) = data.as_object_mut() {
+                object.insert("groupInfo".into(), json!({ "groupId": "group-key" }));
+            }
+            normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let row = normalize(json!({
+            "poll": {
+                "question": "Lunch?",
+                "options": ["Ramen", "Sushi"],
+                "allowMultiple": true,
+            },
+        }));
+        assert_eq!(row.direction, "incoming", "a poll create is a message row");
+        assert_eq!(row.content_kind, "dataMessage");
+        assert_eq!(row.group_id.as_deref(), Some("group-key"));
+        assert!(row.text.is_none(), "poll creates carry no body");
+        let poll = row
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("poll");
+        assert_eq!(poll.question, "Lunch?");
+        assert_eq!(poll.options, vec!["Ramen", "Sushi"]);
+        assert!(poll.allow_multiple);
+        assert!(!poll.terminated, "termination arrives as its own envelope");
+        assert!(poll.votes.is_empty(), "votes fold in later");
+        // The wire face equals the history chain's exact keys — the two
+        // chains land one struct, so the desktop renders both identically.
+        // (The row-level flatten happens on the store record; the receive's
+        // rich skips serialization, so the face asserts off the rich.)
+        let wire = serde_json::to_value(row.rich.as_ref().expect("rich")).expect("wire");
+        assert_eq!(
+            wire["poll"],
+            json!({ "question": "Lunch?", "options": ["Ramen", "Sushi"], "allowMultiple": true })
+        );
+
+        // The bare face (single-selection, defaults folded): allowMultiple
+        // and terminated stay absent, exactly like an import row without
+        // them.
+        let bare = normalize(json!({
+            "poll": { "question": "Tea?", "options": ["yes", "no"] },
+        }));
+        let wire = serde_json::to_value(bare.rich.as_ref().expect("rich")).expect("wire");
+        assert_eq!(
+            wire["poll"],
+            json!({ "question": "Tea?", "options": ["yes", "no"] })
+        );
+    }
+
+    /// Live poll face degradation (§4.118): the face is structural (the
+    /// official bare-poll posture) — absent or mistyped fields ride
+    /// defaults, a non-object face is no face and the envelope keeps the
+    /// skip. Option entries keep their position so vote indexes stay
+    /// addressable (a mistyped label rides empty, never shifts the list).
+    #[test]
+    fn live_poll_face_degrades_without_losing_the_row_shape() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let defaults = normalize(json!({ "poll": {} }));
+        assert_eq!(defaults.direction, "incoming");
+        let poll = defaults
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("a structural poll face always answers");
+        assert_eq!(poll.question, "");
+        assert!(poll.options.is_empty());
+        assert!(!poll.allow_multiple);
+
+        let shifted = normalize(json!({
+            "poll": { "question": 7, "options": ["a", 3, "c"], "allowMultiple": "yes" },
+        }));
+        let poll = shifted
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("poll");
+        assert_eq!(poll.question, "", "a mistyped question rides empty");
+        assert_eq!(
+            poll.options,
+            vec!["a".to_string(), String::new(), "c".to_string()],
+            "positions survive; the mistyped label rides empty"
+        );
+        assert!(!poll.allow_multiple);
+
+        let foreign = normalize(json!({ "poll": "not-an-object" }));
+        assert_eq!(foreign.direction, "skip");
+        assert!(foreign.rich.is_none(), "a non-object face is no face");
+    }
+
+    /// Live poll vote / terminate (§4.118): the two bodyless envelopes
+    /// route as control receives; every degraded shape fails closed to the
+    /// plain skip (the guaranteed faces gate).
+    #[test]
+    fn live_poll_vote_and_terminate_route_as_control() {
+        let normalize = |mut data: serde_json::Value| {
+            if let Some(object) = data.as_object_mut() {
+                object.insert("groupInfo".into(), json!({ "groupId": "group-key" }));
+            }
+            normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": data,
+                },
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let vote = normalize(json!({
+            "pollVote": {
+                "targetAuthor": "+15555550102",
+                "targetSentTimestamp": 1726999999000u64,
+                "optionIndexes": [2, 1, 2, 3],
+                "voteCount": 4,
+            },
+        }));
+        assert_eq!(vote.direction, "incoming");
+        assert_eq!(vote.content_kind, "control");
+        assert_eq!(vote.group_id.as_deref(), Some("group-key"));
+        match vote.control.expect("vote control") {
+            ControlReceive::PollVote {
+                target_author,
+                target_timestamp,
+                option_indexes,
+            } => {
+                assert_eq!(target_author, "+15555550102");
+                assert_eq!(target_timestamp, 1726999999000);
+                assert_eq!(
+                    option_indexes,
+                    vec![2, 1, 3],
+                    "the selection is a set: dedupe keeps poll order"
+                );
+            }
+            other => panic!("expected a poll vote: {other:?}"),
+        }
+
+        let terminate = normalize(json!({
+            "pollTerminate": { "targetSentTimestamp": 1726999999000u64 },
+        }));
+        match terminate.control.expect("terminate control") {
+            ControlReceive::PollTerminate { target_timestamp } => {
+                assert_eq!(target_timestamp, 1726999999000);
+            }
+            other => panic!("expected a poll terminate: {other:?}"),
+        }
+
+        let mut degraded_faces = vec![
+            json!({ "pollVote": { "targetSentTimestamp": 5u64, "optionIndexes": [] } }),
+            json!({ "pollVote": { "targetAuthor": "  ", "targetSentTimestamp": 5u64, "optionIndexes": [] } }),
+            json!({ "pollVote": { "targetAuthor": "+15555550102", "optionIndexes": [] } }),
+            json!({ "pollVote": { "targetAuthor": "+15555550102", "targetSentTimestamp": 0u64, "optionIndexes": [] } }),
+            json!({ "pollVote": { "targetAuthor": "+15555550102", "targetSentTimestamp": 5u64, "optionIndexes": "no" } }),
+            json!({ "pollVote": { "targetAuthor": "+15555550102", "targetSentTimestamp": 5u64, "optionIndexes": [0, "9"] } }),
+            json!({ "pollTerminate": { "targetSentTimestamp": 0u64 } }),
+            json!({ "pollTerminate": {} }),
+        ];
+        degraded_faces.push(json!({
+            "pollVote": {
+                "targetAuthor": "+15555550102",
+                "targetSentTimestamp": 5u64,
+                "optionIndexes": vec![0u64; 33],
+            },
+        }));
+        for face in degraded_faces {
+            let degraded = normalize(face.clone());
+            assert_eq!(
+                degraded.direction, "skip",
+                "a degraded poll control face fails closed: {face}"
+            );
+            assert!(degraded.control.is_none(), "{face}");
+        }
+    }
+
+    /// The self-send transcript echoes (§4.118): the engine's own group
+    /// send (including the connector's `messages.sendPoll*` calls)
+    /// transcribes the full dataMessage, so the create echo lands as the
+    /// account's own outgoing mirror row and the vote/terminate echoes as
+    /// outgoing control receives — the 自发同步 posture (never an unread).
+    #[test]
+    fn sent_poll_echoes_land_outgoing() {
+        let normalize = |sent: serde_json::Value| {
+            normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": { "sentMessage": sent },
+                },
+            }))
+            .unwrap()
+            .unwrap()
+        };
+        let create = normalize(json!({
+            "timestamp": 1726999998000u64,
+            "groupInfo": { "groupId": "group-key" },
+            "poll": { "question": "Lunch?", "options": ["Ramen", "Sushi"] },
+        }));
+        assert_eq!(
+            create.direction, "outgoing",
+            "the create echo is the own row"
+        );
+        assert_eq!(create.content_kind, "syncMessage");
+        assert!(create.control.is_none());
+        assert!(
+            create
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.poll.as_ref())
+                .is_some(),
+            "the face rides the mirror row"
+        );
+
+        let vote = normalize(json!({
+            "timestamp": 1726999999000u64,
+            "groupInfo": { "groupId": "group-key" },
+            "pollVote": {
+                "targetAuthor": "+15555550102",
+                "targetSentTimestamp": 1726999998000u64,
+                "optionIndexes": [0],
+                "voteCount": 1,
+            },
+        }));
+        assert_eq!(vote.direction, "outgoing");
+        assert_eq!(vote.content_kind, "control");
+        match vote.control.expect("vote echo control") {
+            ControlReceive::PollVote {
+                target_author,
+                target_timestamp,
+                option_indexes,
+            } => {
+                assert_eq!(target_author, "+15555550102");
+                assert_eq!(target_timestamp, 1726999998000);
+                assert_eq!(option_indexes, vec![0]);
+            }
+            other => panic!("expected a poll vote echo: {other:?}"),
+        }
+
+        let terminate = normalize(json!({
+            "timestamp": 1726999999500u64,
+            "groupInfo": { "groupId": "group-key" },
+            "pollTerminate": { "targetSentTimestamp": 1726999998000u64 },
+        }));
+        assert_eq!(terminate.direction, "outgoing");
+        assert!(matches!(
+            terminate.control,
+            Some(ControlReceive::PollTerminate { .. })
+        ));
     }
 
     /// Contract 1.38 (§4.37): every receive envelope's `sourceUuid` is

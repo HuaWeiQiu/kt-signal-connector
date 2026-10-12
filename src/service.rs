@@ -1560,7 +1560,7 @@ const EARLY_CONTROL_BUFFER_TTL_MS: u64 = 5 * 60 * 1_000;
 /// stores as its `sender_id` (the account id itself for the outgoing
 /// multi-device mirrors). The author component doubles as the flush-time
 /// author gate: an entry only ever applies to the row its own author sent.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct EarlyControlEntry {
     account_id: String,
     kind: &'static str,
@@ -1577,7 +1577,7 @@ struct EarlyControlEntry {
 /// engine-bounded and the whole table is capacity- and TTL-bounded, so no
 /// per-entry text budget is re-imposed here (the live edit path stores the
 /// same bytes).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum EarlyControlPayload {
     RemoteDelete,
     Edit {
@@ -1585,6 +1585,16 @@ enum EarlyControlPayload {
         new_text: String,
         new_bytes: u32,
     },
+    /// §4.118: the poll fold that addressed a poll row which has not landed
+    /// (or whose conversation does not exist yet). The buffered entry keys
+    /// the **poll author's** sender projection — the fold's row identity —
+    /// never the voter's; the flush applies the same store path the live
+    /// arm runs, so a converged row is identical either way.
+    PollVote {
+        voter_id: String,
+        option_indexes: Vec<u32>,
+    },
+    PollTerminate,
 }
 
 pub struct ConnectorService {
@@ -8070,10 +8080,174 @@ impl ConnectorService {
                         drained.push(HostSideEvent::MessageUpserted(record));
                     }
                 }
+                EarlyControlPayload::PollVote {
+                    voter_id,
+                    option_indexes,
+                } => {
+                    // §4.118: the entry's author key IS the poll row's
+                    // sender projection (the flush matched it above), so
+                    // the store fold addresses exactly the row that just
+                    // landed — the live arm's store path verbatim.
+                    if let Some(mut record) = self.store.fold_poll_vote(
+                        account_id,
+                        conversation_id,
+                        sent_at,
+                        sender_id,
+                        &legacy_sender_id(kind, peer_key, account_id),
+                        &voter_id,
+                        &option_indexes,
+                    )? {
+                        self.store
+                            .attach_reactions(account_id, std::slice::from_mut(&mut record))?;
+                        self.store
+                            .attach_edits(account_id, std::slice::from_mut(&mut record))?;
+                        drained.push(HostSideEvent::MessageUpserted(record));
+                    }
+                }
+                EarlyControlPayload::PollTerminate => {
+                    if let Some(mut record) = self.store.fold_poll_terminate(
+                        account_id,
+                        conversation_id,
+                        sent_at,
+                        sender_id,
+                        &legacy_sender_id(kind, peer_key, account_id),
+                    )? {
+                        self.store
+                            .attach_reactions(account_id, std::slice::from_mut(&mut record))?;
+                        self.store
+                            .attach_edits(account_id, std::slice::from_mut(&mut record))?;
+                        drained.push(HostSideEvent::MessageUpserted(record));
+                    }
+                }
             }
         }
         self.early_controls = remaining;
         Ok(drained)
+    }
+
+    /// The live poll fold (§4.118): a vote or termination addresses the
+    /// poll row it names — never a row of its own — and folds through the
+    /// store's poll-face mutation, re-emitting the updated row on
+    /// `message.upserted` (the edit arm's event shape). Row resolution
+    /// tries the author candidates in order: the account's own outgoing
+    /// mirror when the anchor names the account itself, the direct
+    /// §4.6 sender-hash pair off the anchor string, and — for an
+    /// ACI-shaped anchor the poll row may have landed under its E.164
+    /// form — the §4.37 `peer_identities` reconciliation. A fold that
+    /// hits nothing buffers §4.91-style per candidate (keyed to each
+    /// candidate's sender projection, so the poll row's landing flush
+    /// applies it); a fold whose voter cannot be attributed drops.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_poll_fold(
+        &mut self,
+        account: &AccountRow,
+        conversation_id: &str,
+        kind: &str,
+        peer_key: &str,
+        direction: &str,
+        source: Option<&str>,
+        target_author: &str,
+        target_timestamp: u64,
+        vote: Option<&[u32]>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // The voter is the envelope source (a peer's vote) or the account
+        // itself (the multi-device sent echo) — the same attribution the
+        // reaction arm runs, and the same identity family the §4.38 import
+        // fold's `voterId` carries (E.164 preferred, the ACI string when
+        // the engine could not map it).
+        let voter_id = match direction {
+            "outgoing" => Some(account.signal_account.clone()),
+            _ => source.filter(|s| !s.is_empty()).map(str::to_string),
+        };
+        let Some(voter_id) = voter_id else {
+            return Ok(Vec::new());
+        };
+        // Row candidates in resolution order (each a §4.6 identity pair of
+        // the poll row's sender projection): the account's own outgoing
+        // mirror when the anchor names the account's own number; the
+        // sender-hash pair built straight off the anchor string — the
+        // engine's `targetAuthor` and the poll envelope's `source` flip
+        // between E.164 and ACI through the same contacts state, so the
+        // direct hash matches whichever form landed the row; and, for an
+        // ACI-shaped anchor, the §4.37 `peer_identities` reconciliation
+        // for a row that landed under the number form.
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        if target_author == account.signal_account {
+            let pair = (account.id.clone(), "self".to_string());
+            if !candidates.contains(&pair) {
+                candidates.push(pair);
+            }
+        }
+        let pair = (
+            stable_hash_id(&[&account.id, kind, target_author]),
+            legacy_sender_id(kind, peer_key, &account.id),
+        );
+        if !candidates.contains(&pair) {
+            candidates.push(pair);
+        }
+        if crate::engine::is_uuid_shaped(target_author) {
+            for peer_key_form in self.store.peer_keys_for_aci(&account.id, target_author)? {
+                let pair = (
+                    stable_hash_id(&[&account.id, kind, &peer_key_form]),
+                    legacy_sender_id(kind, peer_key, &account.id),
+                );
+                if !candidates.contains(&pair) {
+                    candidates.push(pair);
+                }
+            }
+        }
+        for (sender_id, legacy_sender) in &candidates {
+            let applied = if let Some(option_indexes) = vote {
+                self.store.fold_poll_vote(
+                    &account.id,
+                    conversation_id,
+                    target_timestamp,
+                    sender_id,
+                    legacy_sender,
+                    &voter_id,
+                    option_indexes,
+                )?
+            } else {
+                self.store.fold_poll_terminate(
+                    &account.id,
+                    conversation_id,
+                    target_timestamp,
+                    sender_id,
+                    legacy_sender,
+                )?
+            };
+            if let Some(mut record) = applied {
+                self.store
+                    .attach_reactions(&account.id, std::slice::from_mut(&mut record))?;
+                self.store
+                    .attach_edits(&account.id, std::slice::from_mut(&mut record))?;
+                return Ok(vec![HostSideEvent::MessageUpserted(record)]);
+            }
+        }
+        // Nothing to fold into yet — §4.91: buffer per candidate so the
+        // poll row's landing flush applies the fold (the entries key each
+        // candidate's sender projection; only the one that equals the
+        // landed row's identity ever fires, and the fold itself is
+        // idempotent so a double candidate can never double-apply).
+        let payload = match vote {
+            Some(option_indexes) => EarlyControlPayload::PollVote {
+                voter_id,
+                option_indexes: option_indexes.to_vec(),
+            },
+            None => EarlyControlPayload::PollTerminate,
+        };
+        for (sender_id, _) in &candidates {
+            self.buffer_early_control(EarlyControlEntry {
+                account_id: account.id.clone(),
+                kind: if kind == "group" { "group" } else { "direct" },
+                peer_key: peer_key.to_string(),
+                target_sent_at: target_timestamp,
+                author_sender_id: sender_id.clone(),
+                buffered_at: now_ms(),
+                payload: payload.clone(),
+            });
+        }
+        Ok(Vec::new())
     }
 
     /// Persist-and-notify one control-plane receive (contract 1.15): reaction
@@ -8371,6 +8545,54 @@ impl ConnectorService {
             ) {
                 self.buffer_early_control(entry);
                 return Ok(Vec::new());
+            }
+            // §4.118: a poll fold whose conversation has not landed buffers
+            // the same way — the poll row cannot exist without its
+            // conversation, and the create's landing flushes the entries.
+            // The empty conversation id makes the fold probes provably miss;
+            // the buffering is the point of the call.
+            if matches!(
+                control,
+                ControlReceive::PollVote { .. } | ControlReceive::PollTerminate { .. }
+            ) {
+                return self.apply_poll_fold(
+                    &account,
+                    "",
+                    kind,
+                    peer_key,
+                    receive.direction,
+                    receive.source.as_deref(),
+                    match &control {
+                        ControlReceive::PollVote { target_author, .. } => target_author,
+                        // The outgoing echo names the account itself; a peer
+                        // terminate without an attributable source has no
+                        // honest anchor and drops (宁缺勿错).
+                        ControlReceive::PollTerminate { .. } if receive.direction == "outgoing" => {
+                            &account.signal_account
+                        }
+                        ControlReceive::PollTerminate { .. }
+                            if receive
+                                .source
+                                .as_deref()
+                                .map(|s| !s.is_empty())
+                                .unwrap_or(false) =>
+                        {
+                            receive.source.as_deref().unwrap_or_default()
+                        }
+                        _ => return Ok(Vec::new()),
+                    },
+                    match &control {
+                        ControlReceive::PollVote {
+                            target_timestamp, ..
+                        }
+                        | ControlReceive::PollTerminate { target_timestamp } => *target_timestamp,
+                        _ => unreachable!("guarded by the matches! above"),
+                    },
+                    match &control {
+                        ControlReceive::PollVote { option_indexes, .. } => Some(option_indexes),
+                        _ => None,
+                    },
+                );
             }
             if let Some(event) =
                 group_incoming_face(&control, &account.id, receive.source.as_deref())
@@ -8752,6 +8974,49 @@ impl ConnectorService {
                     events.push(HostSideEvent::ConversationChanged(summary));
                 }
                 Ok(events)
+            }
+            ControlReceive::PollVote {
+                target_author,
+                target_timestamp,
+                option_indexes,
+            } => self.apply_poll_fold(
+                &account,
+                &conversation.id,
+                kind,
+                peer_key,
+                receive.direction,
+                receive.source.as_deref(),
+                &target_author,
+                target_timestamp,
+                Some(&option_indexes),
+            ),
+            ControlReceive::PollTerminate { target_timestamp } => {
+                // The proto terminate carries no author: the official
+                // terminate send is the poll author's own dataMessage, so
+                // the anchor is the envelope's own sender identity — the
+                // account itself on the multi-device sent echo, the
+                // envelope source on a peer's terminate. A peer terminate
+                // with no attributable source has no honest anchor and
+                // drops (宁缺勿错).
+                let anchor = if receive.direction == "outgoing" {
+                    account.signal_account.clone()
+                } else {
+                    match receive.source.as_deref().filter(|s| !s.is_empty()) {
+                        Some(source) => source.to_string(),
+                        None => return Ok(Vec::new()),
+                    }
+                };
+                self.apply_poll_fold(
+                    &account,
+                    &conversation.id,
+                    kind,
+                    peer_key,
+                    receive.direction,
+                    receive.source.as_deref(),
+                    &anchor,
+                    target_timestamp,
+                    None,
+                )
             }
             ControlReceive::GroupTimerUpdate {
                 expire_timer_seconds,
@@ -26233,6 +26498,373 @@ mod tests {
             .unwrap();
         assert_eq!(row.sent_at, 420, "protocol identity is untouched");
         assert!(row.edited_at.is_some());
+    }
+
+    /// §4.118 full chain: a peer's live poll create lands the message row in
+    /// the history shape, a later vote folds the voter (the envelope source)
+    /// into that row and re-emits it on `message.upserted` — the edit arm's
+    /// event shape — and the termination flips the `terminated` bit in place.
+    /// No poll control ever mints a row of its own.
+    #[test]
+    fn live_poll_create_lands_and_later_vote_and_terminate_fold_in() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let create = NormalizedReceive {
+            timestamp: Some(1000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-key".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                poll: Some(crate::engine::NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: true,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        let landed = service
+            .ingest_receive(create, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let HostSideEvent::MessageUpserted(row) = &landed[0] else {
+            panic!("expected the create's upsert, got {:?}", landed[0]);
+        };
+        let poll = row
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("the create carries the poll face");
+        assert_eq!(poll.question, "Lunch?");
+        assert!(poll.votes.is_empty());
+        assert_eq!(row.direction, "incoming");
+
+        let mut vote = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollVote {
+                target_author: "+15555550101".into(),
+                target_timestamp: 1000,
+                option_indexes: vec![1],
+            },
+        );
+        vote.group_id = Some("group-key".into());
+        let events = service
+            .ingest_receive(vote, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "a vote only re-emits the folded row");
+        let HostSideEvent::MessageUpserted(row) = &events[0] else {
+            panic!("expected message.upserted, got {:?}", events[0]);
+        };
+        let poll = row
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("the fold keeps the poll face");
+        assert_eq!(poll.votes.len(), 1);
+        assert_eq!(
+            poll.votes[0].voter_id, "+15555550101",
+            "the voter is the source"
+        );
+        assert_eq!(poll.votes[0].option_indexes, vec![1]);
+
+        let mut terminate = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollTerminate {
+                target_timestamp: 1000,
+            },
+        );
+        terminate.group_id = Some("group-key".into());
+        let events = service
+            .ingest_receive(terminate, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let HostSideEvent::MessageUpserted(row) = &events[0] else {
+            panic!("expected message.upserted, got {:?}", events[0]);
+        };
+        let poll = row
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("the fold keeps the poll face");
+        assert!(poll.terminated);
+        assert_eq!(poll.votes.len(), 1, "termination never touches votes");
+
+        let listed = service
+            .list_messages(&account.id, &row.conversation_id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(listed.len(), 1, "poll controls never mint rows");
+        assert_eq!(listed[0].id, row.id);
+    }
+
+    /// §4.118 + §4.91: a vote that arrives before its poll create buffers
+    /// silently, and the create's landing flush applies it — the event
+    /// stream reads land-then-converge (the create's upsert, then the
+    /// folded upsert).
+    #[test]
+    fn live_poll_vote_before_create_buffers_and_folds_on_landing() {
+        let (_temp, mut service) = service();
+        let (_account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let mut early = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollVote {
+                target_author: "+15555550101".into(),
+                target_timestamp: 1000,
+                option_indexes: vec![0],
+            },
+        );
+        early.group_id = Some("group-key".into());
+        let buffered = service
+            .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            buffered.is_empty(),
+            "an early vote is buffered, not applied"
+        );
+
+        let create = NormalizedReceive {
+            timestamp: Some(1000),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-key".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                poll: Some(crate::engine::NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        let events = service
+            .ingest_receive(create, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let HostSideEvent::MessageUpserted(landed) = &events[0] else {
+            panic!("expected the create's upsert, got {:?}", events[0]);
+        };
+        let HostSideEvent::MessageUpserted(folded) = &events[1] else {
+            panic!("expected the flushed vote fold, got {:?}", events[1]);
+        };
+        assert_eq!(landed.id, folded.id, "both events name the one row");
+        let landed_poll = landed
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("landed face");
+        assert!(
+            landed_poll.votes.is_empty(),
+            "the landing itself is unvoted"
+        );
+        let folded_poll = folded
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("folded face");
+        assert_eq!(folded_poll.votes.len(), 1);
+        assert_eq!(folded_poll.votes[0].voter_id, "+15555550101");
+        assert_eq!(folded_poll.votes[0].option_indexes, vec![0]);
+    }
+
+    /// §4.118 self-send posture: the account's own poll create echo lands
+    /// the outgoing mirror row (the 自发同步 face — never an unread), and
+    /// the own vote echo folds with the account itself as the voter.
+    #[test]
+    fn sent_poll_echo_lands_outgoing_and_own_vote_folds_with_the_account_voter() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let create = NormalizedReceive {
+            timestamp: Some(1000),
+            content_kind: "syncMessage",
+            direction: "outgoing",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: None,
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("group-key".into()),
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: Some(crate::engine::NormalizedRich {
+                poll: Some(crate::engine::NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        let landed = service
+            .ingest_receive(create, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let HostSideEvent::MessageUpserted(row) = &landed[0] else {
+            panic!("expected the echo's upsert, got {:?}", landed[0]);
+        };
+        assert_eq!(row.direction, "outgoing");
+        let conversation_id = row.conversation_id.clone();
+        let summary = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation_id)
+            .unwrap()
+            .expect("the echo's group conversation");
+        assert_eq!(
+            summary.unread_count, 0,
+            "the self send never counts as an unread"
+        );
+
+        let mut vote = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::PollVote {
+                target_author: "+15555550100".to_string(),
+                target_timestamp: 1000,
+                option_indexes: vec![1],
+            },
+        );
+        vote.direction = "outgoing";
+        vote.group_id = Some("group-key".into());
+        let events = service
+            .ingest_receive(vote, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        let HostSideEvent::MessageUpserted(row) = &events[0] else {
+            panic!("expected message.upserted, got {:?}", events[0]);
+        };
+        let poll = row
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.poll.as_ref())
+            .expect("the fold keeps the poll face");
+        assert_eq!(poll.votes.len(), 1);
+        assert_eq!(
+            poll.votes[0].voter_id, "+15555550100",
+            "the own echo's voter is the account itself"
+        );
+        let summary = service
+            .store_ref()
+            .conversation_summary(&account.id, &conversation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.unread_count, 0, "folds never count as unread");
+    }
+
+    /// §4.118 fail-closed: a vote or termination addressing a row with no
+    /// poll face folds nothing — no events, the row untouched (the buffered
+    /// entries that follow can only ever fire on a poll row's real landing
+    /// identity).
+    #[test]
+    fn poll_control_targeting_a_non_poll_row_never_folds() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let original = NormalizedReceive {
+            timestamp: Some(310),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".to_string()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: None,
+            text: Some("plain text".into()),
+            text_bytes: Some(10),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let mut vote = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::PollVote {
+                target_author: "+15555550101".into(),
+                target_timestamp: 310,
+                option_indexes: vec![0],
+            },
+        );
+        let vote_events = service
+            .ingest_receive(vote.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(vote_events.is_empty(), "a text row is no poll target");
+        vote.control = Some(ControlReceive::PollTerminate {
+            target_timestamp: 310,
+        });
+        let terminate_events = service
+            .ingest_receive(vote, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(terminate_events.is_empty(), "a text row is no poll target");
+
+        let messages = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text.as_deref(), Some("plain text"));
+        assert!(
+            messages[0].rich.is_none(),
+            "the fold never manufactures rich"
+        );
     }
 
     /// Contract 1.110 (§4.91): an early remoteDelete — the original row has

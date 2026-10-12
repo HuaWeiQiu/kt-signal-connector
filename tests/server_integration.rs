@@ -3177,6 +3177,236 @@ async fn incoming_mentions_project_author_aci_on_the_wire_row() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// §4.118 end-to-end: the fake engine's live poll envelopes ride the
+/// receive stream verbatim — the bodyless `dataMessage.poll` create lands a
+/// message row whose wire `poll` face is byte-identical to the §4.38
+/// history chain's (no `terminated`, no `votes`, no `voteCount` yet), the
+/// later `pollVote` folds the voter into that same row on
+/// `message.upserted`, and the `pollTerminate` flips `terminated` in place.
+/// The vote rides in the same emission as its create (the §4.91 buffer
+/// converges whatever order the stream picks).
+#[tokio::test]
+async fn live_poll_create_vote_terminate_land_the_history_shape() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [43_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let signal_data = temp.path().join("signal-data");
+    fs::create_dir_all(&signal_data).unwrap();
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-LivePoll" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Stage one: the create alone. The marker is written only AFTER
+    // link.finish (the established convention — injection is single-shot
+    // and pre-registration envelopes drop fail-closed).
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "sourceName": "Alice",
+                "timestamp": 600,
+                "dataMessage": {
+                    "groupInfo": { "groupId": "Z3JvdXAta2V5" },
+                    "poll": {
+                        "question": "Lunch?",
+                        "options": ["Ramen", "Sushi"],
+                        "allowMultiple": true,
+                    },
+                },
+            },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Poll the history reads until the create row is visible (each poll
+    // drains interleaved events).
+    let mut conversation_id = String::new();
+    let mut create_row: Option<Value> = None;
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("poll-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let conversations = request(
+            &mut client,
+            &format!("conv-{attempt}"),
+            "conversations.list",
+            json!({ "accountId": account_id, "limit": 50 }),
+        )
+        .await;
+        let group = conversations["result"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["type"] == "group")
+            .cloned();
+        let Some(group) = group else { continue };
+        conversation_id = group["id"].as_str().unwrap().to_string();
+        let listed = request(
+            &mut client,
+            &format!("list-{attempt}"),
+            "messages.list",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "limit": 50,
+            }),
+        )
+        .await;
+        let items = listed["result"]["items"].as_array().unwrap();
+        if let Some(row) = items.iter().find(|row| row.get("poll").is_some()) {
+            create_row = Some(row.clone());
+            break;
+        }
+    }
+    let create_row = create_row.expect("the poll create row landed");
+    assert_eq!(create_row["direction"], "incoming");
+    assert_eq!(create_row["sentAt"], 600);
+    assert!(
+        create_row.get("text").is_none() || create_row["text"].is_null(),
+        "poll creates carry no body"
+    );
+    // The wire face is the §4.38 history chain's exact keys: the defaults
+    // (terminated false, no votes) stay absent and `voteCount` never rides.
+    assert_eq!(
+        create_row["poll"],
+        json!({
+            "question": "Lunch?",
+            "options": ["Ramen", "Sushi"],
+            "allowMultiple": true,
+        })
+    );
+
+    // Stage two: the vote and the terminate ride one emission — whatever
+    // order the connector ingests them in, the folded row converges.
+    fs::write(
+        signal_data.join(".fixture-emit-envelopes.json"),
+        json!({ "envelopes": [
+            {
+                "source": "+15555550101",
+                "timestamp": 601,
+                "dataMessage": {
+                    "groupInfo": { "groupId": "Z3JvdXAta2V5" },
+                    "pollVote": {
+                        "targetAuthor": "+15555550101",
+                        "targetSentTimestamp": 600,
+                        "optionIndexes": [1],
+                        "voteCount": 1,
+                    },
+                },
+            },
+            {
+                "source": "+15555550101",
+                "timestamp": 602,
+                "dataMessage": {
+                    "groupInfo": { "groupId": "Z3JvdXAta2V5" },
+                    "pollTerminate": { "targetSentTimestamp": 600 },
+                },
+            },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut folded_row: Option<Value> = None;
+    for attempt in 0..200 {
+        sleep(Duration::from_millis(20)).await;
+        let _ = request(
+            &mut client,
+            &format!("poll2-{attempt}"),
+            "runtime.status",
+            json!({}),
+        )
+        .await;
+        let listed = request(
+            &mut client,
+            &format!("list2-{attempt}"),
+            "messages.list",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "limit": 50,
+            }),
+        )
+        .await;
+        let items = listed["result"]["items"].as_array().unwrap();
+        if let Some(row) = items.iter().find(|row| {
+            row.get("poll").is_some()
+                && row["poll"].get("terminated").and_then(Value::as_bool) == Some(true)
+        }) {
+            folded_row = Some(row.clone());
+            break;
+        }
+    }
+    let folded_row = folded_row.expect("the terminate folded onto the poll row");
+    assert_eq!(
+        folded_row["id"], create_row["id"],
+        "the controls folded into the create's own row"
+    );
+    assert_eq!(
+        folded_row["poll"],
+        json!({
+            "question": "Lunch?",
+            "options": ["Ramen", "Sushi"],
+            "allowMultiple": true,
+            "terminated": true,
+            "votes": [
+                { "voterId": "+15555550101", "optionIndexes": [1] },
+            ],
+        }),
+        "the converged face is the history chain's exact shape"
+    );
+    let items_count = {
+        let listed = request(
+            &mut client,
+            "list-final",
+            "messages.list",
+            json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "limit": 50,
+            }),
+        )
+        .await;
+        listed["result"]["items"].as_array().unwrap().len()
+    };
+    assert_eq!(items_count, 1, "poll controls never mint rows of their own");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn groups_get_projects_the_synced_group_cache() {
     let temp = TempDir::new().unwrap();

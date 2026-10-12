@@ -3071,6 +3071,188 @@ impl Store {
         Ok(record)
     }
 
+    /// Fold one live poll vote onto the poll row it addresses (§4.118):
+    /// the official vote semantics — the voter's full selection replaces
+    /// their prior vote, an empty selection clears it. The row is keyed by
+    /// the §4.6 addressing pair (upstream timestamp + the poll author's
+    /// sender-hash pair, the same identity family receive dedupe and the
+    /// edit arms use; the pair itself disambiguates the incoming/outgoing
+    /// legs, so no direction clause is needed). Fail-closed everywhere: a
+    /// missing or ambiguous row, and a row that carries no poll face, all
+    /// answer `None` and mutate nothing — a vote can never invent a poll
+    /// face on a foreign row. Indexes past the poll's own option bound
+    /// cannot render and no-op the fold (a hostile selection never erases
+    /// a legitimate vote under the clear-vote shape). Returns the updated
+    /// record for the caller's `message.upserted`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_poll_vote(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+        sender_id: &str,
+        legacy_sender_id: &str,
+        voter_id: &str,
+        option_indexes: &[u32],
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        self.fold_poll_row(
+            account_id,
+            conversation_id,
+            target_sent_at,
+            sender_id,
+            legacy_sender_id,
+            |poll| {
+                // The §4.38 cap family: a poll past the vote cap keeps its
+                // first 64 voters, exactly like the import fold.
+                const MAX_POLL_VOTES: usize = 64;
+                let cap = poll.options.len() as u32;
+                let indexes: Vec<u32> = option_indexes
+                    .iter()
+                    .copied()
+                    .filter(|index| *index < cap)
+                    .collect();
+                if let Some(entry) = poll.votes.iter_mut().find(|vote| vote.voter_id == voter_id) {
+                    if indexes.is_empty() {
+                        let voter = voter_id.to_string();
+                        poll.votes.retain(|vote| vote.voter_id != voter);
+                    } else {
+                        entry.option_indexes = indexes;
+                    }
+                    return true;
+                }
+                if indexes.is_empty() || poll.votes.len() >= MAX_POLL_VOTES {
+                    return false;
+                }
+                poll.votes.push(crate::engine::NormalizedPollVote {
+                    voter_id: voter_id.to_string(),
+                    option_indexes: indexes,
+                });
+                true
+            },
+        )
+    }
+
+    /// Fold one live poll termination onto the poll row it addresses
+    /// (§4.118): the `terminated` bit flips true, idempotent. The same
+    /// fail-closed keying and `None` answers as [`Self::fold_poll_vote`].
+    pub fn fold_poll_terminate(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+        sender_id: &str,
+        legacy_sender_id: &str,
+    ) -> Result<Option<MessageRecord>, StoreError> {
+        self.fold_poll_row(
+            account_id,
+            conversation_id,
+            target_sent_at,
+            sender_id,
+            legacy_sender_id,
+            |poll| {
+                if poll.terminated {
+                    return false;
+                }
+                poll.terminated = true;
+                true
+            },
+        )
+    }
+
+    /// The shared fold half: resolve the addressed poll row, require a
+    /// poll face, apply the mutation, persist the rich column, return the
+    /// fresh record. `None` answers an absent target, an ambiguous
+    /// (per-sender timestamp collision) target, and a target with no poll
+    /// face alike — the caller cannot distinguish them and never invents
+    /// state from the difference.
+    fn fold_poll_row<F>(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        target_sent_at: u64,
+        sender_id: &str,
+        legacy_sender_id: &str,
+        mutate: F,
+    ) -> Result<Option<MessageRecord>, StoreError>
+    where
+        F: FnOnce(&mut crate::engine::NormalizedPoll) -> bool,
+    {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let candidates: Vec<(String, Option<String>)> = transaction
+            .prepare(
+                "SELECT id, rich_json FROM messages
+                 WHERE account_id=?1 AND conversation_id=?2 AND sent_at=?3
+                   AND sender_id IN (?4, ?5)
+                   AND status NOT IN ('remote-deleted', 'system')
+                 ORDER BY id ASC",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map(
+                    params![
+                        account_id,
+                        conversation_id,
+                        target_sent_at as i64,
+                        sender_id,
+                        legacy_sender_id,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .and_then(|rows| rows.collect())
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // One row answers; two rows at one (sender-pair, timestamp) identity
+        // are the same ambiguity `message_by_signal_identity` refuses — a
+        // fold into "whichever row wins the ORDER BY" could poison a
+        // foreign row.
+        let mut rows = candidates.into_iter();
+        let Some((message_id, rich_json)) = rows.next() else {
+            return Ok(None);
+        };
+        if rows.next().is_some() {
+            return Ok(None);
+        }
+        let Some(json) = rich_json else {
+            return Ok(None);
+        };
+        // A rich column this store did not write (or cannot parse) is not a
+        // poll row this fold can honestly touch — refuse, never guess.
+        let Ok(mut rich) = serde_json::from_str::<crate::engine::NormalizedRich>(&json) else {
+            return Ok(None);
+        };
+        let Some(poll) = rich.poll.as_mut() else {
+            return Ok(None);
+        };
+        if !mutate(poll) {
+            return Ok(None);
+        }
+        let updated = serde_json::to_string(&rich).expect("rich json");
+        transaction
+            .execute(
+                "UPDATE messages SET rich_json=?2 WHERE id=?1",
+                params![message_id, updated],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let record = transaction
+            .query_row(
+                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                        body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                        quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                 FROM messages
+                 WHERE id=?1",
+                params![message_id],
+                message_record_from_row,
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record)
+    }
+
     /// Mark a message remote-deleted (contract 1.15): a peer's or our own
     /// multi-device remoteDelete pointing at this row's upstream timestamp.
     /// Contract 1.109 (§4.90): the delete is author-scoped — only rows whose
@@ -14951,6 +15133,501 @@ mod tests {
         assert!(
             rows.iter()
                 .all(|row| row["hasUserInitiatedOutbound"].is_boolean())
+        );
+    }
+
+    /// §4.118: the live poll vote fold runs the official replace-on-vote
+    /// semantics against the addressed row — the voter's full selection
+    /// replaces their entry in place, an empty selection clears it, a fresh
+    /// voter with an empty selection no-ops. Indexes past the poll's own
+    /// option bound cannot render: they filter out, and a selection that
+    /// filters to nothing never lands (a hostile selection must not erase a
+    /// legitimate vote under the clear-vote shape). The returned record is
+    /// the fresh row, poll flattened on the wire exactly like the import
+    /// chain's face — `voteCount` never rides.
+    #[test]
+    fn poll_vote_fold_replaces_the_voters_selection_in_place() {
+        use crate::engine::{NormalizedPoll, NormalizedRich};
+        use serde_json::json;
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtcG9sbA==", "Polls")
+            .unwrap();
+        let insert_poll =
+            |store: &Store, id: &str, sender: &str, sent_at: u64, status: &'static str| {
+                let message = MessageRecord {
+                    id: id.into(),
+                    account_id: account.id.clone(),
+                    conversation_id: conversation.id.clone(),
+                    direction: "incoming",
+                    sender_id: sender.into(),
+                    sender_name: None,
+                    mentions_self: false,
+                    sent_at,
+                    received_at: None,
+                    text: None,
+                    text_bytes: None,
+                    text_truncated: false,
+                    text_retrievable: true,
+                    status,
+                    client_request_id: None,
+                    quote_message_id: None,
+                    quote_snapshot: None,
+                    attachments: Vec::new(),
+                    edited_at: None,
+                    rich: Some(NormalizedRich {
+                        poll: Some(NormalizedPoll {
+                            question: "Lunch?".into(),
+                            options: vec!["Ramen".into(), "Sushi".into(), "Cake".into()],
+                            allow_multiple: true,
+                            terminated: false,
+                            votes: Vec::new(),
+                        }),
+                        ..Default::default()
+                    }),
+                    reactions: Vec::new(),
+                    edits: Vec::new(),
+                    delivered_at: None,
+                    read_at: None,
+                    viewed_at: None,
+                    sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    admin_deleted: false,
+                    server_guid: None,
+                    server_timestamp: None,
+                };
+                store.insert_message(&message, None, None, false).unwrap();
+            };
+        insert_poll(&store, "poll-1", "hash-author", 700, "delivered");
+        let votes = |record: &MessageRecord| {
+            record
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.poll.as_ref())
+                .expect("the row keeps its poll face")
+                .votes
+                .clone()
+        };
+
+        // First vote lands as a new aggregated entry.
+        let first = store
+            .fold_poll_vote(
+                &account.id,
+                &conversation.id,
+                700,
+                "hash-author",
+                "legacy-author",
+                "hash-voter-a",
+                &[2],
+            )
+            .unwrap()
+            .expect("the addressed poll row exists");
+        assert_eq!(first.id, "poll-1");
+        let entered = votes(&first);
+        assert_eq!(entered.len(), 1);
+        assert_eq!(entered[0].voter_id, "hash-voter-a");
+        assert_eq!(entered[0].option_indexes, vec![2]);
+
+        // The same voter's new selection replaces their entry in place.
+        let replaced = store
+            .fold_poll_vote(
+                &account.id,
+                &conversation.id,
+                700,
+                "hash-author",
+                "legacy-author",
+                "hash-voter-a",
+                &[0, 1],
+            )
+            .unwrap()
+            .expect("replace");
+        let entered = votes(&replaced);
+        assert_eq!(entered.len(), 1, "replace never appends");
+        assert_eq!(entered[0].option_indexes, vec![0, 1]);
+
+        // An empty selection is the official clear-vote shape.
+        let cleared = store
+            .fold_poll_vote(
+                &account.id,
+                &conversation.id,
+                700,
+                "hash-author",
+                "legacy-author",
+                "hash-voter-a",
+                &[],
+            )
+            .unwrap()
+            .expect("clear");
+        assert!(votes(&cleared).is_empty(), "the voter's entry is gone");
+
+        // A fresh voter clearing a vote they never cast no-ops.
+        assert!(
+            store
+                .fold_poll_vote(
+                    &account.id,
+                    &conversation.id,
+                    700,
+                    "hash-author",
+                    "legacy-author",
+                    "hash-voter-a",
+                    &[],
+                )
+                .unwrap()
+                .is_none(),
+            "nothing to clear is a no-op"
+        );
+
+        // A vote the option bound cannot render never lands — and never
+        // erases a legitimate vote under the clear shape.
+        let cast = store
+            .fold_poll_vote(
+                &account.id,
+                &conversation.id,
+                700,
+                "hash-author",
+                "legacy-author",
+                "hash-voter-a",
+                &[0],
+            )
+            .unwrap()
+            .expect("cast");
+        assert!(
+            store
+                .fold_poll_vote(
+                    &account.id,
+                    &conversation.id,
+                    700,
+                    "hash-author",
+                    "legacy-author",
+                    "hash-voter-b",
+                    &[9],
+                )
+                .unwrap()
+                .is_none(),
+            "an all-out-of-range selection no-ops"
+        );
+        let after = store
+            .message_by_id(&account.id, &conversation.id, "poll-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            votes(&after),
+            votes(&cast),
+            "the hostile vote changed nothing"
+        );
+
+        // The wire row carries the poll flattened at the top level — the
+        // import chain's exact keys, no voteCount anywhere.
+        let wire = serde_json::to_value(&after).unwrap();
+        assert_eq!(
+            wire["poll"]["votes"][0],
+            json!({ "voterId": "hash-voter-a", "optionIndexes": [0] })
+        );
+        assert!(wire["poll"].get("voteCount").is_none());
+        assert!(wire["poll"].get("terminated").is_none());
+    }
+
+    /// §4.118: the fold is fail-closed at every miss — no row at the
+    /// identity, a row with no rich column, a rich payload that is not a
+    /// poll row, a `system`-status row, and the two-rows-at-one-identity
+    /// ambiguity (the same refusal `message_by_signal_identity` makes) all
+    /// answer `None` and mutate nothing. The sender pair disambiguates the
+    /// incoming and outgoing legs sharing one per-sender timestamp. The
+    /// terminate fold flips the bit once and replays as a no-op.
+    #[test]
+    fn poll_fold_fails_closed_on_missing_ambiguous_and_unpollable_rows() {
+        use crate::engine::{NormalizedPoll, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtcG9sbA==", "Polls")
+            .unwrap();
+        let insert = |store: &Store,
+                      id: &str,
+                      sender: &str,
+                      sent_at: u64,
+                      status: &'static str,
+                      rich: Option<NormalizedRich>| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: sender.into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: None,
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: true,
+                status,
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                edited_at: None,
+                rich,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+            };
+            store.insert_message(&message, None, None, false).unwrap();
+        };
+        let poll_rich = || {
+            Some(NormalizedRich {
+                poll: Some(NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: Vec::new(),
+                }),
+                ..Default::default()
+            })
+        };
+        let vote = |sender: &str, sent_at: u64| {
+            store
+                .fold_poll_vote(
+                    &account.id,
+                    &conversation.id,
+                    sent_at,
+                    sender,
+                    sender,
+                    "hash-voter-a",
+                    &[0],
+                )
+                .unwrap()
+        };
+
+        insert(
+            &store,
+            "poll-in",
+            "hash-author",
+            700,
+            "delivered",
+            poll_rich(),
+        );
+        // The outgoing leg shares the timestamp with a different sender pair.
+        insert(&store, "poll-self", "self", 700, "delivered", poll_rich());
+        insert(&store, "plain", "hash-plain", 701, "delivered", None);
+        insert(
+            &store,
+            "unpoll",
+            "hash-unpoll",
+            702,
+            "delivered",
+            Some(NormalizedRich::default()),
+        );
+        insert(
+            &store,
+            "system-poll",
+            "hash-system",
+            703,
+            "system",
+            poll_rich(),
+        );
+        // The ambiguity pair: two poll rows at one (sender-pair, timestamp).
+        insert(&store, "poll-x", "hash-twin", 704, "delivered", poll_rich());
+        insert(&store, "poll-y", "hash-twin", 704, "delivered", poll_rich());
+
+        assert!(vote("hash-nobody", 705).is_none(), "no row at the identity");
+        assert!(vote("hash-plain", 701).is_none(), "no rich column");
+        assert!(
+            vote("hash-unpoll", 702).is_none(),
+            "rich without a poll face"
+        );
+        assert!(vote("hash-system", 703).is_none(), "system rows never fold");
+        assert!(
+            vote("hash-twin", 704).is_none(),
+            "two rows at one identity refuse to fold"
+        );
+        for id in ["poll-x", "poll-y"] {
+            let row = store
+                .message_by_id(&account.id, &conversation.id, id)
+                .unwrap()
+                .unwrap();
+            let poll = row.rich.and_then(|rich| rich.poll).unwrap();
+            assert!(poll.votes.is_empty(), "{id} survived the ambiguous fold");
+        }
+
+        // The sender pair picks exactly one leg when both sit at the same
+        // per-sender timestamp.
+        let incoming = vote("hash-author", 700).expect("the incoming leg folds");
+        assert_eq!(incoming.id, "poll-in");
+        let outgoing = vote("self", 700).expect("the outgoing leg folds");
+        assert_eq!(outgoing.id, "poll-self");
+
+        // Terminate flips the bit once; the replay is an honest no-op.
+        let terminated = store
+            .fold_poll_terminate(
+                &account.id,
+                &conversation.id,
+                700,
+                "hash-author",
+                "hash-author",
+            )
+            .unwrap()
+            .expect("terminate");
+        assert_eq!(terminated.id, "poll-in");
+        let poll = terminated.rich.and_then(|rich| rich.poll).unwrap();
+        assert!(poll.terminated);
+        assert!(
+            store
+                .fold_poll_terminate(
+                    &account.id,
+                    &conversation.id,
+                    700,
+                    "hash-author",
+                    "hash-author",
+                )
+                .unwrap()
+                .is_none(),
+            "an already-terminated poll replays as a no-op"
+        );
+        let still = store
+            .message_by_id(&account.id, &conversation.id, "poll-in")
+            .unwrap()
+            .unwrap();
+        assert!(
+            still
+                .rich
+                .and_then(|rich| rich.poll)
+                .expect("face kept")
+                .terminated,
+            "the replay did not un-terminate"
+        );
+        assert!(
+            store
+                .fold_poll_terminate(&account.id, &conversation.id, 705, "hash-nobody", "x")
+                .unwrap()
+                .is_none(),
+            "terminate misses like vote does"
+        );
+    }
+
+    /// §4.118: the vote fold keeps the §4.38 import cap family — a poll
+    /// already carrying 64 voters refuses a 65th (no-op, nothing mutates)
+    /// while a capped voter replacing their own entry and a plain terminate
+    /// still fold.
+    #[test]
+    fn poll_vote_fold_caps_at_the_sixty_four_voter_bound() {
+        use crate::engine::{NormalizedPoll, NormalizedPollVote, NormalizedRich};
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtcG9sbA==", "Polls")
+            .unwrap();
+        let message = MessageRecord {
+            id: "poll-capped".into(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            direction: "incoming",
+            sender_id: "hash-author".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 900,
+            received_at: None,
+            text: None,
+            text_bytes: None,
+            text_truncated: false,
+            text_retrievable: true,
+            status: "delivered",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: Some(NormalizedRich {
+                poll: Some(NormalizedPoll {
+                    question: "Lunch?".into(),
+                    options: vec!["Ramen".into(), "Sushi".into()],
+                    allow_multiple: false,
+                    terminated: false,
+                    votes: (0..64)
+                        .map(|index| NormalizedPollVote {
+                            voter_id: format!("hash-voter-{index}"),
+                            option_indexes: vec![0],
+                        })
+                        .collect(),
+                }),
+                ..Default::default()
+            }),
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        store.insert_message(&message, None, None, false).unwrap();
+
+        assert!(
+            store
+                .fold_poll_vote(
+                    &account.id,
+                    &conversation.id,
+                    900,
+                    "hash-author",
+                    "hash-author",
+                    "hash-voter-new",
+                    &[1],
+                )
+                .unwrap()
+                .is_none(),
+            "the 65th voter no-ops"
+        );
+        let capped = store
+            .fold_poll_vote(
+                &account.id,
+                &conversation.id,
+                900,
+                "hash-author",
+                "hash-author",
+                "hash-voter-7",
+                &[1],
+            )
+            .unwrap()
+            .expect("a capped voter still replaces their own entry");
+        let poll = capped.rich.and_then(|rich| rich.poll).unwrap();
+        assert_eq!(poll.votes.len(), 64, "the cap held");
+        assert_eq!(poll.votes[7].option_indexes, vec![1]);
+
+        let terminated = store
+            .fold_poll_terminate(&account.id, &conversation.id, 900, "hash-author", "x")
+            .unwrap()
+            .expect("terminate ignores the vote cap");
+        assert!(
+            terminated
+                .rich
+                .and_then(|rich| rich.poll)
+                .unwrap()
+                .terminated
         );
     }
 }
