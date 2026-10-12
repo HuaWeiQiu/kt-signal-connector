@@ -1232,6 +1232,21 @@ pub enum ControlReceive {
     SyncPniChangeNumber {
         change: SyncPniChangeNumber,
     },
+    /// The engine's `syncMessage.contacts` projection (contract 1.136,
+    /// §4.122): the phone pushed its contact list to the linked devices —
+    /// the official handleContacts consume face, the passive half of the
+    /// connector's contacts cache. Each record is one bounded parsed contact
+    /// (the identity + display name the cache holds; the
+    /// expireTimer/inboxPosition family has no connector-cache home and
+    /// stays on the engine face, the throttled `listContacts` enrich owns
+    /// the richer trio). Records whose every field failed the bounds never
+    /// reach this variant — the projection parser dropped them, and an
+    /// envelope with nothing usable left keeps the plain syncMessage skip.
+    /// The routing source stays None — the envelope is our own account and
+    /// the records name their own subjects (the read/viewed precedent).
+    SyncContacts {
+        contacts: Vec<SyncContactRecord>,
+    },
     /// The engine's `groupChanged {groupId, revision, changes[], editor?,
     /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
     /// official GroupV2ChangeDetailType word list the engine decrypted out
@@ -1406,6 +1421,19 @@ pub struct SyncPniChangeNumber {
     pub new_e164: Option<String>,
 }
 
+/// One passive contact record off the engine's `syncMessage.contacts`
+/// projection (contract 1.136, §4.122): the parsed contact identity — the
+/// ACI the engine always projects, the e164 when its cache resolved one —
+/// plus the composed display name. These are the facts the connector's
+/// contacts cache holds (the pull path's `peer_key`/`title` pair); the
+/// expireTimer/inboxPosition family rides the engine face only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SyncContactRecord {
+    pub aci: String,
+    pub number: Option<String>,
+    pub name: Option<String>,
+}
+
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
@@ -1422,6 +1450,16 @@ const MAX_RECEIPT_TIMESTAMPS: usize = 256;
 /// real multi-device read syncs stay far below it; entries past the cap
 /// drop (the same truncate discipline as `MAX_RECEIPT_TIMESTAMPS`).
 const MAX_SYNC_READ_ENTRIES: usize = 256;
+/// One passive contacts face carries at most this many records (contract
+/// 1.136, §4.122): the same coarse batch guard family the read sync rides —
+/// the engine projects the phone's parsed contact set per envelope, and the
+/// tail past the cap drops (the truncate discipline; the stragglers still
+/// converge through the 60s-TTL pull path the passive face only accelerates).
+const MAX_SYNC_CONTACT_RECORDS: usize = 512;
+/// One passive contact record's display-name cap (contract 1.136, §4.122):
+/// the same 64-char title bound the pull path's contact composer applies —
+/// the cache holds one bounded title, not the raw profile text.
+const MAX_SYNC_CONTACT_NAME_CHARS: usize = 64;
 /// One delete-for-me sync carries at most this many conversation groups
 /// (contract 1.102, §4.83): the same coarse batch guard family the read
 /// sync rides — real batches group per conversation and stay far below;
@@ -1717,6 +1755,18 @@ impl NormalizedReceive {
                     std::mem::size_of::<SyncPniChangeNumber>()
                         + change.new_e164.as_ref().map_or(0, String::len)
                 }
+                // The contacts sync carries heap record Vecs like the read
+                // lists — counted entry-wise so the queue budget stays
+                // honest (§4.13).
+                Some(ControlReceive::SyncContacts { contacts }) => contacts
+                    .iter()
+                    .map(|record| {
+                        std::mem::size_of::<SyncContactRecord>()
+                            + record.aci.len()
+                            + record.number.as_ref().map_or(0, String::len)
+                            + record.name.as_ref().map_or(0, String::len)
+                    })
+                    .sum(),
                 _ => 0,
             }
             // Rich bodies carry capped urls/titles/names; ranges are fixed-width.
@@ -3404,6 +3454,57 @@ fn normalized_sync_pni_change_number(value: Option<&Value>) -> Option<SyncPniCha
     Some(change)
 }
 
+/// Bounded `syncMessage.contacts` record family (contract 1.136, §4.122):
+/// the wire shape is `{complete, records: [{aci, number?, name?, …}]}` — the
+/// engine projects the phone's parsed contact set (the official handleContacts
+/// blob consume, the blob itself stays engine-side). Each record normalizes to
+/// the identity + display name the connector's contacts cache holds: the ACI
+/// is the record's hard gate (the engine always projects it — its absence is
+/// a hostile shape, the record drops, 宁缺勿错), the e164 and the composed
+/// name ride optional and per-key bounded (the receive id family caps and the
+/// contact title cap the pull path applies). The expireTimer/inboxPosition
+/// family has no connector-cache home and is not read. A face with no usable
+/// record at all answers empty — the envelope keeps the plain syncMessage
+/// skip (the delete-for-me sibling discipline).
+fn normalized_sync_contact_records(value: Option<&Value>) -> Vec<SyncContactRecord> {
+    let Some(records) = value
+        .and_then(|face| face.get("records"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    records
+        .iter()
+        .take(MAX_SYNC_CONTACT_RECORDS)
+        .filter_map(|entry| {
+            let object = entry.as_object()?;
+            let aci = object
+                .get("aci")?
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())?;
+            let number = object
+                .get("number")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>());
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.chars()
+                        .take(MAX_SYNC_CONTACT_NAME_CHARS)
+                        .collect::<String>()
+                });
+            Some(SyncContactRecord { aci, number, name })
+        })
+        .collect()
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -4744,6 +4845,26 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             group_id: None,
             control: ControlReceive::SyncPniChangeNumber { change },
         });
+    }
+    // The engine's `syncMessage.contacts` projection (contract 1.136,
+    // §4.122): the phone pushed its contact set to the linked devices — the
+    // official handleContacts consume face. Intercepted before the plain
+    // syncMessage skip like its read/viewed/delete-for-me siblings; an
+    // envelope whose records all failed the bounds (or carried none) falls
+    // through to that skip — the `complete` flag alone is the pull path's
+    // concern, not a cache write. The routing source stays None — the
+    // envelope is our own account and the records name their own subjects
+    // (the read/viewed precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object) {
+        let contacts = normalized_sync_contact_records(sync.get("contacts"));
+        if !contacts.is_empty() {
+            return Some(ControlRouting {
+                direction: "incoming",
+                source: None,
+                group_id: None,
+                control: ControlReceive::SyncContacts { contacts },
+            });
+        }
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
     // projection routes like every body-less control face — an empty or
@@ -8542,6 +8663,84 @@ mod tests {
             json!({ "pniChangeNumber": {} }),
             json!({ "pniChangeNumber": { "registrationId": 4294967296u64 } }),
             json!({ "pniChangeNumber": { "newE164": 15555550199u64 } }),
+        ] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.136 (§4.122): the engine's `syncMessage.contacts`
+    /// projection routes as a bounded control batch — each record's identity
+    /// survives with the optional e164/display name, hostile records drop
+    /// per-record, and a face with nothing usable (or no records at all —
+    /// the completion-only envelope) falls through to the plain syncMessage
+    /// skip. The routing source stays None: the envelope is our own account.
+    #[test]
+    fn sync_contacts_routes_bounded_records() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "sourceUuid": "99999999-9999-9999-9999-999999999999",
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        let Some((ControlReceive::SyncContacts { contacts }, source)) = routing(json!({
+            "contacts": {
+                "complete": true,
+                "records": [
+                    {
+                        "aci": "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                        "number": "+15551234567",
+                        "name": "Alice",
+                    },
+                    // No number, no name — the ACI-only record survives.
+                    { "aci": "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283" },
+                    // Hostile shapes drop per-record, the batch rides on.
+                    {},
+                    { "number": "+15551234568" },
+                    { "aci": "" },
+                    { "aci": 42 },
+                ],
+            },
+        })) else {
+            panic!("expected a contacts control routing");
+        };
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].aci, "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae");
+        assert_eq!(contacts[0].number.as_deref(), Some("+15551234567"));
+        assert_eq!(contacts[0].name.as_deref(), Some("Alice"));
+        assert_eq!(contacts[1].aci, "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283");
+        assert!(contacts[1].number.is_none());
+        assert!(contacts[1].name.is_none());
+        assert!(source.is_none(), "the envelope is our own account");
+
+        // The optional faces bound per key: a 200-char name truncates to the
+        // 64-char cache-title cap the pull path applies.
+        let Some((ControlReceive::SyncContacts { contacts }, _)) = routing(json!({
+            "contacts": {
+                "records": [{ "aci": "a", "name": "長".repeat(200) }],
+            },
+        })) else {
+            panic!("expected the long-name record to survive");
+        };
+        assert_eq!(contacts[0].name.as_deref(), Some("長".repeat(64).as_str()));
+
+        // A completion-only envelope (the `complete` flag alone) and a face
+        // whose every record dropped are no cache write — the plain skip.
+        for sync in [
+            json!({ "contacts": { "complete": true, "records": [] } }),
+            json!({ "contacts": { "records": [{ "number": "+15551234568" }] } }),
+            json!({ "contacts": {} }),
         ] {
             let routing = control_routing(
                 json!({ "timestamp": 1727000000000u64, "syncMessage": sync })

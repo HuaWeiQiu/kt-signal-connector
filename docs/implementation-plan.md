@@ -5,10 +5,11 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- No-revision record: 2026-10-13; the §4.121 receive-side gap (the self-sent
-  sticker / bodyless pure-quote `sentMessage` sync projection) lands as
-  connector-internal behavior only — zero wire change, the contract revision
-  stays 1.136 (the §4.121 entry below)
+- No-revision record: 2026-10-13; the §4.121/§4.122 receive-side gap pair (the
+  self-sent sticker / bodyless pure-quote `sentMessage` sync projection and the
+  passive `syncMessage.contacts` consume into the contacts cache) lands as
+  connector-internal behavior only — zero wire change, the contract revision stays
+  1.136 (the §4.121/§4.122 entries below)
 - No-revision stopgap record: 2026-10-12; the §4.119 outbound-receipt resupply stopgap
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
@@ -9846,6 +9847,55 @@ precedence` (a data-less sticker stays skip; a sticker beside a remote-delete ec
 control), and `sync_sent_bodyless_quote_lands_outgoing_row` (the quote-only send lands
 outgoing with the quote face and empty attachments). Gates: fmt, clippy `-D warnings`,
 tests all green.
+
+### 4.122 The passive contacts envelope: `syncMessage.contacts` lands in the contacts cache instead of waiting for the pull (no contract revision — wire unchanged, 2026-10-13)
+
+Official behavior: when a contact or conversation is new, every linked device learns it
+immediately — the phone pushes its contact set and the desktop consumes it
+(`handleContacts`). The engine already projects that consume as the
+`syncMessage.contacts {complete, records[]}` envelope on its receive stream, but the
+connector's syncMessage arm ignored the face entirely, so a passively added contact
+surfaced only after the next 60s-TTL `listContacts` pull. The face is now intercepted in
+`control_routing` like its read/viewed/delete-for-me siblings and consumed into the
+existing contacts cache.
+
+The projection bounds mirror the sync-face family: at most `MAX_SYNC_CONTACT_RECORDS`
+(512) records per envelope (the tail drops — the pull path still covers it within its
+TTL), the ACI each record's hard gate (the engine always projects it; a record without
+one is a hostile shape and drops, 宁缺勿错), the e164 and the composed display name
+optional and per-key bounded (the receive id family's caps, the pull path's 64-char
+title cap). The expireTimer/inboxPosition family is deliberately not read — the
+connector's contacts cache holds the identity/title pair only, and the richer trio stays
+the throttled `listContacts` enrich's (the §4.8 enrichment lane unchanged). A face with
+no usable record at all — including the completion-only envelope, whose `complete` flag
+alone is the pull path's concern — keeps the plain syncMessage skip; nothing routes.
+
+Consumption (`apply_sync_contacts`) reuses the pull path's identity ladder and dedup
+semantics verbatim: `number` first, the ACI the fallback `peer_key` (so a passive record
+converges onto the same cache row a pull wrote), the title the composed display name or
+the masked peer id. The same subject twice in one envelope (a number+aci record beside
+an aci-only sibling) keeps the named entry — a masked duplicate never downgrades a real
+title through the batch's last-write-wins (the same `***` judgment
+`title_should_upgrade` applies). The batch commits through
+`Store::upsert_passive_contacts`, a sibling of `upsert_synced_contacts` with the same
+columns, conflict semantics, and idempotent conversation-skeleton materialization — minus
+the sync marker on purpose: `contacts_synced_at` means "a full `listContacts` pull
+completed", and advancing it on a passive batch would let the 60s short-circuit report a
+freshness the pull never delivered. The store answers exactly the change set — a newly
+materialized skeleton or a placeholder title the batch upgraded — and only those
+conversations ride the existing `conversation.changed` event, so the desktop's
+conversation list converges without a refetch; a replayed batch changes nothing and emits
+nothing. No new method, event, key, error, capability, or store move; zero wire change.
+
+Tests: `sync_contacts_routes_bounded_records` (records route with the optional faces,
+hostile records drop per-record, the completion-only envelope stays skip, the name caps
+at the pull path's title bound), `passive_contacts_batch_keeps_the_pull_marker_and_
+reports_changes` (the change set is exactly the new skeletons plus the placeholder-title
+upgrades, a replay is empty, the pull marker untouched by every passive write and still
+movable by the pull), and `sync_contacts_passive_batch_lands_cache_and_emits_changes`
+(the end-to-end consume: new skeletons ride `conversation.changed`, the marker stays
+pull-owned, the replay is silent, the masked-title upgrade emits again). Gates: fmt,
+clippy `-D warnings`, tests all green.
 
 ## 5. signal-cli Boundary
 

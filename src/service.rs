@@ -8374,6 +8374,13 @@ impl ConnectorService {
         if let ControlReceive::SyncPniChangeNumber { change } = &control {
             return self.apply_sync_pni_change_number(&account, change);
         }
+        // Contract 1.136 (§4.122 consume batch): the passive contacts sync
+        // addresses its own subjects (the records carry their identities),
+        // never an envelope source (the envelope is our own account) — the
+        // same interception family as the verified/call-event siblings above.
+        if let ControlReceive::SyncContacts { contacts } = &control {
+            return self.apply_sync_contacts(&account, contacts);
+        }
         // Group termination (contract 1.134, §4.117): the engine's
         // `groupTerminated` projection — the conversation-less transient
         // family like the story face below. Intercepted before the
@@ -9277,6 +9284,10 @@ impl ConnectorService {
             | ControlReceive::SyncDeviceNameChange { .. }
             | ControlReceive::SyncUsernameChange
             | ControlReceive::SyncPniChangeNumber { .. } => Ok(Vec::new()),
+            // The §4.122 passive contacts sync is intercepted the same way
+            // (it addresses its own subjects, never an envelope source);
+            // this arm is the same unreachable-in-practice guard.
+            ControlReceive::SyncContacts { .. } => Ok(Vec::new()),
             // The §4.117 conversation-less transient family is intercepted
             // before the ladder like the story face; these arms are the same
             // unreachable-in-practice guards.
@@ -9935,6 +9946,82 @@ impl ConnectorService {
             registration_id: change.registration_id,
             new_e164: change.new_e164.clone(),
         }])
+    }
+
+    /// Contract 1.136 (§4.122): consume one `syncMessage.contacts` mirror —
+    /// the phone pushed its contact set to the linked devices (the official
+    /// handleContacts consume face), and the passive records land in the
+    /// existing contacts cache instead of waiting for the next 60s-TTL pull.
+    /// The identity ladder and dedup semantics are the pull path's verbatim
+    /// (`sync_contacts_with`): `number` first, the ACI the fallback `peer_key`
+    /// — so a passive record converges onto the same cache row a pull wrote —
+    /// and the title is the composed display name or the masked peer id. The
+    /// batch commits through the pull path's sibling store write (marker
+    /// untouched — a passive batch is not a pull), and only the changed
+    /// conversation skeletons — a newly materialized one or one whose
+    /// placeholder title the batch upgraded — ride `conversation.changed`, so
+    /// the desktop's conversation list converges without a refetch.
+    fn apply_sync_contacts(
+        &mut self,
+        account: &AccountRow,
+        contacts: &[crate::engine::SyncContactRecord],
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        if contacts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut synced: Vec<(String, String, String)> = Vec::new();
+        for record in contacts {
+            let peer_key = record
+                .number
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| record.aci.clone());
+            let title = record
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| mask_address(&peer_key));
+            // The same subject twice in one envelope (a number+aci record
+            // beside an aci-only sibling): the named entry outranks the
+            // masked one — a masked duplicate never downgrades a real title
+            // through the batch's last-write-wins (the same `***` judgment
+            // `title_should_upgrade` applies).
+            if let Some(existing) = synced.iter_mut().find(|(_, key, _)| *key == peer_key)
+                && existing.2.contains("***")
+                && !title.contains("***")
+            {
+                existing.2 = title.clone();
+            }
+            if !synced.iter().any(|(_, key, _)| *key == peer_key) {
+                synced.push(("contact".to_string(), peer_key, title));
+            }
+        }
+        let entries: Vec<SyncedContact<'_>> = synced
+            .iter()
+            .map(|(kind, peer_key, title)| SyncedContact {
+                kind: kind.as_str(),
+                peer_key: peer_key.as_str(),
+                title: title.as_str(),
+                extra: None,
+            })
+            .collect();
+        let changed = self
+            .store
+            .upsert_passive_contacts(&account.id, &entries, now_ms())?;
+        let mut events = Vec::new();
+        for conversation_id in changed {
+            if let Some(conversation) = self
+                .store
+                .conversation_summary(&account.id, &conversation_id)?
+            {
+                events.push(HostSideEvent::ConversationChanged(conversation));
+            }
+        }
+        Ok(events)
     }
 
     /// Contract 1.70 (§4.58 consume batch): consume one
@@ -26084,6 +26171,110 @@ mod tests {
             .unwrap();
         assert_eq!(row.read_at, Some(2000));
         assert_eq!(row.viewed_at, Some(3000));
+    }
+
+    /// Contract 1.136 (§4.122 consume batch): the passive `syncMessage.
+    /// contacts` mirror lands its records in the existing contacts cache and
+    /// materializes the direct conversation skeletons through the pull
+    /// path's sibling store write — the pull marker untouched — and exactly
+    /// the changed conversations ride `conversation.changed`: a replay is
+    /// silent, a name that upgrades a masked title emits again.
+    #[test]
+    fn sync_contacts_passive_batch_lands_cache_and_emits_changes() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let receive = |contacts: Vec<crate::engine::SyncContactRecord>| {
+            let mut receive = control_receive(
+                "+15555550100",
+                "+15555550100",
+                ControlReceive::SyncContacts { contacts },
+            );
+            receive.source = None;
+            receive
+        };
+        let record = |aci: &str, number: Option<&str>, name: Option<&str>| {
+            crate::engine::SyncContactRecord {
+                aci: aci.to_string(),
+                number: number.map(str::to_string),
+                name: name.map(str::to_string),
+            }
+        };
+
+        let events = service
+            .ingest_receive(
+                receive(vec![
+                    record(
+                        "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                        Some("+15551234567"),
+                        Some("Alice"),
+                    ),
+                    record("0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283", None, None),
+                ]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        // Both skeletons are new — both summaries ride conversation.changed,
+        // the nameless record titling with the masked ACI.
+        assert_eq!(events.len(), 2, "{events:?}");
+        for event in &events {
+            assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
+        }
+        let titled = events
+            .iter()
+            .filter_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .find(|summary| summary.title == "Alice")
+            .expect("the named contact's summary rode the change");
+        assert_eq!(titled.kind, "direct");
+        let row = service
+            .store_ref()
+            .conversation_by_peer(&account.id, "direct", "+15551234567")
+            .unwrap()
+            .expect("the skeleton materialized");
+        assert_eq!(titled.id, row.id);
+        // The pull marker stays pull-owned: a passive batch is not a pull.
+        assert_eq!(service.contacts_synced_at(&account.id).unwrap(), None);
+        let (contact_count, _) = service.count_contacts(&account.id).unwrap();
+        assert_eq!(contact_count, 2);
+
+        // A replay changes nothing — the cache converged, so no events ride.
+        let events = service
+            .ingest_receive(
+                receive(vec![record(
+                    "6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae",
+                    Some("+15551234567"),
+                    Some("Alice"),
+                )]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+
+        // A real name upgrades a masked conversation title and emits it.
+        service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15551234568", "8fc***e2")
+            .unwrap();
+        let events = service
+            .ingest_receive(
+                receive(vec![record(
+                    "1b1c2d3e-4f50-4a1b-8c2d-3e4f50617284",
+                    Some("+15551234568"),
+                    Some("Bob"),
+                )]),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::ConversationChanged(summary) = &events[0] else {
+            panic!("expected a conversation.changed event: {events:?}");
+        };
+        assert_eq!(summary.title, "Bob");
     }
 
     /// Contract 1.34 outbound mentions: more than 64 entries are capped, an

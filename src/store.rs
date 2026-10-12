@@ -5570,6 +5570,112 @@ impl Store {
         Ok(())
     }
 
+    /// Cache one passive contacts batch (contract 1.136, §4.122) with the
+    /// same columns, conflict semantics, and idempotent conversation-skeleton
+    /// materialization as [`Store::upsert_synced_contacts`] — minus the sync
+    /// marker on purpose: `contacts_synced_at` means "a full `listContacts`
+    /// pull completed", and the passive face only accelerates individual
+    /// rows, so advancing it would let the 60s short-circuit report a
+    /// freshness the pull never delivered. Returns the conversation ids whose
+    /// skeleton the batch newly created or whose placeholder title it
+    /// upgraded — the change set the service layer turns into
+    /// `conversation.changed` events.
+    pub fn upsert_passive_contacts(
+        &self,
+        account_id: &str,
+        entries: &[SyncedContact<'_>],
+        synced_at: u64,
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        {
+            let mut stmt = transaction
+                .prepare(
+                    "INSERT INTO contacts(id, account_id, kind, peer_key, title, extra, synced_at)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(account_id, kind, peer_key) DO UPDATE SET
+                       title=excluded.title,
+                       extra=excluded.extra,
+                       synced_at=excluded.synced_at",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for entry in entries {
+                let id = stable_hash_id(&[account_id, entry.kind, entry.peer_key]);
+                stmt.execute(params![
+                    id,
+                    account_id,
+                    entry.kind,
+                    entry.peer_key,
+                    entry.title,
+                    entry.extra,
+                    synced_at as i64
+                ])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+        let mut changed: Vec<String> = Vec::new();
+        {
+            let mut stmt = transaction
+                .prepare(
+                    "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
+                     VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, 0)
+                     ON CONFLICT(id) DO NOTHING",
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            for entry in entries {
+                let conversation_kind = match entry.kind {
+                    "contact" => "direct",
+                    other => other,
+                };
+                let id = stable_hash_id(&[account_id, conversation_kind, entry.peer_key]);
+                let inserted = stmt
+                    .execute(params![
+                        id,
+                        account_id,
+                        conversation_kind,
+                        entry.peer_key,
+                        entry.title,
+                    ])
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                if inserted == 0 {
+                    // The row already exists (created by an earlier sync or a
+                    // real message): leave its state alone, but still upgrade
+                    // masked/placeholder titles — the sync cache may carry a
+                    // display name the conversation has not learned yet.
+                    let existing = transaction
+                        .query_row(
+                            "SELECT title FROM conversations WHERE id=?1",
+                            params![id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                    if let Some(current) = existing
+                        && title_should_upgrade(&current, entry.title)
+                    {
+                        transaction
+                            .execute(
+                                "UPDATE conversations SET title=?2 WHERE id=?1",
+                                params![id, entry.title],
+                            )
+                            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                        changed.push(id);
+                    }
+                } else {
+                    changed.push(id);
+                }
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        changed.sort();
+        changed.dedup();
+        Ok(changed)
+    }
+
     /// Cache one synced contact/group entry. `kind` is 'contact' or 'group';
     /// `extra` is an optional JSON marker (e.g. member count) kept opaque.
     pub fn upsert_contact(
@@ -11507,6 +11613,92 @@ mod tests {
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].title, "Alice A.");
         assert_eq!(store.count_contacts(&account.id).unwrap(), (2, 1));
+    }
+
+    /// Contract 1.136 (§4.122): the passive contacts batch shares the pull
+    /// batch's upsert columns and skeleton materialization but never moves
+    /// the pull marker — `contacts_synced_at` means "a full `listContacts`
+    /// pull completed", and the passive face must not let the 60s
+    /// short-circuit report a freshness the pull never delivered. The return
+    /// is exactly the change set: a newly materialized skeleton or a
+    /// placeholder title upgrade; a replay changes nothing.
+    #[test]
+    fn passive_contacts_batch_keeps_the_pull_marker_and_reports_changes() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let entries = [
+            SyncedContact {
+                kind: "contact",
+                peer_key: "+15555550101",
+                title: "Alice",
+                extra: None,
+            },
+            SyncedContact {
+                kind: "contact",
+                peer_key: "+15555550102",
+                title: "Bob",
+                extra: None,
+            },
+        ];
+        let changed = store
+            .upsert_passive_contacts(&account.id, &entries, 42)
+            .unwrap();
+        // Both skeletons are new: the change set names both conversations,
+        // and the pull marker is untouched.
+        assert_eq!(changed.len(), 2, "{changed:?}");
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), None);
+        assert_eq!(store.count_contacts(&account.id).unwrap(), (2, 0));
+        let conversation = store
+            .conversation_by_peer(&account.id, "direct", "+15555550101")
+            .unwrap()
+            .expect("the skeleton materialized");
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .expect("the new skeleton summarizes");
+        assert_eq!(summary.title, "Alice");
+
+        // A replay of the same batch is a no-op change set.
+        let changed = store
+            .upsert_passive_contacts(&account.id, &entries, 43)
+            .unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+
+        // A real name upgrades a masked conversation title and reports it;
+        // the marker still belongs to the pull path alone.
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "8fc***e2")
+            .unwrap();
+        let upgrade = [SyncedContact {
+            kind: "contact",
+            peer_key: "+15555550103",
+            title: "Carol",
+            extra: None,
+        }];
+        let changed = store
+            .upsert_passive_contacts(&account.id, &upgrade, 44)
+            .unwrap();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        let conversation = store
+            .conversation_by_peer(&account.id, "direct", "+15555550103")
+            .unwrap()
+            .expect("the conversation stays");
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .expect("the upgraded conversation summarizes");
+        assert_eq!(summary.title, "Carol");
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), None);
+
+        // The pull path's marker write is untouched by all of the above.
+        store
+            .upsert_synced_contacts(&account.id, &entries, 45)
+            .unwrap();
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), Some(45));
     }
 
     /// Performance sanity, not a benchmark: a phone-scale contacts sync (a few
