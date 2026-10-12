@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -42,6 +42,41 @@ const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// Dev/test key override (optimization-plan Phase 3 contract): production keys
 /// arrive over the bootstrap secret channel, never through the environment.
 pub const STORE_KEY_ENV: &str = "KT_SIGNAL_STORE_KEY";
+
+/// §4.123 auto send-retry queue constants. The window and the backoff curve
+/// replicate the official client's send-retry job semantics (verified against
+/// the v8.31.0-alpha.1 behavior: an exponential 1.9× curve starting at 190 ms,
+/// capped at one beat per 15 minutes, retried until 24 hours after the job
+/// entered the queue — roughly 110 attempts inside the window).
+///
+/// The window anchor is the row's own `first_send_attempted_at` (stamped at
+/// the first automatic enqueue, never moved by later retries; a manual
+/// `messages.retryText` clears the queue so a later re-enqueue starts a fresh
+/// window — the official manual-retry-is-a-new-job semantics).
+pub const RETRY_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+/// First automatic retry lands 190 ms after the definitive failure — the
+/// official curve's second beat (its first beat, 0 ms, is the initial send
+/// this row already made).
+pub const RETRY_BACKOFF_BASE_MS: u64 = 190;
+/// The official `exponentialBackoff` factor, carried as exact integer
+/// rational 19/10 so the schedule is reproducible without float drift.
+const RETRY_BACKOFF_FACTOR_NUM: u64 = 19;
+const RETRY_BACKOFF_FACTOR_DEN: u64 = 10;
+/// One beat per 15 minutes: the official per-attempt ceiling.
+pub const RETRY_BACKOFF_MAX_MS: u64 = 15 * 60 * 1_000;
+/// Total automatic attempts per row. Derivation: the geometric prefix
+/// 190 ms·(1.9⁰+…+1.9¹³) ≈ 28.1 min stays under the 15-minute cap through
+/// beat 14; every later beat is capped at 900 s, so the 24 h window fits
+/// ≈ 14 + ⌈(24 h − 28.1 min) / 15 min⌉ ≈ 110 attempts. 128 is a pure safety
+/// net above that curve — inside the window the schedule itself always binds
+/// first, and past the window the row is dead anyway.
+pub const MAX_RETRY_ATTEMPTS: u32 = 128;
+/// In-queue ceiling per account: at most this many rows carry a scheduled
+/// retry at once. A 257th failing row settles plain `failed` (the desktop's
+/// manual retry affordance is untouched); the bound keeps the scan, the
+/// per-pass claim batch, and the drain backlog hard-capped (AGENTS.md
+/// bounded-queue rule).
+pub const MAX_RETRY_QUEUED_PER_ACCOUNT: u32 = 256;
 
 /// The full schema DDL, shared by `Store::open` and test fixtures so a test
 /// store can never drift from the production schema.
@@ -107,6 +142,9 @@ CREATE TABLE IF NOT EXISTS messages (
   edited_at INTEGER,
   sender_name TEXT,
   mentions_self INTEGER NOT NULL DEFAULT 0,
+  first_send_attempted_at INTEGER,
+  retry_attempt_count INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at INTEGER,
   FOREIGN KEY(account_id) REFERENCES accounts(id),
   FOREIGN KEY(conversation_id) REFERENCES conversations(id)
 );
@@ -229,6 +267,9 @@ CREATE INDEX IF NOT EXISTS messages_held_since
   ON messages(COALESCE(stored_at, received_at, sent_at));
 CREATE INDEX IF NOT EXISTS messages_expire_due
   ON messages(expire_at) WHERE expire_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS messages_retry_queue
+  ON messages(next_attempt_at, id)
+  WHERE direction='outgoing' AND status='failed' AND next_attempt_at IS NOT NULL;
 ";
 /// Retention: newest rows a conversation keeps regardless of age.
 const MAX_MESSAGES_PER_CONVERSATION: i64 = 2_000;
@@ -983,6 +1024,22 @@ pub struct MessageRecord {
     pub server_timestamp: Option<u64>,
 }
 
+/// One claimed §4.123 retry: everything the drain pass needs to rebuild
+/// the send from the persisted row and settle it. Connector-internal —
+/// never serialized onto the wire.
+#[derive(Clone, Debug)]
+pub struct RetryClaim {
+    pub message_id: String,
+    pub account_id: String,
+    pub conversation_id: String,
+    pub client_request_id: String,
+    /// The row's original pending timestamp. Never minted anew by a
+    /// retry: the history keeps one row whose identity (and the §4.123
+    /// window anchor, `first_send_attempted_at`) is stable across every
+    /// automatic attempt.
+    pub sent_at: u64,
+}
+
 /// One prior body of an edited message (contract 1.32): the text the edit
 /// replaced, its byte count, and the replacement time. Bounded at insert
 /// (≤ 4096 bytes per entry, ≤ 20 entries per message, oldest pruned).
@@ -1255,9 +1312,21 @@ impl Store {
         // host lane, or CLI command sees the store, and never touches rows
         // in any other status ('unknown' is a distinct contract state, the
         // receipt ladder is monotone above it).
+        //
+        // §4.123/§4.124: the same write also retires the automatic retry
+        // scheduling face. A pending row that outlived its process is an
+        // UNKNOWN outcome (the send may already have landed upstream and the
+        // pinned engine face cannot replay a send under its original
+        // timestamp), so the sweep leaves it manual-retry-only — the §4.123
+        // queue never picks it up. Failed rows already carrying a schedule
+        // are untouched: their window and attempt state persist across the
+        // restart, which is the official queue's replay-after-restart
+        // semantics for the definitively-failed half.
         let swept = conn
             .execute(
-                "UPDATE messages SET status='failed' WHERE status='pending'",
+                "UPDATE messages SET status='failed', first_send_attempted_at=NULL,
+                        retry_attempt_count=0, next_attempt_at=NULL
+                 WHERE status='pending'",
                 [],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -2802,6 +2871,14 @@ impl Store {
     /// status push that settled the row between guard and rearm can never arm
     /// two dispatches of the same message. Same transaction shape as
     /// `update_message_status`: one lock round for write + read-back.
+    ///
+    /// §4.123: a manual rearm also retires the automatic retry face. The
+    /// official semantics make a manual retry a NEW job with its own 24 h
+    /// window — if this manual attempt then fails again with an eligible
+    /// error, the fresh enqueue stamps a fresh window anchor instead of
+    /// inheriting the retired one. The automatic claim path flips the status
+    /// in `claim_due_retries` and deliberately does NOT go through this face,
+    /// so queue-driven retries keep their window.
     pub fn rearm_failed_message(
         &self,
         message_id: &str,
@@ -2812,7 +2889,9 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         let changed = transaction
             .execute(
-                "UPDATE messages SET status='pending' WHERE id=?1 AND status='failed'",
+                "UPDATE messages SET status='pending', first_send_attempted_at=NULL,
+                        retry_attempt_count=0, next_attempt_at=NULL
+                 WHERE id=?1 AND status='failed'",
                 params![message_id],
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -2831,6 +2910,322 @@ impl Store {
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         Ok(record.map(|record| (record, changed == 1)))
+    }
+
+    /// The official retry backoff beat for the nth automatic attempt (1-based):
+    /// `min(190 ms · 1.9^(n-1), 15 min)`, computed in exact integer rational
+    /// arithmetic so the schedule is reproducible without float drift. The
+    /// cap is reached at n=15 and every later beat is 15 minutes, which is
+    /// what makes the 24 h window fit ≈110 attempts (see `MAX_RETRY_ATTEMPTS`).
+    pub fn retry_backoff_delay_ms(retry_number: u32) -> u64 {
+        let mut delay = RETRY_BACKOFF_BASE_MS;
+        for _ in 1..retry_number {
+            delay = delay
+                .saturating_mul(RETRY_BACKOFF_FACTOR_NUM)
+                .saturating_div(RETRY_BACKOFF_FACTOR_DEN);
+            if delay >= RETRY_BACKOFF_MAX_MS {
+                return RETRY_BACKOFF_MAX_MS;
+            }
+        }
+        delay.min(RETRY_BACKOFF_MAX_MS)
+    }
+
+    /// Retire the §4.123 scheduling face of one row, whatever its status.
+    /// The unknown-outcome settlement calls this: a row whose wire outcome
+    /// was never settled must never carry a live schedule, so the red line
+    /// (unknown outcomes are never retried automatically) holds at the store
+    /// layer even if a schedule somehow survived onto a later-unknown row.
+    /// Idempotent; the per-account queue ceiling counts only rows it can
+    /// still see, so retiring keeps the bound honest.
+    pub fn retire_retry_schedule(&self, message_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "UPDATE messages SET first_send_attempted_at=NULL, retry_attempt_count=0,
+                    next_attempt_at=NULL
+             WHERE id=?1",
+            params![message_id],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// Settle one dispatched send as definitively failed (§4.123): the
+    /// atomic `pending -> failed` transition, and — when the caller
+    /// classified the engine error as auto-retryable — the queue schedule in
+    /// the same guarded write, so a row can never be observed failed-and-
+    /// unscheduled between settlement and enqueue. The schedule arm refuses
+    /// anything that is not a retryable outbound text row (direction,
+    /// non-empty text, a `client_request_id` — the receive-mirrored
+    /// multi-device echo rows are another device's delivery and are never
+    /// ours to resend), that already spent its attempt budget, or that would
+    /// push the account past the in-queue ceiling; such rows settle plain
+    /// `failed` with the queue face retired. Returns the row after the write
+    /// with whether the settlement actually transitioned (a status push that
+    /// already settled the row wins; the late engine answer loses).
+    ///
+    /// Unknown outcomes never reach this face: the caller settles them
+    /// through `update_message_status(_, "unknown", _)`, and the scheduling
+    /// guard would refuse them anyway (their status is not `pending` after
+    /// that write — the red line is enforced twice, by the funnel and by the
+    /// store).
+    pub fn settle_send_failed(
+        &self,
+        message_id: &str,
+        now: u64,
+        schedule: bool,
+    ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let changed = if schedule {
+            // Scheduling settlement: the status flips alone; the schedule arm
+            // below writes the retry face, so the window anchor
+            // (`first_send_attempted_at`) survives consecutive automatic
+            // attempts — a retry never resets the window.
+            transaction
+                .execute(
+                    "UPDATE messages SET status='failed' WHERE id=?1 AND status='pending'",
+                    params![message_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        } else {
+            // Plain settlement (ineligible error class, non-text row, or the
+            // caller's explicit no-schedule): the row leaves the queue face
+            // entirely, so nothing scheduled survives on a row the queue no
+            // longer owns.
+            transaction
+                .execute(
+                    "UPDATE messages SET status='failed',
+                            first_send_attempted_at=NULL, retry_attempt_count=0,
+                            next_attempt_at=NULL
+                     WHERE id=?1 AND status='pending'",
+                    params![message_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        let record = if changed == 0 {
+            None
+        } else {
+            Self::settle_send_failed_schedule(&transaction, message_id, now, schedule)?;
+            transaction
+                .query_row(
+                    "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+                            body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
+                            quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
+                     FROM messages WHERE id=?1",
+                    params![message_id],
+                    message_record_from_row,
+                )
+                .optional()
+                .map_err(|error| StoreError::Unavailable(Some(error)))?
+        };
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(record.map(|record| (record, true)))
+    }
+
+    /// The §4.123 schedule arm of `settle_send_failed`, on the caller's
+    /// transaction: re-reads the just-settled row, decides eligibility, and
+    /// either writes the scheduling face or retires it. Every refusal
+    /// (non-text row, no clientRequestId, attempt budget spent, account
+    /// queue ceiling) clears `next_attempt_at`, so a refused row can never
+    /// be re-claimed — the budget and the ceiling are terminal for the
+    /// automatic face, not a pause.
+    fn settle_send_failed_schedule(
+        transaction: &Connection,
+        message_id: &str,
+        now: u64,
+        schedule: bool,
+    ) -> Result<(), StoreError> {
+        if !schedule {
+            return Ok(());
+        }
+        let row = transaction
+            .query_row(
+                "SELECT direction, body, client_request_id, retry_attempt_count,
+                        first_send_attempted_at, account_id
+                 FROM messages WHERE id=?1 AND status='failed'",
+                params![message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some((direction, body, client_request_id, attempt_count, _first, account_id)) = row
+        else {
+            return Ok(());
+        };
+        // Eligibility: outbound text row with a clientRequestId (§4.123) and
+        // attempt budget left, and the account under its in-queue ceiling.
+        let eligible = direction == "outgoing"
+            && body.as_deref().is_some_and(|body| !body.is_empty())
+            && client_request_id.is_some()
+            && (attempt_count as u64) < u64::from(MAX_RETRY_ATTEMPTS);
+        if !eligible {
+            return Self::retire_retry_schedule_in(transaction, message_id);
+        }
+        let queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM messages
+                 WHERE account_id=?1 AND direction='outgoing' AND status='failed'
+                   AND next_attempt_at IS NOT NULL AND id<>?2",
+                params![account_id, message_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if queued as u64 >= u64::from(MAX_RETRY_QUEUED_PER_ACCOUNT) {
+            return Self::retire_retry_schedule_in(transaction, message_id);
+        }
+        let delay = Self::retry_backoff_delay_ms(attempt_count as u32 + 1);
+        transaction
+            .execute(
+                "UPDATE messages SET next_attempt_at=?2,
+                        retry_attempt_count=retry_attempt_count+1,
+                        first_send_attempted_at=COALESCE(first_send_attempted_at, ?3)
+                 WHERE id=?1 AND status='failed'",
+                params![message_id, (now.saturating_add(delay)) as i64, now as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// The transaction-bound retire used by the schedule refusals above (the
+    /// standalone `retire_retry_schedule` opens its own connection lock and
+    /// must never be called inside one of these transactions).
+    fn retire_retry_schedule_in(
+        transaction: &Connection,
+        message_id: &str,
+    ) -> Result<(), StoreError> {
+        transaction
+            .execute(
+                "UPDATE messages SET next_attempt_at=NULL
+                 WHERE id=?1 AND status='failed'",
+                params![message_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
+    }
+
+    /// One bounded §4.123 drain pass: scan the due queue (oldest schedule
+    /// first, partial index, hard batch limit), kill the entries whose 24 h
+    /// window has run out, and claim the rest by the atomic
+    /// `failed -> pending` flip — the same guard family as
+    /// `rearm_failed_message`, so a concurrent manual retry or a second
+    /// claimer can never double-take a row (the flip is the claim; a lost
+    /// race simply selects nothing). Bounded at every layer: the scan reads
+    /// at most `limit` rows, each surviving at most `MAX_RETRY_ATTEMPTS`
+    /// claims (the schedule face refuses a 129th), and the queue itself at
+    /// most `MAX_RETRY_QUEUED_PER_ACCOUNT` per account. The drain loop reads
+    /// the wake instant separately, after the pass settles, through
+    /// `next_retry_due_at`.
+    pub fn claim_due_retries(&self, now: u64, limit: u32) -> Result<Vec<RetryClaim>, StoreError> {
+        let conn = self.lock_conn()?;
+        let transaction = conn
+            .unchecked_transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut due = transaction
+            .prepare(
+                "SELECT id, account_id, conversation_id, client_request_id, sent_at,
+                        first_send_attempted_at
+                 FROM messages
+                 WHERE direction='outgoing' AND status='failed'
+                   AND next_attempt_at IS NOT NULL AND next_attempt_at<=?1
+                 ORDER BY next_attempt_at ASC, id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let scanned = due
+            .query_map(params![now as i64, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                ))
+            })
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        drop(due);
+        let mut claims = Vec::new();
+        for (message_id, account_id, conversation_id, client_request_id, sent_at, first) in scanned
+        {
+            // Window judgment (§4.123): past `first_send_attempted_at + 24 h`
+            // the row dies in the queue — it stays `failed` (terminal) and
+            // the scheduling face is retired, so the scan shrinks instead of
+            // circling. The fallback treats a NULL first stamp as "window
+            // started now", which can only happen on a hand-edited store.
+            let window_start = first
+                .map(|value| value as u64)
+                .unwrap_or(sent_at as u64)
+                .min(now);
+            if now.saturating_sub(window_start) >= RETRY_WINDOW_MS {
+                transaction
+                    .execute(
+                        "UPDATE messages SET next_attempt_at=NULL
+                         WHERE id=?1 AND status='failed'",
+                        params![message_id],
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                continue;
+            }
+            // The flip is the claim: only one writer can move a row out of
+            // 'failed', so a double-take (second worker, a racing manual
+            // retry) loses here and the row is skipped this pass.
+            let claimed = transaction
+                .execute(
+                    "UPDATE messages SET status='pending' WHERE id=?1 AND status='failed'",
+                    params![message_id],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            if claimed == 1
+                && let Some(client_request_id) = client_request_id
+            {
+                claims.push(RetryClaim {
+                    message_id,
+                    account_id,
+                    conversation_id,
+                    client_request_id,
+                    sent_at: sent_at as u64,
+                });
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(claims)
+    }
+
+    /// The earliest schedule still standing in the §4.123 queue — the drain
+    /// loop's wake instant (None = queue empty). One partial-index read, run
+    /// after a pass settles so a just-scheduled retry beat is honored at its
+    /// own pace (the official 190 ms… 15 min curve), never at the tick's.
+    pub fn next_retry_due_at(&self) -> Result<Option<u64>, StoreError> {
+        let conn = self.lock_conn()?;
+        let next_due: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(next_attempt_at) FROM messages
+                 WHERE direction='outgoing' AND status='failed'
+                   AND next_attempt_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .flatten();
+        Ok(next_due.map(|value| value.max(0) as u64))
     }
 
     /// Apply an inbound edit (contract 1.15): replace the body of the row the
@@ -5295,7 +5690,9 @@ impl Store {
         }
         let updated = transaction
             .execute(
-                "UPDATE messages SET status='sent', sent_at=?2
+                "UPDATE messages SET status='sent', sent_at=?2,
+                        first_send_attempted_at=NULL, retry_attempt_count=0,
+                        next_attempt_at=NULL
                  WHERE id=?1 AND account_id=?3 AND conversation_id=?4",
                 params![message_id, sent_at as i64, account_id, conversation_id],
             )
@@ -6935,6 +7332,35 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
     }
+    if current < 23 {
+        // §4.123: the automatic send-retry queue scheduling face. Three
+        // additive columns on the row itself — the queue entry IS the
+        // message row (the official job replays the send; our send is the
+        // row), so scheduling state lives beside the status it guards and
+        // every settlement write can retire it in the same transaction:
+        // `first_send_attempted_at` stamps the first automatic enqueue (the
+        // 24 h window anchor; never moved by later retries, cleared when the
+        // queue exits so a manual retry's own failure re-enqueues with a
+        // fresh window), `retry_attempt_count` counts automatic attempts,
+        // `next_attempt_at` schedules the next one (NULL = not queued).
+        // Pre-§4.123 rows legitimately carry none and are never backfilled:
+        // their failures predate the queue, and the desktop's manual retry
+        // affordance already covered them. The partial scan index is created
+        // by POST_MIGRATION_SCHEMA_DDL above.
+        for (column, kind) in [
+            ("first_send_attempted_at", "INTEGER"),
+            ("retry_attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "INTEGER"),
+        ] {
+            if !table_has_column(conn, "messages", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE messages ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            }
+        }
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -7441,6 +7867,533 @@ mod tests {
     /// Every unit-test store is encrypted: the fixture key exercises the same
     /// keyed-open path production uses (optimization-plan Phase 3).
     const TEST_KEY_BYTES: [u8; 32] = [0x5A; 32];
+
+    // ------------------------------------------------------------------
+    // §4.123 automatic send-retry queue (store faces)
+    // ------------------------------------------------------------------
+
+    /// Seed one §4.123 fixture row: an outgoing text row inserted in the
+    /// `sent` placeholder status, then moved to the requested status with
+    /// the requested scheduling face straight through the store connection
+    /// (the schedule face is queue-internal; only the queue faces write it
+    /// in production).
+    #[allow(clippy::too_many_arguments)]
+    fn seed_retry_row(
+        store: &Store,
+        account_id: &str,
+        conversation_id: &str,
+        id: &str,
+        client_request_id: &str,
+        status: &str,
+        first_send_attempted_at: Option<u64>,
+        retry_attempt_count: u32,
+        next_attempt_at: Option<u64>,
+    ) {
+        let record = MessageRecord {
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction: "outgoing",
+            sender_id: "self".into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at: 1_000,
+            received_at: None,
+            text: Some("hello".into()),
+            text_bytes: Some(5),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: Some(client_request_id.into()),
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        assert!(
+            store
+                .insert_message(&record, Some(client_request_id), Some("hello"), false)
+                .unwrap()
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE messages SET status=?2, first_send_attempted_at=?3,
+                        retry_attempt_count=?4, next_attempt_at=?5
+                 WHERE id=?1",
+                params![
+                    id,
+                    status,
+                    first_send_attempted_at.map(|value| value as i64),
+                    retry_attempt_count as i64,
+                    next_attempt_at.map(|value| value as i64),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Read one row's §4.123 face: (status, first_send_attempted_at,
+    /// retry_attempt_count, next_attempt_at).
+    fn retry_face(store: &Store, id: &str) -> (String, Option<i64>, i64, Option<i64>) {
+        store
+            .conn()
+            .query_row(
+                "SELECT status, first_send_attempted_at, retry_attempt_count,
+                        next_attempt_at
+                 FROM messages WHERE id=?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// The window judgment: a queue entry whose `first_send_attempted_at +
+    /// 24 h` has run out dies in the queue — the claim pass retires its
+    /// schedule and claims nothing for it (the row stays `failed`,
+    /// terminal), while a live-window control row in the same pass is
+    /// claimed normally.
+    #[test]
+    fn retry_window_exhaustion_kills_the_queue_entry() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let now: u64 = 1_800_000_000_000;
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-dead",
+            "req-dead",
+            "failed",
+            Some(now - crate::store::RETRY_WINDOW_MS - 1_000),
+            3,
+            Some(now - 500),
+        );
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-live",
+            "req-live",
+            "failed",
+            Some(now - 60_000),
+            1,
+            Some(now - 500),
+        );
+        let claims = store.claim_due_retries(now, 10).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| claim.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m-live"],
+            "the window-dead entry is judged, the live one claimed"
+        );
+        // The dead row: still failed (terminal), schedule retired — the
+        // anchor and the attempt count stay as the terminal record, but
+        // nothing is scheduled, so no later pass can ever claim it again.
+        let (status, first, count, next) = retry_face(&store, "m-dead");
+        assert_eq!(status, "failed");
+        assert_eq!(count, 3);
+        assert!(first.is_some());
+        assert_eq!(next, None);
+        // The claimed row: pending, face intact for the next settlement.
+        let (status, _, _, _) = retry_face(&store, "m-live");
+        assert_eq!(status, "pending");
+    }
+
+    /// The official backoff curve (190 ms · 1.9^(n-1), capped at 15
+    /// minutes) drives the schedule face: the first automatic retry beat
+    /// lands at +190 ms, the second at +361 ms, and the window anchor never
+    /// moves across retries (a retry does not reset the window).
+    #[test]
+    fn retry_backoff_schedule_follows_the_official_curve() {
+        assert_eq!(Store::retry_backoff_delay_ms(1), 190);
+        assert_eq!(Store::retry_backoff_delay_ms(2), 361);
+        assert_eq!(Store::retry_backoff_delay_ms(15), 15 * 60 * 1_000);
+        assert_eq!(Store::retry_backoff_delay_ms(40), 15 * 60 * 1_000);
+        let mut previous = 0;
+        for attempt in 1..=40u32 {
+            let delay = Store::retry_backoff_delay_ms(attempt);
+            assert!(delay >= previous, "the curve never shrinks");
+            assert!(delay <= 15 * 60 * 1_000, "the cap holds");
+            previous = delay;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let first_failure: u64 = 1_800_000_000_000;
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-curve",
+            "req-curve",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        store
+            .settle_send_failed("m-curve", first_failure, true)
+            .unwrap()
+            .unwrap();
+        let (_, first, count, next) = retry_face(&store, "m-curve");
+        assert_eq!(
+            (first, count, next),
+            (
+                Some(first_failure as i64),
+                1,
+                Some((first_failure + 190) as i64)
+            )
+        );
+        // Attempt 2: claim flips it pending, the send fails again, the
+        // schedule advances by the second beat and the anchor stays put.
+        let claims = store.claim_due_retries(first_failure + 190, 10).unwrap();
+        assert_eq!(claims.len(), 1);
+        store
+            .settle_send_failed("m-curve", first_failure + 190, true)
+            .unwrap()
+            .unwrap();
+        let (_, first, count, next) = retry_face(&store, "m-curve");
+        assert_eq!(
+            first,
+            Some(first_failure as i64),
+            "a retry never resets the window"
+        );
+        assert_eq!(count, 2);
+        assert_eq!(
+            next,
+            Some((first_failure + 190 + 361) as i64),
+            "the second beat is 190 ms · 1.9"
+        );
+    }
+
+    /// The claim is the atomic failed→pending flip: a second claim pass
+    /// takes nothing (the claimed rows are pending), and a manual rearm
+    /// that raced ahead of the claim steals the row — the queue never
+    /// double-takes against the manual path.
+    #[test]
+    fn retry_claim_is_atomic_against_double_take() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let now: u64 = 1_800_000_000_000;
+        for id in ["m-a", "m-b", "m-c"] {
+            seed_retry_row(
+                &store,
+                &account.id,
+                &conversation.id,
+                id,
+                &format!("req-{id}"),
+                "failed",
+                Some(now - 1_000),
+                1,
+                Some(now - 500),
+            );
+        }
+        // The manual path wins the race for m-c before the claim runs.
+        let (_, manual_won) = store.rearm_failed_message("m-c").unwrap().unwrap();
+        assert!(manual_won);
+        let claims = store.claim_due_retries(now, 10).unwrap();
+        assert_eq!(claims.len(), 2, "the manually rearmed row is not claimed");
+        let claimed = claims
+            .iter()
+            .map(|claim| claim.message_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(claimed.contains(&"m-a") && claimed.contains(&"m-b"));
+        // A second pass double-takes nothing.
+        let second = store.claim_due_retries(now, 10).unwrap();
+        assert!(second.is_empty(), "the flip is the claim");
+        // The manual loser's guarded rearm reports the loss.
+        let manual_after = store.rearm_failed_message("m-a").unwrap().unwrap();
+        assert!(!manual_after.1, "a claimed row answers changed=false");
+    }
+
+    /// Queue state persists across a store reopen (the official
+    /// replay-after-restart for the definitively-failed half: the schedule
+    /// and the window anchor survive), while the §4.92 startup sweep leaves
+    /// fresh pending rows manual-only — their schedule face is retired by
+    /// the sweep, never armed (a pending row that outlived its process is
+    /// an unknown outcome, and unknown outcomes are never retried
+    /// automatically).
+    #[test]
+    fn retry_queue_survives_restart_while_swept_pendings_stay_manual() {
+        let temp = TempDir::new().unwrap();
+        {
+            let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+            let account = store
+                .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+            let conversation = store
+                .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+                .unwrap();
+            let now: u64 = 1_800_000_000_000;
+            seed_retry_row(
+                &store,
+                &account.id,
+                &conversation.id,
+                "m-queued",
+                "req-queued",
+                "failed",
+                Some(now - 60_000),
+                4,
+                Some(now + 60_000),
+            );
+            seed_retry_row(
+                &store,
+                &account.id,
+                &conversation.id,
+                "m-stuck-pending",
+                "req-stuck",
+                "pending",
+                None,
+                0,
+                None,
+            );
+        }
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        // The swept row: manual-only, no schedule.
+        let (status, first, count, next) = retry_face(&store, "m-stuck-pending");
+        assert_eq!(
+            (status.as_str(), first, count, next),
+            ("failed", None, 0, None)
+        );
+        // The queued row: schedule and anchor intact; still due in the
+        // future, so the pass claims nothing yet — then claims it once due.
+        let (status, first, count, next) = retry_face(&store, "m-queued");
+        assert_eq!(status, "failed");
+        assert_eq!(count, 4);
+        assert!(first.is_some() && next.is_some());
+        let now = next.unwrap() as u64 + 1;
+        let claims = store.claim_due_retries(now, 10).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| claim.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m-queued"],
+            "the queue replays across the restart"
+        );
+    }
+
+    /// Every queue bound is terminal, not a pause: the per-account in-queue
+    /// ceiling refuses a 257th enrollment, the scan batch limit caps a pass,
+    /// and the total attempt cap retires the face instead of scheduling a
+    /// 129th attempt.
+    #[test]
+    fn retry_queue_bounds_are_enforced() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let other = store
+            .upsert_account_from_signal("+15555550102", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let other_conversation = store
+            .ensure_conversation(&other.id, "direct", "+15555550103", "Peer")
+            .unwrap();
+        let now: u64 = 1_800_000_000_000;
+        // Per-account ceiling: 256 queued rows fill the account's queue.
+        for index in 0..MAX_RETRY_QUEUED_PER_ACCOUNT {
+            seed_retry_row(
+                &store,
+                &account.id,
+                &conversation.id,
+                &format!("m-full-{index}"),
+                &format!("req-full-{index}"),
+                "failed",
+                Some(now - 1_000),
+                1,
+                Some(now + 60_000),
+            );
+        }
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-over-cap",
+            "req-over-cap",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        store
+            .settle_send_failed("m-over-cap", now, true)
+            .unwrap()
+            .unwrap();
+        let (status, first, count, next) = retry_face(&store, "m-over-cap");
+        assert_eq!(
+            (status.as_str(), first, count, next),
+            ("failed", None, 0, None),
+            "the 257th enrollment is refused and the face retired"
+        );
+        // Another account's queue is unaffected by the first account's fill.
+        seed_retry_row(
+            &store,
+            &other.id,
+            &other_conversation.id,
+            "m-other-account",
+            "req-other-account",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        store
+            .settle_send_failed("m-other-account", now, true)
+            .unwrap()
+            .unwrap();
+        let (_, first, count, next) = retry_face(&store, "m-other-account");
+        assert_eq!(
+            (first, count, next),
+            (Some(now as i64), 1, Some((now + 190) as i64))
+        );
+        // Scan batch limit: the drain pass takes at most its limit.
+        for index in 0..5 {
+            seed_retry_row(
+                &store,
+                &other.id,
+                &other_conversation.id,
+                &format!("m-due-{index}"),
+                &format!("req-due-{index}"),
+                "failed",
+                Some(now - 1_000),
+                1,
+                Some(now - 500),
+            );
+        }
+        let claims = store.claim_due_retries(now, 2).unwrap();
+        assert_eq!(claims.len(), 2, "the pass never exceeds its batch");
+        let remaining = store.claim_due_retries(now, 100).unwrap();
+        assert_eq!(remaining.len(), 3);
+        // Total attempt cap: a row that already spent its budget settles
+        // terminal — the schedule face retires, nothing is scheduled.
+        seed_retry_row(
+            &store,
+            &other.id,
+            &other_conversation.id,
+            "m-spent",
+            "req-spent",
+            "pending",
+            Some(now - 1_000),
+            MAX_RETRY_ATTEMPTS,
+            None,
+        );
+        store
+            .settle_send_failed("m-spent", now, true)
+            .unwrap()
+            .unwrap();
+        let (status, first, count, next) = retry_face(&store, "m-spent");
+        assert_eq!(status, "failed");
+        assert_eq!(
+            (first, count, next),
+            (Some((now - 1_000) as i64), MAX_RETRY_ATTEMPTS as i64, None),
+            "the 129th attempt is refused, not deferred"
+        );
+    }
+
+    /// Schema 23 (§4.123): a v22 database migrates in place — the three
+    /// scheduling columns appear and the version stamp moves to 23.
+    #[test]
+    fn schema_v23_upgrade_adds_retry_queue_columns() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '22');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               attachment_locators TEXT,
+               live_attachment_locators TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT,
+               server_timestamp INTEGER,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "first_send_attempted_at").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "retry_attempt_count").unwrap());
+        assert!(table_has_column(&store.conn(), "messages", "next_attempt_at").unwrap());
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
 
     /// Contract 1.43 (§4.42): `isSelf` marks exactly the linked account's own
     /// direct chat — the number match — and never a sibling contact, a

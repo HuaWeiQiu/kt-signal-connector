@@ -1955,6 +1955,7 @@ pub fn open_group_runtime(
         supervisor.spawn_watchdog();
         supervisor.spawn_media_governor();
         supervisor.spawn_delivery_receipt_worker();
+        supervisor.spawn_outbox_worker();
         supervisor.spawn_expire_sweeper();
         slots.push(ProxyGroupSlot {
             id: entry.id.clone(),

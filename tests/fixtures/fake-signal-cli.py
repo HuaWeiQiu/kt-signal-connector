@@ -374,6 +374,14 @@ UNREGISTERED_MARKER = SIGNAL_DATA_DIR / ".fixture-unregistered-user-status"
 USERNAME_UNSET_MARKER = SIGNAL_DATA_DIR / ".fixture-username-unset"
 SEND_LOG = SIGNAL_DATA_DIR / ".fixture-send-log.jsonl"
 DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
+# §4.123 test hook: one-shot server-unavailable send answer. A test arms it
+# by touching .fixture-send-unavailable-armed in this engine's own data dir
+# (test-local, never process-global env); the FIRST send call then answers
+# the transport error the engine classifier maps to ServerUnavailable
+# ("Bad gateway (ServerUnavailableException)", the §4.80 anchor shape), the
+# done marker records the one-shot, and every later send answers normally.
+SEND_UNAVAILABLE_ARMED = SIGNAL_DATA_DIR / ".fixture-send-unavailable-armed"
+SEND_UNAVAILABLE_DONE = SIGNAL_DATA_DIR / ".fixture-send-unavailable-done"
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
 # Multi-account mode (optimization-plan §6.4 M3.3 tests and the soak driver's
@@ -874,6 +882,21 @@ for line in sys.stdin:
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # §4.123 one-shot server-unavailable answer (transport error shape
+        # the engine classifier maps to ServerUnavailable), armed per test
+        # through this data dir's marker file.
+        if SEND_UNAVAILABLE_ARMED.exists() and not SEND_UNAVAILABLE_DONE.exists():
+            SEND_UNAVAILABLE_DONE.touch()
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -3,
+                    "message": "Failed to send message: Bad gateway (ServerUnavailableException)",
+                },
+            }
+            emit_json(response)
+            continue
         result = {"timestamp": 99, "results": []}
         # Contract 1.35 test hook: a sticker send whose pack id is all-f
         # crashes with the mutating call in flight — the send may or may not

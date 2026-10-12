@@ -89,6 +89,23 @@ const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 
+/// §4.123 outbox drain cadence: the periodic sweep runs at most this often
+/// per group. The cadence is deliberately slow — the queue's own schedule
+/// (190 ms exponential → 15-minute cap) is what paces retries; the tick only
+/// bounds how late a due row can be noticed when every other wake source is
+/// lost (a dropped drain notification, a clock anomaly). A pass that sees
+/// due-later rows sleeps until the earliest due instant instead of the full
+/// tick, so a fresh 190 ms schedule drains within the same second-series the
+/// official queue would have used, not 15 s later.
+const OUTBOX_TICK: Duration = Duration::from_secs(15);
+/// Floor on the due-time wake: a just-scheduled row is never re-scanned
+/// sooner than this, so a pass that schedules +190 ms cannot busy-loop.
+const OUTBOX_DUE_WAKE_MIN: Duration = Duration::from_millis(50);
+/// Hard claim batch per drain pass (AGENTS.md bounded-queue rule): at most
+/// this many rows leave the queue per pass per group, so one drain can never
+/// monopolize the store lock or the engine's send queue.
+const OUTBOX_CLAIM_BATCH: u32 = 16;
+
 /// §4.119 receipt-failure debounce: after one conversation's receipt face
 /// records a failure, another trigger of the same (account, conversation,
 /// face) key inside this window answers `unknown` without touching the
@@ -219,6 +236,13 @@ pub struct RuntimeSupervisor {
     delivery_receipt_rx: StdMutex<Option<mpsc::Receiver<DeliveryReceiptJob>>>,
     /// The delivery-receipt worker; never held across an await.
     delivery_receipt_worker: StdMutex<Option<JoinHandle<()>>>,
+    /// §4.123 outbox drain: the receiver side of the lossy drain-kick channel
+    /// (cap 1 — a send that finds it full means a pass is already pending),
+    /// taken by `spawn_outbox_worker`; and the single worker slot. The
+    /// channel's sender stays on the supervisor for the engine-landed hooks.
+    outbox_drain_rx: StdMutex<Option<mpsc::Receiver<()>>>,
+    outbox_drain_tx: mpsc::Sender<()>,
+    outbox_worker: StdMutex<Option<JoinHandle<()>>>,
     /// unix ms of last listContacts title enrich (throttle hot list path)
     last_title_enrich_ms: AtomicU64,
     /// The §4.46 backup file three-chain: `Some` when the launcher armed the
@@ -291,6 +315,10 @@ impl RuntimeSupervisor {
         // queue drops the receipt job, never the receive.
         let (delivery_receipt_tx, delivery_receipt_rx) =
             mpsc::channel::<DeliveryReceiptJob>(DELIVERY_RECEIPT_QUEUE_CAP);
+        // §4.123 outbox drain: the cap-1 lossy kick channel the engine-landed
+        // hooks send on; the worker (spawned later by the registry) owns the
+        // receiver and otherwise paces itself on the due schedules + tick.
+        let (outbox_drain_tx, outbox_drain_rx) = mpsc::channel(1);
         let receive_worker = tokio::spawn(receive_persistence_loop(
             receive_rx,
             service.clone(),
@@ -333,6 +361,9 @@ impl RuntimeSupervisor {
             expire_sweeper: StdMutex::new(None),
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
             delivery_receipt_worker: StdMutex::new(None),
+            outbox_drain_rx: StdMutex::new(Some(outbox_drain_rx)),
+            outbox_drain_tx,
+            outbox_worker: StdMutex::new(None),
             last_title_enrich_ms: AtomicU64::new(0),
             backup_handles,
             backup_counters: StdMutex::new(HashMap::new()),
@@ -569,6 +600,118 @@ impl RuntimeSupervisor {
         if let Ok(mut slot) = self.delivery_receipt_worker.lock() {
             *slot = Some(worker);
         }
+    }
+
+    /// Take the §4.123 drain-kick receiver and spawn the single outbox worker
+    /// (idempotent, same discipline as `spawn_delivery_receipt_worker`).
+    ///
+    /// Every pass re-resolves `running_engine()` — a pre-cloned handle goes
+    /// stale across watchdog restarts, and the whole point of the queue is to
+    /// outlive them. Wake sources: a pass-computed due instant (the schedule
+    /// itself), the cap-1 drain kick (engine landed: `start` or
+    /// `restart_engine` — the official online-event re-dispatch, hook-for-
+    /// hook), and the tick cap. All bounded: at most `OUTBOX_CLAIM_BATCH`
+    /// rows leave the queue per pass, and each row's attempt budget lives in
+    /// the store face.
+    pub fn spawn_outbox_worker(self: &Arc<Self>) {
+        let Some(drain) = self
+            .outbox_drain_rx
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+        else {
+            return;
+        };
+        let Ok(mut slot) = self.outbox_worker.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            // A worker is already running (a second spawn after a receiver
+            // take race): drop the spare receiver, keep one drain loop.
+            return;
+        }
+        let supervisor = Arc::clone(self);
+        *slot = Some(tokio::spawn(async move {
+            supervisor.outbox_loop(drain).await;
+        }));
+    }
+
+    /// The engine-landed immediate-drain kick (§4.123): lossy and bounded —
+    /// a full kick channel means a pass is already pending, which is exactly
+    /// the semantics the hooks want.
+    pub(crate) fn notify_outbox_drain(&self) {
+        let _ = self.outbox_drain_tx.try_send(());
+    }
+
+    async fn outbox_loop(self: Arc<Self>, mut drain: mpsc::Receiver<()>) {
+        loop {
+            if let Err(error) = self.outbox_pass().await {
+                tracing::warn!(error_class = error.class(), "outbox drain pass failed");
+            }
+            // Sleep until the earliest schedule still standing (bounded by
+            // the tick, floored so a just-scheduled near beat cannot
+            // busy-loop), the next drain kick, or the tick itself when the
+            // queue is empty.
+            let due_at = blocking_service({
+                let store = Arc::clone(&self.store);
+                move || store.next_retry_due_at().map_err(ServiceError::Store)
+            })
+            .await
+            .ok()
+            .flatten();
+            let wake = match due_at {
+                Some(due_at) => {
+                    let now = crate::link::now_ms();
+                    Duration::from_millis(due_at.saturating_sub(now))
+                        .max(OUTBOX_DUE_WAKE_MIN)
+                        .min(OUTBOX_TICK)
+                }
+                None => OUTBOX_TICK,
+            };
+            tokio::select! {
+                _ = drain.recv() => {}
+                _ = sleep(wake) => {}
+            }
+        }
+    }
+
+    /// One drain pass: claim a bounded batch of due retries (the store face
+    /// kills window-dead entries and wins the atomic failed→pending flip per
+    /// row), rebuild each send from its persisted row, and re-drive it
+    /// through the ordinary `dispatch_prepared` funnel — so settlement,
+    /// events, and the next schedule all flow exactly the paths a manual
+    /// retry uses. An offline engine (NotRunning) aborts the pass BEFORE any
+    /// claim: rows stay queued and wait for recovery, which is the official
+    /// "offline is not failure" semantics. Per-claim failures are warn-only
+    /// and never abort the batch.
+    async fn outbox_pass(&self) -> Result<(), ServiceError> {
+        let engine = self.running_engine().await?;
+        let store = Arc::clone(&self.store);
+        let claims = blocking_service(move || {
+            store
+                .claim_due_retries(crate::link::now_ms(), OUTBOX_CLAIM_BATCH)
+                .map_err(ServiceError::Store)
+        })
+        .await?;
+        for claim in claims {
+            let prepared = {
+                let service = self.service.lock().await;
+                match service.prepare_outbox_retry_text(&claim) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::warn!(
+                            error_class = error.class(),
+                            "outbox retry claim dropped before dispatch"
+                        );
+                        continue;
+                    }
+                }
+            };
+            if let Err(error) = self.dispatch_prepared(&engine, prepared).await {
+                tracing::warn!(error_class = error.class(), "outbox retry dispatch failed");
+            }
+        }
+        Ok(())
     }
 
     /// One best-effort contacts/groups re-sync per linked account of this
@@ -1108,6 +1251,9 @@ impl RuntimeSupervisor {
         if status.state == EngineState::Running {
             self.spawn_contacts_resync();
             self.spawn_history_import_pass();
+            // §4.123: engine landed — the offline queue drains now instead of
+            // waiting out the tick (the official online-event re-dispatch).
+            self.notify_outbox_drain();
         }
         Ok(status)
     }
@@ -1469,6 +1615,9 @@ impl RuntimeSupervisor {
         drop(slot);
         self.spawn_contacts_resync_with(fresh);
         self.spawn_history_import_pass();
+        // §4.123: a fresh engine (watchdog recovery included) drains the
+        // offline queue immediately — the official online-event re-dispatch.
+        self.notify_outbox_drain();
         Ok(())
     }
 
@@ -2158,13 +2307,23 @@ impl RuntimeSupervisor {
                     )))
                 }
                 Err(error) => {
+                    // §4.123: the funnel settles classified — a
+                    // definitive-error answer in the auto-retry class also
+                    // arms the bounded queue schedule in the same guarded
+                    // write, and kicks the drain so the 190 ms first beat is
+                    // honored at its own pace instead of the tick's; every
+                    // other class (and the unknown outcome above, which
+                    // never reaches this arm) settles plain.
                     let events = self
                         .service
                         .lock()
                         .await
-                        .complete_send_failed(&pending_id)?;
+                        .complete_send_failed_for_engine(&pending_id, &error)?;
                     for event in events {
                         let _ = self.host_events.send(event);
+                    }
+                    if ConnectorService::auto_retry_eligible(&error) {
+                        self.notify_outbox_drain();
                     }
                     Err(ServiceError::Engine(error))
                 }

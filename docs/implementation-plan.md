@@ -5,6 +5,11 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- No-revision record: 2026-10-13; the §4.123/§4.124 automatic send-retry queue
+  (the official 190 ms → 15 min backoff drain over definitively-failed
+  outbound texts, plus the maintained manual-only line for restart-pending
+  rows) lands as connector-internal behavior only — zero wire change, the
+  contract revision stays 1.136 (the §4.123/§4.124 entries below)
 - No-revision record: 2026-10-13; the §4.121/§4.122 receive-side gap pair (the
   self-sent sticker / bodyless pure-quote `sentMessage` sync projection and the
   passive `syncMessage.contacts` consume into the contacts cache) lands as
@@ -9896,6 +9901,148 @@ movable by the pull), and `sync_contacts_passive_batch_lands_cache_and_emits_cha
 (the end-to-end consume: new skeletons ride `conversation.changed`, the marker stays
 pull-owned, the replay is silent, the masked-title upgrade emits again). Gates: fmt,
 clippy `-D warnings`, tests all green.
+
+### 4.123 The automatic send-retry queue: definitively-failed outbound texts drain on the official backoff curve (no contract revision — wire unchanged, 2026-10-13)
+
+Official behavior: Signal's sender retries an undelivered message automatically —
+the queue entry waits ~190 ms after the first attempt, re-attempts with a
+1.9× exponential curve capped at 15 minutes, and gives up only after 24 hours
+(`SignalServiceMessageSender`'s retry session, the sender-held attempt window).
+The connector's send funnel historically stopped at the opposite pole: a
+deterministic failure answer settled the row `failed` and left it to the host
+(the §4.92 manual rearm). The gap the desktop feels is the transient one — a
+proxy hiccup, a gateway 502 — where every peer's client quietly recovers and
+ours accumulates a manual backlog. The official answer is now the connector's
+answer, in the store's own idiom: the queue is the row, not a table — schema 23
+adds three columns to `messages` (`first_send_attempted_at`, the window anchor;
+`retry_attempt_count`; `next_attempt_at`) plus one partial index
+(`messages_retry_queue` on `next_attempt_at, id` WHERE direction='outgoing'
+AND status='failed' AND next_attempt_at IS NOT NULL), so a queue entry is a
+failed row carrying its schedule and an entry's death is a column clear, never
+a delete.
+
+Eligibility is the deterministic-error-answer family and only it:
+`EngineError::ServerUnavailable` and `EngineError::Upstream` — the engine
+answered that the API call failed before any dispatch reached the wire, so the
+outcome is definitively "not sent" and a resend cannot double-deliver. The
+deviation ledger, deliberately narrower than the official curve's error set:
+`UpstreamCode`, `RateLimited`, `ProofRequired`, and `IdentityUnverified`
+stay §4.92 manual (each carries a product judgment the funnel must not make
+silently — a rate-limit pause the curve would turn into a hammer, a proof
+request the host must surface, an identity gap the safety banner owns); a
+mutating send that times out classifies `UnknownOutcome` (the §4.80 anchor
+shape) and is never enrolled — the red line (an unknown send outcome must not
+be retried automatically) outranks the queue at every layer; a partial-recipient
+group failure resupplements nobody (the row settles failed whole; a per-recipient
+retry ledger is a future revision's problem).
+
+The curve is the official one in exact integer arithmetic:
+`min(190 ms · 1.9^(n-1), 15 min)` (`Store::retry_backoff_delay_ms` — the cap
+binds from attempt 15, which is what fits ≈110 attempts inside the window).
+The window is anchored on `first_send_attempted_at`, stamped only by the first
+automatic enrollment and never moved by a retry, and judged at claim time:
+a row whose anchor is past 24 h has its `next_attempt_at` cleared and stays
+`failed` (window exhaustion is death, not an error). The ceilings are bounded
+twice over: `MAX_RETRY_ATTEMPTS` (128 — a safety net an order of magnitude
+above the ≈110 the curve fits in 24 h, for a clock that jumps or a curve that
+someday tightens) per row, and `MAX_RETRY_QUEUED_PER_ACCOUNT` (256) live
+entries per account, enforced by the schedule arm — an over-ceiling enrollment
+is refused by clearing that row's `next_attempt_at` only (the window anchor and
+attempt count survive as the terminal state's record; the row stays failed and
+manual). The enrollment is atomic with the settlement:
+`Store::settle_send_failed` performs the guarded `pending → failed` flip and
+the schedule write in one transaction, so no observer — the claim pass
+included — can ever see a row failed-but-unscheduled between the funnel's
+settle and the queue's arm; the ineligible arm is the same write with the
+schedule cleared.
+
+The drain is one bounded worker per process (`spawn_outbox_worker`, spawned
+beside the delivery-receipt worker): a 15 s tick plus a wake-at-earliest-due
+read after every pass (`next_retry_due_at`, floored at 50 ms so a just-scheduled
+190 ms beat is honored at its own pace, never the tick's), claiming at most
+`OUTBOX_CLAIM_BATCH` (16) due rows per pass through `Store::claim_due_retries`
+— an atomic multi-row take that hands each row to exactly one pass (the
+store-level double-take test proves the second claimer gets nothing). A claim
+rebuilds the send from the persisted row through the same
+`rebuild_retry_dispatch` face the manual rearm uses — one code path for both
+retries, the same §4.92 state guards — and settles through the ordinary send
+funnel: success runs the standard `complete_outgoing_send` (which clears the
+schedule face), a still-retryable error re-arms through
+`settle_send_failed` with the count bumped, an unknown retires the schedule
+(`retire_retry_schedule` — the red line's second lock, so a row that drifts
+into the indeterminate family mid-queue loses its live schedule in the same
+breath), and the attempt ceiling's refusal arm clears the schedule and leaves
+the row failed-final. An offline engine never judges the queue: the pass
+aborts before claiming when no engine is up, so entries keep status and
+schedule across downtime. Three hooks make recovery prompt rather than
+tick-paced: the engine landing on `start()`, a successful `restart_engine`,
+and the funnel's own retryable-failure arm each kick the drain (a cap-1 lossy
+channel — a burst of kicks collapses to one immediate pass, bounded by
+construction).
+
+Restart semantics close the loop with §4.92: already-queued (failed +
+scheduled) rows survive restart and resume their curve on the first engine
+land, while pending rows swept at boot stay manual-only — that boundary is
+§4.124's subject below.
+
+Tests: `retry_window_exhaustion_kills_the_queue_entry` (the 24 h judgment
+clears the schedule and keeps the row failed; a fresh anchor survives retries),
+`retry_claim_is_atomic_against_double_take` (one due row, two claimers, one
+winner), `retry_queue_survives_restart_while_swept_pendings_stay_manual`
+(queued rows resume, pending rows do not enroll), `retry_queue_bounds_are_
+enforced` (the per-account ceiling refuses by clearing the schedule only, the
+attempt ceiling kills at 128, both leave the row failed), and
+`schema_v23_upgrade_adds_retry_queue_columns` (the versioned migration stamps
+the columns and index on a v22 store); `retry_queue_enrolls_only_the_eligible_
+error_classes` (ServerUnavailable/Upstream arm the schedule, every other
+class settles plain-failed), `unknown_outcome_retires_any_stale_retry_
+schedule` (the red line's store-side second lock), `outbox_claim_rebuilds_
+the_manual_retry_dispatch` (one dispatch path for both retry families); and
+the `outbox_worker` integration trio `engine_land_drains_a_queued_failed_row`
+(the hook drains a due entry the moment the engine lands, one history row),
+`definitive_failure_requeues_and_the_auto_retry_succeeds` (the end-to-end
+loop: unavailable answer → enrolled → the 190 ms beat retries → sent, two
+upstream sends, one row), and `offline_engine_leaves_the_retry_queue_untouched`
+(no engine, no claim, schedule byte-identical across the wait). Gates: fmt,
+clippy `-D warnings`, tests all green.
+
+### 4.124 The restart line stays manual: swept pending rows are not re-enrolled into the §4.123 queue (no contract revision — wire unchanged, 2026-10-13)
+
+§4.92's rule stands: a connector restart sweeps its in-flight `pending` rows
+to `failed`, and the host re-arms them through `messages.retry` when a human
+decides to. The automatic queue deliberately does not absorb them, and the
+reason is the red line's edge case. A `pending` row at the moment of process
+death has an unresolved wire outcome: the send was dispatched to the engine,
+the engine may have handed it to the server, and the connector died before any
+answer — the §4.80 unknown-outcome family by construction. The official
+sender survives the same crash safely for one reason the connector cannot
+borrow: it re-sends with the original client-side timestamp, and the server
+deduplicates on that timestamp, so a message that actually landed is absorbed
+as a re-delivery of the same send. The pinned `signal-cli` send surface offers
+no such lever — `SendCommand.java` (verified against
+`.references/signal-cli/src/main/java/org/asamk/signal/commands/SendCommand.java`)
+accepts quote, story, and edit timestamps but no message timestamp, so a
+blind re-dispatch of an unknown-outcome row is not a retry; it is a fresh
+send with a fresh timestamp and a real chance of double delivery. The queue's
+eligibility family (§4.123) never contains such a row precisely because the
+funnel enrolls only deterministic error answers — the restart sweep is the
+one path that manufactures unknowns in bulk, and it stays outside the queue
+for the same reason unknowns do.
+
+The evolution path is the engine's, not the connector's: if a future
+signal-cli/engine revision exposes a client-timestamp (or idempotency-key)
+send face, the sweep can hand its rows to the queue with their original
+timestamps and the official crash-recovery semantics become expressible — a
+future revision arms it, the way §4.123 armed the deterministic family. Until
+then the manual rearm is not a gap but the honest face: the one human who
+knows whether the message landed decides, and `messages.retry` re-enters the
+ordinary send path with all its guards.
+
+Tests: `retry_queue_survives_restart_while_swept_pendings_stay_manual` (the
+store-level boundary: queued rows resume, swept pendings stay failed and
+unscheduled), shared with §4.123; no new tests — this section records a
+boundary deliberately kept, not a face added. Gates: fmt, clippy
+`-D warnings`, tests all green.
 
 ## 5. signal-cli Boundary
 

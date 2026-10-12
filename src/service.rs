@@ -25,7 +25,8 @@ use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHand
 use crate::protocol::ApiError;
 use crate::store::{
     AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, ContactSummary,
-    ConversationRow, ConversationSummary, MessageRecord, Page, Store, StoreError, SyncedContact,
+    ConversationRow, ConversationSummary, MessageRecord, Page, RetryClaim, Store, StoreError,
+    SyncedContact,
 };
 
 /// Bounds below are the code-side enforcement of the host-facing schema
@@ -6236,7 +6237,7 @@ impl ConnectorService {
         // Store-level rearm is the authority: `WHERE status='failed'` makes
         // the transition atomic, so a status push that settled the row
         // between the guard above and this write cannot be overwritten.
-        let (rearmed, changed) = self
+        let (_, changed) = self
             .store
             .rearm_failed_message(&row.id)?
             .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
@@ -6247,15 +6248,60 @@ impl ConnectorService {
                 false,
             )));
         }
+        self.rebuild_retry_dispatch(&row, &account, &conversation)
+    }
+
+    /// The §4.123 drain face: rebuild one claimed retry from the persisted
+    /// row — the same rebuild the manual `messages.retryText` runs (§4.26
+    /// semantics: original row, rebuilt upstream params, the row's own
+    /// timestamp as the fallback settlement stamp), minus the manual-only
+    /// assumptions the queue already satisfied. The claim won the atomic
+    /// `failed -> pending` flip in `Store::claim_due_retries`, so this face
+    /// re-checks the claim's identity against the row (a store that moved
+    /// underneath the claim drops it) and never rearms, never mints a new
+    /// clientRequestId, never inserts a second row. An empty-text or
+    /// non-pending row drops the claim (MessageNotFound) — the worker logs
+    /// and moves on; nothing is auto-created from a hostile shape.
+    pub fn prepare_outbox_retry_text(
+        &self,
+        claim: &RetryClaim,
+    ) -> Result<PreparedSend, ServiceError> {
+        let account = self.resolve_account(&claim.account_id)?;
+        let conversation = self.resolve_conversation(&claim.account_id, &claim.conversation_id)?;
+        let row = self
+            .store
+            .message_by_client_request(&claim.account_id, &claim.client_request_id)?
+            .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
+        let matches = row.id == claim.message_id
+            && row.conversation_id == claim.conversation_id
+            && row.direction == "outgoing"
+            && row.status == "pending"
+            && row.sent_at == claim.sent_at
+            && row.text.as_deref().is_some_and(|text| !text.is_empty());
+        if !matches {
+            return Err(ServiceError::Store(StoreError::MessageNotFound));
+        }
+        self.rebuild_retry_dispatch(&row, &account, &conversation)
+    }
+
+    /// The shared retry-dispatch rebuild (contract 1.31 §4.26 tail, now the
+    /// §4.123 drain face too): upstream params rebuilt from the persisted
+    /// row — plain text plus the resolved quote; mentions and text styles
+    /// are not persisted for retry rebuilds (documented deviation, the text
+    /// arrives unchanged) — and a `PreparedSend::Dispatch` addressed to the
+    /// SAME row, so settlement completes the row the bubble already renders.
+    fn rebuild_retry_dispatch(
+        &self,
+        row: &MessageRecord,
+        account: &AccountRow,
+        conversation: &ConversationRow,
+    ) -> Result<PreparedSend, ServiceError> {
+        let text = row.text.clone().unwrap_or_default();
         let quote = row
             .quote_message_id
             .as_deref()
-            .map(|quote_id| self.resolve_quote(&account, &conversation, quote_id))
+            .map(|quote_id| self.resolve_quote(account, conversation, quote_id))
             .transpose()?;
-        // Mentions and text styles are not persisted for retry rebuilds: the
-        // row carries only the plain text, so a retried send goes out
-        // un-highlighted and un-styled (documented deviation: the text
-        // arrives unchanged).
         let params = Self::upstream_text_send_params(
             &account.signal_account,
             &text,
@@ -6264,15 +6310,15 @@ impl ConnectorService {
             None,
             None,
             quote,
-            &conversation,
+            conversation,
             false,
         );
         Ok(PreparedSend::Dispatch {
-            pending_id: row.id,
-            account_id: account.id,
-            conversation_id: conversation.id,
+            pending_id: row.id.clone(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
             params,
-            pending_sent_at: rearmed.sent_at,
+            pending_sent_at: row.sent_at,
         })
     }
 
@@ -7543,6 +7589,10 @@ impl ConnectorService {
         &self,
         pending_id: &str,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        // §4.123: an unknown outcome also retires any retry schedule the row
+        // might carry — unknown is never queued (the red line, enforced at
+        // the store layer).
+        self.store.retire_retry_schedule(pending_id)?;
         Ok(status_change_events(
             self.store
                 .update_message_status(pending_id, "unknown", None)?,
@@ -7662,6 +7712,11 @@ impl ConnectorService {
         }
     }
 
+    /// The §4.26 manual-retry settlement: a definitively failed send that the
+    /// host (or a caller) settles without any automatic follow-up. Same
+    /// permissive non-failed guard as before §4.123 (`status<>'failed'`, an
+    /// idempotent replay is a no-op); the row carries no live schedule —
+    /// nothing on the manual path inherits one.
     pub fn complete_send_failed(
         &self,
         pending_id: &str,
@@ -7670,6 +7725,44 @@ impl ConnectorService {
             self.store
                 .update_message_status(pending_id, "failed", None)?,
         ))
+    }
+
+    /// The §4.123 send-failure settlement used by the dispatch funnel: the
+    /// same `pending -> failed` transition, plus — exactly when the engine
+    /// error belongs to the automatic-retry class — the bounded queue
+    /// schedule in the same guarded write.
+    ///
+    /// Eligibility (§4.123, deliberate and narrow): only
+    /// [`EngineError::ServerUnavailable`] and [`EngineError::Upstream`] — the
+    /// two arms where the engine ANSWERED a definitive JSON-RPC error, so the
+    /// send provably did not land and a resend carries no unknown-outcome
+    /// risk. A mutating call whose answer is lost is
+    /// [`EngineError::UnknownOutcome`] by the engine's own classification and
+    /// never reaches this funnel's retryable arm: unknown outcomes are never
+    /// retried automatically (the §5 send discipline, AGENTS.md red line).
+    /// The structured [`EngineError::UpstreamCode`] families mix
+    /// deterministic refusals (key-invalid, too-large) into the retryable
+    /// ones, so they stay manual this revision; the rate-limit /
+    /// proof-challenge / identity-gate families are the server explicitly
+    /// stopping the send and stay manual (§4.123 deviation note).
+    pub fn complete_send_failed_for_engine(
+        &self,
+        pending_id: &str,
+        error: &EngineError,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let schedule = Self::auto_retry_eligible(error);
+        Ok(status_change_events(self.store.settle_send_failed(
+            pending_id,
+            now_ms(),
+            schedule,
+        )?))
+    }
+
+    pub(crate) fn auto_retry_eligible(error: &EngineError) -> bool {
+        matches!(
+            error,
+            EngineError::ServerUnavailable | EngineError::Upstream
+        )
     }
 
     /// Persist one normalized receive from ONE group's engine. The owning
@@ -14740,6 +14833,7 @@ mod tests {
         NormalizedRich, NormalizedStoryRecipient, NormalizedUnidentifiedStatus, ReceiptKind,
     };
     use crate::store::StoreKey;
+    use rusqlite::params;
 
     fn service() -> (TempDir, ConnectorService) {
         let temp = TempDir::new().unwrap();
@@ -16238,6 +16332,277 @@ mod tests {
                 .message_by_client_request(&account.id, "req-preview-absent")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// §4.123: the automatic queue enrolls exactly the definitive-error
+    /// network classes. `ServerUnavailable` / `Upstream` arm the schedule in
+    /// the same settlement; every other engine error class settles the row
+    /// plain `failed` with no schedule — the rate-limit / proof / identity
+    /// families are the server stopping the send, the structured-code
+    /// families mix deterministic refusals, and the unknown outcome (whose
+    /// funnel arm never schedules) is the red line itself.
+    #[test]
+    fn retry_queue_enrolls_only_the_eligible_error_classes() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let face = |service: &ConnectorService, id: &str| {
+            service
+                .store_ref()
+                .conn()
+                .query_row(
+                    "SELECT status, first_send_attempted_at, retry_attempt_count,
+                            next_attempt_at
+                     FROM messages WHERE id=?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let enrollable = [EngineError::ServerUnavailable, EngineError::Upstream];
+        for (index, error) in enrollable.iter().enumerate() {
+            let request = format!("req-enroll-{index}");
+            let pending_id = match service
+                .prepare_send_text(
+                    &account.id,
+                    &conversation.id,
+                    "hello",
+                    &request,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                PreparedSend::Dispatch { pending_id, .. } => pending_id,
+                PreparedSend::Existing(_) => panic!("new request must dispatch"),
+            };
+            let events = service
+                .complete_send_failed_for_engine(&pending_id, error)
+                .unwrap();
+            assert_eq!(events.len(), 1, "the failed transition emits");
+            let (status, first, count, next) = face(&service, &pending_id);
+            assert_eq!(status, "failed");
+            assert!(
+                first.is_some() && next.is_some() && count == 1,
+                "{error:?} must arm the schedule"
+            );
+        }
+        let refused = [
+            EngineError::RateLimited,
+            EngineError::ProofRequired,
+            EngineError::IdentityUnverified,
+            EngineError::UpstreamCode {
+                code: "STICKER_PACK_INVALID",
+                data: None,
+            },
+            EngineError::Timeout,
+            EngineError::NotRunning,
+            EngineError::Unauthorized,
+            EngineError::UnknownOutcome,
+        ];
+        for (index, error) in refused.iter().enumerate() {
+            let request = format!("req-refuse-{index}");
+            let pending_id = match service
+                .prepare_send_text(
+                    &account.id,
+                    &conversation.id,
+                    "hello",
+                    &request,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                PreparedSend::Dispatch { pending_id, .. } => pending_id,
+                PreparedSend::Existing(_) => panic!("new request must dispatch"),
+            };
+            service
+                .complete_send_failed_for_engine(&pending_id, error)
+                .unwrap();
+            let (status, first, count, next) = face(&service, &pending_id);
+            assert_eq!(status, "failed");
+            assert_eq!(
+                (first, count, next),
+                (None, 0, None),
+                "{error:?} must settle plain failed with no schedule"
+            );
+        }
+    }
+
+    /// The unknown red line at the store layer: an unknown settlement
+    /// retires any schedule the row might carry, so an unknown row can
+    /// never be claimed (AGENTS.md: unknown outcomes are never retried
+    /// automatically).
+    #[test]
+    fn unknown_outcome_retires_any_stale_retry_schedule() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "hello",
+                "req-unknown-face",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new request must dispatch"),
+        };
+        // A stale schedule on a pending row (a hand-edited or restarted-over
+        // store shape): the unknown settlement must sweep it.
+        service
+            .store_ref()
+            .conn()
+            .execute(
+                "UPDATE messages SET first_send_attempted_at=?2, retry_attempt_count=3,
+                        next_attempt_at=?3
+                 WHERE id=?1",
+                params![pending_id, 1_000i64, 2_000i64],
+            )
+            .unwrap();
+        service.complete_send_unknown(&pending_id).unwrap();
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-unknown-face")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "unknown");
+        let face = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT first_send_attempted_at, retry_attempt_count, next_attempt_at
+                 FROM messages WHERE id=?1",
+                params![pending_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(face, (None, 0, None));
+    }
+
+    /// The §4.123 drain rebuild is the §4.26 manual rebuild: a claimed row
+    /// re-dispatches the SAME row with the persisted text, and the send
+    /// settlement completes it, clears the queue face, and leaves the
+    /// history at exactly one row.
+    #[test]
+    fn outbox_claim_rebuilds_the_manual_retry_dispatch() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "queued text",
+                "req-outbox-1",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        // Due-ify: claim past the 190 ms first beat (the schedule is
+        // settle-time + 190 ms; the claim instant must stay inside the
+        // 24 h window, so this is a real-clock +5 s, not an arbitrary
+        // far-future stamp).
+        let due_now = crate::link::now_ms() + 5_000;
+        let claim = service.store_ref().claim_due_retries(due_now, 10).unwrap();
+        assert_eq!(claim.len(), 1);
+        let claim = &claim[0];
+        assert_eq!(claim.message_id, pending_id);
+        assert_eq!(claim.client_request_id, "req-outbox-1");
+        let prepared = match service.prepare_outbox_retry_text(claim).unwrap() {
+            PreparedSend::Dispatch {
+                pending_id, params, ..
+            } => {
+                assert_eq!(pending_id, claim.message_id, "the same row re-dispatches");
+                params
+            }
+            PreparedSend::Existing(_) => panic!("a claim rebuilds a dispatch, never an existing"),
+        };
+        assert_eq!(prepared["message"], json!("queued text"));
+        assert_eq!(prepared["account"], json!("+15555550100"));
+        // Settlement completes the SAME row and clears the queue face.
+        let (sent, _) = service
+            .complete_send_success(&pending_id, &account.id, &conversation.id, 777)
+            .unwrap();
+        assert_eq!(sent.status, "sent");
+        let face = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT status, first_send_attempted_at, retry_attempt_count,
+                        next_attempt_at
+                 FROM messages WHERE id=?1",
+                params![pending_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(face, ("sent".into(), None, 0, None));
+        let rows = service
+            .list_messages(&account.id, &conversation.id, 10, None)
+            .unwrap()
+            .items;
+        assert_eq!(
+            rows.len(),
+            1,
+            "the history stays one row per logical message"
         );
     }
 
