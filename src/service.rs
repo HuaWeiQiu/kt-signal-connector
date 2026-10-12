@@ -6754,7 +6754,7 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids)
+        self.prepare_receipt(account_id, conversation_id, message_ids, false)
     }
 
     /// messages.markViewed: identical addressing, selection, and grouping,
@@ -6763,13 +6763,15 @@ impl ConnectorService {
     /// rows take their first `viewed_at` stamp via `complete_mark_viewed`
     /// before the upstream fan-out — the official local-first discipline, so
     /// the played marker survives an upstream failure and needs no retry.
+    /// (§4.119: the absent selection additionally skips stamped rows and rows
+    /// past the seven-day window, so a played row is never re-sent.)
     pub fn prepare_mark_viewed(
         &self,
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids)
+        self.prepare_receipt(account_id, conversation_id, message_ids, true)
     }
 
     /// messages.syncRead (contract revision 1.108, §4.89): the SELF-SYNC
@@ -6790,7 +6792,7 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids)
+        self.prepare_receipt(account_id, conversation_id, message_ids, false)
     }
 
     /// messages.syncViewed (contract revision 1.108, §4.89): identical
@@ -6807,7 +6809,7 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids)
+        self.prepare_receipt(account_id, conversation_id, message_ids, true)
     }
 
     /// The local half of messages.markViewed (contract 1.94, §4.77):
@@ -6961,12 +6963,16 @@ impl ConnectorService {
     /// rows are all the peer's; group rows persist only a local sender hash
     /// (§4.28), so their author is unknown and they are skipped from the
     /// fan-out — skipped, not an error (spec: rows whose author cannot be
-    /// resolved are skipped).
+    /// resolved are skipped). `unviewed_only` marks the viewed faces: their
+    /// absent selection skips rows that already carry a `viewed_at` stamp
+    /// (§4.119 — the first stamp is the resupply boundary), while the read
+    /// faces select regardless (the store carries no read state).
     fn prepare_receipt(
         &self,
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
+        unviewed_only: bool,
     ) -> Result<PreparedReceipts, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         validate_opaque_id(conversation_id, "conversationId")?;
@@ -6992,6 +6998,7 @@ impl ConnectorService {
                 account_id,
                 conversation_id,
                 MARK_RECEIPT_MESSAGE_IDS_LIMIT as u32,
+                unviewed_only,
             )?,
         };
         // The selected rows' local ids ride along so a later
@@ -12579,7 +12586,9 @@ pub struct MessagesSendAdminDeleteParams {
 
 /// messages.markRead / messages.markViewed params (contract revision 1.34):
 /// the conversation plus an optional bounded `messageIds` list — absent means
-/// every incoming row of the conversation (ascending `sentAt`, bounded 512);
+/// every receipt-eligible incoming row of the conversation (ascending
+/// `sentAt`, bounded 512; §4.119: only rows newer than seven days, and the
+/// viewed faces only rows with no `viewed_at` stamp yet);
 /// explicit ids beyond 512 are truncated, not rejected. No operationId: the
 /// request never mutates local state and its outcome never triggers a retry,
 /// so there is nothing to correlate.
@@ -25405,10 +25414,11 @@ mod tests {
                     .unwrap()
             );
         };
-        seed("m3", 30, "incoming", &conversation.id);
-        seed("out-1", 40, "outgoing", &conversation.id);
-        seed("m1", 10, "incoming", &conversation.id);
-        seed("m2", 20, "incoming", &conversation.id);
+        let now = now_ms();
+        seed("m3", now + 2, "incoming", &conversation.id);
+        seed("out-1", now + 3, "outgoing", &conversation.id);
+        seed("m1", now, "incoming", &conversation.id);
+        seed("m2", now + 1, "incoming", &conversation.id);
 
         let absent = service
             .prepare_mark_read(&account.id, &conversation.id, None)
@@ -25418,7 +25428,7 @@ mod tests {
         assert_eq!(absent.account_signal, "+15555550100");
         assert_eq!(absent.groups.len(), 1);
         assert_eq!(absent.groups[0].recipient, "+15555550101");
-        assert_eq!(absent.groups[0].timestamps, [10, 20, 30]);
+        assert_eq!(absent.groups[0].timestamps, [now, now + 1, now + 2]);
 
         let explicit = service
             .prepare_mark_viewed(
@@ -25433,13 +25443,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(explicit.groups.len(), 1);
-        assert_eq!(explicit.groups[0].timestamps, [30]);
+        assert_eq!(explicit.groups[0].timestamps, [now + 2]);
 
         let group = service
             .store_ref()
             .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Group")
             .unwrap();
-        seed("g1", 50, "incoming", &group.id);
+        seed("g1", now + 4, "incoming", &group.id);
         let group_receipts = service
             .prepare_mark_read(&account.id, &group.id, None)
             .unwrap();
@@ -25524,9 +25534,10 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        seed(&service, "m1", 10, &conversation.id);
-        seed(&service, "m2", 20, &conversation.id);
-        seed(&service, "m3", 30, &conversation.id);
+        let now = now_ms();
+        seed(&service, "m1", now, &conversation.id);
+        seed(&service, "m2", now + 1, &conversation.id);
+        seed(&service, "m3", now + 2, &conversation.id);
 
         // An explicit selection stamps exactly its rows.
         let explicit = service
@@ -25558,7 +25569,7 @@ mod tests {
             .store_ref()
             .ensure_conversation(&account.id, "group", "ZmFrZS1ncm91cC0x", "Group")
             .unwrap();
-        seed(&service, "g1", 50, &group.id);
+        seed(&service, "g1", now + 4, &group.id);
         let group_viewed = service
             .prepare_mark_viewed(&account.id, &group.id, None)
             .unwrap();
@@ -25627,8 +25638,9 @@ mod tests {
                     .unwrap()
             );
         };
-        seed(&service, "s1", 10);
-        seed(&service, "s2", 20);
+        let now = now_ms();
+        seed(&service, "s1", now);
+        seed(&service, "s2", now + 1);
 
         // syncRead: the peer group with ascending timestamps, no local
         // stamps on either face of the rows.
@@ -25637,7 +25649,7 @@ mod tests {
             .unwrap();
         assert_eq!(sync_read.groups.len(), 1);
         assert_eq!(sync_read.groups[0].recipient, conversation.peer_key);
-        assert_eq!(sync_read.groups[0].timestamps, vec![10, 20]);
+        assert_eq!(sync_read.groups[0].timestamps, vec![now, now + 1]);
         let row = service
             .store_ref()
             .message_by_id(&account.id, &conversation.id, "s1")
@@ -25652,7 +25664,7 @@ mod tests {
             .prepare_sync_viewed(&account.id, &conversation.id, None)
             .unwrap();
         assert_eq!(sync_viewed.groups.len(), 1);
-        assert_eq!(sync_viewed.groups[0].timestamps, vec![10, 20]);
+        assert_eq!(sync_viewed.groups[0].timestamps, vec![now, now + 1]);
         service.complete_mark_viewed(&sync_viewed).unwrap();
         let row = service
             .store_ref()
@@ -25660,15 +25672,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.viewed_at.is_some(), "syncViewed stamps locally");
-        // A replay keeps the first stamp.
-        let replay_at = row.viewed_at;
-        service
-            .complete_mark_viewed(
-                &service
-                    .prepare_sync_viewed(&account.id, &conversation.id, None)
-                    .unwrap(),
-            )
+        // A replay keeps the first stamp — and §4.119: the stamped rows drop
+        // out of the absent selection entirely, so the replay prepares an
+        // empty fan-out (nothing is re-sent) and stamps nothing anew.
+        let replay = service
+            .prepare_sync_viewed(&account.id, &conversation.id, None)
             .unwrap();
+        assert!(
+            replay.groups.is_empty(),
+            "stamped rows never re-select: {replay:?}"
+        );
+        let replay_at = row.viewed_at;
+        service.complete_mark_viewed(&replay).unwrap();
         let row = service
             .store_ref()
             .message_by_id(&account.id, &conversation.id, "s1")
@@ -25691,7 +25706,7 @@ mod tests {
             sender_id: "member-hash".into(),
             sender_name: None,
             mentions_self: false,
-            sent_at: 30,
+            sent_at: now + 2,
             received_at: None,
             text: Some("group body".into()),
             text_bytes: Some(10),
@@ -25737,6 +25752,103 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.viewed_at.is_some(), "the group viewed stamp lands");
+    }
+
+    /// §4.119 stopgap: the absent markViewed selection carries only fresh
+    /// unstamped rows and rides exactly that selection into the local stamp,
+    /// the absent markRead still selects every fresh row regardless of stamp,
+    /// an eight-day-old row never selects on either face, and the explicit
+    /// mode stays unfiltered.
+    #[test]
+    fn absent_receipt_selection_excludes_overage_and_stamped_rows() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let seed = |service: &ConnectorService, id: &str, sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        let day: u64 = 24 * 60 * 60 * 1_000;
+        let now = now_ms();
+        seed(&service, "overage", now - 8 * day);
+        seed(&service, "fresh-viewed", now + 1);
+        seed(&service, "fresh", now + 2);
+
+        // A first viewed pass stamps its explicit row (§4.77 unchanged).
+        let explicit = service
+            .prepare_mark_viewed(
+                &account.id,
+                &conversation.id,
+                Some(vec!["fresh-viewed".into()]),
+            )
+            .unwrap();
+        service.complete_mark_viewed(&explicit).unwrap();
+
+        // The absent markViewed selection now carries only the fresh
+        // unstamped row — the stamped one and the overage one never
+        // re-select — and exactly that selection rides into the stamp.
+        let viewed = service
+            .prepare_mark_viewed(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(viewed.groups.len(), 1);
+        assert_eq!(viewed.groups[0].timestamps, vec![now + 2]);
+        assert_eq!(viewed.row_ids, vec!["fresh".to_string()]);
+        service.complete_mark_viewed(&viewed).unwrap();
+
+        // The absent markRead selection carries every fresh row regardless
+        // of stamp (the store tracks no read state) and never the overage.
+        let read = service
+            .prepare_mark_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(read.groups.len(), 1);
+        assert_eq!(read.groups[0].timestamps, vec![now + 1, now + 2]);
+
+        // The explicit mode applies no filter: a stamped row is still
+        // addressable when the desktop names it.
+        let explicit_again = service
+            .prepare_mark_viewed(
+                &account.id,
+                &conversation.id,
+                Some(vec!["fresh-viewed".into()]),
+            )
+            .unwrap();
+        assert_eq!(explicit_again.groups[0].timestamps, vec![now + 1]);
     }
 
     /// Contract 1.94 (§4.77) outgoing face: a VIEWED receipt rides the read

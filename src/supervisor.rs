@@ -89,6 +89,21 @@ const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 
+/// §4.119 receipt-failure debounce: after one conversation's receipt face
+/// records a failure, another trigger of the same (account, conversation,
+/// face) key inside this window answers `unknown` without touching the
+/// engine. The upstream rejects stale receipt timestamps, so a rapid re-trigger
+/// of a failing face is pure replay pressure; the window narrows how often a
+/// failing face re-attempts without retrying anything (the desktop's next
+/// deliberate trigger after the window is a fresh request, never an automatic
+/// retry — the AGENTS.md red line stays intact).
+const RECEIPT_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+/// Hard cap on the debounce map (AGENTS.md bounded-maps rule): expired
+/// entries prune on every touch, and a pathological burst of distinct
+/// failing conversations past the cap is refused insertion (those
+/// conversations keep hitting the engine, never an unbounded map).
+const RECEIPT_FAILURE_MAP_CAP: usize = 4_096;
+
 /// One queued auto delivery receipt (contract revision 1.34, §4.29): after an
 /// incoming dataMessage row lands, the connector best-effort tells the engine
 /// to send the official delivery receipt to its author. Fully silent: failures
@@ -131,6 +146,13 @@ struct PendingRestart {
 struct WatchdogEpisode {
     restarts: u32,
     last_trigger: Option<Instant>,
+}
+
+/// The §4.119 receipt-failure debounce key: one account, one conversation,
+/// one receipt face (`sendReadReceipt` / `sendViewedReceipt`). The NUL
+/// separator keeps the three opaque ids unambiguous.
+fn receipt_failure_key(account_id: &str, conversation_id: &str, method: &str) -> String {
+    format!("{account_id}\u{0}{conversation_id}\u{0}{method}")
 }
 
 /// One proxy group's supervised runtime: its own engine slot, watchdog,
@@ -214,6 +236,12 @@ pub struct RuntimeSupervisor {
     /// listed. Shared with the spawned build tasks, which outlive any borrow
     /// of `self`.
     plaintext_tasks: Arc<crate::backup_export::PlaintextTaskRegistry>,
+    /// §4.119 receipt-failure debounce: (account, conversation, receipt face)
+    /// keys whose last engine attempt failed, valued by the failure instant.
+    /// In-memory, process-local, pruned on every touch, hard-capped. The
+    /// std clock keeps `duration_since` saturating — a backwards wall-clock
+    /// jump reads as "just failed", never a panic.
+    receipt_failures: StdMutex<HashMap<String, std::time::Instant>>,
 }
 
 impl RuntimeSupervisor {
@@ -309,6 +337,7 @@ impl RuntimeSupervisor {
             backup_handles,
             backup_counters: StdMutex::new(HashMap::new()),
             plaintext_tasks: Arc::new(crate::backup_export::PlaintextTaskRegistry::new()),
+            receipt_failures: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -4822,6 +4851,14 @@ impl RuntimeSupervisor {
     /// engine contract `{account, recipient, timestamps}` — recipient is the
     /// single author, timestamps ascend (the engine chunks 100 per
     /// envelope).
+    ///
+    /// §4.119 failure debounce: a failed face records its (account,
+    /// conversation, face) key, and another trigger of the same key inside
+    /// [`RECEIPT_FAILURE_COOLDOWN`] answers `unknown` before any engine or
+    /// store work — the upstream rejection of a conversation's stale
+    /// timestamps cannot be replayed at trigger frequency. Nothing is ever
+    /// retried: the desktop's next deliberate trigger after the window is a
+    /// fresh request (AGENTS.md).
     async fn send_receipt(
         &self,
         account_id: String,
@@ -4829,6 +4866,10 @@ impl RuntimeSupervisor {
         message_ids: Option<Vec<String>>,
         method: &'static str,
     ) -> Result<&'static str, ServiceError> {
+        let failure_key = receipt_failure_key(&account_id, &conversation_id, method);
+        if self.receipt_failure_pending(&failure_key, std::time::Instant::now()) {
+            return Ok("unknown");
+        }
         let engine = self.running_engine().await?;
         let prepared = {
             let service = self.service.lock().await;
@@ -4862,7 +4903,43 @@ impl RuntimeSupervisor {
                 Err(_) => all_confirmed = false,
             }
         }
+        if !all_confirmed {
+            self.note_receipt_failure(&failure_key, std::time::Instant::now());
+        }
         Ok(if all_confirmed { "sent" } else { "unknown" })
+    }
+
+    /// The §4.119 debounce verdict for one key: `true` while the key sits
+    /// inside its cooldown after a recorded failure; an expired entry is
+    /// dropped on the way out.
+    fn receipt_failure_pending(&self, key: &str, now: std::time::Instant) -> bool {
+        let mut failures = self
+            .receipt_failures
+            .lock()
+            .expect("receipt failures mutex");
+        match failures.get(key).copied() {
+            Some(failed_at) if now.duration_since(failed_at) < RECEIPT_FAILURE_COOLDOWN => true,
+            _ => {
+                failures.remove(key);
+                false
+            }
+        }
+    }
+
+    /// Records a face failure at `now`, pruning expired entries first and
+    /// refusing insertion past the hard cap — the map stays bounded
+    /// (AGENTS.md), and a refused insertion only means that conversation
+    /// keeps reaching the engine.
+    fn note_receipt_failure(&self, key: &str, now: std::time::Instant) {
+        let mut failures = self
+            .receipt_failures
+            .lock()
+            .expect("receipt failures mutex");
+        failures.retain(|_, failed_at| now.duration_since(*failed_at) < RECEIPT_FAILURE_COOLDOWN);
+        if failures.len() >= RECEIPT_FAILURE_MAP_CAP {
+            return;
+        }
+        failures.insert(key.to_string(), now);
     }
 
     /// Outbound read SELF-SYNC (contract revision 1.108, §4.89): the same
@@ -7890,9 +7967,9 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RuntimeSupervisor, attachment_download_client, cloud_archive_face,
+        RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor, attachment_download_client, cloud_archive_face,
         cloud_status_from_engine, compose_contact_display_name, compose_import_progress,
-        group_extra_json, is_receive_fatal_stderr, upload_status_from_engine,
+        group_extra_json, is_receive_fatal_stderr, receipt_failure_key, upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -10320,10 +10397,11 @@ mod tests {
                     .unwrap()
             );
         };
-        seed("m1", 10, &conversation.id);
-        seed("m2", 20, &conversation.id);
-        seed("m3", 30, &conversation.id);
-        seed("g1", 50, &group.id);
+        let now = crate::link::now_ms();
+        seed("m1", now, &conversation.id);
+        seed("m2", now + 1, &conversation.id);
+        seed("m3", now + 2, &conversation.id);
+        seed("g1", now + 4, &group.id);
         let viewed_at = |conversation_id: &str, id: &str| {
             store
                 .message_by_id(&account.id, conversation_id, id)
@@ -10380,6 +10458,219 @@ mod tests {
         assert_eq!(group_status, "sent");
         assert!(viewed_at(&group.id, "g1").is_some());
         supervisor.shutdown().await.unwrap();
+    }
+
+    /// §4.119: a receipt-face failure records the conversation+face debounce.
+    /// The immediate same-face replay answers `unknown` with zero new engine
+    /// frames; the other face and another conversation keep their own keys;
+    /// a face whose window has no failure still confirms `sent`.
+    #[tokio::test]
+    async fn receipt_failure_debounce_suppresses_same_face_replays_within_the_window() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store.clone(),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let second = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Other")
+            .unwrap();
+        let seed = |id: &str, sent_at: u64, conversation_id: &str| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation_id.to_string(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+            };
+            assert!(
+                store
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        let now = crate::link::now_ms();
+        seed("m1", now, &conversation.id);
+        seed("m2", now + 1, &second.id);
+
+        let send_log = temp
+            .path()
+            .join("signal-data")
+            .join(".fixture-send-log.jsonl");
+        let receipt_frames = |send_log: &std::path::Path| -> usize {
+            std::fs::read_to_string(send_log)
+                .map(|contents| {
+                    contents
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .filter(|params| params.get("timestamps").is_some())
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let fail_marker = temp
+            .path()
+            .join("signal-data")
+            .join(".fixture-fail-receipt");
+
+        // The read face fails upstream: the answer degrades to `unknown` and
+        // the failure records the conversation+face debounce.
+        std::fs::write(&fail_marker, b"").unwrap();
+        let status = supervisor
+            .send_read_receipt(account.id.clone(), conversation.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown");
+        assert_eq!(receipt_frames(&send_log), 1);
+
+        // The immediate same-face replay never reaches the engine.
+        let status = supervisor
+            .send_read_receipt(account.id.clone(), conversation.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown");
+        assert_eq!(
+            receipt_frames(&send_log),
+            1,
+            "a debounced replay must not dispatch an engine frame"
+        );
+
+        // The viewed face carries its own key: a real attempt, its own
+        // failure record.
+        let status = supervisor
+            .send_viewed_receipt(account.id.clone(), conversation.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown");
+        assert_eq!(receipt_frames(&send_log), 2);
+
+        // Another conversation is not debounced: with the marker gone its
+        // read face reaches the engine and confirms.
+        std::fs::remove_file(&fail_marker).unwrap();
+        let status = supervisor
+            .send_read_receipt(account.id.clone(), second.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(status, "sent");
+        assert_eq!(receipt_frames(&send_log), 3);
+
+        // And the viewed face of the first conversation is now the one
+        // debounced from its own failure.
+        let status = supervisor
+            .send_viewed_receipt(account.id.clone(), conversation.id.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(status, "unknown");
+        assert_eq!(receipt_frames(&send_log), 3);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// §4.119: the debounce map itself — a recorded failure gates its key
+    /// inside the 60-second window and opens exactly past it (the expired
+    /// entry is dropped), and the hard cap refuses insertion instead of
+    /// growing unbounded (AGENTS.md).
+    #[tokio::test]
+    async fn receipt_failure_cooldown_expires_and_the_map_stays_bounded() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        let supervisor =
+            RuntimeSupervisor::new(config, store, DEFAULT_PROXY_GROUP_ID.to_string(), None);
+        let key = receipt_failure_key("acct", "conv", "sendReadReceipt");
+        let now = std::time::Instant::now();
+        assert!(!supervisor.receipt_failure_pending(&key, now));
+        supervisor.note_receipt_failure(&key, now);
+        assert!(supervisor.receipt_failure_pending(&key, now));
+        assert!(
+            supervisor.receipt_failure_pending(&key, now + Duration::from_secs(59)),
+            "inside the window the gate holds"
+        );
+        assert!(
+            !supervisor.receipt_failure_pending(&key, now + Duration::from_secs(61)),
+            "past the window the gate opens"
+        );
+        // The expired entry is gone; the next failure starts a fresh window.
+        assert_eq!(
+            supervisor
+                .receipt_failures
+                .lock()
+                .expect("receipt failures mutex")
+                .len(),
+            0
+        );
+        supervisor.note_receipt_failure(&key, now + Duration::from_secs(61));
+        assert!(supervisor.receipt_failure_pending(&key, now + Duration::from_secs(61)));
+
+        // The cap: live entries are never evicted, an overflow key is
+        // refused (it keeps reaching the engine, the map stays bounded).
+        for index in 0..RECEIPT_FAILURE_MAP_CAP {
+            supervisor.note_receipt_failure(&format!("cap-{index}"), now);
+        }
+        supervisor.note_receipt_failure("cap-overflow", now);
+        let failures = supervisor
+            .receipt_failures
+            .lock()
+            .expect("receipt failures mutex");
+        assert_eq!(failures.len(), RECEIPT_FAILURE_MAP_CAP);
+        assert!(!failures.contains_key("cap-overflow"));
     }
 
     /// §4.38 step 3 (contract revision 1.98), direct branch: no environment

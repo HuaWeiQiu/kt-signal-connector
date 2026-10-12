@@ -5,6 +5,10 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- No-revision stopgap record: 2026-10-12; the §4.119 outbound-receipt resupply stopgap
+  (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
+  lands as connector-internal behavior only — zero wire change, the contract revision stays
+  1.135
 - Contract revision: 1.135 (2026-10-12; the live poll receive chain lands
   (§4.118): the engine's six-question-batch Q3 poll receive faces —
   `dataMessage.poll {question, options, allowMultiple}` /
@@ -2553,9 +2557,13 @@ surface through the existing error mapping — a declared swap boundary, not a s
 - `messages.markRead` / `messages.markViewed`: send-lane, account-scoped mutating (reaction
   precedent §4.6 write-lane mutex). Params: `accountId`, `conversationId`, optional `messageIds`
   (bounded 512, incoming rows only — outgoing and system rows are skipped; absent = every
-  incoming row of the conversation, ascending `sent_at`, bounded 512). The connector does not
+  receipt-eligible incoming row of the conversation, ascending `sent_at`, bounded 512 —
+  §4.119: absent mode selects only rows newer than seven days, and the viewed faces select
+  only rows with no `viewed_at` stamp yet). The connector does not
   persist our own read state (the desktop owns its unread state), so absent mode may re-receipt
-  rows the desktop already marked — duplicates are protocol-idempotent for the peer. Rows whose
+  rows the desktop already marked — duplicates are protocol-idempotent for the peer (the §4.119
+  seven-day window bounds that replay surface; the viewed face's `viewed_at` first-stamp
+  excludes already-played rows entirely). Rows whose
   author cannot be resolved from local data (group rows carrying only the sender hash, §4.28)
   are skipped from the fan-out, not an error. The connector groups the selected rows by author
   and calls the engine `sendReadReceipt` / `sendViewedReceipt` once per author (single-author
@@ -2567,7 +2575,8 @@ surface through the existing error mapping — a declared swap boundary, not a s
   additionally first-stamps the selected incoming rows' local `viewedAt` before the
   fan-out — the played marker is the request's own local effect, lands even when the group
   list is empty, and survives an upstream failure; `messages.markRead` keeps its
-  no-local-write discipline unchanged.)
+  no-local-write discipline unchanged.) (§4.119: the stopgap record for the selection
+  filters and the supervisor failure debounce — connector-internal, no wire change.)
 - Auto delivery receipts: for every incoming envelope the connector best-effort calls the engine
   `sendDeliveryReceipt` (author, [sent_at]) after the row lands — official receiving-client
   behavior, no user setting, no retry, fully silent (failures change nothing).
@@ -7676,7 +7685,8 @@ to `prepare_receipt`: incoming rows only, both forms bounded at 512 (truncation,
 rejection), ascending `sentAt` with same-timestamp collapse, direct-conversation author
 resolution only (group rows persist a local sender hash, §4.28 — their authors stay
 unresolvable and they skip from the fan-out, the same documented boundary the peer face
-carries). The supervisor spends the group on ONE engine `markRead`/`markViewed` call —
+carries; the §4.119 selection filters ride along — one shared store path). The supervisor
+spends the group on ONE engine `markRead`/`markViewed` call —
 `{account, reads|viewed: [{sender, timestamp}...]}`, the author inside each entry, the
 engine chunking 100 entries per envelope internally — where the peer face made one call
 per author. Receipt-class semantics end to end: `{status: sent|unknown}`, any failure
@@ -9671,6 +9681,65 @@ replace-through); and one end-to-end harness test over the real engine
 process (create lands the history shape, the vote+terminate emission
 converges the same row on `messages.list`, one row total). Tests 717 →
 729 (lib 539 → 550), all green.
+
+### 4.119 The outbound receipt resupply stopgap: the seven-day recency window, the viewed-face selection filter, and the supervisor failure debounce (field-incident record, 2026-10-12; no contract revision — wire unchanged)
+
+The field evidence (2026-10-12 production trace): the desktop fires receipt sends on every
+conversation open, focus, foreground return, and new-message arrival, and the connector's
+absent-mode receipt selection (`incoming_rows_for_receipts`, the no-`messageIds` arm of
+`messages.markRead`/`messages.markViewed`, §4.29) took the conversation's OLDEST 512 incoming
+rows with no filter at all. Every trigger therefore re-sent the same stale timestamps as
+read/viewed receipts; the upstream rejects receipt timestamps that old, so the sends could
+never succeed — a de-facto infinite resupply (the trace shows 47 receipt sends with 22
+upstream rejections). The official desktop never behaves this way: `sendReceipts.preload.ts`
+sends only the INCREMENTAL "newly changed since the last mark" set — an already-read message
+is never re-sent, and messages whose receipt errored are explicitly excluded so a failing
+receipt cannot loop.
+
+Three connector-internal changes close the loop. No wire key, method, error code, or
+capability changes; no store schema move; the contract revision stays 1.135.
+
+1. **Viewed-face selection filter.** `incoming_rows_for_receipts` gains a face parameter;
+   the viewed faces (peer `sendViewedReceipt` and self-sync `markViewed`, which share the
+   selection) select only rows with `viewed_at IS NULL`. The §4.77 local-first first stamp
+   becomes the resupply boundary: a row is played upstream at most once per stamp — the
+   already-stamped rows drop out of every later absent selection, which is the official
+   never-re-send-a-read-message posture. The read faces select without that filter (the
+   store carries no read state — the desktop owns its unread state, §4.29).
+2. **Seven-day recency window.** All four receipt faces' absent mode selects only rows
+   with `sent_at > now − 7 days`; older rows drop out of the selection (zero eligible rows
+   is the trivial `sent` no-op). The upstream rejects stale timestamps, so a resupply past
+   that age is protocol-meaningless. The explicit-`messageIds` mode is untouched: the
+   desktop naming ids is itself the incremental act the official client performs.
+3. **Supervisor failure debounce.** `send_receipt` (the peer-faced fan-out) keeps a
+   bounded in-memory map keyed by (account, conversation, receipt face) → last failure
+   instant. Within 60 seconds of a recorded failure, another trigger of the same key
+   answers `{"status": "unknown"}` immediately — no prepare, no local stamp, no engine
+   call. This narrows how often a failing face re-attempts; it retries nothing, so the
+   AGENTS.md red line (an unknown outcome must not be retried automatically) is intact —
+   the desktop's next deliberate trigger after the window is a fresh request, not a retry.
+   The map prunes expired entries on every touch and carries a hard capacity cap, so it
+   stays bounded (AGENTS.md).
+
+Boundary notes: the sync read/viewed faces ride the store-side filters (one shared
+`prepare_receipt` store path) but not the supervisor debounce — the incident's replay
+pressure sits on the peer-faced fan-out, and the self-sync leg keeps its own semantics.
+Auto delivery receipts are per-ingest one-shots with no selection and are untouched.
+Explicit-`messageIds` receipts are untouched. Error rows: the selection has always skipped
+rows whose author cannot be resolved (group sender hashes, §4.28) — unchanged.
+
+Tests: the store arm (the window drops eight-day-old rows from both faces' absent
+selection while fresh rows survive, the viewed face skips stamped rows the read face still
+selects, the explicit mode still addresses a stamped row, the existing order/bound
+disciplines hold on fresh timestamps); the service arm (absent markViewed selects only
+fresh unstamped rows and rides exactly that selection into the stamp, absent markRead
+selects every fresh row regardless of stamp); the supervisor arm (a marker-driven receipt
+failure records the debounce — the immediate same-face replay answers `unknown` with zero
+new engine frames, the other face and another conversation are not debounced, a successful
+face still confirms `sent`; plus the 60-second expiry boundary at the map level); the
+integration arms (the absent read fan-out carries only the fresh row while the stale row
+stays silent, the explicit viewed fan-out still carries both rows; the 425-crash degradation
+switches to the explicit selection so the crash path stays exercised). Gates: all green.
 
 ## 5. signal-cli Boundary
 

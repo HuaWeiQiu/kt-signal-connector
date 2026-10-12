@@ -12,6 +12,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
+use crate::link::now_ms;
 
 const SCHEMA_VERSION: i64 = 22;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
@@ -29,6 +30,12 @@ const PLAINTEXT_BACKUP_SUFFIX: &str = ".plaintext-backup";
 const MIGRATION_STAGING_SUFFIX: &str = ".encrypting";
 /// Phase 3 retention: how long the plaintext migration backup is kept.
 pub const PLAINTEXT_BACKUP_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// §4.119 stopgap: how far back the absent-mode receipt selection reaches.
+/// The upstream rejects receipt timestamps older than a few days, so resupply
+/// past this age is protocol-meaningless; seven days keeps the honest
+/// late-receipt margin (an offline stretch, a clock delivered late) while
+/// never replaying last week's rows.
+const RECEIPT_RECENCY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// A readable plaintext SQLite store starts with these 16 bytes; an encrypted
 /// (SQLCipher) store is indistinguishable from random bytes.
 const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -4757,27 +4764,45 @@ impl Store {
     /// `messages.markRead` / `messages.markViewed` (contract 1.34). Only
     /// incoming rows qualify: an outbound receipt references messages the
     /// peers authored, never our own sends or system rows.
+    ///
+    /// §4.119 stopgap filters: the selection only carries rows newer than
+    /// [`RECEIPT_RECENCY_WINDOW_MS`] (the upstream rejects stale receipt
+    /// timestamps, so a resupply past that age is protocol-meaningless), and
+    /// `unviewed_only` (the viewed faces) additionally carries only rows with
+    /// no `viewed_at` stamp yet — the §4.77 first stamp is the resupply
+    /// boundary, so an already-played row is never re-sent. The
+    /// explicit-`messageIds` mode (`incoming_rows_by_ids`) applies neither
+    /// filter: the desktop naming ids is itself the incremental act.
     pub fn incoming_rows_for_receipts(
         &self,
         account_id: &str,
         conversation_id: &str,
         limit: u32,
+        unviewed_only: bool,
     ) -> Result<Vec<MessageRecord>, StoreError> {
         let conn = self.lock_conn()?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
+        let viewed_clause = if unviewed_only {
+            "   AND viewed_at IS NULL\n"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
                         body, body_bytes, body_truncated, status, quote_message_id, client_request_id,
                         quote_snapshot, attachments_json, rich_json, edited_at, sender_name, mentions_self, delivered_at, read_at, admin_deleted, sticker_json, expire_seconds, expire_start_at, expire_at, server_guid, server_timestamp, viewed_at
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
-                 ORDER BY sent_at ASC, id ASC
-                 LIMIT ?3",
-            )
+                   AND sent_at > ?3
+{viewed_clause}                 ORDER BY sent_at ASC, id ASC
+                 LIMIT ?4"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let cutoff = now_ms().saturating_sub(RECEIPT_RECENCY_WINDOW_MS) as i64;
         let rows = stmt
             .query_map(
-                params![account_id, conversation_id, i64::from(limit)],
+                params![account_id, conversation_id, cutoff, i64::from(limit)],
                 message_record_from_row,
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?
@@ -8291,11 +8316,12 @@ mod tests {
             server_guid: None,
             server_timestamp: None,
         };
+        let now = now_ms();
         for (id, sent_at, direction) in [
-            ("m3", 30, "incoming"),
-            ("out-1", 40, "outgoing"),
-            ("m1", 10, "incoming"),
-            ("m2", 20, "incoming"),
+            ("m3", now + 2, "incoming"),
+            ("out-1", now + 3, "outgoing"),
+            ("m1", now, "incoming"),
+            ("m2", now + 1, "incoming"),
         ] {
             assert!(
                 store
@@ -8305,7 +8331,7 @@ mod tests {
         }
 
         let bounded = store
-            .incoming_rows_for_receipts(&account.id, &conversation.id, 2)
+            .incoming_rows_for_receipts(&account.id, &conversation.id, 2, false)
             .unwrap();
         assert_eq!(
             bounded
@@ -8332,8 +8358,8 @@ mod tests {
             picked.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["m1", "m3"]
         );
-        assert_eq!(picked[0].sent_at, 10);
-        assert_eq!(picked[1].sent_at, 30);
+        assert_eq!(picked[0].sent_at, now);
+        assert_eq!(picked[1].sent_at, now + 2);
 
         store
             .upsert_synced_contacts(
@@ -8358,6 +8384,138 @@ mod tests {
         assert_eq!(
             store.contact_peer_keys(&account.id).unwrap(),
             ["+15555550101"]
+        );
+    }
+
+    /// §4.119 stopgap: the absent receipt selection only reaches inside the
+    /// seven-day recency window, the viewed face skips already-stamped rows
+    /// while the read face still selects them, a row exactly at the cutoff is
+    /// excluded (strictly older-than semantics), and neither filter touches
+    /// the explicit-`messageIds` mode.
+    #[test]
+    fn receipt_absent_selection_stays_inside_the_recency_window_and_viewed_boundary() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let now = now_ms();
+        let seed = |store: &Store, id: &str, sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                direction: "incoming",
+                sender_id: "peer".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+            };
+            assert!(
+                store
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        let day: u64 = 24 * 60 * 60 * 1_000;
+        seed(&store, "overage", now - 8 * day);
+        seed(&store, "at-cutoff", now - 7 * day);
+        seed(&store, "in-window-old", now - 6 * day);
+        seed(&store, "in-window-fresh", now - 3_600_000);
+
+        // Both faces agree inside the window: the overage rows (eight days
+        // old, and exactly at the cutoff — strictly older-than) never select.
+        let viewed = store
+            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, true)
+            .unwrap();
+        assert_eq!(
+            viewed.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["in-window-old", "in-window-fresh"]
+        );
+        let read = store
+            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, false)
+            .unwrap();
+        assert_eq!(
+            read.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["in-window-old", "in-window-fresh"]
+        );
+
+        // The first viewed stamp (§4.77) becomes the resupply boundary: the
+        // stamped row drops out of the viewed face but stays for the read
+        // face, which tracks no local state.
+        assert_eq!(
+            store
+                .stamp_incoming_viewed(
+                    &account.id,
+                    &conversation.id,
+                    &["in-window-old".into()],
+                    now,
+                )
+                .unwrap(),
+            1
+        );
+        let viewed_after = store
+            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, true)
+            .unwrap();
+        assert_eq!(
+            viewed_after
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["in-window-fresh"]
+        );
+        let read_after = store
+            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, false)
+            .unwrap();
+        assert_eq!(
+            read_after
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["in-window-old", "in-window-fresh"]
+        );
+
+        // The explicit-`messageIds` mode applies neither filter: the stamped
+        // row still resolves, and even an overage row stays addressable.
+        let explicit = store
+            .incoming_rows_by_ids(
+                &account.id,
+                &conversation.id,
+                &["in-window-old".into(), "overage".into()],
+            )
+            .unwrap();
+        assert_eq!(
+            explicit
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["overage", "in-window-old"]
         );
     }
 

@@ -4640,9 +4640,10 @@ fn receipt_log_lines(contents: &str) -> Vec<Value> {
 /// genuinely-ingested incoming dataMessage (the finishLink burst covers the
 /// default fixture receive, a staged direct message, and a staged group
 /// message — every receipt addresses the author as a single string, never the
-/// group id); `messages.markRead` without messageIds fans the whole direct
-/// conversation out as one ascending per-author read receipt;
-/// `messages.markViewed` with explicit ids narrows to those rows; and a group
+/// group id); `messages.markRead` without messageIds fans the §4.119-window
+/// selection out as one ascending per-author read receipt (the stale
+/// fixture-era row stays silent, the fresh staged row rides); `messages.markViewed`
+/// with explicit ids narrows to those rows unfiltered; and a group
 /// markRead is the silent `sent` no-op (local group rows carry no resolvable
 /// author, so zero upstream calls).
 #[tokio::test]
@@ -4664,7 +4665,15 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
     let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
 
     // Stage a group message and a second direct message behind the default
-    // link receive: three incoming dataMessages, three auto delivery receipts.
+    // link receive: three incoming dataMessages, three auto delivery
+    // receipts. The direct message carries a FRESH timestamp — §4.119 puts
+    // the absent receipt selection inside the seven-day window, so the
+    // fixture-era default receive (42) stays deliberately stale and the
+    // absent fan-out below proves the exclusion.
+    let fresh_direct: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let signal_data = temp.path().join("signal-data");
     fs::create_dir_all(&signal_data).unwrap();
     fs::write(
@@ -4682,7 +4691,7 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
             {
                 "source": "+15555550101",
                 "sourceName": "林菲菲",
-                "timestamp": 60,
+                "timestamp": fresh_direct,
                 "dataMessage": { "message": "second direct text" }
             }
         ])
@@ -4755,7 +4764,7 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
                 .collect()
         })
         .collect();
-    assert_eq!(timestamps, [vec![42], vec![50], vec![60]]);
+    assert_eq!(timestamps, [vec![42], vec![50], vec![fresh_direct]]);
     for entry in &delivery_receipts {
         assert_eq!(entry["account"], "+15555550100");
         assert_eq!(entry["recipient"], "+15555550101");
@@ -4793,14 +4802,19 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
         .as_str()
         .unwrap()
         .to_string();
-    let id_60 = rows.iter().find(|row| row["sentAt"] == 60).unwrap()["id"]
+    let id_fresh = rows
+        .iter()
+        .find(|row| row["sentAt"] == fresh_direct)
+        .unwrap()["id"]
         .as_str()
         .unwrap()
         .to_string();
 
-    // Absent messageIds: the whole conversation as one ascending read
-    // receipt — distinguishable from every delivery receipt by its [42, 60]
-    // shape, and its log line precedes the markRead answer.
+    // Absent messageIds: the §4.119 window at the wire face — only the fresh
+    // direct row fans out (one ascending per-author read receipt whose
+    // [fresh_direct] shape is distinguishable from every delivery receipt),
+    // while the stale fixture-era row (42) stays silent; the log line
+    // precedes the markRead answer.
     let marked = request(
         &mut client,
         "mark-read",
@@ -4811,11 +4825,12 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
     assert_eq!(marked["result"]["status"], "sent");
     let after_read = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
     assert_eq!(after_read.len(), 4);
-    assert_eq!(after_read[3]["timestamps"], json!([42, 60]));
+    assert_eq!(after_read[3]["timestamps"], json!([fresh_direct]));
     assert_eq!(after_read[3]["recipient"], "+15555550101");
 
     // Explicit messageIds: exactly the addressed rows, receipt order, same
-    // single-author fan-out.
+    // single-author fan-out — unfiltered by §4.119 (the desktop naming ids
+    // is itself the incremental act), so the stale row is still addressable.
     let viewed = request(
         &mut client,
         "mark-viewed",
@@ -4823,14 +4838,14 @@ async fn receipts_mark_read_viewed_and_auto_delivery_reach_the_upstream() {
         json!({
             "accountId": account_id,
             "conversationId": direct_id,
-            "messageIds": [id_42, id_60]
+            "messageIds": [id_42, id_fresh]
         }),
     )
     .await;
     assert_eq!(viewed["result"]["status"], "sent");
     let after_viewed = receipt_log_lines(&fs::read_to_string(&send_log_path).unwrap());
     assert_eq!(after_viewed.len(), 5);
-    assert_eq!(after_viewed[4]["timestamps"], json!([42, 60]));
+    assert_eq!(after_viewed[4]["timestamps"], json!([42, fresh_direct]));
 
     // A group markRead resolves no author locally: the trivial `sent` no-op
     // with zero new upstream calls — no receipt ever carries the group id.
@@ -4941,14 +4956,40 @@ async fn receipt_upstream_failures_degrade_to_unknown_not_errors() {
         .unwrap()
         .to_string();
 
-    // The default selection includes the 425 row, so the read receipt kills
-    // the engine mid-call — and the request still answers, degraded to
-    // `unknown`, with no error object and no retry.
+    // The explicit selection names the 425 row — §4.119 keeps the absent
+    // form window-filtered (a stale row would silently no-op), so the
+    // mid-call crash path drives the explicit face — and the read receipt
+    // still kills the engine mid-call, the request still answers degraded
+    // to `unknown`, with no error object and no retry.
+    let messages = request(
+        &mut client,
+        "messages-1",
+        "messages.list",
+        json!({
+            "accountId": account_id,
+            "conversationId": direct,
+            "limit": 50
+        }),
+    )
+    .await;
+    let crash_target = messages["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sentAt"] == 425)
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let marked = request(
         &mut client,
         "mark-read",
         "messages.markRead",
-        json!({ "accountId": account_id, "conversationId": direct }),
+        json!({
+            "accountId": account_id,
+            "conversationId": direct,
+            "messageIds": [crash_target]
+        }),
     )
     .await;
     assert_eq!(marked["result"]["status"], "unknown");

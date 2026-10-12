@@ -961,6 +961,19 @@ for line in sys.stdin:
         # from remoteDelete 421 / reaction 423 / pin 424.
         if 425 in (params.get("timestamps") or []):
             os._exit(23)
+        # §4.119 stopgap gate: `.fixture-fail-receipt` answers a definite
+        # upstream rejection for the receipt faces (the stale-timestamp
+        # rejection the supervisor failure debounce rides), after the
+        # dispatch log line — the log records the attempt, the error is the
+        # outcome.
+        if (SIGNAL_DATA_DIR / ".fixture-fail-receipt").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "RECEIPT_TIMESTAMP_REJECTED"},
+            }
+            emit_json(response)
+            continue
         result = {}
     elif method == "sendViewOnceOpen":
         # Contract 1.38 view-once open face: same dispatch-recording
