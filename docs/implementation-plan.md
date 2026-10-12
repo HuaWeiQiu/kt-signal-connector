@@ -5,6 +5,10 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- No-revision record: 2026-10-13; the §4.121 receive-side gap (the self-sent
+  sticker / bodyless pure-quote `sentMessage` sync projection) lands as
+  connector-internal behavior only — zero wire change, the contract revision
+  stays 1.136 (the §4.121 entry below)
 - No-revision stopgap record: 2026-10-12; the §4.119 outbound-receipt resupply stopgap
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
@@ -9803,6 +9807,45 @@ without the key omits it on the wire (older-engine byte-compatibility); a non-bo
 engine value reads as absent; the empty list and the non-nullable core gate are
 untouched. Gates: fmt, clippy `-D warnings`, tests (555 lib + 179
 integration, all green), release build.
+
+### 4.121 The self-sent sticker and the bodyless pure-quote sent sync: the `sentMessage` mirror stops dropping bodyless sticker and quote sends (no contract revision — wire unchanged, 2026-10-13)
+
+Official behavior: a sticker the phone sends syncs to every linked desktop and renders
+there, and a quote-only send syncs the same way. The engine's `SyncMessage.content=Sent`
+projection already carried the sticker face (its jsonrpc-compat sent arm), but the
+connector's `sentMessage` arm classified a sticker-only mirror as the bodyless catch-all
+`skip` and dropped the whole envelope; a pure-quote send (quote, no body, no descriptor)
+fell through every arm the same way. Both now land through the existing outgoing ladder —
+the same rows the connector's own sends land as, the self send's own timestamp, never an
+unread.
+
+The sticker arm reuses the §4.32 incoming projection verbatim (`normalized_sticker` —
+one struct, one serde face): the `data` pointer joins the attachment descriptor list as
+a regular metadata-only descriptor (byte fetches stay on the existing media channel) and
+the pack identity rides the row's `sticker` face — the identical `MessageRecord` shape
+the connector's own `messages.sendSticker` pending-row path (§4.31) lands, so the wire
+gains zero new keys and the desktop's existing sticker-row consumer is unchanged. The
+parse sits deliberately after the control ladder and the state-face arms, so the ladder's
+precedence is byte-identical to the text face's: a sticker beside a remote-delete / edit
+/ reaction echo keeps its control routing (the control folds onto the row the sticker
+landed earlier, never spawning a second one), and a sticker beside an
+expiration/group-update/poll rich face keeps the state face. A sticker with no usable
+`data` pointer has nothing renderable and keeps the plain skip routing (the incoming
+arm's 宁缺勿错 discipline). The bodyless pure-quote arm (no body, no descriptor — the
+quote the whole content) lands the same outgoing row a quoted-text send does, quote
+snapshot as the row's quote face.
+
+Desktop rendering of the new rows is presentation-only consumption of the existing
+`message.upserted` face and is not part of this change. No new method, event, key, error,
+capability, or store move; additive receive-plane routing only.
+
+Tests: `sync_sent_sticker_lands_outgoing_row` (sticker-only and quoted-sticker mirrors
+land outgoing rows carrying the pack face plus the metadata-only descriptor; the
+destination and the sent timestamp key the row), `sync_sent_sticker_keeps_prior_routing_
+precedence` (a data-less sticker stays skip; a sticker beside a remote-delete echo stays
+control), and `sync_sent_bodyless_quote_lands_outgoing_row` (the quote-only send lands
+outgoing with the quote face and empty attachments). Gates: fmt, clippy `-D warnings`,
+tests all green.
 
 ## 5. signal-cli Boundary
 

@@ -5116,7 +5116,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             let text = data_message_text(sent);
             let group_id = data_message_group_id(sent);
             let quote = sent.get("quote").and_then(normalized_quote);
-            let attachments = sent
+            let mut attachments = sent
                 .get("attachments")
                 .map(normalized_attachments)
                 .unwrap_or_default();
@@ -5235,9 +5235,34 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     expire_start_at,
                 ));
             }
+            // The sent transcript's sticker face (contract 1.136, §4.121):
+            // the mirror parses beside the message exactly like the incoming
+            // arm's (§4.32) — the `data` pointer joins the attachment list as
+            // a regular metadata-only descriptor and the pack identity rides
+            // the row's sticker face, so a phone-originated sticker renders
+            // from the same outgoing row shape the connector's own
+            // `messages.sendSticker` lands. Parsed after the control ladder
+            // (a sticker + remoteDelete/edit/reaction echo keeps its control
+            // routing) and after the state-face arms, so the rich faces keep
+            // their precedence exactly like the text face's does; a sticker
+            // with no usable data pointer has nothing renderable and keeps
+            // the plain skip routing.
+            let sticker = sent
+                .get("sticker")
+                .and_then(Value::as_object)
+                .and_then(normalized_sticker);
+            if let Some((_, sticker_image)) = sticker.as_ref() {
+                attachments.push(sticker_image.clone());
+            }
+            let with_sticker = |mut outgoing: NormalizedReceive| {
+                if let Some((sticker_meta, _)) = sticker.as_ref() {
+                    outgoing.sticker = Some(sticker_meta.clone());
+                }
+                outgoing
+            };
             if let Some(text) = text {
                 return Ok(with_expire(
-                    make(
+                    with_sticker(make(
                         sent_ts,
                         "syncMessage",
                         "outgoing",
@@ -5248,15 +5273,16 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                         attachments,
                         rich,
                         None,
-                    ),
+                    )),
                     expire_seconds,
                     expire_start_at,
                 ));
             }
             // Attachment-only multi-device send: no body but real descriptors.
+            // A sticker-only send lands here through its data descriptor.
             if !attachments.is_empty() {
                 return Ok(with_expire(
-                    make(
+                    with_sticker(make(
                         sent_ts,
                         "syncMessage",
                         "outgoing",
@@ -5267,12 +5293,33 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                         attachments,
                         rich,
                         None,
+                    )),
+                    expire_seconds,
+                    expire_start_at,
+                ));
+            }
+            // Bodyless pure-quote send (§4.121): the quote is the whole
+            // content — the same outgoing row the quoted-text send lands as,
+            // the self send's own timestamp, never an unread.
+            if let Some(quote) = quote {
+                return Ok(with_expire(
+                    make(
+                        sent_ts,
+                        "syncMessage",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        None,
+                        Some(quote),
+                        attachments,
+                        rich,
+                        None,
                     ),
                     expire_seconds,
                     expire_start_at,
                 ));
             }
-            // sent without body (sticker/other control sync) — skip for now
+            // sent without body (other control sync) — skip for now
             return Ok(make(
                 sent_ts,
                 "syncMessage",
@@ -9850,6 +9897,167 @@ mod tests {
         }));
         assert_eq!(sent.direction, "outgoing");
         assert_eq!(sent.expire_seconds, Some(3600));
+    }
+
+    /// Contract 1.136 (§4.121): a phone-originated sticker mirrors through
+    /// `syncMessage.sentMessage` as the same outgoing row the connector's own
+    /// `messages.sendSticker` lands — the pack identity rides the row's
+    /// sticker face and the `data` pointer joins the attachment list as a
+    /// metadata-only descriptor; a sticker sent with a quote keeps the quote
+    /// beside the face. The pre-1.136 shape dropped the whole envelope as
+    /// skip, so the desktop never learned the phone's sticker sends.
+    #[test]
+    fn sync_sent_sticker_lands_outgoing_row() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "account": "+15555550100",
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": { "sentMessage": data },
+                },
+            }))
+            .unwrap()
+        };
+        let sent = normalize(json!({
+            "timestamp": 1726999999000u64,
+            "destinationNumber": "+15555550101",
+            "sticker": {
+                "packId": "abcdef01",
+                "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                "stickerId": 7,
+                "emoji": "🎉",
+                "data": {
+                    "id": "att-1",
+                    "contentType": "image/webp",
+                    "size": 8192,
+                    "width": 512,
+                    "height": 512,
+                },
+            },
+        }));
+        assert_eq!(sent.direction, "outgoing");
+        assert_eq!(sent.timestamp, Some(1726999999000));
+        assert_eq!(sent.source.as_deref(), Some("+15555550101"));
+        let sticker = sent.sticker.as_ref().expect("sticker metadata");
+        assert_eq!(sticker.pack_id, "abcdef01");
+        assert_eq!(sticker.sticker_id, 7);
+        assert_eq!(sticker.emoji.as_deref(), Some("🎉"));
+        assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].id, "att-1");
+        assert_eq!(
+            sent.attachments[0].content_type.as_deref(),
+            Some("image/webp")
+        );
+
+        // A quoted sticker keeps both faces on the one outgoing row.
+        let quoted = normalize(json!({
+            "timestamp": 1726999998000u64,
+            "destinationUuid": "11111111-1111-1111-1111-111111111111",
+            "quote": {
+                "id": 1726999990000u64,
+                "author": "+15555550101",
+                "text": "look at this",
+            },
+            "sticker": {
+                "packId": "abcdef02",
+                "packKey": "BBBBBBBBBBBBBBBBBBBBBB==",
+                "stickerId": 3,
+                "data": {
+                    "id": "att-2",
+                    "contentType": "image/webp",
+                },
+            },
+        }));
+        assert_eq!(quoted.direction, "outgoing");
+        assert!(quoted.sticker.is_some());
+        let quote = quoted.quote.expect("quoted sticker keeps the quote");
+        assert_eq!(quote.id, 1726999990000);
+        assert_eq!(quoted.attachments.len(), 1);
+        assert_eq!(quoted.attachments[0].id, "att-2");
+    }
+
+    /// Contract 1.136 (§4.121): the sticker face never outranks the faces
+    /// the sent ladder already prioritizes — a mirror whose sticker has no
+    /// usable `data` pointer keeps the plain skip (nothing renderable), and
+    /// a sticker beside a remote-delete echo keeps its control routing (the
+    /// delete must fold onto the row the sticker landed earlier, never spawn
+    /// a second one).
+    #[test]
+    fn sync_sent_sticker_keeps_prior_routing_precedence() {
+        let normalize = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "account": "+15555550100",
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": { "sentMessage": data },
+                },
+            }))
+            .unwrap()
+        };
+        // No usable data pointer → the plain skip routing.
+        let dataless = normalize(json!({
+            "timestamp": 1726999999000u64,
+            "destinationNumber": "+15555550101",
+            "sticker": {
+                "packId": "abcdef01",
+                "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                "stickerId": 7,
+            },
+        }));
+        assert_eq!(dataless.direction, "skip");
+        assert!(dataless.sticker.is_none());
+
+        // Sticker + remoteDelete echo → the control face wins.
+        let deleted = normalize(json!({
+            "timestamp": 1726999999000u64,
+            "destinationNumber": "+15555550101",
+            "remoteDelete": { "timestamp": 1726999990000u64 },
+            "sticker": {
+                "packId": "abcdef01",
+                "packKey": "AAAAAAAAAAAAAAAAAAAAAA==",
+                "stickerId": 7,
+                "data": { "id": "att-1", "contentType": "image/webp" },
+            },
+        }));
+        assert_eq!(deleted.direction, "outgoing");
+        assert_eq!(deleted.content_kind, "control");
+        let Some(ControlReceive::RemoteDelete { target_timestamp }) = deleted.control else {
+            panic!("expected the remote-delete control to win");
+        };
+        assert_eq!(target_timestamp, 1726999990000);
+    }
+
+    /// Contract 1.136 (§4.121): a bodyless pure-quote send — no body, no
+    /// descriptor, the quote the whole content — lands as the same outgoing
+    /// row the quoted-text send does. The pre-1.136 shape fell through every
+    /// arm to skip, so the desktop never saw the phone's quote-only sends.
+    #[test]
+    fn sync_sent_bodyless_quote_lands_outgoing_row() {
+        let normalized = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "destinationNumber": "+15555550101",
+                        "quote": {
+                            "id": 1726999990000u64,
+                            "author": "+15555550101",
+                            "text": "the quoted body",
+                        },
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        assert_eq!(normalized.direction, "outgoing");
+        assert_eq!(normalized.timestamp, Some(1726999997000));
+        assert!(normalized.text.is_none());
+        assert!(normalized.attachments.is_empty());
+        let quote = normalized.quote.expect("the quote is the row's content");
+        assert_eq!(quote.id, 1726999990000);
+        assert_eq!(quote.text, "the quoted body");
     }
 
     /// Contract 1.45 (§4.44): a bodyless group-state change
