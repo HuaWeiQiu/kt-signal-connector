@@ -5,7 +5,33 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
-- Contract revision: 1.133 (2026-10-12; the S2a measurement layer lands
+- Contract revision: 1.134 (2026-10-12; the §4.114 front-run batch lands
+  (§4.117): the engine's four account-scoped stream notifications the
+  connector used to drop — `receive.emptied`, `receive.clockskew`,
+  `groupTerminated`, `contactProfileUpdated` — joined by the fifth the
+  engine shipped meanwhile (`receive.conversationState`, engine
+  `e60d673`), all reach the host as transient events. Two lanes: the two
+  envelope keys join the `control_routing` ladder as ControlReceive
+  variants and forward through the conversation-less transient family
+  (the terminated group forwards even when its row is gone), and the
+  three standalone methods get the new account-domain transient-event
+  lane — attributed EngineEvent variants whose signal account resolves
+  through the store to the opaque accountId (the accountUnbound
+  discipline: malformed stays a parse warning, unmatchable drops
+  warn-only with a perf counter, never silently claimed as forwarded).
+  `receive.conversationState` rides the same lane with the engine's
+  conversations array forwarded verbatim — no entry parsing, no trim,
+  the owner red line: a passthrough structure error corrupts every
+  downstream consumer; the engine's own caps (book 8192/account, batch
+  256 + overflow tail) govern the wire. Five new host event names
+  (`receive.emptied`, `receive.clockSkew`, `group.terminated`,
+  `contact.profileUpdated`, `conversation.stateChanged` — the naming
+  record in §4.117), schema `$defs/event` grows the five members with
+  their data branches (the conversation entries deliberately open
+  objects); no new method, error, capability, or store version; the
+  perf word list grows exactly `account_transient_forwarded` /
+  `_unattributed`. Tests 709 → 717 (lib 532 → 539), all green) —
+  previously 1.133 (2026-10-12; the S2a measurement layer lands
   connector-side (§4.116): the `receive_persistence_loop` per-envelope
   ingest transaction — the registered largest-bottleneck candidate
   (30-envelope burst = 30 transactions) — is timed and counted per
@@ -9350,6 +9376,148 @@ zero) plus the `runtime.doctor` integration test extends the engine-face
 assertions with the `perfMetrics` face (present + projected + drop count
 against the fake engine's echo). Gates: tests 700 → 709 (lib 523 → 532),
 all green; fmt / clippy / release build clean.
+
+### 4.117 The four engine notifications (and the conversation-state fifth) reach the host: the account-domain transient lane + the two envelope-key forwards (contract revision 1.134, 2026-10-12)
+
+The §4.114 front-run batch lands: the engine's four account-scoped stream
+notifications the connector used to drop, joined by the fifth the engine
+shipped meanwhile (`receive.conversationState`, engine `e60d673`), all
+reach the host as transient events. Wire additive-only: five new host
+event names, no new method, no new error code, no capability change, no
+store version change. Every event is transient — no row, no self-heal,
+nothing persisted; a lost notification is the lost official semantics of
+that one notification, exactly like the official client losing one it
+received while offline.
+
+**The engine faces (verified 2026-10-12, `kt-signal-engine` main @
+`e60d673`).** The §4.114 record held for the four; the fifth needed its
+own reconnaissance, and it changed the shape assumption:
+
+- `receive.emptied` `{account}` — standalone JSON-RPC method, the
+  history-queue drained (the official ApiEmptyQueue→EmptyEvent peer),
+  once per drain.
+- `receive.clockskew` `{account, skewMs, serverTimestamp}` — standalone
+  method, edge-triggered past the official 24h threshold; `skewMs` is
+  signed (local − server, positive = the local clock fast).
+- `groupTerminated` `{groupId, terminator?, timestamp}` — a receive
+  envelope key (the whole envelope replaced, the change-only projection);
+  a decrypted group change named the group terminated.
+- `contactProfileUpdated` `{aci}` — a receive envelope key (the
+  `identityChanged` shape family, `sourceUuid` equal to the aci); a
+  peer's profileKeyUpdate batch landed a new profile key.
+- `receive.conversationState` `{account, conversations: [{conversationId,
+  kind, mutedUntilTimestamp, archived, markedUnread}], overflow}` — a
+  **standalone method**, not an envelope key: the engine's F-link batch
+  (e60d673) put the three-flag inbound flips on the same account-domain
+  method lane as emptied/clockskew (词表第五词), differenced against a
+  per-account in-memory book (8192 conversations/account cap,
+  first-observation seeds silently, value-unchanged never notifies),
+  one batch per storage merge with a 256-entry batch cap and an
+  `overflow: true` tail marker; `kind` is `contact | group |
+  legacyGroup`. The connector forwards the array verbatim.
+
+**The wiring.** Two lanes, one forwarding posture:
+
+1. *The envelope keys join the `control_routing` ladder* as
+   `ControlReceive` variants. `groupTerminated` routes by its own
+   groupId (the routing address carries the subject) and forwards
+   through the conversation-less transient family — the service layer
+   intercepts before the conversation ladder on purpose, because a
+   terminated group's row may already be gone and the event is the
+   desktop's termination fact, not a row anchor (a deliberate
+   difference from the groupUpdated/groupChanged faces, which converge
+   rows and die on unknown groups). `contactProfileUpdated` is
+   conversation-less (the aci names its subject). Both fail closed on
+   their guaranteed subject (no groupId / no aci = protocol error =
+   the plain skip); optional faces (terminator/timestamp) degrade to
+   absence, never to invented values (宁缺勿错).
+2. *The standalone methods get the account-domain transient-event lane*
+   (new): `EngineEvent` today carried only group-level facts, so the
+   batch adds three attributed variants
+   (`ReceiveEmptied` / `ReceiveClockSkew` / `ConversationState`)
+   carrying the signal account, emitted from `handle_upstream_line`
+   arms ahead of the unknownNotification default. The supervisor's
+   engine-event watcher (the accountUnbound consumer, now the lane's
+   consumer too) resolves the account through the store into the
+   connector's opaque `accountId` and sends the host frame.
+   **Attribution discipline** (the accountUnbound precedent): a
+   malformed or empty account in the engine notification falls back to
+   the unknownNotification warning at the parse arm; an account that
+   matches no bound connector account drops at the service arm
+   warn-only with a content-free warning and a perf counter —
+   attribution failure is never silently swallowed into a claimed
+   forward. The two envelope-key faces ride the receive pipeline's
+   existing account resolution (the shared ingest ladder), which keeps
+   its silent-skip discipline unchanged — nothing is claimed as
+   forwarded that was not.
+3. *F rides the same lane*: `receive.conversationState` parses the
+   guaranteed faces only — `account` (attribution), `conversations`
+   (non-empty array, then **carried and forwarded verbatim**: no entry
+   parsing, no filtering, no trimming, unnamed sibling keys ride — the
+   owner red line: a passthrough structure error corrupts every
+   downstream consumer), `overflow` (boolean). A non-array or empty
+   conversations face, a non-boolean overflow, or a missing skewMs is
+   a protocol error and answers the unknownNotification warning, never
+   a guessed forward. The engine's own caps govern the wire; the
+   connector adds none.
+
+**The host frames** (the shared host event stream, all transient):
+
+| engine face | host frame | frame data |
+|---|---|---|
+| `receive.emptied` | `receive.emptied` | `{accountId}` |
+| `receive.clockskew` | `receive.clockSkew` | `{accountId, skewMs, serverTimestamp?}` |
+| `groupTerminated` | `group.terminated` | `{accountId, groupId, terminator?, timestamp?}` |
+| `contactProfileUpdated` | `contact.profileUpdated` | `{accountId, aci, timestamp?}` |
+| `receive.conversationState` | `conversation.stateChanged` | `{accountId, conversations, overflow}` |
+
+Naming record (deviations from the §4.114 provisional names, all
+cosmetic and documented here): the four provisional names stand as
+pinned (`receive.emptied`, `receive.clockSkew` — the host frame
+normalizes the engine's lowercase `clockskew` method name to the
+frame vocabulary's camelCase, `contact.profileUpdated`,
+`group.terminated` — the group.changed family sibling). The fifth was
+left open pending reconnaissance; the verified face being an
+account-domain method carrying a per-conversation batch, the frame is
+`conversation.stateChanged` — the `conversation.*` family
+(conversation.changed / conversation.typing) with the stateChanged
+verb the proxyGroup.stateChanged sibling already uses; `receive.*`
+stays the engine-method-mirroring pair above rather than growing a
+third member that is really about conversations.
+
+The schema grows the five `$defs/event` enum members and their data
+branches (the conversations entries deliberately typed `object` and
+open — pinning their internals would promise a connector-side
+whitelist the F red line forbids). The perf layer (the §4.116 closed
+word list) grows exactly two counters: `account_transient_forwarded`
+and `account_transient_unattributed` — the lane's honest face: the
+forward count and the warn-only drop count, content-free.
+
+Tests: the engine parse arms (the three standalone notifications into
+their attributed events with the signed skew and the verbatim array;
+the malformed family — missing/empty account, missing/non-numeric
+skew, non-array or empty conversations, non-boolean overflow — into
+the unknownNotification warning; the two envelope keys into their
+control routings with the fail-closed subject gate); the service
+forward arms (the terminated group forwards without a local
+conversation and persists nothing; the profile notify rides the
+envelope timestamp; the lane resolves the bound account, forwards the
+array verbatim, and drops the unbound account with both perf
+counters); the host wire frames (all five, absent-optional identities
+absent, the array verbatim); and the end-to-end harness over the real
+engine process: the fixture grows a raw-notification marker
+(`.fixture-emit-notifications.json`, full JSON-RPC objects verbatim)
+beside the envelope marker, and one test walks the lanes — the three
+standalone frames with resolved accountId, the 257-entry batch past
+the engine's cap forwarded whole with the overflow tail marker, the
+two envelope-key frames through the extra-receives channel (read
+beside the flush request's reply with a collecting read — the
+forwarded frames race that reply, and a reply-only read eats them),
+the unbound-account non-forward, and the malformed face surfacing as
+runtime.protocolWarning. The §4.114 four-lane set: pass-through and
+the error face are exercised; local gate is n/a (the events carry no
+request) and crash is n/a (the engine staying alive is the
+assertion). Tests 709 → 717 (lib 532 → 539).
 
 ## 5. signal-cli Boundary
 

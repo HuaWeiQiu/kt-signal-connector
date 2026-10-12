@@ -4184,7 +4184,12 @@
             "call.logEvent",
             "account.deviceNameChanged",
             "account.usernameChanged",
-            "identity.pniChanged"
+            "identity.pniChanged",
+            "group.terminated",
+            "contact.profileUpdated",
+            "receive.emptied",
+            "receive.clockSkew",
+            "conversation.stateChanged"
           ]
         },
         "data": {
@@ -4927,6 +4932,148 @@
                   "newE164": {
                     "$ref": "#/$defs/opaqueId",
                     "description": "The account's new number when the projection carried it."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "group.terminated" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "groupId"],
+                "description": "One group-termination event forwarded (contract 1.134, §4.117): the engine's groupTerminated projection — a decrypted group change named the group terminated and the engine replaced the whole envelope with the event (change-only projection). The conversation-less transient family like story.received: no row, nothing persisted, nothing self-heals from a missed delivery. groupId is the subject's group master key (standard base64, the groups.get id form) forwarded verbatim whether or not a local conversation still exists — a terminated group's row may already be gone, and the event is the desktop's termination fact, not a row anchor. terminator is the change author's ACI when the engine decrypted one; absent stays absent (宁缺勿错). The termination interception table engine-side already blocks sends to the dead group.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "groupId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The terminated group's id (the 32-byte master key's standard base64) — the engine projection's subject, forwarded verbatim."
+                  },
+                  "terminator": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "The change author's ACI UUID when the engine decrypted one (the groupUpdated editor discipline); absent keeps the termination unattributed."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The terminating group change's Signal timestamp when the engine projected one."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "contact.profileUpdated" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "aci"],
+                "description": "One contact-profile refresh notify forwarded (contract 1.134, §4.117): the engine's contactProfileUpdated projection — a peer's profileKeyUpdate batch landed a new profile key in the engine's store (the engine rides the receive envelope as a key, the identityChanged shape family). Pure notify: the actual profile/avatar re-fetch stays the desktop's on-demand pull through the existing read faces; the event only says the cached profile may be stale. Conversation-less — the aci names its subject.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "aci": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The peer whose profile key changed (the ACI UUID; the engine projects it equal to the envelope sourceUuid)."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The envelope's Signal timestamp when the engine projected one."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "receive.emptied" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "One history-queue-drained advisory forwarded (contract 1.134, §4.117): the engine's receive.emptied standalone notification — the account's history queue drained (the official ApiEmptyQueue→EmptyEvent peer), emitted once per drain. Account-domain transient lane: the notification's signal account resolves through the store to this accountId, and an unmatchable account drops warn-only (never forwarded, never guessed). Advisory receive-stream state — nothing persists and a missed event converges on the next receive.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "receive.clockSkew" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "skewMs"],
+                "description": "One clock-skew alert forwarded (contract 1.134, §4.117): the engine's receive.clockskew standalone notification — the local clock sits more than the official 24h threshold from the server stamp. Edge-triggered engine-side: one alert per threshold crossing, sustained skew stays silent, and a fixed clock re-arms — a missed event self-corrects at the next crossing. skewMs forwards verbatim with its sign (positive = the local clock runs fast); the observing envelope's serverTimestamp rides when the engine projected one. Account-domain transient lane (the receive.emptied attribution discipline).",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "skewMs": {
+                    "type": "integer",
+                    "description": "The observed skew in milliseconds, signed: local − server (positive = the local clock runs fast)."
+                  },
+                  "serverTimestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The observing envelope's server-recorded timestamp in epoch milliseconds when the engine projected one."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "conversation.stateChanged" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "conversations", "overflow"],
+                "description": "One conversation three-flag inbound batch forwarded (contract 1.134, §4.117): the engine's receive.conversationState standalone notification — after a storage merge, the account's mutedUntilTimestamp/archived/markedUnread flips differenced against the engine's per-account book (the book is what the consumer was last told; first observation seeds silently and value-unchanged never notifies), one batch per merge. The conversations array is the engine projection verbatim — the connector is a pipe and never parses, filters, or trims the entries (the owner red line: a passthrough structure error corrupts every downstream consumer), so each entry is the engine's object with the contract keys conversationId/kind (contact|group|legacyGroup)/mutedUntilTimestamp/archived/markedUnread and any sibling key the engine carried. overflow is the engine's batch-cap tail marker: true means the batch was truncated at the engine's own 256-entry cap (the desktop re-reads through conversations.getState for the full set; the book itself caps at 8192 conversations/account engine-side). Nothing persists connector-side; a missed event converges through the conversation read faces.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "conversations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "object" },
+                    "description": "The flipped conversations verbatim, engine batch order preserved — {conversationId, kind: contact|group|legacyGroup, mutedUntilTimestamp, archived, markedUnread} per entry; no connector-side cap (the engine's own 256-entry batch cap and overflow tail marker govern the wire)."
+                  },
+                  "overflow": {
+                    "type": "boolean",
+                    "description": "The engine's batch-cap tail marker: true = the batch was truncated at the engine's 256-entry cap and the desktop should re-read the full set through conversations.getState."
                   }
                 }
               }

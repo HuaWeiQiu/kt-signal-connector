@@ -1327,6 +1327,63 @@ pub enum HostSideEvent {
         registration_id: Option<u32>,
         new_e164: Option<String>,
     },
+    /// The engine's `groupTerminated` projection forwarded (contract 1.134,
+    /// §4.117): a decrypted group change named the group terminated. The
+    /// conversation-less transient family like `StoryReceived` — no row,
+    /// nothing persisted, nothing self-heals — with the subject's group id
+    /// forwarded verbatim whether or not a local conversation still exists
+    /// (a terminated group's row may already be gone; the event is the
+    /// desktop's termination fact, not a row anchor).
+    GroupTerminated {
+        account_id: String,
+        group_id: String,
+        terminator: Option<String>,
+        timestamp: Option<u64>,
+    },
+    /// The engine's `contactProfileUpdated` projection forwarded (contract
+    /// 1.134, §4.117): a peer's profileKeyUpdate batch landed a new profile
+    /// key in the engine's store. Pure notify — the actual profile/avatar
+    /// re-fetch stays the desktop's on-demand pull through the existing read
+    /// faces; the event only says the cached profile may be stale.
+    ContactProfileUpdated {
+        account_id: String,
+        aci: String,
+        timestamp: Option<u64>,
+    },
+    /// The engine's `receive.emptied` notification forwarded (contract
+    /// 1.134, §4.117): the account's history queue drained — advisory
+    /// receive-stream state (the official ApiEmptyQueue peer), forwarded
+    /// through the account-domain transient lane. Transient: nothing
+    /// persists; a missed event converges on the next receive.
+    ReceiveEmptied {
+        account_id: String,
+    },
+    /// The engine's `receive.clockskew` notification forwarded (contract
+    /// 1.134, §4.117): the local clock sits more than the official 24h
+    /// threshold from the server stamp — edge-triggered, so a missed event
+    /// self-corrects at the next threshold crossing (sustained skew stays
+    /// silent engine-side). `skew_ms` is signed (local − server, positive =
+    /// local clock fast) and forwards verbatim.
+    ClockSkewObserved {
+        account_id: String,
+        skew_ms: i64,
+        server_timestamp: Option<u64>,
+    },
+    /// The engine's `receive.conversationState` notification forwarded
+    /// (contract 1.134, §4.117): the account's conversation three-flag
+    /// inbound flips after a storage merge, differenced against the
+    /// engine's per-account book. The `conversations` array rides the
+    /// engine projection verbatim — the connector is a pipe (the owner red
+    /// line: a passthrough structure error corrupts every downstream
+    /// consumer), never parsed, never trimmed; `overflow` is the engine's
+    /// batch-cap tail marker. The desktop merges the flags into its own
+    /// conversation list; nothing persists connector-side and a missed
+    /// event converges through the conversation read faces.
+    ConversationStateChanged {
+        account_id: String,
+        conversations: Value,
+        overflow: bool,
+    },
 }
 
 /// One conversation-scoped delete group on the `message.deleteForMe` event
@@ -7490,6 +7547,104 @@ impl ConnectorService {
         Ok(vec![HostSideEvent::AccountChanged(account)])
     }
 
+    /// The account-domain transient-notification lane (contract 1.134,
+    /// §4.117): the engine's standalone account-scoped notifications —
+    /// `receive.emptied` / `receive.clockskew` /
+    /// `receive.conversationState` — resolve their signal account to the
+    /// connector's opaque account id through the store and forward the host
+    /// frame. The attribution discipline is the accountUnbound watcher's:
+    /// a signal account that matches no bound account drops warn-only with
+    /// a content-free warning and a perf counter — never silently
+    /// swallowed into a claimed forward, never attributed to a guessed
+    /// account. Every event is transient: no row, nothing persisted,
+    /// nothing self-heals.
+    pub fn forward_receive_emptied(
+        &self,
+        signal_account: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) = self.resolve_account_transient(signal_account, "receive.emptied")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::ReceiveEmptied {
+            account_id: account.id.clone(),
+        }])
+    }
+
+    /// The `receive.clockskew` arm of the account-domain lane (contract
+    /// 1.134, §4.117): the signed skew forwards verbatim (positive = the
+    /// local clock runs fast); the server stamp rides when the engine
+    /// projected one.
+    pub fn forward_clock_skew(
+        &self,
+        signal_account: &str,
+        skew_ms: i64,
+        server_timestamp: Option<u64>,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) = self.resolve_account_transient(signal_account, "receive.clockskew")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::ClockSkewObserved {
+            account_id: account.id.clone(),
+            skew_ms,
+            server_timestamp,
+        }])
+    }
+
+    /// The `receive.conversationState` arm of the account-domain lane
+    /// (contract 1.134, §4.117): the engine's conversations array rides
+    /// verbatim — the connector is a pipe (the owner red line: a
+    /// passthrough structure error corrupts every downstream consumer) —
+    /// with the engine's batch-cap overflow marker beside it.
+    pub fn forward_conversation_state(
+        &self,
+        signal_account: &str,
+        conversations: Value,
+        overflow: bool,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) =
+            self.resolve_account_transient(signal_account, "receive.conversationState")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::ConversationStateChanged {
+            account_id: account.id.clone(),
+            conversations,
+            overflow,
+        }])
+    }
+
+    /// The lane's single attribution point: the signal account resolves
+    /// through the store, or the notification drops warn-only. The warning
+    /// carries the notification kind only — never the account value (the
+    /// logging red line); the perf counter makes the drop visible without
+    /// content.
+    fn resolve_account_transient(
+        &self,
+        signal_account: &str,
+        kind: &str,
+    ) -> Result<Option<AccountRow>, ServiceError> {
+        match self.store.account_by_signal(signal_account) {
+            Ok(Some(account)) => {
+                crate::perf_metrics::add(crate::perf_metrics::keys::ACCOUNT_TRANSIENT_FORWARDED, 1);
+                Ok(Some(account))
+            }
+            Ok(None) => {
+                crate::perf_metrics::add(
+                    crate::perf_metrics::keys::ACCOUNT_TRANSIENT_UNATTRIBUTED,
+                    1,
+                );
+                tracing::warn!(
+                    kind,
+                    "engine notification names an unbound account; dropping unattributed"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn complete_send_failed(
         &self,
         pending_id: &str,
@@ -8037,6 +8192,39 @@ impl ConnectorService {
         }
         if let ControlReceive::SyncPniChangeNumber { change } = &control {
             return self.apply_sync_pni_change_number(&account, change);
+        }
+        // Group termination (contract 1.134, §4.117): the engine's
+        // `groupTerminated` projection — the conversation-less transient
+        // family like the story face below. Intercepted before the
+        // conversation ladder on purpose: a terminated group's conversation
+        // row may already be gone, and the event is the desktop's
+        // termination fact, not a row anchor — it forwards verbatim whether
+        // or not the group resolves, with the subject's group id as the
+        // engine projected it.
+        if let ControlReceive::GroupTerminated {
+            group_id,
+            terminator,
+            timestamp,
+        } = &control
+        {
+            return Ok(vec![HostSideEvent::GroupTerminated {
+                account_id: account.id.clone(),
+                group_id: group_id.clone(),
+                terminator: terminator.clone(),
+                timestamp: *timestamp,
+            }]);
+        }
+        // Contact profile refresh (contract 1.134, §4.117): the engine's
+        // `contactProfileUpdated` projection — conversation-less, the `aci`
+        // names its subject. Intercepted before the ladder like the
+        // termination face: the event names a peer, not a conversation, and
+        // the profile re-fetch stays the desktop's on-demand pull.
+        if let ControlReceive::ContactProfileUpdated { aci } = &control {
+            return Ok(vec![HostSideEvent::ContactProfileUpdated {
+                account_id: account.id.clone(),
+                aci: aci.clone(),
+                timestamp: receive.timestamp,
+            }]);
         }
         // Story receives (contract 1.76, §4.67): a story addresses no
         // conversation — the bounded projection forwards as the transient
@@ -8817,6 +9005,11 @@ impl ConnectorService {
             | ControlReceive::SyncDeviceNameChange { .. }
             | ControlReceive::SyncUsernameChange
             | ControlReceive::SyncPniChangeNumber { .. } => Ok(Vec::new()),
+            // The §4.117 conversation-less transient family is intercepted
+            // before the ladder like the story face; these arms are the same
+            // unreachable-in-practice guards.
+            ControlReceive::GroupTerminated { .. }
+            | ControlReceive::ContactProfileUpdated { .. } => Ok(Vec::new()),
         }
     }
 
@@ -23036,6 +23229,162 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 50, None)
             .unwrap();
         assert_eq!(listed.items.len(), 1, "no second reply row");
+    }
+
+    /// The §4.117 conversation-less transient family (contract 1.134):
+    /// `groupTerminated` forwards verbatim even though its subject group has
+    /// no local conversation (a terminated group's row may already be gone —
+    /// the event is the desktop's termination fact, not a row anchor), and
+    /// `contactProfileUpdated` forwards as the profile-stale notify. Neither
+    /// persists anything and neither creates a conversation.
+    #[test]
+    fn group_terminated_and_profile_updated_forward_transient_without_conversation() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let terminated = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::GroupTerminated {
+                group_id: "ZmFrZS1ncm91cC0x".to_string(),
+                terminator: Some("33333333-3333-3333-3333-333333333333".to_string()),
+                timestamp: Some(1726999999000),
+            },
+        );
+        let events = service
+            .ingest_receive(terminated, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::GroupTerminated {
+            account_id,
+            group_id,
+            terminator,
+            timestamp,
+        } = &events[0]
+        else {
+            panic!("expected a GroupTerminated event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(group_id, "ZmFrZS1ncm91cC0x");
+        assert_eq!(
+            terminator.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(*timestamp, Some(1726999999000));
+
+        let updated = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::ContactProfileUpdated {
+                aci: "22222222-2222-2222-2222-222222222222".to_string(),
+            },
+        );
+        let events = service
+            .ingest_receive(updated, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::ContactProfileUpdated {
+            account_id,
+            aci,
+            timestamp,
+        } = &events[0]
+        else {
+            panic!("expected a ContactProfileUpdated event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(aci, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(*timestamp, Some(500), "the envelope timestamp rides");
+
+        // Neither face persisted anything: no rows in the seeded
+        // conversation and no group conversation created for the
+        // terminated subject.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(listed.items.is_empty(), "neither face creates a row");
+        let listed = service
+            .store_ref()
+            .list_conversations(&account.id, 50, None)
+            .unwrap();
+        assert_eq!(listed.items.len(), 1, "the terminated group creates none");
+    }
+
+    /// The account-domain transient lane (contract 1.134, §4.117): the
+    /// three standalone notifications resolve their bound account and
+    /// forward one host frame each — the conversations array verbatim —
+    /// while an unbound signal account drops warn-only with the perf
+    /// counter, never claimed as forwarded.
+    #[test]
+    fn account_transient_lane_resolves_or_drops_unattributed() {
+        crate::perf_metrics::reset_for_tests();
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let conversations = json!([
+            {
+                "conversationId": "11111111-1111-1111-1111-111111111111",
+                "kind": "contact",
+                "mutedUntilTimestamp": 1727000000000u64,
+                "archived": true,
+                "markedUnread": false,
+            },
+        ]);
+
+        let events = service.forward_receive_emptied("+15555550100").unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(&events[0], HostSideEvent::ReceiveEmptied { account_id } if account_id == &account.id)
+        );
+
+        let events = service
+            .forward_clock_skew("+15555550100", -86_400_001, Some(1727000000000))
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::ClockSkewObserved {
+            account_id,
+            skew_ms,
+            server_timestamp,
+        } = &events[0]
+        else {
+            panic!("expected a ClockSkewObserved event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(*skew_ms, -86_400_001);
+        assert_eq!(*server_timestamp, Some(1727000000000));
+
+        let events = service
+            .forward_conversation_state("+15555550100", conversations.clone(), true)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::ConversationStateChanged {
+            account_id,
+            conversations: carried,
+            overflow,
+        } = &events[0]
+        else {
+            panic!("expected a ConversationStateChanged event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(carried, &conversations, "the array rides verbatim");
+        assert!(*overflow);
+
+        // The unbound account: no frame, the honest warn-only drop.
+        let events = service.forward_receive_emptied("+15555550999").unwrap();
+        assert!(
+            events.is_empty(),
+            "an unbound account forwards nothing: {events:?}"
+        );
+
+        let snapshot = crate::perf_metrics::snapshot_json();
+        let counters = snapshot["counters"].as_object().unwrap();
+        assert_eq!(
+            counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_FORWARDED],
+            3
+        );
+        assert_eq!(
+            counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_UNATTRIBUTED],
+            1
+        );
     }
 
     /// The story receive projection is a verbatim pipe (contract 1.91,

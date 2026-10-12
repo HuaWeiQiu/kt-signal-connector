@@ -286,10 +286,15 @@ impl ProxyGroupRuntime {
             EngineEvent::StorageChanged { state } => {
                 let _ = self.events.send(RegistryEvent::StorageChanged { state });
             }
-            EngineEvent::AccountUnauthorized { .. } => {
-                // Contract 1.21: handled by the supervisor's account-unlink
-                // watcher, which owns the service handle; the registry has
-                // nothing to forward for it.
+            EngineEvent::AccountUnauthorized { .. }
+            | EngineEvent::ReceiveEmptied { .. }
+            | EngineEvent::ReceiveClockSkew { .. }
+            | EngineEvent::ConversationState { .. } => {
+                // Contract 1.21: handled by the supervisor's engine-event
+                // watcher, which owns the service handle. Contract 1.134
+                // §4.117: the account-domain transient notifications ride
+                // the same watcher (their host frames need the store-backed
+                // account resolution); the registry has nothing to forward.
             }
         }
     }

@@ -3823,6 +3823,85 @@ where
             }
             send_shared(writer, &HostEvent::new("identity.pniChanged", payload)).await
         }
+        HostSideEvent::GroupTerminated {
+            account_id,
+            group_id,
+            terminator,
+            timestamp,
+        } => {
+            // Contract 1.134, §4.117: the engine's groupTerminated
+            // projection forwards with the subject verbatim — absent
+            // optional identities stay absent (the story.received
+            // conditional-insert discipline).
+            let mut payload = json!({ "accountId": account_id, "groupId": group_id });
+            if let Some(aci) = terminator {
+                payload["terminator"] = json!(aci);
+            }
+            if let Some(at) = timestamp {
+                payload["timestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("group.terminated", payload)).await
+        }
+        HostSideEvent::ContactProfileUpdated {
+            account_id,
+            aci,
+            timestamp,
+        } => {
+            // Contract 1.134, §4.117: the profile-key-landed notify — the
+            // subject aci plus the envelope timestamp when it carried one;
+            // the re-fetch is the desktop's on-demand pull.
+            let mut payload = json!({ "accountId": account_id, "aci": aci });
+            if let Some(at) = timestamp {
+                payload["timestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("contact.profileUpdated", payload)).await
+        }
+        HostSideEvent::ReceiveEmptied { account_id } => {
+            // Contract 1.134, §4.117: the account-domain transient lane —
+            // the queue-drained advisory forwards as the fact alone.
+            send_shared(
+                writer,
+                &HostEvent::new("receive.emptied", json!({ "accountId": account_id })),
+            )
+            .await
+        }
+        HostSideEvent::ClockSkewObserved {
+            account_id,
+            skew_ms,
+            server_timestamp,
+        } => {
+            // Contract 1.134, §4.117: the skew alert — the signed skew
+            // forwards verbatim (positive = local clock fast); the
+            // observing envelope's server stamp rides when projected.
+            let mut payload = json!({ "accountId": account_id, "skewMs": skew_ms });
+            if let Some(at) = server_timestamp {
+                payload["serverTimestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("receive.clockSkew", payload)).await
+        }
+        HostSideEvent::ConversationStateChanged {
+            account_id,
+            conversations,
+            overflow,
+        } => {
+            // Contract 1.134, §4.117: the three-flag inbound batch — the
+            // conversations array is the engine projection verbatim (the
+            // owner red line: a passthrough structure error corrupts every
+            // downstream consumer), never re-shaped or trimmed here; the
+            // overflow tail marker rides beside it.
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "conversation.stateChanged",
+                    json!({
+                        "accountId": account_id,
+                        "conversations": conversations,
+                        "overflow": overflow,
+                    }),
+                ),
+            )
+            .await
+        }
     }
 }
 
@@ -4651,6 +4730,107 @@ mod tests {
         // The absent-optional discipline: a missing identity stays absent.
         assert!(frame["data"].get("senderName").is_none());
         assert_eq!(frame["data"]["timestamp"], 1727000002000u64);
+    }
+
+    /// Contract 1.134 (§4.117): the five engine-notification wire frames —
+    /// the two envelope-key projections with their absent-optional
+    /// identities, and the account-domain lane's three standalone
+    /// notifications with the conversations array verbatim (no reshape, no
+    /// trim, the overflow marker beside it).
+    #[tokio::test]
+    async fn engine_notification_events_ride_their_contract_frames() {
+        let read_frame = |event: HostSideEvent| async {
+            let (client, mut server) = duplex(64 * 1024);
+            let framed = Framed::new(client, LinesCodec::new());
+            let (sink, _stream) = framed.split();
+            let writer: HostWriter<_> = Arc::new(Mutex::new(sink));
+            send_host_event(&writer, event).await.unwrap();
+            let line = timeout(Duration::from_millis(500), async {
+                Framed::new(&mut server, LinesCodec::new()).next().await
+            })
+            .await
+            .expect("the event frame must flush")
+            .unwrap()
+            .unwrap();
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            frame
+        };
+
+        let frame = read_frame(HostSideEvent::GroupTerminated {
+            account_id: "acct-1".into(),
+            group_id: "ZmFrZS1ncm91cC0x".into(),
+            terminator: Some("33333333-3333-3333-3333-333333333333".into()),
+            timestamp: Some(1726999999000),
+        })
+        .await;
+        assert_eq!(frame["event"], "group.terminated");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["groupId"], "ZmFrZS1ncm91cC0x");
+        assert_eq!(
+            frame["data"]["terminator"],
+            "33333333-3333-3333-3333-333333333333"
+        );
+        assert_eq!(frame["data"]["timestamp"], 1726999999000u64);
+
+        let frame = read_frame(HostSideEvent::GroupTerminated {
+            account_id: "acct-1".into(),
+            group_id: "ZmFrZS1ncm91cC0x".into(),
+            terminator: None,
+            timestamp: None,
+        })
+        .await;
+        assert!(
+            frame["data"].get("terminator").is_none() && frame["data"].get("timestamp").is_none(),
+            "absent optional identities stay absent: {frame}"
+        );
+
+        let frame = read_frame(HostSideEvent::ContactProfileUpdated {
+            account_id: "acct-1".into(),
+            aci: "22222222-2222-2222-2222-222222222222".into(),
+            timestamp: None,
+        })
+        .await;
+        assert_eq!(frame["event"], "contact.profileUpdated");
+        assert_eq!(frame["data"]["aci"], "22222222-2222-2222-2222-222222222222");
+        assert!(frame["data"].get("timestamp").is_none());
+
+        let frame = read_frame(HostSideEvent::ReceiveEmptied {
+            account_id: "acct-1".into(),
+        })
+        .await;
+        assert_eq!(frame["event"], "receive.emptied");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+
+        let frame = read_frame(HostSideEvent::ClockSkewObserved {
+            account_id: "acct-1".into(),
+            skew_ms: -86_400_001,
+            server_timestamp: Some(1727000000000),
+        })
+        .await;
+        assert_eq!(frame["event"], "receive.clockSkew");
+        assert_eq!(frame["data"]["skewMs"], -86_400_001);
+        assert_eq!(frame["data"]["serverTimestamp"], 1727000000000u64);
+
+        let conversations = json!([
+            {
+                "conversationId": "11111111-1111-1111-1111-111111111111",
+                "kind": "contact",
+                "mutedUntilTimestamp": 1727000000000u64,
+                "archived": true,
+                "markedUnread": false,
+                "unnamedSibling": { "rides": true },
+            },
+        ]);
+        let frame = read_frame(HostSideEvent::ConversationStateChanged {
+            account_id: "acct-1".into(),
+            conversations: conversations.clone(),
+            overflow: true,
+        })
+        .await;
+        assert_eq!(frame["event"], "conversation.stateChanged");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["conversations"], conversations, "verbatim");
+        assert_eq!(frame["data"]["overflow"], true);
     }
 
     /// Contract 1.100 (§4.81 D3): the `group.changed` wire frame — the

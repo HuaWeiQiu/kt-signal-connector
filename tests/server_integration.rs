@@ -2326,6 +2326,370 @@ async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.134 (§4.117): the engine-notification forwarding batch end to
+/// end. Pass-through lane: the fixture's raw-notification marker injects the
+/// three standalone account-domain notifications and their host frames ride
+/// with the resolved accountId (receive.emptied / receive.clockSkew /
+/// conversation.stateChanged); the envelope-key faces (groupTerminated /
+/// contactProfileUpdated) ride the extra-receives channel like the
+/// groupUpdated projection. F red line: a conversations array past the
+/// engine's own batch cap forwards verbatim — no connector trim, unnamed
+/// sibling keys ride. Attribution/error lane: a notification naming an
+/// unbound account forwards nothing (the warn-only drop), and a malformed
+/// face surfaces as runtime.protocolWarning instead of a guessed frame.
+/// Local gate n/a (the events carry no request) and crash n/a (the engine
+/// staying alive is the assertion) — the §4.114 four-lane set's other two
+/// lanes do not apply to notifications.
+#[tokio::test]
+async fn engine_notifications_forward_through_the_transient_lane() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [21_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
+    command
+        .arg("serve")
+        .arg("--endpoint")
+        .arg(&endpoint)
+        .arg("--bootstrap-secret-file")
+        .arg(&secret_file)
+        .arg("--signal-cli")
+        .arg(fixture())
+        .arg("--java-home")
+        .arg(temp.path().join("no-such-jre"))
+        .arg("--signal-data-dir")
+        .arg(temp.path().join("signal-data"))
+        .arg("--state-dir")
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env("KT_FAKE_EXPECT_NO_JAVA", "1");
+    let mut connector = command.spawn().unwrap();
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    assert_eq!(started["result"]["state"], "running");
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-EngineNotifications" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+
+    // Drain the link-time burst (the fixture's default receive and any
+    // mirrors) before injecting, so the assertions below only see this
+    // batch's frames. Opportunistic drain: dry reads cost a short window,
+    // never the full harness timeout.
+    for _ in 0..8 {
+        let read = timeout(Duration::from_secs(2), client.next()).await;
+        if read.is_err() || matches!(read, Ok(None)) {
+            break;
+        }
+    }
+
+    // Pass-through lane, standalone methods: one marker batch with the
+    // three notifications.
+    async fn next_frame(client: &mut Framed<UnixStream, LinesCodec>) -> Value {
+        match timeout(HARNESS_REQUEST_TIMEOUT, client.next()).await {
+            Ok(Some(Ok(line))) => serde_json::from_str::<Value>(&line).unwrap(),
+            other => panic!(
+                "the host frame stream ended early: {other:?}\n{}",
+                dump_connector_crash_scene()
+            ),
+        }
+    }
+    // The quiet read: an Option window for drains and absence proofs — a
+    // dry stream is a value, not a failure.
+    async fn next_frame_quiet(client: &mut Framed<UnixStream, LinesCodec>) -> Option<Value> {
+        match timeout(Duration::from_secs(2), client.next()).await {
+            Ok(Some(Ok(line))) => serde_json::from_str::<Value>(&line).ok(),
+            _ => None,
+        }
+    }
+    let conversations = json!([
+        {
+            "conversationId": "11111111-1111-1111-1111-111111111111",
+            "kind": "contact",
+            "mutedUntilTimestamp": 1727000000000_u64,
+            "archived": true,
+            "markedUnread": false,
+            "unnamedSibling": { "rides": true },
+        },
+        {
+            "conversationId": "ZmFrZS1ncm91cC0x",
+            "kind": "group",
+            "mutedUntilTimestamp": 0,
+            "archived": false,
+            "markedUnread": true,
+        },
+    ]);
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-notifications.json"),
+        json!({ "notifications": [
+            { "jsonrpc": "2.0", "method": "receive.emptied", "params": { "account": "+15555550100" } },
+            { "jsonrpc": "2.0", "method": "receive.clockskew", "params": {
+                "account": "+15555550100", "skewMs": -86_400_001_i64, "serverTimestamp": 1727000000000_u64 } },
+            { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
+                "account": "+15555550100", "conversations": conversations, "overflow": false } },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut saw_emptied = None;
+    let mut saw_skew = None;
+    let mut saw_state = None;
+    for _ in 0..24 {
+        let frame = next_frame(&mut client).await;
+        match frame["event"].as_str() {
+            Some("receive.emptied") => saw_emptied = Some(frame),
+            Some("receive.clockSkew") => saw_skew = Some(frame),
+            Some("conversation.stateChanged") => saw_state = Some(frame),
+            _ => {}
+        }
+        if saw_emptied.is_some() && saw_skew.is_some() && saw_state.is_some() {
+            break;
+        }
+    }
+    let emptied = saw_emptied.expect("receive.emptied must ride the lane");
+    assert_eq!(emptied["data"]["accountId"], account_id);
+    let skew = saw_skew.expect("receive.clockSkew must ride the lane");
+    assert_eq!(skew["data"]["accountId"], account_id);
+    assert_eq!(skew["data"]["skewMs"], -86_400_001, "signed skew verbatim");
+    assert_eq!(skew["data"]["serverTimestamp"], 1727000000000_u64);
+    let state = saw_state.expect("conversation.stateChanged must ride the lane");
+    assert_eq!(state["data"]["accountId"], account_id);
+    assert_eq!(
+        state["data"]["conversations"], conversations,
+        "the batch rides verbatim, sibling keys included"
+    );
+    assert_eq!(state["data"]["overflow"], false);
+
+    // F red line: a batch past the engine's own 256-entry cap forwards
+    // verbatim — the connector never trims, and the overflow tail marker
+    // rides beside the array.
+    let oversized: Vec<Value> = (0..257)
+        .map(|index| {
+            json!({
+                "conversationId": format!("id-{index}"),
+                "kind": "contact",
+                "mutedUntilTimestamp": index,
+                "archived": false,
+                "markedUnread": true,
+            })
+        })
+        .collect();
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-notifications.json"),
+        json!({ "notifications": [
+            { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
+                "account": "+15555550100", "conversations": oversized, "overflow": true } },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut saw_oversized = None;
+    for _ in 0..24 {
+        let frame = next_frame(&mut client).await;
+        if frame["event"] == "conversation.stateChanged" {
+            saw_oversized = Some(frame);
+            break;
+        }
+    }
+    let state = saw_oversized.expect("the oversized batch must ride");
+    let carried = state["data"]["conversations"].as_array().unwrap();
+    assert_eq!(
+        carried.len(),
+        257,
+        "the connector never trims the engine batch: {} entries",
+        carried.len()
+    );
+    assert_eq!(carried[0]["conversationId"], "id-0");
+    assert_eq!(carried[256]["conversationId"], "id-256");
+    assert_eq!(state["data"]["overflow"], true, "the tail marker rides");
+
+    // Envelope-key faces: the termination and profile-refresh projections
+    // ride the receive lane (the extra-receives marker + the typing flush,
+    // the groupUpdated test's channel). The two forwarded frames race the
+    // flush request's own reply — the marker flushes during the upstream
+    // listContacts call, before the answer — so the interleaved event frames
+    // are collected beside the reply instead of eaten by a reply-only read.
+    async fn request_collecting(
+        client: &mut Framed<UnixStream, LinesCodec>,
+        request_id: &str,
+        method: &str,
+        params: Value,
+        interleaved: &mut Vec<Value>,
+    ) -> Value {
+        send_request_frame(client, request_id, method, params).await;
+        loop {
+            let frame = next_frame(client).await;
+            if frame.get("requestId").and_then(Value::as_str) == Some(request_id) {
+                return frame;
+            }
+            interleaved.push(frame);
+        }
+    }
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-extra-receives.json"),
+        json!([
+            {
+                "timestamp": 1727000001000_u64,
+                "groupTerminated": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "terminator": "33333333-3333-3333-3333-333333333333",
+                    "timestamp": 1727000001000_u64,
+                },
+            },
+            {
+                "timestamp": 1727000002000_u64,
+                "sourceUuid": "22222222-2222-2222-2222-222222222222",
+                "contactProfileUpdated": { "aci": "22222222-2222-2222-2222-222222222222" },
+            },
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let mut interleaved = Vec::new();
+    let listed = request_collecting(
+        &mut client,
+        "list-for-flush",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 50 }),
+        &mut interleaved,
+    )
+    .await;
+    let group_conversation = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["type"] == "group")
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .expect("the fixture links with a group conversation");
+    let _ = request_collecting(
+        &mut client,
+        "typing-flush",
+        "presence.setTypingMessage",
+        json!({
+            "accountId": account_id,
+            "conversationId": group_conversation
+        }),
+        &mut interleaved,
+    )
+    .await;
+    fn note_lane_frame(
+        frame: Value,
+        saw_terminated: &mut Option<Value>,
+        saw_profile: &mut Option<Value>,
+    ) {
+        match frame["event"].as_str() {
+            Some("group.terminated") if saw_terminated.is_none() => {
+                *saw_terminated = Some(frame);
+            }
+            Some("contact.profileUpdated") if saw_profile.is_none() => {
+                *saw_profile = Some(frame);
+            }
+            _ => {}
+        }
+    }
+    let mut saw_terminated = None;
+    let mut saw_profile = None;
+    for frame in interleaved {
+        note_lane_frame(frame, &mut saw_terminated, &mut saw_profile);
+    }
+    for _ in 0..24 {
+        if saw_terminated.is_some() && saw_profile.is_some() {
+            break;
+        }
+        let frame = next_frame(&mut client).await;
+        note_lane_frame(frame, &mut saw_terminated, &mut saw_profile);
+    }
+    let terminated = saw_terminated.expect("group.terminated must ride the lane");
+    assert_eq!(terminated["data"]["accountId"], account_id);
+    assert_eq!(terminated["data"]["groupId"], "ZmFrZS1ncm91cC0x");
+    assert_eq!(
+        terminated["data"]["terminator"],
+        "33333333-3333-3333-3333-333333333333"
+    );
+    assert_eq!(terminated["data"]["timestamp"], 1727000001000_u64);
+    let profile = saw_profile.expect("contact.profileUpdated must ride the lane");
+    assert_eq!(profile["data"]["accountId"], account_id);
+    assert_eq!(
+        profile["data"]["aci"],
+        "22222222-2222-2222-2222-222222222222"
+    );
+    assert_eq!(profile["data"]["timestamp"], 1727000002000_u64);
+
+    // Attribution/error lane: an unbound account forwards nothing, and a
+    // malformed face (a non-array conversations) surfaces as
+    // runtime.protocolWarning — never a guessed frame.
+    fs::write(
+        temp.path()
+            .join("signal-data")
+            .join(".fixture-emit-notifications.json"),
+        json!({ "notifications": [
+            { "jsonrpc": "2.0", "method": "receive.emptied", "params": { "account": "+15555550999" } },
+            { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
+                "account": "+15555550100", "conversations": 42, "overflow": false } },
+        ] })
+        .to_string(),
+    )
+    .unwrap();
+    let mut saw_warning = false;
+    let mut unattributed_forward = None;
+    // The quiet window: long enough for the batch to deliver (or drop),
+    // bounded so absence stays provable without the full harness timeout.
+    for _ in 0..12 {
+        let Some(frame) = next_frame_quiet(&mut client).await else {
+            continue;
+        };
+        match frame["event"].as_str() {
+            Some("runtime.protocolWarning") => saw_warning = true,
+            Some("receive.emptied") | Some("conversation.stateChanged") => {
+                unattributed_forward = Some(frame);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_warning,
+        "the malformed face must surface as a protocol warning"
+    );
+    assert!(
+        unattributed_forward.is_none(),
+        "an unbound account must never forward: {unattributed_forward:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 #[tokio::test]
 async fn link_finish_reports_a_non_retryable_unknown_outcome_when_the_engine_dies() {
     let temp = TempDir::new().unwrap();

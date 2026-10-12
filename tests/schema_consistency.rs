@@ -377,6 +377,15 @@ fn schema_bound(pointer: &str, key: &str) -> u64 {
 ///   (`chat_folder_syncs_result`) and is pinned by the §4.78 unit and
 ///   integration tests; the write-batch and identity bounds that do have a
 ///   schema hook are pinned by the pairs below.
+/// - the §4.117 engine-notification event faces (contract 1.134): the
+///   subject-id bounds (`group.terminated` groupId / terminator /
+///   `contact.profileUpdated` aci at maxLength 128/64) ride the receive-id
+///   discipline (`MAX_RECEIVE_ID_CHARS`) and the groupUpdated editor bound,
+///   pinned inventory-side like the story.received sibling event faces; the
+///   `conversation.stateChanged` conversations array carries no connector
+///   cap on purpose — the engine's own 256-entry batch cap and overflow
+///   tail marker govern the wire, and the connector never trims (the F
+///   red line), pinned by the §4.117 unit and integration tests.
 #[test]
 fn schema_numeric_bounds_match_code_constants() {
     let pairs: &[(&str, &str, u64)] = &[

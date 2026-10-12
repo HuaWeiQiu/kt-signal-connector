@@ -513,6 +513,15 @@ threading.Thread(target=watch_load_marker, daemon=True).start()
 # later write injects again.
 EMIT_MARKER = SIGNAL_DATA_DIR / ".fixture-emit-envelopes.json"
 
+# Contract 1.134 test hook: raw engine-notification injection. The
+# standalone-method lane (receive.emptied / receive.clockskew /
+# receive.conversationState) cannot ride the envelope markers, so a test
+# writes `.fixture-emit-notifications.json` holding {"notifications": [...]}
+# — each entry a full JSON-RPC notification object — into this data
+# directory and every entry is emitted verbatim. The marker is deleted after
+# delivery so a later write injects again.
+NOTIFICATION_MARKER = SIGNAL_DATA_DIR / ".fixture-emit-notifications.json"
+
 # --- flake instrumentation (temporary) ---
 _flake_log_path = Path(f"/tmp/kt-fixture-debug-{os.getpid()}.log")
 
@@ -556,6 +565,31 @@ def watch_emit_marker():
 
 
 threading.Thread(target=watch_emit_marker, daemon=True).start()
+
+
+def watch_notification_marker():
+    flake_log("notification-marker watcher started")
+    while True:
+        try:
+            spec = json.loads(NOTIFICATION_MARKER.read_text())
+        except (OSError, ValueError):
+            time.sleep(0.05)
+            continue
+        notifications = spec.get("notifications") if isinstance(spec, dict) else None
+        if isinstance(notifications, list) and notifications:
+            flake_log(f"notification marker consumed: {len(notifications)} entries")
+            for notification in notifications:
+                if isinstance(notification, dict):
+                    emit_json(notification)
+            flake_log("notification marker entries emitted")
+        try:
+            NOTIFICATION_MARKER.unlink()
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+
+threading.Thread(target=watch_notification_marker, daemon=True).start()
 
 
 def emit_json(value):
@@ -635,7 +669,9 @@ def pending_extra_receive_notifications():
 
 
 def flush_extra_receives():
-    for notification in pending_extra_receive_notifications():
+    pending = pending_extra_receive_notifications()
+    flake_log(f"extra-receives flush: {len(pending)} pending")
+    for notification in pending:
         emit_json(notification)
 
 

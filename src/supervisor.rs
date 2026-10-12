@@ -159,8 +159,9 @@ pub struct RuntimeSupervisor {
     receive_worker: JoinHandle<()>,
     /// Receive-liveness watchdog; never held across an await.
     watchdog: StdMutex<Option<JoinHandle<()>>>,
-    /// Engine-event watcher marking device-unlinked accounts (contract 1.21);
-    /// never held across an await.
+    /// Engine-event watcher: device-unlinked accounts (contract 1.21) plus
+    /// the account-domain transient-notification lane (contract 1.134,
+    /// §4.117); never held across an await.
     account_unlink_worker: JoinHandle<()>,
     /// One-shot history retention pass; never held across an await.
     retention: StdMutex<Option<JoinHandle<()>>>,
@@ -272,8 +273,11 @@ impl RuntimeSupervisor {
         ));
         // Contract 1.21: authorization failures observed on this group's
         // engine mark the dead account in the shared store and surface it on
-        // the host lane (account.changed).
-        let account_unlink_worker = tokio::spawn(account_unlink_watch_loop(
+        // the host lane (account.changed). Contract 1.134 §4.117: the same
+        // watcher is the account-domain transient-notification lane's
+        // consumer (receive.emptied / receive.clockskew /
+        // receive.conversationState → their host frames).
+        let account_unlink_worker = tokio::spawn(engine_event_watch_loop(
             events.subscribe(),
             service.clone(),
             host_events.clone(),
@@ -7333,7 +7337,13 @@ fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
 /// the dead account in the shared store and surface it on the host lane
 /// (account.changed). The engine classifies the raw upstream error here —
 /// this loop never sees error content, only the attributed decision.
-async fn account_unlink_watch_loop(
+/// Contract 1.134 §4.117: the loop is also the account-domain
+/// transient-notification lane's consumer — the engine's standalone
+/// account-scoped notifications (`receive.emptied` / `receive.clockskew` /
+/// `receive.conversationState`) resolve their account through the store and
+/// forward their host frames here; an unmatchable account drops warn-only
+/// inside the service (never silently claimed as forwarded).
+async fn engine_event_watch_loop(
     mut engine_events: broadcast::Receiver<EngineEvent>,
     service: Arc<Mutex<ConnectorService>>,
     host_events: broadcast::Sender<HostSideEvent>,
@@ -7358,9 +7368,60 @@ async fn account_unlink_watch_loop(
                     }
                 }
             }
+            Ok(EngineEvent::ReceiveEmptied { account }) => {
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_receive_emptied(&account)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
+            Ok(EngineEvent::ReceiveClockSkew {
+                account,
+                skew_ms,
+                server_timestamp,
+            }) => {
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_clock_skew(&account, skew_ms, server_timestamp)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
+            Ok(EngineEvent::ConversationState {
+                account,
+                conversations,
+                overflow,
+            }) => {
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_conversation_state(&account, conversations, overflow)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+/// Send the lane's forwarded events onto the host stream; a store hiccup
+/// warns content-free and never takes the watcher down (the account-unlink
+/// arm's discipline).
+fn emit_forwarded(
+    host_events: &broadcast::Sender<HostSideEvent>,
+    forwarded: Result<Vec<HostSideEvent>, ServiceError>,
+) {
+    match forwarded {
+        Ok(events) => {
+            for event in events {
+                let _ = host_events.send(event);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                error_class = error.class(),
+                "transient notification forward failed"
+            );
         }
     }
 }

@@ -54,6 +54,16 @@ pub mod keys {
     /// Engine snapshot keys the doctor's `engine.perfMetrics` projection
     /// dropped (outside the pinned engine allowlist), summed across probes.
     pub const ENGINE_SNAPSHOT_DROPPED: &str = "engine_snapshot_dropped";
+    /// Account-domain transient notifications (contract 1.134, §4.117:
+    /// `receive.emptied` / `receive.clockskew` /
+    /// `receive.conversationState`) forwarded to the host lane after their
+    /// signal account resolved.
+    pub const ACCOUNT_TRANSIENT_FORWARDED: &str = "account_transient_forwarded";
+    /// Account-domain transient notifications dropped because their signal
+    /// account matched no bound connector account (the accountUnbound
+    /// attribution discipline: unattributed, warn-only, never claimed as
+    /// forwarded).
+    pub const ACCOUNT_TRANSIENT_UNATTRIBUTED: &str = "account_transient_unattributed";
 }
 
 /// Local word list (timings + counters share one table; snapshots only emit
@@ -64,6 +74,8 @@ const KNOWN_KEYS: &[&str] = &[
     keys::RECEIVE_INGEST_ERR,
     keys::RECEIVE_INGEST_EVENTS,
     keys::ENGINE_SNAPSHOT_DROPPED,
+    keys::ACCOUNT_TRANSIENT_FORWARDED,
+    keys::ACCOUNT_TRANSIENT_UNATTRIBUTED,
 ];
 
 /// The engine `engine.perfMetrics` timing-series keys the connector

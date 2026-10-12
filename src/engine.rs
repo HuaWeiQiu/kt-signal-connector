@@ -345,6 +345,42 @@ pub enum EngineEvent {
     AccountUnauthorized {
         account: String,
     },
+    /// The engine's `receive.emptied` notification (contract 1.134, §4.117):
+    /// the account's history queue drained (the official
+    /// ApiEmptyQueue→EmptyEvent peer) — advisory receive-stream state the
+    /// engine only reports; the account-domain transient lane (the
+    /// supervisor's engine-event watcher) resolves the account and forwards
+    /// the host frame. Edge-shaped: emitted once per drain.
+    ReceiveEmptied {
+        account: String,
+    },
+    /// The engine's `receive.clockskew` notification (contract 1.134,
+    /// §4.117): the local clock sits more than the official 24h threshold
+    /// from the server stamp — edge-triggered, so one alert per threshold
+    /// crossing and sustained skew stays silent. `skew_ms` is signed
+    /// (local − server: positive = the local clock runs fast) and forwards
+    /// verbatim; `server_timestamp` is the observing envelope's server
+    /// stamp when the engine projected one.
+    ReceiveClockSkew {
+        account: String,
+        skew_ms: i64,
+        server_timestamp: Option<u64>,
+    },
+    /// The engine's `receive.conversationState` notification (contract
+    /// 1.134, §4.117): the account's conversation three-flag (muted /
+    /// archived / marked-unread) inbound flips, differenced against the
+    /// engine's per-account book after a storage merge. `conversations`
+    /// is the engine's array verbatim — the connector is a pipe (the owner
+    /// red line: a passthrough structure error corrupts every downstream
+    /// consumer), never parsed, never trimmed, entries ride with any
+    /// sibling key the engine carried; `overflow` is the engine's batch-cap
+    /// tail marker. The engine bounds the book (8192/account) and the batch
+    /// (256 entries + `overflow`) connector-independently.
+    ConversationState {
+        account: String,
+        conversations: Value,
+        overflow: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1181,6 +1217,30 @@ pub enum ControlReceive {
         changes: Value,
         editor: Option<String>,
         expire_timer_seconds: Option<u32>,
+    },
+    /// The engine's `groupTerminated {groupId, terminator?, timestamp}`
+    /// projection (contract 1.134, §4.117): a decrypted group change named
+    /// the group terminated and the engine replaced the whole envelope with
+    /// the event (change-only projection). Conversation-less transient
+    /// family like [`ControlReceive::Story`] — no row, nothing persisted —
+    /// though the `groupId` names its subject: the service layer forwards
+    /// it verbatim whether or not the group has a local conversation (a
+    /// terminated group's row may already be gone; the event is the
+    /// desktop's termination fact, not a row anchor). `terminator` is the
+    /// change author's ACI when the engine decrypted one.
+    GroupTerminated {
+        group_id: String,
+        terminator: Option<String>,
+        timestamp: Option<u64>,
+    },
+    /// The engine's `contactProfileUpdated {aci}` projection (contract
+    /// 1.134, §4.117): a peer's profileKeyUpdate batch landed a new profile
+    /// key in the engine's store. Conversation-less (the `aci` names its
+    /// subject); the actual profile/avatar re-fetch stays the desktop's
+    /// on-demand pull through the existing read faces — this event only
+    /// says the cached profile may be stale.
+    ContactProfileUpdated {
+        aci: String,
     },
 }
 
@@ -2395,6 +2455,102 @@ async fn handle_upstream_line(
                 let _ = events.send(EngineEvent::ProtocolWarning {
                     kind: "unknownNotification",
                 });
+            }
+        } else if method == "receive.emptied" {
+            // Contract 1.134 §4.117: the engine's history-queue-drained
+            // notification (the official ApiEmptyQueue→EmptyEvent peer),
+            // forwarded through the account-domain transient lane. The
+            // attribution discipline is the accountUnbound arm's: a
+            // malformed or empty account carries no attributable identity
+            // and falls back to the unknown-notification warning rather
+            // than inventing one; a well-formed account rides the event and
+            // the watcher resolves it through the store (an unmatchable
+            // account drops warn-only there — never silently forwarded).
+            let attributed = object
+                .get("params")
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            if let Some(account) = attributed {
+                let _ = events.send(EngineEvent::ReceiveEmptied {
+                    account: account.to_string(),
+                });
+            } else {
+                let _ = events.send(EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification",
+                });
+            }
+        } else if method == "receive.clockskew" {
+            // Contract 1.134 §4.117: the engine's clock-skew alert
+            // (edge-triggered, one alert per threshold crossing). `skewMs`
+            // is the event's whole payload and fails closed — a missing or
+            // non-numeric skew is a protocol error, not an unknown skew;
+            // the signed value (positive = local clock fast) forwards
+            // verbatim. `serverTimestamp` rides when the engine projected
+            // it. The account attribution matches the receive.emptied arm.
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let skew_ms = params
+                .and_then(|params| params.get("skewMs"))
+                .and_then(Value::as_i64);
+            match (account, skew_ms) {
+                (Some(account), Some(skew_ms)) => {
+                    let _ = events.send(EngineEvent::ReceiveClockSkew {
+                        account: account.to_string(),
+                        skew_ms,
+                        server_timestamp: params
+                            .and_then(|params| params.get("serverTimestamp"))
+                            .and_then(Value::as_u64),
+                    });
+                }
+                _ => {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
+            }
+        } else if method == "receive.conversationState" {
+            // Contract 1.134 §4.117: the engine's conversation three-flag
+            // inbound flips after a storage merge, forwarded through the
+            // same account-domain lane. The `conversations` array is the
+            // engine's projection verbatim — the connector is a pipe (the
+            // owner red line: a passthrough structure error corrupts every
+            // downstream consumer), so the array is carried and forwarded
+            // as-is: no entry parsing, no trimming, sibling keys ride.
+            // `overflow` is the engine's batch-cap tail marker, guaranteed
+            // boolean by the engine contract; a non-array or empty
+            // conversations face (the engine only notifies when the batch is
+            // non-empty), a non-boolean overflow, or a missing account is a
+            // protocol error and falls back to the unknown-notification
+            // warning (never a guessed forward).
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let conversations = params
+                .and_then(|params| params.get("conversations"))
+                .filter(|value| value.is_array() && !value.as_array().unwrap().is_empty())
+                .cloned();
+            let overflow = params
+                .and_then(|params| params.get("overflow"))
+                .and_then(Value::as_bool);
+            match (account, conversations, overflow) {
+                (Some(account), Some(conversations), Some(overflow)) => {
+                    let _ = events.send(EngineEvent::ConversationState {
+                        account: account.to_string(),
+                        conversations,
+                        overflow,
+                    });
+                }
+                _ => {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
             }
         } else {
             let _ = events.send(EngineEvent::ProtocolWarning {
@@ -4143,6 +4299,67 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 editor,
                 expire_timer_seconds,
             },
+        });
+    }
+    // The engine's `groupTerminated` projection (contract 1.134, §4.117): a
+    // decrypted group change named the group terminated, the whole envelope
+    // replaced with the event. It routes by its own groupId — the
+    // conversation-less transient family like the story face, though the
+    // groupId names its subject, so the routing address carries it and the
+    // service layer forwards the event verbatim without any conversation
+    // resolution (a terminated group's row may already be gone). The
+    // guaranteed subject fails closed like the groupUpdated arm: a face
+    // with no groupId is a protocol error and falls to the plain skip;
+    // `terminator` rides the same bounded ACI form the group projections
+    // read, absent stays absent (宁缺勿错, never a mangled one).
+    if let Some(terminated) = envelope.get("groupTerminated").and_then(Value::as_object) {
+        let group_id = terminated
+            .get("groupId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)?;
+        let terminator = terminated
+            .get("terminator")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|aci| !aci.is_empty() && aci.len() <= GROUP_UPDATED_EDITOR_MAX_BYTES)
+            .map(str::to_string);
+        let timestamp = terminated.get("timestamp").and_then(Value::as_u64);
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: Some(group_id.clone()),
+            control: ControlReceive::GroupTerminated {
+                group_id,
+                terminator,
+                timestamp,
+            },
+        });
+    }
+    // The engine's `contactProfileUpdated` projection (contract 1.134,
+    // §4.117): a peer's profileKeyUpdate batch landed a new profile key.
+    // Conversation-less — the `aci` names its subject and the routing
+    // carries no conversation at all; the face forwards as the transient
+    // notify and the desktop re-pulls the profile on demand. The subject
+    // fails closed like the groupTerminated arm above (no aci = protocol
+    // error = plain skip); the envelope's own timestamp rides the
+    // NormalizedReceive as on every face.
+    if let Some(updated) = envelope
+        .get("contactProfileUpdated")
+        .and_then(Value::as_object)
+    {
+        let aci = updated
+            .get("aci")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|aci| !aci.is_empty() && aci.len() <= MAX_RECEIVE_ID_CHARS)
+            .map(str::to_string)?;
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::ContactProfileUpdated { aci },
         });
     }
     // The official `syncMessage.messageRequestResponse` mirror (contract
@@ -8117,6 +8334,302 @@ mod tests {
 
     fn routing_shape_none(change: &serde_json::Value) -> bool {
         control_routing(json!({ "groupChanged": change }).as_object().unwrap()).is_none()
+    }
+
+    /// Contract 1.134 (§4.117): the engine's `groupTerminated` projection
+    /// routes as a conversation-less transient control addressed by its own
+    /// groupId; a face with no subject fails closed to the plain skip.
+    #[test]
+    fn group_terminated_routes_conversation_less_transient() {
+        let routing = control_routing(
+            json!({
+                "timestamp": 1727000000000u64,
+                "groupTerminated": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                    "terminator": "33333333-3333-3333-3333-333333333333",
+                    "timestamp": 1726999999000u64,
+                },
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .expect("expected a groupTerminated routing");
+        assert_eq!(routing.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+        assert!(
+            routing.source.is_none(),
+            "the replaced envelope has no peer source"
+        );
+        let ControlReceive::GroupTerminated {
+            group_id,
+            terminator,
+            timestamp,
+        } = routing.control
+        else {
+            panic!("expected a GroupTerminated control: {:?}", routing.control);
+        };
+        assert_eq!(group_id, "ZmFrZS1ncm91cC0x");
+        assert_eq!(
+            terminator.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(timestamp, Some(1726999999000));
+
+        // The guaranteed subject fails closed: no groupId (or an empty one)
+        // is a protocol error and falls to the plain skip — never a routing
+        // that names nothing.
+        for face in [
+            json!({ "terminator": "33333333-3333-3333-3333-333333333333" }),
+            json!({ "groupId": "" }),
+            json!({ "groupId": 42 }),
+        ] {
+            assert!(
+                control_routing(json!({ "groupTerminated": face }).as_object().unwrap()).is_none(),
+                "expected the fail-closed skip: {face}"
+            );
+        }
+
+        // The optional faces degrade to absence, never to invented values.
+        let bare = control_routing(
+            json!({ "groupTerminated": { "groupId": "ZmFrZS1ncm91cC0x" } })
+                .as_object()
+                .unwrap(),
+        )
+        .expect("expected the bare routing");
+        let ControlReceive::GroupTerminated {
+            terminator,
+            timestamp,
+            ..
+        } = bare.control
+        else {
+            panic!("expected a GroupTerminated control");
+        };
+        assert!(terminator.is_none() && timestamp.is_none());
+    }
+
+    /// Contract 1.134 (§4.117): the engine's `contactProfileUpdated`
+    /// projection routes as a conversation-less transient control naming its
+    /// subject by aci; a face with no aci fails closed to the plain skip.
+    #[test]
+    fn contact_profile_updated_routes_by_aci() {
+        let routing = control_routing(
+            json!({
+                "timestamp": 1727000000000u64,
+                "sourceUuid": "11111111-1111-1111-1111-111111111111",
+                "contactProfileUpdated": { "aci": "11111111-1111-1111-1111-111111111111" },
+            })
+            .as_object()
+            .unwrap(),
+        )
+        .expect("expected a contactProfileUpdated routing");
+        assert!(routing.group_id.is_none() && routing.source.is_none());
+        let ControlReceive::ContactProfileUpdated { aci } = routing.control else {
+            panic!(
+                "expected a ContactProfileUpdated control: {:?}",
+                routing.control
+            );
+        };
+        assert_eq!(aci, "11111111-1111-1111-1111-111111111111");
+
+        for face in [json!({}), json!({ "aci": "" }), json!({ "aci": 42 })] {
+            assert!(
+                control_routing(
+                    json!({ "contactProfileUpdated": face })
+                        .as_object()
+                        .unwrap()
+                )
+                .is_none(),
+                "expected the fail-closed skip: {face}"
+            );
+        }
+    }
+
+    /// Contract 1.134 (§4.117): the engine's standalone account-domain
+    /// notifications parse into their attributed events — the queue-drained
+    /// advisory, the signed clock-skew alert, and the conversation-state
+    /// batch whose array rides verbatim (no entry parsing, sibling keys
+    /// stay).
+    #[tokio::test]
+    async fn account_transient_notifications_parse_to_events() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let line = |value: serde_json::Value| serde_json::to_string(&value).unwrap();
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "receive.emptied",
+                "params": { "account": "+15555550100" },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                event_rx.recv().await.unwrap(),
+                EngineEvent::ReceiveEmptied { ref account } if account == "+15555550100"
+            ),
+            "expected the ReceiveEmptied event"
+        );
+
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "receive.clockskew",
+                "params": {
+                    "account": "+15555550100",
+                    "skewMs": -86_400_001_i64,
+                    "serverTimestamp": 1727000000000u64,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::ReceiveClockSkew {
+            account,
+            skew_ms,
+            server_timestamp,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected the ReceiveClockSkew event");
+        };
+        assert_eq!(account, "+15555550100");
+        assert_eq!(skew_ms, -86_400_001, "the signed skew forwards verbatim");
+        assert_eq!(server_timestamp, Some(1727000000000));
+
+        let conversations = json!([
+            {
+                "conversationId": "11111111-1111-1111-1111-111111111111",
+                "kind": "contact",
+                "mutedUntilTimestamp": 1727000000000u64,
+                "archived": true,
+                "markedUnread": false,
+                "unnamedSibling": { "rides": true },
+            },
+            {
+                "conversationId": "ZmFrZS1ncm91cC0x",
+                "kind": "group",
+                "mutedUntilTimestamp": 0u64,
+                "archived": false,
+                "markedUnread": true,
+            },
+        ]);
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "receive.conversationState",
+                "params": {
+                    "account": "+15555550100",
+                    "conversations": conversations,
+                    "overflow": false,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::ConversationState {
+            account,
+            conversations: carried,
+            overflow,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected the ConversationState event");
+        };
+        assert_eq!(account, "+15555550100");
+        assert_eq!(carried, conversations, "the array rides verbatim");
+        assert!(!overflow);
+    }
+
+    /// Contract 1.134 (§4.117): the account-domain notifications follow the
+    /// accountUnbound attribution discipline — a malformed or empty account,
+    /// a non-array conversations face, a non-boolean overflow marker, or a
+    /// missing skew all carry no attributable forward and fall back to the
+    /// unknown-notification warning.
+    #[tokio::test]
+    async fn malformed_account_transient_notifications_stay_unattributed() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let lines = [
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.emptied",
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.emptied",
+                "params": { "account": "" }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.clockskew",
+                "params": { "account": "+15555550100" }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.clockskew",
+                "params": { "account": "+15555550100", "skewMs": "huge" }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.conversationState",
+                "params": { "account": "+15555550100", "conversations": [], "overflow": false }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.conversationState",
+                "params": {
+                    "account": "+15555550100",
+                    "conversations": [{ "conversationId": "x" }],
+                }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "receive.conversationState",
+                "params": {
+                    "account": "+15555550100",
+                    "conversations": [{ "conversationId": "x" }],
+                    "overflow": "yes",
+                }
+            }))
+            .unwrap(),
+        ];
+        for line_text in &lines {
+            handle_upstream_line(line_text, &mut pending, &events, &ingress, &mut degraded)
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..lines.len() {
+            assert!(matches!(
+                event_rx.recv().await.unwrap(),
+                EngineEvent::ProtocolWarning {
+                    kind: "unknownNotification"
+                }
+            ));
+        }
+        assert!(event_rx.try_recv().is_err());
     }
 
     /// Contract 1.100 (§4.81 D4): the quote's `attachments[]` rides the same
