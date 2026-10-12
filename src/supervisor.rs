@@ -1655,9 +1655,9 @@ impl RuntimeSupervisor {
             tokio::select! {
                 line = recv_stderr_line(stderr_rx.as_mut()) => {
                     match line {
-                        Some(line) => {
-                            if is_receive_fatal_stderr(&line)
-                                && self
+                        Some(line) => match classify_engine_stderr(&line) {
+                            EngineStderrClass::ReceiveFatal => {
+                                if self
                                     .watchdog_request_restart(
                                         &mut last_restart,
                                         &mut pending,
@@ -1666,12 +1666,22 @@ impl RuntimeSupervisor {
                                         "receive WebSocket error on stderr",
                                     )
                                     .await
-                            {
-                                ping_failures = 0;
-                                stderr_rx = None;
-                                stderr_pid = None;
+                                {
+                                    ping_failures = 0;
+                                    stderr_rx = None;
+                                    stderr_pid = None;
+                                }
                             }
-                        }
+                            EngineStderrClass::NetworkPath => {
+                                tracing::info!(
+                                    line = %line,
+                                    "signal-cli engine stderr: network egress declared"
+                                );
+                            }
+                            EngineStderrClass::Diagnostic => {
+                                tracing::debug!(line = %line, "signal-cli engine stderr");
+                            }
+                        },
                         None => {
                             stderr_rx = None;
                             stderr_pid = None;
@@ -7550,6 +7560,43 @@ fn is_receive_fatal_stderr(line: &str) -> bool {
                 .any(|needle| lower.contains(needle)))
 }
 
+/// How the watchdog's stderr consumer surfaces one engine stderr line.
+///
+/// The engine's stderr used to be consumed for receive-fatal shape matching
+/// alone, with every other line discarded — production logs could not show
+/// which network egress the engine had declared, which cost hours of blind
+/// proxy debugging. The classification keeps the fatal verdict primary so the
+/// watchdog path is unchanged, and forwards everything else at a visible or
+/// inspectable level instead of dropping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineStderrClass {
+    /// Receive-fatal shape: the existing watchdog restart path, untouched.
+    ReceiveFatal,
+    /// Engine self-check INFO (the one-shot "network path" egress banner):
+    /// forwarded at info level, once per line, reappearing with each engine
+    /// restart because the banner does.
+    NetworkPath,
+    /// Any other non-fatal line: forwarded at debug level only, so the
+    /// default INFO run stays quiet while a debug capture sees the rest.
+    Diagnostic,
+}
+
+/// Classify one engine stderr line for the watchdog consumer. Fatal wins over
+/// the network-path banner so a pathological line matching both still drives
+/// the unchanged watchdog path. The banner is detected by the literal
+/// "network path" substring (case-insensitive, mirroring the fatal matcher's
+/// style) — deliberately no parsing of the egress value, which stays inside
+/// the verbatim line.
+fn classify_engine_stderr(line: &str) -> EngineStderrClass {
+    if is_receive_fatal_stderr(line) {
+        EngineStderrClass::ReceiveFatal
+    } else if line.to_lowercase().contains("network path") {
+        EngineStderrClass::NetworkPath
+    } else {
+        EngineStderrClass::Diagnostic
+    }
+}
+
 /// Run one media governor pass on a blocking task (ADR 0004): pure
 /// filesystem work — the store lock is never taken, so a deletion sweep can
 /// never delay receives or host requests. Counts only in the log; never
@@ -8126,9 +8173,10 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor, attachment_download_client, cloud_archive_face,
-        cloud_status_from_engine, compose_contact_display_name, compose_import_progress,
-        group_extra_json, is_receive_fatal_stderr, receipt_failure_key, upload_status_from_engine,
+        EngineStderrClass, RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor, attachment_download_client,
+        classify_engine_stderr, cloud_archive_face, cloud_status_from_engine,
+        compose_contact_display_name, compose_import_progress, group_extra_json,
+        is_receive_fatal_stderr, receipt_failure_key, upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -8926,6 +8974,66 @@ mod tests {
             "WARN Scheduler - task failed to start" // no websocket context
         ));
         assert!(!is_receive_fatal_stderr(""));
+    }
+
+    /// The watchdog's stderr consumer grades every non-fatal line instead of
+    /// dropping it (the proxy-debugging observability fix): the engine's
+    /// one-shot "network path" egress banner lands at info level so the
+    /// production log shows which exit the engine chose, everything else at
+    /// debug only. The fatal verdict stays primary — a line matching both
+    /// shapes still drives the unchanged watchdog restart path.
+    #[test]
+    fn stderr_classification_grades_lines_for_forwarding() {
+        // The engine's egress self-check banner, verbatim shape: network
+        // path wins over the debug bucket regardless of which exit (direct,
+        // explicit-env, std-env, system-http, system-socks) it declares —
+        // the matcher is the literal substring, never the value.
+        assert_eq!(
+            classify_engine_stderr(
+                "kt-signal-engine: INFO network path: system-http (http://127.0.0.1:1082)"
+            ),
+            EngineStderrClass::NetworkPath
+        );
+        assert_eq!(
+            classify_engine_stderr("kt-signal-engine: INFO network path: direct"),
+            EngineStderrClass::NetworkPath
+        );
+        assert_eq!(
+            classify_engine_stderr("kt-signal-engine: INFO network path: system-socks"),
+            EngineStderrClass::NetworkPath
+        );
+        // Ordinary engine chatter (self-check INFO, WARN without the receive
+        // fatal shape, even empty lines) is debug-forwarded, not dropped.
+        assert_eq!(
+            classify_engine_stderr("INFO App - Starting signal-cli daemon"),
+            EngineStderrClass::Diagnostic
+        );
+        assert_eq!(
+            classify_engine_stderr("INFO WebSocketConnection - Connected successfully"),
+            EngineStderrClass::Diagnostic
+        );
+        assert_eq!(classify_engine_stderr(""), EngineStderrClass::Diagnostic);
+        // Receive-fatal shapes stay on the watchdog path, unchanged.
+        assert_eq!(
+            classify_engine_stderr(
+                "org.asamk.signal.manager.WebSocketIOException: Connection reset"
+            ),
+            EngineStderrClass::ReceiveFatal
+        );
+        assert_eq!(
+            classify_engine_stderr(
+                "WARN WebSocketConnection - WebSocket connection closed unexpectedly"
+            ),
+            EngineStderrClass::ReceiveFatal
+        );
+        // A pathological line carrying both the banner and a fatal shape is
+        // fatal first: the watchdog must never be muted by the new grading.
+        assert_eq!(
+            classify_engine_stderr(
+                "websocket error after network path was declared: connection reset"
+            ),
+            EngineStderrClass::ReceiveFatal
+        );
     }
 
     /// The engine runs the real fake-signal-cli fixture (the same one the
