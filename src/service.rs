@@ -12323,15 +12323,21 @@ pub struct IdentitiesVerifyParams {
     pub safety_number: String,
 }
 
-/// One projected identity row (contract revision 1.68, §4.61): the pinned
-/// upstream `JsonIdentity` fields verbatim (ListIdentitiesCommand.java:88-96)
-/// — the formatted safety number string (12 spaced 5-digit groups,
-/// Util.java:52-67), the hex fingerprint, the base64 scannable payload when
-/// the upstream supplied one, the three-value trust level
-/// (UNTRUSTED | TRUSTED_UNVERIFIED | TRUSTED_VERIFIED, TrustLevel.java:5-8),
-/// and the add timestamp. `number`/`uuid` are optional exactly as the pinned
-/// shape declares: a UUID-only identity row carries a null number and the
-/// reverse. The desktop derives the official `isVerified` presentation as
+/// One projected identity row (contract revision 1.68, §4.61; contract
+/// revision 1.136, §4.120): the pinned upstream `JsonIdentity` fields
+/// verbatim (ListIdentitiesCommand.java:88-96) — the formatted safety number
+/// string (12 spaced 5-digit groups, Util.java:52-67), the hex fingerprint,
+/// the base64 scannable payload when the upstream supplied one, the
+/// three-value trust level (UNTRUSTED | TRUSTED_UNVERIFIED | TRUSTED_VERIFIED,
+/// TrustLevel.java:5-8), and the add timestamp. `number`/`uuid` are optional
+/// exactly as the pinned shape declares: a UUID-only identity row carries a
+/// null number and the reverse. `pending` (1.136) is the KT engine's own
+/// additive sidecar flag (a peer identity key replaced without confirmation —
+/// the same single source the engine's send gate reads): it passes through
+/// when the engine answered it and stays absent for older engine answers, so
+/// no legacy desktop ever sees a key it does not know; the desktop consumes
+/// it for presentation only and the connector invents neither value nor
+/// grammar. The desktop derives the official `isVerified` presentation as
 /// `trustLevel === 'TRUSTED_VERIFIED'`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12346,6 +12352,12 @@ pub struct IdentityView {
     pub scannable_safety_number: Option<String>,
     pub trust_level: String,
     pub added_timestamp: u64,
+    /// The KT engine's replace-without-confirmation sidecar flag (contract
+    /// revision 1.136, §4.120): verbatim pass-through, absent when the
+    /// engine answer has no key (a non-boolean engine value reads as absent
+    /// — the honest no-signal face).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
 }
 
 /// The `identities.get` result (contract revision 1.68, §4.61): the first
@@ -14473,15 +14485,19 @@ pub(crate) fn group_migrate_result_from_engine(
 }
 
 /// Project the engine's `listIdentities` answer onto the wire shape (contract
-/// revision 1.68, §4.61): the pinned upstream writes one JSON array of
-/// `JsonIdentity` records (ListIdentitiesCommand.java:68-84); the read is
-/// narrowed to one recipient upstream, so the first record is the whole
-/// answer and an empty array is the honest `identity: null` (the official
-/// SafetyNumberNotReady face — a state, not an error). Fields the pinned
-/// record declares nullable (`number`, `uuid`, `scannableSafetyNumber`)
-/// pass through as absent; a record missing its non-nullable identity core
-/// (fingerprint, safetyNumber, trustLevel, addedTimestamp) is a protocol
-/// defect, not a no-identity answer.
+/// revision 1.68, §4.61; contract revision 1.136, §4.120): the pinned
+/// upstream writes one JSON array of `JsonIdentity` records
+/// (ListIdentitiesCommand.java:68-84); the read is narrowed to one recipient
+/// upstream, so the first record is the whole answer and an empty array is
+/// the honest `identity: null` (the official SafetyNumberNotReady face — a
+/// state, not an error). Fields the pinned record declares nullable
+/// (`number`, `uuid`, `scannableSafetyNumber`) pass through as absent; the
+/// engine's additive boolean `pending` sidecar flag (1.136) rides verbatim
+/// when answered and reads as absent otherwise (a non-boolean value is
+/// absence, never a false — the connector invents no signal); a record
+/// missing its non-nullable identity core (fingerprint, safetyNumber,
+/// trustLevel, addedTimestamp) is a protocol defect, not a no-identity
+/// answer.
 pub(crate) fn identity_from_engine(result: &Value) -> Result<IdentityRead, ServiceError> {
     let empty: [Value; 0] = [];
     let entries = result
@@ -14524,6 +14540,7 @@ pub(crate) fn identity_from_engine(result: &Value) -> Result<IdentityRead, Servi
                 .map(str::to_string),
             trust_level: trust_level.to_string(),
             added_timestamp,
+            pending: entry.get("pending").and_then(Value::as_bool),
         }),
     })
 }
@@ -21593,6 +21610,70 @@ mod tests {
         }]))
         .unwrap_err();
         assert!(matches!(error, ServiceError::Engine(EngineError::Protocol)));
+    }
+
+    /// The §4.120 pending pass-through (contract revision 1.136): the
+    /// engine's additive sidecar flag rides the wire verbatim when answered,
+    /// stays absent for older engines, and a non-boolean value reads as
+    /// absent — the connector invents no signal.
+    #[test]
+    fn identity_projection_passes_the_pending_sidecar_key_through() {
+        // Answered: the flag round-trips beside the pinned fields.
+        let read = identity_from_engine(&json!([{
+            "uuid": "99999999-9999-9999-9999-999999999999",
+            "fingerprint": "ab".repeat(32),
+            "safetyNumber": "12345 67890",
+            "trustLevel": "TRUSTED_UNVERIFIED",
+            "addedTimestamp": 1727000000000_u64,
+            "pending": true,
+        }]))
+        .unwrap();
+        assert_eq!(read.identity.as_ref().unwrap().pending, Some(true));
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(wire["identity"]["pending"], true);
+
+        // The cleared face rides too (the engine's trust write face clears
+        // the flag; the value is the engine's, never a local invention).
+        let read = identity_from_engine(&json!([{
+            "uuid": "99999999-9999-9999-9999-999999999999",
+            "fingerprint": "ab".repeat(32),
+            "safetyNumber": "12345 67890",
+            "trustLevel": "TRUSTED_VERIFIED",
+            "addedTimestamp": 1727000000000_u64,
+            "pending": false,
+        }]))
+        .unwrap();
+        assert_eq!(read.identity.as_ref().unwrap().pending, Some(false));
+        let wire = serde_json::to_value(&read).unwrap();
+        assert_eq!(wire["identity"]["pending"], false);
+
+        // Older engine: no key in the answer, no key on the wire.
+        let read = identity_from_engine(&json!([{
+            "uuid": "99999999-9999-9999-9999-999999999999",
+            "fingerprint": "ab".repeat(32),
+            "safetyNumber": "12345 67890",
+            "trustLevel": "UNTRUSTED",
+            "addedTimestamp": 1727000000000_u64,
+        }]))
+        .unwrap();
+        assert_eq!(read.identity.as_ref().unwrap().pending, None);
+        let wire = serde_json::to_value(&read).unwrap();
+        assert!(wire["identity"].get("pending").is_none());
+
+        // A non-boolean engine value reads as absent (never a false): the
+        // honest no-signal face invents nothing.
+        let read = identity_from_engine(&json!([{
+            "uuid": "99999999-9999-9999-9999-999999999999",
+            "fingerprint": "ab".repeat(32),
+            "safetyNumber": "12345 67890",
+            "trustLevel": "UNTRUSTED",
+            "addedTimestamp": 1727000000000_u64,
+            "pending": "yes",
+        }]))
+        .unwrap();
+        assert_eq!(read.identity.as_ref().unwrap().pending, None);
+        let wire = serde_json::to_value(&read).unwrap();
+        assert!(wire["identity"].get("pending").is_none());
     }
 
     /// The avatar result projection (contract revision 1.48, §4.47):

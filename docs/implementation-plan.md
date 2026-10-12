@@ -7,9 +7,28 @@
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
 - No-revision stopgap record: 2026-10-12; the §4.119 outbound-receipt resupply stopgap
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
-  lands as connector-internal behavior only — zero wire change, the contract revision stays
-  1.135
-- Contract revision: 1.135 (2026-10-12; the live poll receive chain lands
+  lands as connector-internal behavior only — zero wire change, the contract revision stayed
+  1.135 at that batch (since superseded by the 1.136 entry below)
+- Contract revision: 1.136 (2026-10-13; the identity pending pass-through
+  (§4.120): the `identities.get` projection additively carries the KT
+  engine's optional boolean `pending` — the engine sidecar key marking a
+  peer identity key that was replaced without confirmation, the same
+  single source the engine's send gate reads (the "Identity unverified"
+  send-error family). The connector forwards the key verbatim when the
+  engine answered it and omits the key when an older engine answer has
+  none — the same optional-key pass-through the pinned JsonIdentity
+  nullable trio practices; the connector invents neither value nor
+  grammar, and a non-boolean engine `pending` reads as absent (the honest
+  no-signal face). Desktop consumption is presentation-only: the
+  safety-change banner judgement widens to
+  `trustLevel === 'UNTRUSTED' || pending === true`, closing the
+  first-contact gap — a never-verified peer whose key was replaced before
+  any trust entry projects TRUSTED_UNVERIFIED (the three-value vocabulary
+  carries no signal) and used to miss the banner; the additive key is the
+  only honest signal. No new method, error, capability, or store move;
+  read lane unchanged; additive wire only. Tests 733 → 734 (lib 554 →
+  555), all green) —
+  previously 1.135 (2026-10-12; the live poll receive chain lands
   (§4.118): the engine's six-question-batch Q3 poll receive faces —
   `dataMessage.poll {question, options, allowMultiple}` /
   `pollVote {targetAuthor, targetSentTimestamp, optionIndexes, voteCount}` /
@@ -9740,6 +9759,50 @@ face still confirms `sent`; plus the 60-second expiry boundary at the map level)
 integration arms (the absent read fan-out carries only the fresh row while the stale row
 stays silent, the explicit viewed fan-out still carries both rows; the 425-crash degradation
 switches to the explicit selection so the crash path stays exercised). Gates: all green.
+
+### 4.120 The identity pending pass-through: `identities.get` rows carry the engine's replace-without-confirmation flag (contract revision 1.136, 2026-10-13)
+
+The engine batch behind the "Identity unverified" send-error family (the §4.61-era
+read/write faces' same sidecar — `kt-signal-engine` `identity.rs`) added a per-identity
+`pending` key to its sidecar: the receive loop sets it when a peer's identity key is
+replaced (the official saveIdentity posture — a verified state degrades to unverified and
+the key stays flagged), the trust write face clears it on confirmation (the verified arm
+and the `default` arm; the explicit `unverified` arm keeps it), and the send gate refuses
+direct sends while the flag stands. The read projection now surfaces that flag, and the
+connector forwards it.
+
+The wire change is one optional key on the §4.61 identity row: `pending?: boolean` beside
+`trustLevel`. The connector parses the engine's `listIdentities` answer through
+`identity_from_engine` with the same pass-through discipline the pinned JsonIdentity
+nullable trio (`number`/`uuid`/`scannableSafetyNumber`) already practices — the key rides
+verbatim when the engine answered it, stays absent when an older engine answer has none,
+and a non-boolean engine value reads as absent (the honest no-signal face; the connector
+invents neither `false` nor any grammar, so no legacy desktop ever sees a key it does not
+know and no hostile engine value can fail the face). Nothing else moves: no new method,
+error code, capability bit, or store move; the read lane, the empty-array = `identity:
+null` fold, and the non-nullable core gate (fingerprint/safetyNumber/trustLevel/
+addedTimestamp) are byte-identical.
+
+The desktop consumes the key for presentation only: the safety-change banner judgement
+(the 2026-10-12 banner batch, `identityUnconfirmedOf`) widens from
+`trustLevel === 'UNTRUSTED'` to `trustLevel === 'UNTRUSTED' || pending === true`, closing
+the recorded first-contact gap — a peer whose key was replaced before any trust entry
+existed projects TRUSTED_UNVERIFIED (the official three-value vocabulary carries no
+"changed" signal for a never-verified peer) and used to miss the banner entirely, the
+send-failure toast being the only tell. The pending bit is the only honest signal, and it
+is presentation judgement on the desktop: the desktop never writes the flag anywhere (the
+authority stays the engine sidecar, read back through the next `identities.get` — the
+`identity.verifiedChanged` "events notify, the read face is the authority" ruling), and
+the confirmed-write local truth flip clears it exactly as the engine's own write face
+does (verified/default clear the flag, explicit unverified keeps it).
+
+Tests: the wire-shape unit (`identity_projection_maps_pinned_record_and_empty_list`
+family, new `identity_projection_passes_the_pending_sidecar_key_through`): a full record
+with `pending: true` round-trips the key on the wire beside the pinned fields; a record
+without the key omits it on the wire (older-engine byte-compatibility); a non-boolean
+engine value reads as absent; the empty list and the non-nullable core gate are
+untouched. Gates: fmt, clippy `-D warnings`, tests (555 lib + 179
+integration, all green), release build.
 
 ## 5. signal-cli Boundary
 
