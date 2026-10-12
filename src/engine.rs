@@ -672,7 +672,7 @@ pub struct NormalizedRich {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<NormalizedContact>,
     /// Poll face (contract 1.81, §4.38 import chain; live chain contract
-    /// 1.134 §4.118): the aggregated read-only render face — question,
+    /// 1.135 §4.118): the aggregated read-only render face — question,
     /// options, the aggregate flag, the per-voter projection and the ended
     /// bit. Two arrival chains land the exact same shape: the archive's
     /// per-message `poll` item folds through the §4.38 import, and the
