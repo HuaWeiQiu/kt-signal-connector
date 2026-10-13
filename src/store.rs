@@ -6225,13 +6225,18 @@ impl Store {
     /// [`Store::upsert_contact`], and the sync marker advances in the same
     /// commit. A failure on any entry rolls the whole batch back, so a partial
     /// sync is never visible and the 60s short-circuit marker can never move
-    /// ahead of the rows it summarizes.
+    /// ahead of the rows it summarizes. Returns exactly the conversation
+    /// skeleton change set the §4.122 passive batch reports — a newly
+    /// materialized skeleton or a placeholder title the batch upgraded — so
+    /// the pull path mirrors the passive batch's `conversation.changed`
+    /// semantics (§4.135) and a replayed pull changes nothing and emits
+    /// nothing.
     pub fn upsert_synced_contacts(
         &self,
         account_id: &str,
         entries: &[SyncedContact<'_>],
         synced_at: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<String>, StoreError> {
         let conn = self.lock_conn()?;
         let transaction = conn
             .unchecked_transaction()
@@ -6268,6 +6273,7 @@ impl Store {
         // stable_hash_id key ensure_conversation uses; existing rows keep
         // their state (unread/muted/pinned), and a masked/placeholder title
         // upgrades through the normal path when a real message later lands.
+        let mut changed: Vec<String> = Vec::new();
         {
             let mut stmt = transaction
                 .prepare(
@@ -6313,7 +6319,10 @@ impl Store {
                                 params![id, entry.title],
                             )
                             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                        changed.push(id);
                     }
+                } else {
+                    changed.push(id);
                 }
             }
         }
@@ -6330,7 +6339,7 @@ impl Store {
         transaction
             .commit()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        Ok(())
+        Ok(changed)
     }
 
     /// Cache one passive contacts batch (contract 1.136, §4.122) with the
@@ -13256,6 +13265,77 @@ mod tests {
             .upsert_synced_contacts(&account.id, &entries, 45)
             .unwrap();
         assert_eq!(store.contacts_synced_at(&account.id).unwrap(), Some(45));
+    }
+
+    /// Contract 1.140 (§4.135): the pull batch reports exactly the skeleton
+    /// change set the §4.122 passive batch reports — a newly materialized
+    /// skeleton or a placeholder title the batch upgraded — so the pull path
+    /// can mirror the passive batch's `conversation.changed` semantics. A
+    /// replay changes nothing, and the sync marker still belongs to the pull.
+    #[test]
+    fn synced_contacts_pull_reports_the_changed_skeleton_set() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let entries = [
+            SyncedContact {
+                kind: "contact",
+                peer_key: "+15555550101",
+                title: "Alice",
+                extra: None,
+            },
+            SyncedContact {
+                kind: "group",
+                peer_key: "Z3JvdXAtMQ==",
+                title: "Group",
+                extra: None,
+            },
+        ];
+        let changed = store
+            .upsert_synced_contacts(&account.id, &entries, 42)
+            .unwrap();
+        assert_eq!(changed.len(), 2, "{changed:?}");
+        // The change set names the conversations, not the contacts rows.
+        let direct = store
+            .conversation_by_peer(&account.id, "direct", "+15555550101")
+            .unwrap()
+            .expect("the skeleton materialized");
+        assert!(changed.contains(&direct.id));
+
+        // A replay of the same batch is a no-op change set; the marker still
+        // advances (the pull owns it, the §4.122 passive face never does).
+        let changed = store
+            .upsert_synced_contacts(&account.id, &entries, 43)
+            .unwrap();
+        assert!(changed.is_empty(), "{changed:?}");
+        assert_eq!(store.contacts_synced_at(&account.id).unwrap(), Some(43));
+
+        // A real name upgrades a masked conversation title and reports it.
+        store
+            .ensure_conversation(&account.id, "direct", "+15555550103", "8fc***e2")
+            .unwrap();
+        let upgrade = [SyncedContact {
+            kind: "contact",
+            peer_key: "+15555550103",
+            title: "Carol",
+            extra: None,
+        }];
+        let changed = store
+            .upsert_synced_contacts(&account.id, &upgrade, 44)
+            .unwrap();
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        let conversation = store
+            .conversation_by_peer(&account.id, "direct", "+15555550103")
+            .unwrap()
+            .expect("the conversation stays");
+        let summary = store
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .expect("the upgraded conversation summarizes");
+        assert_eq!(summary.title, "Carol");
     }
 
     /// Performance sanity, not a benchmark: a phone-scale contacts sync (a few

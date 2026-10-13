@@ -748,6 +748,7 @@ impl RuntimeSupervisor {
         }
         let service = Arc::clone(&self.service);
         let group_id = self.group_id.clone();
+        let host_events = self.host_events.clone();
         *slot = Some(tokio::spawn(async move {
             // Let the fresh engine settle and any link-time inline sync land
             // first; the 60-second cache then folds the overlap into a no-op.
@@ -763,7 +764,9 @@ impl RuntimeSupervisor {
                 }
             };
             for account in accounts {
-                if let Err(error) = sync_contacts_with(&service, &engine, &account.id).await {
+                if let Err(error) =
+                    sync_contacts_with(&service, &engine, &account.id, &host_events).await
+                {
                     tracing::warn!(
                         error_class = error.class(),
                         account_id = %account.id,
@@ -6526,18 +6529,25 @@ impl RuntimeSupervisor {
             }
         }
         let engine = self.running_engine().await?;
-        sync_contacts_with(&self.service, &engine, account_id).await
+        sync_contacts_with(&self.service, &engine, account_id, &self.host_events).await
     }
 }
 
 /// Shared body of [`RuntimeSupervisor::sync_contacts`] plus the startup
 /// re-sync: the read-only engine listing and the single all-or-nothing upsert
 /// transaction. Free-standing so the spawned startup pass can run against the
-/// engine handle it captured at spawn time.
+/// engine handle it captured at spawn time. The change-set half of the store
+/// write rides the host event lane (§4.135): each newly materialized
+/// conversation skeleton or placeholder-title upgrade pushes
+/// `conversation.changed` — the §4.122 passive batch's event semantics — so a
+/// desktop already rendering the list converges after an engine restart or a
+/// fresh link without a refetch; a replayed pull changes nothing and emits
+/// nothing.
 async fn sync_contacts_with(
     service: &Arc<Mutex<ConnectorService>>,
     engine: &EngineHandle,
     account_id: &str,
+    events: &tokio::sync::broadcast::Sender<HostSideEvent>,
 ) -> Result<ContactsSyncOutcome, ServiceError> {
     let number = service.lock().await.account_signal_number(account_id)?;
     // Contacts registered on the account only (no allRecipients walk).
@@ -6622,10 +6632,28 @@ async fn sync_contacts_with(
     // lock is held once instead of per contact, and a partial sync is
     // never visible (a failed entry rolls back the rows and the marker).
     let now_ms = crate::link::now_ms();
-    service
+    let changed = service
         .lock()
         .await
         .upsert_synced_contacts(account_id, &entries, now_ms)?;
+    // §4.135: the skeleton change set rides `conversation.changed` exactly
+    // like the §4.122 passive batch — summaries read after the commit, one
+    // event per changed row, replay-silent by construction (the change set
+    // is empty when nothing materialized or upgraded).
+    let summaries = {
+        let service = service.lock().await;
+        let store = service.store_ref();
+        let mut summaries = Vec::with_capacity(changed.len());
+        for conversation_id in changed {
+            if let Some(summary) = store.conversation_summary(account_id, &conversation_id)? {
+                summaries.push(HostSideEvent::ConversationChanged(summary));
+            }
+        }
+        summaries
+    };
+    for event in summaries {
+        let _ = events.send(event);
+    }
     Ok(ContactsSyncOutcome {
         contact_count,
         group_count,
@@ -9397,6 +9425,112 @@ mod tests {
             .expect("conversation.changed within timeout")
             .unwrap();
         assert!(matches!(event, HostSideEvent::ConversationChanged(_)));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// Contract 1.140 (§4.135): the contacts pull is no longer a silent
+    /// materialization — every skeleton the pull creates rides
+    /// `conversation.changed` on the host lane (the §4.122 passive batch's
+    /// event semantics, now shared by the pull), and a pull inside the 60 s
+    /// short-circuit window emits nothing.
+    #[tokio::test]
+    async fn pull_contacts_sync_emits_conversation_changed_for_new_skeletons() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        // Subscribe before any pull runs so whichever pass materializes the
+        // skeletons — this call or the startup re-sync — has its change set
+        // observable on the lane.
+        let mut host_lane = supervisor.subscribe_host();
+
+        supervisor.sync_contacts(&account.id).await.unwrap();
+
+        // The fixture lists the account itself plus two contacts; the two
+        // contact skeletons must each surface as conversation.changed within
+        // the startup window (whichever pull materialized them emitted them;
+        // the other pass short-circuits on the fresh marker).
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..40 {
+            match timeout(Duration::from_millis(150), host_lane.recv()).await {
+                Ok(Ok(HostSideEvent::ConversationChanged(summary))) => {
+                    if summary.kind == "direct" && !seen.contains(&summary.id) {
+                        seen.push(summary.id);
+                    }
+                    // The fixture lists the account itself plus two contacts:
+                    // three direct skeletons total. Stop once all three rode
+                    // the lane.
+                    if seen.len() >= 3 {
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                _ => {}
+            }
+        }
+        let mut expected: Vec<String> = Vec::new();
+        for peer_key in ["+15555550101", "+15555550102"] {
+            let id = supervisor
+                .service
+                .lock()
+                .await
+                .store_ref()
+                .conversation_by_peer(&account.id, "direct", peer_key)
+                .unwrap()
+                .expect("the pull materialized the skeleton")
+                .id;
+            expected.push(id);
+        }
+        for id in &expected {
+            assert!(
+                seen.contains(id),
+                "skeleton {id} never rode conversation.changed; seen {seen:?}"
+            );
+        }
+
+        // Drain the lane dry before the second pull: the first pull's group
+        // summaries may still be queued behind the direct ones, and the
+        // silence proof must be about the second pull only. (Bounded: 300 ms
+        // of lane silence closes the drain.)
+        while let Ok(Ok(_)) = timeout(Duration::from_millis(300), host_lane.recv()).await {}
+
+        // A second pull inside the window short-circuits: no further
+        // conversation.changed may arrive.
+        supervisor.sync_contacts(&account.id).await.unwrap();
+        let mut quiet = true;
+        for _ in 0..6 {
+            match timeout(Duration::from_millis(100), host_lane.recv()).await {
+                Ok(Ok(HostSideEvent::ConversationChanged(_))) => {
+                    quiet = false;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => {}
+            }
+        }
+        assert!(
+            quiet,
+            "a short-circuited pull must not emit conversation.changed"
+        );
         supervisor.shutdown().await.unwrap();
     }
 

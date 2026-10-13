@@ -2063,12 +2063,16 @@ impl ConnectorService {
 
     /// Cache one full contacts sync atomically: all rows and the sync marker
     /// commit in a single transaction, so a failed batch leaves nothing behind.
+    /// Returns the conversation skeleton change set (§4.135): a newly
+    /// materialized skeleton or a placeholder title the batch upgraded — the
+    /// set the pull path turns into `conversation.changed` events, mirroring
+    /// the §4.122 passive batch.
     pub fn upsert_synced_contacts(
         &self,
         account_id: &str,
         entries: &[SyncedContact<'_>],
         synced_at: u64,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<String>, ServiceError> {
         Ok(self
             .store
             .upsert_synced_contacts(account_id, entries, synced_at)?)

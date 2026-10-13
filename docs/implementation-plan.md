@@ -10499,6 +10499,47 @@ flip; a row that slips through to a rebuild is settled failed with its
 queue face cleared and the manual face answers `RETRY_NOT_ALLOWED`).
 Gates: fmt, clippy `-D warnings`, tests all green.
 
+### 4.135 The pull path rides `conversation.changed`: skeleton materialization is no longer silent (contract revision 1.140, 2026-10-13)
+
+The §4.122 passive batch taught the store to answer exactly the skeleton
+change set — newly materialized skeletons and placeholder-title upgrades —
+and pushed each one as `conversation.changed`, so the desktop's list
+converged without a refetch. The pull path (`contacts.sync`, the startup
+re-sync, and the shared `sync_contacts_with` body) wrote through the
+sibling `upsert_synced_contacts` and threw that answer away: after an
+engine restart or a fresh link, the pull materialized every skeleton and
+the desktop — already rendering its list — learned the new rows only on
+its own next fetch. The pull now mirrors the passive batch's semantics
+verbatim; one change-set discipline, two writers:
+
+- The store's `upsert_synced_contacts` returns the same change set
+  `upsert_passive_contacts` returns: a conversation id per newly
+  materialized skeleton and per placeholder title the batch upgraded
+  (the `title_should_upgrade` judgment — a real title never downgrades).
+  The sync marker still advances in the same commit — only the return
+  type changed — so the 60 s short-circuit and the all-or-nothing
+  transaction are untouched.
+- `sync_contacts_with` turns the change set into one `conversation.changed`
+  per row (summaries read after the commit, the §4.122 shape) and rides
+  the existing host event lane — the same lane the passive batch and the
+  timer faces use; no new event, no new key. The host-facing
+  `contacts.sync` response is byte-identical (`ContactsSyncOutcome`):
+  the events are a side lane, not a response shape change.
+
+Replay silence is structural: a re-pulled batch finds every skeleton
+present and every title real, the change set comes back empty, and
+nothing emits — the short-circuit makes the common replay a no-op before
+the store is even reached. Zero wire change.
+
+Tests: `synced_contacts_pull_reports_the_changed_skeleton_set` (the
+store-level change set: both new skeletons, the empty replay, the
+masked-title upgrade, the marker still pull-owned), and
+`pull_contacts_sync_emits_conversation_changed_for_new_skeletons`
+(the supervisor-level consume against the fixture engine: the pull's
+skeletons ride `conversation.changed` on the host lane, a second pull
+inside the short-circuit window emits nothing). Gates: fmt, clippy
+`-D warnings`, tests all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:
