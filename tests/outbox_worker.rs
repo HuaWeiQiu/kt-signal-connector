@@ -16,7 +16,7 @@ use kt_signal_connector::engine::SignalCliConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::link::now_ms;
 use kt_signal_connector::service::SendTarget;
-use kt_signal_connector::store::{MessageRecord, Store, StoreKey};
+use kt_signal_connector::store::{MessageRecord, SendRetrySchedule, Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -94,7 +94,7 @@ fn seed_queued_row(store: &Store, account_id: &str, conversation_id: &str, reque
         .insert_message(&record, Some(request), None, false)
         .unwrap();
     store
-        .settle_send_failed(&id, now_ms(), true)
+        .settle_send_failed(&id, now_ms(), SendRetrySchedule::Backoff)
         .unwrap()
         .expect("the seeded pending row settles failed-and-queued");
 }
@@ -255,6 +255,73 @@ async fn definitive_failure_requeues_and_the_auto_retry_succeeds() {
         rows.items[0].client_request_id.as_deref(),
         Some("req-auto-1")
     );
+}
+
+/// Contract 1.143 (§4.139): the rate-limit family joins the queue, but on
+/// the Retry-After beat, not the curve — the engine's structured
+/// rate-limit answer (the §4.80 anchor "(RateLimitExceeded)") settles the
+/// row failed-and-enrolled at the official one-minute default (this wire
+/// carries no Retry-After value, so the fallback IS the beat), decisively
+/// beyond any curve beat. The row keeps its single identity and waits its
+/// pause; nothing hammers.
+#[tokio::test]
+async fn rate_limited_failure_enrolls_at_the_retry_after_beat() {
+    let temp = TempDir::new().unwrap();
+    // Arm the fixture's one-shot rate-limit answer in THIS test's own data
+    // dir (test-local marker, never a process-global env).
+    std::fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    std::fs::write(
+        temp.path()
+            .join("signal-data/.fixture-send-ratelimit-armed"),
+        b"",
+    )
+    .unwrap();
+    let store = test_store(temp.path());
+    let (account_id, conversation_id) = seed_account_and_conversation(&store);
+
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        config_for(&temp),
+        Arc::clone(&store),
+        DEFAULT_PROXY_GROUP_ID.to_string(),
+        None,
+    ));
+    supervisor.spawn_outbox_worker();
+    supervisor.start().await.unwrap();
+
+    let before = now_ms();
+    let first = supervisor
+        .send_text(
+            account_id.clone(),
+            SendTarget::Conversation(conversation_id.clone()),
+            "slow down".into(),
+            "req-ratelimit-1".into(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        first.is_err(),
+        "the one-shot rate-limit answer must fail the send"
+    );
+    assert_eq!(
+        status_of(&store, &account_id, "req-ratelimit-1").as_deref(),
+        Some("failed")
+    );
+    let due = store
+        .next_retry_due_at()
+        .unwrap()
+        .expect("the rate-limit failure must arm the queue");
+    assert!(
+        due >= before + kt_signal_connector::store::RATE_LIMIT_RETRY_AFTER_MS - 1_000
+            && due <= now_ms() + kt_signal_connector::store::RATE_LIMIT_RETRY_AFTER_MS + 1_000,
+        "the beat is the Retry-After default, not the curve: {due}"
+    );
+    let rows = store
+        .list_messages(&account_id, &conversation_id, 10, None)
+        .unwrap();
+    assert_eq!(rows.items.len(), 1, "one row per logical message");
 }
 
 /// Offline is not failure: with no engine running, the drain pass claims

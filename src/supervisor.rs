@@ -2328,12 +2328,14 @@ impl RuntimeSupervisor {
                 }
                 Err(error) => {
                     // §4.123: the funnel settles classified — a
-                    // definitive-error answer in the auto-retry class also
+                    // definitive-error answer in an automatic-retry arm also
                     // arms the bounded queue schedule in the same guarded
-                    // write, and kicks the drain so the 190 ms first beat is
-                    // honored at its own pace instead of the tick's; every
-                    // other class (and the unknown outcome above, which
-                    // never reaches this arm) settles plain.
+                    // write (the transport family on the curve beat, the
+                    // rate-limit family on the Retry-After beat), and kicks
+                    // the drain so the beat is honored at its own pace
+                    // instead of the tick's; every other class (and the
+                    // unknown outcome above, which never reaches this arm)
+                    // settles plain.
                     let events = self
                         .service
                         .lock()
@@ -2342,7 +2344,9 @@ impl RuntimeSupervisor {
                     for event in events {
                         let _ = self.host_events.send(event);
                     }
-                    if ConnectorService::auto_retry_eligible(&error) {
+                    if ConnectorService::auto_retry_schedule(&error)
+                        != crate::store::SendRetrySchedule::None
+                    {
                         self.notify_outbox_drain();
                     }
                     Err(ServiceError::Engine(error))

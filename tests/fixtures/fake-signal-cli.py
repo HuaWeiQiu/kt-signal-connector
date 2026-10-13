@@ -382,6 +382,14 @@ DELETE_MODE = os.environ.get("KT_FAKE_DELETE_MODE", "")
 # done marker records the one-shot, and every later send answers normally.
 SEND_UNAVAILABLE_ARMED = SIGNAL_DATA_DIR / ".fixture-send-unavailable-armed"
 SEND_UNAVAILABLE_DONE = SIGNAL_DATA_DIR / ".fixture-send-unavailable-done"
+# Contract 1.143 (§4.139) test hook: one-shot rate-limit send answer. A test
+# arms it by touching .fixture-send-ratelimit-armed in this engine's own data
+# dir; the FIRST send call then answers the engine's structured rate-limit
+# face (-32603 + the §4.80 anchor "(RateLimitExceeded)", the verbatim wire
+# shape), the done marker records the one-shot, and every later send answers
+# normally.
+SEND_RATELIMIT_ARMED = SIGNAL_DATA_DIR / ".fixture-send-ratelimit-armed"
+SEND_RATELIMIT_DONE = SIGNAL_DATA_DIR / ".fixture-send-ratelimit-done"
 ACCOUNT_LINKED = not DELETED_MARKER.exists()
 
 # Multi-account mode (optimization-plan §6.4 M3.3 tests and the soak driver's
@@ -920,6 +928,18 @@ for line in sys.stdin:
                 "error": {
                     "code": -3,
                     "message": "Failed to send message: Bad gateway (ServerUnavailableException)",
+                },
+            }
+            emit_json(response)
+            continue
+        if SEND_RATELIMIT_ARMED.exists() and not SEND_RATELIMIT_DONE.exists():
+            SEND_RATELIMIT_DONE.touch()
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Failed to send message: Rate limited. (RateLimitExceeded)",
                 },
             }
             emit_json(response)

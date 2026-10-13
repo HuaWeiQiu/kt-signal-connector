@@ -6392,7 +6392,11 @@ impl ConnectorService {
         // the whole queue face) and never re-dispatches a caption without
         // its bytes.
         if !row.attachments.is_empty() {
-            self.store.settle_send_failed(&row.id, now_ms(), false)?;
+            self.store.settle_send_failed(
+                &row.id,
+                now_ms(),
+                crate::store::SendRetrySchedule::None,
+            )?;
             return Err(ServiceError::Store(StoreError::MessageNotFound));
         }
         if row.text.as_deref().is_none_or(|text| text.is_empty()) {
@@ -7892,28 +7896,32 @@ impl ConnectorService {
 
     /// The §4.123 send-failure settlement used by the dispatch funnel: the
     /// same `pending -> failed` transition, plus — exactly when the engine
-    /// error belongs to the automatic-retry class — the bounded queue
-    /// schedule in the same guarded write.
+    /// error belongs to an automatic-retry arm — the bounded queue schedule
+    /// in the same guarded write, on the arm's own beat.
     ///
-    /// Eligibility (§4.123, deliberate and narrow): only
-    /// [`EngineError::ServerUnavailable`] and [`EngineError::Upstream`] — the
-    /// two arms where the engine ANSWERED a definitive JSON-RPC error, so the
-    /// send provably did not land and a resend carries no unknown-outcome
-    /// risk. A mutating call whose answer is lost is
-    /// [`EngineError::UnknownOutcome`] by the engine's own classification and
-    /// never reaches this funnel's retryable arm: unknown outcomes are never
-    /// retried automatically (the §5 send discipline, AGENTS.md red line).
-    /// The structured [`EngineError::UpstreamCode`] families mix
+    /// Eligibility (§4.123, deliberate and narrow): only arms where the
+    /// engine ANSWERED a definitive JSON-RPC error, so the send provably did
+    /// not land and a resend carries no unknown-outcome risk —
+    /// [`EngineError::ServerUnavailable`] / [`EngineError::Upstream`] on the
+    /// backoff arm, and (contract 1.143, §4.139) [`EngineError::RateLimited`]
+    /// on the Retry-After arm: a 429/413 is the server answering "wait", not
+    /// "lost", so the row enrolls on the official Retry-After beat instead
+    /// of the curve (the wire carries no value, so the official one-minute
+    /// default stands in) and the eligibility gate, window, and ceilings are
+    /// the shared ones. A mutating call whose answer is lost is
+    /// [`EngineError::UnknownOutcome`] by the engine's own classification
+    /// and never reaches this funnel's retryable arms: unknown outcomes are
+    /// never retried automatically (the §5 send discipline, AGENTS.md red
+    /// line). The structured [`EngineError::UpstreamCode`] families mix
     /// deterministic refusals (key-invalid, too-large) into the retryable
-    /// ones, so they stay manual this revision; the rate-limit /
-    /// proof-challenge / identity-gate families are the server explicitly
-    /// stopping the send and stay manual (§4.123 deviation note).
+    /// ones, and the proof-challenge / identity-gate families carry product
+    /// judgments the funnel must not make silently — they stay manual.
     pub fn complete_send_failed_for_engine(
         &self,
         pending_id: &str,
         error: &EngineError,
     ) -> Result<Vec<HostSideEvent>, ServiceError> {
-        let schedule = Self::auto_retry_eligible(error);
+        let schedule = Self::auto_retry_schedule(error);
         Ok(status_change_events(self.store.settle_send_failed(
             pending_id,
             now_ms(),
@@ -7921,11 +7929,20 @@ impl ConnectorService {
         )?))
     }
 
-    pub(crate) fn auto_retry_eligible(error: &EngineError) -> bool {
-        matches!(
-            error,
-            EngineError::ServerUnavailable | EngineError::Upstream
-        )
+    /// The §4.123 three-arm classification (contract 1.143, §4.139): the
+    /// transport-failure family walks the backoff curve, the rate-limit
+    /// family walks the Retry-After beat, and everything else — the
+    /// structured deterministic refusals, the proof/identity gates, the
+    /// timeout family, the unknown outcome (the red line) — settles plain
+    /// failed with no automatic follow-up.
+    pub(crate) fn auto_retry_schedule(error: &EngineError) -> crate::store::SendRetrySchedule {
+        match error {
+            EngineError::RateLimited => crate::store::SendRetrySchedule::RateLimit,
+            EngineError::ServerUnavailable | EngineError::Upstream => {
+                crate::store::SendRetrySchedule::Backoff
+            }
+            _ => crate::store::SendRetrySchedule::None,
+        }
     }
 
     /// Persist one normalized receive from ONE group's engine. The owning
@@ -17162,10 +17179,14 @@ mod tests {
     }
 
     /// §4.123: the automatic queue enrolls exactly the definitive-error
-    /// network classes. `ServerUnavailable` / `Upstream` arm the schedule in
-    /// the same settlement; every other engine error class settles the row
-    /// plain `failed` with no schedule — the rate-limit / proof / identity
-    /// families are the server stopping the send, the structured-code
+    /// network classes, each arm on its own beat. `ServerUnavailable` /
+    /// `Upstream` arm the curve in the same settlement; `RateLimited`
+    /// (contract 1.143, §4.139) arms the Retry-After beat — the server
+    /// answered "wait", so the row waits the official default minute, not
+    /// the 190 ms curve head that would hammer again almost immediately.
+    /// Every other engine error class settles the row plain `failed` with
+    /// no schedule — the proof / identity families are the server stopping
+    /// the send with a product judgment attached, the structured-code
     /// families mix deterministic refusals, and the unknown outcome (whose
     /// funnel arm never schedules) is the red line itself.
     #[test]
@@ -17232,8 +17253,44 @@ mod tests {
                 "{error:?} must arm the schedule"
             );
         }
+        // The rate-limit arm: enrolled, but on the Retry-After beat — the
+        // official one-minute default this wire falls back to, decisively
+        // not the 190 ms curve head.
+        {
+            let pending_id = match service
+                .prepare_send_text(
+                    &account.id,
+                    &conversation.id,
+                    "hello",
+                    "req-enroll-ratelimit",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+            {
+                PreparedSend::Dispatch { pending_id, .. } => pending_id,
+                PreparedSend::Existing(_) => panic!("new request must dispatch"),
+            };
+            let settled_at = now_ms();
+            let events = service
+                .complete_send_failed_for_engine(&pending_id, &EngineError::RateLimited)
+                .unwrap();
+            assert_eq!(events.len(), 1, "the failed transition emits");
+            let (status, first, count, next) = face(&service, &pending_id);
+            assert_eq!(status, "failed");
+            assert!(first.is_some(), "the rate-limit arm stamps the window");
+            assert_eq!(count, 1);
+            let next = next.expect("the rate-limit arm arms the schedule");
+            assert!(
+                next >= (settled_at + crate::store::RATE_LIMIT_RETRY_AFTER_MS - 1_000) as i64
+                    && next
+                        <= (settled_at + crate::store::RATE_LIMIT_RETRY_AFTER_MS + 1_000) as i64,
+                "the beat is the Retry-After default, not the curve: {next}"
+            );
+        }
         let refused = [
-            EngineError::RateLimited,
             EngineError::ProofRequired,
             EngineError::IdentityUnverified,
             EngineError::UpstreamCode {
@@ -17272,6 +17329,46 @@ mod tests {
                 (first, count, next),
                 (None, 0, None),
                 "{error:?} must settle plain failed with no schedule"
+            );
+        }
+    }
+
+    /// Contract 1.143 (§4.139): the three-arm classification itself — the
+    /// rate-limit family on the Retry-After beat, the transport family on
+    /// the curve, and every other class (the deterministic structured
+    /// refusals, the proof/identity gates, the timeout family, and the
+    /// unknown red line) plain `None`.
+    #[test]
+    fn auto_retry_schedule_classifies_the_three_arms() {
+        use crate::store::SendRetrySchedule;
+        assert_eq!(
+            ConnectorService::auto_retry_schedule(&EngineError::RateLimited),
+            SendRetrySchedule::RateLimit
+        );
+        assert_eq!(
+            ConnectorService::auto_retry_schedule(&EngineError::ServerUnavailable),
+            SendRetrySchedule::Backoff
+        );
+        assert_eq!(
+            ConnectorService::auto_retry_schedule(&EngineError::Upstream),
+            SendRetrySchedule::Backoff
+        );
+        for error in [
+            EngineError::ProofRequired,
+            EngineError::IdentityUnverified,
+            EngineError::UpstreamCode {
+                code: "STICKER_PACK_INVALID",
+                data: None,
+            },
+            EngineError::Timeout,
+            EngineError::NotRunning,
+            EngineError::Unauthorized,
+            EngineError::UnknownOutcome,
+        ] {
+            assert_eq!(
+                ConnectorService::auto_retry_schedule(&error),
+                SendRetrySchedule::None,
+                "{error:?} carries no automatic follow-up"
             );
         }
     }

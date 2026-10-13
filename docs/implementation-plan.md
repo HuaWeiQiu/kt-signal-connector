@@ -19,7 +19,35 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.142 (2026-10-13; the account's own-ACI carry-through
+- Contract revision: 1.143 (2026-10-13; the rate-limit family joins the
+  §4.123 queue on its own Retry-After beat (§4.139): a 429/413 send failure
+  is a definitive engine answer — the server said "wait", not "lost", so the
+  unknown-outcome red line never applies — and the server's explicit pause
+  IS the schedule, not a manual-only dead end the backoff curve would
+  replace with a 190 ms head that hammers again almost immediately. The
+  settle face takes the schedule decision as a three-arm enum
+  (`SendRetrySchedule::None`/`Backoff`/`RateLimit` — the §4.123 one-bool
+  face could not carry "which beat"); both automatic arms share the
+  eligibility gate, window, and ceilings verbatim (outbound text row,
+  clientRequestId, no attachment descriptors §4.134, attempt < 128, per-
+  account queue < 256 — the rate-limit arm is not a budget bypass), and the
+  beat is the official `sleepForRateLimitRetryAfterTime` fallback: this
+  wire carries no Retry-After value by contract (the engine's rate-limit
+  face is the class anchor `(RateLimitExceeded)` alone, no value field —
+  `DEFAULT_RETRY_AFTER` = MINUTE is the answer the official fallback gives
+  a value-less face, so the one-minute default IS the beat here; the
+  official 1 s floor and 24 h-window clamp govern any future value face),
+  `RATE_LIMIT_RETRY_AFTER_MS` = 60_000. The §4.124 anchor stands
+  (SendCommand.java carries no client-timestamp face; the retry dispatches
+  through the ordinary rebuild). Wire additive: zero — no new method,
+  event, key, error, capability, or store move (the schedule lives in the
+  existing §4.123 columns). Tests 778 → 781 (lib 594 → 596: the store's
+  exact Retry-After beat + the shared budget refusal on the new arm, the
+  three-arm classification, the service enroll test's rate-limit leg moves
+  from the refusal family to its own beat assertion; outbox end to end:
+  the fixture's one-shot rate-limit answer enrolls the row at the
+  one-minute beat, decisively not the 190 ms curve head), all green) —
+  previously 1.142 (2026-10-13; the account's own-ACI carry-through
   (§4.138): the account-level identity the desktop needs for self-addressing
   (the call self-UUID and the like) had no connector face — the §4.24
   boundary records the own ACI as not queryable on either engine's jsonRpc
@@ -10054,7 +10082,10 @@ mutating send that times out classifies `UnknownOutcome` (the §4.80 anchor
 shape) and is never enrolled — the red line (an unknown send outcome must not
 be retried automatically) outranks the queue at every layer; a partial-recipient
 group failure resupplements nobody (the row settles failed whole; a per-recipient
-retry ledger is a future revision's problem).
+retry ledger is a future revision's problem). (Contract 1.143 later migrates
+the rate-limit family out of this ledger onto its own Retry-After beat —
+§4.139 — precisely because the curve beat was the hammer the ledger feared:
+the pause the server asked for is the schedule, not a curve head.)
 
 The curve is the official one in exact integer arithmetic:
 `min(190 ms · 1.9^(n-1), 15 min)` (`Store::retry_backoff_delay_ms` — the cap
@@ -10768,6 +10799,63 @@ beside answered siblings), and the end-to-end harness (the answered
 face riding link.finish and accounts.list with the pinned uuid5 value;
 the omit-build reading as absence on both faces). Gates: fmt, clippy
 `-D warnings`, tests all green, release build.
+
+### 4.139 The rate-limit family joins the queue — on the Retry-After beat, not the curve (contract revision 1.143, 2026-10-13)
+
+§4.123's deviation ledger kept the rate-limit family manual for a reason it
+named itself: the backoff curve's 190 ms head would turn a server-ordered
+pause into a hammer. The ledger's answer — leave the row manual — was the
+narrower wrong fix: the desktop sees a dead failed row for a failure the
+official client answers automatically, and the row's one manual retry walks
+straight back into the same 429 the server is still counting. This revision
+keeps the ledger's insight and fixes the mechanism: the pause the server
+asked for IS the schedule.
+
+- The classification face (contract 1.143): the funnel's one-bool "should
+  the queue take this" answer grows into a three-arm decision
+  (`SendRetrySchedule::None` / `Backoff` / `RateLimit`) — a 429/413 is a
+  definitive engine answer (the server said "wait", not "lost"), so the
+  unknown-outcome red line never applies, and the row enrolls like any
+  queue member instead of dying manual. The proof/identity gates stay
+  manual (they carry product judgments the funnel must not make silently —
+  §4.123's ledger still owns them), and the structured-code families stay
+  mixed-deterministic-manual.
+- The beat: the official `sleepForRateLimitRetryAfterTime` waits the
+  server's Retry-After value and falls back to `DEFAULT_RETRY_AFTER` =
+  MINUTE when the answer carries none. This wire carries none by contract —
+  the engine's rate-limit face is the class anchor `(RateLimitExceeded)`
+  alone, no value field — so the official value-less fallback IS the beat:
+  `RATE_LIMIT_RETRY_AFTER_MS` = 60 000 ms from the settlement instant,
+  exactly, not a curve term. The official algorithm's other constants
+  (the 1 s floor, the 24 h-window remainder clamp) govern a value face
+  this wire does not have; the §4.123 window judges the row at claim time
+  as always, which is the connector idiom for the same bound.
+- Everything else about the row is the shared §4.123 face, verbatim: the
+  eligibility gate (outbound text row, `clientRequestId`, no attachment
+  descriptors §4.134), the attempt ceiling (128), the per-account queue
+  ceiling (256), the window anchor and its claim-time judgment, the atomic
+  settle-and-enroll write, and the drain. The rate-limit arm is a beat, not
+  a bypass — a budget-spent row under 429/413 settles terminal exactly as
+  under the curve. The §4.124 anchor stands: SendCommand.java carries no
+  client-timestamp face, so the retry dispatches through the ordinary
+  rebuild (same clientRequestId, same single row).
+- The wire grows nothing: the schedule decision is process-internal (the
+  settle face's enum replaces the bool it could not extend), the queue
+  lives in the existing §4.123 columns, and no method, event, key, error,
+  capability, or store move rides along. Zero engine-side coupling beyond
+  the anchor the §4.80 classifier already pins.
+
+Tests: the store's exact beat (the rate-limit enrollment lands at
+`+RATE_LIMIT_RETRY_AFTER_MS`, never the curve's 190 ms head; the window
+anchor stamps; the shared budget refusal holds on the new arm), the
+three-arm classification (rate-limit → the Retry-After arm, transport →
+the curve, everything else — proof/identity/structured-code/timeout/
+unknown — plain `None`), the service enroll test's rate-limit leg (moved
+out of the refusal family onto its own beat assertion, the window stamped
+and the count bumped once), and the outbox end to end (the fixture's
+one-shot rate-limit answer — the `-32603` + anchor face verbatim — fails
+the send, enrolls the row at the one-minute beat, and leaves exactly one
+row). Gates: fmt, clippy `-D warnings`, tests all green, release build.
 
 ## 5. signal-cli Boundary
 

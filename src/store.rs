@@ -77,6 +77,34 @@ pub const MAX_RETRY_ATTEMPTS: u32 = 128;
 /// per-pass claim batch, and the drain backlog hard-capped (AGENTS.md
 /// bounded-queue rule).
 pub const MAX_RETRY_QUEUED_PER_ACCOUNT: u32 = 256;
+/// The official Retry-After default for the rate-limit family (contract
+/// 1.143, §4.139): the official `sleepForRateLimitRetryAfterTime` answers a
+/// 429/413 job with the server's Retry-After value and falls back to
+/// `DEFAULT_RETRY_AFTER` = MINUTE when the answer carries none — and this
+/// wire carries none by contract (the engine's rate-limit face is the class
+/// anchor alone, no value field), so the fallback IS the schedule. Not a
+/// curve beat: the server asked for a pause, so the row waits the pause.
+pub const RATE_LIMIT_RETRY_AFTER_MS: u64 = 60_000;
+
+/// The §4.123 schedule decision the send-failure funnel hands
+/// `settle_send_failed` (contract 1.143, §4.139): plain settlement retires
+/// the queue face; the backoff arm walks the official curve; the rate-limit
+/// arm schedules the official Retry-After beat — the server explicitly
+/// asked for a pause, so the row waits the pause (the default, this wire
+/// carrying no value) instead of a curve beat that would start hammering
+/// again almost immediately. Both automatic arms share the same eligibility
+/// gate and the same bounded ceilings; only the beat differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendRetrySchedule {
+    /// No automatic follow-up: the row settles plain `failed`, the queue
+    /// face retires.
+    None,
+    /// The transport-failure family's arm: the official §4.123 curve.
+    Backoff,
+    /// The 429/413 family's arm: the official Retry-After default
+    /// ([`RATE_LIMIT_RETRY_AFTER_MS`]), never the curve.
+    RateLimit,
+}
 
 /// §4.134: does the row's persisted attachments face carry at least one
 /// descriptor? `attachments_json` is NULL on plain rows and a JSON array on
@@ -3256,18 +3284,19 @@ impl Store {
 
     /// Settle one dispatched send as definitively failed (§4.123): the
     /// atomic `pending -> failed` transition, and — when the caller
-    /// classified the engine error as auto-retryable — the queue schedule in
-    /// the same guarded write, so a row can never be observed failed-and-
-    /// unscheduled between settlement and enqueue. The schedule arm refuses
-    /// anything that is not a retryable outbound text row (direction,
-    /// non-empty text, a `client_request_id`, no attachment descriptors —
-    /// §4.134, the rebuild's caption-only channel; the receive-mirrored
-    /// multi-device echo rows are another device's delivery and are never
-    /// ours to resend), that already spent its attempt budget, or that would
-    /// push the account past the in-queue ceiling; such rows settle plain
-    /// `failed` with the queue face retired. Returns the row after the write
-    /// with whether the settlement actually transitioned (a status push that
-    /// already settled the row wins; the late engine answer loses).
+    /// classified the engine error into an automatic-retry arm — the queue
+    /// schedule in the same guarded write, so a row can never be observed
+    /// failed-and-unscheduled between settlement and enqueue. The schedule
+    /// arm refuses anything that is not a retryable outbound text row
+    /// (direction, non-empty text, a `client_request_id`, no attachment
+    /// descriptors — §4.134, the rebuild's caption-only channel; the
+    /// receive-mirrored multi-device echo rows are another device's delivery
+    /// and are never ours to resend), that already spent its attempt budget,
+    /// or that would push the account past the in-queue ceiling; such rows
+    /// settle plain `failed` with the queue face retired. Returns the row
+    /// after the write with whether the settlement actually transitioned (a
+    /// status push that already settled the row wins; the late engine answer
+    /// loses).
     ///
     /// Unknown outcomes never reach this face: the caller settles them
     /// through `update_message_status(_, "unknown", _)`, and the scheduling
@@ -3278,13 +3307,16 @@ impl Store {
         &self,
         message_id: &str,
         now: u64,
-        schedule: bool,
+        schedule: SendRetrySchedule,
     ) -> Result<Option<(MessageRecord, bool)>, StoreError> {
         let conn = self.lock_conn()?;
         let transaction = conn
             .unchecked_transaction()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let changed = if schedule {
+        let changed = if matches!(
+            schedule,
+            SendRetrySchedule::Backoff | SendRetrySchedule::RateLimit
+        ) {
             // Scheduling settlement: the status flips alone; the schedule arm
             // below writes the retry face, so the window anchor
             // (`first_send_attempted_at`) survives consecutive automatic
@@ -3343,9 +3375,9 @@ impl Store {
         transaction: &Connection,
         message_id: &str,
         now: u64,
-        schedule: bool,
+        schedule: SendRetrySchedule,
     ) -> Result<(), StoreError> {
-        if !schedule {
+        if matches!(schedule, SendRetrySchedule::None) {
             return Ok(());
         }
         let row = transaction
@@ -3407,7 +3439,16 @@ impl Store {
         if queued as u64 >= u64::from(MAX_RETRY_QUEUED_PER_ACCOUNT) {
             return Self::retire_retry_schedule_in(transaction, message_id);
         }
-        let delay = Self::retry_backoff_delay_ms(attempt_count as u32 + 1);
+        let delay = match schedule {
+            // The 429/413 family waits the server's pause, not the curve:
+            // this wire carries no Retry-After value, so the official
+            // default (one minute) is the beat.
+            SendRetrySchedule::RateLimit => RATE_LIMIT_RETRY_AFTER_MS,
+            SendRetrySchedule::Backoff => Self::retry_backoff_delay_ms(attempt_count as u32 + 1),
+            // Unreachable — the None arm returned before the row read — but
+            // a no-op keeps the match total without inventing behavior.
+            SendRetrySchedule::None => return Ok(()),
+        };
         transaction
             .execute(
                 "UPDATE messages SET next_attempt_at=?2,
@@ -8509,7 +8550,11 @@ mod tests {
             None,
         );
         store
-            .settle_send_failed("m-curve", first_failure, true)
+            .settle_send_failed(
+                "m-curve",
+                first_failure,
+                crate::store::SendRetrySchedule::Backoff,
+            )
             .unwrap()
             .unwrap();
         let (_, first, count, next) = retry_face(&store, "m-curve");
@@ -8526,7 +8571,11 @@ mod tests {
         let claims = store.claim_due_retries(first_failure + 190, 10).unwrap();
         assert_eq!(claims.len(), 1);
         store
-            .settle_send_failed("m-curve", first_failure + 190, true)
+            .settle_send_failed(
+                "m-curve",
+                first_failure + 190,
+                crate::store::SendRetrySchedule::Backoff,
+            )
             .unwrap()
             .unwrap();
         let (_, first, count, next) = retry_face(&store, "m-curve");
@@ -8540,6 +8589,83 @@ mod tests {
             next,
             Some((first_failure + 190 + 361) as i64),
             "the second beat is 190 ms · 1.9"
+        );
+    }
+
+    /// Contract 1.143 (§4.139): the rate-limit arm schedules the official
+    /// Retry-After default, not the curve — the exact one-minute beat from
+    /// the settlement instant, one attempt spent, the window anchor stamped
+    /// like any queue row. The eligibility gate is the shared one: a row
+    /// past its attempt budget settles plain failed with the face retired
+    /// even under the rate-limit family.
+    #[test]
+    fn rate_limit_settlement_schedules_the_retry_after_beat_not_the_curve() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let conversation = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let first_failure: u64 = 1_800_000_000_000;
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-ratelimit",
+            "req-ratelimit",
+            "pending",
+            None,
+            0,
+            None,
+        );
+        store
+            .settle_send_failed(
+                "m-ratelimit",
+                first_failure,
+                crate::store::SendRetrySchedule::RateLimit,
+            )
+            .unwrap()
+            .unwrap();
+        let (_, first, count, next) = retry_face(&store, "m-ratelimit");
+        assert_eq!(
+            (first, count, next),
+            (
+                Some(first_failure as i64),
+                1,
+                Some((first_failure + crate::store::RATE_LIMIT_RETRY_AFTER_MS) as i64)
+            ),
+            "the beat is the Retry-After default, never the 190 ms curve head"
+        );
+
+        // The shared eligibility gate holds on this arm too: a row that
+        // spent its attempt budget settles plain failed with the face
+        // retired — the rate-limit family is not a budget bypass.
+        seed_retry_row(
+            &store,
+            &account.id,
+            &conversation.id,
+            "m-ratelimit-spent",
+            "req-ratelimit-spent",
+            "pending",
+            None,
+            MAX_RETRY_ATTEMPTS,
+            None,
+        );
+        store
+            .settle_send_failed(
+                "m-ratelimit-spent",
+                first_failure,
+                crate::store::SendRetrySchedule::RateLimit,
+            )
+            .unwrap()
+            .unwrap();
+        let (_, first, count, next) = retry_face(&store, "m-ratelimit-spent");
+        assert_eq!(
+            (first, count, next),
+            (None, MAX_RETRY_ATTEMPTS as i64, None),
+            "the spent row stays terminal under the rate-limit arm"
         );
     }
 
@@ -8703,7 +8829,7 @@ mod tests {
             None,
         );
         store
-            .settle_send_failed("m-over-cap", now, true)
+            .settle_send_failed("m-over-cap", now, crate::store::SendRetrySchedule::Backoff)
             .unwrap()
             .unwrap();
         let (status, first, count, next) = retry_face(&store, "m-over-cap");
@@ -8725,7 +8851,11 @@ mod tests {
             None,
         );
         store
-            .settle_send_failed("m-other-account", now, true)
+            .settle_send_failed(
+                "m-other-account",
+                now,
+                crate::store::SendRetrySchedule::Backoff,
+            )
             .unwrap()
             .unwrap();
         let (_, first, count, next) = retry_face(&store, "m-other-account");
@@ -8765,7 +8895,7 @@ mod tests {
             None,
         );
         store
-            .settle_send_failed("m-spent", now, true)
+            .settle_send_failed("m-spent", now, crate::store::SendRetrySchedule::Backoff)
             .unwrap()
             .unwrap();
         let (status, first, count, next) = retry_face(&store, "m-spent");
