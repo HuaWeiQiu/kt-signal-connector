@@ -381,6 +381,22 @@ pub enum EngineEvent {
         conversations: Value,
         overflow: bool,
     },
+    /// The engine's `engine.storagePull` notification (contract 1.141,
+    /// §4.137): the storage-manifest pull outcome — the engine's T-9b result
+    /// event fired once per pull attempt (the login-time automatic pull and
+    /// every `fetchLatest` leg), with the per-family legs answering
+    /// truthfully (`contactsOk`/`groupsOk`) rather than a bare done bit.
+    /// `trigger` forwards verbatim: the type is guaranteed (a string), the
+    /// value domain is not — an engine trigger word this connector has not
+    /// seen rides through unnamed, never guessed into a known one. The
+    /// account-domain transient lane (the supervisor's engine-event watcher)
+    /// resolves the account and forwards the host frame.
+    StoragePull {
+        account: String,
+        trigger: String,
+        contacts_ok: bool,
+        groups_ok: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2691,6 +2707,46 @@ async fn handle_upstream_line(
                         account: account.to_string(),
                         conversations,
                         overflow,
+                    });
+                }
+                _ => {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
+            }
+        } else if method == "engine.storagePull" {
+            // Contract 1.141 §4.137: the engine's storage-manifest pull
+            // outcome event, forwarded through the same account-domain lane.
+            // The parse guarantees the faces the engine contract promises —
+            // the attribution account, the `trigger` word (a string whose
+            // VALUE domain is deliberately unlocked: an engine trigger this
+            // connector has not seen forwards verbatim, never guessed into a
+            // known one), and the two per-family result bits — and a missing
+            // or wrong-typed face is a protocol error answered by the
+            // unknown-notification warning, never a guessed forward.
+            let params = object.get("params");
+            let account = params
+                .and_then(|params| params.get("account"))
+                .and_then(Value::as_str)
+                .filter(|account| !account.is_empty());
+            let trigger = params
+                .and_then(|params| params.get("trigger"))
+                .and_then(Value::as_str)
+                .filter(|trigger| !trigger.is_empty());
+            let contacts_ok = params
+                .and_then(|params| params.get("contactsOk"))
+                .and_then(Value::as_bool);
+            let groups_ok = params
+                .and_then(|params| params.get("groupsOk"))
+                .and_then(Value::as_bool);
+            match (account, trigger, contacts_ok, groups_ok) {
+                (Some(account), Some(trigger), Some(contacts_ok), Some(groups_ok)) => {
+                    let _ = events.send(EngineEvent::StoragePull {
+                        account: account.to_string(),
+                        trigger: trigger.to_string(),
+                        contacts_ok,
+                        groups_ok,
                     });
                 }
                 _ => {
@@ -9389,6 +9445,68 @@ mod tests {
         assert_eq!(account, "+15555550100");
         assert_eq!(carried, conversations, "the array rides verbatim");
         assert!(!overflow);
+
+        // Contract 1.141 (§4.137): the storage-pull outcome rides the same
+        // lane. The engine's current trigger vocabulary is login/fetchLatest;
+        // the parse types the word but does not pin the domain — the unseen
+        // value below forwards verbatim, never rewritten into a known one.
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+                "params": {
+                    "account": "+15555550100",
+                    "trigger": "login",
+                    "contactsOk": true,
+                    "groupsOk": false,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::StoragePull {
+            account,
+            trigger,
+            contacts_ok,
+            groups_ok,
+        } = event_rx.recv().await.unwrap()
+        else {
+            panic!("expected the StoragePull event");
+        };
+        assert_eq!(account, "+15555550100");
+        assert_eq!(trigger, "login");
+        assert!(contacts_ok);
+        assert!(!groups_ok);
+
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+                "params": {
+                    "account": "+15555550100",
+                    "trigger": "someFutureEngineTrigger",
+                    "contactsOk": false,
+                    "groupsOk": true,
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        let EngineEvent::StoragePull { trigger, .. } = event_rx.recv().await.unwrap() else {
+            panic!("expected the StoragePull event");
+        };
+        assert_eq!(
+            trigger, "someFutureEngineTrigger",
+            "an unseen trigger word forwards verbatim, never guessed"
+        );
     }
 
     /// Contract 1.134 (§4.117): the account-domain notifications follow the
@@ -9449,6 +9567,49 @@ mod tests {
                     "account": "+15555550100",
                     "conversations": [{ "conversationId": "x" }],
                     "overflow": "yes",
+                }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+                "params": { "account": "" }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+                "params": {
+                    "account": "+15555550100",
+                    "trigger": 7,
+                    "contactsOk": true,
+                    "groupsOk": true,
+                }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+                "params": {
+                    "account": "+15555550100",
+                    "trigger": "login",
+                    "contactsOk": "yes",
+                    "groupsOk": true,
+                }
+            }))
+            .unwrap(),
+            serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "method": "engine.storagePull",
+                "params": {
+                    "account": "+15555550100",
+                    "trigger": "login",
+                    "contactsOk": true,
                 }
             }))
             .unwrap(),

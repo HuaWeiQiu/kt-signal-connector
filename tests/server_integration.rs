@@ -2451,6 +2451,8 @@ async fn engine_notifications_forward_through_the_transient_lane() {
                 "account": "+15555550100", "skewMs": -86_400_001_i64, "serverTimestamp": 1727000000000_u64 } },
             { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
                 "account": "+15555550100", "conversations": conversations, "overflow": false } },
+            { "jsonrpc": "2.0", "method": "engine.storagePull", "params": {
+                "account": "+15555550100", "trigger": "login", "contactsOk": true, "groupsOk": false } },
         ] })
         .to_string(),
     )
@@ -2459,15 +2461,18 @@ async fn engine_notifications_forward_through_the_transient_lane() {
     let mut saw_emptied = None;
     let mut saw_skew = None;
     let mut saw_state = None;
+    let mut saw_pull = None;
     for _ in 0..24 {
         let frame = next_frame(&mut client).await;
         match frame["event"].as_str() {
             Some("receive.emptied") => saw_emptied = Some(frame),
             Some("receive.clockSkew") => saw_skew = Some(frame),
             Some("conversation.stateChanged") => saw_state = Some(frame),
+            Some("engine.storagePull") => saw_pull = Some(frame),
             _ => {}
         }
-        if saw_emptied.is_some() && saw_skew.is_some() && saw_state.is_some() {
+        if saw_emptied.is_some() && saw_skew.is_some() && saw_state.is_some() && saw_pull.is_some()
+        {
             break;
         }
     }
@@ -2484,6 +2489,13 @@ async fn engine_notifications_forward_through_the_transient_lane() {
         "the batch rides verbatim, sibling keys included"
     );
     assert_eq!(state["data"]["overflow"], false);
+    // Contract 1.141 (§4.137): the storage-pull outcome rides the same lane
+    // with the resolved account and the verbatim trigger.
+    let pull = saw_pull.expect("engine.storagePull must ride the lane");
+    assert_eq!(pull["data"]["accountId"], account_id);
+    assert_eq!(pull["data"]["trigger"], "login");
+    assert_eq!(pull["data"]["contactsOk"], true);
+    assert_eq!(pull["data"]["groupsOk"], false);
 
     // F red line: a batch past the engine's own 256-entry cap forwards
     // verbatim — the connector never trims, and the overflow tail marker
@@ -2655,6 +2667,8 @@ async fn engine_notifications_forward_through_the_transient_lane() {
             { "jsonrpc": "2.0", "method": "receive.emptied", "params": { "account": "+15555550999" } },
             { "jsonrpc": "2.0", "method": "receive.conversationState", "params": {
                 "account": "+15555550100", "conversations": 42, "overflow": false } },
+            { "jsonrpc": "2.0", "method": "engine.storagePull", "params": {
+                "account": "+15555550100", "trigger": "login", "contactsOk": true } },
         ] })
         .to_string(),
     )
@@ -2669,7 +2683,9 @@ async fn engine_notifications_forward_through_the_transient_lane() {
         };
         match frame["event"].as_str() {
             Some("runtime.protocolWarning") => saw_warning = true,
-            Some("receive.emptied") | Some("conversation.stateChanged") => {
+            Some("receive.emptied")
+            | Some("conversation.stateChanged")
+            | Some("engine.storagePull") => {
                 unattributed_forward = Some(frame);
                 break;
             }

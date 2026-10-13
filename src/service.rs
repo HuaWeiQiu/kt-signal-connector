@@ -1399,6 +1399,20 @@ pub enum HostSideEvent {
         conversations: Value,
         overflow: bool,
     },
+    /// The engine's `engine.storagePull` notification forwarded (contract
+    /// 1.141, §4.137): the storage-manifest pull outcome — the trigger word
+    /// rides verbatim (the connector unlocks the value domain: an engine
+    /// trigger it has not seen forwards unnamed, never guessed) beside the
+    /// two per-family result legs. The desktop learns whether the
+    /// post-pull state is already fresh without polling the storage read
+    /// faces. Transient: nothing persists, and a missed event converges
+    /// through the ordinary pull faces.
+    StoragePull {
+        account_id: String,
+        trigger: String,
+        contacts_ok: bool,
+        groups_ok: bool,
+    },
 }
 
 /// One conversation-scoped delete group on the `message.deleteForMe` event
@@ -7785,6 +7799,30 @@ impl ConnectorService {
             account_id: account.id.clone(),
             conversations,
             overflow,
+        }])
+    }
+
+    /// The `engine.storagePull` arm of the account-domain lane (contract
+    /// 1.141, §4.137): the trigger word forwards verbatim — the connector
+    /// unlocks the value domain (an engine trigger it has not seen rides
+    /// unnamed, never guessed into a known one) — beside the two per-family
+    /// result legs the engine answered truthfully.
+    pub fn forward_storage_pull(
+        &self,
+        signal_account: &str,
+        trigger: &str,
+        contacts_ok: bool,
+        groups_ok: bool,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) = self.resolve_account_transient(signal_account, "engine.storagePull")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::StoragePull {
+            account_id: account.id.clone(),
+            trigger: trigger.to_string(),
+            contacts_ok,
+            groups_ok,
         }])
     }
 
@@ -24995,11 +25033,12 @@ mod tests {
         assert_eq!(listed.items.len(), 1, "the terminated group creates none");
     }
 
-    /// The account-domain transient lane (contract 1.134, §4.117): the
-    /// three standalone notifications resolve their bound account and
-    /// forward one host frame each — the conversations array verbatim —
-    /// while an unbound signal account drops warn-only with the perf
-    /// counter, never claimed as forwarded.
+    /// The account-domain transient lane (contract 1.134, §4.117; the
+    /// storage-pull arm joins with 1.141, §4.137): the four standalone
+    /// notifications resolve their bound account and forward one host frame
+    /// each — the conversations array verbatim — while an unbound signal
+    /// account drops warn-only with the perf counter, never claimed as
+    /// forwarded.
     #[test]
     fn account_transient_lane_resolves_or_drops_unattributed() {
         crate::perf_metrics::reset_for_tests();
@@ -25053,6 +25092,26 @@ mod tests {
         assert_eq!(carried, &conversations, "the array rides verbatim");
         assert!(*overflow);
 
+        // Contract 1.141 (§4.137): the storage-pull outcome rides the same
+        // lane — trigger verbatim, the two legs as answered.
+        let events = service
+            .forward_storage_pull("+15555550100", "fetchLatest", true, false)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoragePull {
+            account_id,
+            trigger,
+            contacts_ok,
+            groups_ok,
+        } = &events[0]
+        else {
+            panic!("expected a StoragePull event: {events:?}");
+        };
+        assert_eq!(account_id, &account.id);
+        assert_eq!(trigger, "fetchLatest");
+        assert!(*contacts_ok);
+        assert!(!*groups_ok);
+
         // The unbound account: no frame, the honest warn-only drop.
         let events = service.forward_receive_emptied("+15555550999").unwrap();
         assert!(
@@ -25064,7 +25123,7 @@ mod tests {
         let counters = snapshot["counters"].as_object().unwrap();
         assert_eq!(
             counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_FORWARDED],
-            3
+            4
         );
         assert_eq!(
             counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_UNATTRIBUTED],

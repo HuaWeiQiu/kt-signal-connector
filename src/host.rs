@@ -3948,6 +3948,30 @@ where
             )
             .await
         }
+        HostSideEvent::StoragePull {
+            account_id,
+            trigger,
+            contacts_ok,
+            groups_ok,
+        } => {
+            // Contract 1.141, §4.137: the storage-manifest pull outcome —
+            // the trigger word rides verbatim (the value domain stays the
+            // engine's; the connector never rewrites an unseen word into a
+            // known one) beside the two per-family result legs.
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "engine.storagePull",
+                    json!({
+                        "accountId": account_id,
+                        "trigger": trigger,
+                        "contactsOk": contacts_ok,
+                        "groupsOk": groups_ok,
+                    }),
+                ),
+            )
+            .await
+        }
     }
 }
 
@@ -4877,6 +4901,34 @@ mod tests {
         assert_eq!(frame["data"]["accountId"], "acct-1");
         assert_eq!(frame["data"]["conversations"], conversations, "verbatim");
         assert_eq!(frame["data"]["overflow"], true);
+
+        // Contract 1.141 (§4.137): the storage-pull outcome frame — the
+        // trigger word rides verbatim (an unseen engine word stays itself)
+        // beside the two per-family legs.
+        let frame = read_frame(HostSideEvent::StoragePull {
+            account_id: "acct-1".into(),
+            trigger: "fetchLatest".into(),
+            contacts_ok: true,
+            groups_ok: false,
+        })
+        .await;
+        assert_eq!(frame["event"], "engine.storagePull");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
+        assert_eq!(frame["data"]["trigger"], "fetchLatest");
+        assert_eq!(frame["data"]["contactsOk"], true);
+        assert_eq!(frame["data"]["groupsOk"], false);
+
+        let frame = read_frame(HostSideEvent::StoragePull {
+            account_id: "acct-1".into(),
+            trigger: "someFutureEngineTrigger".into(),
+            contacts_ok: false,
+            groups_ok: true,
+        })
+        .await;
+        assert_eq!(
+            frame["data"]["trigger"], "someFutureEngineTrigger",
+            "an unseen trigger forwards verbatim: {frame}"
+        );
     }
 
     /// Contract 1.100 (§4.81 D3): the `group.changed` wire frame — the

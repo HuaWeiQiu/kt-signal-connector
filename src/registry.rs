@@ -289,7 +289,8 @@ impl ProxyGroupRuntime {
             EngineEvent::AccountUnauthorized { .. }
             | EngineEvent::ReceiveEmptied { .. }
             | EngineEvent::ReceiveClockSkew { .. }
-            | EngineEvent::ConversationState { .. } => {
+            | EngineEvent::ConversationState { .. }
+            | EngineEvent::StoragePull { .. } => {
                 // Contract 1.21: handled by the supervisor's engine-event
                 // watcher, which owns the service handle. Contract 1.134
                 // §4.117: the account-domain transient notifications ride

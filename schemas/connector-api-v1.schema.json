@@ -4302,7 +4302,8 @@
             "contact.profileUpdated",
             "receive.emptied",
             "receive.clockSkew",
-            "conversation.stateChanged"
+            "conversation.stateChanged",
+            "engine.storagePull"
           ]
         },
         "data": {
@@ -5195,6 +5196,38 @@
                   "overflow": {
                     "type": "boolean",
                     "description": "The engine's batch-cap tail marker: true = the batch was truncated at the engine's 256-entry cap and the desktop should re-read the full set through conversations.getState."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "engine.storagePull" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "trigger", "contactsOk", "groupsOk"],
+                "description": "One storage-manifest pull outcome forwarded (contract 1.141, §4.137): the engine's engine.storagePull standalone notification — the engine fires one event per pull attempt (the login-time automatic pull, trigger login, and every fetchLatest pull), with the per-family legs answering truthfully rather than a bare done bit. The trigger word forwards verbatim: the connector deliberately does not pin the value vocabulary (the schema declares the engine's current login|fetchLatest pair descriptively, and an engine trigger this connector has not seen rides through unnamed — the forward is honest, never a guess into a known word). A missed event converges through the ordinary pull faces; nothing persists connector-side.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "trigger": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "The pull's trigger word, forwarded verbatim. The engine's current vocabulary is login (the link-time automatic pull) and fetchLatest; the connector does not enforce the pair — an unseen engine word forwards unchanged."
+                  },
+                  "contactsOk": {
+                    "type": "boolean",
+                    "description": "Whether the pull's contacts leg landed."
+                  },
+                  "groupsOk": {
+                    "type": "boolean",
+                    "description": "Whether the pull's groups leg landed."
                   }
                 }
               }

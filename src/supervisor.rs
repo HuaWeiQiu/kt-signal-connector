@@ -7735,7 +7735,9 @@ fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
 /// account-scoped notifications (`receive.emptied` / `receive.clockskew` /
 /// `receive.conversationState`) resolve their account through the store and
 /// forward their host frames here; an unmatchable account drops warn-only
-/// inside the service (never silently claimed as forwarded).
+/// inside the service (never silently claimed as forwarded). Contract 1.141
+/// §4.137: the storage-manifest pull outcome event (`engine.storagePull`)
+/// joins the same lane with the same attribution discipline.
 async fn engine_event_watch_loop(
     mut engine_events: broadcast::Receiver<EngineEvent>,
     service: Arc<Mutex<ConnectorService>>,
@@ -7787,6 +7789,18 @@ async fn engine_event_watch_loop(
                 let forwarded = {
                     let guard = service.lock().await;
                     guard.forward_conversation_state(&account, conversations, overflow)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
+            Ok(EngineEvent::StoragePull {
+                account,
+                trigger,
+                contacts_ok,
+                groups_ok,
+            }) => {
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_storage_pull(&account, &trigger, contacts_ok, groups_ok)
                 };
                 emit_forwarded(&host_events, forwarded);
             }

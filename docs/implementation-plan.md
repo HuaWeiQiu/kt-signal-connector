@@ -19,7 +19,26 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.140 (2026-10-13; the batch-S quick-win leg — three
+- Contract revision: 1.141 (2026-10-13; the engine.storagePull forwarding
+  face (§4.137): the engine's T-9b storage-manifest pull outcome event —
+  fired once per pull attempt (the login-time automatic pull, trigger
+  `login`, and every `fetchLatest` leg) with the per-family legs answering
+  truthfully (`contactsOk`/`groupsOk`) instead of a bare done bit — rides
+  the §4.117 account-domain transient lane end to end: the parse arm
+  guarantees the faces the engine contract promises (the attribution
+  account, the trigger word typed as a string with the value domain
+  deliberately unlocked so an engine trigger this connector has not seen
+  forwards verbatim, never guessed into a known one, and the two boolean
+  legs; a missing or wrong-typed face is the unknown-notification
+  protocol error, never a guessed forward), the supervisor watcher and
+  the service's resolve-or-drop attribution forward through the same
+  `account_transient_forwarded`/`_unattributed` counters, and the host
+  frame is `engine.storagePull` `{accountId, trigger, contactsOk,
+  groupsOk}`. Wire additive-only: one new host event name, no new method,
+  error, capability, or store move. Tests 771 held (lib 589 held; the
+  four transient-lane tests grow the storagePull assertions in place,
+  the 1.119 extended-tests posture), all green) —
+  previously 1.140 (2026-10-13; the batch-S quick-win leg — three
   correctness/parity gaps the send-and-sync-granularity audit surfaced, all
   connector-internal, zero wire change: the §4.134 attachment-caption retry
   guard (a failed attachment row carrying a non-empty caption never enters
@@ -10599,6 +10618,66 @@ fail-closed skip for an empty or hostile face), and
 `conversation.changed`, a replay is silent, an unknown identity drops
 warn-only, the group half consumes nothing, no message row is ever
 created). Gates: fmt, clippy `-D warnings`, tests all green.
+
+### 4.137 The storage pull outcome reaches the host: `engine.storagePull` rides the account-domain transient lane (contract revision 1.141, 2026-10-13)
+
+The engine's T-9b batch (the storage-manifest pull leg, engine
+`b719997`, joined by the result-event emission this batch pairs with)
+fires a standalone notification once per manifest pull attempt — the
+login-time automatic pull (`trigger: "login"`) and every
+`fetchLatest`-triggered pull — and the connector used to answer the
+unknown method with the plain protocol warning. The event now rides the
+§4.117 account-domain transient lane end to end, the same posture the
+emptied/clockskew/conversationState trio already runs: the parse arm
+emits an attributed `EngineEvent::StoragePull`, the supervisor's
+engine-event watcher hands it to the service, the service resolves the
+signal account through the store (the shared
+`account_transient_forwarded`/`_unattributed` counters — an unbound
+account drops warn-only, never claimed as forwarded), and the host frame
+`engine.storagePull` `{accountId, trigger, contactsOk, groupsOk}` rides
+the shared event stream.
+
+The parse guarantees exactly the faces the engine contract promises and
+deliberately nothing more: the attribution account (non-empty string —
+the malformed family falls back to the unknownNotification warning), the
+`trigger` word, and the two per-family result legs (`contactsOk` /
+`groupsOk`, booleans). The trigger word is typed but its value domain is
+deliberately unlocked: the engine's current vocabulary is `login` /
+`fetchLatest`, and the connector neither pins nor translates it — an
+engine trigger word this connector has not seen forwards verbatim,
+because a guessed rewrite would tell the desktop a lie about which pull
+finished, and a schema-enforced pair would reject the very frames the
+honest-forward posture exists to deliver (the schema declares the pair
+descriptively, not as an enum). A missing or wrong-typed face (no
+account, a numeric trigger, a string leg, a missing `groupsOk`) is a
+protocol error answered by the unknownNotification warning, never a
+guessed forward — the §4.117 discipline verbatim.
+
+The event is transient on the connector side like every lane member: no
+row, nothing persisted, nothing self-heals; a missed event converges
+through the ordinary pull faces the next time the desktop reads them.
+The desktop's consumption is its own: with the truthful per-family legs
+it can skip its post-pull refresh work when the pull already landed
+fresh, and it can schedule one when a leg failed, without polling.
+
+Wire additive-only: one new host event name (`engine.storagePull`), no
+new method, error, capability, or store move; the perf word list grows
+nothing (the lane's two counters are the honest face). Zero engine-side
+coupling beyond the pinned notification shape (`params` = account /
+trigger / contactsOk / groupsOk).
+
+Tests (the four transient-lane tests grow the storagePull assertions in
+place, the 1.119 extended-tests posture): the engine parse arm (the
+login pull and an unseen trigger word forwarded verbatim; the malformed
+family — missing/empty account, numeric trigger, string `contactsOk`,
+missing `groupsOk` — into the unknownNotification warning), the service
+forward arm (the bound account resolves, the unbound account drops with
+both perf counters), the host wire frame (the verbatim trigger beside
+the two legs), and the end-to-end harness over the real engine process
+(the fixture's raw-notification marker grows the storagePull entry; the
+frame rides with the resolved accountId, and the malformed face joins
+the unattributed non-forward batch as a protocol warning). Gates: fmt,
+clippy `-D warnings`, tests all green.
 
 ## 5. signal-cli Boundary
 
