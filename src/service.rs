@@ -10324,6 +10324,14 @@ impl ConnectorService {
     /// conversation skeletons — a newly materialized one or one whose
     /// placeholder title the batch upgraded — ride `conversation.changed`, so
     /// the desktop's conversation list converges without a refetch.
+    /// Contract 1.146 (§4.144): a numbered record's ACI also lands in
+    /// `peer_identities` — the same write the §4.37 receive chain performs,
+    /// same (aci ≠ peer_key) guard — so a number-keyed contact that never
+    /// showed up on a live envelope still resolves its ACI for the §4.129
+    /// summary derivation and the outgoing-call addressing (the pre-1.146
+    /// ingest dropped it, leaving the row with no serviceId at all). An
+    /// aci-only record writes nothing: its peer key *is* the ACI, the
+    /// self-row the §4.37 ladder skips.
     fn apply_sync_contacts(
         &mut self,
         account: &AccountRow,
@@ -10341,6 +10349,10 @@ impl ConnectorService {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| record.aci.clone());
+            if record.number.is_some() && record.aci != peer_key {
+                self.store
+                    .upsert_peer_identity(&account.id, &record.aci, &peer_key)?;
+            }
             let title = record
                 .name
                 .as_deref()
@@ -28195,7 +28207,10 @@ mod tests {
     /// materializes the direct conversation skeletons through the pull
     /// path's sibling store write — the pull marker untouched — and exactly
     /// the changed conversations ride `conversation.changed`: a replay is
-    /// silent, a name that upgrades a masked title emits again.
+    /// silent, a name that upgrades a masked title emits again. Contract
+    /// 1.146 (§4.144): a numbered record's ACI lands in `peer_identities`
+    /// (the aci-only sibling writes nothing), so the materialized summary
+    /// derives its serviceId.
     #[test]
     fn sync_contacts_passive_batch_lands_cache_and_emits_changes() {
         let (_temp, mut service) = service();
@@ -28251,6 +28266,30 @@ mod tests {
             .find(|summary| summary.title == "Alice")
             .expect("the named contact's summary rode the change");
         assert_eq!(titled.kind, "direct");
+        // Contract 1.146 (§4.144): the numbered record's ACI landed in
+        // peer_identities, so the summary derives its serviceId at read
+        // time — the row the pre-1.146 ingest left identifier-less.
+        assert_eq!(
+            titled.service_id.as_deref(),
+            Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        );
+        assert_eq!(
+            service
+                .store_ref()
+                .aci_for_peer_key(&account.id, "+15551234567")
+                .unwrap()
+                .as_deref(),
+            Some("6a2cb17f-ef7c-4a5d-9c69-6f8b2b1f88ae")
+        );
+        // The aci-only sibling writes nothing: its peer key *is* the ACI,
+        // the self-row the §4.37 ladder skips.
+        assert!(
+            service
+                .store_ref()
+                .peer_keys_for_aci(&account.id, "0b1c2d3e-4f50-4a1b-8c2d-3e4f50617283")
+                .unwrap()
+                .is_empty()
+        );
         let row = service
             .store_ref()
             .conversation_by_peer(&account.id, "direct", "+15551234567")

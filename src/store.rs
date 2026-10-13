@@ -650,11 +650,12 @@ pub struct ConversationSummary {
     /// faces (`*ServiceIdEndsWith` / `*E164EndsWith` / `*GroupIdEndsWith`)
     /// can match without a second lookup. A group row keys `groupId` off the
     /// raw group master key; a direct row resolves `e164` (the `+`-prefixed
-    /// phone key), `serviceId` (a UUID-shaped key, or a number-shaped key
-    /// mapped through the most recent ingest-written `peer_identities` row),
-    /// or neither. `pni` is reserved and always absent — the connector has
-    /// no PNI source and never invents one (the honest hole §4.129
-    /// documents).
+    /// phone key), `serviceId` (a UUID-shaped key, or a phone-keyed row in
+    /// either spelling mapped through the most recent ingest-written
+    /// `peer_identities` row — the 1.146 §4.144 widening puts the ACI on the
+    /// `+`-keyed rows too), or neither. `pni` is reserved and always
+    /// absent — the connector has no PNI source and never invents one (the
+    /// honest hole §4.129 documents).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -955,6 +956,36 @@ fn aci_for_peer_key_on(
     Ok(aci)
 }
 
+/// Contract 1.146 (§4.144): the phone-keyed reverse lookup with the two-form
+/// number normalization. The identity writers spell the same number either
+/// way — the receive chain's contacts hit resolves to the engine's
+/// `+`-prefixed e164 while history-imported and sync-projected keys spell
+/// bare digits — so a number-shaped row key resolves through both exact
+/// spellings before it answers absent. The exact-form probe runs first (the
+/// common case), the alternate only on a miss: at most two indexed probes,
+/// no normalization table, no cache (one source, the §4.97 posture). A key
+/// in neither spelling (a group key, a UUID, arbitrary text) has no
+/// alternate form and answers the exact probe alone.
+fn aci_for_phone_key_on(
+    conn: &Connection,
+    account_id: &str,
+    peer_key: &str,
+) -> Result<Option<String>, StoreError> {
+    if let Some(aci) = aci_for_peer_key_on(conn, account_id, peer_key)? {
+        return Ok(Some(aci));
+    }
+    let alternate = match peer_key.strip_prefix('+') {
+        Some(bare) => bare.to_string(),
+        None => {
+            if peer_key.is_empty() || !peer_key.chars().all(|c| c.is_ascii_digit()) {
+                return Ok(None);
+            }
+            format!("+{peer_key}")
+        }
+    };
+    aci_for_peer_key_on(conn, account_id, &alternate)
+}
+
 /// One summary row's derived identifiers (§4.129): each leg absent-key on
 /// the wire.
 #[derive(Clone, Debug, Default)]
@@ -964,16 +995,18 @@ struct ConversationIdentifiers {
     group_id: Option<String>,
 }
 
-/// Contract 1.138 (§4.129): one summary row's protocol identifiers, derived
-/// at read time from the peer key's shape — the desktop's `!` selector faces
-/// match on these without a second lookup. A group row keys `groupId` off
-/// the raw group master key (the §4.44/§4.50 addressing form). A direct row
-/// resolves `e164` off a `+`-prefixed phone key, `serviceId` off a
-/// UUID-shaped key, or — a number-shaped key (history-imported, no live
-/// envelope seen yet) — through the most recent `peer_identities` mapping
-/// the ingest wrote. A key nothing resolves answers all-absent: the row
-/// stays addressable by id, no identifier is invented. `pni` never appears —
-/// the connector has no PNI source (the honest hole §4.129 documents).
+/// Contract 1.138 (§4.129, widened by 1.146 §4.144): one summary row's
+/// protocol identifiers, derived at read time from the peer key's shape —
+/// the desktop's `!` selector faces match on these without a second lookup.
+/// A group row keys `groupId` off the raw group master key (the §4.44/§4.50
+/// addressing form). A direct row resolves `e164` off a `+`-prefixed phone
+/// key, `serviceId` off a UUID-shaped key, or — a phone-keyed row in either
+/// spelling (`+`-prefixed or bare digits: history-imported, no live envelope
+/// seen yet, or a `+`-keyed row the ingest mapped) — through the most recent
+/// `peer_identities` mapping the ingest wrote, both spellings probed. A key
+/// nothing resolves answers all-absent: the row stays addressable by id, no
+/// identifier is invented. `pni` never appears — the connector has no PNI
+/// source (the honest hole §4.129 documents).
 fn conversation_identifiers(
     conn: &Connection,
     account_id: &str,
@@ -989,6 +1022,7 @@ fn conversation_identifiers(
     if peer_key.starts_with('+') {
         return Ok(ConversationIdentifiers {
             e164: Some(peer_key.to_string()),
+            service_id: aci_for_phone_key_on(conn, account_id, peer_key)?,
             ..ConversationIdentifiers::default()
         });
     }
@@ -999,7 +1033,7 @@ fn conversation_identifiers(
         });
     }
     Ok(ConversationIdentifiers {
-        service_id: aci_for_peer_key_on(conn, account_id, peer_key)?,
+        service_id: aci_for_phone_key_on(conn, account_id, peer_key)?,
         ..ConversationIdentifiers::default()
     })
 }
@@ -1376,6 +1410,15 @@ pub struct ContactSummary {
     /// pre-1.60 hosts read byte-identical rows.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_terminated: bool,
+    /// Contract 1.146 (§4.144): the direct row's ServiceId, derived at read
+    /// time through the §4.129 family the conversation summaries run — a
+    /// UUID-shaped peer key answers verbatim, a phone-keyed row (either
+    /// spelling) maps through the most recent ingest-written
+    /// `peer_identities` row, a key nothing resolves and every group row
+    /// answer absent (no identifier invented). Additive absent-key wire:
+    /// pre-1.146 hosts read byte-identical rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_id: Option<String>,
 }
 
 /// One recorded reaction (contract 1.15): the actor's emoji state on a target
@@ -6714,6 +6757,14 @@ impl Store {
                     let kind = static_contact_kind(row.get::<_, String>(1)?);
                     let peer_key: String = row.get(2)?;
                     let extra: Option<String> = row.get(4)?;
+                    // Contract 1.146 (§4.144): the direct row's serviceId
+                    // derives through the §4.129 family over the already
+                    // held connection guard (the §4.42 summary-list
+                    // discipline; the tolerant read — a failed lookup
+                    // degrades to absent, never fails the page).
+                    let service_id =
+                        conversation_identifiers_lossy(&conn, account_id, kind, &peer_key)
+                            .service_id;
                     Ok(ContactSummary {
                         id: row.get(0)?,
                         is_terminated: kind == "group" && extra_is_terminated(extra.as_deref()),
@@ -6721,6 +6772,7 @@ impl Store {
                         is_self: contact_is_self(kind, &peer_key, signal_account.as_deref()),
                         peer_key,
                         title: row.get(3)?,
+                        service_id,
                     })
                 },
             )
@@ -9370,12 +9422,14 @@ mod tests {
         );
     }
 
-    /// Contract 1.138 (§4.129): the summary identifiers derive from the peer
-    /// key's shape — a group row keys groupId off the raw master key, a
-    /// +prefixed direct row answers e164, a UUID-shaped direct row answers
+    /// Contract 1.138 (§4.129, widened by 1.146 §4.144): the summary
+    /// identifiers derive from the peer key's shape — a group row keys
+    /// groupId off the raw master key, a +prefixed direct row answers e164
+    /// (and, since 1.146, serviceId when the ingest-written peer_identities
+    /// row resolves — in either spelling), a UUID-shaped direct row answers
     /// serviceId, a number-shaped direct row maps through the most recent
-    /// peer_identities row, and a key nothing resolves answers all-absent.
-    /// pni is never present.
+    /// peer_identities row (either spelling), and a key nothing resolves
+    /// answers all-absent. pni is never present.
     #[test]
     fn conversation_summary_projects_identifiers_from_the_peer_key() {
         let temp = TempDir::new().unwrap();
@@ -9389,6 +9443,12 @@ mod tests {
         let plus = store
             .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
             .unwrap();
+        let plus_mapped = store
+            .ensure_conversation(&account.id, "direct", "+15555550104", "contact")
+            .unwrap();
+        let plus_exact_map = store
+            .ensure_conversation(&account.id, "direct", "+15555550105", "contact")
+            .unwrap();
         let uuid = store
             .ensure_conversation(
                 &account.id,
@@ -9400,15 +9460,43 @@ mod tests {
         let number = store
             .ensure_conversation(&account.id, "direct", "15555550102", "contact")
             .unwrap();
+        let number_plus_map = store
+            .ensure_conversation(&account.id, "direct", "15555550106", "contact")
+            .unwrap();
         let number_orphan = store
             .ensure_conversation(&account.id, "direct", "15555550103", "contact")
             .unwrap();
-        // The ingest-written mapping a real receive chain leaves behind.
+        // The ingest-written mappings a real receive chain leaves behind —
+        // the bare-digit spelling a history/sync key spells (1.146: the
+        // same mapping the +prefixed contact rows resolve through) beside
+        // the +prefixed spelling the receive chain's contacts hit resolves
+        // to, both probe orders pinned.
         store
             .upsert_peer_identity(
                 &account.id,
                 "11111111-2222-4333-8444-555555555555",
                 "15555550102",
+            )
+            .unwrap();
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "22222222-2222-4333-8444-555555555556",
+                "15555550104",
+            )
+            .unwrap();
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "33333333-2222-4333-8444-555555555557",
+                "+15555550105",
+            )
+            .unwrap();
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "44444444-2222-4333-8444-555555555558",
+                "+15555550106",
             )
             .unwrap();
 
@@ -9428,9 +9516,32 @@ mod tests {
             ids(&group.id),
             (None, None, Some("AbCdEf0123456789=".into()), None)
         );
+        // The 1.146 miss arm: a +keyed row no identity resolves keeps the
+        // 1.138 answer verbatim — e164 present, serviceId absent.
         assert_eq!(
             ids(&plus.id),
             (None, Some("+15555550101".into()), None, None)
+        );
+        // The 1.146 hit arms: a +keyed row the ingest mapped carries both —
+        // e164 verbatim beside the mapped ACI, in the bare-spelled mapping…
+        assert_eq!(
+            ids(&plus_mapped.id),
+            (
+                Some("22222222-2222-4333-8444-555555555556".into()),
+                Some("+15555550104".into()),
+                None,
+                None
+            )
+        );
+        // …and in the +spelled mapping (the exact probe).
+        assert_eq!(
+            ids(&plus_exact_map.id),
+            (
+                Some("33333333-2222-4333-8444-555555555557".into()),
+                Some("+15555550105".into()),
+                None,
+                None
+            )
         );
         assert_eq!(
             ids(&uuid.id),
@@ -9450,7 +9561,82 @@ mod tests {
                 None
             )
         );
+        // The number arm's dual form: a bare-keyed row resolves through a
+        // +spelled mapping too.
+        assert_eq!(
+            ids(&number_plus_map.id),
+            (
+                Some("44444444-2222-4333-8444-555555555558".into()),
+                None,
+                None,
+                None
+            )
+        );
         assert_eq!(ids(&number_orphan.id), (None, None, None, None));
+    }
+
+    /// Contract 1.146 (§4.144): `contacts.list` direct rows additively
+    /// carry the derived serviceId through the same §4.129 family — a
+    /// UUID-shaped peer key verbatim, a phone-keyed row (either spelling)
+    /// through the most recent ingest-written mapping, an unresolved key
+    /// and every group row absent. Absent-key wire: pre-1.146 hosts read
+    /// byte-identical rows.
+    #[test]
+    fn contact_list_rows_carry_the_derived_service_id() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "15555550101", "Bare Key", None, 10)
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "contact", "+15555550102", "Plus Key", None, 10)
+            .unwrap();
+        store
+            .upsert_contact(
+                &account.id,
+                "contact",
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "Aci Key",
+                None,
+                10,
+            )
+            .unwrap();
+        store
+            .upsert_contact(&account.id, "group", "Z3JvdXAtaWQ=", "Group", None, 10)
+            .unwrap();
+        // The ingest-written mapping, +spelled against a bare-keyed row —
+        // the dual-form probe the derivation runs.
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "11111111-2222-4333-8444-555555555555",
+                "+15555550101",
+            )
+            .unwrap();
+
+        let listed = store.list_contacts(&account.id, None, 10, None).unwrap();
+        let service_id_of = |peer_key: &str| {
+            listed
+                .items
+                .iter()
+                .find(|row| row.peer_key == peer_key)
+                .unwrap()
+                .service_id
+                .clone()
+        };
+        assert_eq!(
+            service_id_of("15555550101").as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+        assert_eq!(service_id_of("+15555550102"), None);
+        assert_eq!(
+            service_id_of("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10").as_deref(),
+            Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10")
+        );
+        assert_eq!(service_id_of("Z3JvdXAtaWQ="), None);
     }
 
     /// Contract 1.138 (§4.131): the blocked stamp merges read-modify-write —

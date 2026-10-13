@@ -35,7 +35,52 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.145 (2026-10-13; the call-relay configuration proxy
+- Contract revision: 1.146 (2026-10-13; the peer-ACI surface for the
+  outgoing-call addressing (§4.144): RingRTC's `startOutgoingCall`
+  addresses the peer by its ACI (the ServiceId UUID), and the desktop's
+  call chain could not get one for two whole classes of peers — the
+  §4.129 summary derivation only reverse-looked `peer_identities` for
+  number-shaped (bare-digit) rows, so a `+`-keyed direct row answered
+  e164 and never a serviceId, and the §4.122 sync-contacts ingest
+  dropped `SyncContactRecord.aci` whenever a number was present, so a
+  contact that had never shown up on a live envelope had no ACI
+  anywhere. The two writers converge on the one mapping the derivation
+  already reads: the derivation's phone-keyed arms (both spellings —
+  the `+`-prefixed e164 and the bare digits) probe the most recent
+  ingest-written `peer_identities` row in either spelling (exact probe
+  first, the alternate form on a miss — two indexed probes at most), a
+  hit adds `serviceId` beside the row's own `e164`/number answer (wire
+  additive; a miss keeps the pre-1.146 answer verbatim), and the
+  sync-contacts ingest lands a numbered record's ACI through the same
+  `upsert_peer_identity` write the §4.37 receive chain performs — same
+  (aci ≠ peer_key) guard, an aci-only record writes nothing (its peer
+  key *is* the ACI, the self-row the ladder skips). The landing choice
+  is `peer_identities`, not a contacts-extra column: the table is what
+  the §4.129/§4.48 lookup reads, so one source serves both the summary
+  and the contacts faces with no second read path and no second storage
+  spelling of the same fact (the §4.97 posture), bounded by the contacts
+  scale under `INSERT OR REPLACE` keyed (account_id, aci).
+  `contacts.list` direct rows additively carry the derived `serviceId`
+  too (absent-key; the same derivation family over the page's held
+  guard), so the desktop's compose/call surfaces read the same identity
+  the summaries carry. Deliberately not built: PNI (the §4.129 honest
+  hole stays open — no PNI source exists on this wire), the E.164
+  direct-dial degradation path (a number is never fed to RingRTC — the
+  ACI or nothing), any new error code (the widening is a silent
+  read-time derivation), and any connector-side cache (two indexed
+  probes on a contacts-scale table need none). Schema: description-only
+  expansion on the two list defs — no if/then arm and no def is added
+  because no method, params, event, or error shape changes (the result
+  rows the schema models through descriptions; the 1.138 result-additive
+  precedent). Wire additive: one optional result key on `contacts.list`
+  rows and a widened derivation of the existing §4.129 keys — no new
+  method, event, error, capability, or store move. Tests 786 → 787 (lib
+  597 → 598: the §4.129 derivation test grows the +e164 hit/miss arms
+  and the both-spelling mappings in place (the 1.119/1.141
+  assertions-in-place precedent), the §4.122 sync-contacts test grows
+  the identity-landing and no-self-row assertions, and the contacts
+  list gains its own derivation test), all green) —
+  previously 1.145 (2026-10-13; the call-relay configuration proxy
   face (§4.143): `calls.relays` — the connector-side registration of the
   engine's `calls.relays` (engine e2f2e6d), the authenticated
   GET /v2/calling/relays ICE/TURN read the desktop's calling chain needs
@@ -11184,6 +11229,92 @@ and the engine-down shape answering RUNTIME_NOT_RUNNING; the prepare
 test joins the §4.73 material-gate neighborhood (account resolution,
 the resolved-number forward). Tests 781 → 786 (lib 596 → 597). Gates:
 fmt, clippy `-D warnings`, tests all green, release build.
+
+### 4.144 The peer ACI reaches the outgoing-call addressing: the derivation widens to `+`-keyed rows and the sync ingest stops dropping the ACI (contract revision 1.146, 2026-10-13)
+
+RingRTC's `startOutgoingCall` addresses the peer by its ACI (the
+ServiceId UUID) — a number is not an address it accepts, and the
+connector never feeds it one (the E.164 direct-dial degradation path is
+deliberately nonexistent). Yet two whole classes of peers had no ACI on
+this boundary: the §4.129 summary derivation reverse-looked
+`peer_identities` only for number-shaped (bare-digit) rows, so a
+`+`-keyed direct row — the spelling every live contacts hit keys on —
+answered `e164` and never a `serviceId` (the store test pinned that
+absence); and the §4.122 sync-contacts ingest dropped
+`SyncContactRecord.aci` whenever a number was present, so a contact
+that had never appeared on a live envelope (the receive chain's §4.37
+write is the only other identity writer) had no ACI anywhere. The
+desktop's outgoing-call addressing for those peers had only an E.164 —
+a call that cannot be placed.
+
+**One mapping, both writers.** The repair converges on the table the
+derivation already reads, adding nothing parallel to it:
+
+- Derivation (the §4.129 widening): the phone-keyed arms — the
+  `+`-prefixed e164 and the bare digits alike — probe the most recent
+  ingest-written `peer_identities` row in **either spelling**. The
+  identity writers spell the same number both ways: the receive chain's
+  contacts hit resolves to the engine's `+`-prefixed e164, while
+  history-imported keys and the sync projection's bare digits spell
+  without. The exact-form probe runs first (the common case), the
+  alternate only on a miss — two indexed probes at most, no
+  normalization table, no connector-side cache (two probes on a
+  contacts-scale table need none). A hit adds `serviceId` beside the
+  row's own answer (`e164` verbatim on a `+` row); a miss keeps the
+  pre-1.146 answer byte-identical. Both summary builders share the
+  derivation — the list page and the single-row `conversation.changed`
+  summary cannot disagree (the 1.71 read-time family discipline).
+- Ingest (the §4.122 repair): a numbered `SyncContactRecord` lands its
+  ACI through the same `upsert_peer_identity` write the §4.37 receive
+  chain performs — the same (aci ≠ peer_key) guard, so an aci-only
+  record writes nothing (its peer key *is* the ACI, the self-row the
+  ladder skips). Bounded by the contacts scale under `INSERT OR
+  REPLACE` keyed (account_id, aci); the newest observation wins, the
+  table's documented semantic.
+
+**The landing choice: `peer_identities`, not contacts.extra.** The
+selection was made once and recorded here: `peer_identities` is the
+table the §4.129/§4.48 reverse lookup reads, so landing the sync ACI
+there serves the summaries, the contacts face, and any future reader
+through one lookup path with one storage spelling of the fact — a
+`contacts.extra` column would need the derivation to parse a second
+surface per row and would hold a second copy of a mapping the receive
+chain already writes (the §4.97 second-truth posture refuses exactly
+that). The §4.37 guard and replace-on-newest semantics come with the
+table for free.
+
+**The contacts face joins.** `contacts.list` direct rows additively
+carry the derived `serviceId` (absent-key, `skip` when None) through
+the same derivation family over the page's already-held guard — the
+compose/call surfaces read the identity the summaries carry, and the
+two faces cannot disagree. Group rows and unresolved keys answer
+absent; pre-1.146 hosts read byte-identical rows.
+
+**Deliberately not built.** PNI stays the §4.129 honest hole — no PNI
+source exists on this wire and none is invented; the E.164 direct-dial
+degradation path stays nonexistent (a number is never fed to RingRTC —
+the ACI or nothing); no new error code (the widening is a silent
+read-time derivation with the §4.129 tolerance — a failed lookup
+degrades to absent, it never fails a summary or a page); no
+connector-side cache.
+
+Schema: description-only expansion — the two list defs'
+descriptions carry the 1.146 sentences; no if/then arm and no def is
+added because no method, params, event, or error shape changes (the
+result rows the schema models through descriptions; the 1.138
+result-additive precedent).
+
+Tests: the §4.129 derivation test grows the widened arms in place —
+the `+`-keyed miss (the 1.138 answer verbatim), the `+`-keyed hit
+through a bare-spelled mapping, the `+`-keyed hit through a
+`+`-spelled mapping, and the bare-keyed hit through a `+`-spelled
+mapping (the dual form on both phone arms); the §4.122 sync-contacts
+test grows the identity-landing assertions (the numbered record's ACI
+resolvable by peer key, the materialized summary carrying serviceId,
+the aci-only sibling writing nothing); and the contacts list gains its
+own derivation test (the hit, the miss, the verbatim UUID, the absent
+group row). Tests 786 → 787 (lib 597 → 598). Gates: fmt, clippy
+`-D warnings`, tests all green, release build.
 
 ## 5. signal-cli Boundary
 
