@@ -1772,7 +1772,8 @@ impl NormalizedReceive {
                     .sum(),
                 _ => 0,
             }
-            // Rich bodies carry capped urls/titles/names; ranges are fixed-width.
+            // Rich bodies carry capped urls/titles/names, contact-card
+            // entries and fixed-width ranges (§4.13, §4.132).
             + self.rich.as_ref().map_or(0, |rich| {
                 std::mem::size_of::<NormalizedRich>()
                     + rich
@@ -1794,6 +1795,29 @@ impl NormalizedReceive {
                                 + std::mem::size_of::<NormalizedMention>()
                         })
                         .sum::<usize>()
+                    + rich.contact.as_ref().map_or(0, |contact| {
+                        std::mem::size_of::<NormalizedContact>()
+                            + contact.name.as_ref().map_or(0, |name| {
+                                std::mem::size_of::<NormalizedContactName>()
+                                    + name.given_name.as_ref().map_or(0, String::len)
+                                    + name.family_name.as_ref().map_or(0, String::len)
+                                    + name.prefix.as_ref().map_or(0, String::len)
+                                    + name.suffix.as_ref().map_or(0, String::len)
+                                    + name.middle_name.as_ref().map_or(0, String::len)
+                                    + name.nickname.as_ref().map_or(0, String::len)
+                            })
+                            + contact
+                                .number
+                                .iter()
+                                .chain(contact.email.iter())
+                                .map(|field| {
+                                    field.value.len()
+                                        + field.label.as_ref().map_or(0, String::len)
+                                        + std::mem::size_of::<NormalizedContactField>()
+                                })
+                                .sum::<usize>()
+                            + contact.organization.as_ref().map_or(0, String::len)
+                    })
                     + rich.text_styles.len() * std::mem::size_of::<NormalizedTextStyle>()
             })
     }
@@ -3827,6 +3851,37 @@ fn normalized_sticker(
     ))
 }
 
+/// One live contact card (contract 1.139, §4.132): the bounded face the
+/// §4.38 import chain lands, read through the same
+/// [`crate::history_import::import_contact`] authority — its bounds
+/// (`MAX_CONTACT_*`, the type vocabulary, the whole-card discipline) are the
+/// contract's, never re-stated here. The only live-shape difference is the
+/// avatar wrap (`{avatar: <pointer>, isProfile}`): the pointer unwraps to
+/// the plain archive shape and rides [`normalized_attachment`] like any
+/// descriptor, and `isProfile` — the engine's address-book fact, not the
+/// message's — never rides the row. A card with no usable content answers
+/// None so the envelope keeps its plain routing (never a placeholder card);
+/// a wrapped avatar whose pointer is absent unwraps to no avatar face.
+fn normalized_live_contact(
+    raw: Option<&Value>,
+) -> Option<(NormalizedContact, Option<NormalizedAttachment>)> {
+    let object = raw?.as_object()?;
+    let mut unwrapped = object.clone();
+    if let Some(wrap) = unwrapped.remove("avatar") {
+        let pointer = wrap
+            .as_object()
+            .and_then(|wrap| wrap.get("avatar"))
+            .filter(|value| value.is_object())
+            .cloned();
+        if let Some(pointer) = pointer {
+            unwrapped.insert("avatar".to_string(), pointer);
+        }
+    }
+    let (card, avatar) = crate::history_import::import_contact(Some(&Value::Object(unwrapped)))?;
+    let avatar = avatar.and_then(|avatar| normalized_attachment(&avatar));
+    Some((card, avatar))
+}
+
 /// Strict UUID grammar (8-4-4-4-12 hex, case-insensitive) — the §4.40
 /// promotion test before an identity string is treated as an ACI. A phone
 /// number never matches, and neither does a truncated or decorated value.
@@ -5244,7 +5299,7 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 .get("attachments")
                 .map(normalized_attachments)
                 .unwrap_or_default();
-            let rich = normalized_rich(sent);
+            let mut rich = normalized_rich(sent);
             let (expire_seconds, expire_start_at) = envelope_expire_keys(sent);
             let destination = sent
                 .get("destinationNumber")
@@ -5378,6 +5433,22 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
             if let Some((_, sticker_image)) = sticker.as_ref() {
                 attachments.push(sticker_image.clone());
             }
+            // The sent transcript's contact card (contract 1.139, §4.132):
+            // parsed beside the message exactly like the incoming arm's —
+            // the same bounded face through the §4.38 authority, the wrapped
+            // avatar pointer unwrapping onto the descriptor list. Parsed
+            // after the control ladder (a contact + remoteDelete/edit/
+            // reaction echo keeps its control routing — the merge below
+            // happens after that ladder read) and after the state-face arms,
+            // so the rich faces keep their precedence exactly like the text
+            // face's does.
+            let contact = normalized_live_contact(sent.get("contact"));
+            if let Some((_, Some(avatar))) = contact.as_ref() {
+                attachments.push(avatar.clone());
+            }
+            if let Some((card, _)) = contact.as_ref() {
+                rich.get_or_insert_with(NormalizedRich::default).contact = Some(card.clone());
+            }
             let with_sticker = |mut outgoing: NormalizedReceive| {
                 if let Some((sticker_meta, _)) = sticker.as_ref() {
                     outgoing.sticker = Some(sticker_meta.clone());
@@ -5443,6 +5514,29 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                     expire_start_at,
                 ));
             }
+            // Bodyless contact-only send (contract 1.139, §4.132): the
+            // shared contact is the whole content — the same outgoing row a
+            // peer's card lands as, the self send's own timestamp, never an
+            // unread (the 自发同步 posture). A card with no usable content
+            // answered no face above and keeps the plain skip.
+            if rich.as_ref().is_some_and(|rich| rich.contact.is_some()) {
+                return Ok(with_expire(
+                    make(
+                        sent_ts,
+                        "syncMessage",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        None,
+                        None,
+                        attachments,
+                        rich,
+                        None,
+                    ),
+                    expire_seconds,
+                    expire_start_at,
+                ));
+            }
             // sent without body (other control sync) — skip for now
             return Ok(make(
                 sent_ts,
@@ -5492,7 +5586,20 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         if let Some((_, sticker_image)) = sticker.as_ref() {
             attachments.push(sticker_image.clone());
         }
-        let rich = normalized_rich(data_message);
+        // Live contact card (contract 1.139, §4.132): the bounded face
+        // normalizes beside the message and the unwrapped avatar pointer
+        // joins the descriptor list exactly like a sticker's `data` — byte
+        // fetches stay on the existing media channel. A card with no usable
+        // content answers no face (the import whole-card discipline); the
+        // card rides the rich additive channel, so no store schema bump.
+        let contact = normalized_live_contact(data_message.get("contact"));
+        if let Some((_, Some(avatar))) = contact.as_ref() {
+            attachments.push(avatar.clone());
+        }
+        let mut rich = normalized_rich(data_message);
+        if let Some((card, _)) = contact.as_ref() {
+            rich.get_or_insert_with(NormalizedRich::default).contact = Some(card.clone());
+        }
         let (expire_seconds, expire_start_at) = envelope_expire_keys(data_message);
         let with_sticker =
             |mut receive: NormalizedReceive,
@@ -5592,6 +5699,30 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
         // §4.38 import chain lands (votes/termination fold in later).
         // Anything else bodyless keeps the skip.
         if rich.as_ref().is_some_and(|rich| rich.poll.is_some()) {
+            return Ok(with_expire(
+                make(
+                    timestamp,
+                    "dataMessage",
+                    "incoming",
+                    peer_source,
+                    group_id,
+                    None,
+                    quote,
+                    attachments,
+                    rich,
+                    None,
+                ),
+                expire_seconds,
+                expire_start_at,
+            ));
+        }
+        // Bodyless live contact (contract 1.139, §4.132): the shared-contact
+        // bubble is a real message row — the same NormalizedContact face the
+        // §4.38 import chain lands, the unwrapped avatar already riding the
+        // descriptor list above. Checked after the state faces so their
+        // precedence is untouched (a state marker never coexists with a
+        // card); anything else bodyless keeps the skip.
+        if rich.as_ref().is_some_and(|rich| rich.contact.is_some()) {
             return Ok(with_expire(
                 make(
                     timestamp,
@@ -9781,6 +9912,265 @@ mod tests {
             );
             assert!(degraded.control.is_none(), "{face}");
         }
+    }
+
+    /// Live contact card (contract 1.139, §4.132): the engine's
+    /// `dataMessage.contact` face parses through the §4.38 import
+    /// authority's exact bounds — the wrapped avatar pointer
+    /// (`{avatar, isProfile}`) unwraps onto the descriptor list, `isProfile`
+    /// never rides, and the bodyless card lands as a real incoming row in
+    /// the history chain's wire shape. Degenerate faces (no usable content,
+    /// non-object, wrapped avatar without its pointer) fail closed per the
+    /// whole-card discipline; the queue budget counts the card's heap
+    /// strings entry-wise.
+    #[test]
+    fn live_contact_card_lands_a_message_row_in_the_history_shape() {
+        let avatar = json!({
+            "avatar": {
+                "id": "att-card",
+                "contentType": "image/jpeg",
+                "size": 55,
+            },
+            "isProfile": true,
+        });
+        let full = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "contact": {
+                        "name": {"givenName": "Ada", "familyName": "Lovelace", "middleName": "Byron"},
+                        "number": [
+                            {"value": "+15550000003", "type": "HOME"},
+                            {"value": "+15550000004", "type": "MOBILE", "label": "cell"},
+                        ],
+                        "email": [{"value": "ada@example.org", "type": "WORK"}],
+                        "organization": "Analytical Engines Ltd",
+                        "avatar": avatar,
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            full.direction, "incoming",
+            "a contact card is a message row"
+        );
+        assert_eq!(full.content_kind, "dataMessage");
+        assert!(full.text.is_none(), "cards carry no body");
+        let contact = full
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.contact.as_ref())
+            .expect("card");
+        let name = contact.name.as_ref().expect("name parts");
+        assert_eq!(name.given_name.as_deref(), Some("Ada"));
+        assert_eq!(name.family_name.as_deref(), Some("Lovelace"));
+        assert_eq!(name.middle_name.as_deref(), Some("Byron"));
+        assert_eq!(contact.number[0].kind, "HOME");
+        assert_eq!(contact.number[1].kind, "MOBILE");
+        assert_eq!(contact.number[1].label.as_deref(), Some("cell"));
+        assert_eq!(contact.email[0].value, "ada@example.org");
+        assert_eq!(
+            contact.organization.as_deref(),
+            Some("Analytical Engines Ltd")
+        );
+        assert_eq!(
+            full.attachments.len(),
+            1,
+            "the unwrapped avatar joined the descriptor list"
+        );
+        assert_eq!(full.attachments[0].id, "att-card");
+        assert_eq!(
+            full.attachments[0].content_type.as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(full.attachments[0].locator, None);
+        // The wire face equals the history chain's exact keys, and the
+        // address-book wrap fact stays off the row.
+        let wire = serde_json::to_value(full.rich.as_ref().expect("rich")).expect("wire");
+        assert_eq!(wire["contact"]["name"]["givenName"], "Ada");
+        assert_eq!(wire["contact"]["number"][0]["value"], "+15550000003");
+        assert_eq!(wire["contact"]["organization"], "Analytical Engines Ltd");
+        assert!(
+            !wire.to_string().contains("isProfile"),
+            "isProfile is the engine's address-book fact, not the message's"
+        );
+        // The queue budget counts the card's heap strings entry-wise
+        // (§4.13): the same bodyless envelope without the card is strictly
+        // lighter, and the delta covers the card's own accounting.
+        let bare = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "source": "+15555550101",
+                "dataMessage": {},
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(bare.rich.is_none());
+        let delta = full.estimated_bytes() - bare.estimated_bytes();
+        assert!(
+            delta
+                >= std::mem::size_of::<NormalizedRich>()
+                    + std::mem::size_of::<NormalizedContact>()
+                    + std::mem::size_of::<NormalizedContactName>()
+                    + "Ada".len()
+                    + "Lovelace".len()
+                    + "Byron".len()
+                    + 3 * std::mem::size_of::<NormalizedContactField>()
+                    + 2 * "+15550000003".len()
+                    + "ada@example.org".len()
+                    + "Analytical Engines Ltd".len(),
+            "the card's heap strings count in the queue budget"
+        );
+
+        // A body message keeps its row and the card rides beside the text.
+        let with_text = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000001u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "message": "here is Ada",
+                    "contact": {"name": {"givenName": "Ada"}},
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(with_text.direction, "incoming");
+        assert_eq!(with_text.text.as_deref(), Some("here is Ada"));
+        assert!(
+            with_text
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.contact.as_ref())
+                .is_some(),
+            "the card rides beside the body"
+        );
+        assert!(with_text.attachments.is_empty(), "no avatar, no descriptor");
+
+        // A wrapped avatar without its pointer unwraps to no avatar face —
+        // the card lands, the descriptor list stays empty.
+        let pointerless = normalize_receive(&json!({
+            "envelope": {
+                "timestamp": 1727000000002u64,
+                "source": "+15555550101",
+                "dataMessage": {
+                    "contact": {
+                        "name": {"givenName": "Grace"},
+                        "avatar": {"isProfile": false},
+                    }
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert_eq!(pointerless.direction, "incoming");
+        assert!(
+            pointerless
+                .rich
+                .as_ref()
+                .and_then(|rich| rich.contact.as_ref())
+                .is_some()
+        );
+        assert!(pointerless.attachments.is_empty());
+
+        // Degenerate faces fail closed to the plain skip: an empty card, a
+        // non-object face.
+        for face in [json!({}), json!("not-an-object")] {
+            let degraded = normalize_receive(&json!({
+                "envelope": {
+                    "timestamp": 1727000000003u64,
+                    "source": "+15555550101",
+                    "dataMessage": { "contact": face.clone() },
+                }
+            }))
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                degraded.direction, "skip",
+                "a card with no usable content keeps plain routing: {face}"
+            );
+            assert!(degraded.rich.is_none(), "{face}");
+        }
+    }
+
+    /// The sent transcript's contact card (contract 1.139, §4.132): a
+    /// phone-originated share lands as the same outgoing row a peer's card
+    /// does — the self send's own timestamp, the wrapped avatar on the
+    /// descriptor list. A card beside a control echo (remoteDelete) keeps
+    /// its control routing, the card never riding that row (the sticker
+    /// precedence discipline).
+    #[test]
+    fn sync_sent_contact_card_lands_outgoing_row_and_keeps_control_precedence() {
+        let normalized = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "destinationNumber": "+15555550101",
+                        "contact": {
+                            "name": {"givenName": "Ada", "familyName": "Lovelace"},
+                            "number": [{"value": "+15550000003", "type": "MOBILE"}],
+                            "organization": "Analytical Engines Ltd",
+                            "avatar": {
+                                "avatar": {"id": "att-card", "contentType": "image/jpeg"},
+                                "isProfile": false,
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(normalized.direction, "outgoing");
+        assert_eq!(normalized.timestamp, Some(1726999997000));
+        assert!(normalized.text.is_none());
+        let contact = normalized
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.contact.as_ref())
+            .expect("card");
+        assert_eq!(
+            contact.name.as_ref().unwrap().family_name.as_deref(),
+            Some("Lovelace")
+        );
+        assert_eq!(contact.number[0].kind, "MOBILE");
+        assert_eq!(normalized.attachments.len(), 1);
+        assert_eq!(normalized.attachments[0].id, "att-card");
+
+        // A card + remoteDelete echo from the phone keeps its control
+        // routing — the merge happens after the ladder read, exactly like
+        // the sticker's descriptor push does.
+        let echo = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "destinationNumber": "+15555550101",
+                        "contact": {"name": {"givenName": "Ada"}},
+                        "remoteDelete": {"timestamp": 1726999990000u64},
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(echo.direction, "outgoing");
+        assert_eq!(echo.content_kind, "control");
+        match echo.control.expect("the delete is the row's content") {
+            ControlReceive::RemoteDelete { target_timestamp } => {
+                assert_eq!(target_timestamp, 1726999990000);
+            }
+            other => panic!("expected a remote delete: {other:?}"),
+        }
+        assert!(echo.rich.is_none(), "the card does not ride a control echo");
+        assert!(echo.attachments.is_empty());
     }
 
     /// The self-send transcript echoes (§4.118): the engine's own group

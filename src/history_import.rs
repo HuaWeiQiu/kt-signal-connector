@@ -1634,8 +1634,10 @@ fn import_sticker(raw: Option<&Value>) -> Option<(crate::engine::NormalizedStick
 /// content answers None so the row keeps plain routing instead of storing a
 /// placeholder card (never a half/empty contact — the sticker whole-face
 /// discipline). A malformed entry drops individually; the avatar pointer must
-/// be an object to ride.
-fn import_contact(
+/// be an object to ride. The live receive face (§4.132) reuses the same
+/// bounded reader through [`crate::engine::normalized_live_contact`] — one
+/// authority for the card's bounds, both arrival chains.
+pub(crate) fn import_contact(
     raw: Option<&Value>,
 ) -> Option<(
     crate::engine::NormalizedContact,

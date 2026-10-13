@@ -19,7 +19,21 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.138 (2026-10-13; the batch-C list surface
+- Contract revision: 1.139 (2026-10-13; the batch-C emit surface completes:
+  the live contact-card branch (§4.132 — the engine's live
+  `dataMessage.contact` / `syncMessage.sentMessage.contact` faces parse
+  through the §4.38 import authority's exact bounds, the wrapped avatar
+  pointer `{avatar, isProfile}` unwrapping onto the descriptor list,
+  `isProfile` — the engine's address-book fact — never riding, the
+  bodyless card a real incoming/outgoing row in the history chain's wire
+  shape, a card beside a control echo keeping its control routing, and
+  the queue budget counting the card's heap strings entry-wise; the
+  whole-card discipline — no usable content, no face, plain routing —
+  carries over untouched). Wire additive-only: live rows begin carrying
+  the `rich.contact` key the import rows already carried, no changed
+  shape, error, or capability move. Tests 763 → 765 (lib 581 → 583),
+  all green) —
+  previously 1.138 (2026-10-13; the batch-C list surface
   (§4.128–§4.131; the sections carry the full records): the typing
   projection carries the sender identity (§4.128 — `conversation.typing`
   additively carries `senderId`/`senderName`, absent-key), the
@@ -10093,10 +10107,10 @@ admin-delete-window verification (§4.133 — a verification record, no
 implementation). The batch's remaining faces land in order: the typing
 summary projection (§4.128), the conversation-summary identifiers
 (§4.129), the draft timestamps (§4.130), and the blocked mask (§4.131)
-land together at revision 1.138; the live contact-card branch (§4.132)
-completes the §4.125–§4.133 run in the batch's last commit — the
-numbering gap between 1.137's sections and §4.133 is that landing
-order, not a reserved hole.
+landed together at revision 1.138; the live contact-card branch (§4.132)
+completes the §4.125–§4.133 run at revision 1.139 — the numbering gap
+between 1.137's sections and §4.133 was that landing order, not a
+reserved hole.
 
 ### 4.126 The outbound link-preview date rides the send (contract revision 1.137, 2026-10-13)
 
@@ -10329,6 +10343,59 @@ Tests: `blocked_stamp_survives_the_enrich_and_yields_to_engine_truth`
 consume batch, and a non-BLOCK verb never rewrites the mask),
 `set_blocked_write_back_mirrors_the_local_stamp_and_pushes_changed`
 (the write-back mirror and the event, both directions).
+
+### 4.132 The live contact-card branch: the shared contact reaches the live rows (contract revision 1.139, 2026-10-13)
+
+The §4.38 import chain has landed contact cards since 1.78 — the
+archive's per-message `contact` face parsing onto the bounded
+`NormalizedContact` shape — but the live receive chain never parsed the
+face: a peer sharing a contact over the wire produced a plain (usually
+skipped) row and the desktop never saw the card. This revision closes
+the gap by reusing the import authority itself, not by restating it.
+
+- One authority: the live branch calls the import chain's
+  `import_contact` reader directly (now `pub(crate)`), so the bounds are
+  the contract's, stated once — the `MAX_CONTACT_*` caps, the
+  eight-entry ceiling, the HOME/MOBILE/WORK/CUSTOM type vocabulary with
+  unknown coercing to HOME (the official `phoneToContactFormType` parse
+  face), the whole-card discipline (a card with no usable content
+  answers no face and the envelope keeps its plain routing — never a
+  placeholder card), and the per-entry drop. The live face adds one
+  wrapper: the engine projects the avatar as
+  `{avatar: <pointer>, isProfile}`; the pointer unwraps to the plain
+  archive shape and rides `normalized_attachment` like any descriptor
+  (byte fetches stay on the existing media channel), and `isProfile` —
+  the engine's address-book fact, not the message's — never rides the
+  row. A wrapped avatar whose pointer is absent unwraps to no avatar
+  face.
+- Incoming: the `dataMessage.contact` face parses beside the sticker's
+  (§4.32's list discipline — the pointer joins the attachment descriptor
+  list exactly like a sticker's `data`). A bodyless card lands as a real
+  incoming message row through a new arm checked after the state faces
+  (the timer/group-update/poll markers keep their precedence — a state
+  marker never coexists with a card); a body-carrying message keeps its
+  row with the card riding `rich.contact` beside the text.
+- Sent mirror: the `syncMessage.sentMessage.contact` face parses the
+  same way, after the control ladder and the state-face arms, so a card
+  beside a remoteDelete/edit/reaction echo keeps its control routing
+  (the merge happens after that ladder read — the sticker
+  descriptor-push discipline) and a bodyless contact-only send lands as
+  the same outgoing row a peer's card does, the self send's own
+  timestamp, never an unread (the 自发同步 posture).
+- Budget: the queue estimator (§4.13) counts the card's heap strings
+  entry-wise — the struct, the six name parts, each phone/email entry's
+  value + label + field struct, the organization — the previews/mentions
+  pattern, so one oversized contact card cannot dodge the queue budget.
+- Store and wire: `NormalizedRich.contact` has ridden rows since 1.78
+  (the additive flatten channel), so no store schema move and no new
+  wire key — live rows simply begin carrying the `contact` key the
+  import rows already carried.
+
+Tests: `live_contact_card_lands_a_message_row_in_the_history_shape` (the
+full card, the wrapped-avatar unwrap, `isProfile` never on the wire, the
+budget delta, text+card, the pointerless avatar, the degenerate faces),
+`sync_sent_contact_card_lands_outgoing_row_and_keeps_control_precedence`
+(the outgoing row and the control-echo precedence).
 
 ### 4.133 The admin-delete window is a client-side remote-config gate, not a protocol face (verification record, 2026-10-13; no contract change)
 
