@@ -35,7 +35,29 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.143 (2026-10-13; the rate-limit family joins the
+- Contract revision: 1.144 (2026-10-13; the call-signaling send face grows
+  the two optional RingRTC passthrough keys the desktop's calling half
+  needed (§4.142): `hangupType` rides the payload-less hangup bare frame
+  as the engine legacy face's `type` word — the official proto
+  Hangup{id,type,deviceId} family the pre-1.144 face could not speak
+  (it always emitted the type-less Hangup{kind,id} the engine reads as
+  HangupNormal) — in the engine's five-word vocabulary
+  `normal|accepted|declined|busy|needPermission`, the same words the
+  inbound projection emits; and `destinationDeviceId` rides the 1:1 arm
+  as the engine's directed-delivery passthrough (u32; 0 is the no-device
+  marker and refuses locally, the devices.unlink precedent; a group
+  conversation refuses it locally — the sender-key fan-out has no
+  device-directed face, the engine fail-closes the same pair). Both keys
+  are absent-optional: a request without them emits byte-identical
+  upstream params to the pre-1.144 face, and `hangupType` on any face
+  but the payload-less hangup answers INVALID_REQUEST before any
+  upstream call (a hangup carrying a payload rides the modern opaque
+  face whose bytes carry their own semantics — the bare-frame word is
+  untranslatable there). Wire additive: two optional params keys on one
+  method, no new method, event, error, capability, or store move. Tests
+  781 flat (lib 596 flat; the new faces grow assertions inside the
+  existing prepare test, the 1.119/1.141 precedent) —
+  previously 1.143 (2026-10-13; the rate-limit family joins the
   §4.123 queue on its own Retry-After beat (§4.139): a 429/413 send failure
   is a definitive engine answer — the server said "wait", not "lost", so the
   unknown-outcome red line never applies — and the server's explicit pause
@@ -11018,6 +11040,65 @@ store shape, no second dispatch arm, no wire change, no contract
 revision. The desktop's automatic edit retry (its half of the item)
 rides the error faces already answered; the connector adds nothing the
 funnel must not silently decide.
+
+### 4.142 The call-signaling send face speaks the two RingRTC words it used to drop: hangupType and destinationDeviceId ride out (contract revision 1.144, 2026-10-13)
+
+The §4.49 send face gated the envelope it could translate and dropped
+the two RingRTC words it could not: a desktop hanging up a 1:1 call
+could never say *how* (the payload-less hangup always rode the
+type-less `CallMessage{hangup{id}}` the engine reads as HangupNormal —
+the receiving RingRTC state machine sees every connector hangup as a
+plain normal hangup, never accepted/declined/busy/needPermission), and
+no caller could direct-deliver a 1:1 signaling frame to one device.
+The engine's send face already speaks both words (`legacy:
+{kind: "hangup", id, type?, deviceId?}` — the engine's own 1.53 batch —
+and the top-level `destinationDeviceId`, fail-closed against the group
+arm); this revision teaches the connector's `calls.sendSignal` params
+to carry them.
+
+**The two keys.** Wire additive, both optional, both absent = the
+pre-1.144 upstream bytes exactly:
+
+- *`hangupType`* — one of the engine's five words
+  (`normal|accepted|declined|busy|needPermission`, the same vocabulary
+  the inbound projection emits — the connector never mangles a word the
+  other direction already speaks). It rides only the payload-less
+  hangup bare frame, forwarded as the engine legacy face's `type`:
+  a `hangupType` on any other type, on a busy frame, or on a hangup
+  carrying a payload answers INVALID_REQUEST before any upstream call —
+  a payload hangup rides the modern opaque face whose bytes already
+  carry their own semantics, and the bare-frame word is untranslatable
+  there. Absent stays absent: the legacy face emits `{kind: "hangup",
+  id}` verbatim and the engine reads the type-less proto member as
+  HangupNormal, the exact pre-1.144 shape.
+- *`destinationDeviceId`* — positive u32 (0 is the no-device marker and
+  refuses locally, the devices.unlink precedent), forwarded as the
+  engine's top-level directed-delivery passthrough on the 1:1 arm. A
+  group conversation carrying it answers INVALID_REQUEST locally
+  (official group signaling is the sender-key fan-out with no
+  device-directed face; the engine fail-closes the same pair — the
+  local refusal keeps the face's refuse-before-upstream style). Absent
+  = the engine's no-write default, the pre-1.144 shape.
+
+**The boundary stands.** The connector still never parses, validates,
+or logs the signaling content: both keys are envelope-shape words the
+route decision needs, and the opaque payload bytes cross byte-for-byte
+as always. The incoming face needed no change — the modern opaque arm
+already carried `destinationDeviceId` and the legacy frames ride
+verbatim (the hangup frame's `type`/`deviceId` included), so this
+revision is the send half of a symmetry the receive half already held.
+
+Tests: the new faces grow assertions inside the existing
+`prepare_call_signal_gates_and_forwards_the_envelope` (the 1.119/1.141
+in-place precedent): the declined hangup rides
+`legacy: {kind, id, type: "declined"}`; the absent-key hangup stays
+byte-identical `{kind, id}`; the five-word vocabulary passes and an
+unknown word, a hangupType on offer/busy, and a hangupType with a
+payload all refuse INVALID_REQUEST before any upstream shape;
+`destinationDeviceId` rides the direct modern and legacy arms as the
+top-level engine key, 0 refuses, and the group arm refuses it locally.
+Tests 781 flat (lib 596 flat). Gates: fmt, clippy `-D warnings`, tests
+all green, release build.
 
 ## 5. signal-cli Boundary
 

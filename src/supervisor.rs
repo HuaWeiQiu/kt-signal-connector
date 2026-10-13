@@ -4699,6 +4699,8 @@ impl RuntimeSupervisor {
                 params.call_id,
                 params.payload.as_deref(),
                 params.urgency.as_deref(),
+                params.hangup_type.as_deref(),
+                params.destination_device_id,
             )?
         };
         match engine

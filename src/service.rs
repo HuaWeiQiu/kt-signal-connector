@@ -5813,6 +5813,7 @@ impl ConnectorService {
     /// master key, data, urgency}` sender-key fan-out — and refuses the
     /// payload-less legacy family locally (official group signaling is
     /// opaque-only).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_calls_send_signal(
         &self,
         account_id: &str,
@@ -5821,6 +5822,8 @@ impl ConnectorService {
         call_id: u32,
         payload: Option<&str>,
         urgency: Option<&str>,
+        hangup_type: Option<&str>,
+        destination_device_id: Option<u32>,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         if conversation_id.is_empty()
@@ -5882,6 +5885,46 @@ impl ConnectorService {
                 )));
             }
         };
+        // The hangupType word (1.144, §4.142): the legacy hangup bare
+        // frame's only vocabulary. Legal only on a payload-less hangup —
+        // any other type, a busy frame, or a hangup carrying a payload has
+        // no legacy face to carry the word (a payload hangup rides the
+        // modern opaque face whose bytes carry their own semantics), and
+        // the word must be one of the engine's five (the same vocabulary
+        // the inbound projection emits).
+        let hangup_type_value = match hangup_type {
+            None => None,
+            Some(word) => {
+                if !matches!(signal_type, "hangup") || payload.is_some() {
+                    return Err(ServiceError::Api(ApiError::new(
+                        "INVALID_REQUEST",
+                        "hangupType only rides the payload-less hangup bare frame",
+                        false,
+                    )));
+                }
+                match word {
+                    "normal" | "accepted" | "declined" | "busy" | "needPermission" => Some(word),
+                    _ => {
+                        return Err(ServiceError::Api(ApiError::new(
+                            "INVALID_REQUEST",
+                            "hangupType must be one of normal, accepted, declined, busy, needPermission",
+                            false,
+                        )));
+                    }
+                }
+            }
+        };
+        // The directed-delivery id (1.144, §4.142): 0 is the no-device
+        // marker and is refused locally (the devices.unlink precedent);
+        // the group arm refuses the key below (the sender-key fan-out has
+        // no device-directed face).
+        if destination_device_id == Some(0) {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "destinationDeviceId must be a positive device id",
+                false,
+            )));
+        }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_conversation(account_id, conversation_id)?;
         // The group addressing arm (contract 1.82, §4.49.2): a group
@@ -5900,6 +5943,13 @@ impl ConnectorService {
                 return Err(ServiceError::Api(ApiError::new(
                     "INVALID_REQUEST",
                     "group call signaling is opaque-only — the legacy bare frames have no group face",
+                    false,
+                )));
+            }
+            if destination_device_id.is_some() {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "group call signaling has no device-directed face — destinationDeviceId rides the 1:1 arm only",
                     false,
                 )));
             }
@@ -5933,12 +5983,22 @@ impl ConnectorService {
             // caller addressed is the frames' id face; hangup's type vocabulary
             // is default-normal here — the desktop layer owns richer
             // projections and this connector forwards, never invents).
-            upstream["legacy"] = json!({ "kind": signal_type, "id": call_id });
+            // The hangupType word (1.144, §4.142): the gated optional `type`
+            // the frame family officially carries; absent stays the type-less
+            // pre-1.144 shape (the gate above already bounded it to hangup).
+            let mut legacy = json!({ "kind": signal_type, "id": call_id });
+            if let Some(word) = hangup_type_value {
+                legacy["type"] = json!(word);
+            }
+            upstream["legacy"] = legacy;
         } else {
             upstream["data"] = json!(payload);
         }
         if !urgency_value.is_null() {
             upstream["urgency"] = urgency_value;
+        }
+        if let Some(device) = destination_device_id {
+            upstream["destinationDeviceId"] = json!(device);
         }
         Ok(upstream)
     }
@@ -13038,6 +13098,18 @@ pub struct CallsSendSignalParams {
     pub call_id: u32,
     pub payload: Option<String>,
     pub urgency: Option<String>,
+    /// The legacy hangup word (contract 1.144, §4.142): forwarded as the
+    /// engine legacy face's `type` on `CallMessage{hangup{id,type}}`. Legal
+    /// only on a payload-less hangup bare frame (gated in
+    /// `prepare_calls_send_signal`); absent = the type-less pre-1.144 frame.
+    #[serde(rename = "hangupType")]
+    pub hangup_type: Option<String>,
+    /// The directed-delivery device id (contract 1.144, §4.142): forwarded
+    /// as the engine's top-level `destinationDeviceId` on the 1:1 arm only.
+    /// 0 is refused by the prepare gate (the no-device marker); a group
+    /// conversation refuses the key locally.
+    #[serde(rename = "destinationDeviceId")]
+    pub destination_device_id: Option<u32>,
 }
 
 /// `calls.sendGroupCallUpdate` params (contract revision 1.127, §4.108):
@@ -23689,6 +23761,8 @@ mod tests {
                 7,
                 Some("c2RwLW9mZmVy"),
                 None,
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(upstream["account"], "+15555550100");
@@ -23710,6 +23784,8 @@ mod tests {
                     7,
                     Some("eA=="),
                     None,
+                    None,
+                    None,
                 )
                 .unwrap();
         }
@@ -23721,6 +23797,8 @@ mod tests {
                     illegal,
                     7,
                     Some("eA=="),
+                    None,
+                    None,
                     None,
                 )
                 .unwrap_err();
@@ -23737,6 +23815,8 @@ mod tests {
                 0,
                 Some("eA=="),
                 None,
+                None,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -23747,6 +23827,8 @@ mod tests {
                 "hangup",
                 u32::MAX,
                 Some("eA=="),
+                None,
+                None,
                 None,
             )
             .unwrap();
@@ -23765,6 +23847,8 @@ mod tests {
                     call_id,
                     Some(payload),
                     None,
+                    None,
+                    None,
                 )
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
@@ -23775,7 +23859,16 @@ mod tests {
         // invented bytes, no `data` key. A modern type without a payload
         // still refuses (offer/answer/ice carry RingRTC bytes by protocol).
         let legacy_busy = service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "busy", 7, None, None)
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "busy",
+                7,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(legacy_busy["legacy"], json!({"kind": "busy", "id": 7}));
         assert!(
@@ -23783,11 +23876,29 @@ mod tests {
             "legacy face carries no data"
         );
         let legacy_hangup = service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "hangup", 9, None, None)
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "hangup",
+                9,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(legacy_hangup["legacy"], json!({"kind": "hangup", "id": 9}));
         let error = service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "offer", 7, None, None)
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                7,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert_eq!(
             error.into_api().code,
@@ -23795,7 +23906,16 @@ mod tests {
             "modern type demands payload"
         );
         let error = service
-            .prepare_calls_send_signal(&account.id, &conversation.id, "ice", 7, None, None)
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "ice",
+                7,
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap_err();
         assert_eq!(
             error.into_api().code,
@@ -23814,6 +23934,8 @@ mod tests {
                 7,
                 Some("eA=="),
                 Some("handleImmediately"),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(urgent["urgency"], "handleImmediately");
@@ -23825,6 +23947,8 @@ mod tests {
                 7,
                 None,
                 Some("droppable"),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(droppable["urgency"], "droppable");
@@ -23837,6 +23961,125 @@ mod tests {
                 7,
                 Some("eA=="),
                 Some("urgent"),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+
+        // The hangupType word (1.144, §4.142): the legacy hangup bare
+        // frame's gated `type` — the declined word rides the legacy face,
+        // the five-word vocabulary passes, the absent-key hangup stays the
+        // byte-identical pre-1.144 shape, and every other carrier refuses
+        // before any upstream shape is built.
+        let declined = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "hangup",
+                9,
+                None,
+                None,
+                Some("declined"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            declined["legacy"],
+            json!({"kind": "hangup", "id": 9, "type": "declined"})
+        );
+        for word in ["normal", "accepted", "declined", "busy", "needPermission"] {
+            service
+                .prepare_calls_send_signal(
+                    &account.id,
+                    &conversation.id,
+                    "hangup",
+                    9,
+                    None,
+                    None,
+                    Some(word),
+                    None,
+                )
+                .unwrap();
+        }
+        let plain = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "hangup",
+                9,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            plain["legacy"].get("type").is_none(),
+            "hangupType absent = the type-less pre-1.144 frame"
+        );
+        for (label, ty, payload, word) in [
+            ("wrong-type", "offer", Some("eA=="), Some("declined")),
+            ("busy-frame", "busy", None, Some("declined")),
+            ("payload-hangup", "hangup", Some("eA=="), Some("declined")),
+            ("unknown-word", "hangup", None, Some("expired")),
+        ] {
+            let error = service
+                .prepare_calls_send_signal(
+                    &account.id,
+                    &conversation.id,
+                    ty,
+                    9,
+                    payload,
+                    None,
+                    word,
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
+        }
+
+        // The directed-delivery id (1.144, §4.142): the 1:1 arm forwards it
+        // as the engine's top-level key on both faces, 0 is the no-device
+        // marker and refuses, and the group arm refuses it locally (the
+        // sender-key fan-out has no device-directed face).
+        let directed = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                7,
+                Some("eA=="),
+                None,
+                None,
+                Some(3),
+            )
+            .unwrap();
+        assert_eq!(directed["destinationDeviceId"], 3);
+        let directed_hangup = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "hangup",
+                9,
+                None,
+                None,
+                Some("accepted"),
+                Some(3),
+            )
+            .unwrap();
+        assert_eq!(directed_hangup["destinationDeviceId"], 3);
+        assert_eq!(directed_hangup["legacy"]["type"], "accepted");
+        let error = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &conversation.id,
+                "offer",
+                7,
+                Some("eA=="),
+                None,
+                None,
+                Some(0),
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -23851,6 +24094,8 @@ mod tests {
                 7,
                 Some("eA=="),
                 None,
+                None,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
@@ -23861,6 +24106,8 @@ mod tests {
                 "offer",
                 7,
                 Some("eA=="),
+                None,
+                None,
                 None,
             )
             .unwrap_err();
@@ -23875,7 +24122,16 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtaWQ=", "group")
             .unwrap();
         let group_offer = service
-            .prepare_calls_send_signal(&account.id, &group.id, "offer", 7, Some("eA=="), None)
+            .prepare_calls_send_signal(
+                &account.id,
+                &group.id,
+                "offer",
+                7,
+                Some("eA=="),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(group_offer["account"], "+15555550100");
         assert_eq!(group_offer["group"], "Z3JvdXAtaWQ=");
@@ -23896,6 +24152,8 @@ mod tests {
                 u32::MAX,
                 Some("aWNl"),
                 Some("handleImmediately"),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(group_urgent["group"], "Z3JvdXAtaWQ=");
@@ -23905,15 +24163,40 @@ mod tests {
         // busy carrying a payload keeps the modern data route verbatim (the
         // connector never inspects content, so an explicit payload forwards).
         let error = service
-            .prepare_calls_send_signal(&account.id, &group.id, "busy", 7, None, None)
+            .prepare_calls_send_signal(&account.id, &group.id, "busy", 7, None, None, None, None)
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
         let error = service
-            .prepare_calls_send_signal(&account.id, &group.id, "hangup", 9, None, None)
+            .prepare_calls_send_signal(&account.id, &group.id, "hangup", 9, None, None, None, None)
+            .unwrap_err();
+        assert_eq!(error.into_api().code, "INVALID_REQUEST");
+        // The directed-delivery id has no group leg (1.144, §4.142): the
+        // sender-key fan-out carries no device-directed face, so the key
+        // refuses locally before any upstream call.
+        let error = service
+            .prepare_calls_send_signal(
+                &account.id,
+                &group.id,
+                "offer",
+                7,
+                Some("eA=="),
+                None,
+                None,
+                Some(3),
+            )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
         let group_modern_busy = service
-            .prepare_calls_send_signal(&account.id, &group.id, "busy", 7, Some("eA=="), None)
+            .prepare_calls_send_signal(
+                &account.id,
+                &group.id,
+                "busy",
+                7,
+                Some("eA=="),
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(group_modern_busy["data"], "eA==");
         assert!(
