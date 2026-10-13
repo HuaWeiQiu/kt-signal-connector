@@ -32,8 +32,9 @@ use serde_json::Value;
 
 use kt_signal_connector::PHASE2_CAPABILITIES;
 use kt_signal_connector::engine::{
-    MAX_RECEIVE_ID_CHARS, MAX_SYNC_CALL_ID_CHARS, MAX_SYNC_CALL_LINK_KEY_CHARS,
-    MAX_SYNC_DELETE_GROUP_MESSAGES, MAX_SYNC_DELETE_GROUPS, MAX_SYNC_IDENTITY_KEY_CHARS,
+    MAX_ATTACHMENT_BLUR_HASH_CHARS, MAX_RECEIVE_ID_CHARS, MAX_SYNC_CALL_ID_CHARS,
+    MAX_SYNC_CALL_LINK_KEY_CHARS, MAX_SYNC_DELETE_GROUP_MESSAGES, MAX_SYNC_DELETE_GROUPS,
+    MAX_SYNC_IDENTITY_KEY_CHARS,
 };
 use kt_signal_connector::history_attachment::MAX_PLAINTEXT_BYTES;
 use kt_signal_connector::protocol::MAX_REQUEST_ID_BYTES;
@@ -47,11 +48,12 @@ use kt_signal_connector::service::{
     MAX_DEVICE_NAME_BYTES, MAX_EMOJI_BYTES, MAX_GROUP_MEMBER_ID_CHARS, MAX_GROUP_MEMBERS,
     MAX_LOCATOR_FIELD_CHARS, MAX_LOCATOR_HASH_CHARS, MAX_NOTIFICATION_PROFILE_BATCH,
     MAX_NOTIFICATION_PROFILE_ID_CHARS, MAX_OPAQUE_ID_BYTES, MAX_PIN_CONVERSATION_ID_CHARS,
-    MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS, MAX_SNAPSHOT_DIR_BYTES,
-    MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS, MAX_STICKER_PACK_KEY_CHARS,
-    MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_STORY_LIST_BATCH, MAX_STORY_LIST_ID_CHARS,
-    MAX_STORY_PREVIEW_TITLE_BYTES, MAX_STORY_PREVIEW_URL_CHARS, MAX_TEXT_BYTES,
-    REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
+    MAX_PREVIEW_DESCRIPTION_BYTES, MAX_PREVIEW_IMAGE_DATA_URI_CHARS, MAX_PREVIEW_TITLE_BYTES,
+    MAX_PREVIEW_URL_BYTES, MAX_PROFILE_ABOUT_BYTES, MAX_PROFILE_NAME_BYTES, MAX_SEND_MENTIONS,
+    MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
+    MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_STORY_LIST_BATCH,
+    MAX_STORY_LIST_ID_CHARS, MAX_STORY_PREVIEW_TITLE_BYTES, MAX_STORY_PREVIEW_URL_CHARS,
+    MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
     STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
     USERNAME_MAX_WIRE_CHARS,
 };
@@ -465,6 +467,41 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/messagesSendAttachmentParams/properties/text",
             "maxLength",
             MAX_TEXT_BYTES as u64,
+        ),
+        // §4.127 blur placeholder (contract 1.137): the singular key and the
+        // plural per-entry key share the receive face's own bound — one
+        // constant, both directions.
+        (
+            "/$defs/messagesSendAttachmentParams/properties/blurHash",
+            "maxLength",
+            MAX_ATTACHMENT_BLUR_HASH_CHARS as u64,
+        ),
+        (
+            "/$defs/messagesSendAttachmentEntry/properties/blurHash",
+            "maxLength",
+            MAX_ATTACHMENT_BLUR_HASH_CHARS as u64,
+        ),
+        // §4.126 link-preview entry bounds (the §5.10 family, now declared
+        // in the schema together with the 1.137 date key).
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/url",
+            "maxLength",
+            MAX_PREVIEW_URL_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/title",
+            "maxLength",
+            MAX_PREVIEW_TITLE_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/description",
+            "maxLength",
+            MAX_PREVIEW_DESCRIPTION_BYTES as u64,
+        ),
+        (
+            "/$defs/messagesSendTextParams/properties/previews/items/properties/imageDataUri",
+            "maxLength",
+            MAX_PREVIEW_IMAGE_DATA_URI_CHARS as u64,
         ),
         (
             "/$defs/messagesSendStickerParams/properties/packId",

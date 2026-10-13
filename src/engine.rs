@@ -1521,9 +1521,12 @@ const MAX_MENTION_NAME_BYTES: usize = 128;
 /// sealed-sender/story-recipient lists share the sync receive family's 256
 /// cap, each story entry's distribution-id list takes the 64-entry family
 /// cap, and the blur preview string takes the preview-field budget.
+/// `MAX_ATTACHMENT_BLUR_HASH_CHARS` is `pub` since 1.137 (§4.127): the
+/// send face enforces the same bound connector-side — one constant, both
+/// directions, pinned to the schema pair.
 const MAX_SYNC_SENT_STATUS_ENTRIES: usize = 256;
 const MAX_STORY_DISTRIBUTION_IDS: usize = 64;
-const MAX_ATTACHMENT_BLUR_HASH_CHARS: usize = 128;
+pub const MAX_ATTACHMENT_BLUR_HASH_CHARS: usize = 128;
 /// Sticker bounds (contract revision 1.35): the same face bounds the send
 /// method enforces — pack id 64 hex chars, pack key 128 base64 chars, emoji
 /// label 32 chars. `pub(crate)` since the §4.38 history import face parses

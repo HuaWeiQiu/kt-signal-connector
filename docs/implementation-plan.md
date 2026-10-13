@@ -19,7 +19,27 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.136 (2026-10-13; the identity pending pass-through
+- Contract revision: 1.137 (2026-10-13; the batch-C connector emit surface
+  begins (§4.125 overview; the sections carry the full records): the
+  outbound link-preview `date` send face (§4.126 — `messages.sendText`
+  preview entries gain the optional `date` stamp, 0 reads as absent, the
+  value rides upstream as `previewDate`, the pending row's rich persists
+  the card and the retry rebuild restores it, image bytes stay
+  transit-only), the outbound attachment blur-placeholder face (§4.127 —
+  singular and plural `messages.attachments.send` payloads gain the
+  optional `blurHash`; the pending row's descriptor carries it from the
+  first tick; the engine's data-URI attachment channel has no blurHash
+  key — the upstream gap is documented, not invented), and the
+  §4.133 admin-delete-window verification record (the official window is
+  a client-side remote-config gate, the protocol wire carries none — the
+  connector's no-precheck posture is already the honest face; no
+  implementation). §4.128–§4.132 (the typing summary projection, the
+  conversation-summary identifiers, the draft timestamps, the blocked
+  mask, the live contact-card branch) land in the same batch's
+  subsequent commits. Wire additive-only: two optional request keys,
+  no new method, event, error, capability, or store move. Tests 753 →
+  755 (lib 571 → 573), all green) —
+  previously 1.136 (2026-10-13; the identity pending pass-through
   (§4.120): the `identities.get` projection additively carries the KT
   engine's optional boolean `pending` — the engine sidecar key marking a
   peer identity key that was replaced without confirmation, the same
@@ -10043,6 +10063,136 @@ store-level boundary: queued rows resume, swept pendings stay failed and
 unscheduled), shared with §4.123; no new tests — this section records a
 boundary deliberately kept, not a face added. Gates: fmt, clippy
 `-D warnings`, tests all green.
+
+### 4.125 The batch-C emit surface: the desktop-facing gaps close in order (contract revision 1.137, 2026-10-13)
+
+The desktop parity matrix's batch C is the connector's emit face — every
+surface below rides the connector→host wire (the `MessageRecord` /
+`ConversationSummary` shapes and the host events), never the
+connector→engine leg. This revision lands the batch's two send faces and
+its one verification record: the outbound link-preview `date` stamp
+(§4.126), the outbound attachment blur placeholder (§4.127), and the
+admin-delete-window verification (§4.133 — a verification record, no
+implementation). The batch's remaining five faces — the typing summary
+projection (§4.128), the conversation-summary identifiers (§4.129), the
+draft timestamps (§4.130), the blocked mask (§4.131), and the live
+contact-card branch (§4.132) — land in the same batch's subsequent
+commits and complete the §4.125–§4.133 run; the numbering gap between
+this revision's sections and §4.133 is that landing order, not a
+reserved hole.
+
+### 4.126 The outbound link-preview date rides the send (contract revision 1.137, 2026-10-13)
+
+The receive half of the preview card has ridden message rows since 1.107
+(§4.88: `NormalizedPreview.date`, positive-only, the engine's P14
+projection). The send half was date-less: the desktop's composer stamps
+the preview card it renders in its own bubble, and the stamp vanished at
+the wire — the optimistic row and the eventual mirror disagreed about
+the card's publish date.
+
+- Params: `messages.sendText` preview entries gain the optional `date`
+  (u64 epoch-ms). `0` reads as absent — the official
+  `cleanLinkPreviewDate` falsy posture (a zero stamp carries no
+  information); a negative, fractional, or non-integer value fails
+  params deserialization (the u64 type, fail-closed).
+- Upstream: the engine `send` `previewDate` key (verified against the
+  engine's own send-face parse: a u64 `> 0` is kept, `0` folds to absent
+  — the same falsy posture — a non-integer answers the internal-error
+  face, and the key must ride `previewUrl`, the quoteType host-object
+  precedent). The connector forwards a positive value verbatim and omits
+  the key when absent, so every pre-1.137 send shape stays
+  byte-identical.
+- Pending row: the optimistic row's rich now persists the preview card —
+  `previews[0]` carrying `url`/`title`/`description`/`date` with
+  `image` always absent (the image data URI is transit-only material;
+  the §5.10 budget bounds the hop, not a store). Previously the pending
+  rich armed only for view-once and text-style sends; a preview-bearing
+  send arms it too. Pre-1.137 rows read byte-identically (the key set is
+  unchanged, the card simply exists now).
+- Retry: the shared retry-dispatch rebuild — the §4.26 manual face and
+  the §4.123 queue drain both ride it — restores the preview from the
+  row rich (`url`/`title`/`description`/`date`, never the image bytes:
+  upstream `previewImage` is independently optional, so the retried card
+  re-sends metadata-only). The honest deviation, documented: the image
+  is lost on retry, because persisting a 1.5M-char data URI in the row
+  would break the no-bytes-in-rows rule the store is built on. Rows
+  persisted before this revision carry no rich preview, so their retries
+  stay preview-less — the pre-1.137 behavior, unchanged.
+- Schema: `messagesSendTextParams` declares the `previews` array — a
+  backfill: the code has accepted the key since the §5.10 v1.26 preview
+  face, but the schema def never declared it. This revision declares the
+  full entry shape (required `url`/`title` at the §5.10 bounds, optional
+  `description`/`imageDataUri`, optional `date`; only the first entry is
+  used, extras ignored — the signal-cli one-preview discipline) so the
+  wire contract and the code agree in both directions. The four preview
+  bounds join the schema numeric-bounds pairs; `date`'s floor is 0 by
+  type, its falsy read is behavior (pinned by tests, not by a schema
+  number).
+
+### 4.127 The outbound attachment blur placeholder (contract revision 1.137, 2026-10-13)
+
+The receive half of the blur placeholder has ridden attachment
+descriptors since 1.107 (§4.88). The send half had none: the desktop
+renders outgoing media from the first pending tick and holds a blur
+placeholder until the mirror lands — the descriptor had no key to carry
+one, so the sender's own bubble was the one surface in the product that
+could not blur.
+
+- Params: `messages.attachments.send` gains `blurHash` on the singular
+  payload and `blurHash` on each plural `attachments[]` entry —
+  optional, 1..128 characters (the engine's own
+  `MAX_ATTACHMENT_BLUR_HASH_CHARS`, the receive face's bound verbatim:
+  one constant, both directions). An empty string is INVALID_REQUEST
+  (omit the key instead), an over-bound value is INVALID_REQUEST; the
+  connector never decodes or charset-validates a blur string — the
+  receive posture verbatim: the desktop computes it, the connector ships
+  it.
+- Form exclusivity: a top-level `blurHash` together with the plural
+  `attachments` array is INVALID_REQUEST (the form-match tuple widens;
+  per-entry keys ride the entries, exactly like `filename`/`contentType`
+  before it).
+- Pending row: the descriptor carries `blurHash` from the first pending
+  tick (both descriptor sites — singular and plural — fill it), so the
+  sender's bubble renders the placeholder before settlement and across
+  restarts; the settled row keeps it until the mirror (which carries the
+  engine's own receive-face blur keys) converges the row.
+- Upstream gap, documented and deliberately not invented: the engine's
+  data-URI attachment channel carries no blurHash key (the verified
+  data-URI parameter syntax is `filename` and the `;voice=true`
+  parameter, nothing else). Upstream recipients compute their own
+  placeholders when the media lands. The connector mints no upstream
+  key; this face is the sender's own bubble placeholder, and the gap is
+  the upstream channel's, not the connector's.
+- Schema: both defs gain `blurHash` (1..128); the numeric-bounds pair
+  pins the bound to the shared engine constant.
+
+### 4.133 The admin-delete window is a client-side remote-config gate, not a protocol face (verification record, 2026-10-13; no contract change)
+
+The batch's item eight asked whether the official delete-for-everyone
+time window is something the connector must enforce. Verified against
+the official desktop and the protocol: it is not, and this section is
+the record so nobody "fixes" the connector's no-precheck posture later.
+
+- Official desktop: the window lives in `ts/util/getDeleteMaxAgeMs.dom.ts`
+  — `getAdminDeleteMaxAgeMs()` reads the `global.adminDeleteMaxAgeInSeconds`
+  remote config (positive seconds; anything else falls back to one DAY)
+  — and `ts/canDeleteForEveryone.dom.ts`'s `canUseAdminDelete` enforces
+  `messageAge <= getAdminDeleteMaxAgeMs() + gracePeriodMs` beside the
+  GV2-group and admin-role checks. Purely presentation-layer: the
+  official client stops offering the delete past the window.
+- Protocol wire: `DataMessage.adminDelete
+  {targetAuthorAciBinary, targetSentTimestamp}` (§4.28's field 29)
+  carries no age field, and the server enforces none — an older delete
+  is accepted exactly like a fresh one.
+- Engine: `send_admin_delete_group` (engine `src/service/mod.rs:1631`)
+  composes the proto directly, no window check.
+- Connector: §4.28's posture — "target eligibility against admin state
+  is not pre-checked — the server is the authority" — already matches
+  the wire truth. The window is the composing client's own gate.
+- Decision: no implementation. The window belongs to the desktop's
+  composition UI, which owns the remote config and the button; a
+  connector-side window would be a second, divergent authority reading
+  none of the config the real gate reads.
 
 ## 5. signal-cli Boundary
 

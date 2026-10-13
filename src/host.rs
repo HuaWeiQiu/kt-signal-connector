@@ -913,6 +913,7 @@ enum AttachmentSendForm {
         size_bytes: u64,
         filename: Option<String>,
         content_type: Option<String>,
+        blur_hash: Option<String>,
     },
     Plural {
         entries: Vec<crate::service::MessagesSendAttachmentEntry>,
@@ -1892,22 +1893,32 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                             ),
                         );
                     }
+                    // §4.127: a top-level `blurHash` is a singular-form key —
+                    // beside the plural array it fails the same exclusivity
+                    // tuple (per-entry `blurHash` rides the entries).
                     let form = match (
                         params.data_base64,
                         params.size_bytes,
                         params.filename,
                         params.content_type,
+                        params.blur_hash,
                         params.attachments,
                     ) {
-                        (Some(data_base64), Some(size_bytes), filename, content_type, None) => {
-                            Ok(AttachmentSendForm::Singular {
-                                data_base64,
-                                size_bytes,
-                                filename,
-                                content_type,
-                            })
-                        }
-                        (None, None, None, None, Some(entries)) => {
+                        (
+                            Some(data_base64),
+                            Some(size_bytes),
+                            filename,
+                            content_type,
+                            blur_hash,
+                            None,
+                        ) => Ok(AttachmentSendForm::Singular {
+                            data_base64,
+                            size_bytes,
+                            filename,
+                            content_type,
+                            blur_hash,
+                        }),
+                        (None, None, None, None, None, Some(entries)) => {
                             Ok(AttachmentSendForm::Plural { entries })
                         }
                         _ => Err(ApiError::new(
@@ -1924,6 +1935,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                 size_bytes,
                                 filename,
                                 content_type,
+                                blur_hash,
                             }),
                         ) => {
                             match runtime
@@ -1939,6 +1951,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                     params.quote_message_id,
                                     params.voice_note,
                                     params.view_once,
+                                    blur_hash,
                                 )
                                 .await
                             {

@@ -2382,10 +2382,15 @@ impl ConnectorService {
         quote_message_id: Option<&str>,
         voice_note: bool,
         view_once: bool,
+        blur_hash: Option<&str>,
     ) -> Result<PreparedSend, ServiceError> {
         validate_attachment_send_payload(data_base64, size_bytes)?;
         validate_attachment_descriptor(filename, "filename")?;
         validate_attachment_content_type(content_type)?;
+        // §4.127: the blur placeholder rides the descriptor verbatim; the
+        // bound is the receive face's own constant (one constant, both
+        // directions), enforced before the pending row exists.
+        validate_blur_hash(blur_hash)?;
         // §4.30: the voice flag requires an audio attachment — the official
         // recorder only produces audio, and a non-audio voice flag would
         // render as an unplayable bubble. Deterministic rejection before the
@@ -2466,7 +2471,9 @@ impl ConnectorService {
             height: None,
             is_voice_note: voice_note,
             caption: None,
-            blur_hash: None,
+            // §4.127: the caller-computed placeholder, shipped verbatim —
+            // the sender's bubble renders it from the first pending tick.
+            blur_hash: blur_hash.map(str::to_string),
             incremental_mac: None,
             chunk_size: None,
             is_borderless: false,
@@ -2546,6 +2553,8 @@ impl ConnectorService {
             validate_attachment_send_payload(&entry.data_base64, entry.size_bytes)?;
             validate_attachment_descriptor(entry.filename.as_deref(), "filename")?;
             validate_attachment_content_type(entry.content_type.as_deref())?;
+            // §4.127: the plural face carries the blur placeholder per entry.
+            validate_blur_hash(entry.blur_hash.as_deref())?;
         }
         if let Some(caption) = text
             && !caption.is_empty()
@@ -2589,7 +2598,9 @@ impl ConnectorService {
                 height: None,
                 is_voice_note: false,
                 caption: None,
-                blur_hash: None,
+                // §4.127: per-entry placeholder, same posture as the
+                // singular face.
+                blur_hash: entry.blur_hash.clone(),
                 incremental_mac: None,
                 chunk_size: None,
                 is_borderless: false,
@@ -2887,20 +2898,40 @@ impl ConnectorService {
             // (the official sender echo renders bodyRanges). Mentions stay
             // unpersisted (the 1.34 shape): a styled send carries both, the
             // retry rebuilds neither (documented deviation, §4.29 precedent).
-            rich: (view_once || text_styles.is_some()).then(|| crate::engine::NormalizedRich {
-                view_once,
-                text_styles: text_styles
-                    .as_deref()
-                    .unwrap_or(&[])
+            // §4.126: a preview-bearing send persists the card (url/title/
+            // description/date, never the image bytes — the data URI is
+            // transit-only material), so the optimistic row renders the same
+            // stamp the eventual mirror carries and the retry rebuild
+            // restores the card.
+            rich: {
+                let previews: Vec<crate::engine::NormalizedPreview> = link_preview
                     .iter()
-                    .map(|style| crate::engine::NormalizedTextStyle {
-                        style: style.style.clone(),
-                        start: style.start,
-                        length: style.length,
+                    .map(|card| crate::engine::NormalizedPreview {
+                        url: card.url.clone(),
+                        title: Some(card.title.clone()),
+                        description: card.description.clone(),
+                        date: card.date,
+                        image: None,
                     })
-                    .collect(),
-                ..crate::engine::NormalizedRich::default()
-            }),
+                    .collect();
+                (view_once || text_styles.is_some() || !previews.is_empty()).then(|| {
+                    crate::engine::NormalizedRich {
+                        previews,
+                        view_once,
+                        text_styles: text_styles
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|style| crate::engine::NormalizedTextStyle {
+                                style: style.style.clone(),
+                                start: style.start,
+                                length: style.length,
+                            })
+                            .collect(),
+                        ..crate::engine::NormalizedRich::default()
+                    }
+                })
+            },
             reactions: Vec::new(),
             edits: Vec::new(),
             delivered_at: None,
@@ -6124,6 +6155,14 @@ impl ConnectorService {
             if let Some(image) = &link_preview.image_data_uri {
                 params["previewImage"] = json!(image);
             }
+            // §4.126: the card's publish stamp; the key is absent when the
+            // stamp folded to absent (0 or not given), so every pre-1.137
+            // wire shape stays byte-identical. The engine demands the stamp
+            // ride a preview key pair (the quoteType host-object precedent);
+            // it always does here — this arm only runs under `previewUrl`.
+            if let Some(date) = link_preview.date {
+                params["previewDate"] = json!(date);
+            }
         }
         if let Some(mentions) = mentions {
             // The engine `send` mention entry keys, verbatim (number/start/
@@ -6286,10 +6325,13 @@ impl ConnectorService {
 
     /// The shared retry-dispatch rebuild (contract 1.31 §4.26 tail, now the
     /// §4.123 drain face too): upstream params rebuilt from the persisted
-    /// row — plain text plus the resolved quote; mentions and text styles
-    /// are not persisted for retry rebuilds (documented deviation, the text
-    /// arrives unchanged) — and a `PreparedSend::Dispatch` addressed to the
-    /// SAME row, so settlement completes the row the bubble already renders.
+    /// row — plain text, the resolved quote, and the §4.126 persisted preview
+    /// card when the original send carried one (metadata-only: the image
+    /// bytes never persisted, upstream `previewImage` is independently
+    /// optional); mentions and text styles are not persisted for retry
+    /// rebuilds (documented deviation, the text arrives unchanged) — and a
+    /// `PreparedSend::Dispatch` addressed to the SAME row, so settlement
+    /// completes the row the bubble already renders.
     fn rebuild_retry_dispatch(
         &self,
         row: &MessageRecord,
@@ -6302,10 +6344,26 @@ impl ConnectorService {
             .as_deref()
             .map(|quote_id| self.resolve_quote(account, conversation, quote_id))
             .transpose()?;
+        // §4.126: the card was normalized (url-in-text, bounds) when the send
+        // was accepted; the rebuild projects it back without re-validation —
+        // the stored url rode the stored text. `title` was required non-empty
+        // at send time, so the default never fires on a 1.137 row; a legacy
+        // title-less card cannot exist (pre-1.137 rows carry no rich preview).
+        let preview = row
+            .rich
+            .as_ref()
+            .and_then(|rich| rich.previews.first())
+            .map(|card| UpstreamSendPreview {
+                url: card.url.clone(),
+                title: card.title.clone().unwrap_or_default(),
+                description: card.description.clone(),
+                date: card.date,
+                image_data_uri: None,
+            });
         let params = Self::upstream_text_send_params(
             &account.signal_account,
             &text,
-            None,
+            preview.as_ref(),
             None,
             None,
             None,
@@ -11811,13 +11869,18 @@ pub struct MessagesRetryTextParams {
     pub client_request_id: String,
 }
 
-/// Outbound link preview (contract §5.10 v1.26). signal-cli's JSON-RPC send
-/// carries exactly one preview per message (`previewUrl`/`previewTitle`/
-/// `previewDescription`/`previewImage`, verified against the pinned
-/// distribution), so only the first entry is used and extras are ignored.
+/// Outbound link preview (contract §5.10 v1.26; `date` since 1.137 §4.126).
+/// signal-cli's JSON-RPC send carries exactly one preview per message
+/// (`previewUrl`/`previewTitle`/`previewDescription`/`previewImage`/
+/// `previewDate`, verified against the pinned distribution and the engine's
+/// send-face parse), so only the first entry is used and extras are ignored.
 /// The image travels as an RFC 2397 data URI — the same byte-in-memory
 /// pattern as `messages.attachments.send`; no caller-controlled path ever
-/// reaches upstream.
+/// reaches upstream. `date` is the card's publish stamp in epoch ms: `0`
+/// reads as absent (the official `cleanLinkPreviewDate` falsy posture — a
+/// zero stamp carries no information), and a negative, fractional, or
+/// non-integer value fails params deserialization (the u64 type,
+/// fail-closed).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SendTextPreviewParams {
@@ -11825,17 +11888,21 @@ pub struct SendTextPreviewParams {
     pub title: String,
     pub description: Option<String>,
     pub image_data_uri: Option<String>,
+    #[serde(default)]
+    pub date: Option<u64>,
 }
 
 /// Normalized, validated preview passed down to `dispatch_send` and projected
 /// 1:1 onto the upstream JSON-RPC keys (`previewUrl`/`previewTitle`/
-/// `previewDescription`/`previewImage`).
+/// `previewDescription`/`previewImage`/`previewDate`). `date` is already
+/// falsy-folded: `None` means the key is omitted upstream and on the row.
 #[derive(Debug, Clone)]
 pub struct UpstreamSendPreview {
     pub url: String,
     pub title: String,
     pub description: Option<String>,
     pub image_data_uri: Option<String>,
+    pub date: Option<u64>,
 }
 
 /// A validated mention passed down to `dispatch_send` and projected 1:1 onto
@@ -11900,6 +11967,13 @@ pub struct MessagesSendAttachmentParams {
     /// view-once media is a single unadorned medium).
     #[serde(default)]
     pub view_once: bool,
+    /// §4.127: optional blur placeholder (1..128 chars, the receive face's
+    /// own `MAX_ATTACHMENT_BLUR_HASH_CHARS` bound verbatim — the desktop
+    /// computes it, the connector ships it, never decoded). Singular-form
+    /// only: a plural §4.59 send carries per-entry `blurHash` instead, and a
+    /// top-level key beside the array is INVALID_REQUEST.
+    #[serde(default)]
+    pub blur_hash: Option<String>,
     /// §4.59 plural attachment payloads (contract revision 1.66): one
     /// upstream `send` carries every entry's data URI in its array-typed
     /// `attachments` parameter — the official forward face merges a multi-
@@ -11918,7 +11992,8 @@ pub struct MessagesSendAttachmentParams {
 /// size must equal `sizeBytes`, optional display filename (same path-
 /// separator/control-character rejection) and optional `type/subtype` media
 /// type. No per-entry voice flag: the `;voice=true` data-URI parameter is a
-/// singular-form face only.
+/// singular-form face only. `blurHash` since 1.137 (§4.127): the same bound
+/// and posture as the singular key.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendAttachmentEntry {
@@ -11926,6 +12001,8 @@ pub struct MessagesSendAttachmentEntry {
     pub size_bytes: u64,
     pub filename: Option<String>,
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub blur_hash: Option<String>,
 }
 
 /// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
@@ -13625,11 +13702,38 @@ fn validate_text(text: &str) -> Result<(), ServiceError> {
 /// Bounds for the outbound link preview (contract §5.10 v1.26). The URL cap
 /// follows the de-facto upstream limit; title/description caps mirror the
 /// official desktop renderer's truncation headroom; the image cap bounds the
-/// data URI to ~1 MiB of binary (4/3 base64 inflation included).
-const MAX_PREVIEW_URL_BYTES: usize = 2048;
-const MAX_PREVIEW_TITLE_BYTES: usize = 1024;
-const MAX_PREVIEW_DESCRIPTION_BYTES: usize = 4096;
-const MAX_PREVIEW_IMAGE_DATA_URI_CHARS: usize = 1_572_864;
+/// data URI to ~1 MiB of binary (4/3 base64 inflation included). The schema
+/// numeric-bounds pairs pin all four (§4.126).
+pub const MAX_PREVIEW_URL_BYTES: usize = 2048;
+pub const MAX_PREVIEW_TITLE_BYTES: usize = 1024;
+pub const MAX_PREVIEW_DESCRIPTION_BYTES: usize = 4096;
+pub const MAX_PREVIEW_IMAGE_DATA_URI_CHARS: usize = 1_572_864;
+
+/// Validate the §4.127 blur placeholder: present means 1..=128 chars (the
+/// engine's receive-face bound, `MAX_ATTACHMENT_BLUR_HASH_CHARS` — one
+/// constant, both directions). Never decoded, never charset-checked: the
+/// desktop computes the string, the connector ships it; an empty value means
+/// the caller should have omitted the key.
+fn validate_blur_hash(blur_hash: Option<&str>) -> Result<(), ServiceError> {
+    let Some(blur_hash) = blur_hash else {
+        return Ok(());
+    };
+    if blur_hash.is_empty() {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "blurHash must contain between 1 and 128 characters",
+            false,
+        )));
+    }
+    if blur_hash.len() > crate::engine::MAX_ATTACHMENT_BLUR_HASH_CHARS {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "blurHash must contain between 1 and 128 characters",
+            false,
+        )));
+    }
+    Ok(())
+}
 
 /// At most one preview per send upstream (signal-cli builds `List.of(one)`);
 /// extras are ignored, `None`/empty list means no preview.
@@ -13724,11 +13828,17 @@ fn normalize_send_preview(
             return invalid("preview image data uri exceeds 1.5M chars");
         }
     }
+    // §4.126: the official cleanLinkPreviewDate falsy posture — a zero stamp
+    // carries no information, so it folds to absent and the upstream
+    // `previewDate` key stays off the frame. The u64 type already rejected
+    // negative/fractional/non-integer values at deserialization.
+    let date = preview.date.filter(|date| *date > 0);
     Ok(UpstreamSendPreview {
         url: url.to_string(),
         title: title.to_string(),
         description,
         image_data_uri: preview.image_data_uri,
+        date,
     })
 }
 
@@ -16232,6 +16342,7 @@ mod tests {
                         title: "Example".into(),
                         description: Some("A page".into()),
                         image_data_uri: Some("data:image/jpeg;base64,QUJD".into()),
+                        date: None,
                     },
                     // extras are ignored upstream (List.of(one) on the pinned
                     // signal-cli) — the connector only forwards the first.
@@ -16240,6 +16351,7 @@ mod tests {
                         title: "Second".into(),
                         description: None,
                         image_data_uri: None,
+                        date: None,
                     },
                 ]),
                 None,
@@ -16275,6 +16387,7 @@ mod tests {
             title: title.into(),
             description: None,
             image_data_uri: None,
+            date: None,
         };
         // signal-cli requires the preview url to appear in the message body —
         // enforced here so the failure is a deterministic INVALID_REQUEST
@@ -16305,6 +16418,7 @@ mod tests {
                     title: "Example".into(),
                     description: None,
                     image_data_uri: Some("/etc/passwd".into()),
+                    date: None,
                 }]),
                 None,
                 None,
@@ -16333,6 +16447,272 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// §4.126: the preview date rides the wire three ways — the upstream
+    /// params carry `previewDate` (0 folds to absent, the official falsy
+    /// posture), the pending row's rich persists the card metadata-only
+    /// (never the image bytes), and the retry rebuild restores the card
+    /// without the image.
+    #[test]
+    fn send_text_preview_date_rides_wire_row_and_retry() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "see https://example.com/a",
+                "req-preview-date",
+                None,
+                Some(vec![SendTextPreviewParams {
+                    url: "https://example.com/a".into(),
+                    title: "Example".into(),
+                    description: Some("A page".into()),
+                    image_data_uri: Some("data:image/jpeg;base64,QUJD".into()),
+                    date: Some(1_600_000_000_000),
+                }]),
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch {
+                pending_id, params, ..
+            } => {
+                assert_eq!(params["previewDate"], json!(1_600_000_000_000_u64));
+                pending_id
+            }
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-preview-date")
+            .unwrap()
+            .unwrap();
+        let rich = row.rich.as_ref().expect("a preview send arms the row rich");
+        assert_eq!(rich.previews.len(), 1);
+        assert_eq!(rich.previews[0].url, "https://example.com/a");
+        assert_eq!(rich.previews[0].title.as_deref(), Some("Example"));
+        assert_eq!(rich.previews[0].description.as_deref(), Some("A page"));
+        assert_eq!(rich.previews[0].date, Some(1_600_000_000_000));
+        assert!(
+            rich.previews[0].image.is_none(),
+            "the image data uri is transit-only, never a stored byte"
+        );
+
+        // The retry rebuild restores the card, metadata-only.
+        service.complete_send_failed(&pending_id).unwrap();
+        let params = match service
+            .prepare_retry_text(&account.id, &conversation.id, "req-preview-date")
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            PreparedSend::Existing(_) => panic!("retry must re-dispatch the same row"),
+        };
+        assert_eq!(params["previewUrl"], json!("https://example.com/a"));
+        assert_eq!(params["previewDate"], json!(1_600_000_000_000_u64));
+        assert!(
+            params.get("previewImage").is_none(),
+            "the retried card re-sends metadata-only; previewImage is independently optional"
+        );
+
+        // A zero stamp folds to absent everywhere (the falsy posture).
+        let params = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "see https://example.com/a",
+                "req-preview-date-zero",
+                None,
+                Some(vec![SendTextPreviewParams {
+                    url: "https://example.com/a".into(),
+                    title: "Example".into(),
+                    description: None,
+                    image_data_uri: None,
+                    date: Some(0),
+                }]),
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { params, .. } => params,
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        };
+        assert!(
+            params.get("previewDate").is_none(),
+            "0 folds to absent — the key stays off the frame"
+        );
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-preview-date-zero")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.rich.as_ref().unwrap().previews[0].date, None);
+
+        // The u64 type fails negative, fractional, and non-integer stamps at
+        // params deserialization (fail-closed); 0 parses and folds later.
+        let base = json!({
+            "url": "https://example.com/a",
+            "title": "Example",
+        });
+        for (label, date) in [
+            ("negative", json!(-1)),
+            ("fractional", json!(1.5)),
+            ("string", json!("soon")),
+        ] {
+            let mut value = base.clone();
+            value["date"] = date;
+            assert!(
+                serde_json::from_value::<SendTextPreviewParams>(value).is_err(),
+                "{label} date must fail deserialization"
+            );
+        }
+        let zero = serde_json::from_value::<SendTextPreviewParams>(json!({
+            "url": "https://example.com/a",
+            "title": "Example",
+            "date": 0,
+        }))
+        .unwrap();
+        assert_eq!(zero.date, Some(0));
+    }
+
+    /// §4.127: the blur placeholder rides the pending descriptor (singular
+    /// and plural), fails closed on empty and over-bound values, and never
+    /// reaches the upstream params — the engine's data-URI attachment
+    /// channel has no blurHash key, so the placeholder is the sender's own
+    /// bubble face only.
+    #[test]
+    fn send_attachment_blur_hash_rides_descriptor_and_stays_off_upstream() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let b64 = "YXR0YWNobWVudCBieXRlcw=="; // 16 raw bytes
+        let placeholder = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
+
+        // Singular: the descriptor carries it, the upstream frame does not.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-blur-1",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("see attachment"),
+                None,
+                false,
+                false,
+                Some(placeholder),
+            )
+            .unwrap();
+        match &prepared {
+            PreparedSend::Dispatch { params, .. } => {
+                assert!(
+                    params.get("blurHash").is_none(),
+                    "the upstream data-URI channel has no blurHash key"
+                );
+            }
+            PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+        }
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-blur-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attachments[0].blur_hash.as_deref(), Some(placeholder));
+
+        // Plural: the per-entry key rides its own descriptor.
+        let entries = vec![MessagesSendAttachmentEntry {
+            data_base64: b64.to_string(),
+            size_bytes: 16,
+            filename: Some("notes.txt".into()),
+            content_type: Some("text/plain".into()),
+            blur_hash: Some("abc123".into()),
+        }];
+        let prepared = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-blur-2",
+                &entries,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
+        let row = service
+            .store_ref()
+            .message_by_client_request(&account.id, "req-blur-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attachments[0].blur_hash.as_deref(), Some("abc123"));
+
+        // Fail closed before the pending row: empty and over-bound values.
+        for (label, value) in [("empty", Some("")), ("over-bound", Some(&"x".repeat(129)))] {
+            let error = service
+                .prepare_send_attachment(
+                    &account.id,
+                    &AttachmentSendTarget::Conversation(&conversation.id),
+                    "req-blur-bad",
+                    b64,
+                    16,
+                    Some("notes.txt"),
+                    Some("text/plain"),
+                    None,
+                    None,
+                    false,
+                    false,
+                    value,
+                )
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::Api(ref e) if e.code == "INVALID_REQUEST"),
+                "{label} blurHash must answer INVALID_REQUEST"
+            );
+            assert!(
+                service
+                    .store_ref()
+                    .message_by_client_request(&account.id, "req-blur-bad")
+                    .unwrap()
+                    .is_none(),
+                "{label} blurHash leaves no row behind"
+            );
+        }
+        // The plural face fails closed the same way.
+        let bad_entries = vec![MessagesSendAttachmentEntry {
+            data_base64: b64.to_string(),
+            size_bytes: 16,
+            filename: None,
+            content_type: None,
+            blur_hash: Some(String::new()),
+        }];
+        let error = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-blur-bad-multi",
+                &bad_entries,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref e) if e.code == "INVALID_REQUEST"));
     }
 
     /// §4.123: the automatic queue enrolls exactly the definitive-error
@@ -19283,6 +19663,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -19307,6 +19688,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let PreparedSend::Dispatch {
@@ -19341,6 +19723,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // The stored row carries the metadata-only descriptor so the desktop
@@ -19382,6 +19765,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
@@ -19408,6 +19792,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
@@ -19428,6 +19813,7 @@ mod tests {
                 None,
                 true,
                 false,
+                None,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -19464,6 +19850,7 @@ mod tests {
                 None,
                 true,
                 false,
+                None,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -19501,6 +19888,7 @@ mod tests {
                         size_bytes: *size,
                         filename: filename.map(str::to_string),
                         content_type: content_type.map(str::to_string),
+                        blur_hash: None,
                     },
                 )
                 .collect::<Vec<_>>()
@@ -19611,6 +19999,7 @@ mod tests {
                 size_bytes: 5,
                 filename: Some("a.txt".into()),
                 content_type: Some("text/plain".into()),
+                blur_hash: None,
             })
             .collect();
         let error = service
@@ -19642,6 +20031,7 @@ mod tests {
                 size_bytes: 60_000_000,
                 filename: Some("big.bin".into()),
                 content_type: Some("application/octet-stream".into()),
+                blur_hash: None,
             })
             .collect();
         let error = service
@@ -19784,6 +20174,7 @@ mod tests {
                     *quote,
                     *voice,
                     true,
+                    None,
                 )
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
@@ -19812,6 +20203,7 @@ mod tests {
                 None,
                 false,
                 true,
+                None,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -19842,6 +20234,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
