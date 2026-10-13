@@ -22,6 +22,15 @@
   into connector rows is deliberately not built on the §4.97 persist-nothing
   posture and the §4.117 F red line (the §4.140 entry below) — zero code,
   zero wire change, the contract revision stays 1.143
+- No-revision record: 2026-10-13; the T-⑤ edit/DFE send-failure retry face
+  (the connector half) is disposed as a verification record only — the
+  queue-eligibility semantics exclude both legs by construction (an edit
+  failure never settles a row and a queued `failed` row cannot be edited;
+  DFE is the §4.99 receipt-class no-row face) and the funnel must never be
+  taught to take them: the §4.123 rebuild dispatches a plain new send, so an
+  edit re-driven through it would duplicate the already-delivered original
+  (the §4.141 entry below) — zero code, zero wire change, the contract
+  revision stays 1.143
 - No-revision stopgap record: 2026-10-12; the §4.119 outbound-receipt resupply stopgap
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
@@ -10939,6 +10948,76 @@ consume leg is rejected on the three reasons above. The §4.113 record's
 factual claim is superseded (its dated note points here); the §4.97
 persist-nothing posture stands. No connector code, no schema change, no
 store version change, no wire change, no contract revision.
+
+### 4.141 The edit and delete-for-me failure faces stay outside the queue: the eligibility the funnel never sees (T-⑤ disposition, verification record, 2026-10-13)
+
+The T-⑤ item asked for the connector half of an edit / delete-for-me
+send-failure retry face — "reuse the §4.92/§4.123 funnel" — with the
+instruction to confirm the queue-eligibility semantics first, error-
+prevention over retry capability. This record verifies the semantics
+against the current code (post-1.143) and disposes the item: neither
+leg can reach the funnel, by construction, and the funnel must never be
+taught to take them — the reuse the item names is exactly the trap its
+own caveat guards against.
+
+**The edit leg.** `messages.edit` (§4.86) is not a send; it is a
+rewrite of an already-addressable row, and its failure faces never
+produce a queue member:
+
+- *The target gate excludes the queue.* `prepare_edit` resolves only an
+  outgoing row whose status is addressable (`sent` / `delivered` /
+  `read` — the same gate as `prepare_remote_delete`: a `pending` or
+  `failed` row carries a local clock timestamp, indistinguishable from
+  a missing row, and answers MESSAGE_NOT_FOUND). A row sitting in the
+  §4.123 queue is `failed` — **it cannot be edited**. The rebuild-retry
+  therefore always resends the exact body the row failed with; no edit
+  can change the text under a scheduled retry.
+- *The failure faces enroll nothing.* The dispatch calls the engine
+  directly (`editMessage`, CallClass::Mutating) and never rides
+  `dispatch_prepared`, so the funnel's settle arm is unreachable from
+  it. A deterministic refusal propagates to the desktop with the row
+  untouched (still `sent`, old body, no `edited_at` stamp); the
+  indeterminate family answers `SEND_OUTCOME_UNKNOWN` retryable=false
+  (the caller must reconcile before retrying — the row may already
+  carry the edit upstream); success rewrites the body and stamps
+  `edited_at` with the status untouched. There is no edit-intent row
+  shape to enroll, and none is invented.
+- *The funnel reuse is the trap.* The §4.123 rebuild face dispatches a
+  plain new send (the §4.124 anchor: no client-timestamp face; rebuild
+  = plain text, quote, preview). An already-delivered row whose edit
+  failed, re-driven through that face, would resend the ORIGINAL body
+  as a duplicate new message — precisely the duplicate semantics the
+  official edit-job retries never produce (they re-dispatch
+  `editMessage` against `targetTimestamp`). A correct edit-retry face
+  would need a second dispatch arm, an edit-intent store shape, and a
+  wire face carrying edit-failure state — a feature, not a funnel
+  reuse, and the official auto-retry of edit jobs is the desktop's
+  job-queue half, explicitly out of this item's scope. The manual path
+  exists and is honest today: the desktop re-issues `messages.edit` and
+  the same guards answer.
+
+**The DFE leg.** `messages.deleteForMe` (§4.99) is receipt-class: any
+engine failure — including the engine's pre-flight refusal — degrades
+to `{status: "unknown"}` and is never retried, with zero local writes.
+No row exists to enroll and the funnel never sees it. The §4.99
+discipline stands verbatim.
+
+**The sweep note.** The §4.92 startup sweep writes `failed` directly
+with no queue face — a swept restart-pending row keeps
+`next_attempt_at` NULL and stays manual (the §4.124 discipline), and
+edits and DFE calls are not in its population (neither creates rows).
+The funnel's population is settled only through the two guarded
+entries: the sendText dispatch's definitive-error arm and the drain's
+claim-plus-rebuild, with the §4.134 belt ahead of the dispatch.
+
+**The disposition.** Verified structural, not incidental: the
+eligibility semantics exclude edit/DFE from the queue by construction —
+the funnel's population is the sendText path's pending text rows, and
+neither leg produces one. Recorded as a deliberate stop: no edit-intent
+store shape, no second dispatch arm, no wire change, no contract
+revision. The desktop's automatic edit retry (its half of the item)
+rides the error faces already answered; the connector adds nothing the
+funnel must not silently decide.
 
 ## 5. signal-cli Boundary
 
