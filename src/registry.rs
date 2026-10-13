@@ -1145,6 +1145,27 @@ impl ProxyGroupRuntime {
         slot.supervisor.set_conversation_blocked(params).await
     }
 
+    /// conversations.saveDraft / conversations.clearDraft (contract 1.138,
+    /// §4.130): the draft stamp is account-scoped local state, so both write
+    /// faces route through the account's owning slot like every other
+    /// mutating face — the engine stays out of the path (a local stamp, not
+    /// upstream traffic).
+    pub async fn save_conversation_draft(
+        &self,
+        params: crate::service::ConversationsSaveDraftParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.save_conversation_draft(params).await
+    }
+
+    pub async fn clear_conversation_draft(
+        &self,
+        params: crate::service::ConversationsClearDraftParams,
+    ) -> Result<&'static str, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.clear_conversation_draft(params).await
+    }
+
     /// conversations.getState / conversations.setState (contract 1.116,
     /// §4.97): the three mute/archive/unread bits live in the account's
     /// storage records, so the read and the write route through the

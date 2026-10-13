@@ -19,7 +19,24 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.137 (2026-10-13; the batch-C connector emit surface
+- Contract revision: 1.138 (2026-10-13; the batch-C list surface
+  (§4.128–§4.131; the sections carry the full records): the typing
+  projection carries the sender identity (§4.128 — `conversation.typing`
+  additively carries `senderId`/`senderName`, absent-key), the
+  conversation summary carries its protocol identifiers (§4.129 —
+  `serviceId`/`e164`/`groupId` derived from the peer-key shape, `pni`
+  reserved-never-present), the draft stamp rides the summaries with two
+  new local faces (§4.130 — `conversations.saveDraft`/
+  `conversations.clearDraft`, timestamp-only, draft text stays
+  desktop-side safeStorage), and the blocked mask reaches the list and
+  the event stream (§4.131 — the summary's always-serialized `blocked`
+  bit, written by the §4.47 write-back mirror, the §4.58 BLOCK-family
+  verbs, and the enrich's own isBlocked; one writer per key family).
+  Wire additive-only: two new methods, two optional event keys, four
+  absent-key + one always-serialized summary keys, one new store table,
+  no changed shape, error, or capability move. Tests 755 → 763 (lib
+  573 → 581), all green) —
+  previously 1.137 (2026-10-13; the batch-C connector emit surface
   begins (§4.125 overview; the sections carry the full records): the
   outbound link-preview `date` send face (§4.126 — `messages.sendText`
   preview entries gain the optional `date` stamp, 0 reads as absent, the
@@ -10073,13 +10090,13 @@ connector→engine leg. This revision lands the batch's two send faces and
 its one verification record: the outbound link-preview `date` stamp
 (§4.126), the outbound attachment blur placeholder (§4.127), and the
 admin-delete-window verification (§4.133 — a verification record, no
-implementation). The batch's remaining five faces — the typing summary
-projection (§4.128), the conversation-summary identifiers (§4.129), the
-draft timestamps (§4.130), the blocked mask (§4.131), and the live
-contact-card branch (§4.132) — land in the same batch's subsequent
-commits and complete the §4.125–§4.133 run; the numbering gap between
-this revision's sections and §4.133 is that landing order, not a
-reserved hole.
+implementation). The batch's remaining faces land in order: the typing
+summary projection (§4.128), the conversation-summary identifiers
+(§4.129), the draft timestamps (§4.130), and the blocked mask (§4.131)
+land together at revision 1.138; the live contact-card branch (§4.132)
+completes the §4.125–§4.133 run in the batch's last commit — the
+numbering gap between 1.137's sections and §4.133 is that landing
+order, not a reserved hole.
 
 ### 4.126 The outbound link-preview date rides the send (contract revision 1.137, 2026-10-13)
 
@@ -10165,6 +10182,153 @@ could not blur.
   the upstream channel's, not the connector's.
 - Schema: both defs gain `blurHash` (1..128); the numeric-bounds pair
   pins the bound to the shared engine constant.
+
+### 4.128 The typing projection carries the sender (contract revision 1.138, 2026-10-13)
+
+The `conversation.typing` event (§4.13) told the desktop *that* a
+conversation was typing, never *who*. The desktop list row renders the
+indicator with an author label, and two peers typing into one group are
+two facts, not one — so the event now carries the sender the envelope
+named.
+
+- Event: `conversation.typing` additively carries `senderId` (the
+  envelope source, verbatim — ServiceId UUID or e164 as received) and
+  `senderName` (the envelope `sourceName`, the same trim/64-char bound
+  the engine projection applies to every actor-name capture). Both keys
+  are absent when the envelope carried neither — absent keys keep the
+  host merge total, and pre-1.138 hosts read byte-identical payloads.
+- Source: the fields ride the `NormalizedReceive` the control
+  projection already builds (the same capture every message row's
+  actor name uses) — no engine change, no routing change, the typing
+  arm reads what the envelope said.
+- The rate limiter stays conversation-scoped (unchanged, the 1.15
+  discipline): inside one window the first sender wins, and a second
+  sender's indicator converges on its next upstream refresh — typing
+  indicators re-fire every few seconds, so the collapse self-heals
+  faster than a human notices. The host's display timeout remains the
+  presentation owner.
+- Schema: the `conversation.typing` data def gains the two optional
+  keys (the required trio unchanged).
+
+Tests: `typing_event_carries_the_envelope_sender_identity` (the named
+envelope carries both fields, the bare envelope keeps the name absent),
+beside the 1.15 limiter tests.
+
+### 4.129 The conversation summary carries its identifiers (contract revision 1.138, 2026-10-13)
+
+The desktop's `!` selector faces match on identifier suffixes —
+`*ServiceIdEndsWith`, `*E164EndsWith`, `*GroupIdEndsWith` — and the
+summary row carried none of them: the desktop derived what it could
+from its own cache and the commands sat unimplemented (the parity
+matrix's data-plane gap). The row now carries its identifiers, derived
+at read time from the peer key's shape — the peer key is already the
+row's address, so the derivation is one source, no second truth:
+
+- `groupId`: a group row keys it off the raw group master key — the
+  §4.44/§4.50 addressing form, verbatim.
+- `e164`: a direct row keyed on a `+`-prefixed phone number answers it
+  verbatim.
+- `serviceId`: a direct row keyed on a ServiceId UUID answers it
+  verbatim; a direct row keyed on a number-shaped key (history-
+  imported, no live envelope seen yet) maps through the most recent
+  `peer_identities` row the ingest wrote — the §4.48 reverse lookup. A
+  key nothing resolves leaves the row with no identifier: the row stays
+  addressable by id, and no identifier is invented (the lookup is a
+  tolerant read — a failure degrades to absent, it never fails the
+  summary).
+- `pni`: reserved and never present. The connector has no PNI source —
+  this is the honest hole the section documents so nobody later "fills"
+  it with an invented key.
+- Serialization: the four keys are absent-key (`skip` when None), so
+  pre-1.138 hosts read byte-identical rows and a row without a
+  resolvable identifier carries nothing.
+- Both summary builders share the derivation (the list page and the
+  single-row `conversation.changed` summary cannot disagree — the 1.71
+  read-time family discipline).
+
+Tests: `conversation_summary_projects_identifiers_from_the_peer_key`
+(the five shapes: group / `+` / UUID / number-mapped / orphan).
+
+### 4.130 The draft stamp rides the summaries; saveDraft/clearDraft are local faces (contract revision 1.138, 2026-10-13)
+
+The official DraftRepository records a draft as (conversation, text,
+timestamp). The text is the desktop's own safeStorage material — the
+connector is body-blind to it by construction (the §6.5 no-PII
+discipline applies double to unsent text) — but the *timestamp* is the
+list's sort/label signal and it had no wire. Two new local faces write
+it, and the summaries carry it:
+
+- `conversations.saveDraft` `{accountId, conversationId,
+  draftTimestamp}`: the stamp is required and must be positive (0 is
+  the absent fold — clearing is `clearDraft`'s explicit job, a 0 stamp
+  answers INVALID_REQUEST). Result `{status: "saved"}`.
+- `conversations.clearDraft` `{accountId, conversationId}`: idempotent
+  — a conversation with no stored draft still answers
+  `{status: "cleared"}`, a replay stays silent.
+- Lane: local state with no engine and no upstream — the
+  `history.importRetry` shape (send lane, account-scoped mutating: the
+  same-account write mutex and delete barrier apply through the host
+  `acquire`; the store work runs on the blocking pool). The
+  conversation row resolves first (CONVERSATION_NOT_FOUND before any
+  write); re-saving the same conversation replaces its stamp.
+- Storage: `conversation_drafts(account_id, conversation_id,
+  draft_timestamp, PK(account_id, conversation_id))` — the
+  `conversation_pins` table shape minus the pin identity columns,
+  `CREATE TABLE IF NOT EXISTS` in the open DDL (no user_version move;
+  the `peer_identities` precedent). One row per conversation,
+  replace-on-save; the account/conversation foreign keys cascade.
+- Summaries: `draftTimestamp` (epoch ms, absent when nothing is drafted
+  or after a clear), and both writes push the refreshed summary on
+  `conversation.changed` so every window sees the new draft clock
+  without a re-read (the expire-timer mirror discipline).
+
+Tests: `conversation_draft_stamps_roundtrip_through_summaries` (the
+store boundary), `store_draft_faces_bound_resolve_and_stamp` (bounds
+and refusals), `save_and_clear_draft_stamp_locally_and_push_changed`
+(the supervisor lane and the event).
+
+### 4.131 The blocked mask reaches the list and the event stream (contract revision 1.138, 2026-10-13)
+
+The blocked bit lived in three places — the §4.45 pull (cloud records),
+the §4.47 write (upstream), and the enrich's own `isBlocked` trio stamp
+— and none of them told the desktop's list until it pulled. The summary
+now carries the mask state, and the writers that move it push the
+refreshed summary:
+
+- Summary: `blocked`, a bare always-serialized boolean (the
+  muted/pinned/isSelf discipline — false is the meaningful unmasked
+  default): the direct row's stored `mrr_factors_json.blocked` stamp.
+  Group rows stay false — §4.45 pull remains the group authority (the
+  honest hole; a group mask still read-backs on the §4.47 response
+  body, and the desktop's own cache holds the pull result).
+- Writer 1, the §4.47 write-back: a definite `conversations.setBlocked`
+  success now mirrors the bit into the direct row's factor stamp and
+  rides `conversation.changed` (the expire-timer local-mirror
+  discipline: a mirror failure only costs the next event its freshness,
+  the cloud answer stays the face). A group conversation mirrors
+  nothing.
+- Writer 2, the §4.58 consume batch: the BLOCK family verbs —
+  `BLOCK=3`, `BLOCK_AND_DELETE=4`, `BLOCK_AND_SPAM=6` (the official
+  `SignalService.proto` member values) — stamp `blocked=true` through
+  the same consume batch as the accept stamp, so a linked device's
+  block composition masks the conversation locally too, whichever
+  device composed it. The face stamps true only: the sync vocabulary
+  has no unmask member, and unblocking is writer 1's and the enrich's
+  job.
+- Preservation: the throttled enrich's trio re-stamp now preserves the
+  `blocked` key exactly like the accept pair — each key family has one
+  writer, so an enrich that stamps the probed-absent `{}` can never
+  clear a mask a write face just set, while an engine answer that does
+  name `isBlocked` still wins (the cloud truth at enrich time).
+- Additive posture: pre-1.138 desktops that never read the key lose
+  nothing; pre-1.138 connectors never sent it.
+
+Tests: `blocked_stamp_survives_the_enrich_and_yields_to_engine_truth`
+(the store merge/preserve semantics),
+`ingest_message_request_response_block_family_stamps_blocked` (the
+consume batch, and a non-BLOCK verb never rewrites the mask),
+`set_blocked_write_back_mirrors_the_local_stamp_and_pushes_changed`
+(the write-back mirror and the event, both directions).
 
 ### 4.133 The admin-delete window is a client-side remote-config gate, not a protocol face (verification record, 2026-10-13; no contract change)
 

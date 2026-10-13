@@ -4209,12 +4209,41 @@ impl RuntimeSupervisor {
             .call("setConversationBlocked", upstream, CallClass::Mutating)
             .await
         {
-            Ok(result) => Ok(blocked_conversations_result(
-                result
-                    .get("blocked")
-                    .and_then(Value::as_array)
-                    .ok_or(ServiceError::Engine(EngineError::Protocol))?,
-            )),
+            Ok(result) => {
+                let blocked = blocked_conversations_result(
+                    result
+                        .get("blocked")
+                        .and_then(Value::as_array)
+                        .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+                );
+                // Contract 1.138 (§4.131): the local mirror follows the
+                // upstream write — the direct row's factor stamp carries the
+                // blocked bit (a group row stamps nothing, §4.45 pull stays
+                // the group authority) and the refreshed summary rides
+                // conversation.changed, so the masking window and every other
+                // window converge without a re-read. Best-effort like the
+                // expire-timer mirror: a mirror failure only costs the next
+                // event its freshness, the cloud answer stays the face.
+                if self
+                    .store
+                    .set_conversation_blocked_factor(
+                        &params.account_id,
+                        &params.conversation_id,
+                        params.blocked,
+                    )
+                    .unwrap_or(false)
+                    && let Some(conversation) = self
+                        .store
+                        .conversation_summary(&params.account_id, &params.conversation_id)
+                        .ok()
+                        .flatten()
+                {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(conversation));
+                }
+                Ok(blocked)
+            }
             Err(EngineError::UnknownOutcome) => Err(ServiceError::Api(ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
                 "mutating request has an unknown outcome",
@@ -4222,6 +4251,57 @@ impl RuntimeSupervisor {
             ))),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// conversations.saveDraft (contract 1.138, §4.130): the local draft
+    /// stamp — bounds, resolution, and the timestamp-only write in one
+    /// blocking-lane call over the shared store, no engine and no upstream
+    /// (the `history.importRetry` lane shape; the account-scoped mutating
+    /// mutex and delete barrier apply through the host `acquire`). The
+    /// refreshed summary rides conversation.changed so every window sees the
+    /// new draft clock without a re-read.
+    pub async fn save_conversation_draft(
+        &self,
+        params: crate::service::ConversationsSaveDraftParams,
+    ) -> Result<&'static str, ServiceError> {
+        let store = Arc::clone(&self.store);
+        let summary = blocking_service(move || {
+            crate::service::store_save_conversation_draft(
+                &store,
+                &params.account_id,
+                &params.conversation_id,
+                params.draft_timestamp,
+            )
+        })
+        .await?;
+        let _ = self
+            .host_events
+            .send(HostSideEvent::ConversationChanged(summary));
+        Ok("saved")
+    }
+
+    /// conversations.clearDraft (contract 1.138, §4.130): the stamp is the
+    /// whole draft record, so the clear is the save's inverse on the same
+    /// local lane — idempotent (a conversation with no draft still answers
+    /// `saved`→`cleared`), and the refreshed summary rides
+    /// conversation.changed.
+    pub async fn clear_conversation_draft(
+        &self,
+        params: crate::service::ConversationsClearDraftParams,
+    ) -> Result<&'static str, ServiceError> {
+        let store = Arc::clone(&self.store);
+        let summary = blocking_service(move || {
+            crate::service::store_clear_conversation_draft(
+                &store,
+                &params.account_id,
+                &params.conversation_id,
+            )
+        })
+        .await?;
+        let _ = self
+            .host_events
+            .send(HostSideEvent::ConversationChanged(summary));
+        Ok("cleared")
     }
 
     /// conversations.getState (contract revision 1.116, §4.97, capability
@@ -9867,6 +9947,202 @@ mod tests {
             panic!("expected a conversation.changed event");
         };
         assert_eq!(changed.expire_timer_seconds, Some(604_800));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// conversations.setBlocked (contract 1.138, §4.131): the §4.47 upstream
+    /// write is followed by the local mirror — the direct row's factor stamp
+    /// carries the blocked bit and the refreshed summary rides
+    /// conversation.changed, so the masking window and every other window
+    /// converge without a re-read.
+    #[tokio::test]
+    async fn set_blocked_write_back_mirrors_the_local_stamp_and_pushes_changed() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut host_lane = supervisor.subscribe_host();
+
+        let blocked = supervisor
+            .set_conversation_blocked(crate::service::ConversationsSetBlockedParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                kind: "contact".into(),
+                blocked: true,
+            })
+            .await
+            .unwrap();
+        assert!(
+            blocked
+                .blocked
+                .iter()
+                .any(|entry| entry.conversation_id == "+15555550101"),
+            "the post-write cloud list answers the fresh mask (the resolved peer reference)"
+        );
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.blocked, "the local mirror carries the stamp");
+        let event = timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        let HostSideEvent::ConversationChanged(changed) = event else {
+            panic!("expected a conversation.changed event");
+        };
+        assert_eq!(changed.id, conversation.id);
+        assert!(changed.blocked);
+
+        // The unblock mirror clears the stamp the same way.
+        supervisor
+            .set_conversation_blocked(crate::service::ConversationsSetBlockedParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                kind: "contact".into(),
+                blocked: false,
+            })
+            .await
+            .unwrap();
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.blocked);
+        supervisor.shutdown().await.unwrap();
+    }
+
+    /// conversations.saveDraft / conversations.clearDraft (contract 1.138,
+    /// §4.130): the local draft lane — no engine, no upstream, the stamp
+    /// lands on the shared store, the refreshed summary rides
+    /// conversation.changed on both writes, and an unknown conversation
+    /// answers CONVERSATION_NOT_FOUND.
+    #[tokio::test]
+    async fn save_and_clear_draft_stamp_locally_and_push_changed() {
+        let temp = TempDir::new().unwrap();
+        let store =
+            Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
+        let mut config = SignalCliConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+            temp.path().join("signal-data"),
+        );
+        config.request_timeout = Duration::from_secs(3);
+        config.shutdown_grace = Duration::from_millis(100);
+        let supervisor = Arc::new(RuntimeSupervisor::new(
+            config,
+            store,
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        ));
+        supervisor.start().await.unwrap();
+        let account = supervisor
+            .service
+            .lock()
+            .await
+            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let mut host_lane = supervisor.subscribe_host();
+
+        let status = supervisor
+            .save_conversation_draft(crate::service::ConversationsSaveDraftParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+                draft_timestamp: 1_700_000_000_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "saved");
+        let summary = supervisor
+            .service
+            .lock()
+            .await
+            .store_ref()
+            .conversation_summary(&account.id, &conversation.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.draft_timestamp, Some(1_700_000_000_000));
+        let event = timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        let HostSideEvent::ConversationChanged(changed) = event else {
+            panic!("expected a conversation.changed event");
+        };
+        assert_eq!(changed.draft_timestamp, Some(1_700_000_000_000));
+
+        // The clear refreshes the stamp away.
+        let status = supervisor
+            .clear_conversation_draft(crate::service::ConversationsClearDraftParams {
+                account_id: account.id.clone(),
+                conversation_id: conversation.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "cleared");
+        let event = timeout(Duration::from_secs(2), host_lane.recv())
+            .await
+            .expect("conversation.changed within timeout")
+            .unwrap();
+        let HostSideEvent::ConversationChanged(changed) = event else {
+            panic!("expected a conversation.changed event");
+        };
+        assert_eq!(changed.draft_timestamp, None);
+
+        // An unknown conversation is addressed by nobody.
+        assert!(matches!(
+            supervisor
+                .save_conversation_draft(crate::service::ConversationsSaveDraftParams {
+                    account_id: account.id.clone(),
+                    conversation_id: "no-such-conversation".into(),
+                    draft_timestamp: 1,
+                })
+                .await,
+            Err(crate::service::ServiceError::Store(
+                crate::store::StoreError::ConversationNotFound
+            ))
+        ));
         supervisor.shutdown().await.unwrap();
     }
 

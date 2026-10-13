@@ -61,6 +61,8 @@
             "conversations.getPinned",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.saveDraft",
+            "conversations.clearDraft",
             "conversations.getState",
             "conversations.setState",
             "conversations.acceptRequest",
@@ -393,6 +395,28 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/conversationsSetBlockedParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.saveDraft" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsSaveDraftParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "conversations.clearDraft" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/conversationsClearDraftParams" }
             }
           }
         },
@@ -1721,7 +1745,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "limit"],
-      "description": "Read lane over the local conversation cache; ordered by newest message, page-bounded, cursor-resumable. Contract 1.43 (\u00a74.42): the result includes the linked account's own Note to Self direct conversation \u2014 the contacts sync no longer drops the self entry, so its skeleton materializes like any contact's \u2014 and every summary row carries isSelf (always-serialized boolean): true exactly for the direct conversation whose peerKey equals the account's own number (number-based, the \u00a74.24 boundary: the own ACI is not queryable upstream, so a UUID-keyed row cannot be marked), false on every other row including groups. The self row's title is raw contact material (the account's own profile name); the desktop localizes the Note to Self title and avatar from isSelf \u2014 the connector ships no copy. Contract 1.60 (\u00a74.52): every summary row carries isTerminated (plain bool, present only when true \u2014 absent on false, pre-1.60 hosts read byte-identical rows): the group termination flag the 1.53 \u00a74.50 appendix sync capture stores in the kind='group' contacts row, stamped at read time (a group and its contacts row share the stable id; a group with no cache row yet, every direct row, and every pre-1.53 sync row answer absent/false). The desktop forward-target filter consumes it (the official selectors/composable face excludes terminated groups); the receive chain cannot refresh the flag, only the next contacts.sync can, and syncedAt remains the staleness signal. Contract 1.65 (\u00a74.58): every summary row carries messageRequestAccepted (bare always-serialized boolean, the muted/pinned/isSelf discipline \u2014 both values are meaningful): the official isConversationAccepted multi-factor derived at read time over the row's stored engine factor stamp (mrr_factors_json \u2014 {hidden, profileSharing, blocked} the throttled listContacts enrich stamps on its existing round trip, schema version 20; an engine without the flags stamps the probed-absent {}), the message window, and isSelf. Contract 1.70 (\u00a74.58 consume batch): the stamp also carries the authoritative acceptResponseType face (the official factor's first weight) that a linked device's syncMessage.messageRequestResponse mirror writes on ingest \u2014 a well-formed mirror (known non-UNKNOWN enum member, exactly one thread leg, the ServiceId UUID / 32-byte base64 shapes) stamps it, everything else fails closed into the plain skip; a stamped ACCEPT accepts ahead of every window weight, any other member keeps the window answer, and a row without the stamp keeps the 1.65 local fallback verbatim. Honest per-factor holes never invented (each collapses to inactive, the official default posture): messageCountBeforeMessageRequests (official-desktop migration state), and the group factors addedBy/pendingAdminApprovalV2/group profileSharing (no engine read face) \u2014 a group row derives accepted from its own outgoing window alone. A desktop consumes the key as authoritative when present and keeps its local window derivation only for pre-1.65 connectors where the key is absent. Contract 1.71 (2026-10-07, dated note — the desktop evidence-gate data-plane gap, desktop matrix \u00a718.4 2026-10-06 record): every summary row also carries hasUserInitiatedOutbound (bare always-serialized boolean, the muted/pinned/isSelf discipline \u2014 both values are meaningful): true exactly when the conversation's whole history contains at least one outgoing data row \u2014 the official sentMessageCount > 0 factor (ts/util/isConversationAccepted.preload.ts:58,75, the same factor weight the \u00a74.58 derivation reads) surfaced as a standalone bit, aligned with the official hasUserInitiatedMessages whole-history EXISTS semantics (Server.node.ts:2389-2410, Interface.std.ts:486, conversations.preload.ts:4621/:3752-3755, maybeForwardMessages.preload.ts:192-201), independent of any message window or the newest row. Derived at read time (the same read-time family as messageRequestAccepted, list page and single-row conversation.changed summary share one helper); pure wire addition \u2014 pre-1.71 hosts read byte-identical rows without it. Absent store evidence (a fresh row, or any history the connector does not hold) projects false \u2014 honest absence, never invented.",
+      "description": "Read lane over the local conversation cache; ordered by newest message, page-bounded, cursor-resumable. Contract 1.43 (\u00a74.42): the result includes the linked account's own Note to Self direct conversation \u2014 the contacts sync no longer drops the self entry, so its skeleton materializes like any contact's \u2014 and every summary row carries isSelf (always-serialized boolean): true exactly for the direct conversation whose peerKey equals the account's own number (number-based, the \u00a74.24 boundary: the own ACI is not queryable upstream, so a UUID-keyed row cannot be marked), false on every other row including groups. The self row's title is raw contact material (the account's own profile name); the desktop localizes the Note to Self title and avatar from isSelf \u2014 the connector ships no copy. Contract 1.60 (\u00a74.52): every summary row carries isTerminated (plain bool, present only when true \u2014 absent on false, pre-1.60 hosts read byte-identical rows): the group termination flag the 1.53 \u00a74.50 appendix sync capture stores in the kind='group' contacts row, stamped at read time (a group and its contacts row share the stable id; a group with no cache row yet, every direct row, and every pre-1.53 sync row answer absent/false). The desktop forward-target filter consumes it (the official selectors/composable face excludes terminated groups); the receive chain cannot refresh the flag, only the next contacts.sync can, and syncedAt remains the staleness signal. Contract 1.65 (\u00a74.58): every summary row carries messageRequestAccepted (bare always-serialized boolean, the muted/pinned/isSelf discipline \u2014 both values are meaningful): the official isConversationAccepted multi-factor derived at read time over the row's stored engine factor stamp (mrr_factors_json \u2014 {hidden, profileSharing, blocked} the throttled listContacts enrich stamps on its existing round trip, schema version 20; an engine without the flags stamps the probed-absent {}), the message window, and isSelf. Contract 1.70 (\u00a74.58 consume batch): the stamp also carries the authoritative acceptResponseType face (the official factor's first weight) that a linked device's syncMessage.messageRequestResponse mirror writes on ingest \u2014 a well-formed mirror (known non-UNKNOWN enum member, exactly one thread leg, the ServiceId UUID / 32-byte base64 shapes) stamps it, everything else fails closed into the plain skip; a stamped ACCEPT accepts ahead of every window weight, any other member keeps the window answer, and a row without the stamp keeps the 1.65 local fallback verbatim. Honest per-factor holes never invented (each collapses to inactive, the official default posture): messageCountBeforeMessageRequests (official-desktop migration state), and the group factors addedBy/pendingAdminApprovalV2/group profileSharing (no engine read face) \u2014 a group row derives accepted from its own outgoing window alone. A desktop consumes the key as authoritative when present and keeps its local window derivation only for pre-1.65 connectors where the key is absent. Contract 1.71 (2026-10-07, dated note — the desktop evidence-gate data-plane gap, desktop matrix \u00a718.4 2026-10-06 record): every summary row also carries hasUserInitiatedOutbound (bare always-serialized boolean, the muted/pinned/isSelf discipline \u2014 both values are meaningful): true exactly when the conversation's whole history contains at least one outgoing data row \u2014 the official sentMessageCount > 0 factor (ts/util/isConversationAccepted.preload.ts:58,75, the same factor weight the \u00a74.58 derivation reads) surfaced as a standalone bit, aligned with the official hasUserInitiatedMessages whole-history EXISTS semantics (Server.node.ts:2389-2410, Interface.std.ts:486, conversations.preload.ts:4621/:3752-3755, maybeForwardMessages.preload.ts:192-201), independent of any message window or the newest row. Derived at read time (the same read-time family as messageRequestAccepted, list page and single-row conversation.changed summary share one helper); pure wire addition \u2014 pre-1.71 hosts read byte-identical rows without it. Absent store evidence (a fresh row, or any history the connector does not hold) projects false \u2014 honest absence, never invented. Contract 1.138 (\u00a74.129): every summary row additively carries its protocol identifiers, derived at read time from the peer key's shape so the desktop's `!` selector faces match without a second lookup \u2014 groupId (a group row, the raw group master key, the \u00a74.44/\u00a74.50 addressing form), e164 (a direct row keyed on a +prefixed phone number), serviceId (a direct row keyed on a ServiceId UUID, or keyed on a number-shaped key mapped through the most recent ingest-written peer_identities row); a key nothing resolves leaves all three absent (the row stays addressable by id, no identifier invented) and pni is reserved-never-present (the connector has no PNI source \u2014 the honest hole \u00a74.129 documents). Contract 1.138 (\u00a74.131): every summary row also carries blocked (bare always-serialized boolean, the muted/pinned/isSelf discipline): the direct row's stored blocked stamp \u2014 written by the \u00a74.47 setBlocked write-back, the \u00a74.58 BLOCK-family request-response verbs (BLOCK=3/BLOCK_AND_DELETE=4/BLOCK_AND_SPAM=6), and the contacts enrich's own isBlocked \u2014 so the desktop renders the mask state from the list/event stream instead of a pull; group rows stay false (\u00a74.45 pull remains the group authority, the honest hole). Contract 1.138 (\u00a74.130): every summary row also carries draftTimestamp (epoch ms, absent when nothing is drafted or after conversations.clearDraft) \u2014 the official DraftRepository record's clock, the only draft material the connector holds (draft text stays desktop-side safeStorage); written by the new local conversations.saveDraft/conversations.clearDraft faces, and the refreshed summary rides conversation.changed on every write.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "cursor": { "type": "string", "maxLength": 256 },
@@ -2620,6 +2644,41 @@
           "type": "string",
           "enum": ["contact", "group", "legacyGroup"],
           "description": "The upstream conversation reference taxonomy: direct chat, GroupsV2 group, or GroupsV1 legacy group — the record family the engine reads."
+        }
+      }
+    },
+    "conversationsSaveDraftParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId", "draftTimestamp"],
+      "description": "Stamp one conversation's draft clock (contract revision 1.138, \u00a74.130): the connector stores the official DraftRepository record's timestamp alone — draft text never crosses this wire (the desktop keeps it in its own safeStorage; the connector is body-blind by construction). The face is local state with no engine and no upstream (the history.importRetry lane shape): send lane, account-scoped mutating — the same-account write mutex and delete barrier apply through the host acquire — and the refreshed summary rides conversation.changed, so every window sees the new draft clock without a re-read. The conversation row resolves first (CONVERSATION_NOT_FOUND before any write); re-saving the same conversation replaces its stamp. draftTimestamp is the connector-clock epoch millisecond the desktop wants the list to sort/label the draft by; it must be positive (0 is the absent fold — clearing is conversations.clearDraft's explicit job, a 0 stamp answers INVALID_REQUEST). Result is {status: 'saved'}.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to stamp; resolved against the account before any write."
+        },
+        "draftTimestamp": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The draft's clock (epoch ms, positive): the only draft material the connector holds. Replace-on-save, per conversation."
+        }
+      }
+    },
+    "conversationsClearDraftParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "conversationId"],
+      "description": "Clear one conversation's draft clock (contract revision 1.138, \u00a74.130): the stamp is the whole draft record, so the clear is the save's inverse on the same local lane — no engine, no upstream, send lane, account-scoped mutating, and the refreshed summary rides conversation.changed. The conversation row resolves first (CONVERSATION_NOT_FOUND before any write); the face is idempotent — a conversation with no stored draft still answers {status: 'cleared'} (a replay stays silent).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "conversationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "The conversation to clear; resolved against the account before any write."
         }
       }
     },
@@ -4309,13 +4368,21 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["accountId", "conversationId", "action"],
-                "description": "Ephemeral typing indicator (contract 1.15): never persisted, rate limited per account+conversation before it reaches the host lane. The host owns display timeout.",
+                "description": "Ephemeral typing indicator (contract 1.15): never persisted, rate limited per account+conversation before it reaches the host lane. The host owns display timeout. Contract 1.138 (§4.128): the event additively carries the sender identity the envelope named — senderId (the envelope source, verbatim: ServiceId UUID or e164) and senderName (the trimmed display name) — so the desktop list can attribute the indicator; both keys stay absent when the envelope carried neither, and pre-1.138 hosts read byte-identical payloads. The rate limiter stays conversation-scoped (unchanged): inside one window the first sender wins, a second sender's indicator converges on its next upstream refresh.",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "conversationId": { "$ref": "#/$defs/opaqueId" },
                   "action": {
                     "enum": ["START", "STOP"],
                     "description": "Upstream typingMessage action; START shows the indicator, STOP clears it immediately."
+                  },
+                  "senderId": {
+                    "type": "string",
+                    "description": "The typing sender's identity as the envelope named it (ServiceId UUID or e164, verbatim); absent when the envelope carried no source."
+                  },
+                  "senderName": {
+                    "type": "string",
+                    "description": "The typing sender's display name (the envelope sourceName, trimmed to the shared 64-char bound); absent when the envelope carried no name."
                   }
                 }
               }

@@ -158,6 +158,14 @@ pub const METHODS: &[MethodRow] = &[
     // post-write cloud blocked list read back, not a local echo; advertised
     // through `blocked-write`.
     ("conversations.setBlocked", Lane::Send, true, "send"),
+    // Conversation draft stamp (contract 1.138, §4.130): mutating local
+    // state on the send lane — the history.importRetry class (a local write
+    // with no upstream call, the reaction-class same-account mutex and
+    // delete barrier included). The engine stays out of the path: the stamp
+    // is the whole draft record (the desktop keeps draft text in its own
+    // safeStorage), and the refreshed summary rides conversation.changed.
+    ("conversations.saveDraft", Lane::Send, true, "send"),
+    ("conversations.clearDraft", Lane::Send, true, "send"),
     // Conversation state trio (contract 1.116, §4.97): get is a bounded
     // cloud-backed read of the storage records' mute/archive/unread bits;
     // set is the mutating storage-service partial write — reaction-class
@@ -893,6 +901,8 @@ mod tests {
             "presence.setTypingMessage",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.saveDraft",
+            "conversations.clearDraft",
             "conversations.setState",
             "conversations.setExpireTimer",
             "groups.update",
@@ -965,6 +975,8 @@ mod tests {
             "accounts.deleteLocalData",
             "conversations.setPinned",
             "conversations.setBlocked",
+            "conversations.saveDraft",
+            "conversations.clearDraft",
             "conversations.setState",
             "conversations.setExpireTimer",
             "groups.update",

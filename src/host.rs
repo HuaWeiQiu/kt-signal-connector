@@ -36,13 +36,13 @@ use crate::service::{
     CallsGroupMembersParams, CallsGroupProofParams, CallsLinkPresentationParams,
     CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFoldersListParams,
     ChatFoldersSetRecordsParams, ContactsListParams, ContactsSetLocalAliasParams,
-    ContactsSyncParams, ConversationsGetAvatarParams, ConversationsGetBlockedParams,
-    ConversationsGetPinnedParams, ConversationsGetStateParams, ConversationsListParams,
-    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
-    ConversationsSetStateParams, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
-    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsGetParams,
-    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
-    GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    ContactsSyncParams, ConversationsClearDraftParams, ConversationsGetAvatarParams,
+    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
+    ConversationsListParams, ConversationsSaveDraftParams, ConversationsSetBlockedParams,
+    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, ConversationsSetStateParams,
+    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
+    GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
+    GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
     HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams, LinkSessionParams, LinkStartParams,
@@ -2110,6 +2110,38 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        "conversations.saveDraft" => {
+            match serde_json::from_value::<ConversationsSaveDraftParams>(request.params) {
+                Ok(params) => match runtime.save_conversation_draft(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.saveDraft params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        "conversations.clearDraft" => {
+            match serde_json::from_value::<ConversationsClearDraftParams>(request.params) {
+                Ok(params) => match runtime.clear_conversation_draft(params).await {
+                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid conversations.clearDraft params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "conversations.getState" => {
             match serde_json::from_value::<ConversationsGetStateParams>(request.params) {
                 Ok(params) => match runtime.get_conversation_state(params).await {
@@ -3426,15 +3458,23 @@ where
             account_id,
             conversation_id,
             action,
+            sender_id,
+            sender_name,
         } => {
-            send_shared(
-                writer,
-                &HostEvent::new(
-                    "conversation.typing",
-                    json!({ "accountId": account_id, "conversationId": conversation_id, "action": action }),
-                ),
-            )
-            .await
+            // Contract 1.138 (§4.128): the sender identity rides only when
+            // the envelope named it — absent keys keep the host merge total.
+            let mut payload = json!({
+                "accountId": account_id,
+                "conversationId": conversation_id,
+                "action": action,
+            });
+            if let Some(sender_id) = sender_id {
+                payload["senderId"] = json!(sender_id);
+            }
+            if let Some(sender_name) = sender_name {
+                payload["senderName"] = json!(sender_name);
+            }
+            send_shared(writer, &HostEvent::new("conversation.typing", payload)).await
         }
         HostSideEvent::MessageViewOnceOpened {
             account_id,
@@ -3649,11 +3689,7 @@ where
             if let Some(conversation_id) = conversation_id {
                 payload["conversationId"] = json!(conversation_id);
             }
-            send_shared(
-                writer,
-                &HostEvent::new("identity.verifiedChanged", payload),
-            )
-            .await
+            send_shared(writer, &HostEvent::new("identity.verifiedChanged", payload)).await
         }
         HostSideEvent::CallHistoryEvent {
             account_id,
@@ -3718,10 +3754,7 @@ where
             )
             .await
         }
-        HostSideEvent::FetchLatestSync {
-            account_id,
-            kind,
-        } => {
+        HostSideEvent::FetchLatestSync { account_id, kind } => {
             // Contract 1.106, §4.87: the trigger forwards flat — the
             // SCREAMING word rides verbatim when the projection carried it,
             // absent otherwise (the official fires the same type-less event).

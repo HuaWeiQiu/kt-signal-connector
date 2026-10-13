@@ -18,6 +18,13 @@ use crate::engine::{
 /// The official ACCEPT member of the `messageRequestResponseType` enum
 /// (`SignalService.proto:666-678`): the member the §4.58 factor weight reads.
 const MRR_RESPONSE_TYPE_ACCEPT: u8 = 1;
+/// The BLOCK family of the same enum (§4.131): the members that close the
+/// request by masking the sender — each stamps the conversation's blocked
+/// bit (the official `handleMessageTypeResponse` block branch masks the
+/// conversation for the member verbs the desktop's block composition uses).
+const MRR_RESPONSE_TYPE_BLOCK: u8 = 3;
+const MRR_RESPONSE_TYPE_BLOCK_AND_DELETE: u8 = 4;
+const MRR_RESPONSE_TYPE_BLOCK_AND_SPAM: u8 = 6;
 use crate::groups::MAX_ACCOUNTS_PER_ENGINE;
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::{ActiveLinkSession, LINK_SESSION_TTL, now_ms};
@@ -1063,11 +1070,18 @@ pub enum HostSideEvent {
         viewed_at: Option<u64>,
     },
     /// Ephemeral typing indicator (contract 1.15): never persisted, rate
-    /// limited per account+peer before it reaches the host lane.
+    /// limited per account+peer before it reaches the host lane. Contract
+    /// 1.138 (§4.128): the event additively carries the sender identity the
+    /// envelope named — `sender_id` (the envelope source, verbatim) and
+    /// `sender_name` (the trimmed display name) — so the desktop list can
+    /// attribute the indicator; keys stay absent when the envelope carried
+    /// neither.
     ConversationTyping {
         account_id: String,
         conversation_id: String,
         action: String,
+        sender_id: Option<String>,
+        sender_name: Option<String>,
     },
     /// A view-once message was viewed and its bytes erased (contract 1.38):
     /// emitted exactly once per message on the first burn transition — sync
@@ -9019,6 +9033,11 @@ impl ConnectorService {
                     account_id: account.id,
                     conversation_id: conversation.id,
                     action,
+                    // Contract 1.138 (§4.128): the sender identity rides the
+                    // event — the envelope source verbatim and the trimmed
+                    // display name, absent when the envelope carried neither.
+                    sender_id: receive.source.clone(),
+                    sender_name: receive.peer_name.clone(),
                 }])
             }
             ControlReceive::Receipt {
@@ -10184,7 +10203,10 @@ impl ConnectorService {
     /// conversation, sets the terminal flag for the §4.56
     /// acceptRequest/declineRequest faces' vocabulary (ACCEPT true, every
     /// other known member false — DELETE/BLOCK/BLOCK_AND_DELETE/BLOCK_AND_SPAM
-    /// close the request, SPAM closes it), and the refreshed summary rides
+    /// close the request, SPAM closes it), stamps the blocked bit for the
+    /// BLOCK family verbs (contract 1.138, §4.131 — a linked device's block
+    /// composition masks the conversation locally too, so the list summary
+    /// converges on every device), and the refreshed summary rides
     /// `conversation.changed` so the desktop's request bar converges on every
     /// linked device.
     ///
@@ -10266,6 +10288,20 @@ impl ConnectorService {
             accepted,
             response_type,
         )?;
+        // Contract 1.138 (§4.131): the BLOCK family masks the sender — the
+        // stamp rides the same consume batch (true only; unblocking is the
+        // §4.47 write's and the enrich's own `isBlocked` to clear), so a
+        // masked conversation shows the blocked bit on the next summary,
+        // whichever linked device composed the block.
+        if matches!(
+            response_type,
+            MRR_RESPONSE_TYPE_BLOCK
+                | MRR_RESPONSE_TYPE_BLOCK_AND_DELETE
+                | MRR_RESPONSE_TYPE_BLOCK_AND_SPAM
+        ) {
+            self.store
+                .set_conversation_blocked_factor(&account.id, &conversation.id, true)?;
+        }
         // The summary always re-pushes (idempotent convergence, the
         // GroupTimerUpdate discipline) even when the stamp did not change —
         // a lagging window must still converge.
@@ -10294,6 +10330,73 @@ pub(crate) fn store_list_conversations(
         return Err(ServiceError::Store(StoreError::AccountNotFound));
     }
     Ok(store.list_conversations(account_id, limit, cursor)?)
+}
+
+/// The `conversations.saveDraft` write (contract 1.138, §4.130): bounds,
+/// account/conversation resolution, and the timestamp-only stamp in one
+/// blocking-lane call over the shared store — a local face with no upstream
+/// (the `history.importRetry` lane shape), so the refreshed summary returns
+/// for the caller to ride `conversation.changed` and the response carries
+/// only the status word.
+pub(crate) fn store_save_conversation_draft(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+    draft_timestamp: u64,
+) -> Result<ConversationSummary, ServiceError> {
+    validate_opaque_id(account_id, "accountId")?;
+    if conversation_id.is_empty() || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "conversationId must contain between 1 and 256 characters",
+            false,
+        )));
+    }
+    if draft_timestamp == 0 {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "draftTimestamp must be a positive epoch millisecond",
+            false,
+        )));
+    }
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if !store.save_conversation_draft(account_id, conversation_id, draft_timestamp)? {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    store
+        .conversation_summary(account_id, conversation_id)?
+        .ok_or(ServiceError::Store(StoreError::ConversationNotFound))
+}
+
+/// The `conversations.clearDraft` write (contract 1.138, §4.130): the same
+/// local lane and bounds as the save, idempotent — a conversation with no
+/// stored draft still answers its refreshed summary.
+pub(crate) fn store_clear_conversation_draft(
+    store: &Store,
+    account_id: &str,
+    conversation_id: &str,
+) -> Result<ConversationSummary, ServiceError> {
+    validate_opaque_id(account_id, "accountId")?;
+    if conversation_id.is_empty() || conversation_id.chars().count() > MAX_PIN_CONVERSATION_ID_CHARS
+    {
+        return Err(ServiceError::Api(ApiError::new(
+            "INVALID_REQUEST",
+            "conversationId must contain between 1 and 256 characters",
+            false,
+        )));
+    }
+    if store.account_by_id(account_id)?.is_none() {
+        return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    if !store.clear_conversation_draft(account_id, conversation_id)? {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
+    }
+    store
+        .conversation_summary(account_id, conversation_id)?
+        .ok_or(ServiceError::Store(StoreError::ConversationNotFound))
 }
 
 pub(crate) fn store_list_contacts(
@@ -12509,6 +12612,29 @@ pub struct ConversationsSetStateParams {
     pub muted_until_timestamp: Option<u64>,
     pub archived: Option<bool>,
     pub marked_unread: Option<bool>,
+}
+
+/// `conversations.saveDraft` params (contract revision 1.138, §4.130): the
+/// addressing pair plus the required draft stamp. The body never crosses the
+/// wire — the desktop keeps draft text in its own safeStorage; the connector
+/// stores only the official draft record's clock. `draftTimestamp` is
+/// required and must be positive (0 is the absent fold and clears nothing —
+/// clearing is `conversations.clearDraft`'s explicit job).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsSaveDraftParams {
+    pub account_id: String,
+    pub conversation_id: String,
+    pub draft_timestamp: u64,
+}
+
+/// `conversations.clearDraft` params (contract revision 1.138, §4.130): the
+/// addressing pair alone — the stamp is the whole draft record.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationsClearDraftParams {
+    pub account_id: String,
+    pub conversation_id: String,
 }
 
 /// One `messages.deleteForMe` entry (contract revision 1.118, §4.99): the
@@ -28343,6 +28469,73 @@ mod tests {
         let _ = (&account.id, &conversation.id);
     }
 
+    /// Contract 1.138 (§4.128): the typing event carries the sender identity
+    /// the envelope named — the source verbatim and the trimmed display name
+    /// — so the desktop list can attribute the indicator; the absent-name
+    /// envelope keeps both keys absent.
+    #[test]
+    fn typing_event_carries_the_envelope_sender_identity() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+        let named = service
+            .ingest_receive(
+                control_receive_named(
+                    "+15555550100",
+                    "+15555550101",
+                    "Alice Named",
+                    ControlReceive::Typing {
+                        action: "START".into(),
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert_eq!(named.len(), 1);
+        match &named[0] {
+            HostSideEvent::ConversationTyping {
+                sender_id,
+                sender_name,
+                ..
+            } => {
+                assert_eq!(sender_id.as_deref(), Some("+15555550101"));
+                assert_eq!(sender_name.as_deref(), Some("Alice Named"));
+            }
+            other => panic!("expected a typing event, got {other:?}"),
+        }
+
+        // The envelope without a name: the id rides, the name stays absent
+        // (a different, pre-resolved conversation, so the rate limiter never
+        // swallows it).
+        service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550102", "Peer")
+            .unwrap();
+        let bare = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550102",
+                    ControlReceive::Typing {
+                        action: "START".into(),
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        match &bare[0] {
+            HostSideEvent::ConversationTyping {
+                sender_id,
+                sender_name,
+                ..
+            } => {
+                assert_eq!(sender_id.as_deref(), Some("+15555550102"));
+                assert_eq!(sender_name.as_deref(), None);
+            }
+            other => panic!("expected a typing event, got {other:?}"),
+        }
+        let _ = &account.id;
+    }
+
     /// Peer receipts upgrade earlier outgoing rows monotonically
     /// (sent → delivered → read): a lower tier never downgrades a higher
     /// one, incoming rows stay put, and only real transitions emit
@@ -31135,6 +31328,133 @@ mod tests {
                 .is_empty(),
             "groups carry no request to accept"
         );
+    }
+
+    /// Contract 1.138 (§4.131): the BLOCK family verbs (3/4/6) stamp the
+    /// conversation's blocked bit through the same consume batch — the
+    /// refreshed summary rides conversation.changed with blocked true, the
+    /// terminal not-accepted answer stays, and a non-BLOCK verb never
+    /// touches the mask.
+    #[test]
+    fn ingest_message_request_response_block_family_stamps_blocked() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        service
+            .store_ref()
+            .upsert_peer_identity(
+                &account.id,
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "+15555550101",
+            )
+            .unwrap();
+        // The seeded incoming row pins the window answer to pending (an
+        // empty private conversation derives accepted, the official
+        // empty-private-conversation weight) — the same material the 1.70
+        // test reads.
+        let mut incoming = expire_record_fixture(&account.id, &direct.id, "mrr-block");
+        incoming.sent_at = 10;
+        service
+            .store_ref()
+            .insert_message(&incoming, None, None, false)
+            .unwrap();
+
+        let block = NormalizedReceive {
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 3,
+                thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                group_id: None,
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        let events = service
+            .ingest_receive(block, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let changed = events
+            .iter()
+            .find_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary),
+                _ => None,
+            })
+            .expect("the block stamp rides conversation.changed");
+        assert!(changed.blocked);
+        assert!(!changed.message_request_accepted);
+        let after = service
+            .store_ref()
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(after.blocked);
+
+        // DELETE (2) closes the request without touching the mask.
+        let delete = NormalizedReceive {
+            control: Some(ControlReceive::MessageRequestResponse {
+                response_type: 2,
+                thread_aci: Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                group_id: None,
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        service
+            .ingest_receive(delete, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let after = service
+            .store_ref()
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(after.blocked, "a non-BLOCK verb never rewrites the mask");
+    }
+
+    /// Contract 1.138 (§4.130): the local draft write lane — bounds, the
+    /// unknown-account/unknown-conversation refusals, and the refreshed
+    /// summary the caller rides conversation.changed with.
+    #[test]
+    fn store_draft_faces_bound_resolve_and_stamp() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let direct = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let store = service.store_ref();
+
+        // Bounds: empty id, oversize id, zero stamp, unknown account.
+        assert!(matches!(
+            store_save_conversation_draft(store, &account.id, "", 5),
+            Err(ServiceError::Api(_))
+        ));
+        assert!(matches!(
+            store_save_conversation_draft(store, &account.id, &"x".repeat(257), 5),
+            Err(ServiceError::Api(_))
+        ));
+        assert!(matches!(
+            store_save_conversation_draft(store, &account.id, &direct.id, 0),
+            Err(ServiceError::Api(_))
+        ));
+        assert!(matches!(
+            store_save_conversation_draft(store, "no-such-account", &direct.id, 5),
+            Err(ServiceError::Store(StoreError::AccountNotFound))
+        ));
+        assert!(matches!(
+            store_save_conversation_draft(store, &account.id, "no-such-conversation", 5),
+            Err(ServiceError::Store(StoreError::ConversationNotFound))
+        ));
+
+        // The stamp lands and the summary carries it; the clear refreshes.
+        let summary = store_save_conversation_draft(store, &account.id, &direct.id, 42).unwrap();
+        assert_eq!(summary.draft_timestamp, Some(42));
+        let summary = store_clear_conversation_draft(store, &account.id, &direct.id).unwrap();
+        assert_eq!(summary.draft_timestamp, None);
     }
 
     /// The receive fixture the message-request tests clone from — the same

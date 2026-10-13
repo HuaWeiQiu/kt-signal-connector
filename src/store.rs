@@ -220,6 +220,14 @@ CREATE TABLE IF NOT EXISTS conversation_pins (
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS conversation_drafts (
+  account_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  draft_timestamp INTEGER NOT NULL,
+  PRIMARY KEY(account_id, conversation_id),
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+  FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS peer_identities (
   account_id TEXT NOT NULL,
   aci TEXT NOT NULL,
@@ -582,6 +590,39 @@ pub struct ConversationSummary {
     /// all (fresh row, link-time import gap, any history the connector does
     /// not hold) projects false — honest absence, never invented.
     pub has_user_initiated_outbound: bool,
+    /// Contract 1.138 (§4.129): the row's protocol identifiers, derived at
+    /// read time from the peer key's shape so the desktop's `!` selector
+    /// faces (`*ServiceIdEndsWith` / `*E164EndsWith` / `*GroupIdEndsWith`)
+    /// can match without a second lookup. A group row keys `groupId` off the
+    /// raw group master key; a direct row resolves `e164` (the `+`-prefixed
+    /// phone key), `serviceId` (a UUID-shaped key, or a number-shaped key
+    /// mapped through the most recent ingest-written `peer_identities` row),
+    /// or neither. `pni` is reserved and always absent — the connector has
+    /// no PNI source and never invents one (the honest hole §4.129
+    /// documents).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pni: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub e164: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Contract 1.138 (§4.131): the direct conversation's blocked mask bit,
+    /// the stored `mrr_factors_json.blocked` stamp (written by the §4.47
+    /// setBlocked write-back, the §4.58 BLOCK-family request-response verbs,
+    /// and the contacts enrich's own `isBlocked`). Always serialized (bare
+    /// bool, the muted/pinned/isSelf discipline): false is the meaningful
+    /// unmasked default. Group rows stay false — §4.45 pull remains the
+    /// group blocked authority (the honest hole §4.131 documents).
+    pub blocked: bool,
+    /// Contract 1.138 (§4.130): the conversation's draft timestamp as the
+    /// last `conversations.saveDraft` set it — epoch ms, the official
+    /// DraftRepository's draft record shape minus the body (the desktop
+    /// keeps draft text in its own safeStorage; the connector never sees
+    /// it). Absent when nothing is drafted or after `conversations.clearDraft`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_timestamp: Option<u64>,
 }
 
 /// One conversation's pinned state (contract 1.33): the local row the pin
@@ -837,6 +878,109 @@ fn conversation_has_user_initiated_outbound(
     )
     .map(|present| present != 0)
     .unwrap_or(false)
+}
+
+/// The §4.48 ACI reverse lookup over a caller-held connection guard (the
+/// store mutex is never re-entrant, so the summary builders resolve through
+/// the guard they already hold; the public [`Store::aci_for_peer_key`] is
+/// the locking wrapper for external callers).
+fn aci_for_peer_key_on(
+    conn: &Connection,
+    account_id: &str,
+    peer_key: &str,
+) -> Result<Option<String>, StoreError> {
+    let aci = conn
+        .query_row(
+            "SELECT aci FROM peer_identities WHERE account_id=?1 AND peer_key=?2 LIMIT 1",
+            params![account_id, peer_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(aci)
+}
+
+/// One summary row's derived identifiers (§4.129): each leg absent-key on
+/// the wire.
+#[derive(Clone, Debug, Default)]
+struct ConversationIdentifiers {
+    service_id: Option<String>,
+    e164: Option<String>,
+    group_id: Option<String>,
+}
+
+/// Contract 1.138 (§4.129): one summary row's protocol identifiers, derived
+/// at read time from the peer key's shape — the desktop's `!` selector faces
+/// match on these without a second lookup. A group row keys `groupId` off
+/// the raw group master key (the §4.44/§4.50 addressing form). A direct row
+/// resolves `e164` off a `+`-prefixed phone key, `serviceId` off a
+/// UUID-shaped key, or — a number-shaped key (history-imported, no live
+/// envelope seen yet) — through the most recent `peer_identities` mapping
+/// the ingest wrote. A key nothing resolves answers all-absent: the row
+/// stays addressable by id, no identifier is invented. `pni` never appears —
+/// the connector has no PNI source (the honest hole §4.129 documents).
+fn conversation_identifiers(
+    conn: &Connection,
+    account_id: &str,
+    kind: &str,
+    peer_key: &str,
+) -> Result<ConversationIdentifiers, StoreError> {
+    if kind == "group" {
+        return Ok(ConversationIdentifiers {
+            group_id: Some(peer_key.to_string()),
+            ..ConversationIdentifiers::default()
+        });
+    }
+    if peer_key.starts_with('+') {
+        return Ok(ConversationIdentifiers {
+            e164: Some(peer_key.to_string()),
+            ..ConversationIdentifiers::default()
+        });
+    }
+    if crate::engine::is_uuid_shaped(peer_key) {
+        return Ok(ConversationIdentifiers {
+            service_id: Some(peer_key.to_string()),
+            ..ConversationIdentifiers::default()
+        });
+    }
+    Ok(ConversationIdentifiers {
+        service_id: aci_for_peer_key_on(conn, account_id, peer_key)?,
+        ..ConversationIdentifiers::default()
+    })
+}
+
+/// The tolerant read the summary closures use: an identity lookup failure
+/// (a vanished row, a transient store error mid-page) degrades to the
+/// all-absent answer — a summary row is never failed for its identifiers,
+/// the same tolerance the §4.63 bit next door practices.
+fn conversation_identifiers_lossy(
+    conn: &Connection,
+    account_id: &str,
+    kind: &str,
+    peer_key: &str,
+) -> ConversationIdentifiers {
+    conversation_identifiers(conn, account_id, kind, peer_key).unwrap_or_default()
+}
+
+/// Contract 1.138 (§4.130): the conversation's stored draft timestamp, read
+/// over the caller's already-held connection guard — the same held-guard
+/// discipline as the meta lookups next door, answering None when the table
+/// has no row (nothing drafted, or cleared).
+fn conversation_draft_timestamp(
+    conn: &Connection,
+    account_id: &str,
+    conversation_id: &str,
+) -> Result<Option<u64>, StoreError> {
+    let stamp: Option<i64> = conn
+        .query_row(
+            "SELECT draft_timestamp FROM conversation_drafts
+             WHERE account_id=?1 AND conversation_id=?2",
+            params![account_id, conversation_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    Ok(stamp.map(|value| value.max(0) as u64))
 }
 
 /// Contract 1.60 (§4.54): the ids of the contacts-cache group rows whose last
@@ -1914,10 +2058,14 @@ impl Store {
     /// rows stay NULL and are never backfilled. The trio keys are this
     /// setter's truth (a re-stamp replaces them verbatim); the authoritative
     /// `acceptResponseType` pair the §4.58 receive face
-    /// ([`Store::set_conversation_accept_response_factor`]) wrote survives a
-    /// re-stamp — each key family has exactly one writer, so the throttled
-    /// enrich can never clobber the response state and the response face can
-    /// never clobber the trio.
+    /// ([`Store::set_conversation_accept_response_factor`]) and the `blocked`
+    /// bit the §4.47 write-back / §4.58 BLOCK verbs
+    /// ([`Store::set_conversation_blocked_factor`]) wrote survive a re-stamp
+    /// when the incoming trio does not name them — each key family has
+    /// exactly one writer, so the throttled enrich can never clobber the
+    /// response or blocked state and the write faces can never clobber the
+    /// trio (an engine answer that does carry `isBlocked` still wins, the
+    /// cloud truth at enrich time).
     pub fn set_conversation_mrr_factors_for_peer(
         &self,
         account_id: &str,
@@ -1925,10 +2073,10 @@ impl Store {
         factors_json: &str,
     ) -> Result<bool, StoreError> {
         let conn = self.lock_conn()?;
-        // The accept pair is not the enrich's to write: carry it over from
-        // the row's current stamp so a re-stamp of the trio (every enrich
-        // window re-stamps every direct row the engine answer names) keeps
-        // the response state.
+        // The accept pair and the blocked bit are not the enrich's to
+        // overwrite: carry them over from the row's current stamp so a
+        // re-stamp of the trio (every enrich window re-stamps every direct
+        // row the engine answer names) keeps the response and blocked state.
         let accept = conn
             .query_row(
                 "SELECT mrr_factors_json FROM conversations
@@ -1946,7 +2094,7 @@ impl Store {
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
         if let Some(current) = accept {
-            for key in ["acceptResponseType", "acceptResponseTypeMember"] {
+            for key in ["acceptResponseType", "acceptResponseTypeMember", "blocked"] {
                 if let Some(value) = current.get(key)
                     && !object.contains_key(key)
                 {
@@ -2007,6 +2155,57 @@ impl Store {
             "acceptResponseTypeMember".to_string(),
             Value::from(response_type),
         );
+        let merged = Value::Object(object).to_string();
+        let updated = conn
+            .execute(
+                "UPDATE conversations SET mrr_factors_json=?1
+                 WHERE id=?2 AND account_id=?3 AND kind='direct'",
+                params![merged, conversation_id, account_id],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(updated > 0)
+    }
+
+    /// Contract 1.138 (§4.131): merge the authoritative blocked bit into one
+    /// direct conversation's factor stamp. Two writers share the face — the
+    /// §4.47 `conversations.setBlocked` write-back (the upstream write
+    /// succeeded, the local mirror follows) and the §4.58 consume batch's
+    /// BLOCK-family request-response verbs (BLOCK / BLOCK_AND_DELETE /
+    /// BLOCK_AND_SPAM stamp true; the face never stamps false — only the
+    /// §4.47 write and the enrich's own `isBlocked` may clear). The stamp is
+    /// read-modify-written so the blocked key lands on top of whatever the
+    /// row already stores. Direct rows only: a group block keeps riding the
+    /// §4.45 pull (the response body the §4.47 face answers), so a group
+    /// conversation answers `false` here — nothing stamped, nothing pushed.
+    pub fn set_conversation_blocked_factor(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        blocked: bool,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        // Outer None = no such direct row (or the wrong kind); inner None =
+        // the row exists but was never enriched (a NULL stamp) — both inner
+        // shapes merge to a blocked-only stamp.
+        let current: Option<Option<String>> = conn
+            .query_row(
+                "SELECT mrr_factors_json FROM conversations
+                 WHERE id=?1 AND account_id=?2 AND kind='direct'",
+                params![conversation_id, account_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let Some(current) = current else {
+            // No such direct row (or the wrong kind): nothing to stamp.
+            return Ok(false);
+        };
+        let mut object = current
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<Value>(json).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        object.insert("blocked".to_string(), Value::Bool(blocked));
         let merged = Value::Object(object).to_string();
         let updated = conn
             .execute(
@@ -2188,6 +2387,14 @@ impl Store {
                 |row| {
                     let kind = static_kind(row.get::<_, String>(2)?);
                     let peer_key: String = row.get(11)?;
+                    let factors_json: Option<String> = row.get(12)?;
+                    // Contract 1.138 (§4.129): identifiers derive from the
+                    // peer key's shape; the number-shaped reverse lookup is
+                    // a tolerant read (a failed lookup degrades to absent —
+                    // an identifier is never invented, the §4.129 ladder's
+                    // terminal answer).
+                    let identifiers =
+                        conversation_identifiers_lossy(&conn, account_id, kind, &peer_key);
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -2219,6 +2426,18 @@ impl Store {
                         // Contract 1.71 (§4.63): derived in the same post-map
                         // loop (below), the same read-time family.
                         has_user_initiated_outbound: false,
+                        service_id: identifiers.service_id,
+                        pni: None,
+                        e164: identifiers.e164,
+                        group_id: identifiers.group_id,
+                        // Contract 1.138 (§4.131): the stored blocked bit,
+                        // direct rows only (groups stay false, §4.45 pull is
+                        // the group authority).
+                        blocked: kind == "direct"
+                            && mrr_factors_of(factors_json.as_deref()).blocked == Some(true),
+                        // Contract 1.138 (§4.130): filled in the post-map
+                        // loop (below), the same read-time family.
+                        draft_timestamp: None,
                     })
                 },
             )
@@ -2248,6 +2467,9 @@ impl Store {
             // post-map loop, the same guard.
             item.has_user_initiated_outbound =
                 conversation_has_user_initiated_outbound(&conn, account_id, &item.id);
+            // Contract 1.138 (§4.130): the stored draft stamp, the same
+            // post-map loop, the same guard.
+            item.draft_timestamp = conversation_draft_timestamp(&conn, account_id, &item.id)?;
         }
         let next_cursor = if items.len() as u32 > limit {
             items.truncate(limit as usize);
@@ -3790,6 +4012,75 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Contract 1.138 (§4.130): stamp the conversation's draft timestamp —
+    /// the body never passes through here (the desktop keeps draft text in
+    /// its own safeStorage; the connector sees only the official draft
+    /// record's clock). One row per conversation, the `conversation_pins`
+    /// table shape minus the pin identity columns. Returns whether a
+    /// conversation row was addressed (the caller answers
+    /// CONVERSATION_NOT_FOUND otherwise); re-saving the same conversation
+    /// replaces its stamp.
+    pub fn save_conversation_draft(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        draft_timestamp: u64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let addressed: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if addressed.is_none() {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT INTO conversation_drafts(
+                account_id, conversation_id, draft_timestamp
+             ) VALUES(?1, ?2, ?3)
+             ON CONFLICT(account_id, conversation_id) DO UPDATE SET
+               draft_timestamp=excluded.draft_timestamp",
+            params![account_id, conversation_id, draft_timestamp as i64],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
+    /// Contract 1.138 (§4.130): clear the conversation's draft stamp — the
+    /// official DraftRepository's delete, body-free like the save. Idempotent:
+    /// clearing a conversation with no draft still answers whether the
+    /// conversation row was addressed (the caller answers
+    /// CONVERSATION_NOT_FOUND otherwise) so replays stay silent.
+    pub fn clear_conversation_draft(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock_conn()?;
+        let addressed: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM conversations WHERE id=?1 AND account_id=?2",
+                params![conversation_id, account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        if addressed.is_none() {
+            return Ok(false);
+        }
+        conn.execute(
+            "DELETE FROM conversation_drafts
+             WHERE account_id=?1 AND conversation_id=?2",
+            params![account_id, conversation_id],
+        )
+        .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(true)
+    }
+
     /// Mark a message admin-deleted (contract 1.33): a group admin removed
     /// this row. The status ladder is untouched — the tombstone is the
     /// additive `admin_deleted` flag and the body stays for the audit window;
@@ -3889,15 +4180,7 @@ impl Store {
         peer_key: &str,
     ) -> Result<Option<String>, StoreError> {
         let conn = self.lock_conn()?;
-        let aci = conn
-            .query_row(
-                "SELECT aci FROM peer_identities WHERE account_id=?1 AND peer_key=?2 LIMIT 1",
-                params![account_id, peer_key],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        Ok(aci)
+        aci_for_peer_key_on(&conn, account_id, peer_key)
     }
 
     // -------------------------------------------------------------------------
@@ -5759,12 +6042,21 @@ impl Store {
         let summary = conn
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
-                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key
+                        unread_count, unread_mentions, muted, pinned, expire_timer_seconds, peer_key,
+                        mrr_factors_json
                  FROM conversations WHERE id=?1 AND account_id=?2",
                 params![conversation_id, account_id],
                 |row| {
                     let kind = static_kind(row.get::<_, String>(2)?);
                     let peer_key: String = row.get(11)?;
+                    let factors_json: Option<String> = row.get(12)?;
+                    // Contract 1.138 (§4.129): identifiers derive from the
+                    // peer key's shape; the number-shaped reverse lookup is
+                    // a tolerant read (a failed lookup degrades to absent —
+                    // an identifier is never invented, the §4.129 ladder's
+                    // terminal answer).
+                    let identifiers =
+                        conversation_identifiers_lossy(&conn, account_id, kind, &peer_key);
                     Ok(ConversationSummary {
                         id: row.get(0)?,
                         account_id: row.get(1)?,
@@ -5796,6 +6088,18 @@ impl Store {
                         // Contract 1.71 (§4.63): derived in the same post-map
                         // match (below), the same read-time family.
                         has_user_initiated_outbound: false,
+                        service_id: identifiers.service_id,
+                        pni: None,
+                        e164: identifiers.e164,
+                        group_id: identifiers.group_id,
+                        // Contract 1.138 (§4.131): the stored blocked bit,
+                        // direct rows only (groups stay false, §4.45 pull is
+                        // the group authority).
+                        blocked: kind == "direct"
+                            && mrr_factors_of(factors_json.as_deref()).blocked == Some(true),
+                        // Contract 1.138 (§4.130): filled in the post-map
+                        // match (below), the same read-time family.
+                        draft_timestamp: None,
                     })
                 },
             )
@@ -5848,6 +6152,11 @@ impl Store {
                 // an event-driven window and a full reload cannot disagree.
                 summary.has_user_initiated_outbound =
                     conversation_has_user_initiated_outbound(&conn, account_id, conversation_id);
+                // Contract 1.138 (§4.130): the stored draft stamp — the
+                // summary that rides conversation.changed carries it so the
+                // drafting window and every other window cannot disagree.
+                summary.draft_timestamp =
+                    conversation_draft_timestamp(&conn, account_id, conversation_id)?;
                 Ok(Some(summary))
             }
             None => Ok(None),
@@ -8584,6 +8893,244 @@ mod tests {
                 .map(|row| row.peer_key.as_str())
                 .collect::<Vec<_>>(),
             vec!["+15555550100"]
+        );
+    }
+
+    /// Contract 1.138 (§4.130): the draft stamp round-trips through both
+    /// summary projections — save replaces, clear is idempotent, an unknown
+    /// conversation is addressed by nobody — and the absence collapses to
+    /// the absent wire key everywhere.
+    #[test]
+    fn conversation_draft_stamps_roundtrip_through_summaries() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+
+        // No draft: absent on the single-row and the list face alike.
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.draft_timestamp, None);
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        assert!(page.items.iter().all(|item| item.draft_timestamp.is_none()));
+
+        // Save: the stamp shows on both summaries; re-save replaces.
+        assert!(
+            store
+                .save_conversation_draft(&account.id, &direct.id, 1_700_000_000_000)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.draft_timestamp, Some(1_700_000_000_000));
+        let page = store.list_conversations(&account.id, 10, None).unwrap();
+        let listed = page.items.iter().find(|item| item.id == direct.id).unwrap();
+        assert_eq!(listed.draft_timestamp, Some(1_700_000_000_000));
+        assert!(
+            store
+                .save_conversation_draft(&account.id, &direct.id, 1_700_000_000_500)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.draft_timestamp, Some(1_700_000_000_500));
+
+        // Clear: absent again, and the clear is idempotent.
+        assert!(
+            store
+                .clear_conversation_draft(&account.id, &direct.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_conversation_draft(&account.id, &direct.id)
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.draft_timestamp, None);
+
+        // An unknown conversation is addressed by nobody (the caller answers
+        // CONVERSATION_NOT_FOUND from the false).
+        assert!(
+            !store
+                .save_conversation_draft(&account.id, "no-such-conversation", 1)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .clear_conversation_draft(&account.id, "no-such-conversation")
+                .unwrap()
+        );
+    }
+
+    /// Contract 1.138 (§4.129): the summary identifiers derive from the peer
+    /// key's shape — a group row keys groupId off the raw master key, a
+    /// +prefixed direct row answers e164, a UUID-shaped direct row answers
+    /// serviceId, a number-shaped direct row maps through the most recent
+    /// peer_identities row, and a key nothing resolves answers all-absent.
+    /// pni is never present.
+    #[test]
+    fn conversation_summary_projects_identifiers_from_the_peer_key() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "AbCdEf0123456789=", "group")
+            .unwrap();
+        let plus = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let uuid = store
+            .ensure_conversation(
+                &account.id,
+                "direct",
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "contact",
+            )
+            .unwrap();
+        let number = store
+            .ensure_conversation(&account.id, "direct", "15555550102", "contact")
+            .unwrap();
+        let number_orphan = store
+            .ensure_conversation(&account.id, "direct", "15555550103", "contact")
+            .unwrap();
+        // The ingest-written mapping a real receive chain leaves behind.
+        store
+            .upsert_peer_identity(
+                &account.id,
+                "11111111-2222-4333-8444-555555555555",
+                "15555550102",
+            )
+            .unwrap();
+
+        let ids = |conversation_id: &str| {
+            let summary = store
+                .conversation_summary(&account.id, conversation_id)
+                .unwrap()
+                .unwrap();
+            (
+                summary.service_id,
+                summary.e164,
+                summary.group_id,
+                summary.pni,
+            )
+        };
+        assert_eq!(
+            ids(&group.id),
+            (None, None, Some("AbCdEf0123456789=".into()), None)
+        );
+        assert_eq!(
+            ids(&plus.id),
+            (None, Some("+15555550101".into()), None, None)
+        );
+        assert_eq!(
+            ids(&uuid.id),
+            (
+                Some("0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10".into()),
+                None,
+                None,
+                None
+            )
+        );
+        assert_eq!(
+            ids(&number.id),
+            (
+                Some("11111111-2222-4333-8444-555555555555".into()),
+                None,
+                None,
+                None
+            )
+        );
+        assert_eq!(ids(&number_orphan.id), (None, None, None, None));
+    }
+
+    /// Contract 1.138 (§4.131): the blocked stamp merges read-modify-write —
+    /// a §4.47 write-back or BLOCK verb stamps survive the throttled enrich's
+    /// trio re-stamp when the incoming trio does not name `blocked`, an
+    /// engine answer that does name it wins, and a group row is nobody's
+    /// trio stamp (the §4.45 pull stays the group authority).
+    #[test]
+    fn blocked_stamp_survives_the_enrich_and_yields_to_engine_truth() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let direct = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "contact")
+            .unwrap();
+        let group = store
+            .ensure_conversation(&account.id, "group", "AbCdEf0123456789=", "group")
+            .unwrap();
+
+        // No stamp: the summary's blocked bit reads false.
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.blocked);
+
+        // The stamp lands, and the enrich's probed-absent {} re-stamp keeps
+        // it (alongside the accept pair in the same merge).
+        assert!(
+            store
+                .set_conversation_blocked_factor(&account.id, &direct.id, true)
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_conversation_accept_response_factor(&account.id, &direct.id, true, 1)
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(&account.id, "+15555550101", "{}")
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(summary.blocked);
+        assert!(summary.message_request_accepted);
+
+        // Engine truth wins: an enrich answer naming isBlocked replaces the
+        // stamp.
+        assert!(
+            store
+                .set_conversation_mrr_factors_for_peer(
+                    &account.id,
+                    "+15555550101",
+                    r#"{"blocked":false}"#
+                )
+                .unwrap()
+        );
+        let summary = store
+            .conversation_summary(&account.id, &direct.id)
+            .unwrap()
+            .unwrap();
+        assert!(!summary.blocked);
+
+        // A group row is nobody's trio stamp.
+        assert!(
+            !store
+                .set_conversation_blocked_factor(&account.id, &group.id, true)
+                .unwrap()
         );
     }
 
