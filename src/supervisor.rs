@@ -4872,6 +4872,30 @@ impl RuntimeSupervisor {
             .map_err(ServiceError::from)
     }
 
+    /// calls.relays (contract revision 1.145, §4.143): the call-relay
+    /// proxy — the §4.73 material-passthrough discipline with no material:
+    /// the account resolution rides the service prepare, the read-only
+    /// engine call may touch the network inside the one call (the
+    /// `conversations.getAvatar` read class), and the engine's answer —
+    /// the official-same-shape relay list with its own freshness face —
+    /// passes through untouched. The error face is the engine's verbatim:
+    /// the plain -32603 unknown-account face degrades through the
+    /// structured ladder, and the 401/403 unbound message trips the
+    /// existing §4.17 authorization matcher (the connector adds no
+    /// matcher of its own). Read-only engine class: a timeout answers
+    /// UPSTREAM_TIMEOUT (retryable), never the mutating unknown outcome.
+    pub async fn calls_relays(&self, account_id: &str) -> Result<Value, ServiceError> {
+        let params = {
+            let service = self.service.lock().await;
+            service.prepare_calls_relays(account_id)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("calls.relays", params, CallClass::ReadOnly)
+            .await
+            .map_err(ServiceError::from)
+    }
+
     /// Best-effort "Delete for everyone" for one own sent message
     /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
     /// upstream `remoteDelete` call without it — the same shape as

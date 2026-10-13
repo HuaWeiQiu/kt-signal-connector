@@ -35,7 +35,36 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.144 (2026-10-13; the call-signaling send face grows
+- Contract revision: 1.145 (2026-10-13; the call-relay configuration proxy
+  face (§4.143): `calls.relays` — the connector-side registration of the
+  engine's `calls.relays` (engine e2f2e6d), the authenticated
+  GET /v2/calling/relays ICE/TURN read the desktop's calling chain needs
+  before it can put a call on the wire. The consumer is the desktop call
+  chain: the relays data flows engine → connector → desktop → calling
+  sidecar, the engine owning the whole cache/TTL story (the official
+  `#getIceServers` same-shape TTL cache, stale/lastError honesty, the
+  keep-old-cache failure posture), the connector owning none of it —
+  a pure proxy: resolve the account, forward `{account}` on the read
+  lane, pass the engine's result through untouched (the
+  `{account, relays:[{username, password, urls?, urlsWithIps?,
+  hostname?, ttl?}], fetchedAtMs?, expiresAtMs?, stale, lastError?}`
+  shape, absent keys stay absent), and let the existing error chain
+  speak for itself — the unknown/unregistered account rides the engine's
+  plain -32603 (UPSTREAM_ERROR through the connector's structured face),
+  the 401/403 credential death rides the engine's unbound message
+  through the §4.17 authorization matcher to ACCOUNT_UNLINKED (the
+  connector adds no matcher of its own, the get_device_capabilities
+  posture). Deliberately not built: no TTL/cache (the engine already
+  owns it), no polling/push (the official face is pull-on-demand at call
+  start), no engine-interaction change. Wire additive: one new read
+  method, no new event, error, capability, or store move (advertised
+  through the existing `call-signaling` tag, widened in place — the
+  1.82/1.88/1.127 precedent: the relays are the call chain's own
+  connection material). Tests 781 → 786 (lib 596 → 597: the harness adds
+  the calling-relays file — the verbatim pass-through, the engine-side
+  unknown account, the 401/403 unbound face, the engine-down shape; the
+  prepare test joins the §4.73 material-gate test's neighborhood), all
+  green) — previously 1.144 (2026-10-13; the call-signaling send face grows
   the two optional RingRTC passthrough keys the desktop's calling half
   needed (§4.142): `hangupType` rides the payload-less hangup bare frame
   as the engine legacy face's `type` word — the official proto
@@ -11099,6 +11128,62 @@ payload all refuse INVALID_REQUEST before any upstream shape;
 top-level engine key, 0 refuses, and the group arm refuses it locally.
 Tests 781 flat (lib 596 flat). Gates: fmt, clippy `-D warnings`, tests
 all green, release build.
+
+### 4.143 The desktop calling chain reaches the engine's call relays: calls.relays, the proxy face the connector adds nothing to (contract revision 1.145, 2026-10-13)
+
+The desktop's calling chain cannot put a call on the wire without the
+ICE/TURN relay configuration — the official `getIceServers`
+(GET /v2/calling/relays) answer RingRTC dials with. The engine already
+owns that whole story (engine e2f2e6d): the authenticated read on the
+linked account's credentials, the official-same-shape TTL cache (the
+minimum `relays[].ttl`, the keep-old-cache failure posture, the
+freshness/`lastError` honesty), the 401/403-are-unbound ruling. None of
+it crossed the connector boundary — this revision registers the proxy
+face so the desktop can reach it.
+
+**The consumer and the data flow.** The consumer is the desktop call
+chain; the relays data flows engine → connector → desktop → calling
+sidecar. The connector is a pure pipe on this face: it resolves the
+account, forwards `{account}` on the read lane (the
+`calls.linkPresentation` family's shape — the engine call may touch the
+network inside the one call, the `conversations.getAvatar` read
+class), and passes the engine's answer through untouched: the
+`{account, relays: [{username, password, urls?, urlsWithIps?,
+hostname?, ttl?}], fetchedAtMs?, expiresAtMs?, stale, lastError?}`
+result rides verbatim, absent keys stay absent (the engine's no-null
+discipline mirrored at the pipe). The connector neither parses nor
+persists nor logs the relay material — the TURN credentials cross this
+process exactly once, engine → host (the §4.73 zero-persistence
+discipline verbatim).
+
+**The error face is the engine's, verbatim.** The connector adds no
+matcher and rewrites nothing (the `get_device_capabilities` posture):
+an unknown or unregistered account rides the engine's plain -32603
+(UPSTREAM_ERROR through the connector's structured face), and the
+401/403 credential death rides the engine's unbound message through the
+existing §4.17 authorization matcher to ACCOUNT_UNLINKED — the same
+recovery (relink) the whole unlink chain shares. Network and
+shape failures never surface as errors at all: the engine answers the
+empty-state or keep-old-cache face with `stale`/`lastError` set, HTTP
+200.
+
+**Deliberately not built.** No TTL or cache on the connector side (the
+engine already owns the official-same-shape cache; a second copy would
+be the second-source-of-truth the §4.97 posture refuses); no polling or
+push (the official face is pull-on-demand at call start, and the
+desktop's call chain pulls when its own state machine needs the
+relays); no engine-interaction change (the pinned method is the engine's
+existing KT-extension face, unchanged).
+
+Tests: the harness adds `calling_relays.rs` — the happy pass-through
+pinned byte-for-byte against the fixture stub (the full-shape answer
+with urls/urlsWithIps/hostname/ttl present and the empty-state answer
+with them absent), the engine-side unknown account answering
+UPSTREAM_ERROR, the 401/403 unbound face answering ACCOUNT_UNLINKED,
+and the engine-down shape answering RUNTIME_NOT_RUNNING; the prepare
+test joins the §4.73 material-gate neighborhood (account resolution,
+the resolved-number forward). Tests 781 → 786 (lib 596 → 597). Gates:
+fmt, clippy `-D warnings`, tests all green, release build.
 
 ## 5. signal-cli Boundary
 

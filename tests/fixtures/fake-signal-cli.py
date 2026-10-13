@@ -3554,6 +3554,81 @@ for line in sys.stdin:
             },
             "calls.endorsementsPublicKey": {"endorsementPublicKey": _b64_fixed(5)},
         }[method]
+    elif method == "calls.relays":
+        # §4.143 call-relay configuration proxy (contract 1.145, engine
+        # e2f2e6d): the engine's calls.relays wire mirror. No dispatch
+        # record (the engine's networked read faces never log). The
+        # account gate rides the same engine-state registry (an
+        # unregistered account answers the plain -32603, the engine's
+        # unknown-account face). The marker ladder drives the three
+        # contract faces the driving test pins, each the engine's own
+        # semantics verbatim:
+        # `.fixture-call-relays-unbound` answers the engine's 401/403
+        # unbound message word for word (the USER_UNBOUND_MESSAGE the
+        # connector's §4.17 matcher folds into ACCOUNT_UNLINKED);
+        # `.fixture-call-relays-empty` answers the no-cache empty state
+        # (relays [] + stale, fetchedAtMs/expiresAtMs keys absent — the
+        # engine's no-null discipline); `.fixture-call-relays-refresh-
+        # failed` answers the empty state carrying lastError (the honest
+        # refresh-failure face). The default happy shape carries every
+        # optional relay field (urls/urlsWithIps/hostname/ttl) plus the
+        # freshness pair — stub TURN material, NOT valid credentials (the
+        # engine fake discipline).
+        relay_account = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    relay_account = entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            relay_account = None
+        if relay_account is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-call-relays-unbound").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "Failed to send message: Authorization failed! (AuthorizationFailedException)",
+                },
+            }
+            emit_json(response)
+            continue
+        relay_account_value = params.get("account")
+        if (SIGNAL_DATA_DIR / ".fixture-call-relays-empty").exists():
+            result = {"account": relay_account_value, "relays": [], "stale": True}
+        elif (SIGNAL_DATA_DIR / ".fixture-call-relays-refresh-failed").exists():
+            result = {
+                "account": relay_account_value,
+                "relays": [],
+                "stale": True,
+                "lastError": "http 500",
+            }
+        else:
+            result = {
+                "account": relay_account_value,
+                "relays": [
+                    {
+                        "username": "fixture-relay-user",
+                        "password": "fixture-relay-pass",
+                        "urls": ["turn:turn.example.org:80?transport=tcp"],
+                        "urlsWithIps": ["1.2.3.4:3478"],
+                        "hostname": "turn.example.org",
+                        "ttl": 86400,
+                    }
+                ],
+                "fetchedAtMs": 1_000,
+                "expiresAtMs": 86_501_000,
+                "stale": False,
+            }
     elif method == "generateInviteLinkPassword":
         # Contract 1.117 §4.98: the account-less material face. No dispatch
         # record (the engine's material faces never log), no account: 16

@@ -1315,6 +1315,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.calls_endorsements_public_key().await
     }
 
+    /// calls.relays (contract 1.145, §4.143): the account-scoped call-relay
+    /// proxy — the owning group's engine serves (the §4.73 account-scoped
+    /// material-face posture; the relay material is per-account).
+    pub async fn calls_relays(
+        &self,
+        params: crate::service::CallsRelaysParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.calls_relays(&params.account_id).await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

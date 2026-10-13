@@ -522,6 +522,21 @@ pub const METHODS: &[MethodRow] = &[
     ("calls.groupProof", Lane::Read, false, "read"),
     ("calls.groupMembers", Lane::Read, false, "read"),
     ("calls.endorsementsPublicKey", Lane::Read, false, "read"),
+    // Call-relay configuration proxy (contract revision 1.145, §4.143): the
+    // connector-side registration of the engine's `calls.relays` — the
+    // authenticated GET /v2/calling/relays ICE/TURN read the desktop's
+    // calling chain dials with (the relays data flows engine → connector →
+    // desktop → calling sidecar). A pure proxy: account resolution, the
+    // read-lane forward, the engine's answer through untouched — the
+    // connector owns no TTL, no cache, no polling (the engine's
+    // official-same-shape cache and the pull-on-demand face cover all of
+    // it), and the error face is the engine's verbatim (the plain -32603
+    // unknown-account face, the 401/403 unbound message through the §4.17
+    // matcher). Advertised through the existing `call-signaling` tag,
+    // widened in place (the 1.82/1.88/1.127 precedent — the relays are the
+    // call chain's own connection material). KT-extension, no upstream
+    // connector-side counterpart.
+    ("calls.relays", Lane::Read, false, "read"),
     // Chat-folder sync (contract 1.95, §4.78): chatFolders.list is a bounded
     // cloud-backed read of the account's ChatFolderRecord set;
     // chatFolders.setRecords is the mutating storage-service write —
@@ -669,7 +684,8 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
 /// the row-level serverGuid persistence); `call-signaling` (contract
-/// revision 1.51, widened in place by 1.82, by 1.88, and by 1.127) marks
+/// revision 1.51, widened in place by 1.82, by 1.88, by 1.127, and by
+/// 1.145) marks
 /// the §4.49
 /// call signaling faces (`calls.sendSignal` — the 1:1 and, since 1.82, the
 /// group-addressed route — plus the `call.incoming` and `call.groupIncoming`
@@ -678,7 +694,10 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `calls.groupMembers` / `calls.endorsementsPublicKey` — the signaling
 /// pipeline's own material supply) and, since 1.127, the §4.108 group-call
 /// update write (`calls.sendGroupCallUpdate` — the same pipe's group-era
-/// face; the same no-new-bit discipline);
+/// face; the same no-new-bit discipline) and, since 1.145, the §4.143
+/// call-relay configuration proxy (`calls.relays` — the desktop calling
+/// chain's ICE/TURN connection material, the engine's own cache and
+/// freshness story proxied untouched);
 /// `group-terminate` (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
@@ -861,6 +880,7 @@ mod tests {
             "calls.groupProof",
             "calls.groupMembers",
             "calls.endorsementsPublicKey",
+            "calls.relays",
             "chatFolders.list",
             "notificationProfiles.list",
             "storyDistributionLists.list",

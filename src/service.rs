@@ -6210,6 +6210,20 @@ impl ConnectorService {
         Ok(json!({}))
     }
 
+    /// calls.relays (contract revision 1.145, §4.143): the call-relay proxy
+    /// forward — the one shape decision this face makes. The opaque account
+    /// id resolves to the linked number and the engine rides
+    /// `{account}` alone; the relay material (the TURN credentials among
+    /// it) never passes through this function, so there is nothing here to
+    /// gate beyond the resolution itself.
+    pub fn prepare_calls_relays(&self, account_id: &str) -> Result<Value, ServiceError> {
+        validate_opaque_id(account_id, "accountId")?;
+        let account = self.resolve_account(account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+        }))
+    }
+
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
     /// and same-row retry (`prepare_retry_text`) — one owner for the wire key
     /// names so the two paths cannot drift.
@@ -13170,6 +13184,15 @@ pub struct CallsGroupMembersParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CallsEndorsementsPublicKeyParams {}
+
+/// `calls.relays` params (contract revision 1.145, §4.143): the account
+/// scope of the call-relay proxy — the only shape decision the connector
+/// makes on this face; the engine's answer rides through untouched.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsRelaysParams {
+    pub account_id: String,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -23610,6 +23633,36 @@ mod tests {
             .unwrap_err()
             .into_api();
         assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
+    }
+
+    /// calls.relays (contract revision 1.145, §4.143): the proxy forward is
+    /// the one shape decision — the opaque id resolves to the linked number
+    /// and the engine rides `{account}` alone; an unresolvable account
+    /// refuses ACCOUNT_NOT_FOUND before any upstream shape, and a malformed
+    /// opaque id refuses INVALID_REQUEST (the §4.73 ladder's resolution
+    /// face, no shape gate beyond it — the relay material never passes
+    /// through the prepare).
+    #[test]
+    fn prepare_call_relays_resolves_and_forwards_the_bare_account() {
+        let (_temp, mut service) = service();
+        let (account, _conversation) = linked_account_and_conversation(&mut service);
+
+        let upstream = service.prepare_calls_relays(&account.id).unwrap();
+        assert_eq!(
+            upstream,
+            json!({ "account": "+15555550100" }),
+            "the bare engine forward, no invented keys"
+        );
+
+        let error = service
+            .prepare_calls_relays("kt-acct-missing")
+            .unwrap_err()
+            .into_api();
+        assert_eq!(error.code, "ACCOUNT_NOT_FOUND");
+        assert!(!error.retryable);
+
+        let error = service.prepare_calls_relays("").unwrap_err().into_api();
+        assert_eq!(error.code, "INVALID_REQUEST");
     }
 
     /// §4.73 (contract 1.88): the two new code positions map to themselves

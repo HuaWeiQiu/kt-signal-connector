@@ -155,6 +155,7 @@
             "calls.groupProof",
             "calls.groupMembers",
             "calls.endorsementsPublicKey",
+            "calls.relays",
             "messages.sendStory",
             "stories.setDisabled",
             "stories.getDisabled",
@@ -1451,6 +1452,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/callsEndorsementsPublicKeyParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "calls.relays" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/callsRelaysParams" }
             }
           }
         },
@@ -2869,6 +2881,15 @@
       "additionalProperties": false,
       "description": "Derive the endorsement public key (contract revision 1.88, §4.73, capability call-signaling; engine a3ae39b, engine jsonrpc-compat §3 calls row + §5 block). The one account-less material face (the getStickerPackManifest anonymous-face discipline): no fields, no account, no network — the engine derives the EndorsementPublicKey from its pinned legacy ServerPublicParams (the same constant every engine instance holds) and the bytes pass through. The face answers from the running engine like every other material face (RUNTIME_NOT_RUNNING when the engine is down). Result {endorsementPublicKey}: the EndorsementPublicKey bincode bytes, standard base64 (the RingRTC getCallLinkCall endorsementPublicKey slot's input). Read lane, non-mutating.",
       "properties": {}
+    },
+    "callsRelaysParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId"],
+      "description": "Fetch the account's call relay configuration (contract revision 1.145, §4.143, capability call-signaling; engine e2f2e6d, the engine's calls.relays KT-extension method). Pure proxy: the connector resolves the account and forwards {account} on the read lane; the engine answers from its official-same-shape TTL cache (the authenticated GET /v2/calling/relays on fresh entries, the re-pull on expiry) and the result rides through untouched — {account, relays: [{username, password, urls?, urlsWithIps?, hostname?, ttl?}], fetchedAtMs?, expiresAtMs?, stale, lastError?} with absent keys staying absent (the engine's no-null discipline; fetchedAtMs/expiresAtMs appear once a cache entry exists, lastError carries the most recent refresh failure's honest reason). The connector owns no TTL, no cache, no polling — the engine owns the whole freshness story and the desktop's call chain pulls on demand. The TURN credentials cross the connector exactly once, engine to host: never parsed, never persisted, never logged. Error face is the engine's, verbatim: an unknown/unregistered account rides the engine's plain -32603 (UPSTREAM_ERROR), a 401/403 credential death rides the engine's unbound message through the §4.17 authorization matcher to ACCOUNT_UNLINKED (relink is the recovery), and network/shape failures never error at all — they surface inside the 200 answer as stale/lastError on the empty-state or keep-old-cache face. Read lane, non-mutating; engine call may touch the network inside the one call (the conversations.getAvatar read class).",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" }
+      }
     },
     "conversationsGetPinnedParams": {
       "type": "object",

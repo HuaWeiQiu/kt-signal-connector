@@ -33,7 +33,7 @@ use crate::service::{
     BackupsExportStatusParams, BackupsImportSnapshotParams, BackupsImportSnapshotStatusParams,
     BackupsRestoreFromCloudParams, BackupsUploadStatusParams, BackupsUploadToCloudParams,
     CallsCreateLinkAuthParams, CallsEndorsementsPublicKeyParams, CallsGetStateParams,
-    CallsGroupMembersParams, CallsGroupProofParams, CallsLinkPresentationParams,
+    CallsGroupMembersParams, CallsGroupProofParams, CallsLinkPresentationParams, CallsRelaysParams,
     CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFoldersListParams,
     ChatFoldersSetRecordsParams, ContactsListParams, ContactsSetLocalAliasParams,
     ContactsSyncParams, ConversationsClearDraftParams, ConversationsGetAvatarParams,
@@ -2375,6 +2375,22 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
+        // Call-relay configuration proxy (contract revision 1.145, §4.143):
+        // the pure-proxy shape — account resolution rides the service
+        // prepare, the engine's answer passes through untouched, and the
+        // error face is the engine's verbatim (the plain -32603
+        // unknown-account face through the structured ladder, the 401/403
+        // unbound message through the §4.17 matcher to ACCOUNT_UNLINKED).
+        "calls.relays" => match serde_json::from_value::<CallsRelaysParams>(request.params) {
+            Ok(params) => match runtime.calls_relays(params).await {
+                Ok(result) => HostResponse::success(request_id, result),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid calls.relays params", false),
+            ),
+        },
         "conversations.getPinned" => {
             match serde_json::from_value::<ConversationsGetPinnedParams>(request.params) {
                 Ok(params) => match runtime.get_pinned_conversations(params).await {
