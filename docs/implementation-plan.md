@@ -10540,6 +10540,66 @@ skeletons ride `conversation.changed` on the host lane, a second pull
 inside the short-circuit window emits nothing). Gates: fmt, clippy
 `-D warnings`, tests all green.
 
+### 4.136 The `syncMessage.blocked` consume arm: the linked device's block list masks locally too (contract revision 1.140, 2026-10-13)
+
+The engine already projects the official `_handleBlocked` mirror
+(MessageReceiver.preload.ts:3988) on its receive stream — modern and
+legacy family shapes, the official `areModernFieldsUsed` selection — but
+the connector's syncMessage arm dropped the face entirely, so a block
+composed on the phone never masked the conversation on this device until
+some other writer (the §4.47 write face, the enrich's own `isBlocked`)
+happened to refresh the bit. The arm now consumes like its
+read/viewed/contacts siblings: intercept before the plain syncMessage
+skip, mirror into the §4.131 blocked factor store, ride
+`conversation.changed`.
+
+- Parse (tolerant): both families union — modern
+  `blockedE164s[{e164, timestamp?}]` / `blockedAcis[{aci, timestamp?}]` /
+  `blockedGroups[{groupId, timestamp?}]` entry objects, legacy
+  `numbers` / `acis` / `groupIds` / `acisBinary` string arrays (the
+  engine already resolved the binary forms to UUID strings). Unknown keys
+  and unknown entry fields are not fatal (the official parse is loose the
+  same way); an entry whose identity read fails drops per-entry; each
+  class dedups and caps at `MAX_SYNC_BLOCKED_ENTRIES` (512, the read-face
+  truncate discipline — a real block list is user-scaled tens, so the cap
+  only ever bites on a hostile face). The modern entries' advisory
+  `timestamp` has no home in the connector's factor stamp and does not
+  ride. A face whose every key failed keeps the plain syncMessage skip —
+  the fully-empty list (the official projects the modern empty object for
+  it) is exactly that shape.
+- Consume (presence stamps true only): each e164/ACI identity resolves
+  through the sync ladder family (the identity itself, the recorded
+  ACI→peer-key mappings, then contacts digit-suffix matches — the
+  §4.37/§4.81 shape) and every resolved direct row stamps the blocked
+  factor `true`, so a two-keyed subject converges both row forms. This is
+  the §4.58 BLOCK-family verbs' 盖真不盖假 discipline, deliberately: the
+  official treats the sync as a full-list replacement, but the
+  connector's factor store has no list to replace and a partial sync
+  inferred as "absent means unblocked" could unmask a conversation the
+  §4.47 write face masked — unblocking stays the §4.47 write's and the
+  enrich's own `isBlocked` to clear, exactly as §4.131 assigns it. A
+  conversation whose bit already reads true stamps nothing and emits
+  nothing (replay silence by construction); a stamped one rides
+  `conversation.changed` with the refreshed summary.
+- Group half (deliberate non-consumption): the factor stamp is
+  direct-rows-only and the group summary's blocked bit stays
+  constant-false by design — a group block keeps riding the §4.45 pull as
+  its authority, the honest hole §4.131 documents. The group identities
+  consume silently; no new event, no new key.
+
+No new method, event, key, error, capability, or store move; zero wire
+change.
+
+Tests: `sync_blocked_routes_both_families_and_tolerates_unknown_fields`
+(the routing arm: modern objects, legacy arrays, the union, the dedup,
+the unknown-field tolerance, the identity-cap truncation, the
+fail-closed skip for an empty or hostile face), and
+`ingest_sync_blocked_stamps_the_factor_and_rides_conversation_changed`
+(the consume: the factor stamps and the summary rides
+`conversation.changed`, a replay is silent, an unknown identity drops
+warn-only, the group half consumes nothing, no message row is ever
+created). Gates: fmt, clippy `-D warnings`, tests all green.
+
 ## 5. signal-cli Boundary
 
 The connector starts multi-account JSON-RPC mode without `-a`:

@@ -8580,6 +8580,13 @@ impl ConnectorService {
         if let ControlReceive::SyncContacts { contacts } = &control {
             return self.apply_sync_contacts(&account, contacts);
         }
+        // Contract 1.140 (§4.136 consume arm): the blocked sync addresses its
+        // own subjects (the identities carry themselves), never an envelope
+        // source (the envelope is our own account) — the same interception
+        // family as the contacts sibling above.
+        if let ControlReceive::SyncBlocked { blocked } = &control {
+            return self.apply_sync_blocked(&account, blocked);
+        }
         // Group termination (contract 1.134, §4.117): the engine's
         // `groupTerminated` projection — the conversation-less transient
         // family like the story face below. Intercepted before the
@@ -9492,6 +9499,10 @@ impl ConnectorService {
             // (it addresses its own subjects, never an envelope source);
             // this arm is the same unreachable-in-practice guard.
             ControlReceive::SyncContacts { .. } => Ok(Vec::new()),
+            // The §4.136 blocked sync is intercepted the same way (its
+            // identities name their own subjects); this arm is the same
+            // unreachable-in-practice guard.
+            ControlReceive::SyncBlocked { .. } => Ok(Vec::new()),
             // The §4.117 conversation-less transient family is intercepted
             // before the ladder like the story face; these arms are the same
             // unreachable-in-practice guards.
@@ -10225,6 +10236,84 @@ impl ConnectorService {
                 events.push(HostSideEvent::ConversationChanged(conversation));
             }
         }
+        Ok(events)
+    }
+
+    /// Contract 1.140 (§4.136): consume one `syncMessage.blocked` mirror —
+    /// the account's own linked device replaced its block list (the official
+    /// `_handleBlocked` face), and the identities stamp the §4.131 blocked
+    /// factor on the direct conversations they resolve. Presence stamps true
+    /// only — the same 盖真不盖假 discipline as the §4.58 BLOCK-family verbs;
+    /// unblocking stays the §4.47 write's and the enrich's own `isBlocked`
+    /// to clear, so a replayed (or partial) sync can never unmask a
+    /// conversation, and a conversation whose bit already reads true emits
+    /// nothing (replay silence by construction). Resolution is the sync
+    /// ladder family (the §4.37/§4.81 shape): the identity itself, the
+    /// recorded ACI→peer-key mappings, then contacts digit-suffix matches;
+    /// every resolved direct row of the subject stamps (both forms of a
+    /// two-keyed subject converge). The group half of the face consumes
+    /// silently on purpose: a group block keeps riding the §4.45 pull as its
+    /// authority (the honest hole §4.131 documents), and the factor stamp is
+    /// direct-rows-only. A subject nothing resolves drops warn-only
+    /// (宁缺勿错 — never invent a conversation to block).
+    fn apply_sync_blocked(
+        &mut self,
+        account: &AccountRow,
+        blocked: &crate::engine::SyncBlocked,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let mut events = Vec::new();
+        for identity in blocked.numbers.iter().chain(blocked.acis.iter()) {
+            // The candidate ladder, then every direct row the subject
+            // resolves to — a two-keyed subject (a pull's number-keyed row
+            // beside a sync's UUID-keyed row) converges both forms.
+            let mut peer_keys = vec![identity.clone()];
+            peer_keys.extend(self.store.peer_keys_for_aci(&account.id, identity)?);
+            let digits = address_digits(identity);
+            if !digits.is_empty() {
+                for key in self.store.contact_peer_keys(&account.id)? {
+                    let candidate = address_digits(&key);
+                    if !candidate.is_empty() && candidate.ends_with(&digits) {
+                        peer_keys.push(key);
+                    }
+                }
+            }
+            peer_keys.sort();
+            peer_keys.dedup();
+            let mut matched = false;
+            for peer_key in peer_keys {
+                let Some(conversation) =
+                    self.store
+                        .conversation_by_peer(&account.id, "direct", &peer_key)?
+                else {
+                    continue;
+                };
+                matched = true;
+                let already = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                    .is_some_and(|summary| summary.blocked);
+                if already {
+                    continue;
+                }
+                self.store
+                    .set_conversation_blocked_factor(&account.id, &conversation.id, true)?;
+                if let Some(summary) = self
+                    .store
+                    .conversation_summary(&account.id, &conversation.id)?
+                {
+                    events.push(HostSideEvent::ConversationChanged(summary));
+                }
+            }
+            if !matched {
+                tracing::warn!(
+                    kind = "sync_blocked",
+                    "blocked sync matched no local conversation; dropped"
+                );
+            }
+        }
+        // The group half rides the §4.45 pull's authority (§4.131's honest
+        // hole): nothing to stamp, nothing to emit — the identities above
+        // were the whole connector-visible consumption.
         Ok(events)
     }
 
@@ -31383,6 +31472,119 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, HostSideEvent::ConversationChanged(_))),
             "the mirror still converges"
+        );
+    }
+
+    /// Contract 1.140 (§4.136): the blocked sync consumes into the §4.131
+    /// blocked factor store — presence stamps true on every direct row the
+    /// identity ladder resolves, the refreshed summaries ride
+    /// `conversation.changed`, a replay is silent (the bit already reads
+    /// true), an identity nothing resolves drops warn-only without
+    /// inventing a conversation, the group half consumes nothing, and no
+    /// message row is ever created.
+    #[test]
+    fn ingest_sync_blocked_stamps_the_factor_and_rides_conversation_changed() {
+        let (_temp, mut service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let by_number = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        // A second row of the same subject keyed by the raw ACI (the sync
+        // family's own key form): both forms must converge.
+        let aci = "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10";
+        let by_aci = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", aci, "8fc***e2")
+            .unwrap();
+        let before_number = service
+            .store_ref()
+            .conversation_summary(&account.id, &by_number.id)
+            .unwrap()
+            .unwrap();
+        assert!(!before_number.blocked);
+
+        let base = NormalizedReceive {
+            control: Some(ControlReceive::SyncBlocked {
+                blocked: crate::engine::SyncBlocked {
+                    numbers: vec!["+15555550101".into()],
+                    acis: vec![aci.to_string()],
+                    group_ids: vec!["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into()],
+                },
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        let events = service
+            .ingest_receive(base.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HostSideEvent::MessageUpserted(_))),
+            "a block mirror is not a message row"
+        );
+        let changed: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                HostSideEvent::ConversationChanged(summary) => Some(summary.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changed.len(), 2, "{changed:?}");
+        assert!(changed.contains(&by_number.id) && changed.contains(&by_aci.id));
+        for conversation_id in [&by_number.id, &by_aci.id] {
+            let after = service
+                .store_ref()
+                .conversation_summary(&account.id, conversation_id)
+                .unwrap()
+                .unwrap();
+            assert!(after.blocked, "the factor stamp must read true");
+        }
+
+        // The replay: both bits already read true — nothing stamps, nothing
+        // emits.
+        let events = service
+            .ingest_receive(base, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+
+        // An identity nothing resolves drops warn-only (no conversation is
+        // invented); the group-only half consumes nothing.
+        let unknown = NormalizedReceive {
+            control: Some(ControlReceive::SyncBlocked {
+                blocked: crate::engine::SyncBlocked {
+                    numbers: Vec::new(),
+                    acis: vec!["99999999-9999-9999-9999-999999999999".into()],
+                    group_ids: Vec::new(),
+                },
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        assert!(
+            service
+                .ingest_receive(unknown, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty()
+        );
+        let group_only = NormalizedReceive {
+            control: Some(ControlReceive::SyncBlocked {
+                blocked: crate::engine::SyncBlocked {
+                    numbers: Vec::new(),
+                    acis: Vec::new(),
+                    group_ids: vec!["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".into()],
+                },
+            }),
+            ..base_shape_for_unknown_test()
+        };
+        assert!(
+            service
+                .ingest_receive(group_only, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "the group half rides the pull authority, nothing stamps"
         );
     }
 

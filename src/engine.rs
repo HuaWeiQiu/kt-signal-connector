@@ -1247,6 +1247,22 @@ pub enum ControlReceive {
     SyncContacts {
         contacts: Vec<SyncContactRecord>,
     },
+    /// The engine's `syncMessage.blocked` projection (contract 1.140,
+    /// §4.136): the account's own linked device replaced its block list —
+    /// the official `_handleBlocked` mirror (MessageReceiver.preload.ts:3988),
+    /// which the engine projects in the official's modern/legacy family
+    /// shapes (modern `blockedE164s`/`blockedAcis`/`blockedGroups` entry
+    /// objects, legacy `numbers`/`acis`/`groupIds`/`acisBinary` string
+    /// arrays; a fully-empty list projects the modern empty object). The
+    /// connector unions whichever identities survived the engine's parse,
+    /// deduped per class; the modern entries' advisory `timestamp` has no
+    /// factor-stamp home and does not ride. A face whose every key failed
+    /// the tolerant read keeps the plain syncMessage skip. The routing
+    /// source stays None — the envelope is our own account and the
+    /// identities name their own subjects (the read/viewed precedent).
+    SyncBlocked {
+        blocked: SyncBlocked,
+    },
     /// The engine's `groupChanged {groupId, revision, changes[], editor?,
     /// expireTimerSeconds?}` projection (contract 1.100, §4.81 D3): the
     /// official GroupV2ChangeDetailType word list the engine decrypted out
@@ -1434,6 +1450,21 @@ pub struct SyncContactRecord {
     pub name: Option<String>,
 }
 
+/// The engine's `syncMessage.blocked` projection (contract 1.140, §4.136):
+/// the account's own linked device replaced its block list — the official
+/// `_handleBlocked` mirror. One bounded identity set per subject class,
+/// deduped: the e164s, the ACI ServiceId UUID strings, and the group master
+/// keys in the engine's standard-base64 `groupId` form. The modern entries'
+/// advisory `timestamp` has no home in the connector's factor stamp and does
+/// not ride; the projection already dropped the identities it could not
+/// resolve.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SyncBlocked {
+    pub numbers: Vec<String>,
+    pub acis: Vec<String>,
+    pub group_ids: Vec<String>,
+}
+
 /// Protocol-side bounds for inbound control-plane data (§4.13).
 const MAX_QUOTE_TEXT_CHARS: usize = 128;
 pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
@@ -1456,6 +1487,12 @@ const MAX_SYNC_READ_ENTRIES: usize = 256;
 /// tail past the cap drops (the truncate discipline; the stragglers still
 /// converge through the 60s-TTL pull path the passive face only accelerates).
 const MAX_SYNC_CONTACT_RECORDS: usize = 512;
+/// One blocked sync face carries at most this many identities per subject
+/// class (contract 1.140, §4.136): the read-face truncate discipline again —
+/// a real block list is user-scaled (tens), so the cap only ever bites on a
+/// hostile face, and the tail past it drops (the block state still converges
+/// through the §4.47 write face and the §4.45 pull's own `isBlocked`).
+const MAX_SYNC_BLOCKED_ENTRIES: usize = 512;
 /// One passive contact record's display-name cap (contract 1.136, §4.122):
 /// the same 64-char title bound the pull path's contact composer applies —
 /// the cache holds one bounded title, not the raw profile text.
@@ -3532,6 +3569,79 @@ fn normalized_sync_contact_records(value: Option<&Value>) -> Vec<SyncContactReco
         .collect()
 }
 
+/// The engine's `syncMessage.blocked` face (contract 1.140, §4.136): a
+/// tolerant read of both families the engine projects — the official
+/// `areModernFieldsUsed` selection is the engine's business, so the
+/// connector unions whichever keys survive. Modern entries are objects
+/// (`blockedE164s[{e164, timestamp?}]` / `blockedAcis[{aci, timestamp?}]` /
+/// `blockedGroups[{groupId, timestamp?}]`), legacy entries are string arrays
+/// (`numbers` / `acis` / `groupIds` / `acisBinary` — the last already the
+/// engine-resolved UUID strings). Unknown keys and unknown entry fields are
+/// not fatal (the official parse is loose the same way); an entry whose
+/// identity read fails drops per-entry. None when no identity survived — the
+/// envelope keeps the plain syncMessage skip.
+fn normalized_sync_blocked(value: Option<&Value>) -> Option<SyncBlocked> {
+    let face = value?.as_object()?;
+    let mut blocked = SyncBlocked::default();
+    let mut push_identity = |class: &str, raw: &Value| {
+        let identity = match class {
+            // Modern entry objects carry the identity in a per-class key.
+            "modern-e164" => raw.get("e164"),
+            "modern-aci" => raw.get("aci"),
+            "modern-group" => raw.get("groupId"),
+            // Legacy string arrays carry it directly.
+            _ => Some(raw),
+        }?
+        .as_str()
+        .map(str::trim)
+        .filter(|identity| !identity.is_empty())
+        .map(|identity| {
+            identity
+                .chars()
+                .take(MAX_RECEIVE_ID_CHARS)
+                .collect::<String>()
+        })?;
+        let slot = match class {
+            "modern-e164" | "legacy-number" => &mut blocked.numbers,
+            "modern-aci" | "legacy-aci" => &mut blocked.acis,
+            _ => &mut blocked.group_ids,
+        };
+        slot.push(identity);
+        Some(())
+    };
+    for (class, keys) in [
+        ("modern-e164", ["blockedE164s"].as_slice()),
+        ("modern-aci", ["blockedAcis"].as_slice()),
+        ("modern-group", ["blockedGroups"].as_slice()),
+        ("legacy-number", ["numbers"].as_slice()),
+        ("legacy-aci", ["acis", "acisBinary"].as_slice()),
+        ("legacy-group", ["groupIds"].as_slice()),
+    ] {
+        for key in keys {
+            let Some(entries) = face.get(*key).and_then(Value::as_array) else {
+                continue;
+            };
+            for entry in entries.iter().take(MAX_SYNC_BLOCKED_ENTRIES) {
+                let _ = push_identity(class, entry);
+            }
+        }
+    }
+    blocked.numbers.sort();
+    blocked.numbers.dedup();
+    blocked.numbers.truncate(MAX_SYNC_BLOCKED_ENTRIES);
+    blocked.acis.sort();
+    blocked.acis.dedup();
+    blocked.acis.truncate(MAX_SYNC_BLOCKED_ENTRIES);
+    blocked.group_ids.sort();
+    blocked.group_ids.dedup();
+    blocked.group_ids.truncate(MAX_SYNC_BLOCKED_ENTRIES);
+    if blocked.numbers.is_empty() && blocked.acis.is_empty() && blocked.group_ids.is_empty() {
+        None
+    } else {
+        Some(blocked)
+    }
+}
+
 /// The ServiceId UUID shape gate (the desktop's UUID regex,
 /// MessageReceiver.preload.ts:3274-3309): 8-4-4-4-12 hex groups.
 fn is_service_id_uuid(value: &str) -> bool {
@@ -4923,6 +5033,25 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
                 control: ControlReceive::SyncContacts { contacts },
             });
         }
+    }
+    // The engine's `syncMessage.blocked` projection (contract 1.140,
+    // §4.136): the account's own linked device replaced its block list — the
+    // official _handleBlocked mirror. Intercepted before the plain
+    // syncMessage skip like its contacts sibling; an envelope whose every
+    // key failed the tolerant read (or carried no identity at all — the
+    // fully-empty list projects an empty object) falls through to that
+    // skip. The routing source stays None — the envelope is our own
+    // account and the identities name their own subjects (the read/viewed
+    // precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some(blocked) = normalized_sync_blocked(sync.get("blocked"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncBlocked { blocked },
+        });
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
     // projection routes like every body-less control face — an empty or
@@ -8738,6 +8867,92 @@ mod tests {
 
         // A non-object face is not the projection → the plain skip.
         for sync in [json!({}), json!({ "usernameChange": "renamed" })] {
+            let routing = control_routing(
+                json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
+                    .as_object()
+                    .unwrap(),
+            );
+            assert!(routing.is_none(), "expected the plain skip: {sync}");
+        }
+    }
+
+    /// Contract 1.140 (§4.136): the engine's `syncMessage.blocked` projection
+    /// routes as a control addressed by its own identities — both family
+    /// shapes union, unknown fields tolerated, identities deduped and capped,
+    /// and a face with no surviving identity (the fully-empty list's empty
+    /// object included) kept on the plain syncMessage skip.
+    #[test]
+    fn sync_blocked_routes_both_families_and_tolerates_unknown_fields() {
+        let routing = |sync: serde_json::Value| {
+            control_routing(
+                json!({
+                    "timestamp": 1727000000000u64,
+                    "syncMessage": sync,
+                })
+                .as_object()
+                .unwrap(),
+            )
+            .map(|routing| (routing.control, routing.source))
+        };
+
+        // Modern + legacy keys union into one identity set; unknown face keys
+        // and unknown entry fields are not fatal; the advisory timestamps do
+        // not ride; wrong-typed entries drop per-entry.
+        let Some((ControlReceive::SyncBlocked { blocked }, source)) = routing(json!({
+            "blocked": {
+                "blockedE164s": [
+                    {"e164": "+15555550101", "timestamp": 1727000000000u64, "junk": true},
+                    {"nope": 1},
+                    "not-an-object",
+                ],
+                "blockedAcis": [
+                    {"aci": "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10", "timestamp": 7u64},
+                ],
+                "blockedGroups": [
+                    {"groupId": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="},
+                ],
+                "numbers": ["+15555550101", "+15555550102"],
+                "acis": ["0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10"],
+                "acisBinary": ["33333333-3333-3333-3333-333333333333"],
+                "groupIds": ["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="],
+                "unknownFutureKey": {"whatever": 1},
+            },
+        })) else {
+            panic!("expected a blocked control routing");
+        };
+        assert!(source.is_none(), "the envelope is our own account");
+        assert_eq!(blocked.numbers, ["+15555550101", "+15555550102"]);
+        assert_eq!(
+            blocked.acis,
+            [
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "33333333-3333-3333-3333-333333333333",
+            ]
+        );
+        assert_eq!(
+            blocked.group_ids,
+            ["AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="]
+        );
+
+        // The identity cap truncates per class (the read-face discipline).
+        let flood: Vec<Value> = (0..520)
+            .map(|index| json!({"e164": format!("+1555556{index:04}")}))
+            .collect();
+        let Some((ControlReceive::SyncBlocked { blocked }, _)) = routing(json!({
+            "blocked": { "blockedE164s": flood },
+        })) else {
+            panic!("expected the flooded face to route");
+        };
+        assert_eq!(blocked.numbers.len(), 512);
+
+        // Nothing usable — the fully-empty modern object, a hostile face, a
+        // non-object face — keeps the plain syncMessage skip.
+        for sync in [
+            json!({ "blocked": {} }),
+            json!({ "blocked": {"blockedE164s": [], "numbers": []} }),
+            json!({ "blocked": {"blockedE164s": "nope"} }),
+            json!({ "blocked": "nope" }),
+        ] {
             let routing = control_routing(
                 json!({ "timestamp": 1727000000000u64, "syncMessage": sync })
                     .as_object()
