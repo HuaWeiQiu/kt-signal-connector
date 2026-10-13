@@ -15,6 +15,13 @@
   passive `syncMessage.contacts` consume into the contacts cache) lands as
   connector-internal behavior only — zero wire change, the contract revision stays
   1.136 (the §4.121/§4.122 entries below)
+- No-revision record: 2026-10-13; the T-③ `receive.conversationState`
+  consumption leg (the §4.113 gap's connector-side half) is disposed as a
+  verification record only — the engine's inbound face shipped (e60d673) and
+  contract 1.134 forwards it verbatim (§4.117), and the local consume leg
+  into connector rows is deliberately not built on the §4.97 persist-nothing
+  posture and the §4.117 F red line (the §4.140 entry below) — zero code,
+  zero wire change, the contract revision stays 1.143
 - No-revision stopgap record: 2026-10-12; the §4.119 outbound-receipt resupply stopgap
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
@@ -9249,6 +9256,16 @@ cargo test + release build), all green.
 
 ### 4.113 The conversation flags have no inbound leg: the remote-storage-record face the engine does not project (verification record, 2026-10-12)
 
+> **Dated note (2026-10-13, the T-③ disposition):** the engine-projection-gap
+> claim below held at recording time and no longer holds in full — the
+> engine's F-link batch shipped the inbound face (`receive.conversationState`,
+> engine `e60d673`) and contract 1.134 forwards it verbatim (§4.117, the
+> `conversation.stateChanged` host frame). The closure condition this record
+> named had two halves: the inbound face (done, 1.134) and the
+> connector-side consume leg into local rows (deliberately not built —
+> §4.140, the verification record below). The §4.97 persist-nothing
+> posture stands.
+
 The §4.97 conversation-state family (`conversations.getState` /
 `conversations.setState` over the mutedUntilTimestamp/archived/
 markedUnread bits) is desktop-local-write only: the connector's
@@ -10856,6 +10873,72 @@ and the count bumped once), and the outbox end to end (the fixture's
 one-shot rate-limit answer — the `-32603` + anchor face verbatim — fails
 the send, enrolls the row at the one-minute beat, and leaves exactly one
 row). Gates: fmt, clippy `-D warnings`, tests all green, release build.
+
+### 4.140 The conversationState consumption leg stops at the forward: the local consume leg is deliberately not built (T-③ disposition, verification record, 2026-10-13)
+
+§4.113 recorded the conversation flags with no inbound leg and named a
+two-half closure condition: the engine ships the inbound face, and the
+§4.97 family gains its inbound leg. The first half happened — the
+engine's F-link batch (`receive.conversationState`, `e60d673`) carries
+the three-flag inbound flips, and contract 1.134 (§4.117) forwards the
+batch verbatim to the host as the transient `conversation.stateChanged`
+frame. The T-③ item asked for the second half: a connector-side
+*consume* leg that would also land the three bits into the connector's
+own conversation rows. This record disposes it: the forward is the
+whole deliverable, and the local consume leg is deliberately not built.
+
+**The convergence contract that already holds.** The desktop receives
+the transient frame — the loss semantics are the official ones (a lost
+notification is the lost official semantics of that one notification,
+§4.117) — and pulls the cloud truth on demand through
+`conversations.getState` (§4.97). Event plus pull is the official
+client's own convergence shape for storage-service diffs; it needs no
+connector-side second copy to converge the list.
+
+**Why the consume leg is deliberately not built.** Three recorded
+reasons, each a red line the codebase already holds:
+
+- *The §4.97 persist-nothing posture.* The conversation-state family's
+  recorded design is "both faces persist nothing locally — the cloud
+  record plus the desktop's own cache is the whole story; the connector
+  holds no state copy" (§4.97). A consume leg that writes the three
+  bits into connector rows manufactures exactly the second source of
+  truth that posture exists to prevent, and it carries no invalidation
+  story of its own: a desktop-local `conversations.setState` write and
+  a remote flip arriving in the same merge batch would race two local
+  copies with no official counterpart whose resolution the connector
+  could copy.
+- *The §4.117 F red line on entry internals.* The forwarded
+  `conversations` entries are deliberately typed `object` and open —
+  "pinning their internals would promise a connector-side whitelist the
+  F red line forbids" (§4.117). A consume leg must resolve each entry's
+  `conversationId` against local rows to know which row to update; that
+  resolution pins the id shape and the kind-specific address derivation
+  the forward deliberately never looks at. The consume leg and the
+  verbatim-forward posture cannot coexist on one parse.
+- *No store move is earned.* The list converges without the leg (frame
+  plus pull); the connector adds no capability the engine lacks; and a
+  store migration carrying three flag columns that no wire face reads
+  is dead weight with a maintenance tail — every future summary rebuild
+  and ingest arm would have to keep the copies honest forever.
+
+**The legacy `muted` column note.** The store's conversations table
+carries a `muted` boolean from the earliest schema, inserted 0 and
+never updated by any current face — the summary wire's
+always-serialized `muted` key therefore reads false for every row, every
+account. Its semantics are not the cloud record's:
+`mutedUntilTimestamp` is an expiry-carrying timestamp, the legacy
+column is a bare bool, and mapping one onto the other would either lose
+the expiry or invent a boolean reading the cloud record does not state.
+The column stays untouched; a consume leg would have made "what does
+muted mean now" worse, not better.
+
+**The disposition.** Recorded as a deliberate stop, not a gap: the
+inbound face exists (1.134), the forward is live (§4.117), and the
+consume leg is rejected on the three reasons above. The §4.113 record's
+factual claim is superseded (its dated note points here); the §4.97
+persist-nothing posture stands. No connector code, no schema change, no
+store version change, no wire change, no contract revision.
 
 ## 5. signal-cli Boundary
 
