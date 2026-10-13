@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
@@ -327,5 +327,120 @@ fn proxy_group_specs_fail_closed_before_bootstrap_is_read() {
     assert!(
         !stderr.contains("10.20.30."),
         "diagnostics must not echo proxy endpoints"
+    );
+}
+
+/// Contract 1.147 (§4.145): the R2 TCP leg's argv face — `--listen` is the
+/// endpoint's strict alternative (the same argv discipline as the secret
+/// sources), and `--endpoint` keeps its old requiredness whenever `--listen`
+/// is absent, so a legacy launcher's argv parses byte-identically.
+#[test]
+fn serve_takes_listen_as_the_strict_alternative_to_endpoint() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    let tail = [
+        "--bootstrap-secret-stdin",
+        "--signal-cli",
+        "unused-signal-cli",
+        "--signal-data-dir",
+        "unused-signal-data",
+        "--state-dir",
+        "unused-state",
+    ];
+
+    let both = Command::new(binary)
+        .arg("serve")
+        .args(["--endpoint", "unused-endpoint", "--listen", "127.0.0.1:0"])
+        .args(tail)
+        .output()
+        .expect("connector binary should reject the endpoint pair");
+    assert_eq!(both.status.code(), Some(2));
+    assert!(both.stdout.is_empty());
+    let stderr = String::from_utf8(both.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("--listen"), "unexpected error: {stderr}");
+
+    let neither = Command::new(binary)
+        .arg("serve")
+        .args(tail)
+        .output()
+        .expect("connector binary should reject the missing endpoint");
+    assert_eq!(neither.status.code(), Some(2));
+    assert!(neither.stdout.is_empty());
+    let stderr = String::from_utf8(neither.stderr).expect("error output should be UTF-8");
+    assert!(stderr.contains("--endpoint"), "unexpected error: {stderr}");
+}
+
+/// The §4.145 exposure boundary at the argv gate: only an IPv4 loopback
+/// host:port parses — wildcard, off-host, IPv6 loopback, and a port-less
+/// value are all usage errors before anything binds.
+#[test]
+fn serve_rejects_non_loopback_listen_addresses_at_parse_time() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    let tail = [
+        "--bootstrap-secret-stdin",
+        "--signal-cli",
+        "unused-signal-cli",
+        "--signal-data-dir",
+        "unused-signal-data",
+        "--state-dir",
+        "unused-state",
+    ];
+    let run = |address: &str| {
+        Command::new(binary)
+            .arg("serve")
+            .args(["--listen", address])
+            .args(tail)
+            .output()
+            .expect("connector binary should reject the listen address")
+    };
+
+    for address in ["10.1.2.3:8080", "0.0.0.0:0", "[::1]:0"] {
+        let output = run(address);
+        assert_eq!(output.status.code(), Some(2), "address: {address}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).expect("error output should be UTF-8");
+        assert!(
+            stderr.contains("loopback"),
+            "address {address} must be rejected naming the loopback boundary: {stderr}"
+        );
+    }
+
+    let portless = run("127.0.0.1");
+    assert_eq!(portless.status.code(), Some(2));
+    assert!(portless.stdout.is_empty());
+}
+
+/// `--listen` alone is a complete endpoint face: the argv parses (this launch
+/// then fails at the deliberately empty stdin payload with the classified
+/// exit 1, never a usage exit 2) and a failed launch announces nothing — the
+/// stdout announce only ever follows a successful bind.
+#[test]
+fn serve_accepts_the_listen_face_past_argv_and_fails_without_an_announce() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    let temp = TempDir::new().unwrap();
+    let output = Command::new(binary)
+        .arg("serve")
+        .args(["--listen", "127.0.0.1:0"])
+        .args([
+            "--bootstrap-secret-stdin",
+            "--signal-cli",
+            "unused-signal-cli",
+            "--signal-data-dir",
+        ])
+        .arg(temp.path().join("signal-data"))
+        .args(["--state-dir"])
+        .arg(temp.path().join("state"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("connector binary should run the listen face");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stdout.is_empty(),
+        "a failed launch must not announce: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("error output should be UTF-8");
+    assert!(
+        stderr.contains("bootstrap secret"),
+        "the failure should be the payload classification: {stderr}"
     );
 }

@@ -35,7 +35,51 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.146 (2026-10-13; the peer-ACI surface for the
+- Contract revision: 1.147 (2026-10-13; the R2 connector-first dual-stack
+  transport face (§4.145): `serve` gains `--listen HOST:PORT` as the strict
+  argv alternative to `--endpoint` — an IPv4 loopback address only, checked
+  at the argv gate and again at the listener, with port `0` the production
+  shape so the kernel assigns the port inside the connector process. The
+  bind strictly precedes the announce: only after `TcpListener::bind`
+  succeeds does the connector write exactly one NDJSON line on stdout —
+  `{"apiVersion":"1.0","event":"listening","transport":"tcp","host":"127.0.0.1","port":<N>}`
+  — so the port the desktop reads is real the instant the line arrives (no
+  probe TOCTOU window), and a live leg's port cannot be re-bound (no
+  `SO_REUSEADDR` anywhere on the path: std never sets it), while the kernel
+  hands the port back at process death with zero filesystem residue. After
+  that one line serve-mode stdout is silent on both legs — the batch-2
+  desktop reader holds the announce and then only drains, no backpressure
+  hazard. The token face is unchanged: the 32-byte secret crosses the
+  existing stdin pipe (the two-line payload), the TCP leg runs the same
+  challenge + HMAC-SHA256 double-nonce handshake, zero new cryptography,
+  and the hostile-connect posture is inherited whole (sequential accepts,
+  one unauthenticated slot, the 5-second handshake timeout, a failed probe
+  never consumes the process). Dual-stack compatibility is the point of the
+  batch: the unix-socket leg, the Windows named pipe, and every pre-1.147
+  spawn argv behave byte-for-byte as before — the current desktop keeps
+  spawning `--endpoint`, Windows rejects the TCP transport at startup, and
+  the UDS leg's sun_path guard, staging bind, and drop-unlink all stay
+  verbatim until the batch-4 retirement (R2 contract, docs-drafts
+  r2-signal-endpoint-tcp-contract: the connector-first batch of the
+  migration order). Deliberately not built: the desktop half (the stdout
+  reader, the port injection, the UDS retirement, the env kill-switch —
+  batch 2), the UDS-leg deletion and the 60+ `connector.sock`-shaped test
+  migration (batch 4), the R2-optional Unix widening of the `--parent-pid`
+  watchdog, any stdin-only enforcement on the TCP leg (the launcher owns
+  the secret channel; the file loader stays for the old desktop), and any
+  schema change — no method, param, event, error, or capability changes;
+  the transport is the spawn argv, not the wire (byte-identical on both
+  legs). Tests 787 → 797 (lib 598 → 602: four TCP-leg ipc unit tests — the
+  kernel-assigned loopback bind, the non-loopback rejection trio, the
+  live-leg rebind block plus drop release, and the frame-carrying stream;
+  integration: three argv-face binary tests (the endpoint pair's mutual
+  exclusion, the loopback parse gate, listen-only argv reaching the payload
+  stage without an announce) and the new `tcp_listen` harness pinning the
+  whole spawn — the stdin token, the byte-exact announce, the immediate
+  connect on the announced port, the existing handshake plus a served
+  request over loopback, the wrong-secret rejection arm, and the
+  stdout-silence pin on both legs), all green) —
+  previously 1.146 (2026-10-13; the peer-ACI surface for the
   outgoing-call addressing (§4.144): RingRTC's `startOutgoingCall`
   addresses the peer by its ACI (the ServiceId UUID), and the desktop's
   call chain could not get one for two whole classes of peers — the
@@ -11314,6 +11358,102 @@ resolvable by peer key, the materialized summary carrying serviceId,
 the aci-only sibling writing nothing); and the contacts list gains its
 own derivation test (the hit, the miss, the verbatim UUID, the absent
 group row). Tests 786 → 787 (lib 597 → 598). Gates: fmt, clippy
+`-D warnings`, tests all green, release build.
+
+### 4.145 The endpoint identity leaves the filesystem on the connector half: `--listen` loopback TCP, the stdout announce, and the stdin token, dual-stack (contract revision 1.147, 2026-10-13)
+
+The R2 contract (docs-drafts `r2-signal-endpoint-tcp-contract`, the
+design source for this whole migration) retires the unix-socket
+endpoint's naming debt — the `sun_path` budget logic
+(`MAX_SUN_PATH_BYTES` 103/107), the staging-rename publish, and the
+three-part residue cleanup chain — by moving the endpoint identity from
+the filesystem namespace to process lineage (the spawn), a
+kernel-assigned port, and the bootstrap token. This revision is the
+migration's batch 1, the connector half, and the shape of the batch is
+additive by construction: the connector learns the TCP leg while the
+UDS leg stays byte-for-byte, so the shipping desktop keeps spawning
+`--endpoint` unchanged and the dual-stack window is legal in every
+direction (old desktop + new connector, new connector + old desktop).
+
+**The argv face.** `serve` accepts `--listen HOST:PORT` as the strict
+alternative to `--endpoint`: clap `conflicts_with` (the same argv
+discipline as the secret sources), neither given is still a usage
+error, and the legacy argv grammar is untouched. The value must parse
+as a socket address and must be an IPv4 loopback one — wildcard
+`0.0.0.0`, off-host, and IPv6 `[::1]` addresses are usage errors at the
+argv gate, before anything touches the filesystem — and the boundary is
+checked a second time at the listener itself
+(`LocalListener::bind_tcp`), so the module cannot be handed a
+non-loopback bind by any future caller. Port `0` is the production
+shape: the kernel assigns the port inside the connector process, no
+port number is ever configured, fixed, or logged. Windows rejects the
+TCP transport at startup (the named pipe's current-user DACL semantics
+are strictly better than loopback TCP and stay), and every pre-1.147
+spawn argv — `--endpoint` on Unix, the pipe on Windows — parses and
+behaves identically.
+
+**The announce.** The bind strictly precedes the announce: only after
+`TcpListener::bind` has succeeded does the connector write exactly one
+NDJSON line to stdout,
+`{"apiVersion":"1.0","event":"listening","transport":"tcp","host":"<bound loopback ip>","port":<N>}`,
+so the port the desktop reads is real the instant the line arrives —
+there is no probe TOCTOU window to close, and nobody can race the port
+either: the no-`SO_REUSEADDR` discipline (std never sets it on this
+path) makes a live leg's port exclusively ours, and the kernel hands
+the port back when the process dies — zero filesystem residue, which is
+the whole point. The UDS drop-unlink chain has no TCP counterpart
+because there is nothing to unlink. After that one line serve-mode
+stdout is silent on both legs, pinned by test: the batch-2 desktop
+reader can hold the single announce line and then only drain the pipe
+(no backpressure hazard), diagnostics keep flowing to stderr as always,
+and a launch that fails before the bind announces nothing.
+
+**The token.** Unchanged by design: the 32-byte secret crosses the
+existing stdin pipe (`--bootstrap-secret-stdin`, the two-line payload
+with the store key), and the TCP leg runs the same challenge +
+HMAC-SHA256 double-nonce handshake — the proof binds both per-connection
+nonces and the apiVersion, so a captured proof is dead on the next
+connection. Zero new cryptography. The secret never enters argv, the
+announce frame, or the logs, and the announce carries nothing but the
+bound address. The hostile-local-process posture is inherited whole
+from the UDS accept loop: accepts are sequential (one connection slot),
+a silent or failed handshake dies inside the existing 5-second
+handshake timeout, and a failed probe never consumes the process — the
+only new fact an unauthenticated local process can learn is the one-bit
+"a connector port exists", which the R2 §3.3 equivalence argument
+prices in.
+
+**Deliberately not built (the batch boundary).** The desktop half — the
+stdout announce reader, the port injection, the UDS retirement, the
+`KT_SIGNAL_CONNECTOR_TRANSPORT=uds` kill-switch — is batch 2. Deleting
+this repo's unix-socket leg, its sun_path guard, its staging bind, its
+drop-unlink, and migrating the 60+ `connector.sock`-shaped tests and
+the AF_UNIX scripts is batch 4; every existing UDS test passes this
+revision untouched, which is itself the compatibility pin. The
+R2-optional Unix widening of the `--parent-pid` watchdog is not built
+(the Windows-only watchdog and the pkill-by-argv orphan sweep stay).
+The TCP leg does not enforce the stdin bootstrap source: the launcher
+owns the secret channel, the file loader stays for the old desktop
+until batch 4, and no production spawn uses the file on the TCP leg.
+No `SO_REUSEADDR`, no configurable port or range, no announce retries,
+no announce on the UDS leg (the socket path remains its own
+announcement). Schema: none — no method, param, event, error, or
+capability changes; the transport is the spawn argv, not the wire, and
+the wire is byte-identical on both legs.
+
+Tests: the ipc leg gains four unit tests (the kernel-assigned loopback
+bind, the non-loopback rejection trio `0.0.0.0`/off-host/`::1`, the
+live-leg rebind block plus drop release, and the frame-carrying stream
+round trip); the argv face gains three binary tests (the endpoint
+pair's mutual exclusion and the preserved requiredness, the loopback
+parse gate with the port-less value, and a listen-only argv that
+reaches the payload stage with exit 1 and an empty stdout); and the new
+`tcp_listen` harness pins the whole spawn against the real binary — the
+stdin token in, one byte-exact announce out, an immediate connect on
+the announced port (bind-before-announce), the existing handshake plus
+a served request over loopback, the wrong-secret AUTHENTICATION_FAILED
+arm with the process surviving the probe, and the stdout-silence pin on
+both legs. Tests 787 → 797 (lib 598 → 602). Gates: fmt, clippy
 `-D warnings`, tests all green, release build.
 
 ## 5. signal-cli Boundary

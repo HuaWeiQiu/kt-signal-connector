@@ -5,6 +5,8 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+#[cfg(unix)]
+use kt_signal_connector::API_VERSION;
 use kt_signal_connector::auth::{load_bootstrap_payload, load_bootstrap_payload_from_reader};
 use kt_signal_connector::datalock;
 use kt_signal_connector::engine::SocksProxy;
@@ -35,8 +37,21 @@ struct Cli {
 enum CliCommand {
     /// Serve the private KT host protocol.
     Serve {
-        #[arg(long)]
-        endpoint: PathBuf,
+        #[arg(long, required_unless_present = "listen")]
+        endpoint: Option<PathBuf>,
+        /// Listen for the host on a loopback TCP port instead of the private
+        /// unix socket (contract 1.147, §4.145 — the R2 dual-stack batch;
+        /// e.g. 127.0.0.1:0, where port 0 has the kernel assign a free port).
+        /// After the bind succeeds, exactly one NDJSON announce line carries
+        /// the bound port on stdout and serve-mode stdout stays silent. The
+        /// TCP transport is Unix-only: Windows keeps the named pipe endpoint.
+        #[arg(
+            long,
+            value_name = "HOST:PORT",
+            conflicts_with = "endpoint",
+            value_parser = parse_loopback_listen
+        )]
+        listen: Option<std::net::SocketAddr>,
         #[arg(
             long,
             conflicts_with = "bootstrap_secret_stdin",
@@ -192,8 +207,25 @@ enum PackageCommand {
     },
 }
 
+/// The `--listen` argv gate (contract 1.147, §4.145): the value must parse
+/// as a HOST:PORT socket address and must be an IPv4 loopback one —
+/// wildcard, off-host, and IPv6 addresses are usage errors before anything
+/// touches the filesystem. The message never echoes the value, the same
+/// discipline as the proxy diagnostics (R10). The loopback shape is checked
+/// again at the listener boundary (`LocalListener::bind_tcp`).
+fn parse_loopback_listen(value: &str) -> Result<std::net::SocketAddr, String> {
+    let address: std::net::SocketAddr = value
+        .parse()
+        .map_err(|_| "listen must be a HOST:PORT address".to_string())?;
+    if !(address.is_ipv4() && address.ip().is_loopback()) {
+        return Err("listen must be an IPv4 loopback host:port".to_string());
+    }
+    Ok(address)
+}
+
 struct ServeOptions {
-    endpoint: PathBuf,
+    endpoint: Option<PathBuf>,
+    listen: Option<std::net::SocketAddr>,
     bootstrap_secret_file: Option<PathBuf>,
     bootstrap_secret_stdin: bool,
     parent_pid: Option<u32>,
@@ -229,6 +261,7 @@ async fn main() {
     let result = match cli.command {
         CliCommand::Serve {
             endpoint,
+            listen,
             bootstrap_secret_file,
             bootstrap_secret_stdin,
             parent_pid,
@@ -242,6 +275,7 @@ async fn main() {
             state_dir,
         } => serve_command(ServeOptions {
             endpoint,
+            listen,
             bootstrap_secret_file,
             bootstrap_secret_stdin,
             parent_pid,
@@ -266,9 +300,32 @@ async fn main() {
     }
 }
 
+/// Contract 1.147 (§4.145): the TCP leg announces its kernel-assigned port
+/// with exactly one NDJSON line on stdout — the byte shape the desktop's
+/// batch-2 parser matches (`apiVersion`, `event`, `transport`, `host`,
+/// `port`, in this order). Written only after the bind succeeded, and the
+/// last stdout byte serve mode ever emits: everything after it goes to
+/// stderr, so the launcher can hold one announce line and then drain
+/// without a backpressure hazard.
+#[cfg(unix)]
+fn write_listen_announce(address: std::net::SocketAddr) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let line = format!(
+        "{{\"apiVersion\":\"{API_VERSION}\",\"event\":\"listening\",\"transport\":\"tcp\",\
+         \"host\":\"{}\",\"port\":{}}}\n",
+        address.ip(),
+        address.port()
+    );
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(line.as_bytes())?;
+    stdout.flush()
+}
+
 async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::Error>> {
     let ServeOptions {
         endpoint,
+        listen,
         bootstrap_secret_file,
         bootstrap_secret_stdin,
         parent_pid,
@@ -338,7 +395,34 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         harden_private_directory(&signal_data_dir)?;
         harden_private_directory(&state_dir)?;
     }
-    let listener = LocalListener::bind(&endpoint)?;
+    // Contract 1.147 (§4.145): the transport is the launcher's choice — the
+    // legacy unix-socket endpoint, or the R2 loopback TCP leg. The TCP bind
+    // carries the UDS leg's timing exactly: the port exists before anything
+    // announces it (bind first, announce second — no probe TOCTOU window),
+    // and a runtime-open failure after the announce converges to the same
+    // START_FAILED the UDS leg's post-bind failures always produced.
+    let listener = match listen {
+        Some(address) => {
+            #[cfg(windows)]
+            {
+                let _ = &address;
+                return Err(
+                    "the TCP listen transport is Unix-only; Windows keeps the named pipe endpoint"
+                        .into(),
+                );
+            }
+            #[cfg(unix)]
+            {
+                let listener = LocalListener::bind_tcp(address).await?;
+                write_listen_announce(listener.tcp_address()?)?;
+                listener
+            }
+        }
+        None => {
+            let endpoint = endpoint.expect("clap requires --endpoint unless --listen is given");
+            LocalListener::bind(&endpoint)?
+        }
+    };
     let runtime = open_group_runtime(
         plan,
         signal_cli,
