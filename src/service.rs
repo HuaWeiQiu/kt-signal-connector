@@ -6271,6 +6271,17 @@ impl ConnectorService {
                 false,
             )));
         }
+        // §4.134: an attachment row is never retryable — the rebuild face
+        // carries text/quote/preview only, so a captioned attachment send
+        // would leave as plain text without its bytes. The human answer is
+        // the §4.92 resend, not a rebuild.
+        if !row.attachments.is_empty() {
+            return Err(ServiceError::Api(ApiError::new(
+                "RETRY_NOT_ALLOWED",
+                "attachment sends cannot be retried; resend the attachment",
+                false,
+            )));
+        }
         if row.status == "pending" {
             return Err(ServiceError::Api(ApiError::new(
                 "RETRY_IN_FLIGHT",
@@ -6314,7 +6325,11 @@ impl ConnectorService {
     /// underneath the claim drops it) and never rearms, never mints a new
     /// clientRequestId, never inserts a second row. An empty-text or
     /// non-pending row drops the claim (MessageNotFound) — the worker logs
-    /// and moves on; nothing is auto-created from a hostile shape.
+    /// and moves on; nothing is auto-created from a hostile shape. An
+    /// attachment row drops the claim too (§4.134), but settles the
+    /// deterministic failure on the way out: the claim already flipped it
+    /// pending, so the refusal's guarded no-schedule settlement is what
+    /// keeps a pre-revision enrolled row from stranding.
     pub fn prepare_outbox_retry_text(
         &self,
         claim: &RetryClaim,
@@ -6325,13 +6340,25 @@ impl ConnectorService {
             .store
             .message_by_client_request(&claim.account_id, &claim.client_request_id)?
             .ok_or(ServiceError::Store(StoreError::MessageNotFound))?;
-        let matches = row.id == claim.message_id
+        let identity_matches = row.id == claim.message_id
             && row.conversation_id == claim.conversation_id
             && row.direction == "outgoing"
             && row.status == "pending"
-            && row.sent_at == claim.sent_at
-            && row.text.as_deref().is_some_and(|text| !text.is_empty());
-        if !matches {
+            && row.sent_at == claim.sent_at;
+        if !identity_matches {
+            return Err(ServiceError::Store(StoreError::MessageNotFound));
+        }
+        // §4.134 (belt over the claim gate's braces): an attachment row that
+        // still reached a rebuild — an enrolled-before-the-gate row whose
+        // stored face the claim's read could not parse — settles the
+        // deterministic failure (the guarded flip back to `failed` clears
+        // the whole queue face) and never re-dispatches a caption without
+        // its bytes.
+        if !row.attachments.is_empty() {
+            self.store.settle_send_failed(&row.id, now_ms(), false)?;
+            return Err(ServiceError::Store(StoreError::MessageNotFound));
+        }
+        if row.text.as_deref().is_none_or(|text| text.is_empty()) {
             return Err(ServiceError::Store(StoreError::MessageNotFound));
         }
         self.rebuild_retry_dispatch(&row, &account, &conversation)
@@ -6345,7 +6372,10 @@ impl ConnectorService {
     /// optional); mentions and text styles are not persisted for retry
     /// rebuilds (documented deviation, the text arrives unchanged) — and a
     /// `PreparedSend::Dispatch` addressed to the SAME row, so settlement
-    /// completes the row the bubble already renders.
+    /// completes the row the bubble already renders. Callers reject
+    /// attachment rows before this face (§4.134): the rebuild has no
+    /// attachment channel, so an attachment row's caption would leave as
+    /// plain text.
     fn rebuild_retry_dispatch(
         &self,
         row: &MessageRecord,
@@ -17109,6 +17139,242 @@ mod tests {
             rows.len(),
             1,
             "the history stays one row per logical message"
+        );
+    }
+
+    /// §4.134: the captioned attachment send never enters the §4.123 queue —
+    /// the eligibility gate reads the row's attachment face beside its body,
+    /// so a caption no longer smuggles an attachment row into a rebuild that
+    /// would resend the words without the bytes. A sibling text row enrolls
+    /// beside it and the claim takes only that one.
+    #[test]
+    fn retry_queue_never_enrolls_an_attachment_caption_row() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let attachment_pending = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-caption-1",
+                "YXR0YWNobWVudCBieXRlcw==",
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("see attachment"),
+                None,
+                false,
+                false,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new request must dispatch"),
+        };
+        let text_pending = match service
+            .prepare_send_text(
+                &account.id,
+                &conversation.id,
+                "plain queued text",
+                "req-caption-2",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new request must dispatch"),
+        };
+        // Both rows fail with the same retryable class; only the text row
+        // may arm a schedule.
+        service
+            .complete_send_failed_for_engine(&attachment_pending, &EngineError::ServerUnavailable)
+            .unwrap();
+        service
+            .complete_send_failed_for_engine(&text_pending, &EngineError::ServerUnavailable)
+            .unwrap();
+        let face = |service: &ConnectorService, id: &str| {
+            service
+                .store_ref()
+                .conn()
+                .query_row(
+                    "SELECT status, first_send_attempted_at, retry_attempt_count, next_attempt_at
+                     FROM messages WHERE id=?1",
+                    params![id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            face(&service, &attachment_pending),
+            ("failed".into(), None, 0, None),
+            "the captioned attachment row settles plain-failed, schedule retired"
+        );
+        let (_, first, count, next) = face(&service, &text_pending);
+        assert!(
+            first.is_some() && count == 1 && next.is_some(),
+            "the text row enrolls"
+        );
+
+        // The claim takes exactly the text row; the attachment row is not in
+        // the queue and not flipped.
+        let due_now = crate::link::now_ms() + 5_000;
+        let claims = service.store_ref().claim_due_retries(due_now, 10).unwrap();
+        assert_eq!(claims.len(), 1, "{claims:?}");
+        assert_eq!(claims[0].message_id, text_pending);
+        assert_eq!(face(&service, &attachment_pending).0, "failed");
+    }
+
+    /// §4.134: a pre-revision attachment row that still carries a live
+    /// schedule (hand-written, the enrolled-before-the-gate shape) is
+    /// refused at claim time — the schedule retires, the row stays failed.
+    /// A row that slips past into a rebuild settles the deterministic
+    /// failure (queue face cleared, never a stranded pending), and the
+    /// manual face answers RETRY_NOT_ALLOWED.
+    #[test]
+    fn retry_faces_refuse_an_attachment_row_and_settle_the_deterministic_failure() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let pending_id = match service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-caption-legacy",
+                "YXR0YWNobWVudCBieXRlcw==",
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                Some("see attachment"),
+                None,
+                false,
+                false,
+                None,
+            )
+            .unwrap()
+        {
+            PreparedSend::Dispatch { pending_id, .. } => pending_id,
+            PreparedSend::Existing(_) => panic!("new request must dispatch"),
+        };
+        service
+            .complete_send_failed_for_engine(&pending_id, &EngineError::ServerUnavailable)
+            .unwrap();
+        let row = service
+            .store_ref()
+            .message_by_id(&account.id, &conversation.id, &pending_id)
+            .unwrap()
+            .unwrap();
+        // Hand-write the live schedule the pre-§4.134 gate would have armed.
+        let now = crate::link::now_ms();
+        service
+            .store_ref()
+            .conn()
+            .execute(
+                "UPDATE messages SET first_send_attempted_at=?2, retry_attempt_count=1,
+                        next_attempt_at=?3
+                 WHERE id=?1",
+                params![pending_id, now as i64, (now + 190) as i64],
+            )
+            .unwrap();
+
+        // The claim-time gate: no claim comes out, the schedule retires, the
+        // row stays failed (never flipped pending).
+        let claims = service
+            .store_ref()
+            .claim_due_retries(now + 5_000, 10)
+            .unwrap();
+        assert!(claims.is_empty(), "{claims:?}");
+        let face = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT status, first_send_attempted_at, retry_attempt_count, next_attempt_at
+                 FROM messages WHERE id=?1",
+                params![pending_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(face, ("failed".into(), Some(now as i64), 1, None));
+
+        // The rebuild-time belt: simulate the flip a pre-gate claim won (the
+        // row is pending when the rebuild sees it) and hand the worker's
+        // claim shape to the face. The refusal settles the deterministic
+        // failure and clears the whole queue face.
+        service
+            .store_ref()
+            .conn()
+            .execute(
+                "UPDATE messages SET status='pending' WHERE id=?1",
+                params![pending_id],
+            )
+            .unwrap();
+        let claim = crate::store::RetryClaim {
+            message_id: pending_id.clone(),
+            account_id: account.id.clone(),
+            conversation_id: conversation.id.clone(),
+            client_request_id: "req-caption-legacy".into(),
+            sent_at: row.sent_at,
+        };
+        assert!(service.prepare_outbox_retry_text(&claim).is_err());
+        let face = service
+            .store_ref()
+            .conn()
+            .query_row(
+                "SELECT status, first_send_attempted_at, retry_attempt_count, next_attempt_at
+                 FROM messages WHERE id=?1",
+                params![pending_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            face,
+            ("failed".into(), None, 0, None),
+            "the rebuild refusal settles the failure and retires the schedule"
+        );
+
+        // The manual face refuses the same family deterministically.
+        let error = service
+            .prepare_retry_text(&account.id, &conversation.id, "req-caption-legacy")
+            .unwrap_err();
+        assert!(
+            matches!(error, ServiceError::Api(ref e) if e.code == "RETRY_NOT_ALLOWED"),
+            "the manual face answers RETRY_NOT_ALLOWED, got {error:?}"
         );
     }
 

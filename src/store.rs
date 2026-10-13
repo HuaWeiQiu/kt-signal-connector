@@ -78,6 +78,22 @@ pub const MAX_RETRY_ATTEMPTS: u32 = 128;
 /// bounded-queue rule).
 pub const MAX_RETRY_QUEUED_PER_ACCOUNT: u32 = 256;
 
+/// §4.134: does the row's persisted attachments face carry at least one
+/// descriptor? `attachments_json` is NULL on plain rows and a JSON array on
+/// attachment rows (both insert paths write it that way), so an unparseable
+/// face is a hostile shape and reads as carrying — 宁缺勿错: the rebuild has
+/// no attachment channel, so the queue must never resend a row whose
+/// attachment state it cannot read.
+fn has_attachment_descriptors(attachments_json: Option<&str>) -> bool {
+    let Some(json) = attachments_json else {
+        return false;
+    };
+    serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|value| value.as_array().map(|list| !list.is_empty()))
+        .unwrap_or(true)
+}
+
 /// The full schema DDL, shared by `Store::open` and test fixtures so a test
 /// store can never drift from the production schema.
 const SCHEMA_DDL: &str = "
@@ -3177,7 +3193,8 @@ impl Store {
     /// the same guarded write, so a row can never be observed failed-and-
     /// unscheduled between settlement and enqueue. The schedule arm refuses
     /// anything that is not a retryable outbound text row (direction,
-    /// non-empty text, a `client_request_id` — the receive-mirrored
+    /// non-empty text, a `client_request_id`, no attachment descriptors —
+    /// §4.134, the rebuild's caption-only channel; the receive-mirrored
     /// multi-device echo rows are another device's delivery and are never
     /// ours to resend), that already spent its attempt budget, or that would
     /// push the account past the in-queue ceiling; such rows settle plain
@@ -3267,7 +3284,7 @@ impl Store {
         let row = transaction
             .query_row(
                 "SELECT direction, body, client_request_id, retry_attempt_count,
-                        first_send_attempted_at, account_id
+                        first_send_attempted_at, account_id, attachments_json
                  FROM messages WHERE id=?1 AND status='failed'",
                 params![message_id],
                 |row| {
@@ -3278,20 +3295,35 @@ impl Store {
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<i64>>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
-        let Some((direction, body, client_request_id, attempt_count, _first, account_id)) = row
+        let Some((
+            direction,
+            body,
+            client_request_id,
+            attempt_count,
+            _first,
+            account_id,
+            attachments,
+        )) = row
         else {
             return Ok(());
         };
-        // Eligibility: outbound text row with a clientRequestId (§4.123) and
-        // attempt budget left, and the account under its in-queue ceiling.
+        // Eligibility (§4.123, narrowed by §4.134): outbound text row with a
+        // clientRequestId, attempt budget left, no attachment descriptors,
+        // and the account under its in-queue ceiling. The rebuild face has
+        // no attachment channel, so an attachment row — caption included —
+        // would re-dispatch its caption as plain text without the bytes; the
+        // descriptor-carrying family stays manual (the §4.92 answer), the
+        // refusal the standard retire shape.
         let eligible = direction == "outgoing"
             && body.as_deref().is_some_and(|body| !body.is_empty())
             && client_request_id.is_some()
+            && !has_attachment_descriptors(attachments.as_deref())
             && (attempt_count as u64) < u64::from(MAX_RETRY_ATTEMPTS);
         if !eligible {
             return Self::retire_retry_schedule_in(transaction, message_id);
@@ -3358,7 +3390,7 @@ impl Store {
         let mut due = transaction
             .prepare(
                 "SELECT id, account_id, conversation_id, client_request_id, sent_at,
-                        first_send_attempted_at
+                        first_send_attempted_at, attachments_json
                  FROM messages
                  WHERE direction='outgoing' AND status='failed'
                    AND next_attempt_at IS NOT NULL AND next_attempt_at<=?1
@@ -3375,6 +3407,7 @@ impl Store {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?
@@ -3382,8 +3415,32 @@ impl Store {
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         drop(due);
         let mut claims = Vec::new();
-        for (message_id, account_id, conversation_id, client_request_id, sent_at, first) in scanned
+        for (
+            message_id,
+            account_id,
+            conversation_id,
+            client_request_id,
+            sent_at,
+            first,
+            attachments,
+        ) in scanned
         {
+            // §4.134: an attachment row that still carries a live schedule
+            // (enrolled before the §4.134 enrollment gate) is refused at
+            // claim time — the schedule retires and the row stays `failed`
+            // (the over-ceiling refusal shape), so the rebuild face's
+            // caption-only channel never re-dispatches it and the scan
+            // shrinks instead of circling.
+            if has_attachment_descriptors(attachments.as_deref()) {
+                transaction
+                    .execute(
+                        "UPDATE messages SET next_attempt_at=NULL
+                         WHERE id=?1 AND status='failed'",
+                        params![message_id],
+                    )
+                    .map_err(|error| StoreError::Unavailable(Some(error)))?;
+                continue;
+            }
             // Window judgment (§4.123): past `first_send_attempted_at + 24 h`
             // the row dies in the queue — it stays `failed` (terminal) and
             // the scheduling face is retired, so the scan shrinks instead of

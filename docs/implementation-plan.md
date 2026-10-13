@@ -19,7 +19,28 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.139 (2026-10-13; the batch-C emit surface completes:
+- Contract revision: 1.140 (2026-10-13; the batch-S quick-win leg — three
+  correctness/parity gaps the send-and-sync-granularity audit surfaced, all
+  connector-internal, zero wire change: the §4.134 attachment-caption retry
+  guard (a failed attachment row carrying a non-empty caption never enters
+  the §4.123 queue again — the rebuild's text/quote/preview face has no
+  attachment channel, so an enrolled caption row would re-emit its caption
+  as plain text without its bytes; the eligibility gate refuses the
+  descriptor-carrying family at enrollment, a pre-batch enrolled row is
+  refused at claim and rebuild with the deterministic failure settled, and
+  the manual retry face refuses it too), the §4.135 pull-path
+  `conversation.changed` events (the `contacts.sync`/startup pull now
+  mirrors the §4.122 passive batch's event semantics — the store returns
+  the skeleton change set and each newly materialized or title-upgraded
+  conversation rides `conversation.changed`, so a desktop already rendering
+  the list refreshes after an engine restart or a fresh link without a
+  refetch), and the §4.136 `syncMessage.blocked` consume arm (the engine
+  already projects the official `_handleBlocked` mirror modern+legacy; the
+  connector consumes it into the §4.131 blocked factor store and rides
+  `conversation.changed`, tolerant parse, presence-stamps-true only). No
+  new method, event, key, error, capability, or store move. Tests 765 →
+  771 (lib 583 → 589), all green) —
+  previously 1.139 (2026-10-13; the batch-C emit surface completes:
   the live contact-card branch (§4.132 — the engine's live
   `dataMessage.contact` / `syncMessage.sentMessage.contact` faces parse
   through the §4.38 import authority's exact bounds, the wrapped avatar
@@ -10424,6 +10445,59 @@ the record so nobody "fixes" the connector's no-precheck posture later.
   composition UI, which owns the remote config and the button; a
   connector-side window would be a second, divergent authority reading
   none of the config the real gate reads.
+
+### 4.134 The attachment-caption retry guard: a failed attachment row never enters the §4.123 queue (contract revision 1.140, 2026-10-13)
+
+The §4.123 audit found a correctness hole at the queue's edge: the
+enrollment gate (`Store::settle_send_failed_schedule`) judged eligibility
+on `body` non-empty alone, so a failed `messages.attachments.send` row
+carrying a non-empty caption enrolled exactly like a text row — and the
+rebuild face (`rebuild_retry_dispatch`, shared by the manual §4.26 rearm
+and the automatic §4.123 drain) reconstructs text, quote, and the §4.126
+preview card only. The attachment bytes (and their engine data-URI
+channel) have no home in the rebuilt dispatch, so the drain would have
+re-dispatched the caption as a plain text send: the recipient gets the
+caption's words without the picture, and the original row settles `sent`
+over a message that never carried its attachment. The guard closes the
+hole at every layer, one rule — an attachment row is never retried:
+
+- Enrollment (store): the schedule arm reads the row's persisted
+  `attachments_json` beside `body` and refuses the descriptor-carrying
+  family — the refusal is the standard retire shape (the schedule clears,
+  the row stays `failed` and manual, the §4.92 rearm is still the honest
+  answer), so a refused row is terminal for the automatic face, never a
+  pause. A caption-less attachment row was already ineligible (empty
+  body); the caption no longer smuggles it in.
+- Claim (store): `claim_due_retries` re-checks the same face before the
+  atomic flip, because rows enrolled before this revision can still carry
+  a live schedule. A refused row retires its schedule and stays `failed`
+  (the over-ceiling refusal shape) — the queue hands it to no rebuild,
+  and the scan shrinks instead of circling.
+- Rebuild (service): `prepare_outbox_retry_text` re-checks after the
+  claim's `failed -> pending` flip (belt over the claim's braces — a row
+  that reached a claim through a shape the store could not read). The
+  refusal settles the deterministic failure in the same breath
+  (`settle_send_failed` no-schedule arm: the guarded flip back to
+  `failed` clears the entire queue face), so a legacy row can never
+  strand as pending; the worker logs the drop and moves on.
+- Manual face (service): `messages.retryText` refuses the same family
+  with a deterministic `RETRY_NOT_ALLOWED` — the manual rebuild shares
+  `rebuild_retry_dispatch` and would resend the identical caption-only
+  shape, so the human re-sends the attachment instead (the §4.92 answer).
+
+No store schema move (`attachments_json` has ridden rows since 1.15), no
+wire change: the queue is connector-internal and the refused rows keep
+the exact manual-line shape §4.92 already renders. Zero wire change.
+
+Tests: `retry_queue_never_enrolls_an_attachment_caption_row` (the
+captioned attachment send fails retryably and settles plain-failed with
+the schedule retired — a sibling text row enrolls beside it and the claim
+takes only that one), and
+`retry_faces_refuse_an_attachment_row_and_settle_the_deterministic_failure`
+(a pre-revision enrolled row: the claim-time gate retires it before any
+flip; a row that slips through to a rebuild is settled failed with its
+queue face cleared and the manual face answers `RETRY_NOT_ALLOWED`).
+Gates: fmt, clippy `-D warnings`, tests all green.
 
 ## 5. signal-cli Boundary
 
