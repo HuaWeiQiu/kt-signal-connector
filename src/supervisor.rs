@@ -1314,6 +1314,10 @@ impl RuntimeSupervisor {
                     .list_accounts_in_group(&self.group_id);
             }
         };
+        // Contract 1.142 (§4.138): each entry may carry the engine's own-ACI
+        // report beside the number; the face rides when the engine answers it
+        // and stays absent otherwise — the connector never invents one from
+        // the opaque local row id.
         let numbers = match engine
             .call("listAccounts", json!({}), CallClass::ReadOnly)
             .await
@@ -1324,9 +1328,11 @@ impl RuntimeSupervisor {
                     items
                         .iter()
                         .filter_map(|item| {
-                            item.get("number")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
+                            let number = item.get("number")?.as_str()?;
+                            Some((
+                                number.to_string(),
+                                item.get("aci").and_then(Value::as_str).map(str::to_string),
+                            ))
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1541,9 +1547,10 @@ impl RuntimeSupervisor {
                     true,
                 ))
             })?;
+        let aci = result.get("aci").and_then(Value::as_str);
         let mut account = {
             let mut service = self.service.lock().await;
-            service.complete_link_session(&link_session_id, number, &self.group_id)?
+            service.complete_link_session(&link_session_id, number, &self.group_id, aci)?
         };
         // Refresh profile display name right after link (best-effort).
         if let Ok(engine) = self.running_engine().await
@@ -9187,7 +9194,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -9279,7 +9286,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -9371,7 +9378,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -9469,7 +9476,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         // Subscribe before any pull runs so whichever pass materializes the
@@ -9575,7 +9582,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -9667,7 +9674,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -9789,7 +9796,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -9854,7 +9861,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -10043,7 +10050,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -10125,7 +10132,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -10221,7 +10228,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -10322,7 +10329,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
 
@@ -10435,7 +10442,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let set_params =
@@ -10629,7 +10636,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -10697,7 +10704,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
 
@@ -10881,7 +10888,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
 
@@ -10976,7 +10983,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
 
@@ -11033,7 +11040,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor
@@ -11179,7 +11186,7 @@ mod tests {
             .service
             .lock()
             .await
-            .sync_accounts_from_numbers(&["+15555550100".into()], DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], DEFAULT_PROXY_GROUP_ID)
             .unwrap()
             .remove(0);
         let conversation = supervisor

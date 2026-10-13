@@ -1668,16 +1668,23 @@ impl ConnectorService {
 
     /// Sync live signal-cli numbers of ONE group's engine into the store. New
     /// numbers bind to that group (R3); known numbers keep their immutable
-    /// binding. Returns the accounts visible in this group.
+    /// binding. Each entry may carry the engine's ACI report (contract 1.142,
+    /// §4.138) — normalized to the canonical dashed form and persisted when
+    /// it parses; a face without one leaves the row's stored identity (if
+    /// any) untouched. Returns the accounts visible in this group.
     pub fn sync_accounts_from_numbers(
         &self,
-        numbers: &[String],
+        accounts: &[(String, Option<String>)],
         proxy_group: &str,
     ) -> Result<Vec<AccountSummary>, ServiceError> {
-        for number in numbers {
-            let _ = self
+        for (number, aci) in accounts {
+            let summary = self
                 .store
                 .upsert_account_from_signal(number, None, proxy_group)?;
+            let canonical = aci.as_deref().and_then(crate::store::canonical_aci);
+            if let Some(aci) = canonical.as_deref() {
+                self.store.set_account_aci(&summary.id, Some(aci))?;
+            }
         }
         Ok(self.store.list_accounts_in_group(proxy_group)?)
     }
@@ -1814,6 +1821,7 @@ impl ConnectorService {
         link_session_id: &str,
         number: &str,
         proxy_group: &str,
+        aci: Option<&str>,
     ) -> Result<AccountSummary, ServiceError> {
         let _ = self.require_active_link(link_session_id)?;
         // Per-engine account ceiling (optimization-plan §6.4 M3.3): refuse a
@@ -1826,9 +1834,20 @@ impl ConnectorService {
         let _ = self.take_link_session(link_session_id)?;
         // The binding is fixed here, at link.finish success, and immutable for
         // the life of the account (ADR 0001 R3).
-        Ok(self
+        let summary = self
             .store
-            .upsert_account_from_signal(number, Some(now_ms()), proxy_group)?)
+            .upsert_account_from_signal(number, Some(now_ms()), proxy_group)?;
+        // Contract 1.142 (§4.138): persist the engine's own-ACI answer when
+        // the finishLink face carried one; a face without the key — or with a
+        // value that does not parse as an ACI — leaves any stored identity in
+        // place (absence is not unreporting, and a guess is never invented).
+        // The summary is read after the write, so the link.finish response
+        // already carries the row's aci.
+        let canonical = aci.and_then(crate::store::canonical_aci);
+        if let Some(aci) = canonical.as_deref() {
+            self.store.set_account_aci(&summary.id, Some(aci))?;
+        }
+        Ok(self.store.account_summary(&summary.id)?.unwrap_or(summary))
     }
 
     /// Whether this group already holds the per-engine account ceiling, for
@@ -15392,6 +15411,7 @@ mod tests {
             &link_session_id,
             "+15555550100",
             crate::DEFAULT_PROXY_GROUP_ID,
+            None,
         );
 
         assert!(matches!(late, Err(ServiceError::Api(_))));
@@ -15420,7 +15440,7 @@ mod tests {
                 .begin_link("KT".into(), "sgnl://link?test".into())
                 .unwrap();
             let id = started["linkSessionId"].as_str().unwrap().to_string();
-            service.complete_link_session(&id, &number, group)
+            service.complete_link_session(&id, &number, group, None)
         };
 
         for index in 1..=8 {
@@ -15458,7 +15478,7 @@ mod tests {
                 .unwrap();
             let id = started["linkSessionId"].as_str().unwrap().to_string();
             service
-                .complete_link_session(&id, &format!("+1556555{index:04}"), group)
+                .complete_link_session(&id, &format!("+1556555{index:04}"), group, None)
                 .unwrap();
         }
 
@@ -15467,10 +15487,128 @@ mod tests {
             .unwrap();
         let id = started["linkSessionId"].as_str().unwrap().to_string();
         let relinked = service
-            .complete_link_session(&id, "+15565550008", group)
+            .complete_link_session(&id, "+15565550008", group, None)
             .expect("relink of an existing number is an update, not an addition");
         assert_eq!(relinked.proxy_group, group);
         assert_eq!(service.list_accounts_in_group(group).unwrap().len(), 8);
+    }
+
+    /// Contract 1.142 (§4.138): the finish path persists the engine's own-ACI
+    /// answer in the canonical dashed lowercase form; an absent or unparseable
+    /// face is honest absence — no error, no invention, and no erasure of a
+    /// stored identity (the §4.24 posture: the connector never stands in for
+    /// the engine on identity facts).
+    #[test]
+    fn complete_link_session_persists_the_answered_aci_and_absence_is_honest() {
+        let (_temp, mut service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+
+        // A face with the key: bare uppercase hex lands dashed lowercase, and
+        // the summary read back after the write already carries it.
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let id = started["linkSessionId"].as_str().unwrap().to_string();
+        let linked = service
+            .complete_link_session(
+                &id,
+                "+15555550100",
+                group,
+                Some("5A1CC2CDB36453D48D711EC62B8EB72B"),
+            )
+            .unwrap();
+        assert_eq!(
+            linked.aci.as_deref(),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b")
+        );
+
+        // A re-link whose face carries no key keeps the stored identity.
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let id = started["linkSessionId"].as_str().unwrap().to_string();
+        let relinked = service
+            .complete_link_session(&id, "+15555550100", group, None)
+            .unwrap();
+        assert_eq!(
+            relinked.aci.as_deref(),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b")
+        );
+
+        // A garbage face is not an ACI: it is not persisted, does not fail
+        // the finish, and does not erase the stored identity.
+        let started = service
+            .begin_link("KT".into(), "sgnl://link?test".into())
+            .unwrap();
+        let id = started["linkSessionId"].as_str().unwrap().to_string();
+        let garbage = service
+            .complete_link_session(&id, "+15555550100", group, Some("not-a-uuid"))
+            .unwrap();
+        assert_eq!(
+            garbage.aci.as_deref(),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b")
+        );
+    }
+
+    /// Contract 1.142 (§4.138): the account-sync entries each carry their own
+    /// engine answer — canonicalized and persisted per account — and an
+    /// entry without the key stays absent while the sibling identities
+    /// survive (per-account attribution, never a shared guess).
+    #[test]
+    fn sync_accounts_persists_each_entry_own_aci() {
+        let (_temp, service) = service();
+        let group = crate::DEFAULT_PROXY_GROUP_ID;
+
+        let first = service
+            .sync_accounts_from_numbers(
+                &[(
+                    "+15555550100".into(),
+                    Some("5A1CC2CD-B364-53D4-8D71-1EC62B8EB72B".into()),
+                )],
+                group,
+            )
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            first[0].aci.as_deref(),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b")
+        );
+
+        let second = service
+            .sync_accounts_from_numbers(
+                &[(
+                    "+15555550101".into(),
+                    Some("18e2e00b2ac755eca25dd5646a80c042".into()),
+                )],
+                group,
+            )
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        // Both identities ride — the freshly answered one and the earlier
+        // answer the second sync's read-back must not have disturbed.
+        assert!(
+            second
+                .iter()
+                .any(|account| account.aci.as_deref()
+                    == Some("18e2e00b-2ac7-55ec-a25d-d5646a80c042"))
+        );
+        assert!(
+            second
+                .iter()
+                .any(|account| account.aci.as_deref()
+                    == Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b"))
+        );
+
+        // An entry without the key stays absent; the earlier identities
+        // survive the group-wide read.
+        let third = service
+            .sync_accounts_from_numbers(&[("+15555550102".into(), None)], group)
+            .unwrap();
+        assert_eq!(third.len(), 3);
+        assert_eq!(
+            third.iter().filter(|account| account.aci.is_some()).count(),
+            2
+        );
     }
 
     #[test]
@@ -15518,7 +15656,10 @@ mod tests {
     fn deleting_an_account_does_not_cancel_another_session_link() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let started = service
@@ -15548,7 +15689,7 @@ mod tests {
         let (_temp, service) = service();
         let group = crate::DEFAULT_PROXY_GROUP_ID;
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], group)
+            .sync_accounts_from_numbers(&[("+15555550100".into(), None)], group)
             .unwrap()
             .remove(0);
 
@@ -16475,7 +16616,10 @@ mod tests {
     fn inbound_long_text_is_projected_and_fetched_on_demand() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let full_text = "界".repeat(4_000);
@@ -16526,7 +16670,7 @@ mod tests {
 
         let other_account = service
             .sync_accounts_from_numbers(
-                &["+15555550100".into(), "+15555550102".into()],
+                &[("+15555550100".into(), None), ("+15555550102".into(), None)],
                 crate::DEFAULT_PROXY_GROUP_ID,
             )
             .unwrap()
@@ -16547,7 +16691,10 @@ mod tests {
     fn inbound_text_above_receive_ceiling_keeps_only_an_explicit_preview() {
         let (_temp, mut service) = service();
         service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let oversized = "a".repeat(MAX_INBOUND_TEXT_BYTES + 1);
         let events = service
@@ -16609,7 +16756,10 @@ mod tests {
     fn send_text_projects_first_preview_onto_upstream_params() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -16662,7 +16812,10 @@ mod tests {
     fn send_text_preview_rejects_deterministic_shape_violations() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -16745,7 +16898,10 @@ mod tests {
     fn send_text_preview_date_rides_wire_row_and_retry() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -16881,7 +17037,10 @@ mod tests {
     fn send_attachment_blur_hash_rides_descriptor_and_stays_off_upstream() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17013,7 +17172,10 @@ mod tests {
     fn retry_queue_enrolls_only_the_eligible_error_classes() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17122,7 +17284,10 @@ mod tests {
     fn unknown_outcome_retires_any_stale_retry_schedule() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17191,7 +17356,10 @@ mod tests {
     fn outbox_claim_rebuilds_the_manual_retry_dispatch() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17282,7 +17450,10 @@ mod tests {
     fn retry_queue_never_enrolls_an_attachment_caption_row() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17382,7 +17553,10 @@ mod tests {
     fn retry_faces_refuse_an_attachment_row_and_settle_the_deterministic_failure() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17513,7 +17687,10 @@ mod tests {
     fn retry_text_rearms_the_same_failed_row_and_guards_states() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17787,7 +17964,10 @@ mod tests {
     fn outgoing_sync_reconciles_by_signal_timestamp_and_client_request_id() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17883,7 +18063,10 @@ mod tests {
     fn missing_pending_row_at_send_completion_is_final_not_retryable() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -17939,7 +18122,10 @@ mod tests {
     fn signal_identity_keeps_group_senders_distinct_and_dedupes_replay() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let receive = |source: &str, text: &str| NormalizedReceive {
@@ -18010,7 +18196,10 @@ mod tests {
     fn incoming_receive_captures_sender_name_into_summary_projection() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let receive = NormalizedReceive {
@@ -18139,7 +18328,10 @@ mod tests {
     fn send_by_peer_creates_conversation_once_and_reuses_it() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
 
@@ -18250,7 +18442,10 @@ mod tests {
     fn send_by_peer_validates_target_and_falls_back_to_masked_title() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
 
@@ -18372,7 +18567,10 @@ mod tests {
     fn quote_of_incoming_direct_message_becomes_upstream_quote_params() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let events = service
@@ -18448,7 +18646,10 @@ mod tests {
     fn quote_of_own_sent_message_uses_account_number_and_upstream_timestamp() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -18504,7 +18705,10 @@ mod tests {
     fn unresolvable_quotes_are_rejected_before_any_pending_row_exists() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -18649,7 +18853,10 @@ mod tests {
     fn remote_delete_maps_sent_outgoing_rows_to_upstream_params() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
 
@@ -18690,7 +18897,10 @@ mod tests {
 
         // Group conversation: groupId = peer_key, no recipient.
         service
-            .sync_accounts_from_numbers(&["+15555550101".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550101".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let group = service
             .store_ref()
@@ -18731,7 +18941,10 @@ mod tests {
     fn remote_delete_rejects_rows_without_a_protocol_identity() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -18846,7 +19059,10 @@ mod tests {
     fn send_reaction_maps_rows_to_the_direction_derived_target_author() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service
@@ -18974,7 +19190,10 @@ mod tests {
     fn send_reaction_rejects_rows_without_a_resolvable_target_author() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -19015,7 +19234,10 @@ mod tests {
         // A group incoming message's author address is not persisted (only a
         // local sender hash), so the reaction cannot be addressed upstream.
         service
-            .sync_accounts_from_numbers(&["+15555550101".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550101".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let group = service
             .store_ref()
@@ -19108,7 +19330,10 @@ mod tests {
     fn send_reaction_accepts_receipt_advanced_outgoing_rows() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -19154,7 +19379,10 @@ mod tests {
     fn complete_send_reaction_persists_own_pill_and_removal() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -19242,7 +19470,10 @@ mod tests {
     fn pin_family_maps_rows_with_the_reaction_addressing_model() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service
@@ -19392,7 +19623,10 @@ mod tests {
     fn pin_family_rejects_unaddressable_and_out_of_scope_targets() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -19565,7 +19799,10 @@ mod tests {
     fn complete_pin_unpin_write_replace_and_clear_the_pinned_state() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -19885,7 +20122,10 @@ mod tests {
     fn status_changed_events_fire_once_per_real_transition() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -20129,7 +20369,10 @@ mod tests {
     fn prepare_send_attachment_builds_data_uri_params_and_is_idempotent() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let _events = service
@@ -23874,7 +24117,10 @@ mod tests {
     fn send_story_preparation_gates_then_frames() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let params = |message: &str, full: bool, account_id: &str| MessagesSendStoryParams {
@@ -24033,7 +24279,10 @@ mod tests {
     fn send_story_preview_metadata_gates_then_rides_the_frame() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let params = |preview_url: Option<String>,
@@ -24173,7 +24422,10 @@ mod tests {
     fn stories_toggle_preparation_pins_account() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         service
@@ -24219,7 +24471,10 @@ mod tests {
     fn stories_mark_viewed_preparation_gates_then_frames() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let gate = |params: &StoriesMarkViewedParams| {
@@ -24295,7 +24550,10 @@ mod tests {
     fn stories_send_reaction_preparation_gates_then_frames() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let params =
@@ -24498,7 +24756,10 @@ mod tests {
         // field invented), the declared size is the decrypt-trim input, the
         // landing name is the sanitized id.
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let params = StoryAttachmentDownloadParams {
@@ -24545,7 +24806,10 @@ mod tests {
     fn stories_download_attachment_dedup_answers_measured_size() {
         let (temp, service) = media_service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let landed = temp.path().join("signal-data/attachments/story-bytes");
@@ -24583,7 +24847,10 @@ mod tests {
 
         let (temp, service) = media_service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         // Id shapes.
@@ -25296,7 +25563,10 @@ mod tests {
     fn get_group_projects_the_cached_group_row() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         service
@@ -25618,7 +25888,10 @@ mod tests {
     fn get_group_projects_the_live_pending_members() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         service
@@ -25730,7 +26003,10 @@ mod tests {
     fn prepare_set_local_alias_builds_upstream_params_and_resolves_the_peer() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         // Known via the direct conversation peer.
@@ -25797,7 +26073,10 @@ mod tests {
     fn prepare_set_typing_message_builds_upstream_params_from_the_conversation() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service
@@ -25900,7 +26179,10 @@ mod tests {
         service: &mut ConnectorService,
     ) -> (crate::store::AccountSummary, crate::store::ConversationRow) {
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -27485,7 +27767,10 @@ mod tests {
     fn sync_contacts_passive_batch_lands_cache_and_emits_changes() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let receive = |contacts: Vec<crate::engine::SyncContactRecord>| {
@@ -27798,7 +28083,10 @@ mod tests {
     fn inbound_reaction_without_a_local_conversation_is_dropped() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let events = service
@@ -29955,7 +30243,10 @@ mod tests {
     fn set_expire_timer_preparation_shapes_upstream_by_conversation_kind() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service
@@ -30069,7 +30360,10 @@ mod tests {
         assert_eq!(changed.expire_timer_seconds, Some(86_400));
 
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -30120,7 +30414,10 @@ mod tests {
     fn groups_update_preparation_refuses_the_gaps() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30246,7 +30543,10 @@ mod tests {
     fn groups_update_and_quit_fold_onto_the_engine_face() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30370,7 +30670,10 @@ mod tests {
 
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30491,7 +30794,10 @@ mod tests {
     fn groups_quit_preparation_resolves_the_ladder_and_builds_the_payload() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30540,7 +30846,10 @@ mod tests {
     fn set_username_preparation_enforces_xor_shape_and_frames() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let params = |username: Option<String>, delete: bool| AccountsSetUsernameParams {
@@ -30646,7 +30955,10 @@ mod tests {
     fn get_username_preparation_resolves_the_reader_frame() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         assert_eq!(
@@ -30668,7 +30980,10 @@ mod tests {
     fn username_lookup_preparation_bounds_batch_and_shares_frame() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let params = |usernames: Vec<String>| UsernameLookupParams {
@@ -30755,7 +31070,10 @@ mod tests {
     fn groups_terminate_preparation_addresses_the_group_and_refuses_non_groups() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30829,7 +31147,10 @@ mod tests {
     fn groups_approve_join_requests_preparation_refuses_gaps_and_the_face() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30920,7 +31241,10 @@ mod tests {
     fn groups_revoke_invites_preparation_refuses_gaps_and_the_face() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let group = service
@@ -30998,7 +31322,10 @@ mod tests {
     fn report_spam_preparation_resolves_guid_rows_and_refuses_gaps() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
 
@@ -31130,7 +31457,10 @@ mod tests {
     fn ingest_group_update_mirrors_title_and_lands_a_system_row() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -31271,7 +31601,10 @@ mod tests {
     fn ingest_group_timer_update_mirrors_state_and_lands_the_notice_row() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -31437,7 +31770,10 @@ mod tests {
     fn ingest_group_timer_update_attributes_the_editor() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let conversation = service
@@ -31545,7 +31881,10 @@ mod tests {
     fn ingest_sync_blocked_stamps_the_factor_and_rides_conversation_changed() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let by_number = service
@@ -31654,7 +31993,10 @@ mod tests {
     fn ingest_group_timer_update_for_an_unknown_group_drops() {
         let (_temp, mut service) = service();
         service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap();
         let events = service
             .ingest_receive(
@@ -31702,7 +32044,10 @@ mod tests {
     fn ingest_message_request_response_stamps_the_authoritative_factor() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service
@@ -31870,7 +32215,10 @@ mod tests {
     fn ingest_message_request_response_block_family_stamps_blocked() {
         let (_temp, mut service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service
@@ -31950,7 +32298,10 @@ mod tests {
     fn store_draft_faces_bound_resolve_and_stamp() {
         let (_temp, service) = service();
         let account = service
-            .sync_accounts_from_numbers(&["+15555550100".into()], crate::DEFAULT_PROXY_GROUP_ID)
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
             .unwrap()
             .remove(0);
         let direct = service

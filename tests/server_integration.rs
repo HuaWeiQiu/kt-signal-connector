@@ -1013,6 +1013,124 @@ async fn contacts_list_marks_the_own_entry_is_self_same_source_with_conversation
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.142 (§4.138): the engine's own-ACI answer rides the link.finish
+/// result and the accounts.list rows. The fixture derives a stable uuid5 per
+/// number, so the expected value is pinned; the connector carries it verbatim
+/// (canonical dashed lowercase) on both faces and never substitutes the
+/// opaque local row id.
+#[tokio::test]
+async fn link_finish_and_accounts_list_carry_the_answered_aci() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [23_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Aci" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap();
+    let aci = finished["result"]["aci"].as_str().unwrap();
+    assert_eq!(aci, "5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b");
+    assert_ne!(
+        aci, account_id,
+        "the row id is not an ACI and must never stand in for one"
+    );
+
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    let rows = accounts["result"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], account_id);
+    assert_eq!(rows[0]["aci"], aci);
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
+/// Contract 1.142 (§4.138): an engine face without the aci key reads as
+/// honest absence on both faces — the connector serializes no invented
+/// identity (the key is skipped, never a guess from the opaque row id).
+/// KT_FAKE_OMIT_ACCOUNT_ACI=1 is the fixture's engine-without-the-answer
+/// build, the face the pinned engine actually rides today.
+#[tokio::test]
+async fn an_engine_without_the_aci_face_reads_as_absence_on_both_faces() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [29_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector_with(
+        temp.path(),
+        &endpoint,
+        &secret_file,
+        None,
+        &[("KT_FAKE_OMIT_ACCOUNT_ACI", "1")],
+    );
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-NoAci" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    assert_eq!(finished["result"]["state"], "ready");
+    assert!(
+        finished["result"].get("aci").is_none(),
+        "an absent engine face must not invent a key: {finished:?}"
+    );
+
+    let accounts = request(&mut client, "accounts", "accounts.list", json!({})).await;
+    let rows = accounts["result"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].get("aci").is_none(),
+        "an absent engine face must not invent a key: {rows:?}"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Phase 0 happy-path smoke gap (docs/optimization-plan.md): the existing
 /// phase2 test proves receive persistence through `messages.list`, but nothing
 /// asserted the normalized host event stream, and `messages.getText` had no

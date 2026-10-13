@@ -19,7 +19,36 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.141 (2026-10-13; the engine.storagePull forwarding
+- Contract revision: 1.142 (2026-10-13; the account's own-ACI carry-through
+  (§4.138): the account-level identity the desktop needs for self-addressing
+  (the call self-UUID and the like) had no connector face — the §4.24
+  boundary records the own ACI as not queryable on either engine's jsonRpc
+  surface, and the store's account rows answered the gap with the opaque
+  local row id, which is random 32-hex and NOT an ACI (never derivable, and
+  now explicitly never substituted). Contract-first additive: the pinned
+  engine (b719997) answers no ACI anywhere — finishLink answers `{number}`,
+  listAccounts `[{number}]`, and the truth (the presage store's
+  `registration_data` `service_ids` aci) has no jsonRpc read face — so the
+  connector learns to parse an optional `aci` key beside the number on both
+  faces (the finishLink result and the listAccounts entries), normalizes it
+  through the canonical dashed-lowercase shape (dashed or bare 32-hex, any
+  case; anything else is not an ACI and reads as absence, never a repaired
+  guess), and persists it on the account row (additive nullable
+  `accounts.aci` column, schema 23→24, nothing backfilled). Honesty rules:
+  an absent key is not an unreporting — `None` writes nothing, so a stored
+  identity survives later faces without the key; a fresh answer overwrites;
+  the wire skips the key entirely while the row holds none. Wire
+  additive-only: an optional `aci` key on accounts.list entries and the
+  link.finish result (skipped when unknown; the schema leaves response
+  results unpinned, so §4.138 is the descriptive home), no new method,
+  event, error, capability, or store move. Tests 771 → 778 (lib 589 → 594:
+  the canonical-shape ladder and refusals, the None-never-unreports writer,
+  the v23→v24 migration, the finish-path persistence under
+  answered/absent/garbage faces, the per-entry sync attribution, and the
+  two end-to-end harness tests — the answered face riding both wire faces
+  with the pinned value, and the omit-build reading as absence), all
+  green) —
+  previously 1.141 (2026-10-13; the engine.storagePull forwarding
   face (§4.137): the engine's T-9b storage-manifest pull outcome event —
   fired once per pull attempt (the login-time automatic pull, trigger
   `login`, and every `fetchLatest` leg) with the per-family legs answering
@@ -10678,6 +10707,67 @@ the two legs), and the end-to-end harness over the real engine process
 frame rides with the resolved accountId, and the malformed face joins
 the unattributed non-forward batch as a protocol warning). Gates: fmt,
 clippy `-D warnings`, tests all green.
+
+### 4.138 The account's own ACI: carried when the engine answers it, absent when it does not (contract revision 1.142, 2026-10-13)
+
+The desktop has an account-level identity hole the connector could not
+fill: the own ACI — the UUID the account's peers address it by (the call
+self-UUID, group member rosters, mention ranges) — never appeared on any
+connector face. The store's account rows answered the gap with the
+opaque local row id, and the §4.24 boundary is explicit about why: the
+own ACI is not queryable on either engine's jsonRpc surface, so that id
+is a random 32-hex label, NOT an ACI, and was never derivable from
+anything the connector holds.
+
+This revision keeps that honesty and adds the carry-through a future
+engine answer needs without another contract move — contract-first,
+because the pinned engine (`b719997`) answers no ACI anywhere: finishLink
+answers `{number}`, listAccounts `[{number}]`, and the truth (the presage
+store's `registration_data` `service_ids` aci) has no jsonRpc read face.
+The connector therefore learns exactly one new thing: an optional `aci`
+key beside the number on both faces, and the rules for carrying it.
+
+- The parse-and-normalize ladder: a string value that parses as an ACI —
+  the dashed 8-4-4-4-12 shape or the bare 32-hex shape, either case —
+  normalizes to the dashed lowercase form (the shape the engine's
+  `service_ids` serialization already rides); anything else (wrong
+  length, misplaced dashes, non-hex) is not an ACI and reads as absence.
+  Absence is never repaired into a guess, and an unparseable face does
+  not fail the finish or the sync — it is honest missing material, the
+  same posture the §4.117 lanes take toward unseen vocabulary.
+- Persistence: the account row gains a nullable `aci` column (schema
+  23→24, additive migration, nothing backfilled — pre-1.142 rows
+  legitimately hold none). The write face takes only a fresh answer: an
+  absent or unparseable face writes nothing, so a stored identity
+  survives every later face without the key — an engine that stops
+  answering is not an engine that unlinked the identity — and a fresh
+  answer overwrites.
+- The wire: accounts.list entries and the link.finish result carry
+  `aci` when the row holds one and skip the key entirely when it does
+  not (no `aci: null` ambiguity). The schema leaves response results
+  unpinned by design, so this section is the descriptive home for the
+  shape.
+- What deliberately does not change: the §4.42/§4.43 `isSelf` markers
+  stay number-based (historical rows and the contacts ladder key on the
+  number; the ACI is additive identity material for the desktop, not a
+  re-keying of the self predicates), and the opaque row id keeps its job
+  as the account's connector-side handle (`accountId` everywhere) — it
+  is just never again the only identity-shaped material on the row.
+
+Zero engine-side coupling beyond the two optional keys; no new method,
+event, error, capability, or store move.
+
+Tests: the canonical-shape ladder (the three answering shapes and the
+refusal family — short, misplaced dashes, non-hex, empty), the writer
+(persist, the None-never-unreports rule, the fresh-answer overwrite,
+all three read faces), the v23→v24 migration (the column exists, the
+migrated face reads as absence), the finish path (answered, absent, and
+garbage faces through link.finish), the per-entry sync attribution
+(each account carries its own answer, an absent entry stays absent
+beside answered siblings), and the end-to-end harness (the answered
+face riding link.finish and accounts.list with the pinned uuid5 value;
+the omit-build reading as absence on both faces). Gates: fmt, clippy
+`-D warnings`, tests all green, release build.
 
 ## 5. signal-cli Boundary
 

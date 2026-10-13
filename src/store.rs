@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   linked_at INTEGER,
   last_message_at INTEGER,
   unread_count INTEGER NOT NULL DEFAULT 0,
-  proxy_group TEXT NOT NULL DEFAULT 'default'
+  proxy_group TEXT NOT NULL DEFAULT 'default',
+  aci TEXT
 );
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
@@ -479,6 +480,16 @@ pub struct AccountSummary {
     /// the wire; accounts linked before Phase 4 read as `default`. The binding
     /// is fixed when link.finish succeeds and never changes afterwards.
     pub proxy_group: String,
+    /// The account's own ACI (contract 1.142, §4.138): the engine's
+    /// `registration_data` `service_ids` aci — the account-level identity the
+    /// desktop needs for self-addressing (call self-UUID and the like) — in
+    /// the canonical dashed lowercase form, reported by the engine and
+    /// persisted when the engine carries it. Absent-key on the wire until the
+    /// engine answers it: an engine face without the key means the connector
+    /// holds no ACI, and absence is the honest face — never invented from the
+    /// opaque local row id (which is random 32-hex, not an ACI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aci: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1377,6 +1388,39 @@ pub enum AdjacentMediaDirection {
     Newer,
 }
 
+/// The canonical form of an ACI (contract 1.142, §4.138): 32 hex digits,
+/// accepted in the dashed (8-4-4-4-12) or the bare 32-char shape, any case,
+/// and normalized to the dashed lowercase form — the shape the engine's
+/// `service_ids` ACI already rides. `None` on anything else: a wrong-length
+/// or non-hex face is not an ACI, and absence is honest — the caller leaves
+/// the row's aci unset instead of persisting a guess.
+pub fn canonical_aci(raw: &str) -> Option<String> {
+    let hex: String = if raw.len() == 36
+        && raw.as_bytes()[8] == b'-'
+        && raw.as_bytes()[13] == b'-'
+        && raw.as_bytes()[18] == b'-'
+        && raw.as_bytes()[23] == b'-'
+    {
+        raw.chars().filter(|c| *c != '-').collect()
+    } else if raw.len() == 32 {
+        raw.to_string()
+    } else {
+        return None;
+    };
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let lower = hex.to_ascii_lowercase();
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &lower[0..8],
+        &lower[8..12],
+        &lower[12..16],
+        &lower[16..20],
+        &lower[20..32]
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct AccountRow {
     pub id: String,
@@ -1646,7 +1690,7 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci
                  FROM accounts ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1661,6 +1705,7 @@ impl Store {
                     last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                     unread_count: row.get::<_, i64>(6)? as u32,
                     proxy_group: row.get(7)?,
+                    aci: row.get(8)?,
                 })
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1678,7 +1723,7 @@ impl Store {
         let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci
                  FROM accounts WHERE proxy_group=?1
                  ORDER BY linked_at IS NULL, linked_at DESC, id ASC",
             )
@@ -1694,6 +1739,7 @@ impl Store {
                     last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                     unread_count: row.get::<_, i64>(6)? as u32,
                     proxy_group: row.get(7)?,
+                    aci: row.get(8)?,
                 })
             })
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -1780,7 +1826,7 @@ impl Store {
     pub fn account_summary(&self, account_id: &str) -> Result<Option<AccountSummary>, StoreError> {
         self.lock_conn()?
             .query_row(
-                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group
+                "SELECT id, masked_address, display_name, state, linked_at, last_message_at, unread_count, proxy_group, aci
                  FROM accounts WHERE id=?1",
                 params![account_id],
                 |row| {
@@ -1793,11 +1839,32 @@ impl Store {
                         last_message_at: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
                         unread_count: row.get::<_, i64>(6)? as u32,
                         proxy_group: row.get(7)?,
+                        aci: row.get(8)?,
                     })
                 },
             )
             .optional()
             .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
+    /// Persist the account's own ACI (contract 1.142, §4.138): the engine
+    /// answered the identity, so the row carries it from the next read on.
+    /// `None` writes nothing — an engine face without the key does not
+    /// unreport a previously answered identity; only a fresh engine answer
+    /// overwrites (the canonical form is normalized by [`canonical_aci`]
+    /// before this face is called, so the column only ever holds the dashed
+    /// lowercase form or nothing).
+    pub fn set_account_aci(&self, account_id: &str, aci: Option<&str>) -> Result<(), StoreError> {
+        let Some(aci) = aci else {
+            return Ok(());
+        };
+        self.lock_conn()?
+            .execute(
+                "UPDATE accounts SET aci=?2 WHERE id=?1",
+                params![account_id, aci],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(())
     }
 
     pub fn prepare_account_delete(
@@ -7736,6 +7803,15 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             }
         }
     }
+    if current < 24 && !table_has_column(conn, "accounts", "aci")? {
+        // Contract 1.142 §4.138: the account's own ACI, reported by the
+        // engine and persisted when it answers. Additive nullable column —
+        // pre-1.142 rows legitimately hold none (the engine face had no key
+        // to read), and nothing is backfilled: absence is the honest face
+        // until an engine answer lands.
+        conn.execute("ALTER TABLE accounts ADD COLUMN aci TEXT", [])
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -8768,6 +8844,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// Contract 1.142 (§4.138): the v23→v24 migration adds the additive
+    /// nullable `accounts.aci` column. Nothing is backfilled — pre-1.142 rows
+    /// legitimately hold none (the engine face had no key to read) — and the
+    /// version stamp moves to 24.
+    #[test]
+    fn schema_v24_upgrade_adds_the_account_aci_column() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '23');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               proxy_group TEXT NOT NULL DEFAULT 'default'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "accounts", "aci").unwrap());
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        // The migrated face reads as absence until an engine answer lands.
+        store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(store.list_accounts().unwrap()[0].aci, None);
+    }
+
+    /// Contract 1.142 (§4.138): the canonical ACI shape. The dashed and bare
+    /// 32-hex shapes normalize to dashed lowercase in either case; anything
+    /// else — wrong length, misplaced dashes, non-hex, empty — is not an ACI
+    /// and reads as absence, never a repaired guess.
+    #[test]
+    fn canonical_aci_normalizes_the_answered_shapes_and_refuses_the_rest() {
+        // Dashed lowercase is already canonical.
+        assert_eq!(
+            canonical_aci("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b"),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b".into())
+        );
+        // Dashed uppercase normalizes to lowercase.
+        assert_eq!(
+            canonical_aci("5A1CC2CD-B364-53D4-8D71-1EC62B8EB72B"),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b".into())
+        );
+        // Bare 32-hex (either case) takes the dashed shape.
+        assert_eq!(
+            canonical_aci("5A1CC2CDB36453D48D711EC62B8EB72B"),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b".into())
+        );
+        // Not an ACI: short, misplaced dashes, non-hex, empty.
+        assert_eq!(canonical_aci("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72"), None);
+        assert_eq!(canonical_aci("5a1cc2cd-b36-453d4-8d7-11ec62b8eb72b"), None);
+        assert_eq!(canonical_aci("5a1cc2cd_b364_53d4_8d71_1ec62b8eb72b"), None);
+        assert_eq!(canonical_aci("zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"), None);
+        assert_eq!(canonical_aci(""), None);
+    }
+
+    /// Contract 1.142 (§4.138): the writer takes only a fresh engine answer —
+    /// `None` writes nothing, so an absent face never unreports a stored
+    /// identity — and every read face (the single summary and both listings)
+    /// carries the row's aci once set.
+    #[test]
+    fn set_account_aci_persists_the_answer_and_none_never_unreports() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(
+            store.account_summary(&account.id).unwrap().unwrap().aci,
+            None
+        );
+
+        let aci = canonical_aci("5A1CC2CDB36453D48D711EC62B8EB72B").unwrap();
+        store.set_account_aci(&account.id, Some(&aci)).unwrap();
+        let summary = store.account_summary(&account.id).unwrap().unwrap();
+        assert_eq!(
+            summary.aci.as_deref(),
+            Some("5a1cc2cd-b364-53d4-8d71-1ec62b8eb72b")
+        );
+        assert_eq!(store.list_accounts().unwrap()[0].aci, summary.aci);
+        assert_eq!(
+            store
+                .list_accounts_in_group(DEFAULT_PROXY_GROUP_ID)
+                .unwrap()[0]
+                .aci,
+            summary.aci
+        );
+
+        // The absent face leaves the stored identity in place.
+        store.set_account_aci(&account.id, None).unwrap();
+        assert_eq!(
+            store.account_summary(&account.id).unwrap().unwrap().aci,
+            Some(aci)
+        );
+
+        // A fresh answer overwrites.
+        let other = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        store.set_account_aci(&account.id, Some(&other)).unwrap();
+        assert_eq!(
+            store.account_summary(&account.id).unwrap().unwrap().aci,
+            Some("18e2e00b-2ac7-55ec-a25d-d5646a80c042".into())
+        );
     }
 
     /// Contract 1.43 (§4.42): `isSelf` marks exactly the linked account's own

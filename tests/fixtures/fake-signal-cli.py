@@ -408,6 +408,30 @@ def next_multi_number():
     return number
 
 
+# Contract 1.142 (§4.138): the engine answers each account's own ACI beside
+# the number on finishLink and listAccounts. The fixture derives a stable
+# dashed lowercase UUID per number (uuid5 over the number itself), so every
+# account carries its own identity and the value survives engine restarts.
+# KT_FAKE_OMIT_ACCOUNT_ACI=1 covers the honest-absence face: an engine build
+# that does not answer the key at all, which the connector must report as
+# absence and never paper over with an invented identity.
+OMIT_ACCOUNT_ACI = os.environ.get("KT_FAKE_OMIT_ACCOUNT_ACI") == "1"
+
+
+def account_aci(number):
+    if OMIT_ACCOUNT_ACI:
+        return None
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"kt-fake-account-aci:{number}"))
+
+
+def account_entry(number):
+    entry = {"number": number}
+    aci = account_aci(number)
+    if aci is not None:
+        entry["aci"] = aci
+    return entry
+
+
 # Receiving account for receive notifications: the newest multi-account
 # number when one exists (so post-link receives land on a linked account and
 # the store count matches the link count), otherwise the fixed fixture number.
@@ -750,13 +774,16 @@ for line in sys.stdin:
         DELETED_MARKER.unlink(missing_ok=True)
         # Multi-account mode hands out a fresh number per link; the default
         # mode keeps the fixed fixture number every existing test expects.
-        result = {"number": next_multi_number() if MULTI_ACCOUNT else LINKED_ACCOUNT}
+        # Contract 1.142 (§4.138): the answer may carry the account's own ACI
+        # beside the number (absent under KT_FAKE_OMIT_ACCOUNT_ACI=1).
+        number = next_multi_number() if MULTI_ACCOUNT else LINKED_ACCOUNT
+        result = account_entry(number)
         emit_receive_after = True
     elif method == "listAccounts":
         if MULTI_ACCOUNT:
-            result = [{"number": number} for number in linked_multi_numbers()]
+            result = [account_entry(number) for number in linked_multi_numbers()]
         else:
-            result = [{"number": LINKED_ACCOUNT}] if ACCOUNT_LINKED else []
+            result = [account_entry(LINKED_ACCOUNT)] if ACCOUNT_LINKED else []
     elif method == "listContacts":
         # Contract 1.27 hook: deliver extra receives appended to the marker
         # after link time before answering. Only reached outside the
