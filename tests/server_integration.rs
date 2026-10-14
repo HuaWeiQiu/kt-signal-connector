@@ -15002,3 +15002,162 @@ async fn groups_revoke_invites_round_trip_and_guards() {
     wait_for_process_exit(engine_pid).await;
     assert_clean_exit(&mut connector).await;
 }
+
+/// Contract 1.150 (§4.149): the engine's voice-waveform pair rides the live
+/// row verbatim — a voice descriptor carries the fixed 100-byte base64
+/// waveform and the float-second duration byte-for-byte (the connector never
+/// decodes or re-encodes), a plain attachment beside it in the same
+/// dataMessage carries neither key (absent keys stay absent, the two faces
+/// stay independent), and the store round-trip preserves both.
+#[tokio::test]
+async fn voice_waveform_pair_rides_the_live_row_verbatim() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [31_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+
+    // The engine's fixed 100-byte waveform shape (bytes 0..=99, 136 base64
+    // chars) — pinned whole so a re-encode or trim can never slip through.
+    let waveform_100b = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw==";
+    assert_eq!(waveform_100b.len(), 136);
+
+    // Stage one envelope carrying a voice attachment and a plain image in
+    // the same dataMessage, delivered in the finishLink receive burst.
+    let extra_receives = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-extra-receives.json");
+    fs::create_dir_all(temp.path().join("signal-data")).unwrap();
+    fs::write(
+        &extra_receives,
+        json!([
+            {
+                "source": "+15555550101",
+                "timestamp": 60,
+                "dataMessage": {
+                    "message": "two attachments",
+                    "attachments": [
+                        {
+                            "id": "att-voice",
+                            "contentType": "audio/aac",
+                            "size": 2048,
+                            "isVoiceNote": true,
+                            "waveform": waveform_100b,
+                            "duration": 3.7
+                        },
+                        {
+                            "id": "att-image",
+                            "contentType": "image/png",
+                            "size": 12
+                        }
+                    ]
+                }
+            }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-Voice-Waveform" }),
+    )
+    .await;
+    send_request_frame(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let mut finished: Option<Value> = None;
+    let mut upserted: Option<Value> = None;
+    timeout(Duration::from_secs(5), async {
+        while finished.is_none() || upserted.is_none() {
+            let frame: Value =
+                serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+            if frame.get("requestId").and_then(Value::as_str) == Some("link-finish") {
+                finished = Some(frame);
+                continue;
+            }
+            if frame.get("event").and_then(Value::as_str) == Some("message.upserted")
+                && frame["data"]["sentAt"] == 60
+            {
+                upserted = Some(frame);
+            }
+        }
+    })
+    .await
+    .expect("link finish must deliver the two-attachment receive");
+    let account_id = finished.unwrap()["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let upserted = upserted.unwrap();
+    let conversation_id = upserted["data"]["conversationId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The upsert event and the messages.list row are the same projection:
+    // the voice descriptor carries the pair verbatim, the image descriptor
+    // never grows the keys.
+    let face = &upserted["data"]["attachments"];
+    assert_eq!(face[0]["id"], "att-voice");
+    assert_eq!(face[0]["isVoiceNote"], true);
+    assert_eq!(face[0]["waveform"], waveform_100b, "{face}");
+    assert_eq!(face[0]["duration"], 3.7, "{face}");
+    assert_eq!(face[1]["id"], "att-image");
+    assert_eq!(face[1]["isVoiceNote"], false);
+    assert!(
+        face[1].get("waveform").is_none(),
+        "absent keys stay absent: {face}"
+    );
+    assert!(
+        face[1].get("duration").is_none(),
+        "absent keys stay absent: {face}"
+    );
+
+    let listed = request(
+        &mut client,
+        "list-1",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["sentAt"] == 60)
+        .expect("the two-attachment row is stored");
+    let descriptors = &row["attachments"];
+    assert_eq!(descriptors.as_array().unwrap().len(), 2);
+    let voice = &descriptors[0];
+    assert_eq!(voice["id"], "att-voice");
+    assert_eq!(voice["isVoiceNote"], true);
+    assert_eq!(voice["waveform"], waveform_100b, "{voice}");
+    assert_eq!(voice["duration"], 3.7, "{voice}");
+    let image = &descriptors[1];
+    assert_eq!(image["id"], "att-image");
+    assert_eq!(image["isVoiceNote"], false);
+    assert!(image.get("waveform").is_none(), "{image}");
+    assert!(image.get("duration").is_none(), "{image}");
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}

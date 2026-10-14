@@ -529,7 +529,12 @@ pub struct NormalizedQuoteAttachment {
 /// render `caption`, the blur preview `blurHash`, the streaming-integrity
 /// pair `incrementalMac` + `chunkSize` (both or neither — the official
 /// filePointers discipline), and the always-boolean `isBorderless` / `isGif`
-/// flag projections beside `isVoiceNote`.
+/// flag projections beside `isVoiceNote`. Since contract revision 1.150
+/// (§4.149) it also carries the engine's voice-waveform pair verbatim: the
+/// render `waveform` (standard base64, the engine's fixed 100-byte 0..255 dB
+/// buckets, non-empty only) and the float-second `duration` — never decoded,
+/// re-encoded, or pair-gated (the engine generates both or neither; a failed
+/// generation ships neither and the connector forwards whatever is stated).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedAttachment {
@@ -571,6 +576,19 @@ pub struct NormalizedAttachment {
     pub is_borderless: bool,
     #[serde(default)]
     pub is_gif: bool,
+    /// The engine's voice waveform (contract 1.150, §4.149): the outbound
+    /// voice note's render buckets, standard base64 — forwarded verbatim for
+    /// the desktop's playback bar, never decoded, charset-checked, or
+    /// re-encoded (the §4.149 posture: the connector does not interpret the
+    /// pair; the pairing itself is the engine's generation invariant).
+    /// Absent on every face the engine ships without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<String>,
+    /// The engine's voice duration (contract 1.150, §4.149): float seconds,
+    /// forwarded verbatim beside `waveform` — positive-only is the ingest
+    /// shape gate (the §4.88 zero-information posture), not interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
     /// Ingest-side transit pointer face, internal only — it rides the store's
     /// schema-19 live locator column and never the host wire (the §4.13
     /// metadata-only discipline covers it too). `None` on every engine face
@@ -1487,6 +1505,13 @@ pub(crate) const MAX_INBOUND_ATTACHMENTS: usize = 32;
 const MAX_ATTACHMENT_ID_CHARS: usize = 128;
 const MAX_ATTACHMENT_FILENAME_BYTES: usize = 128;
 const MAX_ATTACHMENT_CONTENT_TYPE_CHARS: usize = 64;
+/// The voice waveform's base64 bound (contract 1.150, §4.149): the engine's
+/// fixed shape is a 100-byte bucket vector (136 base64 chars); the cap is the
+/// attachment pointer face's own base64 family bound (the 1.56 locator cap),
+/// and an over-cap value is not the engine's shape — it drops whole (never
+/// truncated: half a waveform is render material the desktop cannot use, the
+/// incrementalMac posture rather than the lossy blurHash one).
+const MAX_ATTACHMENT_WAVEFORM_CHARS: usize = 512;
 const MAX_EMOJI_CHARS: usize = 16;
 /// One receipt confirms at most this many earlier rows; a larger batch is
 /// truncated (Signal Desktop batches receipts per conversation, so real
@@ -1704,7 +1729,8 @@ impl NormalizedReceive {
             + self.peer_name.as_ref().map_or(0, String::len)
             + self.group_id.as_ref().map_or(0, String::len)
             + self.text.as_ref().map_or(0, String::len)
-            // Attachment ids dominate descriptor size; the rest is fixed-width.
+            // Attachment ids dominate descriptor size; the rest is fixed-width
+            // except the bounded waveform (≤ 512 chars, §4.149), which counts.
             + self
                 .attachments
                 .iter()
@@ -1712,6 +1738,7 @@ impl NormalizedReceive {
                     attachment.id.len()
                         + attachment.content_type.as_ref().map_or(0, String::len)
                         + attachment.filename.as_ref().map_or(0, String::len)
+                        + attachment.waveform.as_ref().map_or(0, String::len)
                         + std::mem::size_of::<NormalizedAttachment>()
                 })
                 .sum::<usize>()
@@ -1735,6 +1762,7 @@ impl NormalizedReceive {
                                         thumb.id.len()
                                             + thumb.content_type.as_ref().map_or(0, String::len)
                                             + thumb.filename.as_ref().map_or(0, String::len)
+                                            + thumb.waveform.as_ref().map_or(0, String::len)
                                             + std::mem::size_of::<NormalizedAttachment>()
                                     })
                                 + std::mem::size_of::<NormalizedQuoteAttachment>()
@@ -3845,7 +3873,12 @@ fn normalized_attachments(value: &Value) -> Vec<NormalizedAttachment> {
 /// a bounded verbatim string, the integrity pair survives only all-or-nothing
 /// (the official filePointers discipline — half a pair verifies nothing),
 /// and the two flag booleans answer false on any non-bool shape (the
-/// isVoiceNote posture: no flag bit = false).
+/// isVoiceNote posture: no flag bit = false). The voice-waveform pair
+/// (contract 1.150, §4.149) parses per-key verbatim: the waveform is a
+/// bounded base64 string the connector never decodes or re-encodes (empty or
+/// over-cap drops whole, never truncated), the duration any positive float —
+/// and the two stay independent (pairing is the engine's generation
+/// invariant, not a connector gate: the connector forwards what is stated).
 fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<NormalizedAttachment> {
     const MAX_LOCATOR_BASE64_CHARS: usize = 512;
     const MAX_LOCATOR_HEX_CHARS: usize = 128;
@@ -3963,6 +3996,15 @@ fn normalized_attachment(object: &serde_json::Map<String, Value>) -> Option<Norm
             .get("isGif")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        waveform: object
+            .get("waveform")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty() && text.len() <= MAX_ATTACHMENT_WAVEFORM_CHARS)
+            .map(str::to_string),
+        duration: object
+            .get("duration")
+            .and_then(Value::as_f64)
+            .filter(|seconds| *seconds > 0.0),
         locator,
     })
 }
@@ -7904,6 +7946,99 @@ mod tests {
         assert_eq!(legacy.chunk_size, None);
         assert!(!legacy.is_borderless);
         assert!(!legacy.is_gif);
+    }
+
+    /// The engine's voice-waveform pair (contract 1.150, §4.149) parses
+    /// per-key verbatim: the 100-byte waveform rides its standard base64
+    /// spelling byte-for-byte and the duration its float seconds, the keys
+    /// stay independent (pairing is the engine's generation invariant, not a
+    /// connector gate), a voice and a plain attachment coexist with their own
+    /// faces, zero-information and hostile shapes answer absent, and a
+    /// pre-1.150 face keeps the exact descriptor (the wire round-trip never
+    /// grows the keys).
+    #[test]
+    fn attachment_voice_waveform_pair_parses_verbatim() {
+        // The engine's fixed shape: 100 dB buckets (bytes 0..=99), 136 base64
+        // chars — pinned whole so a re-encode or trim can never slip through.
+        const WAVEFORM_100B_B64: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw==";
+        assert_eq!(WAVEFORM_100B_B64.len(), 136);
+        let attachments = |data: serde_json::Value| {
+            normalize_receive_fields(&json!({
+                "envelope": {
+                    "timestamp": 1727000000000u64,
+                    "source": "+15555550101",
+                    "dataMessage": { "attachments": data },
+                },
+            }))
+            .unwrap()
+            .attachments
+        };
+
+        // Voice note beside a plain attachment: each descriptor carries its
+        // own face, and the plain one never grows the keys.
+        let pair = attachments(json!([
+            {
+                "id": "voice-1",
+                "contentType": "audio/aac",
+                "size": 2048,
+                "isVoiceNote": true,
+                "waveform": WAVEFORM_100B_B64,
+                "duration": 3.7,
+            },
+            {
+                "id": "img-1",
+                "contentType": "image/png",
+                "size": 12,
+            },
+        ]));
+        assert_eq!(pair.len(), 2);
+        let voice = &pair[0];
+        assert!(voice.is_voice_note);
+        assert_eq!(voice.waveform.as_deref(), Some(WAVEFORM_100B_B64));
+        assert_eq!(voice.duration, Some(3.7));
+        let plain = &pair[1];
+        assert!(!plain.is_voice_note);
+        assert_eq!(plain.waveform, None);
+        assert_eq!(plain.duration, None);
+
+        // The keys are independent — the connector forwards what is stated
+        // and never gates on the engine's pairing invariant.
+        let halves = attachments(json!([
+            { "id": "w-only", "waveform": WAVEFORM_100B_B64 },
+            { "id": "d-only", "duration": 12.5 },
+        ]));
+        assert_eq!(halves[0].waveform.as_deref(), Some(WAVEFORM_100B_B64));
+        assert_eq!(halves[0].duration, None);
+        assert_eq!(halves[1].waveform, None);
+        assert_eq!(halves[1].duration, Some(12.5));
+
+        // Zero-information and hostile shapes answer absent — never a
+        // mangled key. An over-cap "waveform" is not the engine's fixed
+        // shape and drops whole (never truncated into unusable render
+        // material).
+        let hostile = attachments(json!([
+            { "id": "h1", "waveform": "" },
+            { "id": "h2", "waveform": 42 },
+            { "id": "h3", "waveform": "QUJD".repeat(129) },
+            { "id": "h4", "duration": 0 },
+            { "id": "h5", "duration": -1.5 },
+            { "id": "h6", "duration": "3.7" },
+        ]));
+        assert!(hostile.iter().all(|face| face.waveform.is_none()));
+        assert!(hostile.iter().all(|face| face.duration.is_none()));
+
+        // A pre-1.150 face keeps the exact descriptor, and the wire
+        // round-trip never grows the keys.
+        let legacy = attachments(json!([
+            { "id": "old-1", "contentType": "audio/aac", "isVoiceNote": true },
+        ]));
+        let legacy = &legacy[0];
+        assert!(legacy.is_voice_note);
+        assert_eq!(legacy.waveform, None);
+        assert_eq!(legacy.duration, None);
+        let round_trip = serde_json::to_value(legacy).unwrap();
+        assert!(round_trip.get("waveform").is_none());
+        assert!(round_trip.get("duration").is_none());
     }
 
     /// The engine's P14 rich faces (contract 1.107, §4.88) parse per-key:

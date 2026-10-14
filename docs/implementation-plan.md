@@ -42,7 +42,29 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.149 (2026-10-14; the GIF send marker rides the
+- Contract revision: 1.150 (2026-10-14; the voice waveform rides the receive
+  descriptor verbatim (§4.149): the engine's voice-waveform batch (b656714)
+  auto-generates `AttachmentPointer.audioWaveform` (field 21, a fixed
+  100-byte 0..255 dB bucket vector) and `audioDurationSeconds` (field 22,
+  float seconds) on every `;voice=true` send — both fields absent when
+  generation fails, the send shipping anyway — and its receive projection
+  now states `waveform` (standard base64, non-empty only) and `duration`
+  (float seconds) per attachment pointer. The connector pass-through layer
+  learns the two keys additively on the live ingest face: per-key verbatim
+  forward, no base64 validation, no re-encoding, no pair gate (the
+  恒成对或恒缺席 pairing is the engine's generation invariant the connector
+  deliberately does not enforce), the §4.88 shape-gate posture (empty or
+  over-bound waveform drops whole, non-positive/non-number duration drops),
+  and the history-import leg stays zero-change (the backup FilePointer proto
+  has no such members, so import rows structurally never carry the pair).
+  Wire additive: two optional descriptor keys, zero new methods/events/error
+  codes/store moves; desktop rendering consumption is a later batch. Tests
+  814 → 817 (lib 610 → 612: the pair-parse arm — 100-byte verbatim,
+  coexistence, half-pair independence, hostile shapes, legacy round-trip;
+  the import arm — a hostile archive line cannot smuggle the pair;
+  integration +1: the live row carries both keys byte-for-byte beside a
+  plain descriptor that never grows them), all green) —
+  previously 1.149 (2026-10-14; the GIF send marker rides the
   attachment descriptor (§4.147): `messages.attachments.send` gains the
   optional `gif` key — singular top-level, per-entry on the §4.59 array —
   and a true flag appends the `;gif=true` data-URI parameter verbatim on
@@ -3019,7 +3041,13 @@ from the decoded audio; no protocol surface). No new method, no schema change, n
 entry — `attachments.send` callers discover the face from the updated schema description. The
 GIF flag (§4.147) rides the same statement-parameter face: `;gif=true` appends beside the
 voice slot, bitwise-coexists with it upstream, and carries no contentType gate where the
-voice flag demands `audio/*`.
+voice flag demands `audio/*`. Since the engine's voice-waveform batch (b656714, contract
+1.150) the engine itself generates the render material at send time: the upstream pointer
+carries `audioWaveform` (a fixed 100-byte 0..255 dB bucket vector) and
+`audioDurationSeconds` (float seconds), and when generation fails both fields stay absent
+while the send still ships — the connector never fabricates, blocks on, or re-sends a
+waveform (the send's outcome is unaffected by the waveform's), and the receive face
+forwards both keys verbatim (§4.149).
 
 ### 4.31 Stickers: messages.sendSticker + receive projection (contract revision 1.35, 2026-10-04)
 
@@ -11840,6 +11868,74 @@ Tests: integration +1 (the `--engine-bin`/`--signal-cli` equivalence and
 help-visibility lock in `tests/cli.rs`); the harness spawns move to the
 primary spelling except the tcp_listen alias pin; fixture-path references
 follow the rename mechanically. Tests 813 → 814, all green.
+
+### 4.149 The voice waveform rides the receive descriptor verbatim (contract revision 1.150, 2026-10-14)
+
+The engine's voice-waveform batch (kt-signal-engine `b656714`) closes the
+loop the §4.30 voice statement opened: every `;voice=true` send now makes
+the engine generate the render material itself — the upstream pointer
+carries `AttachmentPointer.audioWaveform` (proto field 21, a fixed 100-byte
+vector of 0..255 dB buckets) and `audioDurationSeconds` (field 22, float
+seconds) — and when generation fails both fields stay absent while the send
+ships unchanged (a failed waveform never blocks or re-sends a message; the
+§4.30 send semantics gain that sentence). The engine's receive projection
+(`project_attachment_pointer`) forwards both facts additively as `waveform`
+(standard base64, non-empty only) and `duration` (float seconds) per
+attachment pointer. The connector was the gap: `normalized_attachment` read
+a fixed key list, so the pair died at the pass-through layer and no host
+face could state it. This batch teaches the live ingest face the two keys —
+the desktop rendering half is a later batch.
+
+Posture (the §4.147 GIF batch's "the connector does not interpret, verbatim
+transit", applied to a value instead of a flag):
+
+- **Per-key verbatim.** The waveform rides its base64 spelling
+  byte-for-byte and the duration its float seconds; the connector never
+  decodes, charset-checks, or re-encodes either, and an absent key stays
+  absent (整键缺席). The sender's own voice messages reach the same keys
+  through the engine transcript echo — no second projection face exists to
+  keep in sync.
+- **No pair gate, deliberately unlike the §4.88 integrity pair.** The
+  engine generates the two together or not at all (恒成对或恒缺席), but
+  that is the engine's generation invariant, not a connector-enforced
+  discipline: gating a half pair would be interpreting the pair, and the
+  desktop renders what is stated. (`incrementalMac` + `chunkSize` stay
+  all-or-nothing — there half a pair is a *verified* half that verifies
+  nothing; here the connector adds no verification at all.)
+- **The §4.88 shape-gate posture holds.** An empty waveform is
+  zero-information and drops; a waveform past the 512-char cap (the
+  attachment pointer face's own base64 family bound — the engine's fixed
+  shape is 136 chars) is not the engine's shape and drops whole, never
+  truncated into unusable render material (the `incrementalMac` drop
+  posture rather than the lossy `blurHash` trim); a non-number or
+  non-positive duration answers absent. The receive queue budget counts
+  the bounded waveform string (`estimated_bytes`).
+- **The history-import leg is zero-change by proto fact.** The backup
+  archive's `FilePointer` has no waveform/duration members — the pair
+  exists only on the live pointer face the engine generates at send time —
+  so import rows structurally never carry it, and the importer's fixed key
+  list ignores any stray same-named key a hostile archive line invents
+  (test-pinned). Recorded here so a later batch does not "complete" the
+  import face.
+- **Additive by construction.** Both keys are
+  `#[serde(default, skip_serializing_if = ...)]` options on the shared
+  descriptor: pre-1.150 rows deserialize unchanged and re-serialize without
+  the keys, the store needs no schema move (`attachments_json` is the
+  descriptor blob), and the outgoing pending descriptors stay `None` (the
+  connector never fabricates a waveform; the engine does at send time).
+  Quote thumbnails and sticker/avatar pointers ride the same shared parser,
+  so their faces forward the pair too when an engine projects it — one
+  parser, one wire form (the §4.88 precedent).
+
+Tests: lib +2 — the parse arm (the 100-byte base64 sample pinned whole,
+voice+plain coexistence, half-pair independence, empty/over-cap/hostile
+drops, the legacy round-trip never growing the keys) and the import arm (a
+hostile archive attachment carrying stray `waveform`/`duration` keys still
+lands both `None` while the flag bit projects); integration +1 — a live
+receive carrying a voice attachment (the pinned 100-byte waveform +
+`duration: 3.7`) beside a plain attachment: the upsert event and the
+`messages.list` row both carry the pair byte-for-byte and the plain
+descriptor never grows the keys. Tests 814 → 817, all green.
 
 ## 5. signal-cli Boundary
 

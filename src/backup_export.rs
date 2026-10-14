@@ -2498,6 +2498,8 @@ mod tests {
                         is_borderless: false,
                         is_gif: false,
                         locator: None,
+                        waveform: None,
+                        duration: None,
                     }],
                     ..plaintext_message(
                         &account.id,

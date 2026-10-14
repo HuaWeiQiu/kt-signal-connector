@@ -10189,6 +10189,8 @@ mod tests {
             is_borderless: false,
             is_gif: false,
             locator: None,
+            waveform: None,
+            duration: None,
         };
         let row = |id: &str,
                    sent_at: u64,
@@ -10398,6 +10400,8 @@ mod tests {
             is_borderless: false,
             is_gif: false,
             locator: None,
+            waveform: None,
+            duration: None,
         };
         let row = |id: &str, sent_at: u64, media: bool| MessageRecord {
             id: id.into(),
@@ -11138,6 +11142,8 @@ mod tests {
             is_borderless: false,
             is_gif: false,
             locator: None,
+            waveform: None,
+            duration: None,
         }];
         sticker_row.sticker = Some(crate::engine::NormalizedSticker {
             pack_id: "abcdef01".into(),
@@ -11519,6 +11525,8 @@ mod tests {
                 is_borderless: false,
                 is_gif: false,
                 locator: None,
+                waveform: None,
+                duration: None,
             };
         let kind = || {
             store
@@ -15588,6 +15596,8 @@ mod tests {
                 is_borderless: false,
                 is_gif: false,
                 locator: None,
+                waveform: None,
+                duration: None,
             }],
             rich: Some(NormalizedRich {
                 view_once: true,
@@ -15899,6 +15909,8 @@ mod tests {
                 is_borderless: false,
                 is_gif: false,
                 locator,
+                waveform: None,
+                duration: None,
             }
         };
         let full_face = crate::store::HistoryAttachmentLocator {

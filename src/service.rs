@@ -2535,6 +2535,12 @@ impl ConnectorService {
             // tick (the same statement the `;gif=true` URI parameter makes
             // upstream).
             is_gif: gif,
+            // §4.149: the connector never fabricates the waveform pair — the
+            // engine generates it upstream at send time (or ships neither on
+            // failure); the desktop's own bubble gets it from the engine
+            // transcript echo through the receive face.
+            waveform: None,
+            duration: None,
         };
         self.dispatch_send(
             &account,
@@ -2664,6 +2670,10 @@ impl ConnectorService {
                 is_borderless: false,
                 // §4.147: the per-entry GIF marker, same statement posture.
                 is_gif: entry.gif,
+                // §4.149: never fabricated connector-side (see the singular
+                // face) — the engine's transcript echo carries the pair.
+                waveform: None,
+                duration: None,
             });
         }
         self.dispatch_send(
@@ -2816,6 +2826,8 @@ impl ConnectorService {
             chunk_size: None,
             is_borderless: false,
             is_gif: false,
+            waveform: None,
+            duration: None,
         };
         let sticker = crate::engine::NormalizedSticker {
             pack_id: pack_id.to_string(),
@@ -15521,6 +15533,8 @@ mod tests {
             is_borderless: false,
             is_gif: false,
             locator: None,
+            waveform: None,
+            duration: None,
         }];
         service
             .store_ref()
@@ -21524,6 +21538,8 @@ mod tests {
                 is_borderless: false,
                 is_gif: false,
                 locator: None,
+                waveform: None,
+                duration: None,
             }],
             rich: Some(NormalizedRich {
                 view_once: true,
@@ -30431,6 +30447,8 @@ mod tests {
                         chunk_size: None,
                         is_borderless: false,
                         is_gif: false,
+                        waveform: None,
+                        duration: None,
                         locator: None,
                     }),
                 }],
@@ -30450,6 +30468,8 @@ mod tests {
                 is_borderless: false,
                 is_gif: false,
                 locator: None,
+                waveform: None,
+                duration: None,
             }],
             rich: None,
             sticker: None,
@@ -30531,6 +30551,8 @@ mod tests {
                 is_borderless: true,
                 is_gif: false,
                 locator: None,
+                waveform: None,
+                duration: None,
             }],
             rich: Some(NormalizedRich {
                 previews: vec![NormalizedPreview {

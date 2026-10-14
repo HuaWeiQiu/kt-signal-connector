@@ -1350,6 +1350,14 @@ impl<'a> Importer<'a> {
                 chunk_size,
                 is_borderless: flag == Some(ATTACHMENT_FLAG_BORDERLESS),
                 is_gif: flag == Some(ATTACHMENT_FLAG_GIF),
+                // The backup archive's FilePointer proto has no waveform or
+                // duration members (the pair exists only on the live
+                // AttachmentPointer face the engine generates at send time,
+                // §4.149), so import rows structurally never carry them; the
+                // fixed key list above ignores any stray same-named JSON key
+                // a hostile archive line invents.
+                waveform: None,
+                duration: None,
                 locator: None,
             });
             locators.push(import_locator(raw.get("locator")));
@@ -2245,6 +2253,61 @@ mod tests {
             .unwrap();
         assert_eq!(faces.len(), 1);
         assert_eq!(faces[0].key.as_deref(), Some(key_b64));
+    }
+
+    /// The voice-waveform pair (contract 1.150, §4.149) never rides an
+    /// import row: the backup archive's FilePointer proto has no such
+    /// members, so the importer reads neither key — even a hostile archive
+    /// line inventing same-named JSON keys cannot smuggle the pair onto a
+    /// descriptor, and a voice-flagged archive attachment stays exactly its
+    /// pre-1.150 face (the flag bit yes, the pair never).
+    #[test]
+    fn imported_attachments_never_carry_the_voice_waveform_pair() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(&temp.path().join("store"));
+        let account = store
+            .upsert_account_from_signal(SIGNAL_ACCOUNT, Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let archive = seed_engine(&temp);
+        write_archive(
+            &archive,
+            &[
+                alice().to_string(),
+                serde_json::json!({"type": "chat", "id": 10, "recipientId": 1}).to_string(),
+                serde_json::json!({
+                    "type": "message", "chatId": 10, "authorId": 1, "dateSent": 1000,
+                    "direction": "incoming", "text": "voice",
+                    "attachments": [{
+                        "contentType": "audio/aac", "fileName": "v.aac", "flag": 1, "size": 9,
+                        "waveform": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw==",
+                        "duration": 3.7
+                    }]
+                })
+                .to_string(),
+            ],
+        );
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        assert_eq!(counters.imported, 1);
+        let conversation = alice_conversation_id(&account.id);
+        let row = store
+            .message_by_signal_identity(
+                &account.id,
+                &conversation,
+                "incoming",
+                1000,
+                &stable_hash_id(&[&account.id, "direct", ALICE_E164]),
+                &stable_hash_id(&[&account.id, "direct", ALICE_ACI]),
+            )
+            .unwrap()
+            .expect("imported row");
+        let voice = &row.attachments[0];
+        assert!(voice.is_voice_note, "the flag bit still projects");
+        assert_eq!(voice.waveform, None, "FilePointer has no waveform member");
+        assert_eq!(voice.duration, None, "FilePointer has no duration member");
+        let wire = serde_json::to_value(&row.attachments).unwrap().to_string();
+        assert!(!wire.contains("waveform"));
+        assert!(!wire.contains("duration"));
     }
 
     /// Ingest caps and shape gates on the pointer faces (§4.38 attachv2):
