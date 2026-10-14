@@ -3720,16 +3720,19 @@ where
             remove,
             story_author,
             story_sent_at,
+            group_id,
             sender,
             sender_aci,
             sender_name,
             timestamp,
         } => {
-            // Contract 1.154, §4.153: transient story reaction — the
-            // story.received absent-optional-identity discipline, `remove`
-            // always present (the official reaction-remove is a real emoji
-            // delta, not an absent key), the anchor named by its two wire
-            // keys.
+            // Contract 1.154 §4.153, group legs contract 1.158, §4.156:
+            // transient story reaction — the story.received
+            // absent-optional-identity discipline, `remove` always present
+            // (the official reaction-remove is a real emoji delta, not an
+            // absent key), the anchor named by its two wire keys, and the
+            // group leg's groupId an absent-optional key like the identity
+            // family.
             let mut payload = json!({
                 "accountId": account_id,
                 "emoji": emoji,
@@ -3737,6 +3740,9 @@ where
                 "storyAuthor": story_author,
                 "storySentAt": story_sent_at,
             });
+            if let Some(group) = group_id {
+                payload["groupId"] = json!(group);
+            }
             if let Some(sender) = sender {
                 payload["sender"] = json!(sender);
             }
@@ -3754,18 +3760,23 @@ where
         HostSideEvent::StoryDeleted {
             account_id,
             story_sent_at,
+            group_id,
             sender,
             sender_aci,
             sender_name,
             timestamp,
         } => {
-            // Contract 1.154, §4.153: transient story remote-delete — same
-            // absent-optional-identity discipline, the deleted story named
-            // by its upstream sentAt.
+            // Contract 1.154 §4.153, group leg contract 1.158, §4.156:
+            // transient story remote-delete — same absent-optional
+            // discipline, the deleted story named by its upstream sentAt,
+            // the conservative group leg's groupId absent-optional.
             let mut payload = json!({
                 "accountId": account_id,
                 "storySentAt": story_sent_at,
             });
+            if let Some(group) = group_id {
+                payload["groupId"] = json!(group);
+            }
             if let Some(sender) = sender {
                 payload["sender"] = json!(sender);
             }
@@ -3779,6 +3790,41 @@ where
                 payload["timestamp"] = json!(at);
             }
             send_shared(writer, &HostEvent::new("story.deleted", payload)).await
+        }
+        HostSideEvent::StoryDeleteCandidate {
+            account_id,
+            group_id,
+            target_sent_timestamp,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+        } => {
+            // Contract 1.158, §4.156: transient group story delete
+            // candidacy — the official group story deletion rides a regular
+            // group DOE, so the true §4.91 buffer miss on a group leg claims
+            // candidacy beside the unchanged buffer. Required keys pinned
+            // (accountId, groupId, targetSentTimestamp); the identity family
+            // rides the story.deleted absent-optional discipline. No gate,
+            // nothing persists.
+            let mut payload = json!({
+                "accountId": account_id,
+                "groupId": group_id,
+                "targetSentTimestamp": target_sent_timestamp,
+            });
+            if let Some(sender) = sender {
+                payload["sender"] = json!(sender);
+            }
+            if let Some(aci) = sender_aci {
+                payload["senderAci"] = json!(aci);
+            }
+            if let Some(name) = sender_name {
+                payload["senderName"] = json!(name);
+            }
+            if let Some(at) = timestamp {
+                payload["timestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("story.deleteCandidate", payload)).await
         }
         HostSideEvent::SyncStoryRecipientUpdate {
             account_id,

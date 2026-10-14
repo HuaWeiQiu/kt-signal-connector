@@ -42,7 +42,57 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.157 (2026-10-15; the group audience leg rides the
+- Contract revision: 1.158 (2026-10-15; the group story receive 翻案
+  (§4.156): the connector-side fold the 1.154 batch recorded as the
+  §4.67 group-story boundary is overturned against the official wire —
+  the upstream receive routes a reaction by its target row's domain and
+  the official group story reaction rides the ordinary group channel
+  with the storyContext always present
+  (`Reactions.preload.ts:606-611` / `enqueueReactionForSend.preload.ts:84-91`
+  / `sendNormalMessage.preload.ts:744-755`, upstream `abe80d3`), so the
+  reaction + storyReply co-presence is the story judgment on the group
+  leg exactly as on the 1:1 leg: the `group_id.is_none()` short-circuit
+  comes off the reaction routing and the group leg carries `groupId`
+  (the optional wire key, the groupInfo caliber; absent = the key never
+  serializes, every pre-1.158 event frame reads byte-identically); the
+  official group story deletion rides a regular group DOE with no bit
+  and no storyContext (`deleteStoryForEveryone.preload.ts:38-48`,
+  "Group stories are deleted as regular messages"), so the wire cannot
+  tell it from an ordinary group delete and the true §4.91 buffer miss
+  on a group leg rides the new transient `story.deleteCandidate`
+  candidacy event (`{accountId, groupId, targetSentTimestamp}` plus the
+  absent-optional identity family) beside the unchanged buffer — the
+  story.deleted semantics are NOT widened (that event's isStory-bit
+  contract stays literal; a bit-less group leg reusing it would lie),
+  while the conservative leg — a group envelope whose DOE does carry
+  the bit (officially legal) — routes `story.deleted` with `groupId`
+  (the `ControlReceive::StoryDeleted`/`StoryReaction` variants and the
+  `HostSideEvent` twins widen additively); and the stories-disabled
+  gate realigns onto the official MessageReceiver posture: stories-
+  blocked drops the whole isStoryReply envelope, reactions included, so
+  `story.reaction` gains the gate judged by the same storyReply
+  co-presence (1:1 and group legs identically — the 1.154 no-gate
+  reading is overturned) while `story.deleted` loses its 1.154 gate and
+  `story.deleteCandidate` rides gate-free (the official DOE faces do
+  not gate). The engine is zero-change (its
+  envelope already projects the
+  four keys together — the S7 group story batch `ffab2a8` ships the
+  group context). Two stale recorded sentences (the §4.77/§4.151
+  "group-story reaction needs the group context the story.received
+  projection does not carry") are corrected in place: the projection
+  has carried the group context since the engine's E2 batch. Wire
+  additive: one new transient event, two optional keys on existing
+  events, zero new methods/error codes/store moves/capability bits
+  (the `stories` tag widened in place, the 1.82 precedent). Tests
+  836 → 838 (lib +2: the group-leg key arm — the group story reaction
+  and the conservative story.deleted group leg riding their group keys
+  with zero store writes — and the candidate arm — the group-DOE true
+  miss riding the full candidate key set with the §4.91 flush still
+  converging a late original, the replay face riding nothing, the
+  direct-leg miss staying the pure buffer; the 1.154 group-fold pins
+  and the gate-split pins flip in place), all green — fmt, check, clippy,
+  full cargo test, release build, schema parse) —
+  previously 1.157 (2026-10-15; the group audience leg rides the
   existing `messages.sendStory` face (§4.155), the connector half of the
   engine's group story batch (engine `ffab2a8`, the official
   `StoryMessage.group` GroupContextV2 alignment — the audience two-domain
@@ -7261,10 +7311,11 @@ row-addressed ladder can never target a story (rowless, §4.67).
   `{account, emoji, remove, targetAuthor, targetTimestamp, recipient: [storyAuthor],
   story: true}` — the official client delivers a story reaction as a direct message to
   the story's author. Nothing is written locally and no event is emitted (a story
-  reaction has no row to pill on). v1 addresses author-direct reactions only: a
-  group-story reaction needs the group context the `story.received` projection does not
-  carry, so there is nothing to address a group frame with — a recorded boundary, not an
-  invented one.
+  reaction has no row to pill on). v1 addresses author-direct reactions only — a
+  recorded boundary, not an invented one (the group-story send leg rides the ordinary
+  group channel and is contract 1.159, queued; contract 1.158 corrects this section's
+  recorded reason: the `story.received` projection has carried the group context since
+  the engine's E2 batch).
 - **Mode seam**: JVM/native dispatch the frame as-is. The kt-engine face's `sendReaction`
   has no story half and silently ignores unknown params (it would mis-send a plain
   reaction), so it answers CAPABILITY_UNAVAILABLE (retryable=false) after the same local
@@ -12291,9 +12342,13 @@ Posture (the §4.150 call-event proxy discipline on the stories family):
   no event is emitted, and the receive projection of story-anchored
   reactions is the engine's own batch.
 
-Boundary: v1 still addresses author-direct reactions only — a
-group-story reaction needs the group context the story.received
-projection does not carry (记档边界, not invented).
+Boundary: v1 still addresses author-direct reactions only — the
+group-story send leg rides the ordinary group channel (reaction +
+storyContext + groupV2) and is contract 1.159, queued. (Contract 1.158
+corrects this paragraph's recorded reason: the story.received
+projection has carried the group context since the engine's E2 batch —
+the real 1.152-era boundary was the send face's own parameter shape,
+never a blind projection.)
 
 Tests: integration +2 (`tests/story_reaction.rs`) — the forward arm
 (the send-log pinned byte-for-byte on the four-key engine frame with no
@@ -12391,28 +12446,38 @@ timeline owns the state):
   whose envelope also carries the `storyReply` projection is a reaction
   on a story, not on a message — the anchor is the storyReply, because
   the story has no conversation row for the reaction target to fold
-  onto. Only the 1:1 leg routes to the transient face: a group story
-  reaction keeps its plain group-reaction fold (the §4.67 group-story
-  boundary, 记档 not invented — the group conversation row is the fold
-  target), and a `storyReply` the row ladder degraded (the engine
-  projects the key only when the author resolves) stays a plain
-  reaction — one authority, the shared helper both ladders read, so a
-  shape the row ladder degraded is exactly the shape the control ladder
-  declines. The payload carries the bounded reaction (emoji, the
-  engine's `isRemove` bit — always serialized, a real delta never an
-  absent key) plus the anchor's two halves (`storyAuthor`,
-  `storySentAt`) and the absent-optional-identity family (sender /
+  onto. Contract 1.158 (§4.156) overturned the 1.154 leg boundary: the
+  official receive routes by the target row's domain and the group
+  story reaction rides the ordinary group channel with the storyContext
+  always present, so the co-presence routes the story face on the group
+  leg exactly as on the 1:1 leg and the group leg carries `groupId`
+  (the group master key standard base64, the groupInfo caliber) — the
+  1.154 "a group story reaction keeps its plain group-reaction fold"
+  reading (then 记档 against the §4.67 boundary) is history. A
+  `storyReply` the row ladder degraded (the engine projects the key
+  only when the author resolves) stays a plain reaction — one
+  authority, the shared helper both ladders read, so a shape the row
+  ladder degraded is exactly the shape the control ladder declines. The
+  payload carries the bounded reaction (emoji, the engine's `isRemove`
+  bit — always serialized, a real delta never an absent key) plus the
+  anchor's two halves (`storyAuthor`, `storySentAt`), the optional
+  `groupId`, and the absent-optional-identity family (sender /
   senderAci / senderName / timestamp). The reacting viewer may never
   have a direct thread with the account, so the event claims candidacy,
   not identity: the desktop joins on its own story timeline by the
   anchor and no-ops a stale or deleted-row one.
 - **`story.deleted` — the story-channel DOE.** The story batch S5's
   receive leg ①: `dataMessage.remoteDelete` riding the envelope-level
-  `isStory` bit. Only the 1:1 story channel routes here — a group DOE
-  carries no `isStory` bit and keeps the plain remote-delete fold, and
-  a plain message DOE never carries the bit. The deleted story is named
-  by its upstream sentAt plus the sender identity family; the desktop
-  drops it from its own timeline.
+  `isStory` bit. The bit routes here on both legs — the 1:1 story
+  channel and, contract 1.158 (§4.156), the group envelope that carries
+  the bit (the conservative leg, riding `groupId`; officially legal,
+  some clients may send it). An unsigned group DOE keeps the plain
+  remote-delete fold and rides the §4.156 `story.deleteCandidate`
+  candidacy event instead — the official group story deletion is a
+  regular group DOE, wire-indistinguishable — and a plain message DOE
+  never carries the bit. The deleted story is named by its upstream
+  sentAt plus the sender identity family; the desktop drops it from its
+  own timeline.
 - **`story.recipientUpdate` — the own-story distribution sync.** The
   story batch S5's receive leg ②: the engine's
   `syncMessage.storyRecipientUpdate` projection — the account posted a
@@ -12432,14 +12497,19 @@ timeline owns the state):
   routing source stays None (our own account, the read/viewed
   precedent).
 
-**The stories-disabled gate follows the material.** `story.deleted`
-announces incoming story material — the same family the
-`story.received` gate drops — so the toggle drops it exactly the same
-way. `story.reaction` and `story.recipientUpdate` are events about the
-account's own story (a peer acting on it; the account's own
-distribution), not incoming material — the gate does not apply (the
-§4.70 viewed-receipt precedent: the receipt is the viewer's action, not
-story content).
+**The stories-disabled gate follows the official MessageReceiver
+(contract 1.158).** The official stories-blocked drop removes the whole
+isStoryReply envelope before anything downstream — reactions with a
+storyContext included — and does not gate the DOE faces.
+`story.reaction` therefore gains the gate (the 1.154 "the gate does
+not apply to the reaction" reading is overturned), judged by the same
+storyReply co-presence so the 1:1 and group legs gate identically.
+`story.deleted` loses its 1.154 gate (the official posture leaves the
+DOE faces ungated — the 1.154 incoming-material reading is overturned
+in the other direction), `story.deleteCandidate` rides gate-free like
+every DOE face, and `story.recipientUpdate` stays gate-free (the
+account's own distribution sync — the §4.70 own-story precedent
+survives for the sync family).
 
 **Zero store involvement, zero self-heal.** No row, no conversation,
 no ledger, no schema move — a transient like `story.received`: a
@@ -12457,7 +12527,8 @@ entry-less array, the absent array). The service forward arm — all
 three events forward without creating a row or a conversation, the
 identity family rides, and the gate splits: the disabled toggle drops
 the deletion while the reaction and the recipient sync ride. Tests
-824 → 826, all green.
+824 → 826, all green. (The group-shape pins and the reaction's no-gate
+pin flipped in contract 1.158, §4.156.)
 
 ### 4.154 The story-reply context and the media story leg ride the existing send faces: `messages.sendText` story keys, `messages.sendStory` attachment (contract revision 1.156, 2026-10-15)
 
@@ -12521,7 +12592,13 @@ existing faces):
 Boundary: the engine's group story-send leg (recipients-optional when
 the group is present) is uncommitted WIP in the engine tree — the
 connector keeps its `recipients` non-empty gate untouched and does not
-invent the face (记档边界).
+invent the face (记档边界). (Corrected in place by contract 1.158, the
+1469 finding: the boundary paragraph itself was already a misread —
+`ffab2a8` is committed mainline, §4.155 — and the storyReply pair is
+not 1:1-only: the engine's `send` group arm injects the storyReply
+projection, so with the 1.156 passthrough in place the group
+story-reply chain (`messages.sendText` group path) is end-to-end
+already.)
 
 Tests: integration +4 (`tests/story_reply_send.rs`,
 `tests/story_send_attachment.rs`) — the story-reply forward arm pinned
@@ -12627,6 +12704,123 @@ group riding, the kept refusal with the account-ladder ordering proof)
 and the `story_from_engine` additive projection arm (the pre-1.157
 shape byte-identical, null-as-absence, the pinned face, the malformed
 face as protocol defect). Tests 832 → 836, all green.
+
+### 4.156 The group story receive folds overturn: `story.reaction` / `story.deleted` group legs, the `story.deleteCandidate` candidacy event, the gate realignment (contract revision 1.158, 2026-10-15)
+
+The 1.154 batch folded the group story receive faces into the ordinary
+group folds and recorded it as the §4.67 group-story boundary. The
+upstream forensics (agent-1465 底稿, the official `abe80d3` sources
+read) overturn the boundary: the official receive routes a reaction by
+its target row's domain, not the envelope's group presence, and on the
+wire the group story reaction rides the ordinary group channel with
+the storyContext always present (`reaction + storyReply + groupV2` —
+`Reactions.preload.ts:606-611`, `enqueueReactionForSend.preload.ts:84-91`,
+`sendNormalMessage.preload.ts:744-755`), so the 1:1 co-presence
+judgment IS the group judgment. The engine is zero-change in this
+batch: its envelope already projects `isStory` + `dataMessage.reaction`
++ `dataMessage.storyReply` + `dataMessage.groupInfo` together, and the
+S7 group story batch (`ffab2a8`) ships the group context — the fold
+was always connector-routing-local (`control_routing`'s
+`group_id.is_none()` short-circuits).
+
+Two pieces:
+
+- **The reaction leg (piece one).** The `group_id.is_none()`
+  short-circuit comes off the reaction routing: reaction + storyReply
+  co-presence routes `story.reaction` with the group key on the group
+  leg exactly as on the 1:1 leg. `ControlReceive::StoryReaction` and
+  `HostSideEvent::StoryReaction` gain the optional `group_id` (the
+  group master key standard base64, the groupInfo.groupId caliber —
+  the wire key `groupId`, absent = the key never serializes), and the
+  degraded storyReply keeps the plain reaction fold (one authority, the
+  shared helper). The desktop joins the group anchor against that
+  group's story timeline; the store is untouched (the transient
+  discipline verbatim).
+- **The DOE leg (piece two, the candidate event).** The official group
+  story deletion rides a regular group DOE — no isStory bit, no
+  storyContext (`deleteStoryForEveryone.preload.ts:38-48`, "Group
+  stories are deleted as regular messages"; only list stories ride the
+  story channel) — so the wire cannot tell a group story delete from an
+  ordinary one. The unsigned group DOE therefore keeps its plain fold
+  and its §4.91 early-arrival buffer verbatim, and the TRUE buffer miss
+  (the store answered no row at all; a replayed face matched a row and
+  rides nothing) on a group leg additionally emits the new transient
+  `story.deleteCandidate` — `{accountId, groupId,
+  targetSentTimestamp}` plus the `story.deleted` absent-optional
+  identity family (sender / senderAci / senderName / timestamp). The
+  desktop joins (groupId, sender, targetSentTimestamp) against its own
+  group story timeline and no-ops a stale anchor — candidacy, not
+  identity, the `story.viewed`/`story.reaction` posture. The
+  `story.deleted` semantics are deliberately NOT widened: that event's
+  contract is the isStory-bit story channel, and a bit-less group leg
+  reusing it would lie. The conservative leg covers the officially
+  legal face the wire CAN tell: a group envelope whose DOE carries the
+  bit routes `story.deleted` with `groupId` (`ControlReceive::
+  StoryDeleted` widens the same optional key).
+
+**The stories-disabled gate realigns onto the official
+MessageReceiver.** Stories-blocked drops the whole isStoryReply
+envelope before anything downstream — reactions with a storyContext
+included — and does not gate the DOE faces. `story.reaction` therefore
+gains the gate (the 1.154 "the gate does not apply to a reaction —
+own-story family" reading is overturned: a group story reaction is
+incoming-material-adjacent and the official posture is the
+whole-envelope drop), judged by the same storyReply co-presence so the
+1:1 and group legs gate identically. `story.deleted` loses its 1.154
+gate (the official posture leaves the DOE faces ungated — the 1.154
+incoming-material reading is overturned in the other direction);
+`story.deleteCandidate` rides gate-free (a DOE face).
+
+Posture:
+
+- **Wire additive.** One new transient event (`story.deleteCandidate`),
+  two optional keys on existing events (`groupId` on `story.reaction`
+  and `story.deleted`), zero new methods, zero new error codes, zero
+  store moves, zero new capability bits — the `stories` tag widens in
+  place (the 1.82 precedent chain, now reading 1.158 → 1.157 → 1.156 →
+  1.154 → 1.130). Optional keys are structurally absent when the leg is
+  1:1 (skip-if-absent serialization): every pre-1.158 event frame reads
+  byte-identically, and a JSON null folds to absence at the serde
+  option layer (the §4.154 with_nulls precedent). The
+  `EarlyControlPayload`/buffer schema does not move — the candidate
+  rides beside the buffer, never inside it.
+- **The queue budget counts the new heap strings.** The
+  `ControlReceive::StoryReaction` / `StoryDeleted` budget arms count
+  the group key like their other heap strings (§4.13).
+- **KT-extension, no upstream counterpart** on the candidate event (the
+  official desktop needs no candidacy event — its own receive keeps
+  story rows in the story domain; the connector's rowless fold needs
+  the explicit face).
+
+Boundary: the desktop-side consumption (the (groupId, sender,
+targetSentTimestamp) story-timeline join and the stale-anchor no-op) is
+the S7 desktop batch's; this batch guarantees the events are reachable
+and their shapes pinned. The group story DELETE wire-indistinguishable
+face means an ordinary group DOE whose original lands late also emits a
+candidate — the desktop no-ops it, and the §4.91 flush still converges
+the landed row (pinned by tests). `stories.sendReaction`'s group
+SEND leg is contract 1.159 (queued, the C-S7r passthrough) — this
+batch is receive-only. The two stale "needs the group context the
+story.received projection does not carry" sentences (§4.77/§4.151,
+schema-mirrored) are corrected in place: the projection has carried
+the group context since the engine's E2 batch.
+
+Tests: lib +2. The group-leg key arm (`story_group_legs_carry_their_
+group_key`) — the group story reaction forwards with the group's
+master key on the event and the conservative story.deleted group leg
+rides its key, zero store writes. The candidate arm
+(`story_delete_candidate_rides_the_group_buffer_miss`) — the group-DOE
+true miss riding the full candidate key set, the §4.91 flush still
+converging the late original through the unchanged buffer, the replay
+face riding nothing, the direct-leg miss staying the pure buffer. The
+1.154 pins flipped in place: the engine group-fold pin now routes the
+story face with the group key (plus the conservative bit-carrying
+group DOE leg and the 1:1 no-key pins), the service gate split drops
+the disabled reaction (the official isStoryReply drop) while the
+disabled deletion rides (the DOE faces do not gate — the 1.154 gate
+overturned), and the
+foreign-author group miss in the author-scope arm rides the candidate
+beside the silent fold. Tests 836 → 838, all green.
 
 ## 5. signal-cli Boundary
 

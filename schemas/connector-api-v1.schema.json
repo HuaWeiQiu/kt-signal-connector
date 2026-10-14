@@ -4252,7 +4252,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "storyAuthor", "storySentAt", "emoji"],
-      "description": "Send a reaction to one story (contract 1.152, §4.151, capability stories widened in place): the story-anchored reaction send, now a true engine passthrough — the §4.150 call-event proxy posture on the stories family (the engine's story-reaction batch S4, engine 4822e99, the official reactToStory alignment: the Reaction and StoryContext dual anchor, the same author and the same story timestamp). The connector's gate is the envelope only: the opaque accountId resolves to the linked account and storyAuthor/storySentAt/emoji ride verbatim onto the engine's sendStoryReaction {account, storyAuthor, storyTimestamp, emoji} — the semantic gate lives entirely in the engine's fail-closed parse (missing/empty author or emoji, zero timestamp, an unresolvable author, the identity-reject and profileSharing gates answer the engine's plain -32603, which the connector maps verbatim to UPSTREAM_ERROR retryable; the §4.17 unbound matcher still applying). The one local refusal is remove:true → INVALID_REQUEST (non-retryable): the official reaction is place-only (the upstream reactionForSend hardcodes remove:false, so the engine face carries no remove parameter) and a remove intent must never silently place. Nothing is written locally and no event is emitted (a story reaction has no row to pill on). v1 addresses author-direct reactions only: a group-story reaction needs the group context the story.received projection does not carry. Result: the engine's `{}` success object passes through untouched (the former {status: sent|unknown} settlement face is gone with the reject arm); an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN and is never retried automatically (a host may explicitly re-send with a fresh requestId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. Send lane, account-scoped mutating (the reaction-class write-lane mutex and delete drain barrier apply).",
+      "description": "Send a reaction to one story (contract 1.152, §4.151, capability stories widened in place): the story-anchored reaction send, now a true engine passthrough — the §4.150 call-event proxy posture on the stories family (the engine's story-reaction batch S4, engine 4822e99, the official reactToStory alignment: the Reaction and StoryContext dual anchor, the same author and the same story timestamp). The connector's gate is the envelope only: the opaque accountId resolves to the linked account and storyAuthor/storySentAt/emoji ride verbatim onto the engine's sendStoryReaction {account, storyAuthor, storyTimestamp, emoji} — the semantic gate lives entirely in the engine's fail-closed parse (missing/empty author or emoji, zero timestamp, an unresolvable author, the identity-reject and profileSharing gates answer the engine's plain -32603, which the connector maps verbatim to UPSTREAM_ERROR retryable; the §4.17 unbound matcher still applying). The one local refusal is remove:true → INVALID_REQUEST (non-retryable): the official reaction is place-only (the upstream reactionForSend hardcodes remove:false, so the engine face carries no remove parameter) and a remove intent must never silently place. Nothing is written locally and no event is emitted (a story reaction has no row to pill on). v1 addresses author-direct reactions only — the group-story send leg rides the ordinary group channel (reaction + storyContext + groupV2) and is contract 1.159 (queued; the receive projection has carried the group context since the engine's E2 batch, so the 1.94-era recorded reason is corrected here by contract 1.158). Result: the engine's `{}` success object passes through untouched (the former {status: sent|unknown} settlement face is gone with the reject arm); an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN and is never retried automatically (a host may explicitly re-send with a fresh requestId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. Send lane, account-scoped mutating (the reaction-class write-lane mutex and delete drain barrier apply).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "storyAuthor": {
@@ -4448,6 +4448,7 @@
             "story.viewed",
             "story.reaction",
             "story.deleted",
+            "story.deleteCandidate",
             "story.recipientUpdate",
             "group.changed",
             "message.deleteForMe",
@@ -4820,7 +4821,7 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["accountId", "emoji", "remove", "storyAuthor", "storySentAt"],
-                "description": "A peer's reaction to a story (contract 1.154, §4.153, capability stories): the 1:1 dataMessage.reaction whose storyReply anchor resolved (the engine's story-reaction batch S4 projection — no isStory bit, no group context), forwarded as one transient event. Stories are rowless (contract 1.76 §4.67), so the reaction has no row to fold against: the desktop joins on its own story timeline by the (storyAuthor, storySentAt) anchor and no-ops a stale or deleted-row anchor — the event claims candidacy, not identity. Transient like story.received: nothing persists, a missed delivery is not self-healed. remove rides the engine's isRemove bit (true = the peer removed their reaction; always serialized — a real delta, never an absent key); emoji is the placed emoji either way. The stories-disabled gate does not apply (the event is about the account's own story, not incoming story material — the §4.70 story.viewed precedent). Boundaries unchanged: a group-story reaction (isStory:true + groupContext) keeps the ordinary reaction fold into the group conversation, and the account's own outgoing story-reaction echo keeps the sent-transcript fold — neither reaches this event.",
+                "description": "A peer's reaction to a story (contract 1.154 §4.153, group legs contract 1.158 §4.156, capability stories): the dataMessage.reaction whose storyReply anchor resolved (the engine's story-reaction discrimination face — no isStory bit), forwarded as one transient event. Stories are rowless (contract 1.76 §4.67), so the reaction has no row to fold against: the desktop joins on its own story timeline by the (storyAuthor, storySentAt) anchor and no-ops a stale or deleted-row anchor — the event claims candidacy, not identity. The official receive routes by the target row's domain, and on the wire the group story reaction rides the ordinary group channel with the storyContext always present (reaction + storyReply + groupV2), so the co-presence is the judgment on the group leg exactly as on the 1:1 leg: the group leg rides groupId (the group master key standard base64, the groupInfo caliber; contract 1.158 — the 1.154 group fold into the group conversation is overturned) and the 1:1 leg carries no groupId. Transient like story.received: nothing persists, a missed delivery is not self-healed. remove rides the engine's isRemove bit (true = the peer removed their reaction; always serialized — a real delta, never an absent key); emoji is the placed emoji either way. The stories-disabled gate applies (contract 1.158 alignment with the official MessageReceiver: stories-blocked drops the whole isStoryReply envelope, reactions included — the 1.154 no-gate reading is overturned). Boundaries unchanged: a degraded storyReply (the key the engine did not project) keeps the ordinary reaction fold, and the account's own outgoing story-reaction echo keeps the sent-transcript fold — neither reaches this event.",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "emoji": {
@@ -4843,6 +4844,12 @@
                     "type": "integer",
                     "minimum": 0,
                     "description": "The story's own Signal timestamp (storyReply.sentTimestamp) — the anchor's sentAt half. Not engine-gated positive: a nonsense anchor simply no-ops desktop-side, the story.viewed candidacy posture."
+                  },
+                  "groupId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The group story's owning group (contract 1.158 §4.156): the group master key standard base64, the groupInfo.groupId caliber, present only on the group leg."
                   },
                   "sender": {
                     "type": "string",
@@ -4883,10 +4890,69 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["accountId", "storySentAt"],
-                "description": "A peer deleted their story (contract 1.154, §4.153, capability stories): the engine's envelope-level isStory remote-delete (dataMessage.remoteDelete on a storyMessage envelope, the story batch S5's receive leg) forwarded as one transient event. Stories are rowless connector-side (contract 1.76 §4.67), so the desktop drops the story from its own timeline by the (author = sender, storySentAt) anchor; the event claims candidacy, not identity. Incoming story material, hence the stories-disabled gate applies and has already dropped the envelope when the account opted out (stories.setDisabled) — exactly the story.received gate posture. Transient like story.received: nothing persists, a missed delivery is not self-healed. A group remote-delete carries no isStory bit and keeps the ordinary fold (the §4.67 group-story boundary) — it never reaches this event. sender/senderAci/senderName/timestamp are absent when the envelope did not carry them.",
+                "description": "A peer deleted their story (contract 1.154 §4.153, group leg contract 1.158 §4.156, capability stories): the engine's envelope-level isStory remote-delete (dataMessage.remoteDelete on a story-flagged envelope, the story batch S5's receive leg) forwarded as one transient event. Stories are rowless connector-side (contract 1.76 §4.67), so the desktop drops the story from its own timeline by the (author = sender, storySentAt) anchor; the event claims candidacy, not identity. The stories-disabled gate does not apply (contract 1.158 alignment with the official MessageReceiver: the stories-blocked drop removes isStoryReply envelopes only and leaves the DOE faces ungated — the 1.154 gate is overturned; a stale anchor simply no-ops desktop-side). Transient like story.received: nothing persists, a missed delivery is not self-healed. The bit routes on both legs: the group envelope that carries the isStory bit rides groupId (contract 1.158 — the conservative leg, officially legal, some clients may send it), the 1:1 leg carries no groupId; a group remote-delete with no bit keeps the ordinary fold (the wire cannot tell it from an ordinary group delete — the official group story deletion rides a regular group DOE) and rides the story.deleteCandidate candidacy event instead, never this event. sender/senderAci/senderName/timestamp are absent when the envelope did not carry them.",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "storySentAt": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The deleted story's own Signal timestamp (remoteDelete.timestamp) — the desktop's timeline removal anchor. Not engine-gated positive: a nonsense anchor no-ops desktop-side."
+                  },
+                  "groupId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The story's owning group on the conservative leg (contract 1.158 §4.156): the group master key standard base64, the groupInfo.groupId caliber, present only when the isStory-carrying DOE rode a group envelope."
+                  },
+                  "sender": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The deleting peer as the envelope resolved it (the story's author) when present."
+                  },
+                  "senderAci": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The deleting peer's ACI UUID (envelope sourceUuid) when present."
+                  },
+                  "senderName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The deleting peer's profile/contact display name when present."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The delete envelope's Signal timestamp when the engine projected one; absent means the envelope carried none."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "story.deleteCandidate" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "groupId", "targetSentTimestamp"],
+                "description": "A group delete-for-everyone whose target row has not landed (contract 1.158, §4.156, capability stories): the official group story deletion rides a regular group DOE — no isStory bit, no storyContext, wire-indistinguishable from an ordinary group delete — and a group story has no connector row to answer it, so the true §4.91 buffer miss on a group leg rides this candidacy event beside the unchanged buffer. The desktop joins (groupId, sender, targetSentTimestamp) against its own group story timeline and no-ops a stale or already-folded anchor — the event claims candidacy, not identity (the story.viewed/story.reaction posture); an ordinary group DOE whose original lands late still converges through the buffer and its candidacy no-ops. The stories-disabled gate does not apply (the official MessageReceiver does not gate DOE faces). Transient: nothing persists, nothing self-heals. A replayed delete whose row already answered is not a miss and rides nothing; direct-leg misses keep the pure buffer (the 1:1 story channel DOE carries the isStory bit and routes story.deleted). sender/senderAci/senderName/timestamp are absent when the envelope did not carry them.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "groupId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The addressed group: the group master key standard base64, the groupInfo.groupId caliber."
+                  },
+                  "targetSentTimestamp": {
                     "type": "integer",
                     "minimum": 0,
                     "description": "The deleted story's own Signal timestamp (remoteDelete.timestamp) — the desktop's timeline removal anchor. Not engine-gated positive: a nonsense anchor no-ops desktop-side."

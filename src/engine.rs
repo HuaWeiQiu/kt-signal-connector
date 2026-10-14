@@ -1139,35 +1139,53 @@ pub enum ControlReceive {
     Story {
         message: Value,
     },
-    /// Story-anchored reaction receive (contract 1.154, §4.153): the engine's
-    /// story-reaction discrimination face — a `dataMessage.reaction` whose
-    /// envelope carries the `storyReply` (storyContext) projection is a
-    /// reaction on a story, not on a message (the story batch S4's
-    /// receive-side judgment, engine docs §3: the anchor is the storyReply,
-    /// because the story has no conversation row for the reaction target to
-    /// fold onto). Only the 1:1 leg routes here — the group story reaction
-    /// keeps its plain group-reaction fold (the §4.67 group-story boundary,
-    /// 记档 not invented). The reaction payload stays the parsed reaction
-    /// (emoji, remove); the anchor is the storyReply face verbatim. The
-    /// stories-disabled gate does not apply (a reaction is a peer action on
-    /// the account's own story — the §4.70 own-story receipts family, not
-    /// incoming story material).
+    /// Story-anchored reaction receive (contract 1.154 §4.153, group legs
+    /// contract 1.158, §4.156): the engine's story-reaction discrimination
+    /// face — a `dataMessage.reaction` whose envelope carries the
+    /// `storyReply` (storyContext) projection is a reaction on a story,
+    /// not on a message (the story batch S4's receive-side judgment,
+    /// engine docs §3: the anchor is the storyReply, because the story has
+    /// no conversation row for the reaction target to fold onto). The
+    /// official receive routes by the target row's domain, and on the wire
+    /// the group story reaction rides the ordinary group channel with the
+    /// storyContext always present (reaction + storyReply + groupV2), so
+    /// the co-presence is the judgment on the group leg exactly as on the
+    /// 1:1 leg — the 1.154 group fold is overturned (§4.156). The group
+    /// leg carries `group_id` (the group master key standard base64, the
+    /// groupInfo caliber); the 1:1 leg carries none. A degraded storyReply
+    /// (the engine projects the key only when the author resolves) stays a
+    /// plain reaction — one authority, the shared helper. The reaction
+    /// payload stays the parsed reaction (emoji, remove); the anchor is
+    /// the storyReply face verbatim. The stories-disabled gate applies
+    /// (contract 1.158 alignment with the official MessageReceiver:
+    /// stories-blocked drops the whole isStoryReply envelope, reactions
+    /// included — the 1.154 no-gate reading is overturned).
     StoryReaction {
         emoji: String,
         remove: bool,
         story_author: String,
         story_sent_at: u64,
+        group_id: Option<String>,
     },
-    /// Peer story deletion (contract 1.154, §4.153): the story-channel DOE
-    /// face — `dataMessage.remoteDelete` riding the envelope `isStory` bit
-    /// (the story batch S5's receive leg ①, the E2 gate's
-    /// is_delete_for_everyone exemption). Only the 1:1 story channel routes
-    /// here: a group DOE keeps its plain remote-delete fold (the §4.67
-    /// group-story boundary), and a plain message DOE never carries the bit.
-    /// The stories-disabled gate applies (the deletion of incoming story
-    /// material — the same material family the story.received gate drops).
+    /// Peer story deletion (contract 1.154 §4.153, group leg contract
+    /// 1.158, §4.156): the story-channel DOE face —
+    /// `dataMessage.remoteDelete` riding the envelope `isStory` bit (the
+    /// story batch S5's receive leg ①, the E2 gate's
+    /// is_delete_for_everyone exemption). The bit routes here on both
+    /// legs: the 1:1 story channel, and — conservatively — the group
+    /// envelope that carries the bit (officially legal, some clients may
+    /// send it; §4.156). An unsigned group DOE keeps the plain
+    /// remote-delete fold: the official group story deletion rides a
+    /// regular group DOE with no bit and no storyContext, so the wire
+    /// cannot tell it from an ordinary group delete and the §4.156
+    /// `story.deleteCandidate` event owns that face. A plain message DOE
+    /// never carries the bit. The stories-disabled gate does not apply
+    /// (contract 1.158 alignment with the official MessageReceiver: the
+    /// stories-blocked drop removes isStoryReply envelopes only and
+    /// leaves the DOE faces ungated — the 1.154 gate is overturned).
     StoryDeleted {
         target_timestamp: u64,
+        group_id: Option<String>,
     },
     /// The engine's `syncMessage.storyRecipientUpdate` projection (contract
     /// 1.154, §4.153): the account's own devices learned one of its stories'
@@ -1897,18 +1915,22 @@ impl NormalizedReceive {
                     })
                     .sum(),
                 // The story faces carry bounded identity/emoji strings —
-                // the heap strings count here (§4.13).
+                // the heap strings count here (§4.13); the 1.158 group
+                // legs add the bounded group key to the count.
                 Some(ControlReceive::StoryReaction {
                     emoji,
                     story_author,
+                    group_id,
                     ..
                 }) => {
                     std::mem::size_of::<ControlReceive>()
                         + emoji.len()
                         + story_author.len()
+                        + group_id.as_ref().map_or(0, String::len)
                 }
-                Some(ControlReceive::StoryDeleted { .. }) => {
+                Some(ControlReceive::StoryDeleted { group_id, .. }) => {
                     std::mem::size_of::<ControlReceive>()
+                        + group_id.as_ref().map_or(0, String::len)
                 }
                 // The story recipient update carries heap entry Vecs like
                 // the contacts list — counted entry-wise (§4.13).
@@ -4783,16 +4805,19 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
     if let Some(data_message) = envelope.get("dataMessage").and_then(Value::as_object) {
         let group_id = data_message_group_id(data_message);
         if let Some(reaction) = data_message.get("reaction").and_then(normalized_reaction) {
-            // Story-anchored reaction (contract 1.154, §4.153): the
-            // reaction + storyReply co-presence is the engine's story
-            // discrimination face, and only the 1:1 leg routes to the
-            // transient story face — a group story reaction keeps its plain
-            // group-reaction fold (the §4.67 group-story boundary, 记档 not
-            // invented). A degraded storyReply (the engine projects the key
-            // only when the author resolves) stays a plain reaction. The
-            // anchor is the storyReply face; the reaction target face is
-            // the same author/timestamp by the official dual-anchor
-            // alignment and is not transported twice.
+            // Story-anchored reaction (contract 1.154 §4.153, group legs
+            // contract 1.158, §4.156): the reaction + storyReply co-presence
+            // is the engine's story discrimination face on the group leg
+            // exactly as on the 1:1 leg — the official group story reaction
+            // rides the ordinary group channel with the storyContext always
+            // present (reaction + storyReply + groupV2), so the wire
+            // judgment is one judgment and the group leg carries the group
+            // key (the §4.156 翻案 of the 1.154 group fold). A degraded
+            // storyReply (the engine projects the key only when the author
+            // resolves) stays a plain reaction. The anchor is the
+            // storyReply face; the reaction target face is the same
+            // author/timestamp by the official dual-anchor alignment and is
+            // not transported twice.
             let ControlReceive::Reaction {
                 emoji,
                 target_author,
@@ -4802,18 +4827,17 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             else {
                 unreachable!("normalized_reaction only answers the Reaction variant");
             };
-            if group_id.is_none()
-                && let Some(story) = normalized_story_reply(data_message)
-            {
+            if let Some(story) = normalized_story_reply(data_message) {
                 return Some(ControlRouting {
                     direction: "incoming",
                     source: envelope_peer_source(envelope),
-                    group_id: None,
+                    group_id: group_id.clone(),
                     control: ControlReceive::StoryReaction {
                         emoji,
                         remove,
                         story_author: story.author_aci,
                         story_sent_at: story.sent_timestamp,
+                        group_id: group_id.clone(),
                     },
                 });
             }
@@ -4835,19 +4859,25 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             .and_then(|object| object.get("timestamp"))
             .and_then(Value::as_u64)
         {
-            // Story-channel DOE (contract 1.154, §4.153): the envelope
-            // `isStory` bit marks the deletion riding the story channel —
-            // the story batch S5's receive leg ①. Only the 1:1 leg routes
-            // to the transient story face; a group DOE keeps the plain
-            // remote-delete fold (the §4.67 group-story boundary).
-            if envelope.get("isStory").and_then(Value::as_bool) == Some(true) && group_id.is_none()
-            {
+            // Story-channel DOE (contract 1.154 §4.153, group leg contract
+            // 1.158, §4.156): the envelope `isStory` bit marks the deletion
+            // riding the story channel — the story batch S5's receive leg
+            // ①. The bit routes here on both legs: the 1:1 story channel
+            // and, conservatively, the group envelope that carries the bit
+            // (officially legal, some clients may send it). An unsigned
+            // group DOE keeps the plain remote-delete fold: the official
+            // group story deletion rides a regular group DOE with no bit
+            // and no storyContext, so the wire cannot tell it from an
+            // ordinary group delete and the §4.156 candidate event owns
+            // that face.
+            if envelope.get("isStory").and_then(Value::as_bool) == Some(true) {
                 return Some(ControlRouting {
                     direction: "incoming",
                     source: envelope_peer_source(envelope),
-                    group_id: None,
+                    group_id: group_id.clone(),
                     control: ControlReceive::StoryDeleted {
                         target_timestamp: target,
+                        group_id: group_id.clone(),
                     },
                 });
             }
@@ -10401,10 +10431,13 @@ mod tests {
     }
 
     /// The §4.153 story receive faces route to their transients (contract
-    /// 1.154): the 1:1 reaction + storyReply co-presence is the story face;
-    /// a degraded storyReply (the engine projects the key only when the
-    /// author resolves) and the group shape keep their plain folds; the
-    /// envelope `isStory` remote-delete is the story DOE while a group DOE
+    /// 1.154; the group legs contract 1.158, §4.156): the reaction +
+    /// storyReply co-presence is the story face on the 1:1 leg and — the
+    /// 1.158 翻案 — on the group leg with its group key; a degraded
+    /// storyReply (the engine projects the key only when the author
+    /// resolves) keeps its plain fold; the envelope `isStory` remote-delete
+    /// is the story DOE on the 1:1 leg and on the group envelope that
+    /// carries the bit (the conservative leg) while an unsigned group DOE
     /// stays plain; and the `syncMessage.storyRecipientUpdate` self-sync
     /// rides its positive-stamp and non-empty-recipients gates.
     #[test]
@@ -10436,6 +10469,7 @@ mod tests {
             remove,
             story_author,
             story_sent_at,
+            group_id,
         }) = normalize(story_reaction).control
         else {
             panic!("a 1:1 story reaction routes to the story face");
@@ -10444,6 +10478,7 @@ mod tests {
         assert!(remove, "the isRemove bit rides the story face");
         assert_eq!(story_author, "22222222-2222-2222-2222-222222222222");
         assert_eq!(story_sent_at, 1726999999000);
+        assert_eq!(group_id, None, "the 1:1 leg carries no group key");
 
         // The degraded shape — storyReply without its timestamp (the engine
         // projects the key only when the author resolves) — stays a plain
@@ -10467,8 +10502,10 @@ mod tests {
             Some(ControlReceive::Reaction { .. })
         ));
 
-        // The group shape — reaction + storyReply under a groupContext —
-        // keeps the plain group-reaction fold with its group id.
+        // The group shape — reaction + storyReply + groupV2, the official
+        // group-channel wire — routes the story face with its group key
+        // (contract 1.158, §4.156: the co-presence judgment is one
+        // judgment; the 1.154 group fold is overturned).
         let group_shape = normalize(json!({
             "timestamp": 1727000000000u64,
             "source": "+15555550101",
@@ -10487,15 +10524,16 @@ mod tests {
                 },
             },
         }));
-        match group_shape.control {
-            Some(ControlReceive::Reaction { .. }) => {
-                assert_eq!(group_shape.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
-            }
-            other => panic!("a group story reaction keeps the plain fold: {other:?}"),
-        }
+        let Some(ControlReceive::StoryReaction { group_id, .. }) = group_shape.control else {
+            panic!("a group story reaction routes to the story face with its group key");
+        };
+        assert_eq!(group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
 
         // The 1:1 story DOE: envelope isStory + remoteDelete.
-        let Some(ControlReceive::StoryDeleted { target_timestamp }) = normalize(json!({
+        let Some(ControlReceive::StoryDeleted {
+            target_timestamp,
+            group_id,
+        }) = normalize(json!({
             "timestamp": 1727000000000u64,
             "source": "+15555550101",
             "isStory": true,
@@ -10508,9 +10546,35 @@ mod tests {
             panic!("a 1:1 story DOE routes to the story face");
         };
         assert_eq!(target_timestamp, 1726999999000);
+        assert_eq!(group_id, None, "the 1:1 leg carries no group key");
 
-        // A group DOE (no isStory bit on the group leg) keeps the plain
-        // remote-delete fold.
+        // The conservative leg (contract 1.158, §4.156): a group envelope
+        // that carries the isStory bit routes the story face with its group
+        // key (officially legal, some clients may send it).
+        let group_bit_doe = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "isStory": true,
+            "dataMessage": {
+                "remoteDelete": { "timestamp": 1726999999000u64 },
+                "groupInfo": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                },
+            },
+        }));
+        let Some(ControlReceive::StoryDeleted {
+            target_timestamp,
+            group_id,
+        }) = group_bit_doe.control
+        else {
+            panic!("a bit-carrying group DOE routes to the story face");
+        };
+        assert_eq!(target_timestamp, 1726999999000);
+        assert_eq!(group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+
+        // An unsigned group DOE (no isStory bit on the group leg) keeps the
+        // plain remote-delete fold — the official group story deletion is
+        // wire-indistinguishable and owns the §4.156 candidate event.
         let group_doe = normalize(json!({
             "timestamp": 1727000000000u64,
             "source": "+15555550101",
@@ -10526,7 +10590,7 @@ mod tests {
                 assert_eq!(target_timestamp, 1726999999000);
                 assert_eq!(group_doe.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
             }
-            other => panic!("a group DOE keeps the plain fold: {other:?}"),
+            other => panic!("an unsigned group DOE keeps the plain fold: {other:?}"),
         }
 
         // The self-sync face: storyRecipientUpdate rides with its

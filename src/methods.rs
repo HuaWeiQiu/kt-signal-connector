@@ -805,7 +805,15 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// leg (the engine's audience-at-least-one-domain gate mirrored) and
 /// keeping its refusal without it, and the additive
 /// `group:{groupId,timestamp}` answer face passing the projection through;
-/// the same no-new-bit discipline) and by revision 1.156 (the §4.154
+/// the same no-new-bit discipline) and by revision 1.158 (the §4.156
+/// group story receive 翻案 — the reaction + storyReply co-presence
+/// routing the story face on the group leg exactly as on the 1:1 leg
+/// (the official group-channel wire's always-present storyContext), the
+/// conservative isStory-carrying group DOE leg, the new transient
+/// `story.deleteCandidate` candidacy event over the group-DOE true buffer
+/// miss, and the stories-disabled gate realigned onto the reaction (the
+/// official stories-blocked whole-envelope drop); the same no-new-bit
+/// discipline) and by revision 1.156 (the §4.154
 /// story-reply and media-story send legs on the existing send faces — the
 /// `messages.sendText` storyReply context keys riding the send frame
 /// verbatim, the engine's storyContext parse owning the pair discipline and

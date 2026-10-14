@@ -1170,35 +1170,70 @@ pub enum HostSideEvent {
         sent_timestamps: Vec<u64>,
         viewed_at: u64,
     },
-    /// A peer's reaction to a story (contract 1.154, §4.153): the 1:1
-    /// `dataMessage.reaction` whose `storyReply` anchor resolved — the
-    /// reaction has no row to fold against (stories are rowless, §4.67), so
-    /// the desktop joins on its own story timeline by the (author, sentAt)
-    /// anchor and no-ops a stale one. Transient like `story.received`:
-    /// nothing persists, nothing self-heals. The stories-disabled gate does
-    /// not apply (the event is about the account's own story, not incoming
-    /// story material — the §4.70 receipt precedent).
+    /// A peer's reaction to a story (contract 1.154 §4.153, group legs
+    /// contract 1.158, §4.156): the `dataMessage.reaction` whose
+    /// `storyReply` anchor resolved — the reaction has no row to fold
+    /// against (stories are rowless, §4.67), so the desktop joins on its
+    /// own story timeline by the (author, sentAt) anchor and no-ops a
+    /// stale one. The group leg rides `group_id` (the group master key
+    /// standard base64, the groupInfo caliber) beside the anchor — the
+    /// desktop narrows the join to that group's story timeline; the 1:1
+    /// leg carries none. Transient like `story.received`: nothing
+    /// persists, nothing self-heals. The stories-disabled gate applies
+    /// (contract 1.158 alignment with the official MessageReceiver:
+    /// stories-blocked drops the whole isStoryReply envelope, reactions
+    /// included — the 1.154 no-gate reading is overturned).
     StoryReaction {
         account_id: String,
         emoji: String,
         remove: bool,
         story_author: String,
         story_sent_at: u64,
+        group_id: Option<String>,
         sender: Option<String>,
         sender_aci: Option<String>,
         sender_name: Option<String>,
         timestamp: Option<u64>,
     },
-    /// A peer deleted their story (contract 1.154, §4.153): the engine's
-    /// envelope-level `isStory` remote-delete (`dataMessage.remoteDelete` on
-    /// a `storyMessage` envelope) forwarded so the desktop drops the story
-    /// from its own timeline. Incoming story material — the stories-disabled
-    /// gate applies and drops the envelope exactly like `story.received`.
-    /// Transient like `story.received`: nothing persists, nothing
-    /// self-heals.
+    /// A peer deleted their story (contract 1.154 §4.153, group leg
+    /// contract 1.158, §4.156): the engine's envelope-level `isStory`
+    /// remote-delete (`dataMessage.remoteDelete` on a story-flagged
+    /// envelope) forwarded so the desktop drops the story from its own
+    /// timeline. The bit routes on both legs — the group envelope that
+    /// carries the bit rides `group_id` (the conservative leg; some
+    /// clients may send it), the 1:1 leg carries none; an unsigned group
+    /// DOE keeps the ordinary fold and rides the `story.deleteCandidate`
+    /// candidacy event instead (§4.156). The stories-disabled gate does
+    /// not apply (contract 1.158: the official MessageReceiver leaves
+    /// the DOE faces ungated — the 1.154 gate is overturned). Transient
+    /// like `story.received`: nothing persists, nothing self-heals.
     StoryDeleted {
         account_id: String,
         story_sent_at: u64,
+        group_id: Option<String>,
+        sender: Option<String>,
+        sender_aci: Option<String>,
+        sender_name: Option<String>,
+        timestamp: Option<u64>,
+    },
+    /// A group delete-for-everyone whose target row has not landed
+    /// (contract 1.158, §4.156): the official group story deletion rides a
+    /// regular group DOE — no bit, no storyContext, wire-indistinguishable
+    /// from an ordinary group delete — and a group story has no row to
+    /// answer it, so the true §4.91 buffer miss (the store answered no
+    /// row) rides this candidacy event beside the unchanged buffer. The
+    /// desktop joins (groupId, sender, targetSentTimestamp) against its
+    /// own group story timeline and no-ops a stale or already-folded
+    /// anchor — the event claims candidacy, not identity (the
+    /// story.viewed/story.reaction posture). An ordinary group DOE whose
+    /// original lands late converges through the unchanged buffer; its
+    /// candidacy no-ops. The stories-disabled gate does not apply (the
+    /// official MessageReceiver does not gate DOE faces). Transient:
+    /// nothing persists, nothing self-heals.
+    StoryDeleteCandidate {
+        account_id: String,
+        group_id: String,
+        target_sent_timestamp: u64,
         sender: Option<String>,
         sender_aci: Option<String>,
         sender_name: Option<String>,
@@ -9013,47 +9048,63 @@ impl ConnectorService {
                 story: message.clone(),
             }]);
         }
-        // Peer story reactions (contract 1.154, §4.153): the routing split
-        // the 1:1 reaction face a story apart — a reaction whose `storyReply`
-        // anchor resolved and that addresses no group is aimed at a story,
-        // intercepted before the ladder like `story.received` (a story
-        // addresses no conversation, and the reacting viewer may never have
-        // a direct thread). No gate: the event is about the account's own
-        // story, not incoming story material (the §4.70 receipt precedent).
-        // Group-story reactions and degraded shapes without the anchor keep
+        // Peer story reactions (contract 1.154 §4.153, group legs contract
+        // 1.158, §4.156): the routing split the reaction face a story apart
+        // by the storyReply co-presence — on the group leg exactly as on the
+        // 1:1 leg (the official group story reaction rides the ordinary
+        // group channel with the storyContext always present), intercepted
+        // before the ladder like `story.received` (a story addresses no
+        // conversation, and the reacting viewer may never have a direct
+        // thread; the group key rides the control face, not the ladder).
+        // The stories-disabled gate applies (contract 1.158 alignment with
+        // the official MessageReceiver: stories-blocked drops the whole
+        // isStoryReply envelope, reactions included — the 1.154 no-gate
+        // reading is overturned). Degraded shapes without the anchor keep
         // the ordinary reaction fold.
         if let ControlReceive::StoryReaction {
             emoji,
             remove,
             story_author,
             story_sent_at,
+            group_id,
         } = &control
         {
+            if self.store.stories_disabled(&account.id)? {
+                return Ok(Vec::new());
+            }
             return Ok(vec![HostSideEvent::StoryReaction {
                 account_id: account.id.clone(),
                 emoji: emoji.clone(),
                 remove: *remove,
                 story_author: story_author.clone(),
                 story_sent_at: *story_sent_at,
+                group_id: group_id.clone(),
                 sender: receive.source.clone(),
                 sender_aci: receive.source_uuid.clone(),
                 sender_name: receive.peer_name.clone(),
                 timestamp: receive.timestamp,
             }]);
         }
-        // A peer deleted their story (contract 1.154, §4.153): the
-        // envelope-level `isStory` remote-delete forwarded before the ladder
-        // — incoming story material, so the stories-disabled gate applies
-        // and drops the envelope exactly like `story.received`. A group
-        // remote-delete carries no `isStory` bit and keeps the ordinary
-        // fold.
-        if let ControlReceive::StoryDeleted { target_timestamp } = &control {
-            if self.store.stories_disabled(&account.id)? {
-                return Ok(Vec::new());
-            }
+        // A peer deleted their story (contract 1.154 §4.153, group leg
+        // contract 1.158, §4.156): the envelope-level `isStory` remote-delete
+        // forwarded before the ladder. The stories-disabled gate does NOT
+        // apply (contract 1.158 alignment with the official MessageReceiver:
+        // the stories-blocked drop removes isStoryReply envelopes only and
+        // leaves the DOE faces ungated — the 1.154 incoming-material gate is
+        // overturned; the desktop's story-timeline join no-ops stale
+        // anchors). The bit routes on both legs: the group envelope that
+        // carries the bit rides its group key (the conservative leg); an
+        // unsigned group DOE keeps the ordinary fold and the §4.156
+        // candidate event owns its story face.
+        if let ControlReceive::StoryDeleted {
+            target_timestamp,
+            group_id,
+        } = &control
+        {
             return Ok(vec![HostSideEvent::StoryDeleted {
                 account_id: account.id.clone(),
                 story_sent_at: *target_timestamp,
+                group_id: group_id.clone(),
                 sender: receive.source.clone(),
                 sender_aci: receive.source_uuid.clone(),
                 sender_name: receive.peer_name.clone(),
@@ -9366,14 +9417,32 @@ impl ConnectorService {
                         viewed_at: None,
                     }]),
                     // A replay (the row is already remote-deleted by this
-                    // author) stays silent. §4.91: no row by this author at
+                    // author) stays silent and buffers exactly as
+                    // pre-1.158 (the parked entry expires or answers
+                    // nothing on flush). §4.91: no row by this author at
                     // this timestamp means the original has not landed —
-                    // buffer the delete (the author's own identity keys it)
-                    // instead of dropping it, so a late original converges.
-                    // The age gate above already refused the aged faces, so
-                    // only a delete that could still honestly compose is
-                    // ever buffered.
-                    _ => {
+                    // buffer the delete (the author's own identity keys
+                    // it) instead of dropping it, so a late original
+                    // converges. The age gate above already refused the
+                    // aged faces, so only a delete that could still
+                    // honestly compose is ever buffered.
+                    //
+                    // Contract 1.158 (§4.156): on the TRUE miss — the
+                    // store answered no row at all — a group leg also
+                    // rides the `story.deleteCandidate` candidacy event
+                    // beside the unchanged buffer: the official group
+                    // story deletion rides a regular group DOE and a
+                    // group story has no row to answer it, so the miss is
+                    // exactly the shape a group story delete produces. A
+                    // replayed face matched a row (never a story) and
+                    // rides no candidate. Direct legs keep the pure
+                    // buffer: the 1:1 story channel DOE carries the
+                    // isStory bit and routes `story.deleted` upstream of
+                    // this arm. The stories-disabled gate does not apply
+                    // (the official MessageReceiver does not gate DOE
+                    // faces); the desktop's story-timeline join no-ops a
+                    // stale anchor.
+                    Some((_record, false)) => {
                         self.buffer_early_control(EarlyControlEntry {
                             account_id: account.id.clone(),
                             kind: if kind == "group" { "group" } else { "direct" },
@@ -9383,6 +9452,32 @@ impl ConnectorService {
                             buffered_at: now_ms(),
                             payload: EarlyControlPayload::RemoteDelete,
                         });
+                        Ok(Vec::new())
+                    }
+                    None => {
+                        self.buffer_early_control(EarlyControlEntry {
+                            account_id: account.id.clone(),
+                            kind: if kind == "group" { "group" } else { "direct" },
+                            peer_key: peer_key.to_string(),
+                            target_sent_at: target_timestamp,
+                            author_sender_id,
+                            buffered_at: now_ms(),
+                            payload: EarlyControlPayload::RemoteDelete,
+                        });
+                        if kind == "group" {
+                            return Ok(vec![HostSideEvent::StoryDeleteCandidate {
+                                account_id: account.id.clone(),
+                                group_id: receive
+                                    .group_id
+                                    .clone()
+                                    .unwrap_or_else(|| peer_key.to_string()),
+                                target_sent_timestamp: target_timestamp,
+                                sender: receive.source.clone(),
+                                sender_aci: receive.source_uuid.clone(),
+                                sender_name: receive.peer_name.clone(),
+                                timestamp: receive.timestamp,
+                            }]);
+                        }
                         Ok(Vec::new())
                     }
                 }
@@ -26872,14 +26967,17 @@ mod tests {
         assert_eq!(listed.items.len(), 1, "no second reply row");
     }
 
-    /// The §4.153 story transient family (contract 1.154): a peer's story
-    /// reaction, a peer's story deletion, and the own-story recipient sync
-    /// forward as their transient events without touching the store — no
-    /// row, no conversation. The gate discrimination follows the story
-    /// material: `story.deleted` (incoming story material) drops under the
-    /// stories-disabled toggle while `story.reaction` and
-    /// `story.recipientUpdate` (events about the account's own story) ride
-    /// regardless of it.
+    /// The §4.153 story transient family (contract 1.154; the gate split
+    /// contract 1.158, §4.156): a peer's story reaction, a peer's story
+    /// deletion, and the own-story recipient sync forward as their
+    /// transient events without touching the store — no row, no
+    /// conversation. The gate discrimination follows the official
+    /// MessageReceiver: stories-blocked drops the whole isStoryReply
+    /// envelope, so `story.reaction` (the 1.158 翻案 — the 1.154 no-gate
+    /// reading is overturned) drops under the stories-disabled toggle
+    /// while `story.deleted` rides (the DOE faces do not gate — the 1.154
+    /// incoming-material gate is overturned) and `story.recipientUpdate`
+    /// (the own-distribution sync) rides regardless.
     #[test]
     fn story_transient_faces_forward_without_rows_and_split_on_the_gate() {
         let (_temp, mut service) = service();
@@ -26894,6 +26992,7 @@ mod tests {
                 remove: false,
                 story_author: "22222222-2222-2222-2222-222222222222".to_string(),
                 story_sent_at: 1726999999000,
+                group_id: None,
             },
         );
         let deleted = control_receive(
@@ -26901,6 +27000,7 @@ mod tests {
             "+15555550101",
             ControlReceive::StoryDeleted {
                 target_timestamp: 1726999999000,
+                group_id: None,
             },
         );
         let recipient_update = control_receive(
@@ -26927,6 +27027,7 @@ mod tests {
             remove,
             story_author,
             story_sent_at,
+            group_id,
             sender,
             sender_aci,
             sender_name,
@@ -26940,6 +27041,7 @@ mod tests {
         assert!(!remove);
         assert_eq!(story_author, "22222222-2222-2222-2222-222222222222");
         assert_eq!(*story_sent_at, 1726999999000);
+        assert_eq!(group_id, &None, "the 1:1 leg carries no group key");
         assert_eq!(sender.as_deref(), Some("+15555550199"));
         assert_eq!(
             sender_aci, &None,
@@ -27001,8 +27103,12 @@ mod tests {
             "a story reaction addresses no conversation and creates none"
         );
 
-        // Disabled: the story deletion drops (incoming story material),
-        // the reaction and the recipient sync ride (own-story events).
+        // Disabled: the reaction drops (contract 1.158 翻案 — the official
+        // stories-blocked drop covers the whole isStoryReply envelope,
+        // reactions included); the story deletion RIDES (contract 1.158
+        // 翻案 the other way — the official MessageReceiver leaves the DOE
+        // faces ungated, the 1.154 incoming-material gate is overturned)
+        // and the recipient sync rides (the own-distribution sync).
         service
             .store_ref()
             .set_stories_disabled(&account.id, true)
@@ -27011,15 +27117,225 @@ mod tests {
             service
                 .ingest_receive(deleted, crate::DEFAULT_PROXY_GROUP_ID)
                 .unwrap()
-                .is_empty(),
-            "a disabled story deletion drops"
+                .len()
+                == 1,
+            "a disabled story deletion rides (DOE faces do not gate)"
         );
-        for own_story in [reaction, recipient_update] {
-            let events = service
-                .ingest_receive(own_story, crate::DEFAULT_PROXY_GROUP_ID)
-                .unwrap();
-            assert_eq!(events.len(), 1, "own-story transients ignore the gate");
-        }
+        assert!(
+            service
+                .ingest_receive(reaction, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "a disabled story reaction drops (the official isStoryReply drop)"
+        );
+        let events = service
+            .ingest_receive(recipient_update, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "the own-distribution sync rides the gate");
+    }
+
+    /// The §4.156 group legs carry their group key (contract 1.158): the
+    /// group story reaction forwards as `story.reaction` with the group's
+    /// master key on the event, and the conservative leg — a group
+    /// envelope whose DOE carries the isStory bit — forwards as
+    /// `story.deleted` with it. Neither touches the store.
+    #[test]
+    fn story_group_legs_carry_their_group_key() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let mut reaction = control_receive_named(
+            "+15555550100",
+            "+15555550199",
+            "Peer",
+            ControlReceive::StoryReaction {
+                emoji: "👍".to_string(),
+                remove: false,
+                story_author: "22222222-2222-2222-2222-222222222222".to_string(),
+                story_sent_at: 1726999999000,
+                group_id: Some("Z3JvdXAtYXV0aA".to_string()),
+            },
+        );
+        reaction.group_id = Some("Z3JvdXAtYXV0aA".into());
+        let events = service
+            .ingest_receive(reaction, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryReaction {
+            group_id, sender, ..
+        } = &events[0]
+        else {
+            panic!("expected a StoryReaction event: {events:?}");
+        };
+        assert_eq!(group_id.as_deref(), Some("Z3JvdXAtYXV0aA"));
+        assert_eq!(sender.as_deref(), Some("+15555550199"));
+
+        let mut deleted = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::StoryDeleted {
+                target_timestamp: 1726999999000,
+                group_id: Some("Z3JvdXAtYXV0aA".to_string()),
+            },
+        );
+        deleted.group_id = Some("Z3JvdXAtYXV0aA".into());
+        let events = service
+            .ingest_receive(deleted, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryDeleted {
+            group_id,
+            story_sent_at,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected a StoryDeleted event: {events:?}");
+        };
+        assert_eq!(group_id.as_deref(), Some("Z3JvdXAtYXV0aA"));
+        assert_eq!(*story_sent_at, 1726999999000);
+
+        // Nothing persisted: the group conversation's rows are untouched.
+        assert!(
+            service
+                .list_messages(&account.id, &conversation.id, 50, None)
+                .unwrap()
+                .items
+                .is_empty(),
+            "story transients create no row"
+        );
+    }
+
+    /// The §4.156 candidate face (contract 1.158): a group DOE whose target
+    /// row has not landed buffers (the §4.91 discipline unchanged) and — on
+    /// the true store miss — rides the `story.deleteCandidate` candidacy
+    /// event with its full key set; a late original still converges the
+    /// landed row through the buffer; a replayed delete (the row already
+    /// answered) rides nothing; a direct-leg miss keeps the pure buffer.
+    #[test]
+    fn story_delete_candidate_rides_the_group_buffer_miss() {
+        let (_temp, mut service) = service();
+        let (account, _direct) = linked_account_and_conversation(&mut service);
+        let group = service
+            .store_ref()
+            .ensure_conversation(&account.id, "group", "Z3JvdXAtYXV0aA", "Candidate Group")
+            .unwrap();
+
+        // The miss face: the group delete names a row that has not landed.
+        let mut early = control_receive_named(
+            "+15555550100",
+            "+15555550101",
+            "Early Author",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 700,
+            },
+        );
+        early.direction = "incoming";
+        early.group_id = Some("Z3JvdXAtYXV0aA".into());
+        let events = service
+            .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryDeleteCandidate {
+            account_id: event_account,
+            group_id,
+            target_sent_timestamp,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+        } = &events[0]
+        else {
+            panic!("expected a StoryDeleteCandidate event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(group_id, "Z3JvdXAtYXV0aA");
+        assert_eq!(*target_sent_timestamp, 700);
+        assert_eq!(sender.as_deref(), Some("+15555550101"));
+        assert_eq!(sender_aci, &None);
+        assert_eq!(sender_name.as_deref(), Some("Early Author"));
+        assert_eq!(*timestamp, Some(500));
+        // The store is untouched: the candidacy claims, never applies.
+        assert!(
+            service
+                .list_messages(&account.id, &group.id, 50, None)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        // The buffer still converges: the late original lands and the
+        // buffered delete applies through the unchanged §4.91 flush.
+        let original = NormalizedReceive {
+            timestamp: Some(700),
+            content_kind: "dataMessage",
+            direction: "incoming",
+            account_present: true,
+            account: Some("+15555550100".into()),
+            source: Some("+15555550101".into()),
+            source_uuid: None,
+            peer_name: None,
+            group_id: Some("Z3JvdXAtYXV0aA".into()),
+            text: Some("late group original".into()),
+            text_bytes: Some(19),
+            text_truncated: false,
+            quote: None,
+            attachments: Vec::new(),
+            rich: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            control: None,
+            server_guid: None,
+            server_timestamp: None,
+        };
+        let events = service
+            .ingest_receive(original, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                HostSideEvent::MessageStatusChanged { status, .. } if *status == "remote-deleted"
+            )),
+            "the buffered group delete converges the landed row, got {events:?}"
+        );
+
+        // The replay face: the row already answered — silent, no second
+        // candidacy (a row matched, never a story).
+        let mut replay = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::RemoteDelete {
+                target_timestamp: 700,
+            },
+        );
+        replay.group_id = Some("Z3JvdXAtYXV0aA".into());
+        assert!(
+            service
+                .ingest_receive(replay, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "a replayed group delete rides no candidate"
+        );
+
+        // The direct-leg miss keeps the pure buffer (the 1:1 story DOE
+        // carries the isStory bit and routes story.deleted upstream of this
+        // arm): no candidate on the direct conversation.
+        let direct_early = service
+            .ingest_receive(
+                control_receive(
+                    "+15555550100",
+                    "+15555550103",
+                    ControlReceive::RemoteDelete {
+                        target_timestamp: 900,
+                    },
+                ),
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap();
+        assert!(
+            direct_early.is_empty(),
+            "a direct-leg miss stays the pure buffer: {direct_early:?}"
+        );
     }
 
     /// The §4.117 conversation-less transient family (contract 1.134):
@@ -30116,8 +30432,12 @@ mod tests {
         );
 
         // A delete from an author with no row at this timestamp touches
-        // nothing: the store answers no matching row and the arm stays
-        // silent (the §4.91 early-arrival buffer owns the absent case).
+        // nothing: the store answers no matching row, the §4.91
+        // early-arrival buffer owns the absent case, and — contract 1.158
+        // (§4.156) — the true group miss rides the story.deleteCandidate
+        // candidacy event (the official group story deletion is
+        // wire-indistinguishable; the desktop's timeline join no-ops a
+        // stale anchor).
         let mut foreign = control_receive(
             "+15555550100",
             "+15555550103",
@@ -30126,12 +30446,18 @@ mod tests {
             },
         );
         foreign.group_id = Some("Z3JvdXAtYXV0aA".into());
-        assert!(
-            service
-                .ingest_receive(foreign, crate::DEFAULT_PROXY_GROUP_ID)
-                .unwrap()
-                .is_empty()
-        );
+        let foreign_events = service
+            .ingest_receive(foreign, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(foreign_events.len(), 1, "{foreign_events:?}");
+        assert!(matches!(
+            &foreign_events[0],
+            HostSideEvent::StoryDeleteCandidate {
+                group_id,
+                target_sent_timestamp,
+                ..
+            } if group_id == "Z3JvdXAtYXV0aA" && *target_sent_timestamp == 700
+        ));
         let rows = service
             .list_messages(&account.id, &group.id, 10, None)
             .unwrap()
@@ -30857,7 +31183,9 @@ mod tests {
             .ensure_conversation(&account.id, "group", "Z3JvdXAtYnVmZmVy", "Buffer Group")
             .unwrap();
         let _ = conversation;
-        // Author A's delete arrives first — buffered.
+        // Author A's delete arrives first — buffered (§4.91 unchanged), and
+        // contract 1.158 (§4.156): the true group miss rides the
+        // story.deleteCandidate candidacy event beside the buffer.
         let mut early = control_receive(
             "+15555550100",
             "+15555550101",
@@ -30866,12 +31194,18 @@ mod tests {
             },
         );
         early.group_id = Some("Z3JvdXAtYnVmZmVy".into());
-        assert!(
-            service
-                .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
-                .unwrap()
-                .is_empty()
-        );
+        let early_events = service
+            .ingest_receive(early, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(early_events.len(), 1, "{early_events:?}");
+        assert!(matches!(
+            &early_events[0],
+            HostSideEvent::StoryDeleteCandidate {
+                group_id,
+                target_sent_timestamp,
+                ..
+            } if group_id == "Z3JvdXAtYnVmZmVy" && *target_sent_timestamp == 600
+        ));
 
         let seed_row = |service: &mut ConnectorService, source: &str| {
             let incoming = NormalizedReceive {
