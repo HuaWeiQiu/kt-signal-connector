@@ -35,7 +35,44 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.147 (2026-10-13; the R2 connector-first dual-stack
+- Contract revision: 1.148 (2026-10-14; the import-cancel face and the
+  honest engine-failure consumption (§4.146): `history.importCancel`
+  `{accountId}` → `{accountId, cancelled, state}` — the desktop's
+  cancel-sync stops being an unbind: the cancel marker stops the link-time
+  watcher and the automatic pickup for the process lifetime, the engine
+  forward (`history.importCancel {account}` → `{"cancelled": bool}`, the
+  frozen parallel kt-signal-engine contract) aborts the in-flight
+  transfer-archive download, a live NDJSON import pass exits through its
+  cooperative abort flag and lands `failed`/`cancelled` with its partial
+  counters, and the conditional running-row flip answers `failed` without
+  ever regressing a completed row. Cancel is idempotent across
+  pending/running/failed, never spends the ≤3-attempt budget (no
+  `begin_history_import` on any cancel path), and a canceled failed row
+  stays `history.importRetry`-able verbatim (the re-arm clears the
+  marker). And the wait window stops lying: inside the link-time window
+  with no row and no archive, the projection consults the engine's
+  `transfer.downloadStatus` once — a snapshot with a shaped `errorCode`
+  (the cloudStatus-family key, the engine 0a2ab18 vocabulary
+  `no_archive`/`network`/`cdn_unreachable`/`decode_failed`/`io`) resolves
+  the wait at once: `no_archive` maps onto the existing NO_ARCHIVE
+  information class (`unavailable`/`reason: "no-archive"` immediately, no
+  row, no budget), any other code lands an honest failed row through one
+  atomic `INSERT ... ON CONFLICT DO NOTHING` (the verbatim engine class,
+  unknown codes never normalized) and renders `failed` with its reason; a
+  malformed code, a down engine, or an engine predating either face keeps
+  the pre-1.48 answer byte-for-byte, and an `errorCode` snapshot never
+  renders `downloading` progress. Wire additive: one new method, one new
+  `unavailable` reason value (`cancelled`), and the ledger `errorClass`
+  vocabulary gains the engine's short codes plus `cancelled` — no new
+  event, error code, capability (the `history-import` tag widened in
+  place), or store schema move. Tests 797 → 810 (lib 602 → 608: the
+  projection mapping table, the conditional flip's never-regresses arm,
+  the atomic landing's no-clobber arm, the cancel-marker respect in the
+  probe and watcher, the lane whitelist rows; integration: the mid-pass
+  cancel with the retry-after arm, the idempotent double cancel, the
+  params/account gates, the `no_archive` and `cdn_unreachable`/`network`
+  faces and the malformed-code no-signal arm), all green) —
+  previously 1.147 (2026-10-13; the R2 connector-first dual-stack
   transport face (§4.145): `serve` gains `--listen HOST:PORT` as the strict
   argv alternative to `--endpoint` — an IPv4 loopback address only, checked
   at the argv gate and again at the listener, with port `0` the production
@@ -3316,6 +3353,10 @@ documented data-directory artifact instead of an RPC surface.
   `ACCOUNT_NOT_FOUND`. The method is read-lane, read metrics class; no new error codes.
   (Contract 1.54, §4.51, extends the `running` state with the optional `progress` object and
   adds the `history.importRetry` manual face — that section owns the widened shape. Contract
+  1.148, §4.146, resolves the wait-window `pending` against the engine's failure terminal
+  snapshot (`unavailable`/`no-archive` at once for `no_archive`, an immediate persisted
+  `failed` row for every other engine code, the new `unavailable` reason `cancelled` after a
+  `history.importCancel`) — that section owns the widened face. Contract
   1.56, attachv2 above, widens the import payload itself with the attachment pointer faces;
   the status/progress/retry faces are untouched by it.)
 - Store: one `history_imports` row per account (schema version 15, FK cascade with the account;
@@ -11455,6 +11496,180 @@ a served request over loopback, the wrong-secret AUTHENTICATION_FAILED
 arm with the process surviving the probe, and the stdout-silence pin on
 both legs. Tests 787 → 797 (lib 598 → 602). Gates: fmt, clippy
 `-D warnings`, tests all green, release build.
+
+### 4.146 The import stops when the desktop says stop: `history.importCancel` + the honest engine-failure face (contract revision 1.148, 2026-10-14)
+
+The desktop's cancel-sync button and the failure display close their two
+real-device gaps against the official baseline (cancel = the download stops
+immediately; a failed download shows itself at once with its reason; "the phone
+had nothing to transfer" is an information state, not an error). Two structural
+holes existed. First, there was no cancel face at all: the desktop could only
+unbind the account (deleting every local row) to stop a link-time transfer, and
+the engine's background transfer-archive download (the kt-signal-engine task the
+connector's §4.38 flow consumes across the spawned engine's jsonRpc face) kept
+running against a desktop that had already given up. Second, the wait window
+lied: when the engine's download failed, `history.importStatus` kept answering
+`pending` for the whole [`LINK_WAIT_MS`](§4.38) window and only then flipped to
+`unavailable`/`no-archive` — reporting a failed CDN transfer as "the phone had
+nothing to transfer", ten minutes late. This revision closes both. The engine
+half is a parallel kt-signal-engine batch landing the same frozen contract
+recorded here; the connector consumes it fail-closed (an engine that predates
+either face keeps the pre-1.148 behavior byte-for-byte).
+
+- **Frozen engine contract (kt-signal-engine, jsonRpc face)**: two additions,
+  both KT-extension methods on the spawned engine's JSON-RPC surface.
+  `history.importCancel` params `{account}` (the signal number, the standard
+  engine param face), result `{"cancelled": bool}` — `true` when the engine had
+  a live transfer-archive download for the account and aborted it, `false` when
+  nothing was in flight (the idempotent no-op answer). Mutating class
+  engine-side. And `transfer.downloadStatus` (the §4.51 progress snapshot read)
+  gains the failure terminal state: a snapshot carrying a non-empty string
+  `errorCode` is the terminal-failure face, the engine's short code vocabulary
+  `no_archive` | `network` | `cdn_unreachable` | `decode_failed` | `io`
+  (engine commit 0a2ab18; extensible engine-side — unseen codes are consumed
+  verbatim, never normalized; the `errorCode` key name is the
+  cloudStatus/uploadStatus family name, one spelling across every progress
+  snapshot). The failed snapshot may
+  still carry `bytesRead`/`bytesTotal?` as the last observed bytes and persists
+  until the next start overwrites it (the cloudStatus family discipline: the
+  snapshot is engine-process memory, a restart loses it and the engine retries
+  on its own schedule). A snapshot without `errorCode` keeps the pre-1.53 shape
+  byte-for-byte.
+- **`history.importCancel`** (host method, capability `history-import` —
+  widened in place, no new bit, the 1.53 precedent): params `{accountId}`; result
+  `{accountId, cancelled, state}`. `cancelled` mirrors the engine's answer —
+  `true` = the engine acknowledged aborting a live download; `false` = nothing
+  was in flight, the engine is down (a down engine has no download either — its
+  snapshot died with the process), or the engine predates the method. The
+  connector never fails the call on an engine-forward error: the connector-side
+  half of the cancel has already taken effect, the forward is best-effort and
+  never retried (the unknown-outcome red line — a mutating call whose outcome
+  the connector cannot read is reported as `cancelled: false`, never guessed).
+  `state` is the post-cancel projection state the desktop would read from
+  `history.importStatus`: `"failed"` when a ledger row survived the cancel (a
+  completed import, an earlier failure, or the pass this cancel just aborted),
+  `"running"` only for a stale row whose live pass has not been observed
+  aborting yet, `"unavailable"` when no row exists — after a cancel the face
+  never answers `pending` again this process lifetime.
+  Semantics, all three callable states, idempotent:
+  - *pending* (inside the wait window, no archive yet): the cancel marker is
+    registered first (an in-process bounded set of account ids — at most one
+    entry per linked account, no unbounded resource), so the link watcher's
+    next tick exits instead of waiting out [`LINK_WAIT_MS`](§4.38), the
+    eligibility probe refuses the account (the startup sweep skips it too —
+    automatic pickup stays suppressed for the process lifetime), and the engine
+    forward aborts the in-flight download. No ledger row is created: a cancel
+    must not spend the ≤3-attempt import budget (`begin_history_import` is the
+    only attempts writer and cancel never calls it).
+  - *running* (the connector's NDJSON import pass holds the group slot): the
+    cancel flips the run's cooperative abort flag (checked between archive
+    lines and between write batches), so the pass exits within one batch, its
+    stage scratch clears on the normal exit path, and the run lands
+    `failed` with the new `cancelled` error class carrying its partial
+    counters — the same honest ledger every other failed run writes. The
+    cancel itself additionally flips only a still-`running` row to
+    `failed`/`cancelled` through one conditional `UPDATE ... WHERE
+    state='running'`, so a pass that already completed never regresses (the
+    ending-never-regresses discipline) and the response can answer `"failed"`
+    immediately instead of waiting on the blocking task. The aborted run's
+    own attempt stays counted — it was spent by *starting* the run, not by
+    the cancel — and the failed row remains `history.importRetry`-able
+    verbatim (archive on disk clears and re-arms; the re-arm also clears the
+    cancel marker, an explicit user intent superseding the cancel).
+  - *failed* / *completed*: the engine forward still rides out (a failed
+    download may still be retrying engine-side) and the row is untouched —
+    `cancelled: <engine answer>`, `state: "failed"`/`"completed"`. Repeated
+    calls answer the same shapes (idempotent; the engine answers `false` once
+    nothing is in flight).
+  Send lane, account-scoped mutating — the reaction-class write-lane mutex and
+  delete drain barrier serialize it against every other account mutation (the
+  `history.importRetry` class verbatim; the local writes are the conditional
+  row flip and the in-memory marker). Metrics class `accounts`. No new error
+  codes: unknown accounts answer `ACCOUNT_NOT_FOUND` through the shared store
+  path; shape errors answer the params-gate `INVALID_REQUEST`.
+- **The honest failure face** (status consumption of the engine's terminal
+  snapshot): when the projection has no ledger row, no archive on disk, and the
+  account sits inside the link-time wait window — exactly the state that used
+  to answer `pending` for ten minutes — the projection consults the engine's
+  `transfer.downloadStatus` once (one bounded read-only call, the §4.51
+  precedent). A snapshot with a shaped `errorCode` (non-empty string, ≤64
+  chars — engine output, not trusted input; a malformed code is no signal and
+  the pre-1.48 answer stands, better to omit than to get it wrong) resolves
+  the wait immediately:
+  - `no_archive` maps onto the existing NO_ARCHIVE information class — the
+    face answers `unavailable` with `reason: "no-archive"` at once (the phone
+    transferred nothing; the same answer the expired window would have given,
+    hours earlier, and still never a guessed failure). No ledger row: the
+    information state must not render as a red failed row or spend attempt
+    budget.
+  - every other code — the known `network`/`cdn_unreachable`/`decode_failed`/
+    `io` and any code this connector has not seen — passes through verbatim as
+    the engine class (never normalized into a known word, the §4.117 posture):
+    the connector lands an honest failed ledger row (one atomic
+    `INSERT ... ON CONFLICT DO NOTHING`, so concurrent status polls and a
+    concurrently-claiming import pass cannot double-write or clobber a row
+    that appeared mid-consult; the insert is the row's first attempt, one
+    attempt spent per no-row epoch — the same shape `land_import_engine_failure`
+    has always written for the §4.68/§4.69 watchers) and answers `failed`
+    with that `errorClass` through the unchanged §4.38 row projection. The
+    persisted row survives engine restarts and renders `failed` with its
+    reason until `history.importRetry` or the account's deletion resolves it.
+  An engine that is down, an unknown account shape, or a snapshot without
+  `errorCode` keeps the pre-1.48 face byte-for-byte (`pending` inside the
+  window, `unavailable`/`no-archive` past it) — the connector never invents a
+  failure it did not observe. The window-expiry answer itself is unchanged:
+  the engine consult only shortens the wait, it does not widen the face. And
+  a snapshot carrying `errorCode` never renders `downloading` progress: the
+  §4.51 snapshot parser rejects the failure face as a byte-progress source,
+  so a `running` row beside a stale engine failure snapshot keeps answering
+  the connector's own `processing` stage, never a dead download's bytes.
+- **Store**: two bounded writers, both SQL-atomic, no schema move (the 1.39
+  table already carries every column): `cancel_running_history_import`
+  (the conditional running→failed/`cancelled` flip) and
+  `land_history_import_failure` (the `INSERT OR IGNORE` failed-row landing
+  with the verbatim engine class, reading the surviving row back so the face
+  renders whichever row won). The cancel registry is process memory (an
+  in-process set), deliberately not persisted: a connector restart resets
+  it, and the next startup sweep re-probes the account — the same recovery
+  hole the §4.69 consumption batch recorded for its watcher (one process
+  lifetime owns one cancel intent; a restart is a new intent), and an
+  explicit `history.importRetry` re-arms against the marker at any time.
+- **Deliberately not built**: any new `history.importStatus` state word (the
+  post-cancel face rides the existing `unavailable` state with the new
+  `reason: "cancelled"` beside the existing `no-archive` — the desktop
+  renders the distinction from the reason, and the ledger vocabulary stays
+  running/completed/failed); a persisted cancel marker (the process-lifetime
+  registry above; a restart re-arms and the sweep's attempt budget still
+  bounds the resurrection); any automatic re-download trigger (a failed
+  download's retry is the engine's own schedule plus the engine restart, the
+  retry face answers NO_ARCHIVE honestly until an archive exists); a push
+  event (the desktop polls, the §4.38 discipline); and any signal-cli-mode
+  arm (the production engine path is the spawned kt-signal-engine; a mode
+  without the engine face answers the pre-1.48 shape — the fail-closed
+  consumption posture).
+
+Tests: the fixture gains the `history.importCancel` arm (steered by the same
+transfer markers the download face uses — cancelling clears them and answers
+`true` when a download was in flight) and the `transfer.downloadStatus`
+failure marker (`.fixture-transfer-error` carries the short code). The
+integration chain pins: the mid-pass cancel (a large seeded archive, cancel
+after the `running` observation — the row lands `failed`/`cancelled` with
+partial counters, the stage scratch is gone, `attempts` shows exactly the
+run's own 1, and `history.importRetry` re-arms the same row), the pre-claim
+cancel that blocks the startup sweep outright, the idempotent
+double cancel across completed, failed, and rowless states with the
+unknown-account gate, the `no_archive` → immediate `unavailable`/`no-archive`
+mapping (a live download face without `errorCode` beside it keeping the
+pre-1.48 `pending`), the `cdn_unreachable` and `network` codes → immediate
+persisted `failed` rows with the verbatim classes and the NO_ARCHIVE retry
+ladder on a landed failure, the malformed-code no-signal arm (empty and
+oversized), and the running-row-beside-a-failure-snapshot no-progress arm.
+The unit chain pins the failure-code gate table, the progress parser's
+failure-face rejection, the conditional row flip's never-regresses arm, the
+atomic landing's no-clobber arm, the projection's row/marker/disk/window
+ladder with its consult faces, the probe's cancel-marker refusal, and the
+lane table's mutating whitelist rows. Tests 797 → 810 (lib 602 → 608).
+Gates: fmt, clippy `-D warnings`, tests all green, release build.
 
 ## 5. signal-cli Boundary
 

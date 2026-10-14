@@ -4768,6 +4768,60 @@ impl Store {
         Ok(())
     }
 
+    /// Flip a still-`running` import row to `failed` with the `cancelled`
+    /// class (contract revision 1.148, §4.146): the `history.importCancel`
+    /// face's immediate ledger answer while the aborted pass is still winding
+    /// down. The `WHERE state='running'` guard is the whole discipline — a
+    /// pass that already completed never regresses (the ending-never-regresses
+    /// rule), and a 0-changed-rows update is the race answer, not an error.
+    /// Never touches `attempts`: the cancel itself spends no budget.
+    pub fn cancel_running_history_import(
+        &self,
+        account_id: &str,
+        now_ms: u64,
+    ) -> Result<bool, StoreError> {
+        let changed = self
+            .lock_conn()?
+            .execute(
+                "UPDATE history_imports
+                 SET state='failed', error_class='cancelled', updated_at=?2
+                 WHERE account_id=?1 AND state='running'",
+                params![account_id, now_ms as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        Ok(changed > 0)
+    }
+
+    /// Land an engine-failure failed row (contract revision 1.148, §4.146)
+    /// when the account has no ledger row at all — the wait-window
+    /// observation of the engine's terminal download snapshot. One atomic
+    /// `INSERT ... ON CONFLICT DO NOTHING`: concurrent status polls and a
+    /// concurrently-claiming import pass cannot double-write, and a row that
+    /// appeared mid-consult is read back and rendered instead of clobbered
+    /// (the winner is whichever row exists, never the observation). The
+    /// insert is the row's first attempt (attempts=1), the same shape
+    /// `begin_history_import` writes for the watcher-landed engine failures;
+    /// the caller passes the engine's short error code verbatim.
+    pub fn land_history_import_failure(
+        &self,
+        account_id: &str,
+        error_class: &str,
+        now_ms: u64,
+    ) -> Result<HistoryImportRow, StoreError> {
+        self.lock_conn()?
+            .execute(
+                "INSERT INTO history_imports(
+                    account_id, state, attempts, imported_messages, skipped_lines,
+                    skipped_chats, skipped_messages, error_class, started_at, updated_at
+                 ) VALUES(?1, 'failed', 1, 0, 0, 0, 0, ?2, ?3, ?3)
+                 ON CONFLICT(account_id) DO NOTHING",
+                params![account_id, error_class, now_ms as i64],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        self.history_import_row(account_id)?
+            .ok_or(StoreError::AccountNotFound)
+    }
+
     /// The stored attachment pointer faces of one imported message
     /// (contract 1.55, §4.38 attachv2) — the download wiring's future input
     /// (§4.38 step 3, not wired this batch). NULL column or pre-1.55 row

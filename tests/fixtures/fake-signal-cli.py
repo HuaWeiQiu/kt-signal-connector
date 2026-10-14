@@ -3212,11 +3212,23 @@ for line in sys.stdin:
         # `.fixture-transfer-running` (present = a download is in flight) and
         # `.fixture-transfer-bytes` ("<read> [<total>]", total optional), both
         # written by the driving test. Absent markers answer {present: false},
-        # the honest no-download answer.
+        # the honest no-download answer. §4.146 failure face (contract 1.148):
+        # `.fixture-transfer-error` carries the engine's short failure code —
+        # its presence is the terminal failed snapshot (the code rides
+        # verbatim; the connector gates the shape) and wins over the running
+        # marker, and it persists until the fixture engine restart clears the
+        # markers.
         result = {"present": False}
+        error_marker = SIGNAL_DATA_DIR / ".fixture-transfer-error"
         running_marker = SIGNAL_DATA_DIR / ".fixture-transfer-running"
         bytes_marker = SIGNAL_DATA_DIR / ".fixture-transfer-bytes"
-        if running_marker.exists():
+        if error_marker.exists():
+            try:
+                code = error_marker.read_text().strip()
+            except OSError:
+                code = ""
+            result = {"present": True, "errorCode": code}
+        elif running_marker.exists():
             try:
                 parts = bytes_marker.read_text().split()
                 bytes_read = max(int(parts[0]), 0)
@@ -3226,6 +3238,26 @@ for line in sys.stdin:
             result = {"present": True, "bytesRead": bytes_read}
             if len(parts) > 1:
                 result["bytesTotal"] = max(int(parts[1]), 0)
+    elif method == "history.importCancel":
+        # §4.146 cancel face (contract 1.148): the frozen engine contract —
+        # params {account}, result {"cancelled": bool} where true means a live
+        # download was aborted. The fixture mirrors it from the transfer
+        # markers: `.fixture-transfer-running` present = a download in flight,
+        # aborted now (both progress markers removed, true); absent = nothing
+        # live to cancel (false). A terminal error snapshot is not a live
+        # download — it survives a cancel, like the engine's (it persists
+        # until the next engine start).
+        running_marker = SIGNAL_DATA_DIR / ".fixture-transfer-running"
+        bytes_marker = SIGNAL_DATA_DIR / ".fixture-transfer-bytes"
+        if running_marker.exists():
+            for marker in (running_marker, bytes_marker):
+                try:
+                    marker.unlink()
+                except FileNotFoundError:
+                    pass
+            result = {"cancelled": True}
+        else:
+            result = {"cancelled": False}
     elif method == "backups.restoreFromCloud":
         # §4.69 cloud-restore start face (contract 1.83): the negotiated wire
         # mirror of the engine's KT-extension method — the params face is only

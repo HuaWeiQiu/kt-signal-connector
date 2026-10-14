@@ -11908,6 +11908,15 @@ pub struct HistoryImportRetryParams {
     pub account_id: String,
 }
 
+/// history.importCancel params (contract revision 1.148, §4.146): the
+/// account whose link-time import is cancelled — a live pass aborted, the
+/// orchestration armed against, the binding untouched.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HistoryImportCancelParams {
+    pub account_id: String,
+}
+
 /// history.attachmentDownload params (contract revision 1.57, §4.38 step 3):
 /// the message-addressing triple plus the attachment id from the message's
 /// received metadata — exactly the `messages.attachments.open` shape.

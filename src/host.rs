@@ -44,25 +44,25 @@ use crate::service::{
     GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
     GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
-    HistoryAttachmentDownloadParams, HistoryImportRetryParams, HistoryImportStatusParams,
-    HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams, LinkSessionParams, LinkStartParams,
-    MessageGetTextParams, MessageRequestParams, MessagesAdjacentMediaParams,
-    MessagesAttachmentsCloseHandleParams, MessagesAttachmentsOpenParams,
-    MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams, MessagesEditParams,
-    MessagesListParams, MessagesMarkReadParams, MessagesMarkViewOnceOpenedParams,
-    MessagesMarkViewedParams, MessagesRemoteDeleteParams, MessagesReportSpamParams,
-    MessagesRetryTextParams, MessagesSearchParams, MessagesSendAdminDeleteParams,
-    MessagesSendAttachmentParams, MessagesSendContactParams, MessagesSendPinMessageParams,
-    MessagesSendPollCreateParams, MessagesSendPollTerminateParams, MessagesSendPollVoteParams,
-    MessagesSendReactionParams, MessagesSendStickerParams, MessagesSendStoryParams,
-    MessagesSendTextParams, MessagesSendUnpinMessageParams, MessagesSendViewOnceOpenParams,
-    MessagesSyncReadParams, MessagesSyncViewedParams, NotificationProfilesListParams,
-    NotificationProfilesSetRecordsParams, PresenceSetTypingMessageParams, SendTarget,
-    StickerPackGetSyncsParams, StickerPackImageParams, StickerPackManifestParams,
-    StickerPackSetSyncParams, StorageGetCallLinksParams, StorageIngestParams,
-    StorageSetCallLinkParams, StoriesGetDisabledParams, StoriesMarkViewedParams,
-    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, UsernameLookupParams,
+    HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
+    HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
+    LinkSessionParams, LinkStartParams, MessageGetTextParams, MessageRequestParams,
+    MessagesAdjacentMediaParams, MessagesAttachmentsCloseHandleParams,
+    MessagesAttachmentsOpenParams, MessagesAttachmentsReadChunkParams, MessagesDeleteForMeParams,
+    MessagesEditParams, MessagesListParams, MessagesMarkReadParams,
+    MessagesMarkViewOnceOpenedParams, MessagesMarkViewedParams, MessagesRemoteDeleteParams,
+    MessagesReportSpamParams, MessagesRetryTextParams, MessagesSearchParams,
+    MessagesSendAdminDeleteParams, MessagesSendAttachmentParams, MessagesSendContactParams,
+    MessagesSendPinMessageParams, MessagesSendPollCreateParams, MessagesSendPollTerminateParams,
+    MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStickerParams,
+    MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
+    MessagesSendViewOnceOpenParams, MessagesSyncReadParams, MessagesSyncViewedParams,
+    NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
+    StickerPackManifestParams, StickerPackSetSyncParams, StorageGetCallLinksParams,
+    StorageIngestParams, StorageSetCallLinkParams, StoriesGetDisabledParams,
+    StoriesMarkViewedParams, StoriesSendReactionParams, StoriesSetDisabledParams,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1256,6 +1256,27 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid history.importRetry params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Link-time history import cancel (contract revision 1.148, §4.146):
+        // the params-gate arm — shape errors answer INVALID_REQUEST before
+        // any state inspection; success is
+        // {"accountId", "cancelled", "state"} and is idempotent in every
+        // state (cancel never spends the attempt budget).
+        "history.importCancel" => {
+            match serde_json::from_value::<HistoryImportCancelParams>(request.params) {
+                Ok(params) => match runtime.history_import_cancel(params.account_id).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid history.importCancel params",
                         false,
                     ),
                 ),

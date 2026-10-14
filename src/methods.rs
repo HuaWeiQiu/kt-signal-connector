@@ -197,6 +197,15 @@ pub const METHODS: &[MethodRow] = &[
     // no upstream traffic. Advertised through the existing `history-import`
     // tag (no new capability bit).
     ("history.importRetry", Lane::Send, true, "accounts"),
+    // Link-time history import cancel (contract revision 1.148, §4.146): the
+    // desktop's cancel-sync face — aborts a live pass and arms the in-process
+    // cancel marker without unbinding. Mutating local state on the send lane
+    // behind the reaction-class write-lane mutex and delete drain barrier —
+    // the history.importRetry class verbatim; the one upstream call (the
+    // frozen engine `history.importCancel`) is best-effort read-of-outcome,
+    // never retried, never failing the call. Advertised through the existing
+    // `history-import` tag (no new capability bit, the 1.53 precedent).
+    ("history.importCancel", Lane::Send, true, "accounts"),
     // History attachment download (contract revision 1.57, §4.38 step 3):
     // the transit-CDN byte chain behind an imported pointer face — mutating
     // (it lands a file in the governed media directory), send lane behind the
@@ -942,6 +951,7 @@ mod tests {
             "backups.restoreFromCloud",
             "backups.uploadToCloud",
             "history.importRetry",
+            "history.importCancel",
             "history.attachmentDownload",
             "attachments.download",
             "calls.sendSignal",
@@ -1016,6 +1026,7 @@ mod tests {
             "backups.restoreFromCloud",
             "backups.uploadToCloud",
             "history.importRetry",
+            "history.importCancel",
             "history.attachmentDownload",
             "attachments.download",
             "calls.sendSignal",

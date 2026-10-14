@@ -611,6 +611,15 @@ impl ProxyGroupRuntime {
         slot.supervisor.history_import_retry(account_id).await
     }
 
+    /// history.importCancel (contract revision 1.148, §4.146): the cancel
+    /// marker, the live-pass abort, and the engine face all live with the
+    /// account's group, so the cancel routes through the owning supervisor
+    /// like every other mutating face.
+    pub async fn history_import_cancel(&self, account_id: String) -> Result<Value, ServiceError> {
+        let slot = self.slot_for_account(&account_id).await?;
+        slot.supervisor.history_import_cancel(account_id).await
+    }
+
     /// history.attachmentDownload (contract revision 1.57, §4.38 step 3):
     /// the pointer face and the destination directory live with the
     /// account's group, so the chain routes through the owning supervisor

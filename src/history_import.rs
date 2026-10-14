@@ -34,6 +34,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use thiserror::Error;
@@ -100,6 +101,13 @@ pub enum ImportFailure {
     Io(#[from] std::io::Error),
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
+    /// The run was aborted by `history.importCancel` (contract revision
+    /// 1.148, §4.146): the cooperative abort flag flipped between batches.
+    /// The partial counters are the honest ledger — the exit lands them on
+    /// the failed row with the `cancelled` class, retryable like any other
+    /// failed run.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl ImportFailure {
@@ -109,6 +117,7 @@ impl ImportFailure {
         match self {
             ImportFailure::Io(_) => "io",
             ImportFailure::Store(_) => "store",
+            ImportFailure::Cancelled => "cancelled",
         }
     }
 }
@@ -244,13 +253,30 @@ fn lossy(buf: &[u8]) -> String {
 /// entry (attempt counter bumped), `completed`/`failed` with final counters
 /// on every exit. Partially imported rows stay on a failed run — the identity
 /// discipline makes the next attempt converge without duplicates.
+///
+/// `abort` is the cooperative cancel flag (contract revision 1.148, §4.146):
+/// checked at entry and between archive lines, an aborted run exits through
+/// the [`ImportFailure::Cancelled`] class with its partial counters — the
+/// stage scratch still clears and the run still lands its failed row, so the
+/// ledger never shows a phantom `running`.
 pub fn run_import(
     store: &Arc<Store>,
     account_id: &str,
     signal_account: &str,
     archive: &Path,
+    abort: &AtomicBool,
 ) -> Result<ImportCounters, ImportFailure> {
     store.begin_history_import(account_id, crate::link::now_ms())?;
+    if abort.load(Ordering::Acquire) {
+        let _ = store.complete_history_import(
+            account_id,
+            "failed",
+            &ImportCounters::default(),
+            Some(ImportFailure::Cancelled.class()),
+            crate::link::now_ms(),
+        );
+        return Err(ImportFailure::Cancelled);
+    }
     // A crashed predecessor's scratch never leaks into this run: the stage
     // clears on entry, and the exit path below leaves the tables empty.
     if let Err(failure) = store
@@ -268,8 +294,8 @@ pub fn run_import(
         return Err(failure);
     }
     let mut counters = ImportCounters::default();
-    let inner = pass_one(store, account_id, archive).and_then(|()| {
-        Importer::new(store, account_id, signal_account, &mut counters).run(archive)
+    let inner = pass_one(store, account_id, archive, abort).and_then(|()| {
+        Importer::new(store, account_id, signal_account, &mut counters, abort).run(archive)
     });
     let _ = store.clear_history_stage(account_id);
     match inner {
@@ -299,14 +325,22 @@ pub fn run_import(
 
 /// Pass 1: stage the recipient/chat identity scratch in fixed batches. Only
 /// the identity fields are read; message frames and anything unknown are left
-/// for pass 2's counters.
-fn pass_one(store: &Arc<Store>, account_id: &str, archive: &Path) -> Result<(), ImportFailure> {
+/// for pass 2's counters. The abort flag is checked between lines.
+fn pass_one(
+    store: &Arc<Store>,
+    account_id: &str,
+    archive: &Path,
+    abort: &AtomicBool,
+) -> Result<(), ImportFailure> {
     let file = File::open(archive)?;
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut line_buf = Vec::with_capacity(8 * 1024);
     let mut recipients: Vec<HistoryStageRecipient> = Vec::with_capacity(BATCH_MESSAGES);
     let mut chats: Vec<HistoryStageChat> = Vec::with_capacity(BATCH_MESSAGES);
     loop {
+        if abort.load(Ordering::Acquire) {
+            return Err(ImportFailure::Cancelled);
+        }
         let line = match read_bounded_line(&mut reader, &mut line_buf)? {
             BoundedLine::Eof => break,
             // Pass 2 owns the counters; an over-long line simply stages nothing.
@@ -362,6 +396,7 @@ struct PendingPin {
 /// Pass-2 driver: streams the archive's message frames and writes them one
 /// bounded batch at a time (§4.38 bounded discipline). Between batches the
 /// store lock is released, so live receives never queue behind an import.
+/// The abort flag is checked between lines (contract revision 1.148).
 struct Importer<'a> {
     store: &'a Arc<Store>,
     account_id: &'a str,
@@ -370,6 +405,7 @@ struct Importer<'a> {
     batch: Vec<HistoryImportInsert>,
     pins: Vec<PendingPin>,
     counters: &'a mut ImportCounters,
+    abort: &'a AtomicBool,
 }
 
 impl<'a> Importer<'a> {
@@ -378,6 +414,7 @@ impl<'a> Importer<'a> {
         account_id: &'a str,
         signal_account: &'a str,
         counters: &'a mut ImportCounters,
+        abort: &'a AtomicBool,
     ) -> Self {
         Self {
             store,
@@ -387,6 +424,7 @@ impl<'a> Importer<'a> {
             batch: Vec::with_capacity(BATCH_MESSAGES),
             pins: Vec::new(),
             counters,
+            abort,
         }
     }
 
@@ -395,6 +433,9 @@ impl<'a> Importer<'a> {
         let mut reader = BufReader::with_capacity(64 * 1024, file);
         let mut line_buf = Vec::with_capacity(8 * 1024);
         loop {
+            if self.abort.load(Ordering::Acquire) {
+                return Err(ImportFailure::Cancelled);
+            }
             match read_bounded_line(&mut reader, &mut line_buf)? {
                 BoundedLine::Eof => break,
                 // A corrupt/hostile line is counted, never fatal, never buffered.
@@ -1903,6 +1944,11 @@ mod tests {
         Arc::new(Store::open(dir, Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap())
     }
 
+    /// An idle cancel flag for the unit runs that never get cancelled.
+    fn idle_abort() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
     /// Engine data dir with the documented v2 registry plus one account
     /// directory; returns the archive path.
     fn seed_engine(temp: &TempDir) -> PathBuf {
@@ -2094,7 +2140,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 4);
         let conversation = alice_conversation_id(&account.id);
 
@@ -2190,7 +2237,8 @@ mod tests {
 
         // A re-run converges onto the same rows (identity dedupe) — the new
         // column never duplicates.
-        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
         let faces = store
             .history_attachment_locators(&account.id, &full.id)
@@ -2234,7 +2282,8 @@ mod tests {
                 .to_string(),
             ],
         );
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 1, "caps drop fields, never the message");
         let conversation = alice_conversation_id(&account.id);
         let row = store
@@ -2430,7 +2479,8 @@ mod tests {
         let archive = seed_engine(&temp);
         write_archive(&archive, &standard_archive());
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(
             counters,
             ImportCounters {
@@ -2606,8 +2656,9 @@ mod tests {
         let archive = seed_engine(&temp);
         write_archive(&archive, &standard_archive());
 
-        run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
-        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
         // Every skip class re-counts; the seven previously imported rows now
         // surface as duplicates.
@@ -2677,7 +2728,8 @@ mod tests {
 
         let archive = seed_engine(&temp);
         write_archive(&archive, &standard_archive());
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 6);
         assert_eq!(counters.skipped_messages, 4);
         // The live row won: the archive's copy of the same Signal message
@@ -2713,14 +2765,15 @@ mod tests {
             .unwrap();
         let archive = seed_engine(&temp);
         // No archive written: the open fails and the run lands `failed`.
-        let error = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive)
+        let error = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort())
             .expect_err("missing archive must fail");
         assert!(matches!(error, ImportFailure::Io(_)));
         let row = store.history_import_row(&account.id).unwrap().unwrap();
         assert_eq!(row.state, "failed");
         assert_eq!(row.error_class.as_deref(), Some("io"));
         assert_eq!(row.attempts, 1);
-        run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).expect_err("still missing");
+        run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort())
+            .expect_err("still missing");
         let row = store.history_import_row(&account.id).unwrap().unwrap();
         assert_eq!(row.attempts, 2);
     }
@@ -2772,7 +2825,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 3, "two notices and one regular row");
         assert_eq!(counters.skipped_messages, 0);
 
@@ -2909,7 +2963,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 2);
         assert_eq!(counters.skipped_messages, 0);
         let conversation = alice_conversation_id(&account.id);
@@ -2986,7 +3041,8 @@ mod tests {
         );
 
         // A re-run converges (identity discipline covers sticker rows too).
-        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
     }
 
@@ -3024,7 +3080,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 0);
         assert_eq!(counters.skipped_messages, 2, "the face rode incomplete");
         let row = store.history_import_row(&account.id).unwrap().unwrap();
@@ -3074,7 +3131,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 0);
         assert_eq!(counters.skipped_messages, 3);
     }
@@ -3136,7 +3194,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 2);
         assert_eq!(counters.skipped_messages, 0);
         let conversation = alice_conversation_id(&account.id);
@@ -3225,7 +3284,8 @@ mod tests {
         );
 
         // A re-run converges (identity discipline covers contact rows too).
-        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
     }
 
@@ -3268,7 +3328,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 0);
         assert_eq!(
             counters.skipped_messages, 3,
@@ -3337,7 +3398,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(
             counters.imported, 4,
             "three group rows and the split timer row"
@@ -3418,7 +3480,8 @@ mod tests {
         );
 
         // A re-run converges (identity discipline covers group rows too).
-        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
     }
 
@@ -3508,7 +3571,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 7);
         assert_eq!(counters.skipped_messages, 0);
         let conversation = alice_conversation_id(&account.id);
@@ -3651,7 +3715,8 @@ mod tests {
         assert_eq!(admin_row.status, "delivered");
 
         // A re-run converges (identity discipline covers every face).
-        let second = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let second =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(second.imported, 0);
     }
 
@@ -3727,7 +3792,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 2, "the poll and the group reply");
         assert_eq!(counters.skipped_messages, 6, "5 wrong-typed + adhocCall");
         assert_eq!(counters.skipped_lines, 0, "adhocCall is never junk");
@@ -3813,7 +3879,8 @@ mod tests {
             ],
         );
 
-        let counters = run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive).unwrap();
+        let counters =
+            run_import(&store, &account.id, SIGNAL_ACCOUNT, &archive, &idle_abort()).unwrap();
         assert_eq!(counters.imported, 1);
         let conversation = alice_conversation_id(&account.id);
         let row = store

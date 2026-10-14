@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -223,6 +223,22 @@ pub struct RuntimeSupervisor {
     /// live pass as its progress. Set/cleared inside the same claim/release
     /// window as the single-flight flag.
     history_import_holder: Arc<StdMutex<Option<String>>>,
+    /// The cooperative cancel flag for the run that holds the slot (contract
+    /// revision 1.148, §4.146): `history.importCancel` flips it when the
+    /// holder names the cancelled account, the run checks it between archive
+    /// lines, and every claim resets it first so a stale flag can never kill
+    /// the next account's pass. One flag per group (the slot is
+    /// single-flight); never held across an await.
+    history_import_abort: Arc<AtomicBool>,
+    /// The process-lifetime cancel registry (contract revision 1.148,
+    /// §4.146): accounts whose link-time import the desktop cancelled. At
+    /// most one entry per linked account (bounded by the account ceiling);
+    /// the link watcher exits on it, the eligibility probe refuses it, the
+    /// status face answers `unavailable`/`cancelled` from it, and an explicit
+    /// `history.importRetry` clears it (an explicit user intent supersedes
+    /// the cancel). Deliberately not persisted: a connector restart is a new
+    /// intent (the §4.69 recovery-hole posture).
+    history_import_cancels: Arc<StdMutex<HashSet<String>>>,
     /// Disappearing-message sweep single flight (contract revision 1.42,
     /// §4.41): at most one sweep pass per group at a time, shared with the
     /// periodic task.
@@ -357,6 +373,8 @@ impl RuntimeSupervisor {
             contacts_resync: StdMutex::new(None),
             history_import_running: Arc::new(AtomicBool::new(false)),
             history_import_holder: Arc::new(StdMutex::new(None)),
+            history_import_abort: Arc::new(AtomicBool::new(false)),
+            history_import_cancels: Arc::new(StdMutex::new(HashSet::new())),
             expire_sweep_running: Arc::new(AtomicBool::new(false)),
             expire_sweeper: StdMutex::new(None),
             delivery_receipt_rx: StdMutex::new(Some(delivery_receipt_rx)),
@@ -797,6 +815,8 @@ impl RuntimeSupervisor {
         let data_dir = self.config.data_dir.clone();
         let running = Arc::clone(&self.history_import_running);
         let holder = Arc::clone(&self.history_import_holder);
+        let abort = Arc::clone(&self.history_import_abort);
+        let cancels = Arc::clone(&self.history_import_cancels);
         tokio::spawn(async move {
             // Let the fresh engine settle and any link-time inline sync land
             // before the first import pass claims store batches.
@@ -818,8 +838,9 @@ impl RuntimeSupervisor {
                 let probe = tokio::task::spawn_blocking({
                     let store = Arc::clone(&store);
                     let data_dir = data_dir.clone();
+                    let cancels = Arc::clone(&cancels);
                     let account_id = account.id.clone();
-                    move || probe_history_import(&store, &data_dir, &account_id)
+                    move || probe_history_import(&store, &data_dir, &account_id, &cancels)
                 })
                 .await
                 .unwrap_or(HistoryImportProbe::Done);
@@ -831,6 +852,7 @@ impl RuntimeSupervisor {
                 let _ = claim_and_run_history_import(
                     Arc::clone(&running),
                     Arc::clone(&holder),
+                    Arc::clone(&abort),
                     Arc::clone(&store),
                     job,
                 )
@@ -849,6 +871,8 @@ impl RuntimeSupervisor {
         let data_dir = self.config.data_dir.clone();
         let running = Arc::clone(&self.history_import_running);
         let holder = Arc::clone(&self.history_import_holder);
+        let abort = Arc::clone(&self.history_import_abort);
+        let cancels = Arc::clone(&self.history_import_cancels);
         tokio::spawn(async move {
             let deadline =
                 Instant::now() + Duration::from_millis(crate::history_import::LINK_WAIT_MS);
@@ -864,8 +888,9 @@ impl RuntimeSupervisor {
                 let probe = tokio::task::spawn_blocking({
                     let store = Arc::clone(&store);
                     let data_dir = data_dir.clone();
+                    let cancels = Arc::clone(&cancels);
                     let account_id = account_id.clone();
-                    move || probe_history_import(&store, &data_dir, &account_id)
+                    move || probe_history_import(&store, &data_dir, &account_id, &cancels)
                 })
                 .await
                 .unwrap_or(HistoryImportProbe::Done);
@@ -876,6 +901,7 @@ impl RuntimeSupervisor {
                         if claim_and_run_history_import(
                             Arc::clone(&running),
                             Arc::clone(&holder),
+                            Arc::clone(&abort),
                             Arc::clone(&store),
                             job,
                         )
@@ -907,22 +933,37 @@ impl RuntimeSupervisor {
     /// minimal projection the desktop polls — store-first, never the network.
     /// Since contract 1.53 a `running` row also consults the engine's
     /// transfer-download snapshot (one bounded read-only call) so the
-    /// Download stage can report byte progress; every other state is
+    /// Download stage can report byte progress. Since contract 1.148 (§4.146)
+    /// a wait-window `pending` with no archive consults the same snapshot
+    /// once: the engine's failure terminal state resolves the wait at once
+    /// (`no_archive` onto the existing NO_ARCHIVE information class, any
+    /// other code onto an immediately-landed persisted failed row) instead of
+    /// hanging `pending` until the window expires; every other state is
     /// store/disk-only exactly as before.
     pub async fn history_import_status(&self, account_id: String) -> Result<Value, ServiceError> {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
+        let cancels = Arc::clone(&self.history_import_cancels);
         let row_account_id = account_id.clone();
         let (mut status, signal_account) = blocking_service(move || {
-            let status = history_import_status_projection(&store, &data_dir, &row_account_id)?;
-            let signal_account = if status["state"] == "running" {
-                store
+            // The engine face is consulted only where it can change the
+            // answer: a `running` row (byte progress) and a wait-window
+            // `pending` with no archive (failure consumption). The
+            // projection's consult flag names the second: a disk-`pending`
+            // (archive present, the sweep or watcher about to claim it)
+            // never consults — a stale terminal snapshot must not land a
+            // failed row beside an archive the connector is about to
+            // import. Every other state is already terminal or
+            // store/disk-derived.
+            let (status, consult_engine) =
+                history_import_status_projection(&store, &data_dir, &cancels, &row_account_id)?;
+            let signal_account = match (status["state"].as_str(), consult_engine) {
+                (Some("running"), _) | (Some("pending"), true) => store
                     .account_by_id(&row_account_id)
                     .ok()
                     .flatten()
-                    .map(|account| account.signal_account)
-            } else {
-                None
+                    .map(|account| account.signal_account),
+                _ => None,
             };
             Ok((status, signal_account))
         })
@@ -937,7 +978,7 @@ impl RuntimeSupervisor {
         // the pre-1.53 shape, no progress invented.
         if status["state"] == "running" {
             let mut downloading = None;
-            if let Some(signal_account) = signal_account
+            if let Some(signal_account) = signal_account.as_deref()
                 && let Ok(engine) = self.running_engine().await
                 && let Ok(snapshot) = engine
                     .call(
@@ -958,7 +999,121 @@ impl RuntimeSupervisor {
                 object.insert("progress".to_owned(), progress);
             }
         }
+        // Failure consumption (contract 1.148, §4.146): a wait-window
+        // `pending` with no archive resolves immediately against the engine's
+        // terminal snapshot. `no_archive` is the existing information class
+        // (the phone transferred nothing — never a failed row); any other
+        // code lands an honest persisted failed row through one atomic
+        // insert-or-ignore and renders it. A down engine, a malformed code,
+        // or a snapshot without `errorCode` keeps the pre-1.48 answer.
+        if status["state"] == "pending"
+            && let Some(signal_account) = signal_account
+            && let Ok(engine) = self.running_engine().await
+            && let Ok(snapshot) = engine
+                .call(
+                    "transfer.downloadStatus",
+                    json!({ "account": signal_account }),
+                    CallClass::ReadOnly,
+                )
+                .await
+            && let Some(code) = engine_import_failure_code(&snapshot)
+        {
+            if code == IMPORT_FAILURE_NO_ARCHIVE {
+                status = json!({
+                    "accountId": account_id,
+                    "state": "unavailable",
+                    "reason": "no-archive",
+                });
+            } else {
+                let store = Arc::clone(&self.store);
+                let row_account_id = account_id.clone();
+                let code = code.to_string();
+                let row = blocking_service(move || {
+                    store
+                        .land_history_import_failure(&row_account_id, &code, crate::link::now_ms())
+                        .map_err(ServiceError::from)
+                })
+                .await?;
+                status = serde_json::to_value(row)
+                    .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)))?;
+            }
+        }
         Ok(status)
+    }
+
+    /// history.importCancel (contract revision 1.148, §4.146): the desktop's
+    /// cancel-sync stops the import without unbinding. The marker registers
+    /// first (the link watcher exits on its next tick, the eligibility probe
+    /// refuses the account, the status face answers
+    /// `unavailable`/`cancelled`), a live pass for THIS account gets its
+    /// cooperative abort flag flipped and its still-`running` row flipped to
+    /// `failed`/`cancelled` through the conditional store write (never
+    /// regressing a completed row, never spending the attempt budget), and
+    /// the frozen engine contract (`history.importCancel {account}` →
+    /// `{"cancelled": bool}`) rides out best-effort: an engine error of any
+    /// flavor answers `cancelled: false` and never retries — the
+    /// connector-side half has already taken effect, and the unknown-outcome
+    /// red line forbids guessing. Idempotent in every state.
+    pub async fn history_import_cancel(&self, account_id: String) -> Result<Value, ServiceError> {
+        let store = Arc::clone(&self.store);
+        let cancels = Arc::clone(&self.history_import_cancels);
+        let abort = Arc::clone(&self.history_import_abort);
+        let holder = Arc::clone(&self.history_import_holder);
+        let row_account_id = account_id.clone();
+        let signal_account = blocking_service(move || {
+            let account = store
+                .account_by_id(&row_account_id)?
+                .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
+            if let Ok(mut set) = cancels.lock() {
+                set.insert(row_account_id.clone());
+            }
+            // Only THIS account's live pass gets the abort flag: the holder
+            // names the slot's owner (contract 1.53), and the flag resets at
+            // every claim, so a stale flag can never kill the next pass.
+            let live = holder
+                .lock()
+                .map(|slot| slot.as_deref() == Some(row_account_id.as_str()))
+                .unwrap_or(false);
+            if live {
+                abort.store(true, Ordering::Release);
+            }
+            // The immediate ledger answer while the aborted pass winds down.
+            // The `WHERE state='running'` guard is the race discipline: a
+            // pass that already completed never regresses.
+            let _ = store.cancel_running_history_import(&row_account_id, crate::link::now_ms());
+            Ok(account.signal_account)
+        })
+        .await?;
+        let mut cancelled = false;
+        if let Ok(engine) = self.running_engine().await {
+            cancelled = engine
+                .call(
+                    "history.importCancel",
+                    json!({ "account": signal_account }),
+                    CallClass::Mutating,
+                )
+                .await
+                .ok()
+                .and_then(|result| result.get("cancelled").and_then(Value::as_bool))
+                .unwrap_or(false);
+        }
+        // The post-cancel state the desktop would read from importStatus: the
+        // row's truth when one survived, else the marker's
+        // `unavailable`/`cancelled` — never `pending` after a cancel.
+        let store = Arc::clone(&self.store);
+        let row_account_id = account_id.clone();
+        let state = blocking_service(move || {
+            Ok(match store.history_import_row(&row_account_id)? {
+                Some(row) => row.state,
+                None => "unavailable".to_owned(),
+            })
+        })
+        .await?;
+        Ok(json!({
+            "accountId": account_id,
+            "cancelled": cancelled,
+            "state": state,
+        }))
     }
 
     /// history.importRetry (contract revision 1.53, §4.38): clear the
@@ -968,12 +1123,23 @@ impl RuntimeSupervisor {
     /// account-scoped write-lane mutex and delete drain barrier serialize it
     /// against every other account mutation (host `acquire`); the store work
     /// runs on the blocking pool. A non-`failed` row is NOT_RETRYABLE; no
-    /// archive on the engine face is NO_ARCHIVE.
+    /// archive on the engine face is NO_ARCHIVE. Since contract 1.148
+    /// (§4.146) a successful re-arm also clears the cancel marker: an
+    /// explicit retry is the user intent that supersedes the cancel.
     pub async fn history_import_retry(&self, account_id: String) -> Result<Value, ServiceError> {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
-        blocking_service(move || history_import_retry_projection(&store, &data_dir, &account_id))
-            .await
+        let row_account_id = account_id.clone();
+        let result = blocking_service(move || {
+            history_import_retry_projection(&store, &data_dir, &row_account_id)
+        })
+        .await?;
+        if result.get("armed").and_then(Value::as_bool) == Some(true)
+            && let Ok(mut set) = self.history_import_cancels.lock()
+        {
+            set.remove(&account_id);
+        }
+        Ok(result)
     }
 
     /// history.attachmentDownload (contract revision 1.57, §4.38 step 3):
@@ -6153,6 +6319,7 @@ impl RuntimeSupervisor {
                             let claimed = claim_and_run_history_import(
                                 Arc::clone(&supervisor.history_import_running),
                                 Arc::clone(&supervisor.history_import_holder),
+                                Arc::clone(&supervisor.history_import_abort),
                                 Arc::clone(&supervisor.store),
                                 HistoryImportJob {
                                     account_id: account.clone(),
@@ -6251,6 +6418,7 @@ impl RuntimeSupervisor {
                         claim_and_run_history_import(
                             Arc::clone(&supervisor.history_import_running),
                             Arc::clone(&supervisor.history_import_holder),
+                            Arc::clone(&supervisor.history_import_abort),
                             Arc::clone(&supervisor.store),
                             HistoryImportJob {
                                 account_id: account.clone(),
@@ -6295,6 +6463,7 @@ impl RuntimeSupervisor {
                     let claimed = claim_and_run_history_import(
                         Arc::clone(&supervisor.history_import_running),
                         Arc::clone(&supervisor.history_import_holder),
+                        Arc::clone(&supervisor.history_import_abort),
                         Arc::clone(&supervisor.store),
                         HistoryImportJob {
                             account_id: account.clone(),
@@ -7055,7 +7224,20 @@ fn probe_history_import(
     store: &Arc<Store>,
     data_dir: &Path,
     account_id: &str,
+    cancels: &StdMutex<HashSet<String>>,
 ) -> HistoryImportProbe {
+    // A cancel marker outranks everything (contract 1.148, §4.146): the
+    // link watcher exits on its next tick and the sweep skips the account —
+    // no pass is ever claimed again until `history.importRetry` clears the
+    // marker. A poisoned lock (a panicking holder) reads as not-cancelled,
+    // the pre-1.48 behavior.
+    if cancels
+        .lock()
+        .map(|set| set.contains(account_id))
+        .unwrap_or(false)
+    {
+        return HistoryImportProbe::Done;
+    }
     let Ok(Some(account)) = store.account_by_id(account_id) else {
         return HistoryImportProbe::Done;
     };
@@ -7087,10 +7269,14 @@ fn probe_history_import(
 /// and converge retention after a completed run (§4.38). `false` means
 /// another import holds the slot; the caller retries later. The holder name
 /// rides the claim window so `history.importStatus` can attribute the
-/// `processing` stage to the polled account (contract 1.53).
+/// `processing` stage to the polled account (contract 1.53). The cancel flag
+/// resets at every claim so a `history.importCancel` abort (contract 1.148,
+/// §4.146) can only ever hit the run it names — a stale flag from a previous
+/// run never kills the next account's pass.
 async fn claim_and_run_history_import(
     running: Arc<AtomicBool>,
     holder: Arc<StdMutex<Option<String>>>,
+    abort: Arc<AtomicBool>,
     store: Arc<Store>,
     job: HistoryImportJob,
 ) -> bool {
@@ -7100,10 +7286,11 @@ async fn claim_and_run_history_import(
     {
         return false;
     }
+    abort.store(false, Ordering::Release);
     if let Ok(mut slot) = holder.lock() {
         *slot = Some(job.account_id.clone());
     }
-    run_history_import(&store, &job).await;
+    run_history_import(&store, &job, Arc::clone(&abort)).await;
     if let Ok(mut slot) = holder.lock() {
         *slot = None;
     }
@@ -7111,7 +7298,7 @@ async fn claim_and_run_history_import(
     true
 }
 
-async fn run_history_import(store: &Arc<Store>, job: &HistoryImportJob) {
+async fn run_history_import(store: &Arc<Store>, job: &HistoryImportJob, abort: Arc<AtomicBool>) {
     let outcome = tokio::task::spawn_blocking({
         let store = Arc::clone(store);
         let job = job.clone();
@@ -7121,6 +7308,7 @@ async fn run_history_import(store: &Arc<Store>, job: &HistoryImportJob) {
                 &job.account_id,
                 &job.signal_account,
                 &job.archive,
+                &abort,
             )
         }
     })
@@ -7346,23 +7534,69 @@ async fn converge_history_retention(store: Arc<Store>) {
     }
 }
 
+/// The engine's failure code for "the phone transferred nothing" — the
+/// existing NO_ARCHIVE information class (contract 1.148, §4.146): an
+/// informational face, never a failed row, never budget.
+const IMPORT_FAILURE_NO_ARCHIVE: &str = "no_archive";
+
+/// The engine failure-code length cap (contract 1.148, §4.146): anything
+/// longer than this is engine output noise, not a code, and is consumed as
+/// malformed — the pre-1.48 answer stands.
+const MAX_IMPORT_FAILURE_CODE_CHARS: usize = 64;
+
+/// The engine's terminal download-failure code, when the snapshot carries
+/// one worth consuming (contract 1.148, §4.146): a non-empty string within
+/// [`MAX_IMPORT_FAILURE_CODE_CHARS`]. An absent, empty, or oversized value —
+/// or a non-string — is malformed engine output and answers `None`: the
+/// pre-1.48 honest face, byte for byte.
+fn engine_import_failure_code(snapshot: &Value) -> Option<&str> {
+    snapshot
+        .get("errorCode")
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty() && code.len() <= MAX_IMPORT_FAILURE_CODE_CHARS)
+}
+
 /// The `history.importStatus` projection (§4.38). Priority order is the
 /// contract's: a persisted ledger row (running/completed/failed) always
 /// answers; otherwise the archive presence or the link-time wait window
 /// decides between `pending` and `unavailable` — the engine's failure modes
 /// are indistinguishable from "the phone had nothing to transfer" and are
-/// reported as such, never guessed.
+/// reported as such, never guessed. Since contract 1.148 (§4.146) a cancel
+/// marker with no ledger row answers `unavailable`/`cancelled` ahead of
+/// every store/disk branch: the account was cancelled, and no pending face
+/// may resurrect it until a retry clears the marker. The boolean in the
+/// answer is the consult face: `true` only for the wait-window `pending`
+/// branch — the one state whose answer the engine's terminal snapshot can
+/// still change (§4.146 failure consumption). A row answers with `false`
+/// (the caller consults for `running` byte progress by state, never by this
+/// flag) and every store/disk-derived answer with `false`.
 fn history_import_status_projection(
     store: &Arc<Store>,
     data_dir: &Path,
+    cancels: &StdMutex<HashSet<String>>,
     account_id: &str,
-) -> Result<Value, ServiceError> {
+) -> Result<(Value, bool), ServiceError> {
     let account = store
         .account_by_id(account_id)?
         .ok_or(ServiceError::Store(StoreError::AccountNotFound))?;
     if let Some(row) = store.history_import_row(account_id)? {
-        return serde_json::to_value(row)
-            .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)));
+        let status = serde_json::to_value(row)
+            .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)))?;
+        return Ok((status, false));
+    }
+    let cancelled = cancels
+        .lock()
+        .map(|set| set.contains(account_id))
+        .unwrap_or(false);
+    if cancelled {
+        return Ok((
+            json!({
+                "accountId": account_id,
+                "state": "unavailable",
+                "reason": "cancelled",
+            }),
+            false,
+        ));
     }
     let on_disk = crate::history_import::archive_path(data_dir, &account.signal_account)
         .map(|path| crate::history_import::archive_ready(&path))
@@ -7370,7 +7604,10 @@ fn history_import_status_projection(
     if on_disk {
         // Archive present, no run has claimed it yet: the sweep or the link
         // watcher picks it up within seconds.
-        return Ok(json!({ "accountId": account_id, "state": "pending" }));
+        return Ok((
+            json!({ "accountId": account_id, "state": "pending" }),
+            false,
+        ));
     }
     let linked_at = store
         .account_summary(account_id)?
@@ -7379,13 +7616,16 @@ fn history_import_status_projection(
         crate::link::now_ms().saturating_sub(linked_at) < crate::history_import::LINK_WAIT_MS
     });
     if inside_window {
-        return Ok(json!({ "accountId": account_id, "state": "pending" }));
+        return Ok((json!({ "accountId": account_id, "state": "pending" }), true));
     }
-    Ok(json!({
-        "accountId": account_id,
-        "state": "unavailable",
-        "reason": "no-archive",
-    }))
+    Ok((
+        json!({
+            "accountId": account_id,
+            "state": "unavailable",
+            "reason": "no-archive",
+        }),
+        false,
+    ))
 }
 
 /// The contract 1.53 `progress` object the desktop gets while
@@ -7405,9 +7645,15 @@ fn history_import_status_projection(
 /// integer within u64; `bytesTotal`, when present, the same; when both ride,
 /// `bytesRead <= bytesTotal` must hold. A malformed snapshot drops the
 /// `progress` object entirely — the state projection is never sacrificed for
-/// a malformed ornament ("better to omit than to get it wrong").
+/// a malformed ornament ("better to omit than to get it wrong"). Since
+/// contract 1.148 (§4.146) a snapshot carrying `errorCode` is the engine's
+/// terminal failure face — it never renders `downloading` byte progress;
+/// the failure-consumption face owns the answer.
 fn import_progress_from_engine_snapshot(snapshot: &Value) -> Option<Value> {
     if snapshot.get("present") != Some(&Value::Bool(true)) {
+        return None;
+    }
+    if snapshot.get("errorCode").is_some() {
         return None;
     }
     let bytes_read = snapshot.get("bytesRead").and_then(Value::as_u64);
@@ -8323,7 +8569,9 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
     use rusqlite::Connection;
@@ -8334,10 +8582,13 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        EngineStderrClass, RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor, attachment_download_client,
-        classify_engine_stderr, cloud_archive_face, cloud_status_from_engine,
-        compose_contact_display_name, compose_import_progress, group_extra_json,
-        is_receive_fatal_stderr, receipt_failure_key, upload_status_from_engine,
+        EngineStderrClass, HistoryImportProbe, IMPORT_FAILURE_NO_ARCHIVE,
+        MAX_IMPORT_FAILURE_CODE_CHARS, RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor,
+        attachment_download_client, classify_engine_stderr, cloud_archive_face,
+        cloud_status_from_engine, compose_contact_display_name, compose_import_progress,
+        engine_import_failure_code, group_extra_json, history_import_status_projection,
+        import_progress_from_engine_snapshot, is_receive_fatal_stderr, probe_history_import,
+        receipt_failure_key, upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{NormalizedReceive, SignalCliConfig};
@@ -8367,6 +8618,304 @@ mod tests {
         // account's pass — the boolean is already account-attributed by the
         // caller): the honest pre-1.53 shape, no progress invented.
         assert_eq!(compose_import_progress(None, false), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Contract revision 1.148 (§4.146): the cancel face and the engine's
+    // terminal download-failure consumption.
+    // -------------------------------------------------------------------------
+
+    /// The §4.146 failure-code gate: non-empty strings within the cap are
+    /// codes (the known short family and unseen ones alike — the connector
+    /// consumes fail-closed); absent, empty, oversized, and non-string values
+    /// are malformed engine output and answer None (the pre-1.48 face).
+    #[test]
+    fn engine_import_failure_code_gate() {
+        assert_eq!(IMPORT_FAILURE_NO_ARCHIVE, "no_archive");
+        // The engine 0a2ab18 vocabulary — every one of the five consumes
+        // immediately (never a ten-minute pending), and unseen codes ride
+        // the same verbatim arm.
+        for code in [
+            "no_archive",
+            "network",
+            "cdn_unreachable",
+            "decode_failed",
+            "io",
+            "something_new",
+        ] {
+            assert_eq!(
+                engine_import_failure_code(&json!({ "errorCode": code })),
+                Some(code),
+                "{code}"
+            );
+        }
+        let boundary = "a".repeat(MAX_IMPORT_FAILURE_CODE_CHARS);
+        assert_eq!(
+            engine_import_failure_code(&json!({ "errorCode": boundary })),
+            Some(boundary.as_str())
+        );
+        // Bytes may ride along; the code still reads.
+        assert_eq!(
+            engine_import_failure_code(&json!({
+                "errorCode": "cdn_unreachable",
+                "bytesRead": 5,
+                "bytesTotal": 9
+            })),
+            Some("cdn_unreachable")
+        );
+        // Malformed: absent, empty, oversized, non-string.
+        assert_eq!(
+            engine_import_failure_code(&json!({ "present": true })),
+            None
+        );
+        assert_eq!(
+            engine_import_failure_code(&json!({ "errorCode": "" })),
+            None
+        );
+        let oversized = "a".repeat(MAX_IMPORT_FAILURE_CODE_CHARS + 1);
+        assert_eq!(
+            engine_import_failure_code(&json!({ "errorCode": oversized })),
+            None
+        );
+        assert_eq!(engine_import_failure_code(&json!({ "errorCode": 7 })), None);
+    }
+
+    /// A failure-carrying snapshot never renders byte progress (§4.146): the
+    /// terminal face owns the answer, the ornament would lie.
+    #[test]
+    fn import_progress_rejects_failure_snapshots() {
+        assert_eq!(
+            import_progress_from_engine_snapshot(&json!({
+                "present": true,
+                "errorCode": "cdn_unreachable"
+            })),
+            None
+        );
+        assert_eq!(
+            import_progress_from_engine_snapshot(&json!({
+                "present": true,
+                "errorCode": "io",
+                "bytesRead": 1,
+                "bytesTotal": 2
+            })),
+            None
+        );
+        // Sanity: the same snapshot without the code still renders.
+        let progress = import_progress_from_engine_snapshot(&json!({
+            "present": true,
+            "bytesRead": 1,
+            "bytesTotal": 2
+        }))
+        .unwrap();
+        assert_eq!(progress["stage"], "downloading");
+    }
+
+    /// §4.146: the conditional running→failed/`cancelled` flip hits only a
+    /// live row, never regresses a completed one, and never touches the
+    /// attempt budget (the cancel itself is free; the run's own begin spent
+    /// the one attempt).
+    #[test]
+    fn cancel_running_history_import_flips_only_running() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(temp.path());
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        // No row at all: the race answer, not an error.
+        assert!(!store.cancel_running_history_import(&account.id, 1).unwrap());
+
+        // A running row flips with the class, attempts untouched.
+        store.begin_history_import(&account.id, 2).unwrap();
+        assert!(store.cancel_running_history_import(&account.id, 3).unwrap());
+        let row = store.history_import_row(&account.id).unwrap().unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.error_class.as_deref(), Some("cancelled"));
+        assert_eq!(row.attempts, 1);
+
+        // A completed row never regresses.
+        store.begin_history_import(&account.id, 4).unwrap();
+        store
+            .complete_history_import(
+                &account.id,
+                "completed",
+                &crate::store::ImportCounters::default(),
+                None,
+                5,
+            )
+            .unwrap();
+        assert!(!store.cancel_running_history_import(&account.id, 6).unwrap());
+        let row = store.history_import_row(&account.id).unwrap().unwrap();
+        assert_eq!(row.state, "completed");
+        assert!(row.error_class.is_none());
+    }
+
+    /// §4.146: the atomic failure landing writes attempts=1 with the
+    /// verbatim engine code when no row exists, and never clobbers a row
+    /// that appeared mid-consult — the read-back winner is returned either
+    /// way.
+    #[test]
+    fn land_history_import_failure_lands_once_and_never_clobbers() {
+        let temp = TempDir::new().unwrap();
+        let store = test_store(temp.path());
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let row = store
+            .land_history_import_failure(&account.id, "cdn_unreachable", 7)
+            .unwrap();
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.error_class.as_deref(), Some("cdn_unreachable"));
+        assert_eq!(row.attempts, 1);
+
+        // A second observation over the now-persisted row changes nothing —
+        // the read-back (still the first row) is the answer.
+        let again = store
+            .land_history_import_failure(&account.id, "io", 8)
+            .unwrap();
+        assert_eq!(again.error_class.as_deref(), Some("cdn_unreachable"));
+        assert_eq!(again.attempts, 1);
+        assert_eq!(again.started_at, row.started_at);
+
+        // The same for a completed row: consumption never regresses it.
+        store.clear_failed_history_import(&account.id).unwrap();
+        store.begin_history_import(&account.id, 9).unwrap();
+        store
+            .complete_history_import(
+                &account.id,
+                "completed",
+                &crate::store::ImportCounters::default(),
+                None,
+                10,
+            )
+            .unwrap();
+        let completed = store
+            .land_history_import_failure(&account.id, "decode_failed", 11)
+            .unwrap();
+        assert_eq!(completed.state, "completed");
+    }
+
+    /// The §4.146 status-projection ladder with consult faces: the row wins
+    /// over everything (never a consult flag — the caller consults for
+    /// `running` by state), the cancel marker beats the disk/window faces,
+    /// the archive-on-disk `pending` never consults, and only the
+    /// wait-window `pending` carries the consult flag.
+    #[test]
+    fn history_import_status_projection_orders_row_marker_disk_and_window() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let account_dir = signal_data.join("accounts").join("lk-unit");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(
+            signal_data.join("engine-state.json"),
+            r#"{"version":2,"accounts":[
+                {"number":"+15555550100","dir":"accounts/lk-unit"},
+                {"number":"+15555550101","dir":"accounts/lk-unit"},
+                {"number":"+15555550102","dir":"accounts/lk-unit"}
+            ]}"#,
+        )
+        .unwrap();
+        let archive = account_dir.join("history-import.ndjson");
+        std::fs::write(&archive, "{\"type\":\"recipient\"}\n").unwrap();
+
+        let store = Arc::new(test_store(temp.path()));
+        let now = crate::link::now_ms();
+        let rowed = store
+            .upsert_account_from_signal("+15555550100", Some(now), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let disk_window = store
+            .upsert_account_from_signal("+15555550101", Some(now), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let expired = store
+            .upsert_account_from_signal("+15555550102", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let cancels = StdMutex::new(HashSet::new());
+
+        // Archive on disk, no row, no marker: pending, and no engine consult
+        // — the sweep or watcher claims it within seconds.
+        let (status, consult) =
+            history_import_status_projection(&store, &signal_data, &cancels, &disk_window.id)
+                .unwrap();
+        assert_eq!(status["state"], "pending");
+        assert!(!consult);
+
+        // The cancel marker beats the disk face: unavailable/cancelled, no
+        // consult — no pending face may resurrect a cancelled account.
+        cancels.lock().unwrap().insert(disk_window.id.clone());
+        let (status, consult) =
+            history_import_status_projection(&store, &signal_data, &cancels, &disk_window.id)
+                .unwrap();
+        assert_eq!(status["state"], "unavailable");
+        assert_eq!(status["reason"], "cancelled");
+        assert!(!consult);
+        cancels.lock().unwrap().remove(&disk_window.id);
+
+        // A persisted row wins over even the marker (the ledger is the
+        // truth): running, no consult flag.
+        cancels.lock().unwrap().insert(rowed.id.clone());
+        store.begin_history_import(&rowed.id, now).unwrap();
+        let (status, consult) =
+            history_import_status_projection(&store, &signal_data, &cancels, &rowed.id).unwrap();
+        assert_eq!(status["state"], "running");
+        assert!(!consult);
+
+        // Archive removed inside the wait window: pending WITH the consult
+        // flag — the one state the engine's terminal snapshot can resolve.
+        std::fs::remove_file(&archive).unwrap();
+        let (status, consult) =
+            history_import_status_projection(&store, &signal_data, &cancels, &disk_window.id)
+                .unwrap();
+        assert_eq!(status["state"], "pending");
+        assert!(consult);
+
+        // Window expired, no archive, no row: the pre-1.48 informational
+        // face, no consult.
+        let (status, consult) =
+            history_import_status_projection(&store, &signal_data, &cancels, &expired.id).unwrap();
+        assert_eq!(status["state"], "unavailable");
+        assert_eq!(status["reason"], "no-archive");
+        assert!(!consult);
+    }
+
+    /// §4.146: the eligibility probe answers Done for a cancelled account —
+    /// the link watcher exits and the sweep skips on its next tick — and
+    /// Ready for the same account without the marker.
+    #[test]
+    fn probe_history_import_honors_the_cancel_marker() {
+        let temp = TempDir::new().unwrap();
+        let signal_data = temp.path().join("signal-data");
+        let account_dir = signal_data.join("accounts").join("lk-probe");
+        std::fs::create_dir_all(&account_dir).unwrap();
+        std::fs::write(
+            signal_data.join("engine-state.json"),
+            r#"{"version":2,"accounts":[{"number":"+15555550100","dir":"accounts/lk-probe"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            account_dir.join("history-import.ndjson"),
+            "{\"type\":\"recipient\"}\n",
+        )
+        .unwrap();
+        let store = Arc::new(test_store(temp.path()));
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+
+        let cancels = StdMutex::new(HashSet::new());
+        let probe = probe_history_import(&store, &signal_data, &account.id, &cancels);
+        let HistoryImportProbe::Ready(job) = probe else {
+            panic!("archive present with no marker must be Ready");
+        };
+        assert_eq!(job.account_id, account.id);
+        assert_eq!(job.signal_account, "+15555550100");
+
+        cancels.lock().unwrap().insert(account.id.clone());
+        assert!(matches!(
+            probe_history_import(&store, &signal_data, &account.id, &cancels),
+            HistoryImportProbe::Done
+        ));
     }
 
     /// §4.69 cloudStatus shape gate (contract 1.83): well-formed snapshots
