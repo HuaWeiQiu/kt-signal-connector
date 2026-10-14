@@ -187,9 +187,11 @@ fn engine_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsString> {
     ];
     // ADR 0004: dropping --ignore-attachments is the entire media opt-in —
     // the engine then downloads inbound attachments into its data directory,
-    // where the connector's media governor bounds retention. Stories and
-    // stickers stay ignored in every shape; they are not part of the media
-    // PoC and would add unbounded surface.
+    // where the connector's media governor bounds retention. --ignore-stories
+    // and --ignore-stickers stay in every shape for argv compatibility, but
+    // they are no-ops on the engine side (engine f2ba462): stickers project
+    // metadata-only and stories project transient regardless of the flags, so
+    // this argument list does not discard them.
     if !media_ingest {
         args.push("--ignore-attachments".into());
     }
