@@ -5120,7 +5120,7 @@
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["accountId", "callId", "timestamp"],
-                "description": "One call-history sync record forwarded (contract 1.104, §4.85): the engine's syncMessage.callEvent projection — the account's own linked device wrote one 1:1/group call's history entry, the official callEventSync face. Pure transient forwarding: the desktop's own call log is the authoritative store (the connector keeps none), so a missed delivery loses that one entry exactly as the official client loses one it received while offline. The record carries the local conversationId when the projection's conversation identity resolved (the 32-byte group form addresses its group row directly, the UUID/e164 forms walk the §4.81 resolution ladder); absent stays absent and the desktop joins by the projection's own identity.",
+                "description": "One call-history sync record forwarded (contract 1.104, §4.85): the engine's syncMessage.callEvent projection — the account's own linked device wrote one 1:1/group call's history entry, the official callEventSync face. Pure transient forwarding: the desktop's own call log is the authoritative store (the connector keeps none), so a missed delivery loses that one entry exactly as the official client loses one it received while offline. The record carries the local conversationId when the projection's conversation identity resolved (the 32-byte group form addresses its group row directly, the UUID/e164 forms walk the §4.81 resolution ladder); absent stays absent and the desktop joins by the projection's own identity. Contract 1.155 (2026-10-15, §4.85): the record gains the raw identity leg peerId — the projection's own conversation identity in its three forms (hex room id / ServiceId UUID / standard-base64 group master key), forwarded verbatim with no connector-side gate (the engine's parse owns the identity, the ladder reads the form; the wire-additive twin of the call.logEvent peerId leg). Raw and resolved stay decoupled: conversationId remains the ladder's hit alone, so an ad-hoc hex room id the ladder cannot resolve still rides peerId while the record stays conversation-less — the desktop's ad-hoc ledger join reads the raw leg the way its official callLogEvent join already does. An absent identity stays an absent key, never null: every pre-1.155 frame reads byte-identically.",
                 "properties": {
                   "accountId": { "$ref": "#/$defs/opaqueId" },
                   "callId": {
@@ -5148,6 +5148,10 @@
                     "type": "string",
                     "enum": ["accepted", "not-accepted", "delete", "observed", "unknown"],
                     "description": "The history outcome — the projection's lowercase word verbatim; absent when the projection carried none."
+                  },
+                  "peerId": {
+                    "$ref": "#/$defs/opaqueId",
+                    "description": "The projection's raw conversation identity — the three-form shape (hex room id / ServiceId UUID / standard-base64 group master key) forwarded verbatim for the desktop's own official join (contract 1.155; the same leg the call.logEvent mutation record carries)."
                   },
                   "conversationId": {
                     "$ref": "#/$defs/opaqueId",

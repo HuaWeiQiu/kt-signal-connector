@@ -1289,6 +1289,13 @@ pub enum HostSideEvent {
         kind: Option<&'static str>,
         direction: Option<&'static str>,
         outcome: Option<&'static str>,
+        /// Contract 1.155 (§4.85): the projection's raw conversation identity
+        /// — the three forms (hex room id / ServiceId UUID / standard-base64
+        /// group master key) forwarded verbatim, never decoded, never
+        /// re-encoded (the `call.logEvent` peerId leg, wire-additive twin);
+        /// the gate is the engine's. Rides only when the projection carried
+        /// an identity — absent stays absent, never null.
+        peer_id: Option<String>,
         conversation_id: Option<String>,
     },
     /// The engine's `syncMessage.configuration` projection forwarded
@@ -10361,6 +10368,12 @@ impl ConnectorService {
     /// carries the local `conversationId`, a miss forwards conversation-less
     /// and the desktop joins by the projection's own identity. The word
     /// legs ride verbatim (the parser's whitelists already resolved them).
+    /// Since 1.155 the record also carries the raw identity leg: the
+    /// projection's own conversation identity rides `peer_id` verbatim —
+    /// raw and resolved stay decoupled (`conversation_id` is the ladder's
+    /// hit, `peer_id` is the projection's own text), so an ad-hoc hex room
+    /// id the ladder cannot resolve still reaches the desktop's ad-hoc
+    /// ledger join; absent stays absent, never null.
     fn apply_sync_call_event(
         &mut self,
         account: &AccountRow,
@@ -10377,6 +10390,7 @@ impl ConnectorService {
             kind: event.kind,
             direction: event.direction,
             outcome: event.outcome,
+            peer_id: event.conversation_id.clone(),
             conversation_id: conversation.map(|conversation| conversation.id),
         }])
     }
@@ -27884,9 +27898,13 @@ mod tests {
     /// Contract 1.104 (§4.85): the call-event sync forwards as one transient
     /// event — the 32-byte group form addresses its group row directly, the
     /// UUID form ladders to the direct thread, an ad-hoc hex room id stays
-    /// honestly conversation-less, and the word legs ride verbatim. Nothing
-    /// mirrors (the connector keeps no call-history store) and nothing
-    /// converges beside the event.
+    /// honestly conversation-less, and the word legs ride verbatim. Since
+    /// 1.155 the raw identity leg rides beside the ladder's verdict: the
+    /// projection's own conversation identity forwards as `peerId` verbatim,
+    /// so the ad-hoc miss still carries its identity (both keys on the
+    /// ladder hits, the raw leg alone on the hex miss, neither on the
+    /// identity-less record). Nothing mirrors (the connector keeps no
+    /// call-history store) and nothing converges beside the event.
     #[test]
     fn sync_call_event_forwards_with_the_resolved_conversation() {
         let (_temp, mut service) = service();
@@ -27928,6 +27946,7 @@ mod tests {
                 kind,
                 direction,
                 outcome,
+                peer_id,
                 conversation_id,
             } => (
                 account_id.clone(),
@@ -27936,14 +27955,16 @@ mod tests {
                 *kind,
                 *direction,
                 *outcome,
+                peer_id.clone(),
                 conversation_id.clone(),
                 events.len(),
             ),
             other => panic!("expected the call-history event: {other:?}"),
         };
 
-        // The 32-byte group form addresses the group row directly.
-        let (event_account, call_id, _, kind, direction, outcome, conversation_id, count) =
+        // The 32-byte group form addresses the group row directly — both
+        // keys coexist: the raw identity and the ladder's hit.
+        let (event_account, call_id, _, kind, direction, outcome, peer_id, conversation_id, count) =
             event_of(
                 service
                     .ingest_receive(
@@ -27957,21 +27978,24 @@ mod tests {
         assert_eq!(kind, Some("video"));
         assert_eq!(direction, Some("incoming"));
         assert_eq!(outcome, Some("not-accepted"));
+        assert_eq!(peer_id.as_deref(), Some(GROUP_ID_32B));
         assert_eq!(conversation_id.as_deref(), Some(group.id.as_str()));
         assert_eq!(count, 1, "one event, nothing converges beside it");
 
         // The UUID form ladders to the direct thread through the recorded
-        // ACI→peer-key mapping.
-        let (_, _, _, _, _, _, conversation_id, _) = event_of(
+        // ACI→peer-key mapping — both keys ride again.
+        let (_, _, _, _, _, _, peer_id, conversation_id, _) = event_of(
             service
                 .ingest_receive(sync("1002", Some(ACI)), crate::DEFAULT_PROXY_GROUP_ID)
                 .unwrap(),
         );
+        assert_eq!(peer_id.as_deref(), Some(ACI));
         assert_eq!(conversation_id.as_deref(), Some(conversation.id.as_str()));
 
         // An ad-hoc hex room id resolves nothing local — the record forwards
-        // conversation-less.
-        let (_, _, _, _, _, _, conversation_id, _) = event_of(
+        // conversation-less, and since 1.155 the raw identity leg still
+        // rides so the desktop's ad-hoc ledger can join by it.
+        let (_, _, _, _, _, _, peer_id, conversation_id, _) = event_of(
             service
                 .ingest_receive(
                     sync("1003", Some("deadbeef")),
@@ -27979,14 +28003,18 @@ mod tests {
                 )
                 .unwrap(),
         );
+        assert_eq!(peer_id.as_deref(), Some("deadbeef"));
         assert!(conversation_id.is_none());
 
-        // No conversation identity at all — the same conversation-less face.
-        let (_, _, _, _, _, _, conversation_id, _) = event_of(
+        // No conversation identity at all — the same conversation-less face,
+        // and the raw leg is absent with it (absence stays absence, never
+        // null; the pre-1.155 frame shape).
+        let (_, _, _, _, _, _, peer_id, conversation_id, _) = event_of(
             service
                 .ingest_receive(sync("1004", None), crate::DEFAULT_PROXY_GROUP_ID)
                 .unwrap(),
         );
+        assert!(peer_id.is_none());
         assert!(conversation_id.is_none());
     }
 

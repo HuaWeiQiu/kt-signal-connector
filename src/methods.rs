@@ -729,7 +729,7 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
 /// the row-level serverGuid persistence); `call-signaling` (contract
 /// revision 1.51, widened in place by 1.82, by 1.88, by 1.127, by
-/// 1.145, and by 1.151) marks
+/// 1.145, by 1.151, and by 1.155) marks
 /// the §4.49
 /// call signaling faces (`calls.sendSignal` — the 1:1 and, since 1.82, the
 /// group-addressed route — plus the `call.incoming` and `call.groupIncoming`
@@ -744,7 +744,11 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// freshness story proxied untouched) and, since 1.151, the §4.150
 /// call-event self-sync proxy (`calls.sendCallEvent` — the call chain's
 /// own cross-device history face, the engine's SyncMessage.callEvent=19
-/// self-send with the full parameter gate proxied verbatim);
+/// self-send with the full parameter gate proxied verbatim) and, since
+/// 1.155, the §4.85 raw identity leg (the `call.historyEvent` record's
+/// optional `peerId` — the projection's raw conversation identity riding
+/// verbatim, the desktop's ad-hoc ledger join key, `call.logEvent`'s
+/// wire-additive twin);
 /// `group-terminate` (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);

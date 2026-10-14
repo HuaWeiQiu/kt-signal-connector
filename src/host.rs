@@ -3875,13 +3875,18 @@ where
             kind,
             direction,
             outcome,
+            peer_id,
             conversation_id,
         } => {
             // Contract 1.104, §4.85: the call-history record forwards flat
             // with the absent-optional discipline — the word legs ride only
             // when the projection carried them and an unresolved record
             // stays conversation-less (the story.received conditional-insert
-            // style).
+            // style). Since 1.155 the record also rides the §4.85 raw
+            // identity leg: the projection's own conversation identity goes
+            // out verbatim as `peerId` — the same leg `call.logEvent`
+            // already carries, the desktop's ad-hoc ledger join key — only
+            // when the projection named one, absent staying absent.
             let mut payload = json!({
                 "accountId": account_id,
                 "callId": call_id,
@@ -3895,6 +3900,9 @@ where
             }
             if let Some(outcome) = outcome {
                 payload["event"] = json!(outcome);
+            }
+            if let Some(peer_id) = peer_id {
+                payload["peerId"] = json!(peer_id);
             }
             if let Some(conversation_id) = conversation_id {
                 payload["conversationId"] = json!(conversation_id);
@@ -5301,7 +5309,10 @@ mod tests {
     /// Contract 1.104 (§4.85): the `call.historyEvent` wire frame — the
     /// record rides flat with the absent-optional discipline: the word legs
     /// exist only when the projection carried them and an unresolved record
-    /// stays conversation-less.
+    /// stays conversation-less. Since 1.155 the raw identity leg rides the
+    /// same way: `peerId` forwards verbatim beside the ladder's
+    /// `conversationId` (both keys coexisting on a hit), and an unprojected
+    /// record carries neither — the pre-1.155 shape byte-identically.
     #[tokio::test]
     async fn call_history_event_rides_the_flat_record() {
         let (client, mut server) = duplex(64 * 1024);
@@ -5317,6 +5328,7 @@ mod tests {
                 kind: Some("audio"),
                 direction: Some("incoming"),
                 outcome: Some("accepted"),
+                peer_id: Some("deadbeef".into()),
                 conversation_id: Some("conv-1".into()),
             },
         )
@@ -5331,6 +5343,7 @@ mod tests {
                 kind: None,
                 direction: None,
                 outcome: None,
+                peer_id: None,
                 conversation_id: None,
             },
         )
@@ -5351,6 +5364,8 @@ mod tests {
         assert_eq!(frame["data"]["type"], "audio");
         assert_eq!(frame["data"]["direction"], "incoming");
         assert_eq!(frame["data"]["event"], "accepted");
+        // The raw identity leg rides verbatim beside the ladder's hit.
+        assert_eq!(frame["data"]["peerId"], "deadbeef");
         assert_eq!(frame["data"]["conversationId"], "conv-1");
 
         let line = timeout(Duration::from_millis(500), lines.next())
@@ -5361,10 +5376,12 @@ mod tests {
         let frame: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(frame["data"]["callId"], "42");
         // The absent-optional discipline: an unprojected record carries none
-        // of the four optional keys.
+        // of the five optional keys — the pre-1.155 shape byte-identically
+        // (absence stays absence, never null).
         assert!(frame["data"].get("type").is_none());
         assert!(frame["data"].get("direction").is_none());
         assert!(frame["data"].get("event").is_none());
+        assert!(frame["data"].get("peerId").is_none());
         assert!(frame["data"].get("conversationId").is_none());
     }
 

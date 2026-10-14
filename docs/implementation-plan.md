@@ -42,7 +42,29 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.154 (2026-10-14; the transient story-receive faces
+- Contract revision: 1.155 (2026-10-15; the ad-hoc call-history identity leg
+  (§4.85): `call.historyEvent` gains the optional `peerId` — the projection's
+  own conversation identity forwarded verbatim in its three forms (hex room
+  id / ServiceId UUID / standard-base64 group master key), the wire-additive
+  twin of the `call.logEvent` peerId leg contract 1.106 already carries. The
+  §4.85 ladder resolves the projection's identity to at most a local
+  `conversationId` and drops the raw text at the ladder's exit — so an ad-hoc
+  hex room id (which naturally resolves nothing, the connector keeping no
+  ad-hoc face) forwarded honestly conversation-less but with no identity at
+  all: the desktop's ad-hoc call ledger had no join key, and even the
+  account's own ad-hoc calls could not enter it. Raw and resolved stay
+  decoupled — `conversationId` remains the ladder's hit alone, `peerId` is
+  the projection's raw text, and the join stays the desktop consumer's
+  boundary. The honest-pipe posture does not move (§4.73/§4.85/§4.87): zero
+  parsing of the three forms, no hex-shape validation (the engine's parse is
+  the gate), no call-link store, no roomId derivation, no name enrichment,
+  and `call.logEvent` untouched. Absence stays absence, never null: every
+  pre-1.155 frame reads byte-identically. Wire additive: one optional key,
+  zero new methods/events/error codes/store moves. Tests 826 → 826 (the
+  service forward arm and the wire frame arm gain the peerId legs and the
+  old-shape byte-identical regression, no new harnesses), all green — fmt,
+  check, clippy, full cargo test, release build, schema parse) —
+  previously 1.154 (2026-10-14; the transient story-receive faces
   (§4.153): `story.reaction` / `story.deleted` / `story.recipientUpdate` —
   the receive-side half of the engine's story batch S4/S5 (engine 4822e99 /
   7320393, the same batch whose send faces the 1.152/1.153 registrations
@@ -7983,6 +8005,33 @@ flat camelCase shape, the absent optionals); and the schema consistency pair
 identity rides the shared `opaqueId` def, no inline bound to pin, the event
 enum auto-balanced against the emission
 literal). Gates: 621 → 624, all green.
+
+**The 1.155 widening — the raw identity leg.** The ladder's exit used to be
+the record's last word on identity: the projection's conversation identity
+was consumed by the §4.85 ladder and the raw text dropped with it, so an
+ad-hoc hex room id — which the ladder resolves to nothing by construction
+(the connector keeps no ad-hoc face) — forwarded honestly conversation-less
+but carried no identity at all: the desktop's ad-hoc call ledger had no join
+key, and even the account's own ad-hoc calls could not enter it. Contract
+1.155 adds the missing raw leg: `call.historyEvent` gains the optional
+`peerId`, the projection's own conversation identity forwarded verbatim in
+its three forms — the wire-additive twin of the `call.logEvent` peerId leg
+(§4.87), the same raw leg the desktop's official callLogEvent join already
+reads. The honest-pipe posture does not move (§4.73/§4.85/§4.87): the
+connector does not parse the three forms, does not validate the hex shape
+(the engine's parse is the gate), keeps no call-link store, derives no
+roomId, enriches no name, and `call.logEvent` is untouched. Raw and resolved
+stay decoupled — `conversationId` keeps meaning the ladder's hit alone across
+the event surface, `peerId` keeps meaning the projection's raw text — and
+the join stays the desktop consumer's boundary. Absence stays absence, never
+null: a projection that named no identity forwards with both keys absent,
+and every pre-1.155 frame reads byte-identically. Tests: the service forward
+arm (`sync_call_event_forwards_with_the_resolved_conversation`) gains the
+peerId assertions — the ad-hoc hex miss riding `peerId` while staying
+conversation-less, the UUID and group hits carrying both keys, the
+identity-less record carrying neither — and the wire frame arm
+(`call_history_event_rides_the_flat_record`) pins the `peerId` leg plus the
+no-peerId old shape byte-identically; 826 → 826, all green.
 
 ### 4.86 Edit-send migration: `messages.edit` rides the engine `editMessage` face (contract revision 1.105, 2026-10-11)
 
