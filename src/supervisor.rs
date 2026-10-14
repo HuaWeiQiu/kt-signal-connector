@@ -2623,29 +2623,32 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// stories.sendReaction (contract 1.94, §4.77): the story-anchored
-    /// reaction send — the `messages.sendReaction` send class verbatim
-    /// (confirmed `sent`, an indeterminate outcome `unknown`, a definite
-    /// error propagates, nothing retries) with the story anchor frame in
-    /// place of the row-addressed one. No local write and no event: a story
-    /// reaction has no row to pill on (stories are rowless, §4.67).
+    /// stories.sendReaction (contract 1.152, §4.151): the story-anchored
+    /// reaction send — the §4.150 call-event proxy posture on the stories
+    /// family. The account resolution rides the service prepare, the
+    /// engine's `sendStoryReaction` crosses as its own mutating call (the
+    /// official reactToStory alignment, the Reaction + StoryContext dual
+    /// anchor), the success answer (`{}`) passes through untouched, and the
+    /// error face is the engine's verbatim through the structured ladder:
+    /// the plain -32603 parse/identity/profileSharing faces degrade to
+    /// UPSTREAM_ERROR, the §4.17 unbound matcher still applies, and the
+    /// connector adds no gate of its own (the engine 4822e99 parse owns the
+    /// value domain). Mutating class: a timeout answers SEND_OUTCOME_UNKNOWN
+    /// and is never retried — an unknown reaction outcome may already sit in
+    /// the author's fan-out.
     pub async fn send_story_reaction(
         &self,
         params: StoriesSendReactionParams,
-    ) -> Result<&'static str, ServiceError> {
-        let engine = self.running_engine().await?;
+    ) -> Result<Value, ServiceError> {
         let frame = {
             let service = self.service.lock().await;
             service.prepare_story_send_reaction(&params)?
         };
-        match engine
-            .call("sendReaction", frame, CallClass::Mutating)
+        let engine = self.running_engine().await?;
+        engine
+            .call("sendStoryReaction", frame, CallClass::Mutating)
             .await
-        {
-            Ok(_) => Ok("sent"),
-            Err(EngineError::UnknownOutcome) => Ok("unknown"),
-            Err(error) => Err(error.into()),
-        }
+            .map_err(ServiceError::from)
     }
 
     /// Send one attachment (optionally with a caption) — implementation-plan
@@ -11566,17 +11569,26 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// stories.sendReaction: the engine-gap answer is
-    /// CAPABILITY_UNAVAILABLE (not retryable) after local validation — the
-    /// §4.53 precedent — and no frame ever leaves the process.
+    /// stories.sendReaction (contract 1.152, §4.151): the supervisor-level
+    /// forward — the engine's `sendStoryReaction` crosses as its own
+    /// mutating call, the `{}` success answer passes through untouched, and
+    /// the one local refusal (`remove: true`) answers INVALID_REQUEST
+    /// before any engine traffic (the face is place-only).
     #[tokio::test]
-    async fn stories_send_reaction_answers_capability_unavailable() {
+    async fn stories_send_reaction_forwards_the_engine_frame() {
         let temp = TempDir::new().unwrap();
+        let data_dir = temp.path().join("signal-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("engine-state.json"),
+            r#"{"version":2,"accounts":[{"number":"+15555550100","dir":"accounts/lk-abc"}]}"#,
+        )
+        .unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
         let mut config = EngineConfig::new(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
-            temp.path().join("signal-data"),
+            data_dir.clone(),
         );
         config.request_timeout = Duration::from_secs(3);
         config.shutdown_grace = Duration::from_millis(100);
@@ -11595,7 +11607,7 @@ mod tests {
             .unwrap()
             .remove(0);
 
-        let error = supervisor
+        let answered = supervisor
             .send_story_reaction(crate::service::StoriesSendReactionParams {
                 account_id: account.id.clone(),
                 story_author: "+15555550101".into(),
@@ -11605,19 +11617,44 @@ mod tests {
                 operation_id: None,
             })
             .await
+            .unwrap();
+        assert_eq!(answered, serde_json::json!({}));
+
+        let error = supervisor
+            .send_story_reaction(crate::service::StoriesSendReactionParams {
+                account_id: account.id,
+                story_author: "+15555550101".into(),
+                story_sent_at: 1727000000000,
+                emoji: "👍".into(),
+                remove: true,
+                operation_id: None,
+            })
+            .await
             .unwrap_err();
         assert!(matches!(
             error,
             crate::service::ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable
+                if api.code == "INVALID_REQUEST" && !api.retryable
         ));
-        assert!(
-            !temp
-                .path()
-                .join("signal-data")
-                .join(".fixture-send-log.jsonl")
-                .exists(),
-            "no frame ever leaves the process"
+
+        // The dispatch log pins the frame: the resolved signal account
+        // under the engine's names, no remove key (the face is
+        // place-only), and the remove refusal contributed no line.
+        let send_log = std::fs::read_to_string(data_dir.join(".fixture-send-log.jsonl"))
+            .expect("fixture must log the dispatches");
+        let dispatches: Vec<serde_json::Value> = send_log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(dispatches.len(), 1, "{dispatches:?}");
+        assert_eq!(
+            dispatches[0],
+            serde_json::json!({
+                "account": "+15555550100",
+                "storyAuthor": "+15555550101",
+                "storyTimestamp": 1727000000000u64,
+                "emoji": "👍",
+            })
         );
         supervisor.shutdown().await.unwrap();
     }

@@ -1826,14 +1826,18 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ),
             }
         }
-        // Story reaction send (contract 1.94, §4.77): the stories.markViewed
-        // dispatch shape — params shape errors answer INVALID_REQUEST, the
-        // answer is {status: sent|unknown}; a definite upstream error
-        // propagates (send class, not receipt class).
+        // Story reaction send (contract 1.152, §4.151): the §4.150
+        // call-event proxy shape on the stories family — params shape errors
+        // answer INVALID_REQUEST, the engine's `{}` success answer and error
+        // faces pass through untouched, and the whole value domain
+        // (author/emoji/timestamp gates, identity and profileSharing) stays
+        // the engine's parse (engine 4822e99), never re-gated or re-keyed
+        // here. `remove: true` is the connector's one refusal (the upstream
+        // face places only).
         "stories.sendReaction" => {
             match serde_json::from_value::<StoriesSendReactionParams>(request.params) {
                 Ok(params) => match runtime.send_story_reaction(params).await {
-                    Ok(status) => HostResponse::success(request_id, json!({ "status": status })),
+                    Ok(result) => HostResponse::success(request_id, result),
                     Err(error) => HostResponse::failure(request_id, error.into_api()),
                 },
                 Err(_) => HostResponse::failure(

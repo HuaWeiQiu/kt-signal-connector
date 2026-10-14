@@ -5094,23 +5094,27 @@ impl ConnectorService {
         }))
     }
 
-    /// stories.sendReaction (contract 1.94, §4.77): the story-anchored
-    /// reaction send. A story lands in no conversation row (§4.67), so the
-    /// message-addressed `messages.sendReaction` ladder can never target
-    /// one; this face takes the story anchor (author + the story's own
-    /// Signal timestamp) verbatim from the caller — the desktop's story
-    /// timeline is the authoritative source of both. Validation runs fully
-    /// before the honest refusal: the face answers CAPABILITY_UNAVAILABLE
-    /// (retryable=false) after local validation — the §4.53 engine-gap
-    /// precedent (ADR 0003: the removed signal-cli fallback face dispatched
-    /// the pinned `sendReaction --story` frame, but its removal is not a
-    /// capability regression; the kt-engine answer was already this
-    /// refusal). The send-class settlement (`{status: sent|unknown}`, a
-    /// definite error propagates, nothing retries) will live in the
-    /// supervisor when the engine face lands. v1 addresses author-direct
+    /// stories.sendReaction (contract 1.152, §4.151): the story-anchored
+    /// reaction send, now a true engine passthrough — the §4.150
+    /// call-event posture on the stories family (the engine's story-reaction
+    /// batch S4, kt-signal-engine 4822e99, opened the face). The §4.77
+    /// constant-reject arm (CAPABILITY_UNAVAILABLE after local validation)
+    /// is gone: the connector's gate is the envelope only — the opaque
+    /// account resolution plus the standard `operationId` shape check — and
+    /// every other key rides verbatim (`storyAuthor` the author's address,
+    /// `storyTimestamp` the story's own Signal timestamp, `emoji` the
+    /// reaction): the engine's parse gate owns the whole value domain
+    /// (missing/empty author or emoji, zero timestamp, an unresolvable
+    /// author, the identity-reject and profileSharing gates) and its plain
+    /// -32603 answers through the structured ladder (UPSTREAM_ERROR,
+    /// retryable), never re-gated or re-keyed here. The one refusal the
+    /// connector keeps is `remove: true` (INVALID_REQUEST, non-retryable):
+    /// the official reaction is place-only (sendNormalMessage
+    /// reactionForSend hardcodes `remove:false`, so the engine face carries
+    /// no remove parameter at all) and a remove intent would otherwise
+    /// silently place — a lie, never forwarded. v1 addresses author-direct
     /// reactions only: a group-story reaction needs the group context the
-    /// story.received projection does not carry, so there is nothing to
-    /// address a group frame with (记档边界, not invented).
+    /// story.received projection does not carry (记档边界, not invented).
     pub fn prepare_story_send_reaction(
         &self,
         params: &StoriesSendReactionParams,
@@ -5119,28 +5123,20 @@ impl ConnectorService {
         if let Some(operation_id) = params.operation_id.as_deref() {
             validate_opaque_id(operation_id, "operationId")?;
         }
-        let author = params.story_author.trim();
-        if author.is_empty() || author.chars().count() > MAX_OPAQUE_ID_BYTES {
+        if params.remove {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "storyAuthor must contain between 1 and 128 characters",
+                "a story reaction cannot be removed; the upstream face places only",
                 false,
             )));
         }
-        if params.story_sent_at == 0 {
-            return Err(ServiceError::Api(ApiError::new(
-                "INVALID_REQUEST",
-                "storySentAt must be a positive Signal timestamp",
-                false,
-            )));
-        }
-        validate_emoji(&params.emoji)?;
-        self.resolve_account(&params.account_id)?;
-        Err(ServiceError::Api(ApiError::new(
-            "CAPABILITY_UNAVAILABLE",
-            "the kt-engine face has no story reaction send yet",
-            false,
-        )))
+        let account = self.resolve_account(&params.account_id)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "storyAuthor": params.story_author,
+            "storyTimestamp": params.story_sent_at,
+            "emoji": params.emoji,
+        }))
     }
 
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
@@ -12874,13 +12870,19 @@ pub struct StoriesMarkViewedParams {
     pub story_sent_at: u64,
 }
 
-/// `stories.sendReaction` params (contract 1.94, §4.77): the story anchor —
-/// the author's address plus the story's own Signal timestamp — and the
-/// reaction itself. `remove` (default false) lifts the own reaction instead
-/// of placing it. Stories are rowless (§4.67), so there is no conversation
-/// or messageId on this face; the desktop's story timeline supplies the
-/// anchor. `operationId` rides the standard mutating-call envelope and is
-/// validated when present.
+/// `stories.sendReaction` params (contract 1.152, §4.151): the story anchor
+/// — the author's address plus the story's own Signal timestamp — and the
+/// reaction itself. The §4.77 engine-gap face is gone: the engine
+/// (`sendStoryReaction`, 4822e99) receives every key verbatim and owns the
+/// whole value domain (missing/empty author or emoji, zero timestamp,
+/// unresolvable author, identity-reject and profileSharing gates answer its
+/// plain -32603 through the structured ladder). `remove` stays on the wire
+/// face but `true` answers INVALID_REQUEST locally — the official reaction
+/// is place-only (remove:false hardcoded upstream), so a remove intent has
+/// no face to forward to and must never silently place. Stories are rowless
+/// (§4.67), so there is no conversation or messageId on this face;
+/// `operationId` rides the standard mutating-call envelope and is validated
+/// when present.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoriesSendReactionParams {
@@ -25311,13 +25313,15 @@ mod tests {
         );
     }
 
-    /// stories.sendReaction (contract 1.94, §4.77): validation runs
-    /// entirely before the account ladder — author bounds, the meaningless
-    /// zero storySentAt, the emoji shape — then the engine-gap face answers
-    /// CAPABILITY_UNAVAILABLE (not retryable) after the same local
-    /// validation.
+    /// stories.sendReaction (contract 1.152, §4.151): the §4.150 proxy
+    /// posture — the envelope is the connector's whole gate (the opaque
+    /// account ladder plus the standard operationId shape check), the
+    /// author/emoji/timestamp keys ride the frame verbatim (the §4.77
+    /// local value gates are gone; the engine's parse owns that domain),
+    /// and the one local refusal is `remove: true` (the upstream face is
+    /// place-only).
     #[test]
-    fn stories_send_reaction_preparation_gates_then_frames() {
+    fn story_send_reaction_prepares_the_verbatim_frame() {
         let (_temp, service) = service();
         let account = service
             .sync_accounts_from_numbers(
@@ -25335,53 +25339,71 @@ mod tests {
                 remove: false,
                 operation_id: None,
             };
-        let gate = |params: &StoriesSendReactionParams| {
-            matches!(
-                service.prepare_story_send_reaction(params),
-                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
-            )
-        };
 
-        assert!(
-            gate(&params("", 1727000000000, "👍", &account.id)),
-            "empty author"
+        // The verbatim frame: the resolved account rides `account`, the
+        // three keys reassemble under the engine's names, no remove key
+        // exists on the frame (the face is place-only). The formerly local
+        // value faces now forward — a blank author, a zero timestamp, and a
+        // bare emoji all pass the envelope gate for the engine's parse to
+        // answer (the 1.151 timestamp rationale: connector typing would eat
+        // part of that error face).
+        let frame = service
+            .prepare_story_send_reaction(&params("+15555550101", 1727000000000, "👍", &account.id))
+            .unwrap();
+        assert_eq!(
+            frame,
+            json!({
+                "account": "+15555550100",
+                "storyAuthor": "+15555550101",
+                "storyTimestamp": 1727000000000u64,
+                "emoji": "👍",
+            })
         );
-        assert!(
-            gate(&params("   ", 1727000000000, "👍", &account.id)),
-            "blank author"
-        );
-        assert!(
-            gate(&params(
+        assert!(frame.get("remove").is_none());
+        let forwarded = [
+            params("", 1727000000000, "👍", &account.id),
+            params("+15555550101", 0, "👍", &account.id),
+            params("+15555550101", 1727000000000, "", &account.id),
+            params(
                 &"k".repeat(MAX_OPAQUE_ID_BYTES + 1),
                 1727000000000,
                 "👍",
-                &account.id
-            )),
-            "oversized author"
-        );
-        assert!(
-            gate(&params("+15555550101", 0, "👍", &account.id)),
-            "zero sentAt"
-        );
-        assert!(
-            gate(&params("+15555550101", 1727000000000, "", &account.id)),
-            "empty emoji"
-        );
-        assert!(
-            gate(&params("+15555550101", 1727000000000, "👍🎉", &account.id)),
-            "multi-grapheme emoji"
-        );
-        assert!(
-            gate(&params(
+                &account.id,
+            ),
+        ];
+        for value in &forwarded {
+            let frame = service.prepare_story_send_reaction(value).unwrap();
+            assert_eq!(frame["account"], json!("+15555550100"));
+            assert_eq!(frame["storyAuthor"], json!(value.story_author));
+            assert_eq!(frame["storyTimestamp"], json!(value.story_sent_at));
+            assert_eq!(frame["emoji"], json!(value.emoji));
+        }
+
+        // The one local refusal: remove:true answers INVALID_REQUEST
+        // (non-retryable) before any engine traffic — the official reaction
+        // is place-only, so a remove intent has no upstream face.
+        let mut removal = params("+15555550101", 1727000000000, "👍", &account.id);
+        removal.remove = true;
+        let error = service.prepare_story_send_reaction(&removal).unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Api(ref api) if api.code == "INVALID_REQUEST" && !api.retryable
+        ));
+
+        // The envelope gate stays: an unresolvable opaque account id and an
+        // unknown account keep their pre-forward faces.
+        let error = service
+            .prepare_story_send_reaction(&params(
                 "+15555550101",
                 1727000000000,
                 "👍",
-                &"k".repeat(129)
-            )),
-            "oversized accountId"
-        );
-
-        // Unknown account after the parameter gates.
+                &"k".repeat(129),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"
+        ));
         let error = service
             .prepare_story_send_reaction(&params(
                 "+15555550101",
@@ -25394,30 +25416,6 @@ mod tests {
             error,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
-
-        // The engine-gap face: CAPABILITY_UNAVAILABLE after the same local
-        // validation ladder (the §4.53 precedent), and the gates still run
-        // first.
-        let error = service
-            .prepare_story_send_reaction(&params("+15555550101", 1727000000000, "👍", &account.id))
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ServiceError::Api(ref api)
-                if api.code == "CAPABILITY_UNAVAILABLE" && !api.retryable
-        ));
-        assert!(
-            matches!(
-                service.prepare_story_send_reaction(&params(
-                    "+15555550101",
-                    0,
-                    "👍",
-                    &account.id
-                )),
-                Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
-            ),
-            "parameter gates precede the capability answer"
-        );
     }
 
     /// One caller-shaped story attachment pointer, mutated per case — the

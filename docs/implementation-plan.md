@@ -42,7 +42,40 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.151 (2026-10-14; the call-event self-sync crosses the
+- Contract revision: 1.152 (2026-10-14; the story-reaction send becomes a
+  true engine passthrough (§4.151): `stories.sendReaction` — the §4.150
+  call-event proxy posture on the stories family; the engine's story
+  batch S4 (engine 4822e99, the official reactToStory alignment, the
+  Reaction + StoryContext dual anchor) opened the `sendStoryReaction`
+  face this batch registers host-side. The §4.77 constant
+  CAPABILITY_UNAVAILABLE arm is retired: the connector's gate is the
+  envelope only (the opaque account resolution plus the standard
+  operationId shape check), `storyAuthor`/`storySentAt`/`emoji` ride
+  verbatim onto the engine's `{account, storyAuthor, storyTimestamp,
+  emoji}` — the author/emoji shape, the zero timestamp, the author
+  resolution, and the identity-reject/profileSharing gates are the
+  engine's fail-closed parse answering its plain -32603 through the
+  structured ladder (UPSTREAM_ERROR retryable), never re-gated or
+  re-keyed here; the one local refusal is `remove: true` →
+  INVALID_REQUEST non-retryable (the official reaction is place-only,
+  remove:false hardcoded upstream — a remove intent must never silently
+  place). Success answer: the engine's `{}` passes through untouched
+  (the former {status: sent|unknown} settlement face is gone with the
+  reject arm); an indeterminate mutating outcome answers
+  SEND_OUTCOME_UNKNOWN, never retried. Wire additive: zero new
+  methods/events/error codes/store moves (the `stories` capability
+  widened in place, the 1.82 precedent; the engine face carries no
+  remove parameter). Group-story reactions stay unaddressable (the
+  story.received projection carries no group context — 记档边界, not
+  invented). Tests 819 → 821 (integration +2: tests/story_reaction.rs —
+  the forward arm with the send-log pinned byte-for-byte on the
+  four-key engine frame and the `{}` echo plus the former local gates'
+  values forwarding gate-free; the error arm — the remove refusal with
+  zero upstream traffic, the engine parse-gate face, the unknown engine
+  account, the engine-down face; lib: the §4.77 preparation arm
+  rewritten to the verbatim frame, the registry/lane rows unchanged),
+  all green) —
+  previously 1.151 (2026-10-14; the call-event self-sync crosses the
   connector (§4.150): `calls.sendCallEvent` — the host-side registration of
   the engine's `sendCallEvent` (engine 6d56660, SyncMessage.callEvent=19,
   the official updateRemoteCallHistory/getDeleteCallEvent alignment) —
@@ -12026,6 +12059,77 @@ the ladder to UPSTREAM_ERROR retryable, the unknown engine account, the
 engine-down RUNTIME_NOT_RUNNING face); lib: the registry/lane grouping
 rows (the send-lane/mutating classification table grows the new method).
 Tests 817 → 819, all green.
+
+### 4.151 The story-reaction send becomes a true engine passthrough: `stories.sendReaction`, the proxy face on the stories family (contract revision 1.152, 2026-10-14)
+
+The engine's story batch S4 (kt-signal-engine `4822e99`) opened the
+`sendStoryReaction` face — the official reactToStory alignment: the
+Reaction and StoryContext dual anchor (the same author, the same story
+timestamp), the reaction delivered as a direct message to the story's
+author. The engine's parse gate is full-parameter fail-closed (the
+non-empty author, the non-empty emoji, the strictly positive story
+timestamp, the author resolution, and the identity-reject and
+profileSharing gates all answering the plain -32603), and the upstream
+reaction is place-only (`remove:false` hardcoded in the official
+reactionForSend — the engine face carries no remove parameter at all).
+This batch retires the §4.77 constant-reject arm and registers the face
+host-side.
+
+Posture (the §4.150 call-event proxy discipline on the stories family):
+
+- **The connector's gate is the envelope only.** The opaque account id
+  resolves to the linked number and the standard `operationId` shape
+  check still runs; every other key rides verbatim onto the engine's
+  `sendStoryReaction {account, storyAuthor, storyTimestamp, emoji}` —
+  the author/emoji shapes, the zero timestamp, the author resolution,
+  and the identity/profileSharing gates are never re-gated, re-keyed,
+  or re-shaped here; a semantic refusal is the engine's plain -32603
+  through the structured ladder (UPSTREAM_ERROR, retryable), and the
+  §4.17 unbound matcher still applies (the connector adds no matcher of
+  its own). The §4.77 local value gates (author bounds, the zero
+  storySentAt, the emoji grapheme shape) are gone on purpose:
+  connector-side typing would eat part of the engine's error face (the
+  1.151 timestamp rationale).
+- **The one local refusal is `remove: true`.** INVALID_REQUEST,
+  non-retryable, before any engine traffic: the official reaction is
+  place-only, so a remove intent has no upstream face to forward to and
+  must never silently place — forwarding it would be a lie. `remove`
+  stays on the wire face (the 1.94 shape) so a false/absent value keeps
+  the pre-1.152 frame byte-identical; the forwarded frame carries no
+  remove key.
+- **Verbatim in both directions.** The engine's `{}` success object
+  passes through untouched — the former `{status: sent|unknown}`
+  settlement face is gone with the reject arm. Unknown host keys fail
+  the params face locally (the deny_unknown_fields envelope, every
+  forwarding method's posture).
+- **Mutating class, the send lane.** The reaction-class write-lane
+  mutex and delete drain barrier apply (a story reaction is a
+  reaction-class write, unchanged from 1.94), and an indeterminate
+  outcome answers SEND_OUTCOME_UNKNOWN — never retried (an unknown
+  reaction outcome may already sit in the author's fan-out).
+- **No new capability bit.** Advertised through the existing `stories`
+  tag, widened in place (the 1.82/1.88/1.127/1.145/1.151 precedent —
+  the story-reaction send is the story chain's own face).
+  KT-extension, no upstream counterpart.
+- **Zero store involvement.** No row, no ledger, no schema move: a
+  story reaction has no row to pill on (stories are rowless, §4.67),
+  no event is emitted, and the receive projection of story-anchored
+  reactions is the engine's own batch.
+
+Boundary: v1 still addresses author-direct reactions only — a
+group-story reaction needs the group context the story.received
+projection does not carry (记档边界, not invented).
+
+Tests: integration +2 (`tests/story_reaction.rs`) — the forward arm
+(the send-log pinned byte-for-byte on the four-key engine frame with no
+remove key, the `{}` echo, and the former local gates' values — the
+blank author, the zero timestamp — forwarding gate-free) and the error
+arm (the remove refusal with zero upstream traffic, the engine
+parse-gate -32603 face through the ladder to UPSTREAM_ERROR retryable,
+the unknown engine account, the engine-down RUNTIME_NOT_RUNNING face);
+lib: the §4.77 preparation arm rewritten to the verbatim frame (the
+forwarded values pinned, the remove refusal, the envelope ladder), the
+send-lane/mutating registry rows unchanged. Tests 819 → 821, all green.
 
 ## 5. signal-cli Boundary
 

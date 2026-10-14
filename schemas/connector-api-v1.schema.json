@@ -4226,30 +4226,30 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "storyAuthor", "storySentAt", "emoji"],
-      "description": "Send or remove a reaction to one story (contract 1.94, §4.77, capability stories): the story-anchored reaction send. messages.sendReaction's row-addressed ladder can never target a story (stories land in no conversation row, contract 1.76 §4.67); this face takes the story anchor verbatim from the caller — storyAuthor is the author's address (phone number or UUID-shaped ACI) and storySentAt is the story's own Signal timestamp (a zero timestamp is the officially meaningless marker and answers INVALID_REQUEST), both owned by the desktop's story timeline. The upstream frame is the pinned signal-cli's own story-reaction face (sendReaction --story, pinned 0.14.8): {account, emoji, remove, targetAuthor, targetTimestamp, recipient: [storyAuthor], story: true} — the official client delivers a story reaction as a direct message to the story's author. Nothing is written locally and no event is emitted (a story reaction has no row to pill on). The kt-engine face has no story-reaction send and answers CAPABILITY_UNAVAILABLE (not retryable) after local validation. v1 addresses author-direct reactions only: a group-story reaction needs the group context the story.received projection does not carry. The result is {status: 'sent'} when the upstream confirmed, or {status: 'unknown'} when the outcome of the mutating upstream call cannot be determined; 'unknown' is never retried automatically by the connector (host may explicitly re-send with a fresh requestId and the same operationId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. remove=true removes a previously sent story reaction (upstream best effort). Send lane, account-scoped mutating.",
+      "description": "Send a reaction to one story (contract 1.152, §4.151, capability stories widened in place): the story-anchored reaction send, now a true engine passthrough — the §4.150 call-event proxy posture on the stories family (the engine's story-reaction batch S4, engine 4822e99, the official reactToStory alignment: the Reaction and StoryContext dual anchor, the same author and the same story timestamp). The connector's gate is the envelope only: the opaque accountId resolves to the linked account and storyAuthor/storySentAt/emoji ride verbatim onto the engine's sendStoryReaction {account, storyAuthor, storyTimestamp, emoji} — the semantic gate lives entirely in the engine's fail-closed parse (missing/empty author or emoji, zero timestamp, an unresolvable author, the identity-reject and profileSharing gates answer the engine's plain -32603, which the connector maps verbatim to UPSTREAM_ERROR retryable; the §4.17 unbound matcher still applying). The one local refusal is remove:true → INVALID_REQUEST (non-retryable): the official reaction is place-only (the upstream reactionForSend hardcodes remove:false, so the engine face carries no remove parameter) and a remove intent must never silently place. Nothing is written locally and no event is emitted (a story reaction has no row to pill on). v1 addresses author-direct reactions only: a group-story reaction needs the group context the story.received projection does not carry. Result: the engine's `{}` success object passes through untouched (the former {status: sent|unknown} settlement face is gone with the reject arm); an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN and is never retried automatically (a host may explicitly re-send with a fresh requestId). operationId is an optional host correlation id; the connector validates its shape but does not persist it. Send lane, account-scoped mutating (the reaction-class write-lane mutex and delete drain barrier apply).",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "storyAuthor": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128,
-          "description": "The story author's address (phone number or ACI UUID); the frame's targetAuthor and single recipient."
+          "description": "The story author's address (phone number or ACI UUID). Forwarded verbatim — the resolvability gate is the engine's."
         },
         "storySentAt": {
           "type": "integer",
           "minimum": 1,
-          "description": "The story's own Signal timestamp (the story's protocol identity); the frame's targetTimestamp."
+          "description": "The story's own Signal timestamp (the story's protocol identity); the engine frame's storyTimestamp. Forwarded verbatim — the zero/positivity gate is the engine's."
         },
         "emoji": {
           "type": "string",
           "minLength": 1,
           "maxLength": 32,
-          "description": "The reaction; a single unicode grapheme cluster of at most 32 UTF-8 bytes, mirroring the pinned signal-cli requirement."
+          "description": "The reaction. Forwarded verbatim — the empty/shape gate is the engine's."
         },
         "remove": {
           "type": "boolean",
           "default": false,
-          "description": "True removes a previously sent story reaction; the emoji must still identify the reaction to remove."
+          "description": "Must stay false: true answers INVALID_REQUEST locally (the upstream reaction is place-only, remove:false hardcoded — there is no removal face to forward to)."
         },
         "operationId": { "$ref": "#/$defs/opaqueId" }
       }

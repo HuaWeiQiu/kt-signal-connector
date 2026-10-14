@@ -995,6 +995,43 @@ for line in sys.stdin:
         if params.get("targetTimestamp") == 423:
             os._exit(23)
         result = {}
+    elif method == "sendStoryReaction":
+        # §4.151 story-reaction send (contract 1.152, engine 4822e99): the
+        # engine's sendStoryReaction wire mirror — the official reactToStory
+        # alignment (Reaction + StoryContext dual anchor, place-only). Same
+        # dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests assert the {account, storyAuthor, storyTimestamp,
+        # emoji} contract byte-for-byte (the send-family discipline). The
+        # account gate rides the same engine-state registry (an unregistered
+        # account answers the plain -32603, the engine's unknown-account
+        # face). The marker `.fixture-story-reaction-rejected` answers the
+        # engine's parse/identity/profileSharing gate face (-32603) — the
+        # value domain gates are the real engine's fail-closed parse, which
+        # the fixture deliberately does not re-implement. Success answers
+        # `{}` (the engine's empty success object).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        story_account = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    story_account = entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            story_account = None
+        if story_account is None or (
+            SIGNAL_DATA_DIR / ".fixture-story-reaction-rejected"
+        ).exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        result = {}
     elif method in ("sendPinMessage", "sendUnpinMessage", "sendAdminDelete"):
         # Contract 1.33 pin family: same dispatch-recording discipline as
         # `send`: the exact upstream params, so tests can assert
