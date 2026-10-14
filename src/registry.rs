@@ -1508,6 +1508,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.send_story_reaction(params).await
     }
 
+    /// Story-anchored delete-for-everyone routing (contract 1.153, §4.152):
+    /// the owning group's supervisor forwards the story delete frame to its
+    /// own engine, the §4.150 proxy posture on the stories family — the
+    /// engine answer and error faces ride through untouched.
+    pub async fn send_story_delete_for_everyone(
+        &self,
+        params: crate::service::StoriesDeleteForEveryoneParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_story_delete_for_everyone(params).await
+    }
+
     /// View-once open sync routing (contract revision 1.38): the owning
     /// group's supervisor forwards the bare passthrough; receipt-class
     /// semantics end to end.

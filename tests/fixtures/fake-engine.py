@@ -1032,6 +1032,48 @@ for line in sys.stdin:
             emit_json(response)
             continue
         result = {}
+    elif method == "deleteStoryForEveryone":
+        # §4.152 story delete-for-everyone fan-out (contract 1.153, engine
+        # 7320393): the engine's deleteStoryForEveryone wire mirror — the
+        # official sendDeleteForEveryone alignment (per-recipient DOE legs
+        # over the story channel + the exactly-once self-sync). Same
+        # dispatch-recording discipline as `send`: the exact upstream
+        # params, so tests assert the {account, targetTimestamp,
+        # updatedStoryRecipients[, recipients]} contract byte-for-byte (the
+        # send-family discipline). The account gate rides the same
+        # engine-state registry (an unregistered account answers the plain
+        # -32603, the engine's unknown-account face). The marker
+        # `.fixture-story-delete-rejected` answers the engine's parse gate
+        # face (-32603) — the value-domain gates (the timestamp domain, the
+        # recipients entry shapes and the rejected single-string form, the
+        # updatedStoryRecipients member shapes) are the real engine's
+        # fail-closed parse, which the fixture deliberately does not
+        # re-implement. Success answers a pinned {timestamp} (the DOE
+        # envelope ts; the real engine answers the new deletion's own
+        # Signal timestamp).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        delete_account = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    delete_account = entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            delete_account = None
+        if delete_account is None or (
+            SIGNAL_DATA_DIR / ".fixture-story-delete-rejected"
+        ).exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        result = {"timestamp": 1727000999999}
     elif method in ("sendPinMessage", "sendUnpinMessage", "sendAdminDelete"):
         # Contract 1.33 pin family: same dispatch-recording discipline as
         # `send`: the exact upstream params, so tests can assert

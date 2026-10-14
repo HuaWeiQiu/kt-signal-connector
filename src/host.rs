@@ -61,9 +61,10 @@ use crate::service::{
     NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
     PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
     StickerPackManifestParams, StickerPackSetSyncParams, StorageGetCallLinksParams,
-    StorageIngestParams, StorageSetCallLinkParams, StoriesGetDisabledParams,
-    StoriesMarkViewedParams, StoriesSendReactionParams, StoriesSetDisabledParams,
-    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, UsernameLookupParams,
+    StorageIngestParams, StorageSetCallLinkParams, StoriesDeleteForEveryoneParams,
+    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
+    StoriesSetDisabledParams, StoryDistributionListsListParams,
+    StoryDistributionListsSetRecordsParams, UsernameLookupParams,
 };
 use crate::store::{MAX_ADJACENT_MEDIA_LIMIT, MAX_PAGE_LIMIT};
 use crate::{API_VERSION, DEFAULT_HOST_FRAME_LIMIT, advertised_capabilities};
@@ -1845,6 +1846,29 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     ApiError::new(
                         "INVALID_REQUEST",
                         "invalid stories.sendReaction params",
+                        false,
+                    ),
+                ),
+            }
+        }
+        // Story delete-for-everyone fan-out (contract 1.153, §4.152): the
+        // §4.150 proxy shape on the stories family — params shape errors
+        // answer INVALID_REQUEST, the engine's `{timestamp}` answer and
+        // error faces pass through untouched, and the whole value domain
+        // (the timestamp domain, the recipients entries, the
+        // updatedStoryRecipients shapes, the author resolution) stays the
+        // engine's parse (engine 7320393), never re-gated or re-keyed here.
+        "stories.deleteForEveryone" => {
+            match serde_json::from_value::<StoriesDeleteForEveryoneParams>(request.params) {
+                Ok(params) => match runtime.send_story_delete_for_everyone(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid stories.deleteForEveryone params",
                         false,
                     ),
                 ),

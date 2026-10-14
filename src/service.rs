@@ -5139,6 +5139,48 @@ impl ConnectorService {
         }))
     }
 
+    /// stories.deleteForEveryone (contract 1.153, §4.152): the story-anchored
+    /// delete-for-everyone fan-out — the §4.150 call-event proxy posture on
+    /// the stories family (the engine's story batch S5, engine 7320393, the
+    /// official sendDeleteStoryForEveryone alignment: the per-recipient DOE
+    /// legs over the story channel plus the exactly-once self-sync). The
+    /// connector's gate is the envelope only — the opaque account resolution
+    /// plus the standard `operationId` shape check — and every other key
+    /// rides verbatim (`targetTimestamp` the deleted story's own Signal
+    /// timestamp, `recipients` the optional per-recipient DOE fan-out list,
+    /// `updatedStoryRecipients` the storyMessageRecipients wire shape the
+    /// recipients' story views converge to): the value domain (the
+    /// timestamp positivity and number face, the recipients entries'
+    /// non-empty-string shape and the rejected single-string form, the
+    /// updatedStoryRecipients member shapes, and the author resolution) is
+    /// the engine's fail-closed parse, never re-gated or re-keyed here —
+    /// its plain -32603 answers through the structured ladder
+    /// (UPSTREAM_ERROR, retryable). Absent stays absent: the optional
+    /// `recipients` key never forwards as null (the engine reads null as
+    /// the empty batch, but the frame carries the caller's shape, and the
+    /// no-null discipline keeps the wire honest). Nothing is written
+    /// locally and no event is emitted (a story has no row to pill on,
+    /// §4.67).
+    pub fn prepare_story_delete_for_everyone(
+        &self,
+        params: &StoriesDeleteForEveryoneParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        if let Some(operation_id) = params.operation_id.as_deref() {
+            validate_opaque_id(operation_id, "operationId")?;
+        }
+        let account = self.resolve_account(&params.account_id)?;
+        let mut prepared = json!({
+            "account": account.signal_account,
+            "targetTimestamp": params.target_timestamp,
+            "updatedStoryRecipients": params.updated_story_recipients,
+        });
+        if let Some(recipients) = &params.recipients {
+            prepared["recipients"] = recipients.clone();
+        }
+        Ok(prepared)
+    }
+
     /// username.lookup (contract revision 1.59, §4.55; the kt-engine face
     /// opened with contract 1.74, §4.65): entries resolve through the
     /// engine's `usernameLookup` reader (same server lookups, engine compat
@@ -12892,6 +12934,31 @@ pub struct StoriesSendReactionParams {
     pub emoji: String,
     #[serde(default)]
     pub remove: bool,
+    pub operation_id: Option<String>,
+}
+
+/// `stories.deleteForEveryone` params (contract 1.153, §4.152): the story
+/// anchor (the deleted story's own Signal timestamp), the optional
+/// per-recipient DOE fan-out list, and the `storyMessageRecipients` wire
+/// shape the recipients' story views converge to. The minimal type face on
+/// purpose (the §4.150 posture): the three story keys ride the engine frame
+/// verbatim — `targetTimestamp`, `recipients`, and `updatedStoryRecipients`
+/// stay raw JSON values because the engine's documented gate owns their
+/// whole value domain (a positive u64 timestamp; the recipients
+/// non-empty-string entries with the rejected single-string form; the
+/// per-entry `{destinationUuid, isAllowedToReply, distributionListIds?}`
+/// shapes — 负/小数/字符串/半形 entries are all its refusals), so
+/// connector-side typing would eat those error faces instead of forwarding
+/// them. Stories are rowless (§4.67), so there is no conversation or
+/// messageId on this face; `operationId` rides the standard mutating-call
+/// envelope and is validated when present.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StoriesDeleteForEveryoneParams {
+    pub account_id: String,
+    pub target_timestamp: Value,
+    pub recipients: Option<Value>,
+    pub updated_story_recipients: Value,
     pub operation_id: Option<String>,
 }
 
@@ -25416,6 +25483,134 @@ mod tests {
             error,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
+    }
+
+    /// stories.deleteForEveryone (contract 1.153, §4.152): the §4.150 proxy
+    /// posture — the envelope is the connector's whole gate (the opaque
+    /// account ladder plus the standard operationId shape check), the three
+    /// story keys ride the frame verbatim as raw JSON values (the value
+    /// domain is the engine's parse; the 1.151 timestamp rationale), and
+    /// the optional `recipients` key stays absent when absent, never null.
+    #[test]
+    fn story_delete_for_everyone_prepares_the_verbatim_frame() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let params = |target: Value,
+                      recipients: Option<Value>,
+                      updated: Value,
+                      account_id: &str| StoriesDeleteForEveryoneParams {
+            account_id: account_id.to_string(),
+            target_timestamp: target,
+            recipients,
+            updated_story_recipients: updated,
+            operation_id: None,
+        };
+        let updated = json!([
+            {
+                "destinationUuid": "9d6f9f4f-2f3c-4a5b-8c7d-6e5f4a3b2c1d",
+                "isAllowedToReply": true,
+            },
+            {
+                "destinationUuid": "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d",
+                "isAllowedToReply": false,
+                "distributionListIds": ["list-1"],
+            },
+        ]);
+
+        // The verbatim frame: the resolved account rides `account`, the
+        // target timestamp and the recipient shapes cross as raw JSON (a
+        // well-formed frame keeps its member shapes untouched), and the
+        // optional recipients key stays absent when absent — never null.
+        let frame = service
+            .prepare_story_delete_for_everyone(&params(
+                json!(1727000000000u64),
+                None,
+                updated.clone(),
+                &account.id,
+            ))
+            .unwrap();
+        assert_eq!(
+            frame,
+            json!({
+                "account": "+15555550100",
+                "targetTimestamp": 1727000000000u64,
+                "updatedStoryRecipients": updated,
+            })
+        );
+        assert!(frame.get("recipients").is_none());
+
+        // The value domain forwards, gate-free: a string-form timestamp and
+        // a half-shaped recipient entry ride verbatim for the engine's
+        // parse to answer (the 1.151 timestamp rationale: connector typing
+        // would eat part of that error face).
+        let frame = service
+            .prepare_story_delete_for_everyone(&params(
+                json!("1727000000000"),
+                Some(json!([" +15555550101 ", ""])),
+                json!([{"destinationUuid": ""}]),
+                &account.id,
+            ))
+            .unwrap();
+        assert_eq!(frame["account"], json!("+15555550100"));
+        assert_eq!(frame["targetTimestamp"], json!("1727000000000"));
+        assert_eq!(frame["recipients"], json!([" +15555550101 ", ""]));
+        assert_eq!(
+            frame["updatedStoryRecipients"],
+            json!([{"destinationUuid": ""}])
+        );
+
+        // The envelope gate stays: an unshaped opaque account id and an
+        // unknown account keep their pre-forward faces; the standard
+        // operationId shape check still runs.
+        let error = service
+            .prepare_story_delete_for_everyone(&params(
+                json!(1727000000000u64),
+                None,
+                updated.clone(),
+                &"k".repeat(129),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"
+        ));
+        let error = service
+            .prepare_story_delete_for_everyone(&params(
+                json!(1727000000000u64),
+                None,
+                updated,
+                "acct-absent",
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+        let mut shaped = StoriesDeleteForEveryoneParams {
+            account_id: account.id.clone(),
+            target_timestamp: json!(1727000000000u64),
+            recipients: None,
+            updated_story_recipients: json!([{
+                "destinationUuid": "9d6f9f4f-2f3c-4a5b-8c7d-6e5f4a3b2c1d",
+                "isAllowedToReply": true,
+            }]),
+            operation_id: Some("op".repeat(65)),
+        };
+        let error = service
+            .prepare_story_delete_for_everyone(&shaped)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"
+        ));
+        shaped.operation_id = Some("op-ok".to_string());
+        service.prepare_story_delete_for_everyone(&shaped).unwrap();
     }
 
     /// One caller-shaped story attachment pointer, mutated per case — the

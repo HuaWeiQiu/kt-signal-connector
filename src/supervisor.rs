@@ -2651,6 +2651,37 @@ impl RuntimeSupervisor {
             .map_err(ServiceError::from)
     }
 
+    /// stories.deleteForEveryone (contract 1.153, §4.152): the
+    /// story-anchored delete fan-out — the §4.150 call-event proxy posture
+    /// on the stories family. The account resolution rides the service
+    /// prepare, the engine's `deleteStoryForEveryone` crosses as its own
+    /// mutating call (the official sendDeleteStoryForEveryone alignment:
+    /// the per-recipient DOE legs over the story channel plus the
+    /// exactly-once self-sync), the success `{timestamp}` answer (the DOE
+    /// envelope ts) passes through untouched, and the error face is the
+    /// engine's verbatim through the structured ladder: the plain -32603
+    /// parse/unknown-account faces degrade to UPSTREAM_ERROR, the §4.17
+    /// unbound matcher still applies, and the connector adds no gate of its
+    /// own (the engine 7320393 fail-closed parse owns the timestamp domain,
+    /// the recipients entries, and the updatedStoryRecipients shapes).
+    /// Mutating class: a timeout answers SEND_OUTCOME_UNKNOWN and is never
+    /// retried — an unknown delete outcome may already sit in the
+    /// recipients' story fan-out.
+    pub async fn send_story_delete_for_everyone(
+        &self,
+        params: crate::service::StoriesDeleteForEveryoneParams,
+    ) -> Result<Value, ServiceError> {
+        let frame = {
+            let service = self.service.lock().await;
+            service.prepare_story_delete_for_everyone(&params)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("deleteStoryForEveryone", frame, CallClass::Mutating)
+            .await
+            .map_err(ServiceError::from)
+    }
+
     /// Send one attachment (optionally with a caption) — implementation-plan
     /// §4.12. Identical settlement path to `send_text`: local prepare under
     /// the service lock, upstream mutating `send` call, pending row settled

@@ -500,6 +500,20 @@ pub const METHODS: &[MethodRow] = &[
     // Advertised through the existing `stories` tag (widened in place, the
     // 1.82 call-signaling precedent).
     ("stories.sendReaction", Lane::Send, true, "send"),
+    // Story delete-for-everyone fan-out (contract 1.153, §4.152): the
+    // connector-side registration of the engine's `deleteStoryForEveryone`
+    // (engine 7320393, the official sendDeleteForEveryone alignment) — the
+    // §4.150 proxy posture on the stories family. A pure send-lane proxy:
+    // account resolution, the mutating forward, the engine's `{timestamp}`
+    // answer and error faces through untouched — the timestamp domain, the
+    // recipients entries (absent/null = the empty batch, the single-string
+    // form refused), and the updatedStoryRecipients member shapes are the
+    // engine's fail-closed parse, never re-gated or re-keyed here. Mutating:
+    // an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never
+    // retried (an unknown delete outcome may already sit in the recipients'
+    // story fan-out). Rowless: no local write, no event. Advertised through
+    // the existing `stories` tag (widened in place, the 1.82 precedent).
+    ("stories.deleteForEveryone", Lane::Send, true, "send"),
     // Story-anchored attachment byte faces (contract revision 1.86, §4.71):
     // the story byte channel — stories land in no conversation row (§4.67),
     // so the row-anchored `attachments.download` can never address one and
@@ -770,7 +784,11 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// no-new-bit discipline) and by revision 1.152 (the §4.151 conversion of
 /// `stories.sendReaction` to the engine passthrough — the §4.150 proxy
 /// posture on the stories family, the §4.77 constant-reject arm retired;
-/// the same no-new-bit discipline) and by revision 1.130 (the
+/// the same no-new-bit discipline) and by revision 1.153 (the §4.152
+/// `stories.deleteForEveryone` story delete fan-out — the §4.150 proxy
+/// posture registering the engine's `deleteStoryForEveryone`, the
+/// per-recipient DOE legs plus the exactly-once self-sync; the same
+/// no-new-bit discipline) and by revision 1.130 (the
 /// `storyDistributionLists.list` / `storyDistributionLists.setRecords`
 /// story-audience sync faces — the §4.78 sync-face pair over the story
 /// distribution lists the §4.67 send faces address; the same no-new-bit
@@ -992,6 +1010,7 @@ mod tests {
             "stories.setDisabled",
             "stories.markViewed",
             "stories.sendReaction",
+            "stories.deleteForEveryone",
             "stories.downloadAttachment",
             "chatFolders.setRecords",
             "notificationProfiles.setRecords",
@@ -1068,6 +1087,7 @@ mod tests {
             "stories.setDisabled",
             "stories.markViewed",
             "stories.sendReaction",
+            "stories.deleteForEveryone",
             "stories.downloadAttachment",
             "chatFolders.setRecords",
             "notificationProfiles.setRecords",

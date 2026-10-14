@@ -163,6 +163,7 @@
             "stories.getDisabled",
             "stories.markViewed",
             "stories.sendReaction",
+            "stories.deleteForEveryone",
             "stories.downloadAttachment",
             "stories.openAttachment"
           ]
@@ -1542,6 +1543,17 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/storiesSendReactionParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "stories.deleteForEveryone" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/storiesDeleteForEveryoneParams" }
             }
           }
         },
@@ -4250,6 +4262,29 @@
           "type": "boolean",
           "default": false,
           "description": "Must stay false: true answers INVALID_REQUEST locally (the upstream reaction is place-only, remove:false hardcoded — there is no removal face to forward to)."
+        },
+        "operationId": { "$ref": "#/$defs/opaqueId" }
+      }
+    },
+    "storiesDeleteForEveryoneParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "targetTimestamp", "updatedStoryRecipients"],
+      "description": "Fan out a delete-for-everyone for one story (contract 1.153, §4.152, capability stories widened in place — no new capability bit; engine 7320393, the engine's deleteStoryForEveryone KT-extension method): the story-anchored delete fan-out — the §4.150 call-event proxy posture on the stories family, the official sendDeleteForEveryone alignment (the per-recipient DOE legs over the story channel plus the exactly-once self-sync; the receive projection of the same sync message is the engine's). Pure proxy on the send lane — 语义闸在引擎，connector 逐字转发: the connector's gate is the envelope only (the opaque account resolution plus the standard operationId shape check), every other key rides verbatim, and the semantic gate lives entirely in the engine's fail-closed parse — the positive-integer timestamp, the recipients non-empty-string entries with the rejected single-string form (absent/null = the empty batch, the no-recipient short-circuit to the self-sync leg), and the updatedStoryRecipients per-entry {destinationUuid, isAllowedToReply, distributionListIds?} shapes — so a violation answers the engine's plain -32603, which the connector maps verbatim to UPSTREAM_ERROR (retryable), the §4.17 unbound matcher still applying; the connector adds no gate of its own (targetTimestamp/recipients/updatedStoryRecipients are deliberately untyped raw JSON values: connector-side typing would eat the engine's error faces, the 1.151 timestamp rationale). The optional recipients key stays absent when absent, never null (the no-null discipline). Nothing is written locally and no event is emitted (a story has no row to pill on, §4.67). Send lane, account-scoped mutating: the reaction-class write-lane mutex and delete drain barrier apply; an indeterminate outcome answers SEND_OUTCOME_UNKNOWN and is never retried (an unknown delete outcome may already sit in the recipients' story fan-out). Result {timestamp} rides through untouched — the DOE envelope ts, the new deletion's own Signal timestamp. operationId is an optional host correlation id; the connector validates its shape but does not persist it.",
+      "properties": {
+        "accountId": { "$ref": "#/$defs/opaqueId" },
+        "targetTimestamp": {
+          "description": "The deleted story's own Signal timestamp (the story's protocol identity). Raw JSON value by design — forwarded verbatim; the positivity/number gate is the engine's."
+        },
+        "recipients": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "The optional per-recipient DOE fan-out list (the recipients whose story copies are addressed directly); absent = the engine's empty batch (the no-recipient short-circuit to the self-sync leg). Forwarded verbatim — the entry shapes and the rejected single-string form are the engine's gate."
+        },
+        "updatedStoryRecipients": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "The storyMessageRecipients wire shape the recipients' story views converge to (the fan-out list expansion), each entry {destinationUuid, isAllowedToReply, distributionListIds?}. Required non-empty. Forwarded verbatim — the member shapes are the engine's gate."
         },
         "operationId": { "$ref": "#/$defs/opaqueId" }
       }

@@ -42,7 +42,34 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.152 (2026-10-14; the story-reaction send becomes a
+- Contract revision: 1.153 (2026-10-14; the story delete fan-out crosses the
+  connector (§4.152): `stories.deleteForEveryone` — the host-side
+  registration of the engine's `deleteStoryForEveryone` (engine 7320393,
+  the official sendDeleteForEveryone alignment, the per-recipient DOE legs
+  over the story channel plus the exactly-once self-sync and the
+  storyMessageRecipients receive projection). The §4.150 call-event proxy
+  posture on the stories family, second face: the connector's gate is the
+  envelope only (the opaque account resolution plus the standard
+  operationId shape check), `targetTimestamp`/`recipients`/
+  `updatedStoryRecipients` ride verbatim as raw JSON values (the engine's
+  fail-closed parse owns the timestamp domain, the recipients
+  non-empty-string entries with the rejected single-string form, and the
+  per-entry `{destinationUuid, isAllowedToReply, distributionListIds?}`
+  shapes; untyped on purpose — connector typing would eat those error
+  faces, the 1.151 rationale), absent stays absent never null, the
+  success `{timestamp}` (the DOE envelope ts) passes through untouched,
+  and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN,
+  never retried. Wire additive: one new method, zero new events/error
+  codes/store moves (the `stories` capability widened in place, the 1.82
+  precedent). Tests 821 → 824 (integration +2: tests/story_delete.rs —
+  the forward arm with the send-log pinned byte-for-byte on the fanned-out
+  and no-recipient legs, the `{timestamp}` echo; the error arm — the
+  unshaped-account-id INVALID_REQUEST with zero upstream traffic, the
+  engine parse-gate face, the unknown engine account, the engine-down
+  face; lib +1: the prepare arm — the verbatim frame, the absent-stays-
+  absent recipients key, the raw-JSON forward, the envelope ladder), all
+  green) —
+  previously 1.152 (2026-10-14; the story-reaction send becomes a
   true engine passthrough (§4.151): `stories.sendReaction` — the §4.150
   call-event proxy posture on the stories family; the engine's story
   batch S4 (engine 4822e99, the official reactToStory alignment, the
@@ -12130,6 +12157,76 @@ the unknown engine account, the engine-down RUNTIME_NOT_RUNNING face);
 lib: the §4.77 preparation arm rewritten to the verbatim frame (the
 forwarded values pinned, the remove refusal, the envelope ladder), the
 send-lane/mutating registry rows unchanged. Tests 819 → 821, all green.
+
+### 4.152 The story delete fan-out crosses the connector: `stories.deleteForEveryone`, the second proxy face on the stories family (contract revision 1.153, 2026-10-14)
+
+The engine's story batch S5 (kt-signal-engine `7320393`) opened the
+`deleteStoryForEveryone` face — the official sendDeleteForEveryone
+alignment: the per-recipient DOE legs travel the story channel, the
+deletion self-syncs to the account's own devices exactly once, and the
+same sync message carries the `storyMessageRecipients` projection the
+recipients' story views converge to (its receive face is the engine's
+own batch). The engine's parse gate is full-parameter fail-closed: the
+strictly positive integer `targetTimestamp`, the `recipients` list
+(absent/null = the empty batch — the official zero-recipient special
+case short-circuiting to the self-sync leg; non-empty-string entries;
+the single-string form refused), and the required non-empty
+`updatedStoryRecipients` array with the per-entry
+`{destinationUuid, isAllowedToReply, distributionListIds?}` member
+shapes — every violation answering the plain -32603. This batch
+registers the face host-side.
+
+Posture (the §4.150 call-event proxy discipline on the stories family):
+
+- **The connector's gate is the envelope only.** The opaque account id
+  resolves to the linked number and the standard `operationId` shape
+  check still runs; every other key rides verbatim onto the engine's
+  `deleteStoryForEveryone {account, targetTimestamp, recipients?,
+  updatedStoryRecipients}` — the timestamp domain, the recipients
+  entries, and the member shapes are never re-gated, re-keyed, or
+  re-shaped here; a semantic refusal is the engine's plain -32603
+  through the structured ladder (UPSTREAM_ERROR, retryable), and the
+  §4.17 unbound matcher still applies.
+- **Raw JSON values on purpose.** `targetTimestamp`, `recipients`, and
+  `updatedStoryRecipients` stay untyped on the connector face: the
+  engine's documented gate owns their whole value domain (a positive
+  u64 millisecond timestamp; 负/小数/字符串 are its refusals; the
+  recipients entries and the member shapes carry faces of their own),
+  so connector-side typing would eat part of that error face instead of
+  forwarding it (the 1.151 timestamp rationale, applied per key).
+- **Absent stays absent.** The optional `recipients` key never forwards
+  as null: the engine reads null as the empty batch, but the frame
+  carries the caller's shape — the no-null discipline keeps the wire
+  honest (the §4.150 optional-key posture verbatim). Unknown host keys
+  fail the params face locally (the deny_unknown_fields envelope).
+- **Verbatim in both directions.** The engine's `{timestamp}` answer —
+  the DOE envelope ts, the new deletion's own Signal timestamp — passes
+  through untouched.
+- **Mutating class, the send lane.** The reaction-class write-lane
+  mutex and delete drain barrier apply (a story delete is the delete
+  class), and an indeterminate outcome answers SEND_OUTCOME_UNKNOWN —
+  never retried (an unknown delete outcome may already sit in the
+  recipients' story fan-out).
+- **No new capability bit.** Advertised through the existing `stories`
+  tag, widened in place (the 1.82 precedent chain). KT-extension, no
+  upstream counterpart.
+- **Zero store involvement.** No row, no ledger, no schema move: a
+  story has no row to pill on (§4.67), no event is emitted, and the
+  receive projection of the same sync message is the engine's own
+  batch.
+
+Tests: integration +2 (`tests/story_delete.rs`) — the forward arm (the
+send-log pinned byte-for-byte on the fanned-out leg and the
+no-recipient leg with `recipients` structurally absent, the
+`{timestamp}` echo) and the error arm (the unshaped-account-id
+INVALID_REQUEST with zero upstream traffic, the engine parse-gate
+-32603 face through the ladder to UPSTREAM_ERROR retryable, the unknown
+engine account, the engine-down RUNTIME_NOT_RUNNING face); lib +1: the
+prepare arm (the verbatim frame, the absent-stays-absent recipients
+key, the raw-JSON forward of the string-form timestamp and the
+half-shaped entries, the envelope ladder — the unshaped opaque account
+id, the unknown account, the oversized operationId), the send-lane/
+mutating registry rows grow the new method. Tests 821 → 824, all green.
 
 ## 5. signal-cli Boundary
 
