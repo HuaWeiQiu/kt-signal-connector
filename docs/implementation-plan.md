@@ -35,7 +35,30 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.148 (2026-10-14; the import-cancel face and the
+- Contract revision: 1.149 (2026-10-14; the GIF send marker rides the
+  attachment descriptor (§4.147): `messages.attachments.send` gains the
+  optional `gif` key — singular top-level, per-entry on the §4.59 array —
+  and a true flag appends the `;gif=true` data-URI parameter verbatim on
+  the §4.30 statement-parameter face, the connector never interpreting it:
+  the engine (dae6cdd) maps it to the official `Flags.GIF=8` bit while the
+  receive side has projected `isGif` since §4.88. The pending row's
+  descriptor records `isGif` so the sender's own bubble renders the GIF UI
+  from the first tick; an unflagged send stays byte-identical to the
+  pre-1.149 upstream frame; a top-level `gif` beside the array is the
+  singular-form INVALID_REQUEST the voiceNote/viewOnce markers answer (the
+  plural face carries per-entry `gif` instead); no contentType gate (the
+  official Tenor GIF is often a video/mp4 carrier — GIF-ness is a stated
+  flag, never a media-type sniff); the sticker image face stays out of the
+  flag path (the official sticker pointer has no GIF bit). Wire additive:
+  two optional param keys, zero new methods/events/error codes/store moves.
+  Tests 810 → 813 (lib 608 → 610: the URI arm — gif-only, voice+gif
+  coexistence, `gif=false` appends nothing; the singular flagged/unflagged
+  byte-exact URI + descriptor pair; the per-entry plural pair; the
+  deserialization arms; integration +1: the fixture send-log verbatim
+  `;gif=true` pin on singular and plural with the plain-entry verbatim
+  control, the row/response `isGif` projection, and the
+  top-level-beside-array no-row rejection), all green) —
+  previously 1.148 (2026-10-14; the import-cancel face and the
   honest engine-failure consumption (§4.146): `history.importCancel`
   `{accountId}` → `{accountId, cancelled, state}` — the desktop's
   cancel-sync stops being an unbind: the cancel marker stops the link-time
@@ -2986,7 +3009,10 @@ Receive side is already contract-complete: the inbound attachment descriptor has
 `isVoiceNote` since contract 1.15 and the engine projects it from the pointer flags — zero
 receive-plane change. Waveform rendering is a desktop concern (the official client derives it
 from the decoded audio; no protocol surface). No new method, no schema change, no capability
-entry — `attachments.send` callers discover the face from the updated schema description.
+entry — `attachments.send` callers discover the face from the updated schema description. The
+GIF flag (§4.147) rides the same statement-parameter face: `;gif=true` appends beside the
+voice slot, bitwise-coexists with it upstream, and carries no contentType gate where the
+voice flag demands `audio/*`.
 
 ### 4.31 Stickers: messages.sendSticker + receive projection (contract revision 1.35, 2026-10-04)
 
@@ -5579,7 +5605,10 @@ listed under the same handshake entry):
   attachment message and official view-once media is a single unadorned
   medium — neither face produces a multi-attachment message, so the plural
   form carries no per-entry voice flag and no view-once semantics (the
-  descriptor `isVoiceNote` is false for every plural entry).
+  descriptor `isVoiceNote` is false for every plural entry). The GIF flag
+  is the carve-out (§4.147): a forwarded multi-attachment message may
+  legitimately carry a GIF beside plain files, so the plural form carries
+  per-entry `gif` and rejects only a top-level `gif` beside the array.
 - `text` (caption) and `quoteMessageId` are message-level and shared by both
   forms. The pending row carries one metadata-only descriptor per entry, in
   array order (descriptor ids derive from the entry index), so the desktop
@@ -11670,6 +11699,72 @@ atomic landing's no-clobber arm, the projection's row/marker/disk/window
 ladder with its consult faces, the probe's cancel-marker refusal, and the
 lane table's mutating whitelist rows. Tests 797 → 810 (lib 602 → 608).
 Gates: fmt, clippy `-D warnings`, tests all green, release build.
+
+### 4.147 The GIF flag rides the send attachment descriptor verbatim (contract revision 1.149, 2026-10-14)
+
+The official GIF message is a plain attachment message whose
+`DataMessage.attachments[].flags` carries the `Flags.GIF = 8` bit. The
+receive side has been contract-complete since §4.88 (contract 1.107): the
+live ingest projects the always-boolean `isGif` beside `isVoiceNote`, and
+the archive import reads the same flag bits (`Borderless=2 / Gif=8`), so
+imported and live descriptors share one wire form. The engine's send face
+(kt-signal-engine `dae6cdd`, compat §5 GIF batch) now also accepts the
+`;gif=true` data-URI parameter on any `send` attachment — bare `gif` and
+`gif=true` equivalent, `gif=false` explicit-off, a non-bool value failing
+closed upstream — and sets the bit at message-assembly time. The connector
+half was the gap: `build_attachment_data_uri` rebuilt every outgoing data
+URI from `dataBase64` + `contentType` (§4.12) and the desktop-facing params
+had no surface to state GIF-ness at all, so a flagged GIF could not cross
+the pipeline. This batch closes it.
+
+`messages.attachments.send` gains an optional `gif: boolean` (default
+false), singular top-level and per-entry on the §4.59 array. When true the
+URI builder appends the `;gif=true` parameter on the §4.30
+statement-parameter face (after the voice slot, before the filename; the
+parameters are name-parsed, order-independent), and the pending row's
+descriptor records `isGif: true` so the sender's own bubble renders the GIF
+UI from the first pending tick — the same statement the URI makes upstream.
+Deliberate posture:
+
+- **The connector never interprets the flag.** It ships verbatim; the
+  engine maps it to the official `Flags.GIF=8` bit, bitwise-OR-ed with the
+  voice/borderless bits at pointer-assembly time.
+- **No contentType gate.** The engine imposes none, and the official Tenor
+  GIF is often a `video/mp4` carrier — GIF-ness is a stated flag, never a
+  media-type sniff (`image/gif` does not auto-flag either; the mediatype
+  judgement stays the desktop's, the §4.88 receive posture verbatim).
+- **No new exclusivity.** The engine applies the flag on the view-once leg
+  too and lets voice and gif coexist bitwise; the connector invents no
+  interaction rules between them.
+- **A top-level `gif` beside the §4.59 array is `INVALID_REQUEST`** — the
+  same singular-form rule the voiceNote/viewOnce markers answer. The plural
+  face carries per-entry `gif` instead (a forwarded multi-attachment
+  message may legitimately carry a GIF beside plain files); each entry's
+  URI and row descriptor mirror their own entry, in array order.
+- **The sticker image stays out of the flag path** — the engine's
+  `upload_sticker_image` single-item face never sees the parameter (the
+  official sticker pointer has no GIF bit), so the sticker URI builder arm
+  pins `false`.
+- **Additive by construction.** Both keys are `#[serde(default)]`
+  booleans, so a pre-1.149 desktop request produces the byte-identical
+  upstream frame; the schema gains the two optional properties, the plural
+  if/then guard arm (`required: ["gif"]` beside the array), and the
+  description chains. Reverse direction: the engine send answer is
+  `{timestamp, results}` — no attachment pointers ride it, so there is no
+  response projection face to widen; the sent descriptor the desktop reads
+  is the connector's own pending row (its `isGif` now settable), and the
+  engine-side transcript echo (own-message sync, history export) already
+  projects `isGif` through the same `NormalizedAttachment` (§4.88).
+
+Tests: the URI arm extends the §4.12 builder test (gif-only, voice+gif
+coexistence, `gif=false` appends nothing), the deserialization arms extend
+the §4.59 form test (both keys parse, absent stays false); lib +2 (the
+singular flagged/unflagged byte-exact URI + descriptor pair, the per-entry
+plural pair); integration +1: the fixture send log pins the engine-received
+`;gif=true` byte-for-byte on the flagged entries (singular and plural)
+while the plain entries stay verbatim, the sent `MessageRecord` and the
+stored row both project `isGif`, and the top-level-beside-array rejection
+leaves no upstream line and no row.
 
 ## 5. signal-cli Boundary
 

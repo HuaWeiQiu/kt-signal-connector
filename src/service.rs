@@ -2434,6 +2434,7 @@ impl ConnectorService {
         voice_note: bool,
         view_once: bool,
         blur_hash: Option<&str>,
+        gif: bool,
     ) -> Result<PreparedSend, ServiceError> {
         validate_attachment_send_payload(data_base64, size_bytes)?;
         validate_attachment_descriptor(filename, "filename")?;
@@ -2505,7 +2506,8 @@ impl ConnectorService {
         }
         let account = self.resolve_account(account_id)?;
         let conversation = self.resolve_send_conversation(account_id, target)?;
-        let data_uri = build_attachment_data_uri(data_base64, filename, content_type, voice_note)?;
+        let data_uri =
+            build_attachment_data_uri(data_base64, filename, content_type, voice_note, gif)?;
         // The pending row carries the same metadata-only descriptor the
         // renderer projects (contract 1.15 wire shape), so the desktop bubble
         // and conversation preview exist from the first pending tick instead
@@ -2528,7 +2530,11 @@ impl ConnectorService {
             incremental_mac: None,
             chunk_size: None,
             is_borderless: false,
-            is_gif: false,
+            // §4.147: the GIF marker rides the descriptor too, so the
+            // sender's own bubble renders the GIF UI from the first pending
+            // tick (the same statement the `;gif=true` URI parameter makes
+            // upstream).
+            is_gif: gif,
         };
         self.dispatch_send(
             &account,
@@ -2632,6 +2638,7 @@ impl ConnectorService {
                 entry.filename.as_deref(),
                 entry.content_type.as_deref(),
                 false,
+                entry.gif,
             )?;
             data_uris.push(json!(data_uri));
             descriptors.push(NormalizedAttachment {
@@ -2655,7 +2662,8 @@ impl ConnectorService {
                 incremental_mac: None,
                 chunk_size: None,
                 is_borderless: false,
-                is_gif: false,
+                // §4.147: the per-entry GIF marker, same statement posture.
+                is_gif: entry.gif,
             });
         }
         self.dispatch_send(
@@ -2780,8 +2788,16 @@ impl ConnectorService {
         let quote = quote_message_id
             .map(|id| self.resolve_quote(&account, &conversation, id))
             .transpose()?;
-        let data_uri =
-            build_attachment_data_uri(&image.data_base64, None, Some(&image.content_type), false)?;
+        // §4.147: the sticker image rides the single-item upload face the
+        // engine keeps out of the shared attachment path — the official
+        // sticker pointer has no GIF bit, so this URI never carries the flag.
+        let data_uri = build_attachment_data_uri(
+            &image.data_base64,
+            None,
+            Some(&image.content_type),
+            false,
+            false,
+        )?;
         // The sent row's descriptor records the sticker image (metadata only)
         // and the row itself records the pack identity, so the sender's bubble
         // renders as a sticker across restarts (§4.31).
@@ -12369,6 +12385,16 @@ pub struct MessagesSendAttachmentParams {
     /// top-level key beside the array is INVALID_REQUEST.
     #[serde(default)]
     pub blur_hash: Option<String>,
+    /// §4.147 (contract revision 1.149): the GIF marker — true appends the
+    /// `;gif=true` data-URI parameter, which the engine maps to the official
+    /// `Flags.GIF=8` bit (the receive side has projected `isGif` since
+    /// §4.88). No contentType gate: the official Tenor GIF is often a
+    /// `video/mp4` carrier, GIF-ness is a stated flag and never a media-type
+    /// sniff. Singular-form only: a plural §4.59 send carries per-entry `gif`
+    /// instead, and a top-level `gif: true` beside the array is
+    /// INVALID_REQUEST.
+    #[serde(default)]
+    pub gif: bool,
     /// §4.59 plural attachment payloads (contract revision 1.66): one
     /// upstream `send` carries every entry's data URI in its array-typed
     /// `attachments` parameter — the official forward face merges a multi-
@@ -12388,7 +12414,9 @@ pub struct MessagesSendAttachmentParams {
 /// separator/control-character rejection) and optional `type/subtype` media
 /// type. No per-entry voice flag: the `;voice=true` data-URI parameter is a
 /// singular-form face only. `blurHash` since 1.137 (§4.127): the same bound
-/// and posture as the singular key.
+/// and posture as the singular key. `gif` since 1.149 (§4.147): the per-entry
+/// `;gif=true` data-URI parameter — the official `Flags.GIF=8` bit, no
+/// contentType gate (Tenor GIFs are often `video/mp4` carriers).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendAttachmentEntry {
@@ -12398,6 +12426,8 @@ pub struct MessagesSendAttachmentEntry {
     pub content_type: Option<String>,
     #[serde(default)]
     pub blur_hash: Option<String>,
+    #[serde(default)]
+    pub gif: bool,
 }
 
 /// `messages.sendSticker` image payload (contract revision 1.35, §4.31): the
@@ -15315,11 +15345,15 @@ fn validate_avatar_data_uri(data_uri: &str) -> Result<String, ServiceError> {
 /// [`validate_attachment_send_payload`]. `voice` appends the `;voice=true`
 /// parameter (§4.30), which the engine maps to the official VOICE_MESSAGE
 /// attachment flag — the wire shape the official desktop recorder emits.
+/// `gif` appends the `;gif=true` parameter (§4.147), which the engine maps
+/// to the official `Flags.GIF=8` bit — both flags are verbatim statement
+/// parameters the connector never interprets.
 fn build_attachment_data_uri(
     base64_data: &str,
     filename: Option<&str>,
     content_type: Option<&str>,
     voice: bool,
+    gif: bool,
 ) -> Result<String, ServiceError> {
     let mut decoded = Vec::with_capacity(base64_data.len() / 4 * 3);
     base64_decode_to_vec(base64_data, &mut decoded).map_err(|_| {
@@ -15335,6 +15369,9 @@ fn build_attachment_data_uri(
     uri.push_str(content_type.unwrap_or("application/octet-stream"));
     if voice {
         uri.push_str(";voice=true");
+    }
+    if gif {
+        uri.push_str(";gif=true");
     }
     if let Some(filename) = filename {
         uri.push_str(";filename=");
@@ -17198,6 +17235,7 @@ mod tests {
                 false,
                 false,
                 Some(placeholder),
+                false,
             )
             .unwrap();
         match &prepared {
@@ -17223,6 +17261,7 @@ mod tests {
             filename: Some("notes.txt".into()),
             content_type: Some("text/plain".into()),
             blur_hash: Some("abc123".into()),
+            gif: false,
         }];
         let prepared = service
             .prepare_send_attachment_multi(
@@ -17258,6 +17297,7 @@ mod tests {
                     false,
                     false,
                     value,
+                    false,
                 )
                 .unwrap_err();
             assert!(
@@ -17280,6 +17320,7 @@ mod tests {
             filename: None,
             content_type: None,
             blur_hash: Some(String::new()),
+            gif: false,
         }];
         let error = service
             .prepare_send_attachment_multi(
@@ -17687,6 +17728,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap()
         {
@@ -17790,6 +17832,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap()
         {
@@ -20554,9 +20597,14 @@ mod tests {
         }
 
         assert!(validate_attachment_send_payload(&b64, payload.len() as u64).is_ok());
-        let uri =
-            build_attachment_data_uri(&b64, Some("notes 下载.txt"), Some("text/plain"), false)
-                .unwrap();
+        let uri = build_attachment_data_uri(
+            &b64,
+            Some("notes 下载.txt"),
+            Some("text/plain"),
+            false,
+            false,
+        )
+        .unwrap();
         assert!(uri.starts_with("data:text/plain;filename=notes%20%E4%B8%8B%E8%BD%BD.txt;base64,"));
         let payload_part = uri.rsplit(";base64,").next().unwrap();
         let mut decoded = Vec::new();
@@ -20564,14 +20612,32 @@ mod tests {
         assert_eq!(decoded, payload);
 
         // Default content type when none given.
-        let uri = build_attachment_data_uri(&b64, None, None, false).unwrap();
+        let uri = build_attachment_data_uri(&b64, None, None, false, false).unwrap();
         assert!(uri.starts_with("data:application/octet-stream;base64,"));
 
         // §4.30: the voice flag inserts the `;voice=true` parameter after the
         // mime type, before the filename and base64 payload markers.
         let uri =
-            build_attachment_data_uri(&b64, Some("voice.ogg"), Some("audio/ogg"), true).unwrap();
+            build_attachment_data_uri(&b64, Some("voice.ogg"), Some("audio/ogg"), true, false)
+                .unwrap();
         assert!(uri.starts_with("data:audio/ogg;voice=true;filename=voice.ogg;base64,"));
+
+        // §4.147: the GIF flag inserts the `;gif=true` parameter on the same
+        // statement-parameter face — after the mime/voice slot, before the
+        // filename and base64 markers — and coexists with the voice flag
+        // byte-for-byte; `gif=false` inserts nothing.
+        let uri =
+            build_attachment_data_uri(&b64, Some("tenor.gif"), Some("image/gif"), false, true)
+                .unwrap();
+        assert!(uri.starts_with("data:image/gif;gif=true;filename=tenor.gif;base64,"));
+        let uri = build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), true, true)
+            .unwrap();
+        assert!(uri.starts_with("data:video/mp4;voice=true;gif=true;filename=clip.mp4;base64,"));
+        let uri =
+            build_attachment_data_uri(&b64, Some("clip.mp4"), Some("video/mp4"), false, false)
+                .unwrap();
+        assert!(uri.starts_with("data:video/mp4;filename=clip.mp4;base64,"));
+        assert!(!uri.contains("gif"), "gif=false appends no parameter");
     }
 
     /// prepare_send_attachment (§4.12): validation failures leave no pending
@@ -20643,6 +20709,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -20668,6 +20735,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap();
         let PreparedSend::Dispatch {
@@ -20703,6 +20771,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap();
         // The stored row carries the metadata-only descriptor so the desktop
@@ -20745,6 +20814,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap();
         assert!(matches!(prepared, PreparedSend::Dispatch { .. }));
@@ -20772,6 +20842,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "ACCOUNT_NOT_FOUND");
@@ -20793,6 +20864,7 @@ mod tests {
                 true,
                 false,
                 None,
+                false,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -20830,6 +20902,7 @@ mod tests {
                 true,
                 false,
                 None,
+                false,
             )
             .unwrap_err();
         assert_eq!(error.into_api().code, "INVALID_REQUEST");
@@ -20840,6 +20913,144 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// §4.147: the GIF marker rides the send face verbatim — the singular
+    /// send appends the `;gif=true` data-URI parameter (the engine maps it to
+    /// the official `Flags.GIF=8` bit), the pending row's descriptor carries
+    /// `is_gif` so the sender's own bubble renders the GIF UI from the first
+    /// tick, and an unflagged send stays byte-identical to the pre-1.149
+    /// upstream frame (no parameter, `is_gif` false).
+    #[test]
+    fn prepare_send_attachment_gif_flag_rides_uri_and_descriptor() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64 = "YXR0YWNobWVudCBieXRlcw=="; // "attachment bytes", 16 raw
+
+        // The flagged send: the URI carries the verbatim parameter and the
+        // descriptor records the flag.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-gif-1",
+                b64,
+                16,
+                Some("tenor.gif"),
+                Some("image/gif"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                true,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:image/gif;gif=true;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-gif-1")
+            .unwrap()
+            .expect("the pending gif row exists");
+        assert!(row.attachments[0].is_gif);
+        assert!(!row.attachments[0].is_voice_note);
+
+        // The unflagged send stays byte-identical to the pre-1.149 frame.
+        let prepared = service
+            .prepare_send_attachment(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-gif-2",
+                b64,
+                16,
+                Some("notes.txt"),
+                Some("text/plain"),
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        assert_eq!(
+            params["attachments"][0].as_str().unwrap(),
+            "data:text/plain;filename=notes.txt;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-gif-2")
+            .unwrap()
+            .expect("the pending plain row exists");
+        assert!(!row.attachments[0].is_gif);
+    }
+
+    /// §4.147 on the plural face: the per-entry `gif` flag rides only its own
+    /// entry's data URI — one entry flagged, one plain — and each row
+    /// descriptor mirrors its own entry, in array order.
+    #[test]
+    fn prepare_send_attachment_multi_gif_flag_rides_per_entry() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let b64_16 = "YXR0YWNobWVudCBieXRlcw=="; // "attachment bytes", 16 raw
+        let b64_5 = "aGVsbG8="; // "hello", 5 raw
+        let entries = vec![
+            MessagesSendAttachmentEntry {
+                data_base64: b64_16.to_string(),
+                size_bytes: 16,
+                filename: Some("tenor.gif".into()),
+                content_type: Some("video/mp4".into()),
+                blur_hash: None,
+                gif: true,
+            },
+            MessagesSendAttachmentEntry {
+                data_base64: b64_5.to_string(),
+                size_bytes: 5,
+                filename: Some("notes.txt".into()),
+                content_type: Some("text/plain".into()),
+                blur_hash: None,
+                gif: false,
+            },
+        ];
+        let prepared = service
+            .prepare_send_attachment_multi(
+                &account.id,
+                &AttachmentSendTarget::Conversation(&conversation.id),
+                "req-multi-gif",
+                &entries,
+                None,
+                None,
+            )
+            .unwrap();
+        let PreparedSend::Dispatch { params, .. } = &prepared else {
+            panic!("expected a dispatch");
+        };
+        let attachments = params["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(
+            attachments[0].as_str().unwrap(),
+            "data:video/mp4;gif=true;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
+        );
+        assert_eq!(
+            attachments[1].as_str().unwrap(),
+            "data:text/plain;filename=notes.txt;base64,aGVsbG8="
+        );
+        let row = service
+            .store
+            .message_by_client_request(&account.id, "req-multi-gif")
+            .unwrap()
+            .expect("the pending multi gif row exists");
+        assert!(row.attachments[0].is_gif);
+        assert!(!row.attachments[1].is_gif);
     }
 
     /// Contract 1.66 (§4.59): the plural form sends ONE upstream message
@@ -20868,6 +21079,7 @@ mod tests {
                         filename: filename.map(str::to_string),
                         content_type: content_type.map(str::to_string),
                         blur_hash: None,
+                        gif: false,
                     },
                 )
                 .collect::<Vec<_>>()
@@ -20979,6 +21191,7 @@ mod tests {
                 filename: Some("a.txt".into()),
                 content_type: Some("text/plain".into()),
                 blur_hash: None,
+                gif: false,
             })
             .collect();
         let error = service
@@ -21011,6 +21224,7 @@ mod tests {
                 filename: Some("big.bin".into()),
                 content_type: Some("application/octet-stream".into()),
                 blur_hash: None,
+                gif: false,
             })
             .collect();
         let error = service
@@ -21081,7 +21295,34 @@ mod tests {
         assert_eq!(plural_only.attachments.as_ref().unwrap().len(), 1);
         assert!(plural_only.data_base64.is_none());
         assert!(!plural_only.voice_note);
+        assert!(!plural_only.gif);
         let _ = base;
+
+        // §4.147: the GIF marker deserializes on both forms — the singular
+        // top-level key and the per-entry key — and stays false when absent.
+        let gif_singular = serde_json::from_value::<MessagesSendAttachmentParams>(json!({
+            "accountId": "acc-1",
+            "conversationId": "conv-1",
+            "clientRequestId": "req-form-gif-1",
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "gif": true
+        }))
+        .unwrap();
+        assert!(gif_singular.gif);
+        let gif_plural = serde_json::from_value::<MessagesSendAttachmentParams>(json!({
+            "accountId": "acc-1",
+            "conversationId": "conv-1",
+            "clientRequestId": "req-form-gif-2",
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5, "gif": true },
+                { "dataBase64": "YmFzZQ==", "sizeBytes": 4 }
+            ]
+        }))
+        .unwrap();
+        let gif_entries = gif_plural.attachments.as_ref().unwrap();
+        assert!(gif_entries[0].gif);
+        assert!(!gif_entries[1].gif);
 
         // Any singular key beside the array fails the host's deterministic
         // form match (simulated at the deserialization boundary: the shape
@@ -21154,6 +21395,7 @@ mod tests {
                     *voice,
                     true,
                     None,
+                    false,
                 )
                 .unwrap_err();
             assert_eq!(error.into_api().code, "INVALID_REQUEST", "{label}");
@@ -21183,6 +21425,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {
@@ -21214,6 +21457,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             )
             .unwrap();
         let PreparedSend::Dispatch { params, .. } = &prepared else {

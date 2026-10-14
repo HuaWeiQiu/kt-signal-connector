@@ -782,6 +782,7 @@ impl ProxyGroupRuntime {
         voice_note: bool,
         view_once: bool,
         blur_hash: Option<String>,
+        gif: bool,
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
@@ -798,6 +799,7 @@ impl ProxyGroupRuntime {
                 voice_note,
                 view_once,
                 blur_hash,
+                gif,
             )
             .await
     }

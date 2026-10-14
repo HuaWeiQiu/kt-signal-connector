@@ -2669,6 +2669,7 @@ impl RuntimeSupervisor {
         voice_note: bool,
         view_once: bool,
         blur_hash: Option<String>,
+        gif: bool,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -2700,6 +2701,7 @@ impl RuntimeSupervisor {
                 voice_note,
                 view_once,
                 blur_hash.as_deref(),
+                gif,
             )?
         };
         self.dispatch_prepared(&engine, prepared).await

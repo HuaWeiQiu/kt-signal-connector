@@ -2304,7 +2304,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["dataBase64", "sizeBytes"],
-      "description": "One plural-form attachment (contract revision 1.66): the §4.12 singular budget family per entry — standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes), optional filename (1..128 bytes, no path separators or control characters) and optional contentType (type/subtype). No per-entry voice flag: the ;voice=true data-URI parameter is a singular-form face only. blurHash (contract revision 1.137, §4.127) is the per-entry blur placeholder: 1..128 characters, shipped verbatim to the pending row's descriptor, never decoded (the receive face's own bound — one constant, both directions).",
+      "description": "One plural-form attachment (contract revision 1.66): the §4.12 singular budget family per entry — standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes), optional filename (1..128 bytes, no path separators or control characters) and optional contentType (type/subtype). No per-entry voice flag: the ;voice=true data-URI parameter is a singular-form face only. blurHash (contract revision 1.137, §4.127) is the per-entry blur placeholder: 1..128 characters, shipped verbatim to the pending row's descriptor, never decoded (the receive face's own bound — one constant, both directions). gif (contract revision 1.149, §4.147) is the per-entry GIF marker: true appends the ;gif=true data-URI parameter — shipped verbatim, the connector never interprets it; the engine maps it to the official Flags.GIF=8 bit (the receive side has projected isGif since contract 1.107) — and the entry's pending descriptor records isGif. No contentType gate: GIF-ness is a stated flag, never a media-type sniff (the official Tenor GIF is often a video/mp4 carrier).",
       "properties": {
         "dataBase64": {
           "type": "string",
@@ -2337,6 +2337,11 @@
           "minLength": 1,
           "maxLength": 128,
           "description": "Optional blur placeholder (contract revision 1.137, §4.127): 1..128 characters, shipped verbatim onto the row descriptor for the sender's own bubble; never decoded or charset-checked. The upstream data-URI attachment channel carries no blurHash key, so upstream recipients compute their own."
+        },
+        "gif": {
+          "type": "boolean",
+          "default": false,
+          "description": "Optional GIF marker (contract revision 1.149, §4.147): true appends the ;gif=true data-URI parameter for this entry — shipped verbatim, the connector never interprets it (the engine maps it to the official Flags.GIF=8 bit) — and the entry's pending descriptor records isGif so the sender's own bubble renders the GIF UI from the first tick. No contentType gate: GIF-ness is a stated flag, never a media-type sniff."
         }
       }
     },
@@ -2344,7 +2349,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "clientRequestId"],
-      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Two mutually exclusive payload forms (contract revision 1.66): the singular §4.12 form — dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling), optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; or the plural §4.59 form — attachments is an array of 1..32 entries (the upstream per-message ceiling), each carrying its own dataBase64/sizeBytes/filename/contentType, and the combined raw payload stays within the same 100 MiB message budget so one request still fits one host frame (the official forward face: one forwarded multi-attachment message is one upstream message). Both forms re-encode payloads as RFC 2397 data URIs for the upstream send call and never persist attachment bytes. The forms are never mixed: any singular key beside the attachments array (or a singular send missing dataBase64/sizeBytes) is INVALID_REQUEST before the pending row exists; voiceNote and viewOnce are singular-form faces and are INVALID_REQUEST on the plural form (a voice note is always a single-attachment message; view-once media is a single unadorned medium). text is an optional caption subject to the sendText byte bound and quoteMessageId quotes one message in the same conversation — shared by both forms. Settlement follows messages.sendText: the response is the sent MessageRecord whose descriptor list carries one entry per attachment in order, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
+      "description": "Exactly one addressing form must be set: conversationId, or kind+peerKey (peerTitle optional). Two mutually exclusive payload forms (contract revision 1.66): the singular §4.12 form — dataBase64 is standard padded base64 whose decoded size must equal sizeBytes (1..104857600 bytes, the official Signal attachment ceiling), optional filename (1..128 bytes, no path separators or control characters) and contentType (type/subtype) become data-URI parameters; or the plural §4.59 form — attachments is an array of 1..32 entries (the upstream per-message ceiling), each carrying its own dataBase64/sizeBytes/filename/contentType, and the combined raw payload stays within the same 100 MiB message budget so one request still fits one host frame (the official forward face: one forwarded multi-attachment message is one upstream message). Both forms re-encode payloads as RFC 2397 data URIs for the upstream send call and never persist attachment bytes. The forms are never mixed: any singular key beside the attachments array (or a singular send missing dataBase64/sizeBytes) is INVALID_REQUEST before the pending row exists; voiceNote and viewOnce are singular-form faces and are INVALID_REQUEST on the plural form (a voice note is always a single-attachment message; view-once media is a single unadorned medium). gif (contract revision 1.149, §4.147) is the singular-form GIF marker — true appends the ;gif=true data-URI parameter, shipped verbatim and never interpreted by the connector (the engine maps it to the official Flags.GIF=8 bit; the receive side has projected isGif since contract 1.107); the plural form carries per-entry gif instead, and a top-level gif beside the array is INVALID_REQUEST. No contentType gate: GIF-ness is a stated flag, never a media-type sniff (the official Tenor GIF is often a video/mp4 carrier). text is an optional caption subject to the sendText byte bound and quoteMessageId quotes one message in the same conversation — shared by both forms. Settlement follows messages.sendText: the response is the sent MessageRecord whose descriptor list carries one entry per attachment in order, and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN with no automatic retry.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "conversationId": { "$ref": "#/$defs/opaqueId" },
@@ -2403,7 +2408,7 @@
           "minItems": 1,
           "maxItems": 32,
           "items": { "$ref": "#/$defs/messagesSendAttachmentEntry" },
-          "description": "Plural form (contract revision 1.66): one upstream message carries every entry, the official multi-attachment forward shape. 1..32 entries; the entries' combined sizeBytes stays within the 100 MiB message budget. Mutually exclusive with the singular dataBase64/sizeBytes/filename/contentType/blurHash keys, and with voiceNote/viewOnce."
+          "description": "Plural form (contract revision 1.66): one upstream message carries every entry, the official multi-attachment forward shape. 1..32 entries; the entries' combined sizeBytes stays within the 100 MiB message budget. Mutually exclusive with the singular dataBase64/sizeBytes/filename/contentType/blurHash keys, and with voiceNote/viewOnce/gif (the plural face carries per-entry gif instead, contract revision 1.149)."
         },
         "text": {
           "type": "string",
@@ -2421,6 +2426,11 @@
           "type": "boolean",
           "default": false,
           "description": "Send the attachment as a view-once message (contract revision 1.38): the upstream send carries viewOnce=true and the sent row's rich record carries viewOnce so the sender's bubble renders the burn UI across restarts. Requires contentType image/* or video/*, an empty caption, no quoteMessageId, and no voiceNote; any violation is INVALID_REQUEST before the pending row exists. Singular form only: INVALID_REQUEST on the plural attachments array."
+        },
+        "gif": {
+          "type": "boolean",
+          "default": false,
+          "description": "Send the attachment as a GIF (contract revision 1.149, §4.147): the data URI gains ;gif=true — shipped verbatim, the connector never interprets it; the engine maps it to the official Flags.GIF=8 bit (the receive side has projected isGif since contract 1.107) — and the sent descriptor records isGif so the sender's own bubble renders the GIF UI from the first tick. No contentType gate: GIF-ness is a stated flag, never a media-type sniff (the official Tenor GIF is often a video/mp4 carrier). Singular form only: the plural attachments array carries per-entry gif instead, and a top-level gif beside the array is INVALID_REQUEST."
         }
       },
       "allOf": [
@@ -2442,7 +2452,8 @@
                 { "required": ["contentType"] },
                 { "required": ["blurHash"] },
                 { "required": ["voiceNote"] },
-                { "required": ["viewOnce"] }
+                { "required": ["viewOnce"] },
+                { "required": ["gif"] }
               ]
             }
           }

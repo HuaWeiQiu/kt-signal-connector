@@ -1901,15 +1901,19 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                     // payload forms are mutually exclusive. The plural form
                     // rejects any singular key outright (and the singular-only
                     // voiceNote/viewOnce markers, neither official multi-
-                    // attachment face); the singular form requires exactly the
-                    // §4.12 pair (dataBase64+sizeBytes). Both rejections are
+                    // attachment face; §4.147 extends the same rule to a
+                    // top-level `gif` — the plural face carries per-entry
+                    // `gif` instead); the singular form requires exactly the
+                    // §4.12 pair (dataBase64+sizeBytes). All rejections are
                     // deterministic and happen before any pending row exists.
-                    if params.attachments.is_some() && (params.voice_note || params.view_once) {
+                    if params.attachments.is_some()
+                        && (params.voice_note || params.view_once || params.gif)
+                    {
                         return HostResponse::failure(
                             request_id,
                             ApiError::new(
                                 "INVALID_REQUEST",
-                                "voiceNote and viewOnce apply to the singular attachment form only",
+                                "voiceNote, viewOnce and gif apply to the singular attachment form only",
                                 false,
                             ),
                         );
@@ -1973,6 +1977,7 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                     params.voice_note,
                                     params.view_once,
                                     blur_hash,
+                                    params.gif,
                                 )
                                 .await
                             {

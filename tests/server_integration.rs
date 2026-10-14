@@ -14600,6 +14600,222 @@ async fn multi_attachment_send_merges_entries_into_one_upstream_message() {
     assert_clean_exit(&mut connector).await;
 }
 
+/// Contract 1.149 (§4.147): the GIF marker rides the send face verbatim —
+/// the fixture engine's send log carries the `;gif=true` data-URI parameter
+/// byte-for-byte on the flagged entries and nothing on the unflagged ones
+/// (the engine maps the parameter to the official `Flags.GIF=8` bit), the
+/// sent MessageRecord and the stored row both project `isGif` for the
+/// sender's own bubble, and a top-level `gif` beside the plural array is
+/// INVALID_REQUEST before any pending row exists (the plural face carries
+/// per-entry `gif` instead).
+#[tokio::test]
+async fn gif_flag_send_rides_the_data_uri_verbatim() {
+    let temp = TempDir::new().unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let endpoint = temp.path().join("connector.sock");
+    let secret_file = temp.path().join("bootstrap.secret");
+    let secret = [77_u8; 32];
+    write_secret_file(&secret_file, &secret);
+
+    let mut connector = spawn_connector(temp.path(), &endpoint, &secret_file);
+    wait_for_path(&endpoint).await;
+    let stream = UnixStream::connect(&endpoint).await.unwrap();
+    let mut client = Framed::new(stream, LinesCodec::new());
+    authenticate(&mut client, &secret).await;
+    let started = request(&mut client, "start", "runtime.start", json!({})).await;
+    let engine_pid = started["result"]["pid"].as_u64().unwrap() as u32;
+    let link = request(
+        &mut client,
+        "link-start",
+        "link.start",
+        json!({ "deviceName": "KT-GifFlag" }),
+    )
+    .await;
+    let finished = request(
+        &mut client,
+        "link-finish",
+        "link.finish",
+        json!({ "linkSessionId": link["result"]["linkSessionId"] }),
+    )
+    .await;
+    let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    let listed = request(
+        &mut client,
+        "conversations-1",
+        "conversations.list",
+        json!({ "accountId": account_id, "limit": 10 }),
+    )
+    .await;
+    let conversation_id = listed["result"]["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let send_log_path = temp
+        .path()
+        .join("signal-data")
+        .join(".fixture-send-log.jsonl");
+    let attachment_lines = || {
+        fs::read_to_string(&send_log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|params| params.get("attachments").is_some())
+            .collect::<Vec<_>>()
+    };
+
+    // The flagged singular send: the engine receives the verbatim parameter
+    // and the response descriptor projects isGif.
+    let sent = request(
+        &mut client,
+        "gif-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-1",
+            "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
+            "sizeBytes": 16,
+            "filename": "tenor.gif",
+            "contentType": "image/gif",
+            "gif": true
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["attachments"][0]["isGif"], true, "{sent}");
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 1, "one upstream send: {lines:?}");
+    assert_eq!(
+        lines[0]["attachments"][0].as_str().unwrap(),
+        "data:image/gif;gif=true;filename=tenor.gif;base64,YXR0YWNobWVudCBieXRlcw=="
+    );
+
+    // The stored row carries the flag to the desktop's list face.
+    let listed = request(
+        &mut client,
+        "list-gif",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let row = listed["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["clientRequestId"] == "gif-send-1")
+        .expect("the gif row is listed");
+    assert_eq!(row["attachments"][0]["isGif"], true);
+
+    // The unflagged send stays byte-identical to the pre-1.149 frame: no
+    // parameter, `isGif` false.
+    let sent = request(
+        &mut client,
+        "plain-send",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-2",
+            "dataBase64": "aGVsbG8=",
+            "sizeBytes": 5,
+            "filename": "notes.txt",
+            "contentType": "text/plain"
+        }),
+    )
+    .await;
+    assert_eq!(sent["result"]["attachments"][0]["isGif"], false, "{sent}");
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 2, "one upstream send per request: {lines:?}");
+    assert_eq!(
+        lines[1]["attachments"][0].as_str().unwrap(),
+        "data:text/plain;filename=notes.txt;base64,aGVsbG8="
+    );
+
+    // The plural face: the flag rides per entry only — the flagged entry's
+    // URI carries it, the plain entry's stays verbatim, and each descriptor
+    // mirrors its own entry in array order.
+    let sent = request(
+        &mut client,
+        "gif-multi",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-3",
+            "attachments": [
+                {
+                    "dataBase64": "YXR0YWNobWVudCBieXRlcw==",
+                    "sizeBytes": 16,
+                    "filename": "clip.mp4",
+                    "contentType": "video/mp4",
+                    "gif": true
+                },
+                {
+                    "dataBase64": "aGVsbG8=",
+                    "sizeBytes": 5,
+                    "filename": "notes.txt",
+                    "contentType": "text/plain"
+                }
+            ]
+        }),
+    )
+    .await;
+    let descriptors = sent["result"]["attachments"].as_array().unwrap();
+    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors[0]["isGif"], true);
+    assert_eq!(descriptors[1]["isGif"], false);
+    let lines = attachment_lines();
+    assert_eq!(lines.len(), 3, "one upstream send per request: {lines:?}");
+    let upstream = lines[2]["attachments"].as_array().unwrap();
+    assert_eq!(upstream.len(), 2);
+    assert_eq!(
+        upstream[0].as_str().unwrap(),
+        "data:video/mp4;gif=true;filename=clip.mp4;base64,YXR0YWNobWVudCBieXRlcw=="
+    );
+    assert_eq!(
+        upstream[1].as_str().unwrap(),
+        "data:text/plain;filename=notes.txt;base64,aGVsbG8="
+    );
+
+    // A top-level `gif` beside the array is a singular-form key: the same
+    // deterministic INVALID_REQUEST the voiceNote/viewOnce markers answer,
+    // with no upstream line and no row left behind.
+    let mixed = request(
+        &mut client,
+        "gif-mixed",
+        "messages.attachments.send",
+        json!({
+            "accountId": account_id,
+            "conversationId": conversation_id,
+            "clientRequestId": "gif-send-4",
+            "attachments": [
+                { "dataBase64": "aGVsbG8=", "sizeBytes": 5 }
+            ],
+            "gif": true
+        }),
+    )
+    .await;
+    assert_eq!(mixed["error"]["code"], "INVALID_REQUEST", "{mixed}");
+    assert_eq!(mixed["error"]["retryable"], false);
+    assert_eq!(attachment_lines().len(), 3);
+    let listed = request(
+        &mut client,
+        "list-final",
+        "messages.list",
+        json!({ "accountId": account_id, "conversationId": conversation_id, "limit": 50 }),
+    )
+    .await;
+    let rows = listed["result"]["items"].as_array().unwrap();
+    assert!(
+        rows.iter()
+            .all(|row| row["clientRequestId"] != "gif-send-4"),
+        "the rejected request leaves no row"
+    );
+
+    drop(client);
+    wait_for_process_exit(engine_pid).await;
+    assert_clean_exit(&mut connector).await;
+}
+
 /// Contract 1.64 (§4.57): the groups.revokeInvites face. The handshake
 /// advertises the method plus the `group-invite-revoke` capability; the
 /// fail-closed ladder (unknown conversation, direct addressing, shape
