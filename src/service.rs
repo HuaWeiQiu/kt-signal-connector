@@ -4974,6 +4974,15 @@ impl ConnectorService {
     /// no deep parse, no cap check, no shape gate (the upload/cap gates
     /// are the engine's transit-CDN face). The message byte gates keep
     /// running only when the text leg rides.
+    ///
+    /// Contract 1.157 (§4.155): the recipients empty batch, locally refused
+    /// since 1.76, now rides only with the group audience leg (the engine's
+    /// own audience-at-least-one-domain gate mirrored: group absent + empty
+    /// batch keeps the pre-1.157 local refusal; group present + empty batch
+    /// forwards as the group single leg; group and recipients co-present
+    /// forwards as-is — the mixed-domain orchestration is the engine's,
+    /// never re-gated here). The group key itself rides raw and ungated:
+    /// the whole value domain is the engine's fail-closed parse.
     pub fn prepare_send_story(
         &self,
         params: &MessagesSendStoryParams,
@@ -4989,10 +4998,12 @@ impl ConnectorService {
                 false,
             )));
         }
-        if params.recipients.is_empty() || params.recipients.len() > MAX_STORY_RECIPIENTS {
+        if (params.recipients.is_empty() && params.group.is_none())
+            || params.recipients.len() > MAX_STORY_RECIPIENTS
+        {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
-                "recipients must contain between 1 and 1001 entries",
+                "recipients must contain between 1 and 1001 entries (an empty batch rides only with the group audience leg)",
                 false,
             )));
         }
@@ -5079,6 +5090,14 @@ impl ConnectorService {
         }
         if let Some(attachment) = params.attachment.as_deref() {
             frame["attachment"] = json!(attachment);
+        }
+        // §4.155 (contract 1.157): the group audience leg rides verbatim —
+        // the raw value forwarded as the caller shaped it, the engine's
+        // fail-closed parse owning the whole domain (non-string/empty → its
+        // plain -32603, the 32B decode → its refusal, terminated /
+        // announcements-only → its structured -1 faces).
+        if let Some(group) = &params.group {
+            frame["group"] = group.clone();
         }
         if let Some(id) = distribution_list_id {
             frame["distributionListId"] = json!(id);
@@ -13079,6 +13098,18 @@ pub struct UsernameLookupParams {
 /// forwards what arrived. The attachment data URI is verbatim transit
 /// material: no deep parse, no cap check (the upload/cap gates are the
 /// engine's transit-CDN face).
+///
+/// Contract 1.157 (§4.155): `group` is the group audience leg (the
+/// engine's group story batch, engine `ffab2a8`, the official
+/// `StoryMessage.group` GroupContextV2 alignment) — the recipients empty
+/// batch, locally refused since 1.76, now forwards when the group leg
+/// rides (the group single leg; the engine's own audience-at-least-one-domain
+/// gate mirrored) and keeps its refusal when the group leg is absent. The
+/// mixed audience (group + recipients) forwards as-is — the multi-domain
+/// orchestration is the engine's, never a connector gate. The additive
+/// response face `group: {groupId, timestamp}` passes through the
+/// projection untouched (absent stays absent, never null — every
+/// pre-1.157 response reads byte-identically).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendStoryParams {
@@ -13099,6 +13130,21 @@ pub struct MessagesSendStoryParams {
     /// and never gates the value domain (empty string included; the
     /// engine's parse owns the refusal).
     pub attachment: Option<String>,
+    /// Contract 1.157 (§4.155): the group audience leg — the engine groupId
+    /// (the group master key standard base64, the `sendTextGroup` group-id
+    /// caliber) riding the engine `sendStory` frame verbatim. The key stays
+    /// a raw JSON value on purpose (the 1.153 three-key and 1.156 timestamp
+    /// posture): the engine's documented gate owns the whole value domain —
+    /// a non-string or empty group answers its plain -32603, a non-32B
+    /// group id its decode refusal, a terminated group and an
+    /// announcements-only non-admin group its structured -1
+    /// `SEND_TARGET_*` faces — and connector-side typing would eat the
+    /// non-string face, answering a local INVALID_REQUEST (different code,
+    /// different retryability) instead of forwarding the engine's
+    /// UPSTREAM_ERROR ladder. A JSON null folds to None at the serde option
+    /// layer (the §4.154 with_nulls precedent): neither absent nor null
+    /// ever reaches the gates or the frame.
+    pub group: Option<Value>,
 }
 
 /// `stories.setDisabled` params (contract revision 1.76, §4.67): the
@@ -13192,12 +13238,30 @@ pub struct StoriesDisabled {
 /// projected entry-for-entry (the fake's empty list is the honest offline
 /// shape; the real engine answers one success entry per recipient —
 /// any-failure sends fold into an upstream error instead of a partial
-/// list, the §5 send discipline).
+/// list, the §5 send discipline). Contract 1.157 (§4.155): the additive
+/// `group` answer face rides the engine's group leg answer through
+/// untouched — absent stays absent (the key never serializes, every
+/// pre-1.157 response reads byte-identically), present is pinned to the
+/// engine's documented `{groupId, timestamp}` shape (a malformed face is
+/// the same protocol defect the required keys answer).
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorySendResult {
     pub timestamp: u64,
     pub results: Vec<StorySendRecipientResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<StorySendGroupFace>,
+}
+
+/// The engine sendStory answer's group leg face (contract 1.157, §4.155):
+/// the engine's own additive `{groupId, timestamp}` — the group id echoed
+/// and the group leg's own timestamp (the single leg shares the batch
+/// timestamp, the mixed audience answers the official +1 offset).
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorySendGroupFace {
+    pub group_id: String,
+    pub timestamp: u64,
 }
 
 /// One per-recipient story outcome (contract revision 1.76, §4.67): the
@@ -25397,6 +25461,7 @@ mod tests {
             preview_url: None,
             preview_title: None,
             attachment: None,
+            group: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
@@ -25556,6 +25621,7 @@ mod tests {
             preview_url: None,
             preview_title: None,
             attachment: attachment.map(str::to_string),
+            group: None,
         };
 
         // The media leg alone: no message key on the frame, the data URI
@@ -25657,6 +25723,7 @@ mod tests {
             preview_url,
             preview_title,
             attachment: None,
+            group: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
@@ -25772,6 +25839,107 @@ mod tests {
         let null_frame = service.prepare_send_story(&with_nulls).unwrap();
         assert!(null_frame.get("previewUrl").is_none());
         assert!(null_frame.get("previewTitle").is_none());
+    }
+
+    /// Contract 1.157 (§4.155): the group audience leg rides the frame
+    /// verbatim and flips the recipients empty-batch gate exactly per the
+    /// engine's mirrored audience gate — the group single leg forwards (the
+    /// empty batch riding on the frame), the mixed audience forwards
+    /// as-is, the empty batch without the group keeps the pre-1.157 local
+    /// refusal, and a raw non-string group value rides ungated (the
+    /// engine's fail-closed parse owns the whole domain, the raw-Value
+    /// posture keeping its -32603 → UPSTREAM_ERROR ladder intact).
+    #[test]
+    fn send_story_group_leg_rides_the_frame_and_flips_the_recipients_gate() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let base = |recipients: Vec<String>, group: Option<Value>| MessagesSendStoryParams {
+            account_id: account.id.clone(),
+            message: Some("story body".to_string()),
+            recipients,
+            distribution_list_id: None,
+            allows_replies: false,
+            text_style: None,
+            body_ranges: None,
+            preview_image: None,
+            preview_url: None,
+            preview_title: None,
+            attachment: None,
+            group,
+        };
+
+        // The group single leg: the empty batch rides the frame and the
+        // group id forwards verbatim.
+        let group_id = "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=";
+        let single = service
+            .prepare_send_story(&base(Vec::new(), Some(json!(group_id))))
+            .unwrap();
+        assert_eq!(
+            single,
+            json!({
+                "account": "+15555550100",
+                "recipients": [],
+                "allowsReplies": false,
+                "message": "story body",
+                "group": group_id,
+            })
+        );
+
+        // The mixed audience: group and recipients co-present forwards
+        // as-is — the multi-domain orchestration is the engine's.
+        let mixed = service
+            .prepare_send_story(&base(vec!["+15555550101".into()], Some(json!(group_id))))
+            .unwrap();
+        assert_eq!(mixed["group"], json!(group_id));
+        assert_eq!(mixed["recipients"], json!(["+15555550101"]));
+
+        // A raw non-string group value rides ungated: the connector's
+        // typing would eat the engine's plain -32603 non-string refusal
+        // (the 1.153 three-key posture), so the shape forwards as sent.
+        let raw_shape = service
+            .prepare_send_story(&base(
+                vec!["+15555550101".into()],
+                Some(json!({"masterKey": "abc", "revision": 3})),
+            ))
+            .unwrap();
+        assert_eq!(
+            raw_shape["group"],
+            json!({"masterKey": "abc", "revision": 3})
+        );
+
+        // The empty-string group rides too — the value domain (empty
+        // included) is the engine's refusal.
+        let empty_group = service
+            .prepare_send_story(&base(vec!["+15555550101".into()], Some(json!(""))))
+            .unwrap();
+        assert_eq!(empty_group["group"], json!(""));
+
+        // The pre-1.157 local refusal keeps its face: the empty batch
+        // without the group leg answers INVALID_REQUEST before the account
+        // ladder — an unknown account id proves the ordering.
+        let refused = service.prepare_send_story(&base(Vec::new(), None));
+        match refused {
+            Err(ServiceError::Api(api)) => {
+                assert_eq!(api.code, "INVALID_REQUEST");
+                assert!(!api.retryable);
+            }
+            other => panic!("expected the empty-batch refusal, got {other:?}"),
+        }
+        let unknown = service.prepare_send_story(&{
+            let mut params = base(Vec::new(), None);
+            params.account_id = "acct-absent".into();
+            params
+        });
+        assert!(
+            matches!(unknown, Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"),
+            "the empty-batch refusal precedes the account ladder"
+        );
     }
 
     /// stories.setDisabled / stories.getDisabled (contract 1.76, §4.67):

@@ -797,6 +797,14 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `story.recipientUpdate` events over the engine's story S4/S5 batch
 /// projections, the story.received transient discipline: no rows, no
 /// self-heal, the stories-disabled gate on incoming story material only;
+/// the same no-new-bit discipline) and by revision 1.157 (the §4.155 group
+/// audience leg on the `messages.sendStory` face — the engine's group
+/// story batch (engine `ffab2a8`), the official `StoryMessage.group`
+/// GroupContextV2 alignment: the engine groupId riding the frame verbatim
+/// as a raw value, the recipients empty batch riding only with the group
+/// leg (the engine's audience-at-least-one-domain gate mirrored) and
+/// keeping its refusal without it, and the additive
+/// `group:{groupId,timestamp}` answer face passing the projection through;
 /// the same no-new-bit discipline) and by revision 1.156 (the §4.154
 /// story-reply and media-story send legs on the existing send faces — the
 /// `messages.sendText` storyReply context keys riding the send frame

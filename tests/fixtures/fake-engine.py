@@ -2331,6 +2331,18 @@ for line in sys.stdin:
             "timestamp": int(time.time() * 1000),
             "results": [],
         }
+        # §4.155 (contract 1.157) the group audience leg's additive answer
+        # face: group present (absent = the pre-1.157 no-group shape) adds
+        # {groupId, timestamp} — the single leg shares the batch timestamp,
+        # the mixed audience answers the official +1 offset (the real
+        # engine's group state and member resolution stay unreachable to
+        # the fake, the send-fake discipline).
+        if params.get("group") is not None:
+            result["group"] = {
+                "groupId": params["group"],
+                "timestamp": result["timestamp"]
+                + (1 if params.get("recipients") else 0),
+            }
     elif method == "getBlockedConversations":
         # Contract 1.46 §4.45 blocked read: the storage-order projection as a
         # fixture constant (one contact + one legacy group). Read face, no

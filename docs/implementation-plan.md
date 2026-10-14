@@ -42,7 +42,43 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.156 (2026-10-15; the story-reply and media-story
+- Contract revision: 1.157 (2026-10-15; the group audience leg rides the
+  existing `messages.sendStory` face (§4.155), the connector half of the
+  engine's group story batch (engine `ffab2a8`, the official
+  `StoryMessage.group` GroupContextV2 alignment — the audience two-domain
+  send, sendStoryMessage.preload.ts:40-63): the optional `group` key (the
+  engine groupId, the group master key standard base64, the
+  `sendTextGroup` group-id caliber) rides the engine frame verbatim as a
+  raw JSON value (the 1.153 three-key / 1.156 timestamp posture — the
+  engine's documented gate owns the whole value domain: a non-string or
+  empty group answers its plain -32603, a non-32B group id its decode
+  refusal, a terminated group and an announcements-only non-admin group
+  its structured -1 `SEND_TARGET_*` faces, all degrading through the
+  ladder to UPSTREAM_ERROR retryable, which connector-side typing would
+  eat); the recipients empty batch — locally refused since 1.76 — now
+  rides only with the group leg (the group single leg, the engine's
+  audience-at-least-one-domain gate mirrored: group absent + empty batch
+  keeps the local INVALID_REQUEST refusal, group and recipients
+  co-present forwards as-is — the mixed-domain orchestration is the
+  engine's, never a connector gate); and the answer face is additive
+  `group: {groupId, timestamp}` passing the `story_from_engine`
+  projection through untouched (absent — and null — stays absent, the key
+  never serializes, every pre-1.157 frame and answer reads
+  byte-identically; a malformed face is the same pinned protocol defect
+  the required keys answer). The §4.154 boundary paragraph's "uncommitted
+  WIP" reading of the engine group leg was a misread — `ffab2a8` is the
+  engine's committed mainline, and this batch lands against the committed
+  contract. Wire additive: one optional key on an existing method, zero
+  new methods/events/error codes/store moves. Tests 832 → 836
+  (integration +2: tests/story_send_group.rs — the forward arm pinned
+  byte-for-byte across the group single leg, the mixed audience, and the
+  pre-1.157 shape with the answer face passthrough; the error arm — the
+  empty-batch local refusal with zero engine traffic, the marker
+  -32603 → UPSTREAM_ERROR retryable face, the engine-down
+  RUNTIME_NOT_RUNNING face; lib +2: the group frame/gate arm and the
+  `story_from_engine` additive projection arm), all green — fmt, check,
+  clippy, full cargo test, release build, schema parse) —
+  previously 1.156 (2026-10-15; the story-reply and media-story
   send legs on the existing send faces (§4.154), the connector half of the
   engine's story send batches: `messages.sendText` gains the two optional
   `storyReplyAuthor`/`storyReplyTimestamp` context keys (the engine `send`
@@ -12502,6 +12538,95 @@ the story path, and the engine-down RUNTIME_NOT_RUNNING face; lib +2 —
 the sendText story-reply frame arm and the sendStory media-leg frame
 arm (verbatim frames, absence kept absent, the media leg's text gate
 skipped). Tests 826 → 832, all green.
+
+### 4.155 The group audience leg rides the story send face: `messages.sendStory` group (contract revision 1.157, 2026-10-15)
+
+The engine's group story batch (`ffab2a8` — the committed mainline; the
+§4.154 boundary paragraph's "uncommitted WIP" reading was a misread,
+corrected here) opens the audience two-domain send: the official
+distribution-lists ∧ group-conversations audiences riding one send
+(`sendStoryMessage.preload.ts:40-63`), the group value source the local
+group state (`getGroupV2Info`), and the wire format
+`Content.storyMessage` carrying `StoryMessage.group = GroupContextV2`
+(`protos/SignalService.proto:473-482`, the group change always absent,
+the group leg's `allowsReplies` hardcoded true — the RPC parameter
+governs the list leg only). This batch is the connector half, on the
+same widening arm the 1.156 media leg rode:
+
+- **Verbatim transit, raw on purpose.** `group` is the engine groupId —
+  the group master key standard base64, the `sendTextGroup` group-id
+  caliber — and rides the frame as a raw JSON value (the 1.153
+  three-key / 1.156 timestamp posture): the engine's documented gate
+  owns the whole value domain (its own fail-closed ladder: a non-string
+  or empty group → plain -32603, a non-32B group id → the decode
+  refusal, a terminated group → `-1` + `SEND_TARGET_TERMINATED`, an
+  announcements-only non-admin group → `-1` +
+  `SEND_TARGET_ANNOUNCEMENTS_ONLY`), and connector-side typing would eat
+  the non-string face — answering a local INVALID_REQUEST (a different
+  code with different retryability) instead of forwarding the engine's
+  UPSTREAM_ERROR ladder. A JSON null folds to None at the serde option
+  layer (the §4.154 with_nulls precedent): neither absent nor null ever
+  reaches the gates or the frame.
+- **The recipients empty-batch gate flips to the engine's mirror.** The
+  1.76-era local refusal (an empty batch answered INVALID_REQUEST before
+  the account ladder) narrows to its engine counterpart: group absent +
+  empty batch keeps the refusal (the pre-1.157 face, the ordering
+  proven by the unknown-account id); group present + empty batch
+  forwards as the group single leg (the engine's
+  audience-at-least-one-domain gate — its own empty-batch refusal fires
+  only without the group); group and recipients co-present forwards
+  as-is — the mixed-domain orchestration (two jobs, two syncs, the
+  official +1 timestamp offset) is the engine's, never a connector
+  gate. The empty batch rides the frame as an empty array (the engine's
+  list-leg skip input), the per-entry shape gates untouched.
+- **The additive answer face passes through.** The engine answers
+  `group: {groupId, timestamp}` when its group leg answered (the single
+  leg sharing the batch timestamp, the mixed audience the official +1
+  offset); the `story_from_engine` projection now carries it — absent
+  (and null, the engine's 缺席 caliber) stays absent and the
+  serialization never emits the key, so every pre-1.157 answer reads
+  byte-identically; present, both keys are pinned to the documented
+  shape, the same pinned-face discipline as the required timestamp /
+  results pair (a malformed face answers UPSTREAM_PROTOCOL_ERROR
+  loudly, never smoothed). The group-leg error face rides the existing
+  ladder unchanged: the `-1` `SEND_TARGET_*` literals are not
+  host-declared codes, so they degrade to plain UPSTREAM_ERROR retryable
+  exactly like every upstream code the connector's allowlist does not
+  declare — zero new error codes.
+- **The send lane and the mutating class do not move.** The method keeps
+  its registry row, its send-lane serialization, and its
+  mutating-class send-outcome semantics; no new capability bit — the
+  `stories` tag widens in place (the 1.82 precedent chain, now reading
+  1.157 → 1.156 → 1.154 → 1.130).
+- **Every pre-1.157 frame and answer reads byte-identically.** The
+  absent-optional key is structurally absent on both faces — the
+  widening changes nothing for a caller that never sends it.
+
+Boundary: the connector performs no group resolution, no 32B decode,
+and no group-state read — the group id is opaque transit material end
+to end, and the fake engine answers the group face without group state
+(the send-fake discipline; the real engine's group cache, member
+resolution, and the three candidate gates are its own acceptance). The
+group-leg `allowsReplies: true` hardcode, the sync shapes, and the
+receive-side group story projections (E2/P14, already landed) are the
+engine's contract, not re-gated here.
+
+Tests: integration +2 (`tests/story_send_group.rs`) — the forward arm
+pinned byte-for-byte across the audience states (the group single leg
+with the empty batch riding and the verbatim group id, the mixed
+audience with both keys riding, the pre-1.157 shape with no group key
+on the frame and no group face on the answer) and the answer face
+passthrough (the single leg's shared timestamp, the mixed audience's +1
+offset, the absent face never serializing); the error arm — the
+empty-batch local refusal with zero engine traffic (the send log
+absent), the marker -32603 → UPSTREAM_ERROR retryable face on the group
+path, and the engine-down RUNTIME_NOT_RUNNING face. Lib +2 — the
+group frame/gate arm (the single leg's empty-batch frame, the mixed
+co-presence, the raw non-string value riding ungated, the empty-string
+group riding, the kept refusal with the account-ladder ordering proof)
+and the `story_from_engine` additive projection arm (the pre-1.157
+shape byte-identical, null-as-absence, the pinned face, the malformed
+face as protocol defect). Tests 832 → 836, all green.
 
 ## 5. signal-cli Boundary
 

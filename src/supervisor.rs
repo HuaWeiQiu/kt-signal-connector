@@ -50,17 +50,18 @@ use crate::service::{
     StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
     StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
     StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, StorySendRecipientResult, StorySendResult,
-    StorySendSuccess, UsernameLookupEntry, UsernameLookupParams, UsernameLookupResult,
-    account_device_capabilities_from_engine, account_limit_error, blocked_conversations_result,
-    call_link_syncs_result, chat_folder_syncs_result, conversation_state_from_engine,
-    device_list_from_engine, group_create_result_from_engine, group_invite_join_status_from_engine,
-    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
-    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
-    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
-    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
-    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
-    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
+    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
+    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
+    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
+    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
+    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
+    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
+    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
+    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
+    merge_contacts_summary_from_engine, notification_profile_syncs_result,
+    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
+    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
+    store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -2535,6 +2536,12 @@ impl RuntimeSupervisor {
     /// outcome answers SEND_OUTCOME_UNKNOWN and is never retried (the §5
     /// send discipline, rowless variant — there is no pending row to
     /// settle, and a story is idempotent upstream by its own timestamp).
+    /// Contract 1.157 (§4.155): the group audience leg rides the same one
+    /// mutating call — the engine answers its additive `group` face and the
+    /// projection passes it through (absent stays absent); a group-leg
+    /// refusal rides the structured ladder, its non-allowlisted `SEND_*`
+    /// literals degrading to the plain UPSTREAM_ERROR exactly like every
+    /// upstream code the host contract does not declare.
     pub async fn send_story(
         &self,
         params: MessagesSendStoryParams,
@@ -8603,7 +8610,11 @@ pub(crate) fn avatar_from_engine_for_tests(result: &Value) -> Result<AvatarDownl
 /// required key is a protocol defect, answered loudly rather than smoothed
 /// into a row-less send truth the desktop cannot reconcile; an entry count
 /// past the request cap is the same drift (a silently dropped entry would
-/// misreport one recipient's send state).
+/// misreport one recipient's send state). Contract 1.157 (§4.155): the
+/// additive `group` face passes through — absent (or null, the engine's
+/// 缺席 caliber) stays absent and the projection keeps the pre-1.157 shape
+/// byte-identically; present, both keys are pinned to the engine's
+/// documented shape, the same pinned-face discipline as the required pair.
 fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
     let timestamp = result
         .get("timestamp")
@@ -8633,7 +8644,25 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
             },
         });
     }
-    Ok(StorySendResult { timestamp, results })
+    let group = match result.get("group") {
+        None | Some(Value::Null) => None,
+        Some(face) => Some(StorySendGroupFace {
+            group_id: face
+                .get("groupId")
+                .and_then(Value::as_str)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                .to_string(),
+            timestamp: face
+                .get("timestamp")
+                .and_then(Value::as_u64)
+                .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+        }),
+    };
+    Ok(StorySendResult {
+        timestamp,
+        results,
+        group,
+    })
 }
 
 #[cfg(test)]
@@ -11419,6 +11448,10 @@ mod tests {
             // Contract 1.156 (§4.154): the media story leg — the text-face
             // tests stay on the text leg, the attachment face has its own.
             attachment: None,
+            // Contract 1.157 (§4.155): the group audience leg — the
+            // dispatch tests stay on the list leg, the group face has its
+            // own.
+            group: None,
         };
 
         // The default-shape send projects the lean frame and the fake's
@@ -11518,6 +11551,88 @@ mod tests {
             "an unknown sendStory outcome is never retried"
         );
         supervisor.shutdown().await.unwrap();
+    }
+
+    /// Contract 1.157 (§4.155): the sendStory answer projection passes the
+    /// engine's additive `group` face through — absent (and null, the
+    /// engine's 缺席 caliber) keeps the pre-1.157 shape byte-identically
+    /// (the key never serializes), present is pinned to the documented
+    /// `{groupId, timestamp}` shape, and a malformed face is the same
+    /// protocol defect the required keys answer.
+    #[test]
+    fn send_story_answer_group_face_passes_through_additively() {
+        // The pre-1.157 answer: no group key, the projection keeps the
+        // exact serialization shape (absent stays absent, never null).
+        let pre = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [
+                {"recipientNumber": "+15555550101",
+                 "success": {"timestamp": 1001u64}}
+            ],
+        }))
+        .unwrap();
+        assert!(pre.group.is_none());
+        assert_eq!(
+            serde_json::to_value(&pre).unwrap(),
+            json!({
+                "timestamp": 1000u64,
+                "results": [
+                    {"recipientNumber": "+15555550101",
+                     "success": {"timestamp": 1001u64}}
+                ],
+            })
+        );
+
+        // An explicit null face reads as absence (the engine's own caliber).
+        let nulled = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [],
+            "group": null,
+        }))
+        .unwrap();
+        assert!(nulled.group.is_none());
+
+        // The group face passes through pinned to the documented shape.
+        let grouped = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [],
+            "group": {"groupId": "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=", "timestamp": 1001u64},
+        }))
+        .unwrap();
+        let face = grouped.group.as_ref().expect("the group face rides");
+        assert_eq!(
+            face.group_id,
+            "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q="
+        );
+        assert_eq!(face.timestamp, 1001);
+        assert_eq!(
+            serde_json::to_value(&grouped).unwrap(),
+            json!({
+                "timestamp": 1000u64,
+                "results": [],
+                "group": {
+                    "groupId": "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=",
+                    "timestamp": 1001u64,
+                },
+            })
+        );
+
+        // A malformed face is a protocol defect, answered loudly.
+        for broken in [
+            json!({"timestamp": 1u64, "results": [], "group": {"timestamp": 2u64}}),
+            json!({"timestamp": 1u64, "results": [], "group": {"groupId": "abc"}}),
+            json!({"timestamp": 1u64, "results": [], "group": {"groupId": 7, "timestamp": 2u64}}),
+            json!({"timestamp": 1u64, "results": [], "group": "abc"}),
+        ] {
+            let error = super::story_from_engine(&broken).err().unwrap();
+            assert!(
+                matches!(
+                    error,
+                    crate::service::ServiceError::Engine(EngineError::Protocol)
+                ),
+                "expected a protocol defect for {broken}"
+            );
+        }
     }
 
     /// stories.markViewed (contract 1.85, §4.70): the frame is
