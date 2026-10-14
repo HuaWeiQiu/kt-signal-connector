@@ -2230,6 +2230,8 @@ impl ConnectorService {
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
         text_styles: Option<Vec<SendTextStyleParams>>,
+        story_reply_author: Option<String>,
+        story_reply_timestamp: Option<Value>,
     ) -> Result<PreparedSend, ServiceError> {
         let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
@@ -2259,6 +2261,8 @@ impl ConnectorService {
             None,
             Vec::new(),
             false,
+            story_reply_author,
+            story_reply_timestamp,
         )
     }
 
@@ -2280,6 +2284,8 @@ impl ConnectorService {
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
         text_styles: Option<Vec<SendTextStyleParams>>,
+        story_reply_author: Option<String>,
+        story_reply_timestamp: Option<Value>,
     ) -> Result<PreparedSend, ServiceError> {
         let preview = previews_to_upstream(previews, text)?;
         validate_text(text)?;
@@ -2337,6 +2343,8 @@ impl ConnectorService {
             None,
             Vec::new(),
             false,
+            story_reply_author,
+            story_reply_timestamp,
         )
     }
 
@@ -2607,6 +2615,8 @@ impl ConnectorService {
             Some(vec![json!(data_uri)]),
             vec![descriptor],
             view_once,
+            None,
+            None,
         )
     }
 
@@ -2741,6 +2751,8 @@ impl ConnectorService {
             Some(data_uris),
             descriptors,
             false,
+            None,
+            None,
         )
     }
 
@@ -2991,6 +3003,8 @@ impl ConnectorService {
         attachments: Option<Vec<Value>>,
         attachment_descriptors: Vec<NormalizedAttachment>,
         view_once: bool,
+        story_reply_author: Option<String>,
+        story_reply_timestamp: Option<Value>,
     ) -> Result<PreparedSend, ServiceError> {
         let account_id = account.id.as_str();
         let conversation_id = conversation.id.as_str();
@@ -3109,6 +3123,8 @@ impl ConnectorService {
             quote,
             conversation,
             view_once,
+            story_reply_author,
+            story_reply_timestamp,
         );
         Ok(PreparedSend::Dispatch {
             pending_id,
@@ -4945,13 +4961,28 @@ impl ConnectorService {
     /// MY_STORY zero UUID, any other strict UUID passes through lowercased
     /// (`normalizeStoryDistributionId`), anything else is the officially
     /// unreachable shape and answers INVALID_REQUEST.
+    ///
+    /// Contract 1.156 (§4.154): `message` is the text story leg and
+    /// `attachment` the media story leg (the engine's media story batch,
+    /// engine `7e3652e`, the official `StoryMessage.fileAttachment`
+    /// alignment; the connector-shape transit data URI rides the same
+    /// upload path as any attachment send). The connector performs no
+    /// leg-exclusivity gate — message/attachment co-presence, a text-leg
+    /// key on the attachment leg, and a bare no-payload frame are the
+    /// engine's fail-closed parse (plain -32603 through the structured
+    /// ladder) — and the attachment data URI is verbatim transit material:
+    /// no deep parse, no cap check, no shape gate (the upload/cap gates
+    /// are the engine's transit-CDN face). The message byte gates keep
+    /// running only when the text leg rides.
     pub fn prepare_send_story(
         &self,
         params: &MessagesSendStoryParams,
     ) -> Result<Value, ServiceError> {
         validate_opaque_id(&params.account_id, "accountId")?;
-        let message = params.message.trim();
-        if message.is_empty() || message.len() > MAX_TEXT_BYTES {
+        let message = params.message.as_deref().map(str::trim);
+        if let Some(message) = message
+            && (message.is_empty() || message.len() > MAX_TEXT_BYTES)
+        {
             return Err(ServiceError::Api(ApiError::new(
                 "INVALID_REQUEST",
                 "message must contain between 1 and 65536 bytes",
@@ -5037,10 +5068,18 @@ impl ConnectorService {
         let account = self.resolve_account(&params.account_id)?;
         let mut frame = json!({
             "account": account.signal_account,
-            "message": message,
             "recipients": params.recipients,
             "allowsReplies": params.allows_replies,
         });
+        // §4.154: each leg key rides only when its leg rides — a bare frame
+        // (no message, no attachment) forwards as-is and is the engine's
+        // no-payload refusal, never a connector gate.
+        if let Some(message) = message {
+            frame["message"] = json!(message);
+        }
+        if let Some(attachment) = params.attachment.as_deref() {
+            frame["attachment"] = json!(attachment);
+        }
         if let Some(id) = distribution_list_id {
             frame["distributionListId"] = json!(id);
         }
@@ -6417,6 +6456,8 @@ impl ConnectorService {
         quote: Option<(u64, String)>,
         conversation: &ConversationRow,
         view_once: bool,
+        story_reply_author: Option<String>,
+        story_reply_timestamp: Option<Value>,
     ) -> Value {
         let mut params = json!({
             "account": signal_account,
@@ -6487,6 +6528,17 @@ impl ConnectorService {
         // absent when false, so every existing wire shape stays byte-identical.
         if view_once {
             params["viewOnce"] = json!(true);
+        }
+        // §4.154 (contract 1.156): the story-reply send context rides the
+        // send top level verbatim — each key only when the caller sent it,
+        // absence never becoming null. The pair discipline (同置或都缺) and
+        // the timestamp's whole value domain are the engine's fail-closed
+        // parse; the connector invents no key and drops none.
+        if let Some(author) = story_reply_author {
+            params["storyReplyAuthor"] = json!(author);
+        }
+        if let Some(timestamp) = story_reply_timestamp {
+            params["storyReplyTimestamp"] = timestamp;
         }
         params
     }
@@ -6636,7 +6688,9 @@ impl ConnectorService {
     /// card when the original send carried one (metadata-only: the image
     /// bytes never persisted, upstream `previewImage` is independently
     /// optional); mentions and text styles are not persisted for retry
-    /// rebuilds (documented deviation, the text arrives unchanged) — and a
+    /// rebuilds (documented deviation, the text arrives unchanged), and the
+    /// 1.156 story-reply context joins that family (§4.154: transit-only,
+    /// the engine frame never the row — a rebuild resends without it) — and a
     /// `PreparedSend::Dispatch` addressed to the SAME row, so settlement
     /// completes the row the bubble already renders. Callers reject
     /// attachment rows before this face (§4.134): the rebuild has no
@@ -6680,6 +6734,8 @@ impl ConnectorService {
             quote,
             conversation,
             false,
+            None,
+            None,
         );
         Ok(PreparedSend::Dispatch {
             pending_id: row.id.clone(),
@@ -12449,6 +12505,19 @@ pub struct MessagesSendTextParams {
     /// §4.62: optional outbound text-style ranges; entry shape validated by
     /// `SendTextStyleParams` (unknown keys fail deserialization).
     pub text_style: Option<Vec<SendTextStyleParams>>,
+    /// Contract 1.156 (§4.154): the story-reply send context — the replied-to
+    /// story's author address and the story's own Signal timestamp, riding
+    /// the engine `send` frame verbatim. The two keys are optional and
+    /// independent on this face: the pair discipline (同置或都缺合法，单边
+    /// 在场拒) is the engine's fail-closed parse, never a connector gate —
+    /// a single-sided presence forwards as-is. The author rides verbatim
+    /// (the empty string included — the refusal is the engine's), and the
+    /// timestamp stays a raw JSON value on purpose (the 1.151 sendCallEvent
+    /// timestamp posture): the value domain (zero/negative/fractional/
+    /// non-integer) is the engine's documented gate, and connector-side
+    /// typing would eat those error faces instead of forwarding them.
+    pub story_reply_author: Option<String>,
+    pub story_reply_timestamp: Option<Value>,
 }
 
 /// One outbound @mention entry (contract revision 1.34, §4.29): the shape
@@ -12999,11 +13068,22 @@ pub struct UsernameLookupParams {
 /// optional link-preview metadata: each validates fail-closed (the §4.74
 /// ladder) and rides the engine frame verbatim; absent means the key is
 /// never sent.
+///
+/// Contract 1.156 (§4.154): the story body itself is optional — `message`
+/// is the text story leg and `attachment` (the engine's media story batch,
+/// engine `7e3652e`, the official `StoryMessage.fileAttachment` alignment)
+/// is the media story leg. The connector performs no leg-exclusivity gate:
+/// message/attachment co-presence, a text-leg key riding the attachment
+/// leg, and a bare no-payload frame are all the engine's fail-closed parse
+/// (its plain -32603 through the structured ladder) — the connector only
+/// forwards what arrived. The attachment data URI is verbatim transit
+/// material: no deep parse, no cap check (the upload/cap gates are the
+/// engine's transit-CDN face).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessagesSendStoryParams {
     pub account_id: String,
-    pub message: String,
+    pub message: Option<String>,
     pub recipients: Vec<String>,
     pub distribution_list_id: Option<String>,
     #[serde(default)]
@@ -13013,6 +13093,12 @@ pub struct MessagesSendStoryParams {
     pub preview_image: Option<String>,
     pub preview_url: Option<String>,
     pub preview_title: Option<String>,
+    /// The media story leg: one attachment data URI (the upstream
+    /// `data:<mediatype>[;filename=<pct>][;voice=true][;gif=true];base64,`
+    /// shape) forwarded verbatim — the connector never parses the content
+    /// and never gates the value domain (empty string included; the
+    /// engine's parse owns the refusal).
+    pub attachment: Option<String>,
 }
 
 /// `stories.setDisabled` params (contract revision 1.76, §4.67): the
@@ -17233,6 +17319,8 @@ mod tests {
                 ]),
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -17245,6 +17333,106 @@ mod tests {
         assert_eq!(
             dispatch["previewImage"],
             json!("data:image/jpeg;base64,QUJD")
+        );
+    }
+
+    /// messages.sendText story-reply context (contract 1.156, §4.154): the
+    /// two optional keys ride the upstream frame verbatim — each only when
+    /// the caller sent it, absence never becoming null — with no pair gate
+    /// (a single-sided presence forwards as-is; the engine's storyContext
+    /// parse owns the discipline) and no value-domain gate (a raw
+    /// string-form timestamp forwards untouched, the 1.151 timestamp
+    /// posture). The keyless body stays byte-identical to the pre-1.156
+    /// shape.
+    #[test]
+    fn send_text_story_reply_context_rides_the_upstream_frame_verbatim() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550101", "Peer")
+            .unwrap();
+        let prepare =
+            |text: &str, request: &str, author: Option<&str>, timestamp: Option<Value>| {
+                match service
+                    .prepare_send_text(
+                        &account.id,
+                        &conversation.id,
+                        text,
+                        request,
+                        None,
+                        None,
+                        None,
+                        None,
+                        author.map(str::to_string),
+                        timestamp,
+                    )
+                    .unwrap()
+                {
+                    PreparedSend::Dispatch { params, .. } => params,
+                    PreparedSend::Existing(_) => panic!("new client request must dispatch"),
+                }
+            };
+
+        // Both keys: the full story-reply context, byte-verbatim.
+        assert_eq!(
+            prepare(
+                "story reply body",
+                "req-story-reply-both",
+                Some("22222222-2222-2222-2222-222222222222"),
+                Some(json!(1_727_000_000_000u64)),
+            ),
+            json!({
+                "account": "+15555550100",
+                "message": "story reply body",
+                "recipient": ["+15555550101"],
+                "storyReplyAuthor": "22222222-2222-2222-2222-222222222222",
+                "storyReplyTimestamp": 1_727_000_000_000u64,
+            })
+        );
+
+        // Author only: the single-sided presence forwards as-is (the
+        // pair-discipline refusal is the engine's face).
+        let author_only = prepare(
+            "author only",
+            "req-story-reply-author",
+            Some("22222222-2222-2222-2222-222222222222"),
+            None,
+        );
+        assert_eq!(
+            author_only["storyReplyAuthor"],
+            json!("22222222-2222-2222-2222-222222222222")
+        );
+        assert!(author_only.get("storyReplyTimestamp").is_none());
+
+        // Timestamp only, in a shape the engine refuses (a string stamp):
+        // the raw value forwards untouched.
+        let timestamp_only = prepare(
+            "timestamp only",
+            "req-story-reply-stamp",
+            None,
+            Some(json!("1727000000000")),
+        );
+        assert!(timestamp_only.get("storyReplyAuthor").is_none());
+        assert_eq!(
+            timestamp_only["storyReplyTimestamp"],
+            json!("1727000000000")
+        );
+
+        // Neither key: the pre-1.156 wire shape, byte-identical.
+        assert_eq!(
+            prepare("plain body", "req-story-reply-plain", None, None),
+            json!({
+                "account": "+15555550100",
+                "message": "plain body",
+                "recipient": ["+15555550101"],
+            })
         );
     }
 
@@ -17282,6 +17470,8 @@ mod tests {
                 Some(vec![preview("https://example.com/a", "Example")]),
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap_err();
         assert!(matches!(url_absent, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -17302,6 +17492,8 @@ mod tests {
                 }]),
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap_err();
         assert!(matches!(path_image, ServiceError::Api(error) if error.code == "INVALID_REQUEST"));
@@ -17314,6 +17506,8 @@ mod tests {
                 "req-preview-title",
                 None,
                 Some(vec![preview("https://example.com/a", "   ")]),
+                None,
+                None,
                 None,
                 None,
             )
@@ -17362,6 +17556,8 @@ mod tests {
                     image_data_uri: Some("data:image/jpeg;base64,QUJD".into()),
                     date: Some(1_600_000_000_000),
                 }]),
+                None,
+                None,
                 None,
                 None,
             )
@@ -17422,6 +17618,8 @@ mod tests {
                     image_data_uri: None,
                     date: Some(0),
                 }]),
+                None,
+                None,
                 None,
                 None,
             )
@@ -17663,6 +17861,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                 )
                 .unwrap()
             {
@@ -17690,6 +17890,8 @@ mod tests {
                     &conversation.id,
                     "hello",
                     "req-enroll-ratelimit",
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -17737,6 +17939,8 @@ mod tests {
                     &conversation.id,
                     "hello",
                     &request,
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -17828,6 +18032,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -17896,6 +18102,8 @@ mod tests {
                 &conversation.id,
                 "queued text",
                 "req-outbox-1",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -18011,6 +18219,8 @@ mod tests {
                 &conversation.id,
                 "plain queued text",
                 "req-caption-2",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -18235,6 +18445,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -18295,6 +18507,8 @@ mod tests {
                 &conversation.id,
                 "unknown outcome",
                 "retry-req-2",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -18379,6 +18593,8 @@ mod tests {
                 None,
                 None,
                 Some((0..65).map(|index| style("BOLD", index, 1)).collect()),
+                None,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -18404,6 +18620,8 @@ mod tests {
                 None,
                 None,
                 Some(vec![style("BLINK", 0, 2)]),
+                None,
+                None,
             )
             .unwrap_err();
         assert!(
@@ -18433,6 +18651,8 @@ mod tests {
                         style("SPOILER", 7, 4),
                         style("MONOSPACE", 7, 4),
                     ]),
+                    None,
+                    None,
                 )
                 .unwrap(),
         );
@@ -18467,6 +18687,8 @@ mod tests {
                     None,
                     None,
                     Some(Vec::new()),
+                    None,
+                    None,
                 )
                 .unwrap(),
         );
@@ -18506,6 +18728,8 @@ mod tests {
                 &conversation.id,
                 "same text is not identity",
                 "client-request-exact",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -18605,6 +18829,8 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-race",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -18875,6 +19101,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -18905,6 +19133,8 @@ mod tests {
                 },
                 "hello again",
                 "peer-req-2",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -18942,7 +19172,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    None
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap(),
             PreparedSend::Existing(_)
@@ -18957,7 +19189,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    None
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap(),
             PreparedSend::Existing(_)
@@ -18986,7 +19220,7 @@ mod tests {
                 "text",
                 "req-bad-kind",
                 None, None,
-             None, None),
+             None, None, None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
         assert!(matches!(
@@ -19000,7 +19234,7 @@ mod tests {
                 "text",
                 "req-empty-peer",
                 None, None,
-             None, None),
+             None, None, None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST"
         ));
         assert!(matches!(
@@ -19016,7 +19250,9 @@ mod tests {
                 None,
                 None,
                 None,
-                None
+                None,
+                None,
+                None,
             ),
             Err(ServiceError::Store(StoreError::AccountNotFound))
         ));
@@ -19031,6 +19267,8 @@ mod tests {
                 },
                 "group hello",
                 "req-group",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19063,6 +19301,8 @@ mod tests {
                 },
                 "masked hello",
                 "req-masked",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19145,6 +19385,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19192,6 +19434,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19209,6 +19453,8 @@ mod tests {
                 "quote own",
                 "req-quote-own",
                 Some(&pending_id),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19253,6 +19499,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap_err()
             .into_api();
@@ -19271,7 +19519,9 @@ mod tests {
                     None,
                     None,
                     None,
-                    None
+                    None,
+                    None,
+                    None,
                 )
                 .unwrap(),
             PreparedSend::Dispatch { .. }
@@ -19289,6 +19539,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19302,7 +19554,7 @@ mod tests {
                 "quote pending",
                 "req-quote-pending",
                 Some(&pending_id), None,
-             None, None),
+             None, None, None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
 
@@ -19350,7 +19602,7 @@ mod tests {
                 "quote group",
                 "req-quote-group",
                 Some(&group_message.id), None,
-             None, None),
+             None, None, None, None),
             Err(ServiceError::Api(error)) if error.code == "INVALID_REQUEST" && !error.retryable
         ));
 
@@ -19364,7 +19616,9 @@ mod tests {
                 Some(&group_message.id),
                 None,
                 None,
-                None
+                None,
+                None,
+                None,
             ),
             Err(ServiceError::Store(StoreError::MessageNotFound))
         ));
@@ -19397,6 +19651,8 @@ mod tests {
                 &direct.id,
                 "delete me",
                 "req-rd-1",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19442,6 +19698,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19483,6 +19741,8 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-rd-p",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19607,6 +19867,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19689,6 +19951,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19732,6 +19996,8 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-sr-p",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -19876,6 +20142,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -19921,6 +20189,8 @@ mod tests {
                 &conversation.id,
                 "reaction target",
                 "req-sr-complete",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -20012,6 +20282,8 @@ mod tests {
                 &direct.id,
                 "pin me",
                 "req-pin-1",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -20116,6 +20388,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -20165,6 +20439,8 @@ mod tests {
                 &conversation.id,
                 "in flight",
                 "req-pin-pending",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -20271,6 +20547,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -20341,6 +20619,8 @@ mod tests {
                 &conversation.id,
                 "pin target one",
                 "req-pin-c1",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -20683,6 +20963,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -20715,6 +20997,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -20734,6 +21018,8 @@ mod tests {
                 &conversation.id,
                 "will vanish",
                 "req-unknown",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -25095,7 +25381,7 @@ mod tests {
             .remove(0);
         let params = |message: &str, full: bool, account_id: &str| MessagesSendStoryParams {
             account_id: account_id.to_string(),
-            message: message.to_string(),
+            message: Some(message.to_string()),
             recipients: vec!["+15555550101".into()],
             distribution_list_id: full.then(|| "11111111-2222-3333-4444-555555555555".into()),
             allows_replies: full,
@@ -25110,6 +25396,7 @@ mod tests {
             preview_image: full.then(|| "data:image/png;base64,AAAA".to_string()),
             preview_url: None,
             preview_title: None,
+            attachment: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
@@ -25239,6 +25526,107 @@ mod tests {
         );
     }
 
+    /// messages.sendStory media story leg (contract 1.156, §4.154): the
+    /// optional `attachment` rides the engine frame verbatim and `message`
+    /// becomes optional — the two content legs, both optional on the
+    /// connector face with no leg-exclusivity gate (co-presence, a
+    /// text-leg key on the attachment leg, and the bare no-payload frame
+    /// all forward as-is; the engine's fail-closed parse owns the
+    /// refusal). The message byte gates keep running only when the text
+    /// leg rides.
+    #[test]
+    fn send_story_media_leg_rides_the_frame_verbatim() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let base = |message: Option<&str>, attachment: Option<&str>| MessagesSendStoryParams {
+            account_id: account.id.clone(),
+            message: message.map(str::to_string),
+            recipients: vec!["+15555550101".into()],
+            distribution_list_id: None,
+            allows_replies: false,
+            text_style: None,
+            body_ranges: None,
+            preview_image: None,
+            preview_url: None,
+            preview_title: None,
+            attachment: attachment.map(str::to_string),
+        };
+
+        // The media leg alone: no message key on the frame, the data URI
+        // byte-verbatim (the filename parameter and base64 payload never
+        // reshaped).
+        let media_uri = "data:image/jpeg;filename=story%20pic.jpg;base64,QUJDREVGRw==";
+        assert_eq!(
+            service
+                .prepare_send_story(&base(None, Some(media_uri)))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "recipients": ["+15555550101"],
+                "allowsReplies": false,
+                "attachment": media_uri,
+            })
+        );
+
+        // The text leg alone: the pre-1.156 shape, no attachment key.
+        assert_eq!(
+            service
+                .prepare_send_story(&base(Some("text story body"), None))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "message": "text story body",
+                "recipients": ["+15555550101"],
+                "allowsReplies": false,
+            })
+        );
+
+        // Both legs: the connector forwards what arrived — the co-presence
+        // refusal is the engine's face, never a connector gate.
+        assert_eq!(
+            service
+                .prepare_send_story(&base(
+                    Some("caption body"),
+                    Some("data:image/png;base64,AAAA"),
+                ))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "message": "caption body",
+                "recipients": ["+15555550101"],
+                "allowsReplies": false,
+                "attachment": "data:image/png;base64,AAAA",
+            })
+        );
+
+        // The empty-string attachment and the bare no-payload frame both
+        // forward as-is: the zero-local-gate posture (the engine's parse
+        // owns the refusal). The text-leg byte gate keeps its trimmed
+        // shape (whitespace-only still INVALID_REQUEST) and a non-empty
+        // message is trimmed into the frame as before.
+        assert_eq!(
+            service.prepare_send_story(&base(None, Some(""))).unwrap()["attachment"],
+            json!("")
+        );
+        assert_eq!(
+            service
+                .prepare_send_story(&base(None, None))
+                .unwrap()
+                .get("message"),
+            None
+        );
+        assert!(matches!(
+            service.prepare_send_story(&base(Some("   "), None)),
+            Err(ServiceError::Api(ref api)) if api.code == "INVALID_REQUEST"
+        ));
+    }
+
     /// messages.sendStory link-preview metadata (contract 1.91, §4.74): the
     /// two optional keys gate independently ahead of the account ladder —
     /// non-https/empty/over-cap `previewUrl` and empty/over-cap
@@ -25259,7 +25647,7 @@ mod tests {
                       preview_title: Option<String>,
                       account_id: &str| MessagesSendStoryParams {
             account_id: account_id.to_string(),
-            message: "story body".to_string(),
+            message: Some("story body".to_string()),
             recipients: vec!["+15555550101".into()],
             distribution_list_id: None,
             allows_replies: false,
@@ -25268,6 +25656,7 @@ mod tests {
             preview_image: Some("data:image/png;base64,AAAA".to_string()),
             preview_url,
             preview_title,
+            attachment: None,
         };
         let gate = |params: &MessagesSendStoryParams| {
             matches!(
@@ -27452,6 +27841,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -29193,6 +29584,8 @@ mod tests {
                 None,
                 None,
                 Some(mentions),
+                None,
+                None,
                 None,
             )
         };
@@ -31280,6 +31673,8 @@ mod tests {
                 &direct.id,
                 "has attachment",
                 request_id,
+                None,
+                None,
                 None,
                 None,
                 None,

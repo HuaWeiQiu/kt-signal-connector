@@ -917,6 +917,21 @@ for line in sys.stdin:
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # §4.154 (contract 1.156) one-shot parse-gate answer: the marker
+        # `.fixture-send-rejected` answers the plain -32603 face the real
+        # engine's fail-closed send parse answers for every storyReply
+        # value-domain violation (single-sided presence, empty author,
+        # zero/negative/fractional timestamp) — the gates themselves are
+        # the real engine's, which the fixture deliberately does not
+        # re-implement.
+        if (SIGNAL_DATA_DIR / ".fixture-send-rejected").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
         # §4.123 one-shot server-unavailable answer (transport error shape
         # the engine classifier maps to ServerUnavailable), armed per test
         # through this data dir's marker file.
@@ -2295,6 +2310,21 @@ for line in sys.stdin:
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        # §4.154 (contract 1.156) one-shot parse-gate answer: the marker
+        # `.fixture-story-send-rejected` answers the plain -32603 face the
+        # real engine's fail-closed parse answers for the two-leg value
+        # domain (message/attachment co-presence, a text-leg key on the
+        # attachment leg, an empty attachment, the bare no-payload frame) —
+        # the gates themselves are the real engine's, which the fixture
+        # deliberately does not re-implement.
+        if (SIGNAL_DATA_DIR / ".fixture-story-send-rejected").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
         if params.get("message") == "fixture_story_crash.31":
             os._exit(31)
         result = {

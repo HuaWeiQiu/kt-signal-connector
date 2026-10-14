@@ -736,6 +736,8 @@ impl ProxyGroupRuntime {
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
         text_styles: Option<Vec<SendTextStyleParams>>,
+        story_reply_author: Option<String>,
+        story_reply_timestamp: Option<Value>,
     ) -> Result<MessageRecord, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
@@ -748,6 +750,8 @@ impl ProxyGroupRuntime {
                 previews,
                 mentions,
                 text_styles,
+                story_reply_author,
+                story_reply_timestamp,
             )
             .await
     }

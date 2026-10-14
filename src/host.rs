@@ -1732,6 +1732,8 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                                 params.previews,
                                 params.mentions,
                                 params.text_style,
+                                params.story_reply_author,
+                                params.story_reply_timestamp,
                             )
                             .await
                         {

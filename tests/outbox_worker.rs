@@ -206,6 +206,8 @@ async fn definitive_failure_requeues_and_the_auto_retry_succeeds() {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
     assert!(
@@ -295,6 +297,8 @@ async fn rate_limited_failure_enrolls_at_the_retry_after_beat() {
             SendTarget::Conversation(conversation_id.clone()),
             "slow down".into(),
             "req-ratelimit-1".into(),
+            None,
+            None,
             None,
             None,
             None,

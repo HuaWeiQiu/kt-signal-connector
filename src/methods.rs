@@ -797,7 +797,14 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `story.recipientUpdate` events over the engine's story S4/S5 batch
 /// projections, the story.received transient discipline: no rows, no
 /// self-heal, the stories-disabled gate on incoming story material only;
-/// the same no-new-bit discipline) and by revision 1.130 (the
+/// the same no-new-bit discipline) and by revision 1.156 (the §4.154
+/// story-reply and media-story send legs on the existing send faces — the
+/// `messages.sendText` storyReply context keys riding the send frame
+/// verbatim, the engine's storyContext parse owning the pair discipline and
+/// the value domain, plus the `messages.sendStory` `attachment` media-story
+/// leg (engine 7e3652e), the data URI verbatim transit with the upload and
+/// cap gates its own; wire-additive optional keys, the same no-new-bit
+/// discipline) and by revision 1.130 (the
 /// `storyDistributionLists.list` / `storyDistributionLists.setRecords`
 /// story-audience sync faces — the §4.78 sync-face pair over the story
 /// distribution lists the §4.67 send faces address; the same no-new-bit

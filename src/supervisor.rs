@@ -2389,6 +2389,8 @@ impl RuntimeSupervisor {
         previews: Option<Vec<SendTextPreviewParams>>,
         mentions: Option<Vec<SendTextMentionParams>>,
         text_styles: Option<Vec<SendTextStyleParams>>,
+        story_reply_author: Option<String>,
+        story_reply_timestamp: Option<Value>,
     ) -> Result<MessageRecord, ServiceError> {
         let engine = self.running_engine().await?;
         let prepared = {
@@ -2403,6 +2405,8 @@ impl RuntimeSupervisor {
                     previews,
                     mentions,
                     text_styles,
+                    story_reply_author,
+                    story_reply_timestamp,
                 )?,
                 SendTarget::Peer {
                     kind,
@@ -2421,6 +2425,8 @@ impl RuntimeSupervisor {
                     previews,
                     mentions,
                     text_styles,
+                    story_reply_author,
+                    story_reply_timestamp,
                 )?,
             }
         };
@@ -9859,6 +9865,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -9951,6 +9959,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -10039,6 +10049,8 @@ mod tests {
                 &conversation.id,
                 "react confirmed",
                 "req-sr-ok",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -10247,6 +10259,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .unwrap()
         {
@@ -10335,6 +10349,8 @@ mod tests {
                 &conversation.id,
                 "pin confirmed",
                 "req-pin-ok",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -11383,7 +11399,7 @@ mod tests {
 
         let story_params = |message: &str, full: bool| crate::service::MessagesSendStoryParams {
             account_id: account.id.clone(),
-            message: message.to_string(),
+            message: Some(message.to_string()),
             recipients: vec!["+15555550101".into()],
             distribution_list_id: full.then(|| "11111111-2222-3333-4444-555555555555".into()),
             allows_replies: full,
@@ -11400,6 +11416,9 @@ mod tests {
             // full-option dispatch; the lean shape stays key-free.
             preview_url: full.then(|| "https://example.com/story".to_string()),
             preview_title: full.then(|| "Example".to_string()),
+            // Contract 1.156 (§4.154): the media story leg — the text-face
+            // tests stay on the text leg, the attachment face has its own.
+            attachment: None,
         };
 
         // The default-shape send projects the lean frame and the fake's

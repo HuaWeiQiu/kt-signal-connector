@@ -42,7 +42,41 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.155 (2026-10-15; the ad-hoc call-history identity leg
+- Contract revision: 1.156 (2026-10-15; the story-reply and media-story
+  send legs on the existing send faces (§4.154), the connector half of the
+  engine's story send batches: `messages.sendText` gains the two optional
+  `storyReplyAuthor`/`storyReplyTimestamp` context keys (the engine `send`
+  face's storyContext pair, P14 组 4, the official
+  `DataMessage.StoryContext` alignment — a story reply IS a normal 1:1
+  message carrying the story anchor, SendMessage.preload.ts:567-577), and
+  `messages.sendStory` gains the optional `attachment` media story leg
+  (the engine's media story batch, engine `7e3652e`, the official
+  `StoryMessage.fileAttachment` oneof) with `message` becoming optional —
+  the text leg. Both faces stay verbatim-transit proxies in the
+  §4.150/§4.151 proxy posture: each key forwards only when the caller sent
+  it, absence never becoming null; the storyReply pair discipline (同置或
+  都缺合法, a single-sided presence refused) and the timestamp's whole
+  value domain (zero/negative/fractional/non-integer) stay the engine's
+  fail-closed parse — the timestamp deliberately rides a raw JSON value
+  (the 1.151 timestamp posture; connector-side typing would eat those
+  error faces) — and no connector leg-exclusivity gate exists on the
+  sendStory content legs (message/attachment co-presence, a text-leg key
+  on the attachment leg, the bare no-payload frame, the empty-string
+  attachment: all the engine's plain -32603 through the structured ladder
+  to UPSTREAM_ERROR retryable); the attachment data URI is verbatim
+  transit material, no deep parse, no cap check (the transit-CDN upload
+  gates are the engine's). The storyReply context is transit-only on the
+  row face: it rides the engine frame, never the pending row, so a
+  `messages.retryText` rebuild resends without it (the §4.29
+  rebuild-face boundary, recorded). Every pre-1.156 frame reads
+  byte-identically. Wire additive: three optional keys across two
+  existing methods, zero new methods/events/error codes/store moves.
+  Tests 826 → 832 (integration +4: the story-reply three-state verbatim
+  forward and error arm, the media-leg five-state verbatim forward and
+  error arm; lib +2: the sendText story-reply frame arm plus the sendStory
+  media-leg frame arm), all green — fmt, check, clippy, full cargo test,
+  release build, schema parse) —
+  previously 1.155 (2026-10-15; the ad-hoc call-history identity leg
   (§4.85): `call.historyEvent` gains the optional `peerId` — the projection's
   own conversation identity forwarded verbatim in its three forms (hex room
   id / ServiceId UUID / standard-base64 group master key), the wire-additive
@@ -12388,6 +12422,86 @@ three events forward without creating a row or a conversation, the
 identity family rides, and the gate splits: the disabled toggle drops
 the deletion while the reaction and the recipient sync ride. Tests
 824 → 826, all green.
+
+### 4.154 The story-reply context and the media story leg ride the existing send faces: `messages.sendText` story keys, `messages.sendStory` attachment (contract revision 1.156, 2026-10-15)
+
+The engine's story send batches close the loop the receive half opened
+in 1.154: the upstream story batch P14 组 4 (`88f3888`) threads the
+`storyReplyAuthor`/`storyReplyTimestamp` pair from the story send face
+onto the message send face (`DataMessage.StoryContext`, the official
+`SendMessage.preload.ts:567-577` anchor — a story reply IS a normal 1:1
+message carrying the story anchor), and the engine's `7e3652e` media
+story batch opens the `sendStory` attachment leg (the official
+`StoryMessage.fileAttachment` oneof, `protos/SignalService.proto:476-479`,
+the `sendStory.preload.ts:186-190` alignment). This batch is the
+connector half: both keys on the text face, both content legs on the
+story face — with neither method gaining a method row, both already
+registered (the §4.2 text send face, the §4.67 story send face).
+
+Posture (the §4.150/§4.151 proxy discipline, now on widening arms of
+existing faces):
+
+- **Verbatim transit, presence-keyed.** `storyReplyAuthor` rides the
+  engine frame only when the caller sent it; absence stays absence,
+  never null. `storyReplyTimestamp` rides a raw JSON value on purpose —
+  the whole value domain (the zero/negative stamp, the fractional or
+  non-integer number) is the engine's fail-closed parse face, and
+  connector-side typing would eat it (the 1.151/1.153 timestamp
+  posture). The pair's 同置或都缺 discipline — a single-sided presence
+  refused — is likewise never re-gated here: both halves forward
+  exactly as the caller shaped them and the co-presence verdict is the
+  engine's plain -32603 through the structured ladder (UPSTREAM_ERROR,
+  retryable).
+- **No connector leg-exclusivity gate on the story face.** `message`
+  becomes optional (the text leg); `attachment` joins as the media
+  story leg. Content legs stay the engine's verdict: message and
+  attachment co-present, a text-leg key on the attachment leg, the
+  bare no-payload frame, the empty-string attachment — all forward and
+  all answer the engine's parse. `attachment` is verbatim transit
+  material (the data URI): no deep parse, no MIME shape, no size cap —
+  the transit-CDN upload gates are the engine's. The existing local
+  `message` gate (trim + non-empty + the 1..65536 byte bound) runs
+  only when the key is present — a text leg is still a text leg; the
+  media leg with no text key never sees it.
+- **Transit-only storyReply on the row face.** The storyReply pair
+  rides the engine frame, never the pending outbox row: zero store
+  move, and a `messages.retryText` rebuild resends without it (the
+  §4.29 rebuild-face boundary, recorded — the row stores the text
+  body, not the reply context). `sendStory`'s result shape is
+  unchanged.
+- **The send lane and the mutating class do not move.** Both methods
+  keep their registry rows, their send-lane serialization, and their
+  mutating-class send-outcome semantics; no new error code, no new
+  event, no new method row.
+- **No new capability bit.** The `stories` tag widens in place (the
+  1.82 precedent chain — the tag's revision chain now reads the 1.156
+  send-leg widening between the 1.154 receive faces and the 1.130
+  audience faces).
+  KT-extension, no upstream counterpart.
+- **Every pre-1.156 frame reads byte-identically.** The absent-optional
+  keys are structurally absent — the two-key widening changes nothing
+  for a caller that never sends them.
+
+Boundary: the engine's group story-send leg (recipients-optional when
+the group is present) is uncommitted WIP in the engine tree — the
+connector keeps its `recipients` non-empty gate untouched and does not
+invent the face (记档边界).
+
+Tests: integration +4 (`tests/story_reply_send.rs`,
+`tests/story_send_attachment.rs`) — the story-reply forward arm pinned
+byte-for-byte across the three states (the pair riding, a single key
+riding, both absent) and the media-leg forward arm across five (the
+media leg with no message key and the verbatim data URI, both legs
+co-present, the empty-string attachment riding gate-free, the bare
+frame, plus the text-leg unchanged shape), each error arm covering the
+engine parse-gate -32603 → UPSTREAM_ERROR retryable face (the fixture
+marker sentinels), the unknown-account ACCOUNT_NOT_FOUND non-retryable
+face on the text path (the honest face — `prepare_send_text` has no
+opaque-envelope gate to fail first) and the INVALID_REQUEST face on
+the story path, and the engine-down RUNTIME_NOT_RUNNING face; lib +2 —
+the sendText story-reply frame arm and the sendStory media-leg frame
+arm (verbatim frames, absence kept absent, the media leg's text gate
+skipped). Tests 826 → 832, all green.
 
 ## 5. signal-cli Boundary
 
