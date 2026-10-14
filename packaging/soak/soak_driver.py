@@ -389,7 +389,7 @@ def parse_args(argv):
     parser.add_argument("--load-steps", default="", help="comma-separated msg/min per account, e.g. 1,5,20")
     parser.add_argument("--load-accounts", type=int, default=2)
     parser.add_argument("--connector", default=str(root / "target/release/kt-signal-connector"))
-    parser.add_argument("--signal-cli", default=str(root / "tests/fixtures/fake-signal-cli.py"))
+    parser.add_argument("--signal-cli", default=str(root / "tests/fixtures/fake-engine.py"))
     parser.add_argument(
         "--store-key",
         default="5a" * 32,

@@ -22,14 +22,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::SignalCliConfig;
+use kt_signal_connector::engine::EngineConfig;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use serde_json::json;
 use tempfile::TempDir;
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// All supervisor-test stores are encrypted with one fixed key, so a seeded
@@ -78,8 +78,8 @@ fn write_stale_cloud_archive(data_dir: &Path) {
     .unwrap();
 }
 
-fn cloud_restore_config(fixture: &Path, data_dir: &Path) -> SignalCliConfig {
-    let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
+fn cloud_restore_config(fixture: &Path, data_dir: &Path) -> EngineConfig {
+    let mut config = EngineConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     config

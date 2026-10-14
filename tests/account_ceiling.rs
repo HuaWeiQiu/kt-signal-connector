@@ -46,7 +46,7 @@ fn bootstrap_payload(secret: &[u8; 32]) -> String {
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// Link `index` accounts through the wire protocol, then assert the ceiling
@@ -68,7 +68,7 @@ async fn ninth_link_start_is_refused_with_the_group_named() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(temp.path().join("signal-data"))

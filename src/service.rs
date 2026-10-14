@@ -407,11 +407,11 @@ impl ServiceError {
             }
             ServiceError::Engine(EngineError::NotRunning) => ApiError::new(
                 "RUNTIME_NOT_RUNNING",
-                "signal-cli runtime is not running",
+                "engine runtime is not running",
                 false,
             ),
             ServiceError::Engine(EngineError::Timeout) => {
-                ApiError::new("UPSTREAM_TIMEOUT", "signal-cli request timed out", true)
+                ApiError::new("UPSTREAM_TIMEOUT", "engine request timed out", true)
             }
             ServiceError::Engine(EngineError::UnknownOutcome) => ApiError::new(
                 "SEND_OUTCOME_UNKNOWN",
@@ -419,13 +419,13 @@ impl ServiceError {
                 false,
             ),
             ServiceError::Engine(EngineError::Exited) => {
-                ApiError::new("UPSTREAM_EXITED", "signal-cli exited", true)
+                ApiError::new("UPSTREAM_EXITED", "engine exited", true)
             }
             ServiceError::Engine(EngineError::Protocol) => {
-                ApiError::new("UPSTREAM_PROTOCOL_ERROR", "signal-cli protocol error", true)
+                ApiError::new("UPSTREAM_PROTOCOL_ERROR", "engine protocol error", true)
             }
             ServiceError::Engine(EngineError::Upstream) => {
-                ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true)
+                ApiError::new("UPSTREAM_ERROR", "engine returned an error", true)
             }
             // Contract 1.36 structured engine errors (§4.32/§4.33): the code
             // is a fixed engine literal from the engine.rs allowlist — mapped
@@ -881,7 +881,7 @@ impl ServiceError {
                         "the group link preview was rejected by the Signal server",
                         false,
                     ),
-                    _ => ApiError::new("UPSTREAM_ERROR", "signal-cli returned an error", true),
+                    _ => ApiError::new("UPSTREAM_ERROR", "engine returned an error", true),
                 }
             }
             ServiceError::Engine(EngineError::Unauthorized) => ApiError::new(
@@ -925,11 +925,11 @@ impl ServiceError {
                 false,
             ),
             ServiceError::Engine(EngineError::Backpressure) => {
-                ApiError::new("INTERNAL_ERROR", "signal-cli request queue is full", true)
+                ApiError::new("INTERNAL_ERROR", "engine request queue is full", true)
             }
             ServiceError::Engine(EngineError::StartFailed) => ApiError::new(
                 "RUNTIME_START_FAILED",
-                "signal-cli runtime could not be started",
+                "engine runtime could not be started",
                 true,
             ),
             // Local filesystem work outside the store (§4.38 step-3 download
@@ -7355,14 +7355,14 @@ impl ConnectorService {
         {
             return Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "attachment is not available in the signal-cli data directory",
+                "attachment is not available in the engine data directory",
                 true,
             )));
         }
         let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
             return Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "attachment is not available in the signal-cli data directory",
+                "attachment is not available in the engine data directory",
                 true,
             )));
         };
@@ -7710,7 +7710,7 @@ impl ConnectorService {
         let Some((path, size_bytes)) = media.locate_attachment(&sanitized_id) else {
             return Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "attachment is not available in the signal-cli data directory",
+                "attachment is not available in the engine data directory",
                 true,
             )));
         };

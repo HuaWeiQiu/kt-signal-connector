@@ -42,7 +42,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 const TEST_STORE_KEY: [u8; 32] = [0x5A; 32];
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 fn spawn_connector(root: &Path, endpoint: &Path) -> Child {
@@ -74,7 +74,7 @@ fn spawn_connector_inner(root: &Path, endpoint: &Path, remove_proxy_env: bool) -
         .arg(endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))

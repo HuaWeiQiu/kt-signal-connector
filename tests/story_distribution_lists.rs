@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::SignalCliConfig;
+use kt_signal_connector::engine::EngineConfig;
 use kt_signal_connector::service::{
     StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams,
 };
@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 fn test_store(dir: &Path) -> Arc<Store> {
@@ -62,7 +62,7 @@ fn story_list_supervisor(
             kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
         )
         .unwrap();
-    let mut config = SignalCliConfig::new(fixture().to_path_buf(), data_dir.to_path_buf());
+    let mut config = EngineConfig::new(fixture().to_path_buf(), data_dir.to_path_buf());
     config.request_timeout = Duration::from_secs(5);
     config.shutdown_grace = Duration::from_millis(100);
     let supervisor = Arc::new(RuntimeSupervisor::new(

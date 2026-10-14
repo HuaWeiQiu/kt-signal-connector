@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kt_signal_connector::engine::{
-    CallClass, EngineEvent, EngineHandle, SignalCliConfig, event_channel, receive_channel,
+    CallClass, EngineConfig, EngineEvent, EngineHandle, event_channel, receive_channel,
 };
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// All watchdog-test stores are encrypted with one fixed key (Phase 3), so a
@@ -35,7 +35,7 @@ fn watchdog_supervisor_with_throttle(
 ) -> (Arc<RuntimeSupervisor>, PathBuf) {
     let store = test_store(temp.path());
     let data_dir = temp.path().join("signal-data");
-    let mut config = SignalCliConfig::new(fixture(), data_dir.clone());
+    let mut config = EngineConfig::new(fixture(), data_dir.clone());
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.watchdog_interval = Duration::from_millis(50);
@@ -68,7 +68,7 @@ async fn wait_for_pid_change(supervisor: &Arc<RuntimeSupervisor>, pid_before: u3
 #[tokio::test]
 async fn engine_stderr_lines_are_broadcast_to_subscribers() {
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
@@ -99,7 +99,7 @@ async fn engine_stderr_lines_are_broadcast_to_subscribers() {
 #[tokio::test]
 async fn shutdown_completes_when_the_receive_queue_is_full_and_storage_is_down() {
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.receive_enqueue_timeout = Duration::from_millis(50);

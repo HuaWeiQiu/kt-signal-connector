@@ -46,13 +46,16 @@ fn bootstrap_payload(secret: &[u8; 32]) -> String {
 }
 
 fn fixture() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 fn base_serve_command(root: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kt-signal-connector"));
     command
         .arg("serve")
+        // §4.148: the old engine flag spelling, pinned end to end — the
+        // hidden compatibility alias must keep launching the real binary
+        // (the primary name is `--engine-bin`; tests/cli.rs locks both).
         .arg("--signal-cli")
         .arg(fixture())
         .arg("--java-home")

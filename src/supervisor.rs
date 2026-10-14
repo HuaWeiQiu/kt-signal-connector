@@ -12,9 +12,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep};
 
 use crate::engine::{
-    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
-    NormalizedReceive, QueuedReceive, ReceiveIngress, SignalCliConfig, event_channel,
-    receive_channel,
+    CallClass, EngineConfig, EngineError, EngineEvent, EngineHandle, EngineState, EngineStatus,
+    NormalizedReceive, QueuedReceive, ReceiveIngress, event_channel, receive_channel,
 };
 use crate::media::{MediaGovernor, MediaHandleTable};
 use crate::protocol::ApiError;
@@ -177,7 +176,7 @@ fn receipt_failure_key(account_id: &str, conversation_id: &str, method: &str) ->
 /// (ADR 0001 R4/R5). The group id is the opaque wire identity; the proxy
 /// endpoint stays inside the launcher-provided config.
 pub struct RuntimeSupervisor {
-    config: SignalCliConfig,
+    config: EngineConfig,
     /// Opaque group id (launcher-defined, ADR 0001 R1). Appears on the wire
     /// and in logs; the group's proxy endpoint never does.
     pub(crate) group_id: String,
@@ -286,7 +285,7 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     pub fn new(
-        config: SignalCliConfig,
+        config: EngineConfig,
         store: Arc<Store>,
         group_id: String,
         media_handles: Option<Arc<MediaHandleTable>>,
@@ -299,7 +298,7 @@ impl RuntimeSupervisor {
     /// table — see `backup_handles`). `new` is the media-only compatibility
     /// form the tests use.
     pub fn with_backup_handles(
-        config: SignalCliConfig,
+        config: EngineConfig,
         store: Arc<Store>,
         group_id: String,
         media_handles: Option<Arc<MediaHandleTable>>,
@@ -1851,11 +1850,11 @@ impl RuntimeSupervisor {
                             EngineStderrClass::NetworkPath => {
                                 tracing::info!(
                                     line = %line,
-                                    "signal-cli engine stderr: network egress declared"
+                                    "engine stderr: network egress declared"
                                 );
                             }
                             EngineStderrClass::Diagnostic => {
-                                tracing::debug!(line = %line, "signal-cli engine stderr");
+                                tracing::debug!(line = %line, "engine stderr");
                             }
                         },
                         None => {
@@ -1890,7 +1889,7 @@ impl RuntimeSupervisor {
                             tracing::warn!(
                                 attempt = episode.restarts,
                                 reason = deferred.reason,
-                                "watchdog restarting signal-cli engine (pending retry)"
+                                "watchdog restarting the engine (pending retry)"
                             );
                             if self.restart_engine().await.is_ok() {
                                 crate::metrics::record_watchdog_restart();
@@ -2047,7 +2046,7 @@ impl RuntimeSupervisor {
         } else {
             format!("pending-retry {}", episode.restarts)
         };
-        tracing::warn!(%label, reason, "watchdog restarting signal-cli engine");
+        tracing::warn!(%label, reason, "watchdog restarting the engine");
         match self.restart_engine().await {
             Ok(()) => {
                 crate::metrics::record_watchdog_restart();
@@ -3103,7 +3102,7 @@ impl RuntimeSupervisor {
             ))),
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -3136,7 +3135,7 @@ impl RuntimeSupervisor {
             ))),
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4514,7 +4513,7 @@ impl RuntimeSupervisor {
             // deterministic refusal — retryable=false, the 1.115 discipline.
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4560,7 +4559,7 @@ impl RuntimeSupervisor {
             // groups discipline).
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4626,7 +4625,7 @@ impl RuntimeSupervisor {
             // through the allowlist channels.
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4660,7 +4659,7 @@ impl RuntimeSupervisor {
             // same way.
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4694,7 +4693,7 @@ impl RuntimeSupervisor {
             // through the allowlist channels.
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4735,7 +4734,7 @@ impl RuntimeSupervisor {
             // deterministic refusal — retryable=false.
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -4768,7 +4767,7 @@ impl RuntimeSupervisor {
             ))),
             Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
-                "signal-cli returned an error",
+                "engine returned an error",
                 false,
             ))),
             Err(error) => Err(error.into()),
@@ -8593,7 +8592,7 @@ mod tests {
         receipt_failure_key, upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
-    use crate::engine::{NormalizedReceive, SignalCliConfig};
+    use crate::engine::{EngineConfig, NormalizedReceive};
     use crate::service::HostSideEvent;
     use crate::store::{MessageRecord, Store, StoreKey};
     use crate::supervisor::EngineError;
@@ -9159,17 +9158,17 @@ mod tests {
     #[test]
     fn mrr_factor_stamp_carries_exactly_the_exposed_flags() {
         use super::{contact_item_peer_key, mrr_factors_stamp};
-        let signal_cli = json!({
+        let contact_item = json!({
             "number": "+15555550101",
             "isBlocked": false,
             "isHidden": true,
             "profileSharing": false
         });
         assert_eq!(
-            mrr_factors_stamp(&signal_cli),
+            mrr_factors_stamp(&contact_item),
             r#"{"blocked":false,"hidden":true,"profileSharing":false}"#
         );
-        assert_eq!(contact_item_peer_key(&signal_cli), Some("+15555550101"));
+        assert_eq!(contact_item_peer_key(&contact_item), Some("+15555550101"));
 
         let kt_engine = json!({ "number": "+15555550102", "name": "Peer" });
         assert_eq!(mrr_factors_stamp(&kt_engine), "{}");
@@ -9253,8 +9252,8 @@ mod tests {
                 .unwrap()
         };
         let supervisor = Arc::new(RuntimeSupervisor::new(
-            SignalCliConfig::new(
-                temp.path().join("unused-signal-cli"),
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
                 temp.path().join("unused-signal-data"),
             ),
             Arc::new(store),
@@ -9302,8 +9301,8 @@ mod tests {
             )
             .unwrap();
         let supervisor = RuntimeSupervisor::new(
-            SignalCliConfig::new(
-                temp.path().join("unused-signal-cli"),
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
                 temp.path().join("unused-signal-data"),
             ),
             Arc::new(store),
@@ -9748,7 +9747,7 @@ mod tests {
         );
     }
 
-    /// The engine runs the real fake-signal-cli fixture (the same one the
+    /// The engine runs the real fake-engine fixture (the same one the
     /// engine-integration suite drives): its `remoteDelete` handler exits with
     /// the mutating call in flight, so the upstream result is lost mid-call.
     /// The supervisor must surface that as the explicit `unknown` response —
@@ -9758,8 +9757,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -9839,7 +9838,7 @@ mod tests {
         supervisor.shutdown().await.unwrap();
     }
 
-    /// The engine runs the real fake-signal-cli fixture: its `sendReaction`
+    /// The engine runs the real fake-engine fixture: its `sendReaction`
     /// handler exits with the mutating call in flight (targetTimestamp 423),
     /// so the upstream result is lost mid-call. The supervisor must surface
     /// that as the explicit `unknown` response — not a retryable error — and
@@ -9850,8 +9849,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -9942,8 +9941,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10040,8 +10039,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10146,8 +10145,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10238,8 +10237,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10360,8 +10359,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10425,8 +10424,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10564,8 +10563,8 @@ mod tests {
             .unwrap();
 
         let supervisor = Arc::new(RuntimeSupervisor::new(
-            SignalCliConfig::new(
-                temp.path().join("unused-signal-cli"),
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
                 temp.path().join("unused-signal-data"),
             ),
             Arc::new(store),
@@ -10614,8 +10613,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10696,8 +10695,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10792,8 +10791,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -10893,8 +10892,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11006,8 +11005,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11200,8 +11199,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11268,8 +11267,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11452,8 +11451,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11547,8 +11546,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11604,8 +11603,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11750,8 +11749,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let mut config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let mut config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         config.request_timeout = Duration::from_secs(3);
@@ -11909,8 +11908,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store =
             Arc::new(Store::open(temp.path(), Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap());
-        let config = SignalCliConfig::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+        let config = EngineConfig::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
             temp.path().join("signal-data"),
         );
         let supervisor =

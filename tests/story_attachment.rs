@@ -19,7 +19,7 @@ use aes::Aes256;
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
-use kt_signal_connector::engine::SignalCliConfig;
+use kt_signal_connector::engine::EngineConfig;
 use kt_signal_connector::media::MediaHandleTable;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
@@ -138,8 +138,8 @@ fn story_event_attachment(size: u64, locator: Value) -> Value {
 }
 
 fn supervisor(temp: &TempDir, cdn_base: Option<String>) -> Arc<RuntimeSupervisor> {
-    let mut config = SignalCliConfig::new(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py"),
+    let mut config = EngineConfig::new(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py"),
         temp.path().join("signal-data"),
     );
     config.request_timeout = Duration::from_secs(1);

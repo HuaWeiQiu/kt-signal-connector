@@ -178,8 +178,8 @@ fn serve_requires_exactly_one_bootstrap_secret_source() {
     let required_args = [
         "--endpoint",
         "unused-endpoint",
-        "--signal-cli",
-        "unused-signal-cli",
+        "--engine-bin",
+        "unused-engine",
         "--signal-data-dir",
         "unused-signal-data",
         "--state-dir",
@@ -228,8 +228,8 @@ fn serve_rejects_an_invalid_socks_proxy_before_starting() {
         "--endpoint",
         "unused-endpoint",
         "--bootstrap-secret-stdin",
-        "--signal-cli",
-        "unused-signal-cli",
+        "--engine-bin",
+        "unused-engine",
         "--signal-data-dir",
         "unused-signal-data",
         "--state-dir",
@@ -271,8 +271,8 @@ fn proxy_group_specs_fail_closed_before_bootstrap_is_read() {
         "unused-endpoint",
         "--bootstrap-secret-file",
         "/nonexistent/bootstrap.secret",
-        "--signal-cli",
-        "unused-signal-cli",
+        "--engine-bin",
+        "unused-engine",
         "--signal-data-dir",
         "unused-signal-data",
         "--state-dir",
@@ -339,8 +339,8 @@ fn serve_takes_listen_as_the_strict_alternative_to_endpoint() {
     let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
     let tail = [
         "--bootstrap-secret-stdin",
-        "--signal-cli",
-        "unused-signal-cli",
+        "--engine-bin",
+        "unused-engine",
         "--signal-data-dir",
         "unused-signal-data",
         "--state-dir",
@@ -377,8 +377,8 @@ fn serve_rejects_non_loopback_listen_addresses_at_parse_time() {
     let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
     let tail = [
         "--bootstrap-secret-stdin",
-        "--signal-cli",
-        "unused-signal-cli",
+        "--engine-bin",
+        "unused-engine",
         "--signal-data-dir",
         "unused-signal-data",
         "--state-dir",
@@ -422,8 +422,8 @@ fn serve_accepts_the_listen_face_past_argv_and_fails_without_an_announce() {
         .args(["--listen", "127.0.0.1:0"])
         .args([
             "--bootstrap-secret-stdin",
-            "--signal-cli",
-            "unused-signal-cli",
+            "--engine-bin",
+            "unused-engine",
             "--signal-data-dir",
         ])
         .arg(temp.path().join("signal-data"))
@@ -443,4 +443,54 @@ fn serve_accepts_the_listen_face_past_argv_and_fails_without_an_announce() {
         stderr.contains("bootstrap secret"),
         "the failure should be the payload classification: {stderr}"
     );
+}
+
+/// §4.148 naming batch: `--engine-bin` is the primary engine flag and
+/// `--signal-cli` stays accepted as a hidden compatibility alias — both
+/// spellings bind the same argument and parse past the argv gate (the
+/// classified empty-stdin payload failure, never a usage exit 2), and the
+/// alias never appears in help.
+#[test]
+fn serve_engine_bin_and_the_signal_cli_alias_are_the_same_argument() {
+    let binary = env!("CARGO_BIN_EXE_kt-signal-connector");
+    let temp = TempDir::new().unwrap();
+    let run = |flag: &str| {
+        Command::new(binary)
+            .arg("serve")
+            .args(["--listen", "127.0.0.1:0"])
+            .args([
+                "--bootstrap-secret-stdin",
+                flag,
+                "unused-engine",
+                "--signal-data-dir",
+            ])
+            .arg(temp.path().join("signal-data"))
+            .args(["--state-dir"])
+            .arg(temp.path().join("state"))
+            .stdin(Stdio::null())
+            .output()
+            .expect("connector binary should run the engine flag")
+    };
+
+    let help = Command::new(binary)
+        .args(["serve", "--help"])
+        .output()
+        .expect("connector binary should print serve help");
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).expect("help should be UTF-8");
+    assert!(stdout.contains("--engine-bin"), "help: {stdout}");
+    assert!(
+        !stdout.contains("--signal-cli"),
+        "the compatibility alias must stay hidden from help: {stdout}"
+    );
+
+    for flag in ["--engine-bin", "--signal-cli"] {
+        let output = run(flag);
+        assert_eq!(output.status.code(), Some(1), "flag {flag}");
+        let stderr = String::from_utf8(output.stderr).expect("error output should be UTF-8");
+        assert!(
+            stderr.contains("bootstrap secret"),
+            "flag {flag} must parse past argv and fail on the payload: {stderr}"
+        );
+    }
 }

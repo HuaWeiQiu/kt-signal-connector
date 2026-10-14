@@ -44,7 +44,7 @@ fn bootstrap_payload(secret: &[u8; 32]) -> String {
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 fn write_secret_file(path: &Path, secret: &[u8; 32]) {
@@ -68,7 +68,7 @@ fn spawn_group_connector(
         .arg(endpoint)
         .arg("--bootstrap-secret-file")
         .arg(secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))

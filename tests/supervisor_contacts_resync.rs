@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kt_signal_connector::engine::SignalCliConfig;
+use kt_signal_connector::engine::EngineConfig;
 use kt_signal_connector::store::{Store, StoreKey};
 use kt_signal_connector::supervisor::RuntimeSupervisor;
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// All supervisor-test stores are encrypted with one fixed key, so a seeded
@@ -43,7 +43,7 @@ async fn engine_start_resyncs_conversation_skeletons_for_linked_accounts() {
         .unwrap()
     };
     let store = test_store(temp.path());
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     let supervisor = Arc::new(RuntimeSupervisor::new(
@@ -114,7 +114,7 @@ async fn engine_mode_resync_materializes_the_self_skeleton_too() {
         .unwrap()
     };
     let store = test_store(temp.path());
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     let supervisor = Arc::new(RuntimeSupervisor::new(

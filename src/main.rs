@@ -68,8 +68,12 @@ enum CliCommand {
         parent_pid: Option<u32>,
         /// Path to the kt engine executable — the connector's signal sidecar
         /// speaking the pinned JSON-RPC face (ADR 0003: the only engine).
-        #[arg(long)]
-        signal_cli: PathBuf,
+        /// A legacy spelling of this flag stays accepted as a hidden
+        /// compatibility alias for launchers written before the naming batch
+        /// (§4.148); both spellings are the same argument and the alias never
+        /// appears in help.
+        #[arg(long, alias = "signal-cli")]
+        engine_bin: PathBuf,
         #[arg(long)]
         java_home: Option<PathBuf>,
         /// SOCKS proxy for the engine child as host:port (env:
@@ -229,7 +233,7 @@ struct ServeOptions {
     bootstrap_secret_file: Option<PathBuf>,
     bootstrap_secret_stdin: bool,
     parent_pid: Option<u32>,
-    signal_cli: PathBuf,
+    engine_bin: PathBuf,
     java_home: Option<PathBuf>,
     socks_proxy: Option<SocksProxy>,
     proxy_group: Vec<String>,
@@ -265,7 +269,7 @@ async fn main() {
             bootstrap_secret_file,
             bootstrap_secret_stdin,
             parent_pid,
-            signal_cli,
+            engine_bin,
             java_home,
             socks_proxy,
             proxy_group,
@@ -279,7 +283,7 @@ async fn main() {
             bootstrap_secret_file,
             bootstrap_secret_stdin,
             parent_pid,
-            signal_cli,
+            engine_bin,
             java_home,
             socks_proxy,
             proxy_group,
@@ -329,7 +333,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
         bootstrap_secret_file,
         bootstrap_secret_stdin,
         parent_pid,
-        signal_cli,
+        engine_bin,
         java_home,
         socks_proxy,
         proxy_group,
@@ -425,7 +429,7 @@ async fn serve_command(options: ServeOptions) -> Result<(), Box<dyn std::error::
     };
     let runtime = open_group_runtime(
         plan,
-        signal_cli,
+        engine_bin,
         &state_dir,
         java_home,
         store_key,

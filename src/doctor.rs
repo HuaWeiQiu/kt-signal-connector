@@ -394,7 +394,7 @@ async fn engine_face(status: &EngineStatus, engine: Option<&EngineHandle>) -> En
                         engine,
                         "engine.protocolCapabilities",
                         "the engine answered an error for the self-certification method \
-                         (a stock signal-cli engine does not carry the kt-engine face)",
+                         (an engine without the kt-engine self-certification face)",
                     )
                     .await,
                 ),
@@ -477,8 +477,8 @@ async fn probe_engine_perf_metrics(engine: &EngineHandle) -> EngineMethodFace {
         ) => EngineMethodFace::failed("the engine stopped answering mid-probe"),
         Err(_) => EngineMethodFace::failed(
             "the engine answered an error for the perf-metrics method \
-             (a stock signal-cli engine, or an engine predating the \
-             engine.perfMetrics face, surfaces the upstream class)",
+             (an engine predating the engine.perfMetrics face surfaces the \
+             upstream class)",
         ),
     }
 }

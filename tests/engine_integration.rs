@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use kt_signal_connector::engine::{
-    CallClass, EngineError, EngineEvent, EngineHandle, EngineState, STDIN_WRITE_QUEUE_CAPACITY,
-    SignalCliConfig, event_channel, receive_channel,
+    CallClass, EngineConfig, EngineError, EngineEvent, EngineHandle, EngineState,
+    STDIN_WRITE_QUEUE_CAPACITY, event_channel, receive_channel,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 async fn engine(
@@ -26,7 +26,7 @@ async fn engine(
     tokio::sync::mpsc::Receiver<kt_signal_connector::engine::QueuedReceive>,
 ) {
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = request_timeout;
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
@@ -190,7 +190,7 @@ async fn crash_exits_and_a_new_engine_can_start() {
     assert_eq!(result, Err(EngineError::Exited));
     assert_eq!(engine.status().state, EngineState::Exited);
 
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.shutdown_grace = Duration::from_millis(100);
     let (events, _) = event_channel();
     let (receive_ingress, _receives) = receive_channel();
@@ -318,7 +318,7 @@ async fn send_reaction_slow_answer_and_crash_are_unknown_outcomes() {
 #[tokio::test]
 async fn oversized_output_faults_runtime() {
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.line_limit = 64;
     config.request_timeout = Duration::from_secs(3);
     config.shutdown_grace = Duration::from_millis(100);
@@ -447,7 +447,7 @@ async fn kt_engine_sidecar_round_trips_over_the_engine_actor() {
         return;
     }
     let temp = TempDir::new().unwrap();
-    let mut config = SignalCliConfig::new(PathBuf::from(bin), temp.path().join("signal-data"));
+    let mut config = EngineConfig::new(PathBuf::from(bin), temp.path().join("signal-data"));
     config.shutdown_grace = Duration::from_secs(2);
     let (events, _) = event_channel();
     let (receive_ingress, _receives) = receive_channel();

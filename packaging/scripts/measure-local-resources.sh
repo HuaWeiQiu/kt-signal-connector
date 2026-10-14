@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 REPORT_DIR="${1:-"$ROOT/packaging/out/resource-reports"}"
 BIN="$ROOT/target/release/kt-signal-connector"
-FIXTURE="$ROOT/tests/fixtures/fake-signal-cli.py"
+FIXTURE="$ROOT/tests/fixtures/fake-engine.py"
 mkdir -p "$REPORT_DIR"
 
 cargo build --release --manifest-path "$ROOT/Cargo.toml"

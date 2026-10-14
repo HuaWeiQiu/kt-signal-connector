@@ -26,7 +26,7 @@ run_probe() {
   local args=(serve
     --endpoint "$endpoint"
     --bootstrap-secret-file "$secret_file"
-    --signal-cli tests/fixtures/fake-signal-cli.py
+    --engine-bin tests/fixtures/fake-engine.py
     --java-home "$ROOT/jre"
     --signal-data-dir "$ROOT/signal-data-$2"
     --state-dir "$ROOT/state-$2")

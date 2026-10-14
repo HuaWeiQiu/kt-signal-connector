@@ -34,7 +34,7 @@ use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 
 use crate::DEFAULT_PROXY_GROUP_ID;
-use crate::engine::{EngineError, EngineEvent, EngineState, EngineStatus, SignalCliConfig};
+use crate::engine::{EngineConfig, EngineError, EngineEvent, EngineState, EngineStatus};
 use crate::groups::{MAX_PROXY_GROUPS, ProxyGroupPlan};
 use crate::protocol::ApiError;
 use crate::service::{
@@ -1966,7 +1966,7 @@ fn effective_media_ingest(media_ingest: bool) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub fn open_group_runtime(
     plan: ProxyGroupPlan,
-    signal_cli: PathBuf,
+    engine_bin: PathBuf,
     state_dir: &Path,
     java_home: Option<PathBuf>,
     store_key: Option<StoreKey>,
@@ -1988,7 +1988,7 @@ pub fn open_group_runtime(
     let backup_handles = Arc::new(crate::backup_export::BackupFileHandleTable::new());
     let mut slots = Vec::with_capacity(plan.groups.len());
     for entry in &plan.groups {
-        let mut config = SignalCliConfig::new(signal_cli.clone(), entry.data_dir.clone());
+        let mut config = EngineConfig::new(engine_bin.clone(), entry.data_dir.clone());
         config.media_ingest = media_ingest;
         config.expire_sweep_interval = expire_sweep_interval;
         let supervisor = Arc::new(RuntimeSupervisor::with_backup_handles(
@@ -2036,8 +2036,8 @@ mod tests {
             ProxyGroupSlot::new(
                 id.to_string(),
                 Arc::new(RuntimeSupervisor::new(
-                    SignalCliConfig::new(
-                        PathBuf::from("unused-signal-cli"),
+                    EngineConfig::new(
+                        PathBuf::from("unused-engine"),
                         PathBuf::from("/tmp/unused-signal-data"),
                     ),
                     store.clone(),

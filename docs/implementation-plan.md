@@ -5,6 +5,13 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- No-revision record: 2026-10-14; the engine-wording residue batch (§4.148)
+  lands as connector-internal naming and copy only — the argv engine flag
+  becomes `--engine-bin` with `--signal-cli` kept as a hidden compatibility
+  alias, the in-process identifiers and the fake-engine fixture lose their
+  signal-cli spellings, and the user/developer-facing error and log copy
+  moves to engine wording — zero wire change, the contract revision stays
+  1.149 (the §4.148 entry below)
 - No-revision record: 2026-10-13; the §4.123/§4.124 automatic send-retry queue
   (the official 190 ms → 15 min backoff drain over definitively-failed
   outbound texts, plus the maintained manual-only line for restart-pending
@@ -11765,6 +11772,74 @@ plural pair); integration +1: the fixture send log pins the engine-received
 while the plain entries stay verbatim, the sent `MessageRecord` and the
 stored row both project `isGif`, and the top-level-beside-array rejection
 leaves no upstream line and no row.
+
+### 4.148 The residue wording follows the runtime: `--engine-bin`, engine-worded copy, and the boundaries the sweep deliberately does not cross (no-revision record, 2026-10-14)
+
+The runtime decision is settled (ADR 0003: the self-hosted kt engine is the
+only Signal runtime; the pinned upstream `signal-cli` is historical
+compatibility and forensics context, with its runtime modes removed by
+decision), but the connector still spoke the old engine's name in three
+places a reader meets without opening a history file: the launcher argv,
+the error/log copy, and the agent-facing rules. This batch rewords those
+and nothing else. Zero behavior change: no request bytes move, no success
+answer moves, no code, retryability, schema shape, store row, or metric
+changes; the only sanctioned byte deltas are the argv alias acceptance and
+the error `message` text listed below (codes, retryability, and `data`
+stay byte-stable, and every pinned test was updated with the strings).
+
+- **argv (additive, both spellings forever-equivalent).** The serve flag
+  becomes `--engine-bin` (primary, the help-visible name); `--signal-cli`
+  remains a hidden compatibility alias bound to the same argument, so
+  every launcher written before this batch parses unchanged. A new
+  integration test locks the pair: `serve --help` shows `--engine-bin` and
+  never `--signal-cli`, and both spellings parse past the argv gate to the
+  same classified payload failure. The end-to-end harness in
+  `tests/tcp_listen.rs` keeps launching the real binary through the old
+  spelling on purpose — the alias must keep working, not merely parse.
+  `--java-home` stays accepted-but-ignored (ADR 0003 defers the
+  desktop-side cleanup); every `KT_SIGNAL_*` env key keeps its name.
+- **In-process identifiers.** `SignalCliConfig` → `EngineConfig`,
+  `signal_cli_args` → `engine_args`, the test dummy paths
+  (`unused-signal-cli`, `/bin/signal-cli`) → neutral engine paths, and the
+  fake engine fixture `tests/fixtures/fake-signal-cli.py` →
+  `tests/fixtures/fake-engine.py` (the three packaging/regression scripts
+  that name the fixture follow it; the soak driver keeps its own
+  `--signal-cli` tool flag, which the connector alias accepts).
+- **Copy sweep (51 string sites, 37 distinct strings).** The `EngineError`
+  and host Display faces (15: the engine error enum plus the host
+  runtime-stop face), the host-mapped `ApiError` messages (24 sites: the
+  `RUNTIME_*`/`UPSTREAM_*`/`INTERNAL_ERROR` texts and the media
+  `attachment is not available in the engine data directory` family), the
+  supervisor and engine log lines (10: engine start/stop, call
+  completed/failed, stderr relay, watchdog restarts, the shutdown kill),
+  and the two doctor probe reasons (the self-certification and
+  perf-metrics degradation reasons lose their stock-signal-cli clause and
+  name the missing engine face instead). `docs/doctor-contract.md` mirrors
+  the two probe reasons verbatim, so its three stale clauses moved with
+  them. Code comments are deliberately not copy: the pinned-version
+  behavior notes, the stderr-shape heuristics and their fixture anchor
+  lines (`INFO App - Starting signal-cli daemon`), and the
+  legacy-manifest wording stay as forensic context (ADR 0003 §5 keeps the
+  read-only reference checkout the authority for that history).
+- **Deliberately not moved (the boundary, recorded so the next sweep does
+  not cross it).** Wire and persisted schema keys: the manifest's
+  `signalCli`/`jre` component keys (the rollback-tolerance face, schema
+  required) and every `schemas/connector-api-v1.schema.json` key and
+  description (the schema is a served artifact; its signal-cli mentions
+  are compat/forensics prose). Env keys (`KT_SIGNAL_*`). The desktop-side
+  wire fields (`signalCliPid`/`signalCliEngine`) do not exist in this
+  repository and are the cross-repo batch's to carry. Historical ledgers
+  keep their old words by design: the implementation-plan sections below
+  this one, the ADRs, the phase/validation/handover/plan documents, and
+  `docs/signal-cli-upgrade.md` are records, not copy. `AGENTS.md` and
+  `README.md` are the two operational documents that did move — the
+  agent rules now state the runtime facts, the naming discipline, and the
+  do-not-rename surfaces up front.
+
+Tests: integration +1 (the `--engine-bin`/`--signal-cli` equivalence and
+help-visibility lock in `tests/cli.rs`); the harness spawns move to the
+primary spelling except the tcp_listen alias pin; fixture-path references
+follow the rename mechanically. Tests 813 → 814, all green.
 
 ## 5. signal-cli Boundary
 

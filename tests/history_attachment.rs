@@ -16,7 +16,7 @@ use aes::Aes256;
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
-use kt_signal_connector::engine::SignalCliConfig;
+use kt_signal_connector::engine::EngineConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::media::MediaHandleTable;
 use kt_signal_connector::store::{Store, StoreKey};
@@ -36,7 +36,7 @@ const KEY: [u8; 64] = [0x21; 64];
 type HmacSha256 = Hmac<Sha256>;
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 fn test_store(dir: &std::path::Path) -> Arc<Store> {
@@ -165,8 +165,8 @@ fn kt_engine_config(
     fixture: &std::path::Path,
     data_dir: &std::path::Path,
     cdn_base: Option<String>,
-) -> SignalCliConfig {
-    let mut config = SignalCliConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
+) -> EngineConfig {
+    let mut config = EngineConfig::new(fixture.to_path_buf(), data_dir.to_path_buf());
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config.media_ingest = true;

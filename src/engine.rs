@@ -71,7 +71,7 @@ const STDERR_QUEUE_CAPACITY: usize = 64;
 const STDERR_LINE_LIMIT: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
-pub struct SignalCliConfig {
+pub struct EngineConfig {
     pub executable: PathBuf,
     pub data_dir: PathBuf,
     /// Media ingest opt-in (ADR 0004). Launcher input only — never IPC
@@ -102,7 +102,7 @@ pub struct SignalCliConfig {
     pub history_cdn_base: Option<String>,
 }
 
-impl SignalCliConfig {
+impl EngineConfig {
     pub fn new(executable: PathBuf, data_dir: PathBuf) -> Self {
         Self {
             executable,
@@ -176,7 +176,7 @@ impl std::str::FromStr for SocksProxy {
 /// `--ignore-attachments` is present: with it the rest of the argv —
 /// including `--ignore-stories` and `--ignore-stickers` — is unchanged, and
 /// without it the argv is byte-identical to the pre-media-POC launcher.
-fn signal_cli_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsString> {
+fn engine_args(data_dir: &Path, media_ingest: bool) -> Vec<std::ffi::OsString> {
     // Explicit: pull server messages as soon as the daemon is up.
     let mut args: Vec<std::ffi::OsString> = vec![
         "--data-dir".into(),
@@ -226,23 +226,23 @@ pub enum CallClass {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum EngineError {
-    #[error("signal-cli process could not be started")]
+    #[error("engine process could not be started")]
     StartFailed,
-    #[error("signal-cli is not running")]
+    #[error("engine is not running")]
     NotRunning,
-    #[error("signal-cli request queue is full")]
+    #[error("engine request queue is full")]
     Backpressure,
-    #[error("signal-cli request timed out")]
+    #[error("engine request timed out")]
     Timeout,
-    #[error("signal-cli mutating request has an unknown outcome")]
+    #[error("engine mutating request has an unknown outcome")]
     UnknownOutcome,
-    #[error("signal-cli exited before completing the request")]
+    #[error("engine exited before completing the request")]
     Exited,
-    #[error("signal-cli produced invalid protocol output")]
+    #[error("engine produced invalid protocol output")]
     Protocol,
-    #[error("signal-cli returned an error")]
+    #[error("engine returned an error")]
     Upstream,
-    #[error("signal-cli rejected the device credentials")]
+    #[error("engine rejected the device credentials")]
     Unauthorized,
     /// Contract 1.99 §4.80: the engine's send-chain transport families. The
     /// engine folds a transport-layer send failure into the plain
@@ -253,11 +253,11 @@ pub enum EngineError {
     /// content-free — the anchor literal is a fixed engine string, never
     /// user data — and the classification carries no event: a transport
     /// failure never touches account state.
-    #[error("signal-cli send was rate-limited upstream")]
+    #[error("engine send was rate-limited upstream")]
     RateLimited,
-    #[error("signal-cli send requires an upstream proof challenge")]
+    #[error("engine send requires an upstream proof challenge")]
     ProofRequired,
-    #[error("signal-cli server is unavailable")]
+    #[error("engine server is unavailable")]
     ServerUnavailable,
     /// Contract 1.114 §4.95: the identity-trust gate family. The engine (P9)
     /// refuses a send when the recipient's identity key changed without
@@ -269,7 +269,7 @@ pub enum EngineError {
     /// instead of generic upstream noise. The variant stays content-free and
     /// the classification carries no event: a per-recipient trust refusal
     /// never touches account state.
-    #[error("signal-cli send was rejected: recipient identity is unverified")]
+    #[error("engine send was rejected: recipient identity is unverified")]
     IdentityUnverified,
     /// The engine answered a JSON-RPC error object with an upstream error
     /// code (contract 1.36 sticker/pin faces): the code string is carried
@@ -280,7 +280,7 @@ pub enum EngineError {
     /// verbatim (`profileKeyUpdate`-era partial-success facts such as
     /// PROFILE_UPLOAD_FAILED's `{retryable, textSaved}`); a missing data
     /// object serializes as None and older hosts see the 1.49 shape.
-    #[error("signal-cli returned a structured error")]
+    #[error("engine returned a structured error")]
     UpstreamCode {
         code: &'static str,
         #[allow(dead_code)]
@@ -1908,7 +1908,7 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     pub async fn start(
-        config: SignalCliConfig,
+        config: EngineConfig,
         events: broadcast::Sender<EngineEvent>,
         receive_ingress: ReceiveIngress,
     ) -> Result<Self, EngineError> {
@@ -1931,7 +1931,7 @@ impl EngineHandle {
         let (stdout_reader, stdout_writer) =
             std::io::pipe().map_err(|_| EngineError::StartFailed)?;
         command
-            .args(signal_cli_args(&config.data_dir, config.media_ingest))
+            .args(engine_args(&config.data_dir, config.media_ingest))
             .stdin(Stdio::piped())
             .stdout(stdout_writer)
             .stderr(Stdio::piped())
@@ -2065,7 +2065,7 @@ impl EngineHandle {
             }
         });
 
-        tracing::info!(pid, "signal-cli engine started");
+        tracing::info!(pid, "engine process started");
         Ok(Self {
             commands: command_tx,
             status: status_rx,
@@ -2160,14 +2160,14 @@ impl EngineHandle {
                 call_class = call_class_label(class),
                 duration_ms = started.elapsed().as_millis() as u64,
                 result = "ok",
-                "signal-cli call completed"
+                "engine call completed"
             ),
             Err(error) => tracing::warn!(
                 upstream_method = method,
                 call_class = call_class_label(class),
                 duration_ms = started.elapsed().as_millis() as u64,
                 error_class = error.class(),
-                "signal-cli call failed"
+                "engine call failed"
             ),
         }
         outcome
@@ -2198,7 +2198,7 @@ impl EngineHandle {
             Err(_) => {
                 tracing::warn!(
                     timeout_ms = self.shutdown_timeout.as_millis() as u64,
-                    "engine shutdown unanswered; killing signal-cli process"
+                    "engine shutdown unanswered; killing the engine process"
                 );
                 // The actor only holds this lock briefly inside `stop_child`,
                 // so a parked actor cannot block the kill.
@@ -2389,13 +2389,13 @@ async fn run_actor(
         tracing::info!(
             state = terminal_class,
             pid = process_pid,
-            "signal-cli engine stopped"
+            "engine process stopped"
         );
     } else {
         tracing::warn!(
             state = terminal_class,
             pid = process_pid,
-            "signal-cli engine terminated without a shutdown request"
+            "engine terminated without a shutdown request"
         );
     }
     // Aborting the writer drops any half-written frame and closes the child's
@@ -6088,12 +6088,12 @@ mod tests {
 
     #[test]
     fn config_defaults_to_opt_out_media_ingest() {
-        let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
+        let config = EngineConfig::new(PathBuf::from("/bin/kt-engine"), PathBuf::from("/data"));
         assert!(!config.media_ingest);
     }
 
     #[test]
-    fn signal_cli_args_match_the_launcher_shape() {
+    fn engine_args_match_the_launcher_shape() {
         let expected: Vec<std::ffi::OsString> = [
             "--data-dir",
             "/data",
@@ -6107,7 +6107,7 @@ mod tests {
         .into_iter()
         .map(Into::into)
         .collect();
-        assert_eq!(signal_cli_args(Path::new("/data"), false), expected);
+        assert_eq!(engine_args(Path::new("/data"), false), expected);
     }
 
     /// Media opt-in (ADR 0004 gate 5): enabling `--media-ingest` changes the
@@ -6115,8 +6115,8 @@ mod tests {
     /// stories and stickers stay ignored and every other byte is unchanged.
     #[test]
     fn media_ingest_only_drops_ignore_attachments_from_the_argv() {
-        let baseline = signal_cli_args(Path::new("/data"), false);
-        let media = signal_cli_args(Path::new("/data"), true);
+        let baseline = engine_args(Path::new("/data"), false);
+        let media = engine_args(Path::new("/data"), true);
         let dropped: Vec<_> = baseline
             .iter()
             .filter(|arg| !media.contains(arg))
@@ -6138,7 +6138,7 @@ mod tests {
         assert!(media.contains(&std::ffi::OsString::from("--ignore-stories")));
         assert!(media.contains(&std::ffi::OsString::from("--ignore-stickers")));
         // The config default stays opt-out.
-        let config = SignalCliConfig::new(PathBuf::from("/bin/signal-cli"), PathBuf::from("/data"));
+        let config = EngineConfig::new(PathBuf::from("/bin/kt-engine"), PathBuf::from("/data"));
         assert!(!config.media_ingest);
     }
 

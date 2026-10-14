@@ -101,11 +101,11 @@ exclusive by construction:
     exited / backpressure during the probe),
   - `the engine answered an error for the version method …`,
   - `the engine answered an error for the self-certification method …`
-    (a stock signal-cli engine does not carry the kt-engine face; the full
+    (an engine without the kt-engine self-certification face; the full
     string carries the error class),
   - `the engine answered an error for the perf-metrics method …`
-    (a stock signal-cli engine, or an engine predating the
-    `engine.perfMetrics` face; the full string carries the error class).
+    (an engine predating the `engine.perfMetrics` face; the full string
+    carries the error class).
 
 Absent engine answers are the designed degradation — a diagnostic never fails
 as a whole because one engine face could not answer.
@@ -134,8 +134,8 @@ and counts:
 
 The probe rides the same reachability gate, the same 3-second read-only
 diagnostic budget, and the same degradation family as the other method
-faces: an engine predating `engine.perfMetrics` (or a stock signal-cli
-engine) answers `present: false` with the upstream-error-class reason; a
+faces: an engine predating `engine.perfMetrics` answers `present: false`
+with the upstream-error-class reason; a
 wedged engine answers `the engine stopped answering mid-probe`. Read-only
 end to end: the engine's metric registry is process-internal state, the
 probe sends `{}` and writes nothing.

@@ -11,7 +11,7 @@
 # two sampled orphans still had Parent Process: launchd [1]. P0 (40e2248)
 # turned in-harness hangs into evidenced failures; this wrapper is P1 and
 # removes the orphan class itself: everything the gate spawns (test binaries,
-# the kt-signal-connector binary, the fake-signal-cli.py fixture) inherits the
+# the kt-signal-connector binary, the fake-engine.py fixture) inherits the
 # wrapper's fresh process group and dies with it.
 #
 # Usage:

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kt_signal_connector::DEFAULT_PROXY_GROUP_ID;
-use kt_signal_connector::engine::SignalCliConfig;
+use kt_signal_connector::engine::EngineConfig;
 use kt_signal_connector::ids::stable_hash_id;
 use kt_signal_connector::link::now_ms;
 use kt_signal_connector::service::SendTarget;
@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// All supervisor-test stores are encrypted with one fixed key, so a seeded
@@ -31,8 +31,8 @@ fn test_store(dir: &Path) -> Arc<Store> {
     Arc::new(Store::open(dir, Some(StoreKey::from_bytes([0x5A; 32]))).unwrap())
 }
 
-fn config_for(temp: &TempDir) -> SignalCliConfig {
-    let mut config = SignalCliConfig::new(fixture(), temp.path().join("signal-data"));
+fn config_for(temp: &TempDir) -> EngineConfig {
+    let mut config = EngineConfig::new(fixture(), temp.path().join("signal-data"));
     config.request_timeout = Duration::from_secs(1);
     config.shutdown_grace = Duration::from_millis(100);
     config

@@ -350,7 +350,7 @@ pub enum HostError {
     PeerGone,
     #[error("host authentication failed")]
     Authentication,
-    #[error("signal-cli runtime could not be stopped")]
+    #[error("engine runtime could not be stopped")]
     RuntimeShutdown,
 }
 
@@ -3418,12 +3418,12 @@ fn map_start_failure(failure: StartFailure) -> ApiError {
     match failure {
         StartFailure::AlreadyRunning => ApiError::new(
             "RUNTIME_ALREADY_RUNNING",
-            "signal-cli runtime is already running",
+            "engine runtime is already running",
             false,
         ),
         StartFailure::StartFailed => ApiError::new(
             "RUNTIME_START_FAILED",
-            "signal-cli runtime could not be started",
+            "engine runtime could not be started",
             true,
         ),
     }
@@ -3433,12 +3433,12 @@ fn map_stop_failure(failure: StopFailure) -> ApiError {
     match failure {
         StopFailure::NotRunning => ApiError::new(
             "RUNTIME_NOT_RUNNING",
-            "signal-cli runtime is not running",
+            "engine runtime is not running",
             false,
         ),
         StopFailure::StopFailed => ApiError::new(
             "RUNTIME_STOP_FAILED",
-            "signal-cli runtime could not be stopped",
+            "engine runtime could not be stopped",
             true,
         ),
     }
@@ -4084,7 +4084,7 @@ mod tests {
 
     use super::*;
     use crate::auth::BootstrapSecret;
-    use crate::engine::SignalCliConfig;
+    use crate::engine::EngineConfig;
     use crate::store::{Store, StoreKey};
     use crate::supervisor::RuntimeSupervisor;
 
@@ -4099,8 +4099,8 @@ mod tests {
         // Leak TempDir for unit test lifetime; path stays valid for process.
         std::mem::forget(temp);
         Arc::new(RuntimeSupervisor::new(
-            SignalCliConfig::new(
-                PathBuf::from("unused-signal-cli"),
+            EngineConfig::new(
+                PathBuf::from("unused-engine"),
                 PathBuf::from("/tmp/unused-signal-data"),
             ),
             Arc::new(store),
@@ -4607,8 +4607,8 @@ mod tests {
         let store = Store::open(temp.path(), Some(StoreKey::from_bytes([0x5A; 32]))).unwrap();
         // Leak TempDir for unit test lifetime; path stays valid for process.
         std::mem::forget(temp);
-        let mut config = SignalCliConfig::new(
-            PathBuf::from("unused-signal-cli"),
+        let mut config = EngineConfig::new(
+            PathBuf::from("unused-engine"),
             PathBuf::from("/tmp/unused-signal-data"),
         );
         config.media_ingest = true;

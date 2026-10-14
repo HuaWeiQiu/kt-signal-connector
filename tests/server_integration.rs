@@ -2168,7 +2168,7 @@ async fn serve_ignores_java_home_and_never_leaks_java_env() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(temp.path().join("no-such-jre"))
@@ -2225,7 +2225,7 @@ async fn kt_engine_mode_serves_group_expire_timer_and_group_updated() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(temp.path().join("no-such-jre"))
@@ -2474,7 +2474,7 @@ async fn engine_notifications_forward_through_the_transient_lane() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(temp.path().join("no-such-jre"))
@@ -12210,7 +12210,7 @@ async fn spawn_connector_from_stdin(root: &Path, endpoint: &Path, secret: &[u8; 
         .arg("--endpoint")
         .arg(endpoint)
         .arg("--bootstrap-secret-stdin")
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(root.join("jre"))
@@ -12257,7 +12257,7 @@ fn spawn_connector_with(
         .arg(endpoint)
         .arg("--bootstrap-secret-file")
         .arg(secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--signal-data-dir")
         .arg(root.join("signal-data"))
@@ -12282,7 +12282,7 @@ fn spawn_connector_with(
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-signal-cli.py")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-engine.py")
 }
 
 /// Wait for the connector to exit and require a clean status. The connector's
@@ -13405,7 +13405,7 @@ async fn cloud_restore_faces_round_trip_in_kt_engine_mode() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(temp.path().join("no-such-jre"))
@@ -13658,7 +13658,7 @@ async fn cloud_upload_faces_round_trip_in_kt_engine_mode() {
         .arg(&endpoint)
         .arg("--bootstrap-secret-file")
         .arg(&secret_file)
-        .arg("--signal-cli")
+        .arg("--engine-bin")
         .arg(fixture())
         .arg("--java-home")
         .arg(temp.path().join("no-such-jre"))
