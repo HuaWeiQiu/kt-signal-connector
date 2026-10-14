@@ -638,7 +638,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // The group.changed change-list cap (contract 1.100, §4.81 D3): the
         // parse-side truncate bound the event data mirrors.
         (
-            "/$defs/event/allOf/10/then/properties/data/properties/changes",
+            "/$defs/event/allOf/13/then/properties/data/properties/changes",
             "maxItems",
             GROUP_CHANGED_MAX_CHANGES as u64,
         ),
@@ -646,17 +646,17 @@ fn schema_numeric_bounds_match_code_constants() {
         // the parse-side bounds — the group cap, the per-group entry cap,
         // and the author id bound (the receive-id family).
         (
-            "/$defs/event/allOf/11/then/properties/data/properties/deletes",
+            "/$defs/event/allOf/14/then/properties/data/properties/deletes",
             "maxItems",
             MAX_SYNC_DELETE_GROUPS as u64,
         ),
         (
-            "/$defs/event/allOf/11/then/properties/data/properties/deletes/items/properties/messages",
+            "/$defs/event/allOf/14/then/properties/data/properties/deletes/items/properties/messages",
             "maxItems",
             MAX_SYNC_DELETE_GROUP_MESSAGES as u64,
         ),
         (
-            "/$defs/event/allOf/11/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
+            "/$defs/event/allOf/14/then/properties/data/properties/deletes/items/properties/messages/items/properties/author",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
         ),
@@ -665,12 +665,12 @@ fn schema_numeric_bounds_match_code_constants() {
         // hex identity key mirrors its own bound (the parse drops an
         // over-bound key whole — never a truncated fingerprint).
         (
-            "/$defs/event/allOf/12/then/properties/data/properties/destinationUuid",
+            "/$defs/event/allOf/15/then/properties/data/properties/destinationUuid",
             "maxLength",
             MAX_RECEIVE_ID_CHARS as u64,
         ),
         (
-            "/$defs/event/allOf/12/then/properties/data/properties/identityKey",
+            "/$defs/event/allOf/15/then/properties/data/properties/identityKey",
             "maxLength",
             MAX_SYNC_IDENTITY_KEY_CHARS as u64,
         ),
@@ -679,7 +679,7 @@ fn schema_numeric_bounds_match_code_constants() {
         // the conversation identity rides the shared opaqueId def, so no
         // inline pairing exists to pin.
         (
-            "/$defs/event/allOf/13/then/properties/data/properties/callId",
+            "/$defs/event/allOf/16/then/properties/data/properties/callId",
             "maxLength",
             MAX_SYNC_CALL_ID_CHARS as u64,
         ),
@@ -687,24 +687,24 @@ fn schema_numeric_bounds_match_code_constants() {
         // their own bound — the root key drops the record whole over it, the
         // admin key drops per-key (never a truncated call-link address).
         (
-            "/$defs/event/allOf/16/then/properties/data/properties/rootKey",
+            "/$defs/event/allOf/19/then/properties/data/properties/rootKey",
             "maxLength",
             MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
         ),
         (
-            "/$defs/event/allOf/16/then/properties/data/properties/adminKey",
+            "/$defs/event/allOf/19/then/properties/data/properties/adminKey",
             "maxLength",
             MAX_SYNC_CALL_LINK_KEY_CHARS as u64,
         ),
         // The device-name/PNI registration ids mirror the parse's u32 range
         // gate (the std bound the parse enforces through try_from).
         (
-            "/$defs/event/allOf/18/then/properties/data/properties/deviceId",
+            "/$defs/event/allOf/21/then/properties/data/properties/deviceId",
             "maximum",
             u32::MAX as u64,
         ),
         (
-            "/$defs/event/allOf/20/then/properties/data/properties/registrationId",
+            "/$defs/event/allOf/23/then/properties/data/properties/registrationId",
             "maximum",
             u32::MAX as u64,
         ),

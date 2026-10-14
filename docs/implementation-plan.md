@@ -42,7 +42,36 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.153 (2026-10-14; the story delete fan-out crosses the
+- Contract revision: 1.154 (2026-10-14; the transient story-receive faces
+  (§4.153): `story.reaction` / `story.deleted` / `story.recipientUpdate` —
+  the receive-side half of the engine's story batch S4/S5 (engine 4822e99 /
+  7320393, the same batch whose send faces the 1.152/1.153 registrations
+  crossed). The 1:1 `dataMessage.reaction` whose `storyReply` anchor
+  resolved routes to the transient story face (the engine's story-reaction
+  discrimination: the anchor is the storyReply, because a story has no
+  conversation row for the reaction target to fold onto); the envelope-level
+  `isStory` remote-delete rides the story channel to the story-deletion
+  face; and the `syncMessage.storyRecipientUpdate` self-sync (the
+  `deleteStoryForEveryone` fan-out plus the multi-list send's `isUpdate`
+  shape, the official StoryRecipientUpdateEvent mirror) forwards its
+  recipients verbatim in the sent-transcript §4.88 entry shape. The
+  `story.received` transient discipline verbatim: no rows, no conversation
+  resolution, no self-heal. The stories-disabled gate discrimination follows
+  the material: `story.deleted` drops under the toggle (incoming story
+  material) while `story.reaction` and `story.recipientUpdate` ride
+  regardless (events about the account's own story — the §4.70 viewed-
+  receipt precedent). Degraded and group shapes keep their plain folds: a
+  storyReply the row ladder degraded stays a plain reaction (one authority —
+  the shared helper), a group story reaction and a group DOE keep the
+  ordinary group folds (the §4.67 group-story boundary), and a zero-stamp or
+  entry-less recipient update answers no event (the parse falls through to
+  the plain syncMessage skip). Wire additive: three new transient events,
+  zero new methods/error codes/store moves (the `stories` capability
+  widened in place, the 1.82 precedent). Tests 824 → 826 (lib +2: the engine
+  routing arm — the three routes with the group/degraded plain folds and the
+  parse gates pinned; the service forward arm — the three transients without
+  rows or conversations and the gate split), all green) —
+  previously 1.153 (2026-10-14; the story delete fan-out crosses the
   connector (§4.152): `stories.deleteForEveryone` — the host-side
   registration of the engine's `deleteStoryForEveryone` (engine 7320393,
   the official sendDeleteForEveryone alignment, the per-recipient DOE legs
@@ -12227,6 +12256,89 @@ key, the raw-JSON forward of the string-form timestamp and the
 half-shaped entries, the envelope ladder — the unshaped opaque account
 id, the unknown account, the oversized operationId), the send-lane/
 mutating registry rows grow the new method. Tests 821 → 824, all green.
+
+### 4.153 The story receive faces go transient: `story.reaction` / `story.deleted` / `story.recipientUpdate`, the receive-side half of the story batch (contract revision 1.154, 2026-10-14)
+
+The engine's story batch S4/S5 (kt-signal-engine `4822e99` / `7320393`)
+opened their send faces in 1.152/1.153; this batch forwards the batch's
+receive-side projections, completing the connector's story surface on
+both directions. Three faces, all following the `story.received`
+transient discipline (§4.67: stories are rowless connector-side — no
+row, no conversation resolution, no self-heal; the desktop's story
+timeline owns the state):
+
+- **`story.reaction` — the story-anchored reaction.** The engine's
+  story-reaction discrimination is co-presence: a `dataMessage.reaction`
+  whose envelope also carries the `storyReply` projection is a reaction
+  on a story, not on a message — the anchor is the storyReply, because
+  the story has no conversation row for the reaction target to fold
+  onto. Only the 1:1 leg routes to the transient face: a group story
+  reaction keeps its plain group-reaction fold (the §4.67 group-story
+  boundary, 记档 not invented — the group conversation row is the fold
+  target), and a `storyReply` the row ladder degraded (the engine
+  projects the key only when the author resolves) stays a plain
+  reaction — one authority, the shared helper both ladders read, so a
+  shape the row ladder degraded is exactly the shape the control ladder
+  declines. The payload carries the bounded reaction (emoji, the
+  engine's `isRemove` bit — always serialized, a real delta never an
+  absent key) plus the anchor's two halves (`storyAuthor`,
+  `storySentAt`) and the absent-optional-identity family (sender /
+  senderAci / senderName / timestamp). The reacting viewer may never
+  have a direct thread with the account, so the event claims candidacy,
+  not identity: the desktop joins on its own story timeline by the
+  anchor and no-ops a stale or deleted-row one.
+- **`story.deleted` — the story-channel DOE.** The story batch S5's
+  receive leg ①: `dataMessage.remoteDelete` riding the envelope-level
+  `isStory` bit. Only the 1:1 story channel routes here — a group DOE
+  carries no `isStory` bit and keeps the plain remote-delete fold, and
+  a plain message DOE never carries the bit. The deleted story is named
+  by its upstream sentAt plus the sender identity family; the desktop
+  drops it from its own timeline.
+- **`story.recipientUpdate` — the own-story distribution sync.** The
+  story batch S5's receive leg ②: the engine's
+  `syncMessage.storyRecipientUpdate` projection — the account posted a
+  story from another linked device and the sealed distribution lists
+  ride home (the `deleteStoryForEveryone` self-sync fan-out plus the
+  multi-list send's `isUpdate` shape, the official
+  StoryRecipientUpdateEvent mirror). The recipients ride verbatim in
+  the sent-transcript `storyMessageRecipients` shape (§4.88) — the
+  engine's producer is the same `sent_story_message_recipient`
+  projection, so both chains land the identical entry shape; an empty
+  `distributionListIds` stays an empty list (the official My-story
+  narrowing). The parse gates mirror the sync receive family: the
+  story's own Signal timestamp must be strictly positive (a zero or
+  absent stamp has no story to address) and the entries array must
+  yield at least one parseable entry — a gated face falls through to
+  the plain syncMessage skip like its verified/callEvent siblings; the
+  routing source stays None (our own account, the read/viewed
+  precedent).
+
+**The stories-disabled gate follows the material.** `story.deleted`
+announces incoming story material — the same family the
+`story.received` gate drops — so the toggle drops it exactly the same
+way. `story.reaction` and `story.recipientUpdate` are events about the
+account's own story (a peer acting on it; the account's own
+distribution), not incoming material — the gate does not apply (the
+§4.70 viewed-receipt precedent: the receipt is the viewer's action, not
+story content).
+
+**Zero store involvement, zero self-heal.** No row, no conversation,
+no ledger, no schema move — a transient like `story.received`: a
+missed delivery is not retried or reconstructed. No new capability bit:
+advertised through the existing `stories` tag, widened in place (the
+1.82 precedent chain). KT-extension, no upstream counterpart.
+
+Tests: lib +2. The engine routing arm — the three routes pinned (the
+story reaction's four payload faces with the `isRemove` bit, the story
+DOE's target timestamp, the recipient update's two-entry array with the
+tolerated partial entry) plus the plain folds kept (the degraded
+storyReply reaction, the group reaction with its group id, the group
+DOE) and the parse gates falling through (the zero stamp, the
+entry-less array, the absent array). The service forward arm — all
+three events forward without creating a row or a conversation, the
+identity family rides, and the gate splits: the disabled toggle drops
+the deletion while the reaction and the recipient sync ride. Tests
+824 → 826, all green.
 
 ## 5. signal-cli Boundary
 

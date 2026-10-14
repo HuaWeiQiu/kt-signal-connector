@@ -1170,6 +1170,52 @@ pub enum HostSideEvent {
         sent_timestamps: Vec<u64>,
         viewed_at: u64,
     },
+    /// A peer's reaction to a story (contract 1.154, §4.153): the 1:1
+    /// `dataMessage.reaction` whose `storyReply` anchor resolved — the
+    /// reaction has no row to fold against (stories are rowless, §4.67), so
+    /// the desktop joins on its own story timeline by the (author, sentAt)
+    /// anchor and no-ops a stale one. Transient like `story.received`:
+    /// nothing persists, nothing self-heals. The stories-disabled gate does
+    /// not apply (the event is about the account's own story, not incoming
+    /// story material — the §4.70 receipt precedent).
+    StoryReaction {
+        account_id: String,
+        emoji: String,
+        remove: bool,
+        story_author: String,
+        story_sent_at: u64,
+        sender: Option<String>,
+        sender_aci: Option<String>,
+        sender_name: Option<String>,
+        timestamp: Option<u64>,
+    },
+    /// A peer deleted their story (contract 1.154, §4.153): the engine's
+    /// envelope-level `isStory` remote-delete (`dataMessage.remoteDelete` on
+    /// a `storyMessage` envelope) forwarded so the desktop drops the story
+    /// from its own timeline. Incoming story material — the stories-disabled
+    /// gate applies and drops the envelope exactly like `story.received`.
+    /// Transient like `story.received`: nothing persists, nothing
+    /// self-heals.
+    StoryDeleted {
+        account_id: String,
+        story_sent_at: u64,
+        sender: Option<String>,
+        sender_aci: Option<String>,
+        sender_name: Option<String>,
+        timestamp: Option<u64>,
+    },
+    /// Own-story distribution sync (contract 1.154, §4.153): the engine's
+    /// `syncMessage.storyRecipientUpdate` projection — the account posted a
+    /// story from another linked device and the distribution lists ride home
+    /// — forwarded with the recipients verbatim (the sent-transcript
+    /// `storyMessageRecipients` shape, §4.88). Self-sync about the account's
+    /// own story: no conversation, no row, no gate; the desktop's story
+    /// timeline owns distribution state. Transient like `story.received`.
+    SyncStoryRecipientUpdate {
+        account_id: String,
+        timestamp: u64,
+        recipients: Vec<crate::engine::NormalizedStoryRecipient>,
+    },
     /// The engine's `groupChanged` projection forwarded (contract 1.100,
     /// §4.81 D3): the official change word list for one group update rides
     /// verbatim as the transient `group.changed` event — the connector keeps
@@ -8885,6 +8931,69 @@ impl ConnectorService {
                 story: message.clone(),
             }]);
         }
+        // Peer story reactions (contract 1.154, §4.153): the routing split
+        // the 1:1 reaction face a story apart — a reaction whose `storyReply`
+        // anchor resolved and that addresses no group is aimed at a story,
+        // intercepted before the ladder like `story.received` (a story
+        // addresses no conversation, and the reacting viewer may never have
+        // a direct thread). No gate: the event is about the account's own
+        // story, not incoming story material (the §4.70 receipt precedent).
+        // Group-story reactions and degraded shapes without the anchor keep
+        // the ordinary reaction fold.
+        if let ControlReceive::StoryReaction {
+            emoji,
+            remove,
+            story_author,
+            story_sent_at,
+        } = &control
+        {
+            return Ok(vec![HostSideEvent::StoryReaction {
+                account_id: account.id.clone(),
+                emoji: emoji.clone(),
+                remove: *remove,
+                story_author: story_author.clone(),
+                story_sent_at: *story_sent_at,
+                sender: receive.source.clone(),
+                sender_aci: receive.source_uuid.clone(),
+                sender_name: receive.peer_name.clone(),
+                timestamp: receive.timestamp,
+            }]);
+        }
+        // A peer deleted their story (contract 1.154, §4.153): the
+        // envelope-level `isStory` remote-delete forwarded before the ladder
+        // — incoming story material, so the stories-disabled gate applies
+        // and drops the envelope exactly like `story.received`. A group
+        // remote-delete carries no `isStory` bit and keeps the ordinary
+        // fold.
+        if let ControlReceive::StoryDeleted { target_timestamp } = &control {
+            if self.store.stories_disabled(&account.id)? {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![HostSideEvent::StoryDeleted {
+                account_id: account.id.clone(),
+                story_sent_at: *target_timestamp,
+                sender: receive.source.clone(),
+                sender_aci: receive.source_uuid.clone(),
+                sender_name: receive.peer_name.clone(),
+                timestamp: receive.timestamp,
+            }]);
+        }
+        // Own-story distribution sync (contract 1.154, §4.153): the
+        // `storyRecipientUpdate` projection intercepted before the ladder —
+        // the account's own story distribution riding home from another
+        // linked device, no conversation to resolve and no gate (own-story
+        // sync, not incoming story material).
+        if let ControlReceive::SyncStoryRecipientUpdate {
+            timestamp,
+            recipients,
+        } = &control
+        {
+            return Ok(vec![HostSideEvent::SyncStoryRecipientUpdate {
+                account_id: account.id.clone(),
+                timestamp: *timestamp,
+                recipients: recipients.clone(),
+            }]);
+        }
         // Story view receipts (contract 1.85, §4.70). A VIEWED receipt is
         // intercepted before the conversation ladder because its story half
         // addresses no conversation at all: the viewer may never have
@@ -9696,6 +9805,14 @@ impl ConnectorService {
             // as well (a story addresses no conversation), so this arm is
             // the unreachable fall-through too.
             ControlReceive::Story { .. } => Ok(Vec::new()),
+            // The three 1.154 story faces are intercepted the same way (a
+            // story reaction and the recipient sync address no conversation,
+            // and the story remote-delete short-circuits on the
+            // stories-disabled gate), so these arms are the unreachable
+            // fall-through too.
+            ControlReceive::StoryReaction { .. } => Ok(Vec::new()),
+            ControlReceive::StoryDeleted { .. } => Ok(Vec::new()),
+            ControlReceive::SyncStoryRecipientUpdate { .. } => Ok(Vec::new()),
             // Call signaling (contract 1.51, §4.49): no row, no local state
             // — the signaling payload forwards as the transient
             // `call.incoming` event addressed by the conversation it routed
@@ -26182,6 +26299,156 @@ mod tests {
             .list_messages(&account.id, &conversation.id, 50, None)
             .unwrap();
         assert_eq!(listed.items.len(), 1, "no second reply row");
+    }
+
+    /// The §4.153 story transient family (contract 1.154): a peer's story
+    /// reaction, a peer's story deletion, and the own-story recipient sync
+    /// forward as their transient events without touching the store — no
+    /// row, no conversation. The gate discrimination follows the story
+    /// material: `story.deleted` (incoming story material) drops under the
+    /// stories-disabled toggle while `story.reaction` and
+    /// `story.recipientUpdate` (events about the account's own story) ride
+    /// regardless of it.
+    #[test]
+    fn story_transient_faces_forward_without_rows_and_split_on_the_gate() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let reaction = control_receive_named(
+            "+15555550100",
+            "+15555550199",
+            "Peer",
+            ControlReceive::StoryReaction {
+                emoji: "❤️".to_string(),
+                remove: false,
+                story_author: "22222222-2222-2222-2222-222222222222".to_string(),
+                story_sent_at: 1726999999000,
+            },
+        );
+        let deleted = control_receive(
+            "+15555550100",
+            "+15555550101",
+            ControlReceive::StoryDeleted {
+                target_timestamp: 1726999999000,
+            },
+        );
+        let recipient_update = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::SyncStoryRecipientUpdate {
+                timestamp: 1726999999000,
+                recipients: vec![crate::engine::NormalizedStoryRecipient {
+                    destination_uuid: Some("33333333-3333-3333-3333-333333333333".to_string()),
+                    distribution_list_ids: vec!["00000000-0000-0000-0000-000000000000".to_string()],
+                    is_allowed_to_reply: Some(true),
+                }],
+            },
+        );
+
+        // Enabled (the default): all three forward.
+        let events = service
+            .ingest_receive(reaction.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryReaction {
+            account_id: event_account,
+            emoji,
+            remove,
+            story_author,
+            story_sent_at,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+        } = &events[0]
+        else {
+            panic!("expected a StoryReaction event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(emoji, "❤️");
+        assert!(!remove);
+        assert_eq!(story_author, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(*story_sent_at, 1726999999000);
+        assert_eq!(sender.as_deref(), Some("+15555550199"));
+        assert_eq!(
+            sender_aci, &None,
+            "the control_receive helper carries no uuid"
+        );
+        assert_eq!(sender_name.as_deref(), Some("Peer"));
+        assert_eq!(*timestamp, Some(500));
+
+        let events = service
+            .ingest_receive(deleted.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::StoryDeleted {
+            account_id: event_account,
+            story_sent_at,
+            sender,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected a StoryDeleted event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(*story_sent_at, 1726999999000);
+        assert_eq!(sender.as_deref(), Some("+15555550101"));
+
+        let events = service
+            .ingest_receive(recipient_update.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::SyncStoryRecipientUpdate {
+            account_id: event_account,
+            timestamp,
+            recipients,
+        } = &events[0]
+        else {
+            panic!("expected a SyncStoryRecipientUpdate event: {events:?}");
+        };
+        assert_eq!(event_account, &account.id);
+        assert_eq!(*timestamp, 1726999999000);
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(
+            recipients[0].destination_uuid.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+
+        // Nothing persisted anywhere: no row on the linked conversation,
+        // no conversation for the reacting peer.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(listed.items.is_empty(), "story transients create no row");
+        assert!(
+            service
+                .store_ref()
+                .conversation_by_peer(&account.id, "direct", "+15555550199")
+                .unwrap()
+                .is_none(),
+            "a story reaction addresses no conversation and creates none"
+        );
+
+        // Disabled: the story deletion drops (incoming story material),
+        // the reaction and the recipient sync ride (own-story events).
+        service
+            .store_ref()
+            .set_stories_disabled(&account.id, true)
+            .unwrap();
+        assert!(
+            service
+                .ingest_receive(deleted, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "a disabled story deletion drops"
+        );
+        for own_story in [reaction, recipient_update] {
+            let events = service
+                .ingest_receive(own_story, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap();
+            assert_eq!(events.len(), 1, "own-story transients ignore the gate");
+        }
     }
 
     /// The §4.117 conversation-less transient family (contract 1.134):

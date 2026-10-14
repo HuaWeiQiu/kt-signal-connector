@@ -788,7 +788,12 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `stories.deleteForEveryone` story delete fan-out — the §4.150 proxy
 /// posture registering the engine's `deleteStoryForEveryone`, the
 /// per-recipient DOE legs plus the exactly-once self-sync; the same
-/// no-new-bit discipline) and by revision 1.130 (the
+/// no-new-bit discipline) and by revision 1.154 (the §4.153 transient
+/// story-receive faces — the `story.reaction` / `story.deleted` /
+/// `story.recipientUpdate` events over the engine's story S4/S5 batch
+/// projections, the story.received transient discipline: no rows, no
+/// self-heal, the stories-disabled gate on incoming story material only;
+/// the same no-new-bit discipline) and by revision 1.130 (the
 /// `storyDistributionLists.list` / `storyDistributionLists.setRecords`
 /// story-audience sync faces — the §4.78 sync-face pair over the story
 /// distribution lists the §4.67 send faces address; the same no-new-bit

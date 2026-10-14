@@ -4432,6 +4432,9 @@
             "call.groupIncoming",
             "story.received",
             "story.viewed",
+            "story.reaction",
+            "story.deleted",
+            "story.recipientUpdate",
             "group.changed",
             "message.deleteForMe",
             "identity.verifiedChanged",
@@ -4786,6 +4789,171 @@
                     "type": "integer",
                     "minimum": 1,
                     "description": "The receipt's arrival instant (the envelope timestamp, contract 1.32; connector clock when the envelope carried none) — the desktop's viewedAtMs."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "story.reaction" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "emoji", "remove", "storyAuthor", "storySentAt"],
+                "description": "A peer's reaction to a story (contract 1.154, §4.153, capability stories): the 1:1 dataMessage.reaction whose storyReply anchor resolved (the engine's story-reaction batch S4 projection — no isStory bit, no group context), forwarded as one transient event. Stories are rowless (contract 1.76 §4.67), so the reaction has no row to fold against: the desktop joins on its own story timeline by the (storyAuthor, storySentAt) anchor and no-ops a stale or deleted-row anchor — the event claims candidacy, not identity. Transient like story.received: nothing persists, a missed delivery is not self-healed. remove rides the engine's isRemove bit (true = the peer removed their reaction; always serialized — a real delta, never an absent key); emoji is the placed emoji either way. The stories-disabled gate does not apply (the event is about the account's own story, not incoming story material — the §4.70 story.viewed precedent). Boundaries unchanged: a group-story reaction (isStory:true + groupContext) keeps the ordinary reaction fold into the group conversation, and the account's own outgoing story-reaction echo keeps the sent-transcript fold — neither reaches this event.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "emoji": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 32,
+                    "description": "The reaction emoji (the bounded projection of dataMessage.reaction.emoji)."
+                  },
+                  "remove": {
+                    "type": "boolean",
+                    "description": "The engine's isRemove bit: true = the peer removed this reaction, false = placed. Always serialized."
+                  },
+                  "storyAuthor": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The story author's ACI (storyReply.authorAci) — the anchor's author half; the account's own ACI for reactions to its own story."
+                  },
+                  "storySentAt": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The story's own Signal timestamp (storyReply.sentTimestamp) — the anchor's sentAt half. Not engine-gated positive: a nonsense anchor simply no-ops desktop-side, the story.viewed candidacy posture."
+                  },
+                  "sender": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The reacting peer as the envelope resolved it (phone number or masked peer id) when present."
+                  },
+                  "senderAci": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The reacting peer's ACI UUID (envelope sourceUuid) when present."
+                  },
+                  "senderName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The reacting peer's profile/contact display name when present."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The reaction envelope's Signal timestamp when the engine projected one; absent means the envelope carried none."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "story.deleted" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "storySentAt"],
+                "description": "A peer deleted their story (contract 1.154, §4.153, capability stories): the engine's envelope-level isStory remote-delete (dataMessage.remoteDelete on a storyMessage envelope, the story batch S5's receive leg) forwarded as one transient event. Stories are rowless connector-side (contract 1.76 §4.67), so the desktop drops the story from its own timeline by the (author = sender, storySentAt) anchor; the event claims candidacy, not identity. Incoming story material, hence the stories-disabled gate applies and has already dropped the envelope when the account opted out (stories.setDisabled) — exactly the story.received gate posture. Transient like story.received: nothing persists, a missed delivery is not self-healed. A group remote-delete carries no isStory bit and keeps the ordinary fold (the §4.67 group-story boundary) — it never reaches this event. sender/senderAci/senderName/timestamp are absent when the envelope did not carry them.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "storySentAt": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The deleted story's own Signal timestamp (remoteDelete.timestamp) — the desktop's timeline removal anchor. Not engine-gated positive: a nonsense anchor no-ops desktop-side."
+                  },
+                  "sender": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The deleting peer as the envelope resolved it (the story's author) when present."
+                  },
+                  "senderAci": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The deleting peer's ACI UUID (envelope sourceUuid) when present."
+                  },
+                  "senderName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "description": "The deleting peer's profile/contact display name when present."
+                  },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The delete envelope's Signal timestamp when the engine projected one; absent means the envelope carried none."
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "story.recipientUpdate" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId", "timestamp", "storyMessageRecipients"],
+                "description": "Own-story distribution sync (contract 1.154, §4.153, capability stories): the engine's syncMessage.storyRecipientUpdate projection — the account posted a story from another linked device and the sealed distribution lists ride home — forwarded as one transient event with the recipients verbatim in the sent-transcript storyMessageRecipients shape (contract 1.107 §4.88; the engine's producer is the same sent_story_message_recipient projection, so both chains land the identical entry shape). Self-sync about the account's own story: no conversation, no row, no gate (own-story sync, not incoming story material) — the desktop's story timeline owns distribution state. timestamp is the story's own Signal timestamp (the sync entry's own, positive-gated; a zero/absent stamp or an entry-less array answers no event — the engine never projects one). An empty distributionListIds stays an empty list (the official list-narrowed semantics). Transient like story.received: nothing persists, a missed delivery is not self-healed; cross-version dual-form windows (a storyMessage echo or a storyRecipientUpdate for the same send) are the engine's same-host same-version premise and the connector forwards the new face only.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" },
+                  "timestamp": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The story's own Signal timestamp (the sync entry's timestamp; positive-gated at the parse)."
+                  },
+                  "storyMessageRecipients": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["distributionListIds"],
+                      "properties": {
+                        "destinationUuid": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128,
+                          "description": "The destination's service-id string when the entry carried one (PNI-prefixed for a PNI destination, the plain UUID for an ACI); absent stays absent."
+                        },
+                        "distributionListIds": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128
+                          },
+                          "description": "The distribution (playlist) ids verbatim; empty = the official My-story narrowing, and the key always rides."
+                        },
+                        "isAllowedToReply": {
+                          "type": "boolean",
+                          "description": "The reply-permission bit only when the proto stated one; absent stays absent."
+                        }
+                      }
+                    },
+                    "description": "The recipients whose story views converge to the new distribution — one entry per destination, bounded by the sync receive family's entry cap."
                   }
                 }
               }

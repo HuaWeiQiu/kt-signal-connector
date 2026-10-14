@@ -3712,6 +3712,88 @@ where
             }
             send_shared(writer, &HostEvent::new("story.viewed", payload)).await
         }
+        HostSideEvent::StoryReaction {
+            account_id,
+            emoji,
+            remove,
+            story_author,
+            story_sent_at,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+        } => {
+            // Contract 1.154, §4.153: transient story reaction — the
+            // story.received absent-optional-identity discipline, `remove`
+            // always present (the official reaction-remove is a real emoji
+            // delta, not an absent key), the anchor named by its two wire
+            // keys.
+            let mut payload = json!({
+                "accountId": account_id,
+                "emoji": emoji,
+                "remove": remove,
+                "storyAuthor": story_author,
+                "storySentAt": story_sent_at,
+            });
+            if let Some(sender) = sender {
+                payload["sender"] = json!(sender);
+            }
+            if let Some(aci) = sender_aci {
+                payload["senderAci"] = json!(aci);
+            }
+            if let Some(name) = sender_name {
+                payload["senderName"] = json!(name);
+            }
+            if let Some(at) = timestamp {
+                payload["timestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("story.reaction", payload)).await
+        }
+        HostSideEvent::StoryDeleted {
+            account_id,
+            story_sent_at,
+            sender,
+            sender_aci,
+            sender_name,
+            timestamp,
+        } => {
+            // Contract 1.154, §4.153: transient story remote-delete — same
+            // absent-optional-identity discipline, the deleted story named
+            // by its upstream sentAt.
+            let mut payload = json!({
+                "accountId": account_id,
+                "storySentAt": story_sent_at,
+            });
+            if let Some(sender) = sender {
+                payload["sender"] = json!(sender);
+            }
+            if let Some(aci) = sender_aci {
+                payload["senderAci"] = json!(aci);
+            }
+            if let Some(name) = sender_name {
+                payload["senderName"] = json!(name);
+            }
+            if let Some(at) = timestamp {
+                payload["timestamp"] = json!(at);
+            }
+            send_shared(writer, &HostEvent::new("story.deleted", payload)).await
+        }
+        HostSideEvent::SyncStoryRecipientUpdate {
+            account_id,
+            timestamp,
+            recipients,
+        } => {
+            // Contract 1.154, §4.153: transient own-story distribution sync —
+            // the recipients ride verbatim in the sent-transcript
+            // storyMessageRecipients shape (§4.88); an empty list stays an
+            // empty list (the official list-narrowed semantics).
+            let payload = json!({
+                "accountId": account_id,
+                "timestamp": timestamp,
+                "storyMessageRecipients": recipients,
+            });
+            send_shared(writer, &HostEvent::new("story.recipientUpdate", payload)).await
+        }
         HostSideEvent::GroupChanged {
             account_id,
             conversation_id,

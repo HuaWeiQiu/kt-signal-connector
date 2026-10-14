@@ -1139,6 +1139,49 @@ pub enum ControlReceive {
     Story {
         message: Value,
     },
+    /// Story-anchored reaction receive (contract 1.154, §4.153): the engine's
+    /// story-reaction discrimination face — a `dataMessage.reaction` whose
+    /// envelope carries the `storyReply` (storyContext) projection is a
+    /// reaction on a story, not on a message (the story batch S4's
+    /// receive-side judgment, engine docs §3: the anchor is the storyReply,
+    /// because the story has no conversation row for the reaction target to
+    /// fold onto). Only the 1:1 leg routes here — the group story reaction
+    /// keeps its plain group-reaction fold (the §4.67 group-story boundary,
+    /// 记档 not invented). The reaction payload stays the parsed reaction
+    /// (emoji, remove); the anchor is the storyReply face verbatim. The
+    /// stories-disabled gate does not apply (a reaction is a peer action on
+    /// the account's own story — the §4.70 own-story receipts family, not
+    /// incoming story material).
+    StoryReaction {
+        emoji: String,
+        remove: bool,
+        story_author: String,
+        story_sent_at: u64,
+    },
+    /// Peer story deletion (contract 1.154, §4.153): the story-channel DOE
+    /// face — `dataMessage.remoteDelete` riding the envelope `isStory` bit
+    /// (the story batch S5's receive leg ①, the E2 gate's
+    /// is_delete_for_everyone exemption). Only the 1:1 story channel routes
+    /// here: a group DOE keeps its plain remote-delete fold (the §4.67
+    /// group-story boundary), and a plain message DOE never carries the bit.
+    /// The stories-disabled gate applies (the deletion of incoming story
+    /// material — the same material family the story.received gate drops).
+    StoryDeleted {
+        target_timestamp: u64,
+    },
+    /// The engine's `syncMessage.storyRecipientUpdate` projection (contract
+    /// 1.154, §4.153): the account's own devices learned one of its stories'
+    /// recipients changed — the story batch S5's receive leg ②, the
+    /// `deleteStoryForEveryone` self-sync fan-out plus the multi-list story
+    /// send's `isUpdate=true` sync shape (the official
+    /// StoryRecipientUpdateEvent mirror). Own-story sync family like the
+    /// §4.70 viewed receipts: the stories-disabled gate does not apply. The
+    /// timestamp is the story's own Signal timestamp (the official envelope
+    /// ts); the recipients ride verbatim.
+    SyncStoryRecipientUpdate {
+        timestamp: u64,
+        recipients: Vec<NormalizedStoryRecipient>,
+    },
     /// The engine's `syncMessage.read[]` / `.viewed[]` projection (contract
     /// 1.100, §4.81): the account's own linked device marked upstream
     /// messages read (or viewed) — the official #handleRead/#handleViewed
@@ -1853,6 +1896,40 @@ impl NormalizedReceive {
                             + record.name.as_ref().map_or(0, String::len)
                     })
                     .sum(),
+                // The story faces carry bounded identity/emoji strings —
+                // the heap strings count here (§4.13).
+                Some(ControlReceive::StoryReaction {
+                    emoji,
+                    story_author,
+                    ..
+                }) => {
+                    std::mem::size_of::<ControlReceive>()
+                        + emoji.len()
+                        + story_author.len()
+                }
+                Some(ControlReceive::StoryDeleted { .. }) => {
+                    std::mem::size_of::<ControlReceive>()
+                }
+                // The story recipient update carries heap entry Vecs like
+                // the contacts list — counted entry-wise (§4.13).
+                Some(ControlReceive::SyncStoryRecipientUpdate { recipients, .. }) => {
+                    std::mem::size_of::<ControlReceive>()
+                        + recipients
+                            .iter()
+                            .map(|entry| {
+                                std::mem::size_of::<NormalizedStoryRecipient>()
+                                    + entry
+                                        .destination_uuid
+                                        .as_ref()
+                                        .map_or(0, String::len)
+                                    + entry
+                                        .distribution_list_ids
+                                        .iter()
+                                        .map(String::len)
+                                        .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                }
                 _ => 0,
             }
             // Rich bodies carry capped urls/titles/names, contact-card
@@ -4214,19 +4291,7 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
     // {authorAci, sentTimestamp}, both keys required — the engine projects the
     // face only when the author resolves, and a degraded shape here drops the
     // key (never the row), the §4.20 per-entry discipline.
-    if let Some(reply) = message.get("storyReply").and_then(Value::as_object) {
-        rich.story_reply = reply
-            .get("authorAci")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
-            .zip(reply.get("sentTimestamp").and_then(Value::as_u64))
-            .map(|(author_aci, sent_timestamp)| NormalizedStoryReply {
-                author_aci,
-                sent_timestamp,
-            });
-    }
+    rich.story_reply = normalized_story_reply(message);
     // Live poll face (§4.118): `dataMessage.poll {question, options,
     // allowMultiple}` — the engine's Q3 projection — parses onto the same
     // NormalizedPoll the §4.38 import chain lands. The live face carries no
@@ -4314,31 +4379,7 @@ fn normalized_rich(message: &serde_json::Map<String, Value>) -> Option<Normalize
         rich.story_message_recipients = entries
             .iter()
             .take(MAX_SYNC_SENT_STATUS_ENTRIES)
-            .filter_map(|entry| {
-                let object = entry.as_object()?;
-                Some(NormalizedStoryRecipient {
-                    destination_uuid: object
-                        .get("destinationUuid")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>()),
-                    distribution_list_ids: object
-                        .get("distributionListIds")
-                        .and_then(Value::as_array)
-                        .map(|ids| {
-                            ids.iter()
-                                .take(MAX_STORY_DISTRIBUTION_IDS)
-                                .filter_map(Value::as_str)
-                                .map(str::trim)
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default(),
-                    is_allowed_to_reply: object.get("isAllowedToReply").and_then(Value::as_bool),
-                })
-            })
+            .filter_map(|entry| entry.as_object().map(normalized_story_recipient))
             .collect();
     }
     if rich.is_empty() {
@@ -4467,6 +4508,89 @@ fn bounded_story_material(story: &serde_json::Map<String, Value>) -> Option<Valu
     let value = Value::Object(story.clone());
     let serialized = serde_json::to_string(&value).ok()?;
     (serialized.len() <= MAX_STORY_MATERIAL_BYTES).then_some(value)
+}
+
+/// Story-reply context (contract 1.76, §4.67): `dataMessage.storyReply` →
+/// {authorAci, sentTimestamp}, both keys required — the engine projects the
+/// face only when the author resolves, and a degraded shape here drops the
+/// face (never the row), the §4.20 per-entry discipline. One authority for
+/// both consumers: the rich row face and the §4.153 story-reaction routing
+/// read the same helper, so a shape the row ladder degraded is exactly the
+/// shape the control ladder declines.
+fn normalized_story_reply(
+    message: &serde_json::Map<String, Value>,
+) -> Option<NormalizedStoryReply> {
+    let reply = message.get("storyReply")?.as_object()?;
+    reply
+        .get("authorAci")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
+        .zip(reply.get("sentTimestamp").and_then(Value::as_u64))
+        .map(|(author_aci, sent_timestamp)| NormalizedStoryReply {
+            author_aci,
+            sent_timestamp,
+        })
+}
+
+/// One `storyMessageRecipients[]` entry (contract 1.107, §4.88): the
+/// destination service id, the distribution (playlist) ids verbatim, and the
+/// reply-permission bit only when the proto stated one. One authority for
+/// both consumers: the sent transcript's rich face and the §4.153 story
+/// recipient-update sync parse the same helper, so both chains land the
+/// identical entry shape.
+fn normalized_story_recipient(object: &serde_json::Map<String, Value>) -> NormalizedStoryRecipient {
+    NormalizedStoryRecipient {
+        destination_uuid: object
+            .get("destinationUuid")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>()),
+        distribution_list_ids: object
+            .get("distributionListIds")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                ids.iter()
+                    .take(MAX_STORY_DISTRIBUTION_IDS)
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(MAX_RECEIVE_ID_CHARS).collect::<String>())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        is_allowed_to_reply: object.get("isAllowedToReply").and_then(Value::as_bool),
+    }
+}
+
+/// The engine's `syncMessage.storyRecipientUpdate` face (contract 1.154,
+/// §4.153): the story's own Signal timestamp plus the recipients array the
+/// recipients' story views converge to. The timestamp is the story anchor —
+/// zero or absent has no story to address and drops the face (the
+/// SyncCallEvent positive-stamp gate); an entry the engine could not resolve
+/// forwards with only its carried keys (the NormalizedStoryRecipient
+/// tolerance), and an array with no entry at all is no face — the engine's
+/// own gate never projects one, so what survives here is the bounds
+/// family's own guard.
+fn normalized_sync_story_recipient_update(
+    face: Option<&Value>,
+) -> Option<(u64, Vec<NormalizedStoryRecipient>)> {
+    let face = face?.as_object()?;
+    let timestamp = face
+        .get("timestamp")
+        .and_then(Value::as_u64)
+        .filter(|timestamp| *timestamp > 0)?;
+    let entries = face
+        .get("storyMessageRecipients")
+        .and_then(Value::as_array)?;
+    let recipients = entries
+        .iter()
+        .take(MAX_SYNC_SENT_STATUS_ENTRIES)
+        .filter_map(|entry| entry.as_object().map(normalized_story_recipient))
+        .collect::<Vec<_>>();
+    (!recipients.is_empty()).then_some((timestamp, recipients))
 }
 
 /// Bounded reaction payload: emoji shortened, author bounded, malformed shapes
@@ -4659,11 +4783,50 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
     if let Some(data_message) = envelope.get("dataMessage").and_then(Value::as_object) {
         let group_id = data_message_group_id(data_message);
         if let Some(reaction) = data_message.get("reaction").and_then(normalized_reaction) {
+            // Story-anchored reaction (contract 1.154, §4.153): the
+            // reaction + storyReply co-presence is the engine's story
+            // discrimination face, and only the 1:1 leg routes to the
+            // transient story face — a group story reaction keeps its plain
+            // group-reaction fold (the §4.67 group-story boundary, 记档 not
+            // invented). A degraded storyReply (the engine projects the key
+            // only when the author resolves) stays a plain reaction. The
+            // anchor is the storyReply face; the reaction target face is
+            // the same author/timestamp by the official dual-anchor
+            // alignment and is not transported twice.
+            let ControlReceive::Reaction {
+                emoji,
+                target_author,
+                target_timestamp,
+                remove,
+            } = reaction
+            else {
+                unreachable!("normalized_reaction only answers the Reaction variant");
+            };
+            if group_id.is_none()
+                && let Some(story) = normalized_story_reply(data_message)
+            {
+                return Some(ControlRouting {
+                    direction: "incoming",
+                    source: envelope_peer_source(envelope),
+                    group_id: None,
+                    control: ControlReceive::StoryReaction {
+                        emoji,
+                        remove,
+                        story_author: story.author_aci,
+                        story_sent_at: story.sent_timestamp,
+                    },
+                });
+            }
             return Some(ControlRouting {
                 direction: "incoming",
                 source: envelope_peer_source(envelope),
                 group_id,
-                control: reaction,
+                control: ControlReceive::Reaction {
+                    emoji,
+                    target_author,
+                    target_timestamp,
+                    remove,
+                },
             });
         }
         if let Some(target) = data_message
@@ -4672,6 +4835,22 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             .and_then(|object| object.get("timestamp"))
             .and_then(Value::as_u64)
         {
+            // Story-channel DOE (contract 1.154, §4.153): the envelope
+            // `isStory` bit marks the deletion riding the story channel —
+            // the story batch S5's receive leg ①. Only the 1:1 leg routes
+            // to the transient story face; a group DOE keeps the plain
+            // remote-delete fold (the §4.67 group-story boundary).
+            if envelope.get("isStory").and_then(Value::as_bool) == Some(true) && group_id.is_none()
+            {
+                return Some(ControlRouting {
+                    direction: "incoming",
+                    source: envelope_peer_source(envelope),
+                    group_id: None,
+                    control: ControlReceive::StoryDeleted {
+                        target_timestamp: target,
+                    },
+                });
+            }
             return Some(ControlRouting {
                 direction: "incoming",
                 source: envelope_peer_source(envelope),
@@ -5151,6 +5330,30 @@ fn control_routing(envelope: &serde_json::Map<String, Value>) -> Option<ControlR
             source: None,
             group_id: None,
             control: ControlReceive::SyncBlocked { blocked },
+        });
+    }
+    // The engine's `syncMessage.storyRecipientUpdate` projection (contract
+    // 1.154, §4.153): the account's own devices learned one of its stories'
+    // recipients changed — the story batch S5's receive leg ② (the
+    // deleteStoryForEveryone self-sync fan-out plus the multi-list story
+    // send's isUpdate sync shape, the official StoryRecipientUpdateEvent
+    // mirror). Intercepted before the plain syncMessage skip like its
+    // verified/callEvent siblings; a face whose timestamp failed the gate or
+    // whose entries all failed the shapes falls through to that skip. The
+    // routing source stays None — the envelope is our own account (the
+    // read/viewed precedent).
+    if let Some(sync) = envelope.get("syncMessage").and_then(Value::as_object)
+        && let Some((timestamp, recipients)) =
+            normalized_sync_story_recipient_update(sync.get("storyRecipientUpdate"))
+    {
+        return Some(ControlRouting {
+            direction: "incoming",
+            source: None,
+            group_id: None,
+            control: ControlReceive::SyncStoryRecipientUpdate {
+                timestamp,
+                recipients,
+            },
         });
     }
     // Call signaling (contract 1.51, §4.49): the engine's callMessage
@@ -10195,6 +10398,213 @@ mod tests {
                 .and_then(|rich| rich.story_reply.as_ref())
                 .is_none()
         );
+    }
+
+    /// The §4.153 story receive faces route to their transients (contract
+    /// 1.154): the 1:1 reaction + storyReply co-presence is the story face;
+    /// a degraded storyReply (the engine projects the key only when the
+    /// author resolves) and the group shape keep their plain folds; the
+    /// envelope `isStory` remote-delete is the story DOE while a group DOE
+    /// stays plain; and the `syncMessage.storyRecipientUpdate` self-sync
+    /// rides its positive-stamp and non-empty-recipients gates.
+    #[test]
+    fn story_receive_faces_route_to_their_transients() {
+        let normalize = |envelope: serde_json::Value| {
+            normalize_receive(&json!({ "envelope": envelope }))
+                .unwrap()
+                .unwrap()
+        };
+        let story_reaction = json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "sourceUuid": "11111111-1111-1111-1111-111111111111",
+            "dataMessage": {
+                "reaction": {
+                    "emoji": "❤️",
+                    "targetAuthor": "22222222-2222-2222-2222-222222222222",
+                    "targetSentTimestamp": 1726999999000u64,
+                    "isRemove": true,
+                },
+                "storyReply": {
+                    "authorAci": "22222222-2222-2222-2222-222222222222",
+                    "sentTimestamp": 1726999999000u64,
+                },
+            },
+        });
+        let Some(ControlReceive::StoryReaction {
+            emoji,
+            remove,
+            story_author,
+            story_sent_at,
+        }) = normalize(story_reaction).control
+        else {
+            panic!("a 1:1 story reaction routes to the story face");
+        };
+        assert_eq!(emoji, "❤️");
+        assert!(remove, "the isRemove bit rides the story face");
+        assert_eq!(story_author, "22222222-2222-2222-2222-222222222222");
+        assert_eq!(story_sent_at, 1726999999000);
+
+        // The degraded shape — storyReply without its timestamp (the engine
+        // projects the key only when the author resolves) — stays a plain
+        // reaction: one authority, the row ladder's degradation.
+        let degraded = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "dataMessage": {
+                "reaction": {
+                    "emoji": "❤️",
+                    "targetAuthor": "22222222-2222-2222-2222-222222222222",
+                    "targetSentTimestamp": 1726999999000u64,
+                },
+                "storyReply": {
+                    "authorAci": "22222222-2222-2222-2222-222222222222",
+                },
+            },
+        }));
+        assert!(matches!(
+            degraded.control,
+            Some(ControlReceive::Reaction { .. })
+        ));
+
+        // The group shape — reaction + storyReply under a groupContext —
+        // keeps the plain group-reaction fold with its group id.
+        let group_shape = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "dataMessage": {
+                "reaction": {
+                    "emoji": "❤️",
+                    "targetAuthor": "22222222-2222-2222-2222-222222222222",
+                    "targetSentTimestamp": 1726999999000u64,
+                },
+                "storyReply": {
+                    "authorAci": "22222222-2222-2222-2222-222222222222",
+                    "sentTimestamp": 1726999999000u64,
+                },
+                "groupInfo": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                },
+            },
+        }));
+        match group_shape.control {
+            Some(ControlReceive::Reaction { .. }) => {
+                assert_eq!(group_shape.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+            }
+            other => panic!("a group story reaction keeps the plain fold: {other:?}"),
+        }
+
+        // The 1:1 story DOE: envelope isStory + remoteDelete.
+        let Some(ControlReceive::StoryDeleted { target_timestamp }) = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "isStory": true,
+            "dataMessage": {
+                "remoteDelete": { "timestamp": 1726999999000u64 },
+            },
+        }))
+        .control
+        else {
+            panic!("a 1:1 story DOE routes to the story face");
+        };
+        assert_eq!(target_timestamp, 1726999999000);
+
+        // A group DOE (no isStory bit on the group leg) keeps the plain
+        // remote-delete fold.
+        let group_doe = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550101",
+            "dataMessage": {
+                "remoteDelete": { "timestamp": 1726999999000u64 },
+                "groupInfo": {
+                    "groupId": "ZmFrZS1ncm91cC0x",
+                },
+            },
+        }));
+        match group_doe.control {
+            Some(ControlReceive::RemoteDelete { target_timestamp }) => {
+                assert_eq!(target_timestamp, 1726999999000);
+                assert_eq!(group_doe.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+            }
+            other => panic!("a group DOE keeps the plain fold: {other:?}"),
+        }
+
+        // The self-sync face: storyRecipientUpdate rides with its
+        // recipients; source stays None (our own account).
+        let recipient_update = normalize(json!({
+            "timestamp": 1727000000000u64,
+            "source": "+15555550100",
+            "syncMessage": {
+                "storyRecipientUpdate": {
+                    "timestamp": 1726999999000u64,
+                    "storyMessageRecipients": [
+                        {
+                            "destinationUuid": "33333333-3333-3333-3333-333333333333",
+                            "distributionListIds": ["00000000-0000-0000-0000-000000000000"],
+                            "isAllowedToReply": true,
+                        },
+                        {
+                            "distributionListIds": [],
+                        },
+                    ],
+                },
+            },
+        }));
+        let Some(ControlReceive::SyncStoryRecipientUpdate {
+            timestamp,
+            recipients,
+        }) = recipient_update.control
+        else {
+            panic!("a storyRecipientUpdate routes to the sync face");
+        };
+        assert_eq!(timestamp, 1726999999000);
+        assert_eq!(recipients.len(), 2);
+        assert_eq!(
+            recipients[0].destination_uuid.as_deref(),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
+        assert_eq!(
+            recipients[0].distribution_list_ids,
+            vec!["00000000-0000-0000-0000-000000000000"]
+        );
+        assert_eq!(recipients[0].is_allowed_to_reply, Some(true));
+        assert_eq!(recipients[1].destination_uuid, None);
+        assert!(recipients[1].distribution_list_ids.is_empty());
+        assert_eq!(recipients[1].is_allowed_to_reply, None);
+
+        // The gates: a zero timestamp (no story to address) and an
+        // entry-less array (no face) fall through to the plain sync skip.
+        for broken in [
+            json!({
+                "storyRecipientUpdate": {
+                    "timestamp": 0u64,
+                    "storyMessageRecipients": [
+                        { "distributionListIds": ["00000000-0000-0000-0000-000000000000"] },
+                    ],
+                },
+            }),
+            json!({
+                "storyRecipientUpdate": {
+                    "timestamp": 1726999999000u64,
+                    "storyMessageRecipients": [],
+                },
+            }),
+            json!({
+                "storyRecipientUpdate": {
+                    "timestamp": 1726999999000u64,
+                },
+            }),
+        ] {
+            let fallen = normalize(json!({
+                "timestamp": 1727000000000u64,
+                "source": "+15555550100",
+                "syncMessage": broken,
+            }));
+            assert!(
+                fallen.control.is_none(),
+                "a gated storyRecipientUpdate falls through: {broken}"
+            );
+        }
     }
 
     /// Contract 1.38 (§4.36): a metadata-only view-once marker
