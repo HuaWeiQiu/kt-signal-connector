@@ -42,7 +42,57 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.158 (2026-10-15; the group story receive 翻案
+- Contract revision: 1.159 (2026-10-15; the group leg on the
+  `stories.sendReaction` face (§4.157): the connector half of the
+  engine's group story-reaction batch (engine `a6c0520`, the official
+  ordinary-group-channel alignment — the group story reaction rides the
+  ordinary group channel DataMessage{groupV2, reaction, storyContext}
+  three-key face, `enqueueReactionForSend.preload.ts:84-91`, target
+  conversation = the group itself, not the story channel; the C-S7r
+  unlock key the desktop's S7 outbound range waits on): the optional
+  host `group` key rides onto the engine `sendStoryReaction` frame's
+  `groupId` key verbatim as a raw JSON value (the 1.157 sendStory group
+  posture, the face's second re-key beside 1.152's
+  storySentAt → storyTimestamp — the engine's
+  documented gate owns the whole value domain: a non-string or empty
+  group answers its plain -32603, a non-32B group id its decode refusal,
+  a terminated group and an announcements-only non-admin group its
+  structured -1 `SEND_TARGET_*` faces, all degrading through the ladder
+  to UPSTREAM_ERROR retryable, which connector-side typing would eat);
+  the `remove:true` local refusal keeps its face ahead of the group key
+  on both legs (the engine face carries no remove parameter, so the
+  remove-plus-group combination answers locally, never forwarded); and
+  the additive `group:{groupId,timestamp}` answer passes through
+  untouched — this face has no local projection to re-key (the §4.151
+  verbatim-both-directions posture), so the group answer face needs no
+  local structure, and the §4.155 skip-if-absent/required-pair pinning
+  discipline lands at the engine's answer instead (its fake mirrors the
+  documented shape; the connector's fixture plays it). Absent and null
+  fold to the same no-key state at the serde option layer (the §4.154
+  with_nulls precedent): every pre-1.159 frame and answer reads
+  byte-identically. The §4.151 boundary sentence ("v1 addresses
+  author-direct reactions only") and the §4.77-era recorded reason are
+  overturned in place. The messages.sendReaction widening route stays
+  rejected (the 1469 底稿 verdict: a story has no row to target and a
+  group-inbound author is unresolvable — two breakpoints). Wire
+  additive: one optional key on one existing method, zero new methods/
+  error codes/store moves/capability bits (the `stories` tag widened in
+  place, the 1.82 precedent chain, now reading 1.159 → 1.158 → 1.157 →
+  1.156 → 1.154 → 1.130). Tests 838 → 842 (integration +2: the
+  `tests/story_send_reaction_group.rs` forward arm — the group leg
+  byte-for-byte with the answer face passing through, the raw non-string
+  value riding ungated, the pre-1.159 shape byte-identical — and the
+  error arm — the remove-plus-group local refusal, the marker -32603
+  degrading to UPSTREAM_ERROR retryable on the group path, the
+  engine-down face; lib +2: the frame-ride arm (the verbatim re-keyed
+  group frame, the raw non-string and empty-string values riding
+  ungated) and the null-fold/gate-order arm (the serde null fold with
+  the pre-1.159 frame byte-identical, the remove-plus-group refusal
+  keeping its face ahead of the account ladder, the envelope ladder
+  running on the group path)), all
+  green — fmt, check, clippy, full cargo test, release build, schema
+  parse) —
+  previously 1.158 (2026-10-15; the group story receive 翻案
   (§4.156): the connector-side fold the 1.154 batch recorded as the
   §4.67 group-story boundary is overturned against the official wire —
   the upstream receive routes a reaction by its target row's domain and
@@ -12342,13 +12392,14 @@ Posture (the §4.150 call-event proxy discipline on the stories family):
   no event is emitted, and the receive projection of story-anchored
   reactions is the engine's own batch.
 
-Boundary: v1 still addresses author-direct reactions only — the
-group-story send leg rides the ordinary group channel (reaction +
-storyContext + groupV2) and is contract 1.159, queued. (Contract 1.158
-corrects this paragraph's recorded reason: the story.received
-projection has carried the group context since the engine's E2 batch —
-the real 1.152-era boundary was the send face's own parameter shape,
-never a blind projection.)
+Boundary: the author-direct leg is no longer the whole face — contract
+1.159 (§4.157) adds the group story-reaction leg on this same method
+(the optional `group` key, the ordinary group channel). The 1.152-era
+recorded reason ("a group-story reaction needs the group context the
+story.received projection does not carry") stays corrected per contract
+1.158: the projection has carried the group context since the engine's
+E2 batch — the real 1.152-era boundary was the send face's own
+parameter shape, closed by the engine's group leg (`a6c0520`).
 
 Tests: integration +2 (`tests/story_reaction.rs`) — the forward arm
 (the send-log pinned byte-for-byte on the four-key engine frame with no
@@ -12821,6 +12872,97 @@ disabled deletion rides (the DOE faces do not gate — the 1.154 gate
 overturned), and the
 foreign-author group miss in the author-scope arm rides the candidate
 beside the silent fold. Tests 836 → 838, all green.
+
+### 4.157 The group story reaction crosses the send face: `stories.sendReaction` group (contract revision 1.159, 2026-10-15)
+
+The engine's group story-reaction batch (engine `a6c0520`, the §5
+「群 story 反应发送面」contract节) opened the `sendStoryReaction`
+group leg — the official ordinary-group-channel alignment: a group
+story reaction rides the ordinary group channel as
+`DataMessage{groupV2, reaction, storyContext}` three keys on one
+message (`enqueueReactionForSend.preload.ts:84-91` — the group story's
+target conversation is the group itself, only a 1:1 story switches to
+the author's session; `sendNormalMessage.preload.ts:711-723` — the
+group leg carries no remove parameter, `reactionForSend` hardcodes
+`remove:false`), not the story channel (the 1.151-era wording
+overturned by the engine's own batch). This batch is the connector
+half — the C-S7r unlock key: `stories.sendReaction` params carry
+`deny_unknown_fields` since 1.152, so a desktop sending `groupId` was
+hard-refused at the params face; the host key now rides. The host wire
+key is `group` (the 1.157 sendStory caliber); the engine frame's key
+is `groupId` (the engine `a6c0520` contract) — the prepare re-keys it
+the way 1.152 re-keyed `storySentAt` → `storyTimestamp`, the face's
+second re-key, both directions verbatim otherwise.
+
+Posture (the §4.150/§4.151 proxy constitution on the widened arm, the
+1.157 sendStory group precedent discipline):
+
+- **Bare `Value` by design.** `group` rides the engine frame verbatim
+  as a raw JSON value (the 1.153 three-key / 1.156 storyReplyTimestamp
+  / 1.157 sendStory group posture): the engine's documented gate owns
+  the whole value domain — a non-string or empty group answers its
+  plain -32603, a non-32B group id its decode refusal, a terminated
+  group and an announcements-only non-admin group its structured -1
+  `SEND_TARGET_*` faces, and the group-leg errors walk the same
+  structured send_error single point as the 1.157 group path (degrading
+  to UPSTREAM_ERROR retryable through the ladder). Connector-side
+  typing would eat those faces into a local INVALID_REQUEST with a
+  different code and retryability.
+- **The local gate order does not move.** The one connector refusal —
+  `remove: true` (INVALID_REQUEST, non-retryable, §4.151) — stays
+  ahead of the group key on both legs: the engine face carries no
+  remove parameter, so a remove intent with a group aboard answers
+  locally and never reaches the engine (the remove-plus-group
+  combination is decided entirely at the connector's one local gate;
+  the engine never arbitrates it). The envelope gates (the opaque
+  account ladder plus the standard `operationId` shape check) run on
+  the group path unchanged.
+- **Verbatim in both directions, no local answer structure.** The
+  §4.151 posture already passes the success answer through untouched —
+  this face has no `story_from_engine`-style projection to re-key — so
+  the additive group answer face `group:{groupId,timestamp}` (the
+  engine `a6c0520` documented shape; the 1:1 leg keeps the bare `{}`)
+  crosses with zero connector answer code. The §4.155 pinning
+  discipline (skip-if-absent, the required pair, a malformed face as a
+  protocol defect) lands at the engine's answer instead: the engine's
+  fake mirrors the documented shape, the connector's fixture plays it,
+  and the integration pins the passthrough both ways (the group face
+  rides; the bare `{}` stays byte-identical).
+- **No-null.** Absent and explicit-null fold to the same no-key state
+  at the serde option layer (the §4.154 with_nulls precedent): neither
+  form reaches the gates or the engine frame — the 1:1 leg keeps the
+  pre-1.159 frame byte-identically.
+- **The rejected route stays rejected.** Widening `messages.sendReaction`
+  instead (keying the group reaction off a message row) remains
+  refused — the 1469 底稿 verdict: a story has no row to target and a
+  group-inbound reaction's author is unresolvable from a sender hash,
+  two breakpoints; the story-anchored face is the only honest anchor.
+
+Boundary: the connector does zero group parsing and zero 32B decode —
+the group id is opaque transit end to end (the 1.157 boundary
+verbatim); the group state reads (terminated/announcements-only) are
+the engine's shared group-send path, unreachable to the connector.
+The desktop S7 outbound range (the group reaction UI + the group
+bubble materialization) consumes this key; the receive half is
+contract 1.158 (§4.156). Wire additive: one optional key on one
+existing method, zero new methods/error codes/store moves/capability
+bits — the `stories` tag widened in place (the 1.82 precedent chain,
+now reading 1.159 → 1.158 → 1.157 → 1.156 → 1.154 → 1.130).
+
+Tests: integration +2 (`tests/story_send_reaction_group.rs`) — the
+forward arm (the group single leg byte-for-byte on the send log, the
+answer face passing through, a raw non-string group value riding
+ungated, the pre-1.159 shape byte-identical on frame and answer) and
+the error arm (the remove-plus-group local refusal with zero upstream
+traffic, the marker -32603 degrading to UPSTREAM_ERROR retryable on
+the group path, the engine-down RUNTIME_NOT_RUNNING face); lib +2
+(`story_send_reaction_group_leg_rides_the_frame` — the verbatim
+re-keyed group frame, the raw non-string and empty-string values
+riding ungated; `story_send_reaction_group_null_folds_and_keeps_the_
+gate_order` — the serde null fold with the pre-1.159 frame
+byte-identical, the remove-plus-group refusal ahead of the account
+ladder, the envelope ladder running on the group path). Tests 838 →
+842, all green.
 
 ## 5. signal-cli Boundary
 

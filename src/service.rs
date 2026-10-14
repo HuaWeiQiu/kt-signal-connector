@@ -5240,27 +5240,42 @@ impl ConnectorService {
         }))
     }
 
-    /// stories.sendReaction (contract 1.152, §4.151): the story-anchored
-    /// reaction send, now a true engine passthrough — the §4.150
-    /// call-event posture on the stories family (the engine's story-reaction
-    /// batch S4, kt-signal-engine 4822e99, opened the face). The §4.77
-    /// constant-reject arm (CAPABILITY_UNAVAILABLE after local validation)
-    /// is gone: the connector's gate is the envelope only — the opaque
-    /// account resolution plus the standard `operationId` shape check — and
-    /// every other key rides verbatim (`storyAuthor` the author's address,
-    /// `storyTimestamp` the story's own Signal timestamp, `emoji` the
-    /// reaction): the engine's parse gate owns the whole value domain
-    /// (missing/empty author or emoji, zero timestamp, an unresolvable
-    /// author, the identity-reject and profileSharing gates) and its plain
-    /// -32603 answers through the structured ladder (UPSTREAM_ERROR,
-    /// retryable), never re-gated or re-keyed here. The one refusal the
-    /// connector keeps is `remove: true` (INVALID_REQUEST, non-retryable):
-    /// the official reaction is place-only (sendNormalMessage
-    /// reactionForSend hardcodes `remove:false`, so the engine face carries
-    /// no remove parameter at all) and a remove intent would otherwise
-    /// silently place — a lie, never forwarded. v1 addresses author-direct
-    /// reactions only: a group-story reaction needs the group context the
-    /// story.received projection does not carry (记档边界, not invented).
+    /// stories.sendReaction (contract 1.152, §4.151; the group leg contract
+    /// 1.159, §4.157): the story-anchored reaction send, now a true engine
+    /// passthrough — the §4.150 call-event posture on the stories family
+    /// (the engine's story-reaction batch S4, kt-signal-engine 4822e99,
+    /// opened the face). The §4.77 constant-reject arm (CAPABILITY_
+    /// UNAVAILABLE after local validation) is gone: the connector's gate is
+    /// the envelope only — the opaque account resolution plus the standard
+    /// `operationId` shape check — and every other key rides verbatim
+    /// (`storyAuthor` the author's address, `storyTimestamp` the story's
+    /// own Signal timestamp, `emoji` the reaction): the engine's parse gate
+    /// owns the whole value domain (missing/empty author or emoji, zero
+    /// timestamp, an unresolvable author, the identity-reject and
+    /// profileSharing gates) and its plain -32603 answers through the
+    /// structured ladder (UPSTREAM_ERROR, retryable), never re-gated or
+    /// re-keyed here. The one refusal the connector keeps is `remove: true`
+    /// (INVALID_REQUEST, non-retryable): the official reaction is
+    /// place-only (sendNormalMessage reactionForSend hardcodes
+    /// `remove:false`, so the engine face carries no remove parameter at
+    /// all) and a remove intent would otherwise silently place — a lie,
+    /// never forwarded; the refusal stays ahead of the group key, so the
+    /// remove-plus-group combination answers locally on both legs.
+    /// Contract 1.159 (§4.157): the optional `group` re-keys onto the
+    /// frame's `groupId` key verbatim as a raw value when present (the
+    /// 1.157 sendStory group posture, the face's second re-key beside
+    /// 1.152's storySentAt → storyTimestamp — the engine's group leg
+    /// `a6c0520` owns the whole value
+    /// domain: non-string/empty -32603, the 32B decode refusal, the
+    /// structured -1 SEND_TARGET_* faces), answering the official group
+    /// story reaction — the ordinary group channel DataMessage{groupV2,
+    /// reaction, storyContext} three-key face
+    /// (enqueueReactionForSend.preload.ts:84-91), not the story channel;
+    /// the additive `{group:{groupId,timestamp}}` answer passes through
+    /// untouched (this face has no local projection to re-key). Absent and
+    /// null fold to the same no-key state at the serde option layer (the
+    /// §4.154 with_nulls precedent): the 1:1 author-direct leg keeps the
+    /// pre-1.159 frame byte-identically.
     pub fn prepare_story_send_reaction(
         &self,
         params: &StoriesSendReactionParams,
@@ -5277,12 +5292,19 @@ impl ConnectorService {
             )));
         }
         let account = self.resolve_account(&params.account_id)?;
-        Ok(json!({
+        let mut prepared = json!({
             "account": account.signal_account,
             "storyAuthor": params.story_author,
             "storyTimestamp": params.story_sent_at,
             "emoji": params.emoji,
-        }))
+        });
+        if let Some(group) = &params.group {
+            // The engine frame's key is `groupId` (the engine a6c0520
+            // contract) — the host key re-keys onto it the way 1.152
+            // re-keyed storySentAt → storyTimestamp.
+            prepared["groupId"] = group.clone();
+        }
+        Ok(prepared)
     }
 
     /// stories.deleteForEveryone (contract 1.153, §4.152): the story-anchored
@@ -13270,19 +13292,28 @@ pub struct StoriesMarkViewedParams {
     pub story_sent_at: u64,
 }
 
-/// `stories.sendReaction` params (contract 1.152, §4.151): the story anchor
-/// — the author's address plus the story's own Signal timestamp — and the
-/// reaction itself. The §4.77 engine-gap face is gone: the engine
-/// (`sendStoryReaction`, 4822e99) receives every key verbatim and owns the
-/// whole value domain (missing/empty author or emoji, zero timestamp,
-/// unresolvable author, identity-reject and profileSharing gates answer its
-/// plain -32603 through the structured ladder). `remove` stays on the wire
-/// face but `true` answers INVALID_REQUEST locally — the official reaction
-/// is place-only (remove:false hardcoded upstream), so a remove intent has
-/// no face to forward to and must never silently place. Stories are rowless
-/// (§4.67), so there is no conversation or messageId on this face;
-/// `operationId` rides the standard mutating-call envelope and is validated
-/// when present.
+/// `stories.sendReaction` params (contract 1.152, §4.151; the group leg
+/// contract 1.159, §4.157): the story anchor — the author's address plus
+/// the story's own Signal timestamp — and the reaction itself. The §4.77
+/// engine-gap face is gone: the engine (`sendStoryReaction`, 4822e99)
+/// receives every key verbatim and owns the whole value domain
+/// (missing/empty author or emoji, zero timestamp, unresolvable author,
+/// identity-reject and profileSharing gates answer its plain -32603
+/// through the structured ladder). `remove` stays on the wire face but
+/// `true` answers INVALID_REQUEST locally — the official reaction is
+/// place-only (remove:false hardcoded upstream), so a remove intent has
+/// no face to forward to and must never silently place. Stories are
+/// rowless (§4.67), so there is no conversation or messageId on this
+/// face; `operationId` rides the standard mutating-call envelope and is
+/// validated when present. Contract 1.159 (§4.157): the optional `group`
+/// re-keys onto the engine frame's `groupId` key verbatim as a raw value
+/// (the 1.157 sendStory group posture — the engine's group leg, `a6c0520`,
+/// owns the whole
+/// value domain: a non-string or empty group answers its plain -32603, a
+/// non-32B group id its decode refusal, terminated and announcements-only
+/// groups the structured -1 faces), and the `remove:true` local refusal
+/// keeps its face ahead of the group key — a remove intent never reaches
+/// the engine on either leg.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StoriesSendReactionParams {
@@ -13292,6 +13323,7 @@ pub struct StoriesSendReactionParams {
     pub emoji: String,
     #[serde(default)]
     pub remove: bool,
+    pub group: Option<Value>,
     pub operation_id: Option<String>,
 }
 
@@ -26187,6 +26219,7 @@ mod tests {
                 story_sent_at: sent_at,
                 emoji: emoji.to_string(),
                 remove: false,
+                group: None,
                 operation_id: None,
             };
 
@@ -26264,6 +26297,164 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
+            ServiceError::Store(StoreError::AccountNotFound)
+        ));
+    }
+
+    /// Contract 1.159 (§4.157): the group leg rides the `stories.sendReaction`
+    /// frame verbatim — the group id re-keys onto the engine frame's
+    /// `groupId` key as a raw value (the engine's fail-closed parse owns
+    /// the whole domain: a raw non-string value and the empty string both
+    /// ride ungated, connector typing would eat the engine's refusals).
+    #[test]
+    fn story_send_reaction_group_leg_rides_the_frame() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group_id = "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=";
+
+        // The group single leg: the groupId rides the frame verbatim beside
+        // the unchanged story anchor and emoji keys.
+        let frame = service
+            .prepare_story_send_reaction(&StoriesSendReactionParams {
+                account_id: account.id.clone(),
+                story_author: "+15555550177".into(),
+                story_sent_at: 1727000000000,
+                emoji: "❤️".into(),
+                remove: false,
+                group: Some(Value::String(group_id.into())),
+                operation_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            frame,
+            json!({
+                "account": "+15555550100",
+                "storyAuthor": "+15555550177",
+                "storyTimestamp": 1727000000000u64,
+                "emoji": "❤️",
+                "groupId": group_id,
+            })
+        );
+
+        // A raw non-string group value rides ungated — connector typing
+        // would eat the engine's plain -32603 non-string refusal (the 1.157
+        // sendStory group posture), so the shape forwards as sent.
+        let raw_shape = service
+            .prepare_story_send_reaction(&StoriesSendReactionParams {
+                account_id: account.id.clone(),
+                story_author: "+15555550177".into(),
+                story_sent_at: 1727000000000,
+                emoji: "❤️".into(),
+                remove: false,
+                group: Some(json!({"masterKey": "abc", "revision": 3})),
+                operation_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            raw_shape["groupId"],
+            json!({"masterKey": "abc", "revision": 3})
+        );
+
+        // The empty-string group rides too — the value domain (empty
+        // included) is the engine's refusal.
+        let empty_group = service
+            .prepare_story_send_reaction(&StoriesSendReactionParams {
+                account_id: account.id.clone(),
+                story_author: "+15555550177".into(),
+                story_sent_at: 1727000000000,
+                emoji: "❤️".into(),
+                remove: false,
+                group: Some(Value::String(String::new())),
+                operation_id: None,
+            })
+            .unwrap();
+        assert_eq!(empty_group["groupId"], json!(""));
+    }
+
+    /// Contract 1.159 (§4.157): absent and explicit-null fold to the same
+    /// no-key state at the serde option layer (the pre-1.159 frame stays
+    /// byte-identical), and the local gate order does not move — the
+    /// `remove:true` local refusal keeps its face ahead of the group key on
+    /// both legs (an unknown account id proves the remove gate precedes the
+    /// account ladder with the group leg aboard), and the envelope ladder
+    /// still runs on the group path.
+    #[test]
+    fn story_send_reaction_group_null_folds_and_keeps_the_gate_order() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let group_id = "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=";
+
+        // Absent and explicit-null are the same no-key state: serde folds a
+        // JSON null into None at the option layer, so neither form ever
+        // reaches the frame (the pre-1.159 shape byte-identical).
+        let with_null: StoriesSendReactionParams = serde_json::from_value(json!({
+            "accountId": account.id,
+            "storyAuthor": "+15555550177",
+            "storySentAt": 1727000000000u64,
+            "emoji": "❤️",
+            "group": null,
+        }))
+        .unwrap();
+        assert!(with_null.group.is_none());
+        let null_frame = service.prepare_story_send_reaction(&with_null).unwrap();
+        assert!(null_frame.get("group").is_none());
+        assert_eq!(
+            null_frame,
+            json!({
+                "account": "+15555550100",
+                "storyAuthor": "+15555550177",
+                "storyTimestamp": 1727000000000u64,
+                "emoji": "❤️",
+            })
+        );
+
+        // The gate order does not move: remove:true answers INVALID_REQUEST
+        // ahead of the account ladder even with the group leg aboard — an
+        // unknown account id proves the ordering (the refusal is not an
+        // AccountNotFound).
+        let removal = service
+            .prepare_story_send_reaction(&StoriesSendReactionParams {
+                account_id: "acct-absent".into(),
+                story_author: "+15555550177".into(),
+                story_sent_at: 1727000000000,
+                emoji: "❤️".into(),
+                remove: true,
+                group: Some(Value::String(group_id.into())),
+                operation_id: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            removal,
+            ServiceError::Api(ref api) if api.code == "INVALID_REQUEST" && !api.retryable
+        ));
+
+        // The envelope gate still runs on the group path: an unknown account
+        // with a well-formed group answers AccountNotFound.
+        let unknown = service
+            .prepare_story_send_reaction(&StoriesSendReactionParams {
+                account_id: "acct-absent".into(),
+                story_author: "+15555550177".into(),
+                story_sent_at: 1727000000000,
+                emoji: "❤️".into(),
+                remove: false,
+                group: Some(Value::String(group_id.into())),
+                operation_id: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            unknown,
             ServiceError::Store(StoreError::AccountNotFound)
         ));
     }

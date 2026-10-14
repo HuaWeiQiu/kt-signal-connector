@@ -813,7 +813,15 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `story.deleteCandidate` candidacy event over the group-DOE true buffer
 /// miss, and the stories-disabled gate realigned onto the reaction (the
 /// official stories-blocked whole-envelope drop); the same no-new-bit
-/// discipline) and by revision 1.156 (the §4.154
+/// discipline) and by revision 1.159 (the §4.157 group leg on the
+/// `stories.sendReaction` face — the engine's group story-reaction batch
+/// (engine `a6c0520`), the official ordinary-group-channel alignment: the
+/// optional host `group` key riding onto the engine frame's `groupId` key
+/// verbatim as a raw value (the engine's fail-closed parse owning the
+/// whole value domain), the `remove:true` local refusal keeping its face
+/// ahead of the group key on both legs, and the additive
+/// `group:{groupId,timestamp}` answer passing through untouched; the same
+/// no-new-bit discipline) and by revision 1.156 (the §4.154
 /// story-reply and media-story send legs on the existing send faces — the
 /// `messages.sendText` storyReply context keys riding the send frame
 /// verbatim, the engine's storyContext parse owning the pair discipline and

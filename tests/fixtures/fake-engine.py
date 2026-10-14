@@ -1023,7 +1023,13 @@ for line in sys.stdin:
         # engine's parse/identity/profileSharing gate face (-32603) — the
         # value domain gates are the real engine's fail-closed parse, which
         # the fixture deliberately does not re-implement. Success answers
-        # `{}` (the engine's empty success object).
+        # `{}` (the engine's empty success object). §4.157 (contract 1.159)
+        # the group leg's additive answer face: groupId present (absent =
+        # the pre-1.159 no-group shape) adds {group: {groupId, timestamp}} —
+        # the engine fake discipline (group present = the group face, the
+        # group id echoed and the group leg's own timestamp; the real
+        # engine's group state and member resolution stay unreachable to
+        # the fake).
         with WRITE_LOCK:
             with SEND_LOG.open("a") as log:
                 log.write(json.dumps(params, separators=(",", ":")) + "\n")
@@ -1047,6 +1053,11 @@ for line in sys.stdin:
             emit_json(response)
             continue
         result = {}
+        if params.get("groupId") is not None:
+            result["group"] = {
+                "groupId": params["groupId"],
+                "timestamp": int(time.time() * 1000),
+            }
     elif method == "deleteStoryForEveryone":
         # §4.152 story delete-for-everyone fan-out (contract 1.153, engine
         # 7320393): the engine's deleteStoryForEveryone wire mirror — the

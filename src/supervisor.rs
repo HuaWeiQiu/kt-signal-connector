@@ -2636,19 +2636,22 @@ impl RuntimeSupervisor {
         }
     }
 
-    /// stories.sendReaction (contract 1.152, §4.151): the story-anchored
-    /// reaction send — the §4.150 call-event proxy posture on the stories
-    /// family. The account resolution rides the service prepare, the
-    /// engine's `sendStoryReaction` crosses as its own mutating call (the
-    /// official reactToStory alignment, the Reaction + StoryContext dual
-    /// anchor), the success answer (`{}`) passes through untouched, and the
-    /// error face is the engine's verbatim through the structured ladder:
-    /// the plain -32603 parse/identity/profileSharing faces degrade to
-    /// UPSTREAM_ERROR, the §4.17 unbound matcher still applies, and the
-    /// connector adds no gate of its own (the engine 4822e99 parse owns the
-    /// value domain). Mutating class: a timeout answers SEND_OUTCOME_UNKNOWN
-    /// and is never retried — an unknown reaction outcome may already sit in
-    /// the author's fan-out.
+    /// stories.sendReaction (contract 1.152, §4.151; the group leg contract
+    /// 1.159, §4.157): the story-anchored reaction send — the §4.150
+    /// call-event proxy posture on the stories family. The account
+    /// resolution rides the service prepare, the engine's `sendStoryReaction`
+    /// crosses as its own mutating call (the official reactToStory
+    /// alignment, the Reaction + StoryContext dual anchor), the success
+    /// answer (`{}` on the 1:1 leg, additive `{group:{groupId,timestamp}}`
+    /// on the group leg, engine `a6c0520`) passes through untouched, and
+    /// the error face is the engine's verbatim through the structured
+    /// ladder: the plain -32603 parse/identity/profileSharing faces and the
+    /// group leg's decode/-1-word structured faces degrade to UPSTREAM_ERROR,
+    /// the §4.17 unbound matcher still applies, and the connector adds no
+    /// gate of its own (the engine parse owns the value domain). Mutating
+    /// class: a timeout answers SEND_OUTCOME_UNKNOWN and is never retried —
+    /// an unknown reaction outcome may already sit in the author's or the
+    /// group's fan-out.
     pub async fn send_story_reaction(
         &self,
         params: StoriesSendReactionParams,
@@ -11779,6 +11782,7 @@ mod tests {
                 story_sent_at: 1727000000000,
                 emoji: "👍".into(),
                 remove: false,
+                group: None,
                 operation_id: None,
             })
             .await
@@ -11792,6 +11796,7 @@ mod tests {
                 story_sent_at: 1727000000000,
                 emoji: "👍".into(),
                 remove: true,
+                group: None,
                 operation_id: None,
             })
             .await

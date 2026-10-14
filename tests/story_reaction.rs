@@ -93,6 +93,7 @@ fn reaction(
         story_sent_at: sent_at,
         emoji: emoji.to_string(),
         remove: false,
+        group: None,
         operation_id: None,
     }
 }
