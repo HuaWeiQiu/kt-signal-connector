@@ -6252,6 +6252,38 @@ impl ConnectorService {
         }))
     }
 
+    /// calls.sendCallEvent (contract revision 1.151, §4.150): the call-event
+    /// self-sync forward — the one shape decision this face makes is the
+    /// envelope itself. The opaque account id resolves to the linked number;
+    /// every other key rides verbatim (`type`/`direction`/`event` words, the
+    /// conversationId reference, the optional callId string, the optional
+    /// timestamp value) — the engine's parse gate owns the three word lists,
+    /// the per-leg conversation shapes, the callId domain, and the
+    /// direct/group callId requirement (engine 6d56660 fail-closed), so the
+    /// connector neither interprets nor re-keys any of it. Optional keys
+    /// stay absent, never null (the engine's no-null discipline).
+    pub fn prepare_send_call_event(
+        &self,
+        params: &CallsSendCallEventParams,
+    ) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account_id, "accountId")?;
+        let account = self.resolve_account(&params.account_id)?;
+        let mut prepared = json!({
+            "account": account.signal_account,
+            "type": params.call_type,
+            "direction": params.direction,
+            "event": params.event,
+            "conversationId": params.conversation_id,
+        });
+        if let Some(call_id) = &params.call_id {
+            prepared["callId"] = json!(call_id);
+        }
+        if let Some(timestamp) = &params.timestamp {
+            prepared["timestamp"] = timestamp.clone();
+        }
+        Ok(prepared)
+    }
+
     /// Upstream JSON-RPC send params shared by first dispatch (`dispatch_send`)
     /// and same-row retry (`prepare_retry_text`) — one owner for the wire key
     /// names so the two paths cannot drift.
@@ -13255,6 +13287,30 @@ pub struct CallsEndorsementsPublicKeyParams {}
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CallsRelaysParams {
     pub account_id: String,
+}
+
+/// `calls.sendCallEvent` params (contract revision 1.151, §4.150): the
+/// call-event cross-device sync forward — the minimal type face. The
+/// connector resolves the opaque account id and forwards every other key
+/// verbatim; the word lists, the per-leg conversation shapes, the callId
+/// decimal-u64-string domain, and the per-leg callId requirement are the
+/// engine's own fail-closed parse gate (engine 6d56660), which the host
+/// answers through the structured ladder untouched. The timestamp rides as
+/// the raw JSON value on purpose: the engine's documented gate owns the
+/// whole value domain (positive u64 milliseconds; 负/小数/字符串 all its
+/// refusals), so connector-side typing would eat part of that face instead
+/// of forwarding it.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CallsSendCallEventParams {
+    pub account_id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub direction: String,
+    pub event: String,
+    pub conversation_id: String,
+    pub call_id: Option<String>,
+    pub timestamp: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

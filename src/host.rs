@@ -34,15 +34,16 @@ use crate::service::{
     BackupsRestoreFromCloudParams, BackupsUploadStatusParams, BackupsUploadToCloudParams,
     CallsCreateLinkAuthParams, CallsEndorsementsPublicKeyParams, CallsGetStateParams,
     CallsGroupMembersParams, CallsGroupProofParams, CallsLinkPresentationParams, CallsRelaysParams,
-    CallsSendGroupCallUpdateParams, CallsSendSignalParams, ChatFoldersListParams,
-    ChatFoldersSetRecordsParams, ContactsListParams, ContactsSetLocalAliasParams,
-    ContactsSyncParams, ConversationsClearDraftParams, ConversationsGetAvatarParams,
-    ConversationsGetBlockedParams, ConversationsGetPinnedParams, ConversationsGetStateParams,
-    ConversationsListParams, ConversationsSaveDraftParams, ConversationsSetBlockedParams,
-    ConversationsSetExpireTimerParams, ConversationsSetPinnedParams, ConversationsSetStateParams,
-    GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams, GroupsCancelJoinRequestParams,
-    GroupsCreateParams, GroupsGetParams, GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams,
-    GroupsMigrateParams, GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
+    CallsSendCallEventParams, CallsSendGroupCallUpdateParams, CallsSendSignalParams,
+    ChatFoldersListParams, ChatFoldersSetRecordsParams, ContactsListParams,
+    ContactsSetLocalAliasParams, ContactsSyncParams, ConversationsClearDraftParams,
+    ConversationsGetAvatarParams, ConversationsGetBlockedParams, ConversationsGetPinnedParams,
+    ConversationsGetStateParams, ConversationsListParams, ConversationsSaveDraftParams,
+    ConversationsSetBlockedParams, ConversationsSetExpireTimerParams, ConversationsSetPinnedParams,
+    ConversationsSetStateParams, GroupsApproveJoinRequestsParams, GroupsBuildInviteLinkParams,
+    GroupsCancelJoinRequestParams, GroupsCreateParams, GroupsGetParams,
+    GroupsInviteLinkPasswordParams, GroupsJoinViaLinkParams, GroupsMigrateParams,
+    GroupsParseInviteLinkParams, GroupsPreviewViaLinkParams, GroupsQuitParams,
     GroupsRevokeInvitesParams, GroupsTerminateParams, GroupsUpdateParams,
     HistoryAttachmentDownloadParams, HistoryImportCancelParams, HistoryImportRetryParams,
     HistoryImportStatusParams, HostSideEvent, IdentitiesGetParams, IdentitiesVerifyParams,
@@ -2417,6 +2418,30 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
                 ApiError::new("INVALID_REQUEST", "invalid calls.relays params", false),
             ),
         },
+        // Call-event self-sync proxy (contract revision 1.151, §4.150): the
+        // pure-proxy shape on the send lane — the account resolution rides
+        // the service prepare, every other key crosses verbatim, the
+        // engine's {timestamp} answer and error faces pass through
+        // untouched, and the full parameter gate (the three word lists, the
+        // per-leg conversation shapes, the callId domain, the per-leg
+        // callId requirement) stays the engine's fail-closed parse
+        // (engine 6d56660), never re-gated or re-keyed here.
+        "calls.sendCallEvent" => {
+            match serde_json::from_value::<CallsSendCallEventParams>(request.params) {
+                Ok(params) => match runtime.send_call_event(params).await {
+                    Ok(result) => HostResponse::success(request_id, result),
+                    Err(error) => HostResponse::failure(request_id, error.into_api()),
+                },
+                Err(_) => HostResponse::failure(
+                    request_id,
+                    ApiError::new(
+                        "INVALID_REQUEST",
+                        "invalid calls.sendCallEvent params",
+                        false,
+                    ),
+                ),
+            }
+        }
         "conversations.getPinned" => {
             match serde_json::from_value::<ConversationsGetPinnedParams>(request.params) {
                 Ok(params) => match runtime.get_pinned_conversations(params).await {

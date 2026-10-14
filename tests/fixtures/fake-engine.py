@@ -3661,6 +3661,53 @@ for line in sys.stdin:
                 "expiresAtMs": 86_501_000,
                 "stale": False,
             }
+    elif method == "sendCallEvent":
+        # §4.150 call-event cross-device sync (contract 1.151, engine
+        # 6d56660): the engine's sendCallEvent wire mirror — the
+        # SyncMessage.callEvent=19 self-send face. Same dispatch-recording
+        # discipline as `send`: the exact upstream params, so tests assert
+        # the {account, type, direction, event, conversationId, callId?,
+        # timestamp?} contract byte-for-byte (the callEvent fields are
+        # record metadata, kept verbatim — the send-family discipline). The
+        # account gate rides the same engine-state registry (an
+        # unregistered account answers the plain -32603, the engine's
+        # unknown-account face). The marker `.fixture-call-event-rejected`
+        # answers the engine's parse-gate face (-32603) — the three word
+        # lists, the per-leg conversation shapes, the callId domain, and
+        # the per-leg callId requirement are the real engine's fail-closed
+        # parse gate, which the fixture deliberately does not re-implement.
+        # Success answers {timestamp}: the caller's value when present, the
+        # envelope moment when absent (three legs, same answer shape — the
+        # send-family stub discipline).
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        event_account = None
+        try:
+            state = json.loads((SIGNAL_DATA_DIR / "engine-state.json").read_text())
+            for entry in state.get("accounts") or []:
+                if entry.get("number") == params.get("account"):
+                    event_account = entry["dir"]
+                    break
+        except (OSError, ValueError, KeyError, AttributeError):
+            event_account = None
+        if event_account is None:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        if (SIGNAL_DATA_DIR / ".fixture-call-event-rejected").exists():
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32603, "message": "Internal error"},
+            }
+            emit_json(response)
+            continue
+        result = {"timestamp": params.get("timestamp", 1_000)}
     elif method == "generateInviteLinkPassword":
         # Contract 1.117 §4.98: the account-less material face. No dispatch
         # record (the engine's material faces never log), no account: 16

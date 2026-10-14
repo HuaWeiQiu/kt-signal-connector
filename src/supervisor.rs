@@ -5063,6 +5063,34 @@ impl RuntimeSupervisor {
             .map_err(ServiceError::from)
     }
 
+    /// calls.sendCallEvent (contract revision 1.151, §4.150): the call-event
+    /// self-sync proxy — the §4.143 relays posture on the send lane. The
+    /// account resolution rides the service prepare, the
+    /// SyncMessage.callEvent=19 self-send crosses as the engine's own
+    /// mutating call, the success `{timestamp}` answer passes through
+    /// untouched, and the error face is the engine's verbatim through the
+    /// structured ladder: the plain -32603 parse/unknown-account faces
+    /// degrade to UPSTREAM_ERROR, the §4.17 unbound matcher still applies,
+    /// and the connector adds no gate of its own (the engine 6d56660
+    /// fail-closed parse owns the word lists, the conversation shapes, the
+    /// callId domain, and the per-leg callId requirement). Mutating engine
+    /// class: a timeout answers SEND_OUTCOME_UNKNOWN and is never retried —
+    /// an unknown sync outcome may already sit in the self-device fan-out.
+    pub async fn send_call_event(
+        &self,
+        params: crate::service::CallsSendCallEventParams,
+    ) -> Result<Value, ServiceError> {
+        let prepared = {
+            let service = self.service.lock().await;
+            service.prepare_send_call_event(&params)?
+        };
+        let engine = self.running_engine().await?;
+        engine
+            .call("sendCallEvent", prepared, CallClass::Mutating)
+            .await
+            .map_err(ServiceError::from)
+    }
+
     /// Best-effort "Delete for everyone" for one own sent message
     /// (docs/remote-delete-l2-plan.md): local prepare under the service lock,
     /// upstream `remoteDelete` call without it — the same shape as

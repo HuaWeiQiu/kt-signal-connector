@@ -1337,6 +1337,17 @@ impl ProxyGroupRuntime {
         slot.supervisor.calls_relays(&params.account_id).await
     }
 
+    /// calls.sendCallEvent (contract 1.151, §4.150): the account-scoped
+    /// call-event self-sync proxy — the owning group's engine serves (the
+    /// §4.143 account-scoped posture; the self-send is per-account state).
+    pub async fn send_call_event(
+        &self,
+        params: crate::service::CallsSendCallEventParams,
+    ) -> Result<serde_json::Value, ServiceError> {
+        let slot = self.slot_for_account(&params.account_id).await?;
+        slot.supervisor.send_call_event(params).await
+    }
+
     pub async fn remote_delete(
         &self,
         params: crate::service::MessagesRemoteDeleteParams,

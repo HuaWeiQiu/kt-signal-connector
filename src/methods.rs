@@ -546,6 +546,23 @@ pub const METHODS: &[MethodRow] = &[
     // call chain's own connection material). KT-extension, no upstream
     // connector-side counterpart.
     ("calls.relays", Lane::Read, false, "read"),
+    // Call-event self-sync proxy (contract revision 1.151, §4.150): the
+    // connector-side registration of the engine's `sendCallEvent` — the
+    // SyncMessage.callEvent=19 self-send that mirrors one call-history
+    // state transition to the account's own devices (the official
+    // updateRemoteCallHistory/getDeleteCallEvent alignment). A pure
+    // send-lane proxy: account resolution, the mutating forward, the
+    // engine's {timestamp} answer and error faces through untouched — the
+    // three word lists, the per-leg conversation shapes, the callId
+    // domain, and the direct/group callId requirement are the engine's
+    // fail-closed parse gate (engine 6d56660), never re-gated or re-keyed
+    // here. The event source wiring (one call per local transition) lives
+    // in the calling sidecar (queued); desktop consumption is queued.
+    // Advertised through the existing `call-signaling` tag, widened in
+    // place (the 1.82/1.88/1.127/1.145 precedent — the call-event sync is
+    // the call chain's own history face). KT-extension, no upstream
+    // connector-side counterpart.
+    ("calls.sendCallEvent", Lane::Send, true, "send"),
     // Chat-folder sync (contract 1.95, §4.78): chatFolders.list is a bounded
     // cloud-backed read of the account's ChatFolderRecord set;
     // chatFolders.setRecords is the mutating storage-service write —
@@ -693,8 +710,8 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// avatar download and blocked-bit write faces; `report-spam` (contract
 /// revision 1.49) marks the §4.48 report face (`messages.reportSpam` plus
 /// the row-level serverGuid persistence); `call-signaling` (contract
-/// revision 1.51, widened in place by 1.82, by 1.88, by 1.127, and by
-/// 1.145) marks
+/// revision 1.51, widened in place by 1.82, by 1.88, by 1.127, by
+/// 1.145, and by 1.151) marks
 /// the §4.49
 /// call signaling faces (`calls.sendSignal` — the 1:1 and, since 1.82, the
 /// group-addressed route — plus the `call.incoming` and `call.groupIncoming`
@@ -706,7 +723,10 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// face; the same no-new-bit discipline) and, since 1.145, the §4.143
 /// call-relay configuration proxy (`calls.relays` — the desktop calling
 /// chain's ICE/TURN connection material, the engine's own cache and
-/// freshness story proxied untouched);
+/// freshness story proxied untouched) and, since 1.151, the §4.150
+/// call-event self-sync proxy (`calls.sendCallEvent` — the call chain's
+/// own cross-device history face, the engine's SyncMessage.callEvent=19
+/// self-send with the full parameter gate proxied verbatim);
 /// `group-terminate` (contract revision 1.52) marks the §4.50 termination face
 /// (`groups.terminate`); `group-join-approve` (contract revision 1.58) marks
 /// the §4.53 join-request approval face (`groups.approveJoinRequests`);
@@ -956,6 +976,7 @@ mod tests {
             "attachments.download",
             "calls.sendSignal",
             "calls.sendGroupCallUpdate",
+            "calls.sendCallEvent",
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",
@@ -1031,6 +1052,7 @@ mod tests {
             "attachments.download",
             "calls.sendSignal",
             "calls.sendGroupCallUpdate",
+            "calls.sendCallEvent",
             "accounts.setUsername",
             "conversations.acceptRequest",
             "conversations.declineRequest",

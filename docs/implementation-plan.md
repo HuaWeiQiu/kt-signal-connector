@@ -42,7 +42,29 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.150 (2026-10-14; the voice waveform rides the receive
+- Contract revision: 1.151 (2026-10-14; the call-event self-sync crosses the
+  connector (§4.150): `calls.sendCallEvent` — the host-side registration of
+  the engine's `sendCallEvent` (engine 6d56660, SyncMessage.callEvent=19,
+  the official updateRemoteCallHistory/getDeleteCallEvent alignment) —
+  forwards one call-history state transition to the account's own devices.
+  Pure send-lane proxy: the connector's gate is the envelope (the opaque
+  account resolution plus the required-key/JSON-type face), every other
+  key rides verbatim, the engine's full-parameter fail-closed parse gate
+  (the three word lists, the per-leg conversation shapes, the callId
+  decimal-u64 domain, the direct/group callId requirement) answers through
+  the structured ladder verbatim (the plain -32603 → UPSTREAM_ERROR
+  retryable), the success `{timestamp}` passes through untouched, and an
+  indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN, never
+  retried. Wire additive: one new method, zero new events/error codes/
+  store moves (the `call-signaling` capability widened in place, the
+  1.82/1.88/1.127/1.145 precedent). The event source wiring lives in the
+  calling sidecar (queued), desktop consumption queued. Tests 817 → 819
+  (integration +2: the forward arm — the direct leg with every key and the
+  ad-hoc leg with both optional keys absent, the send-log pinned
+  byte-for-byte per leg, the `{timestamp}` echo; the error arm — the
+  engine's parse-gate face, the unknown engine account, the engine-down
+  face; lib: the registry/lane grouping rows), all green) —
+  previously 1.150 (2026-10-14; the voice waveform rides the receive
   descriptor verbatim (§4.149): the engine's voice-waveform batch (b656714)
   auto-generates `AttachmentPointer.audioWaveform` (field 21, a fixed
   100-byte 0..255 dB bucket vector) and `audioDurationSeconds` (field 22,
@@ -11936,6 +11958,74 @@ receive carrying a voice attachment (the pinned 100-byte waveform +
 `duration: 3.7`) beside a plain attachment: the upsert event and the
 `messages.list` row both carry the pair byte-for-byte and the plain
 descriptor never grows the keys. Tests 814 → 817, all green.
+
+### 4.150 The call-event self-sync crosses the connector: `calls.sendCallEvent`, the proxy face the connector adds nothing to (contract revision 1.151, 2026-10-14)
+
+The engine's call-event batch (kt-signal-engine `6d56660`) opened the
+outbound half of call-history sync: `sendCallEvent` folds one call-history
+state transition into `SyncMessage.callEvent=19` and self-sends it to the
+account's own devices (the presage self-send channel, the sendViewOnceOpen
+posture), the official updateRemoteCallHistory/getDeleteCallEvent
+alignment. The engine's parse gate is full-parameter fail-closed: the
+three word lists (`type` audio|video|group|ad-hoc, `direction`
+incoming|outgoing, `event` accepted|not-accepted|delete|observed), the
+conversationId shape per leg (direct = number/service-id, group = the
+32-byte master key standard base64, ad-hoc = the roomId lowercase hex —
+the inverse of the inbound projection), the callId decimal-u64-string
+domain with the direct/group legs requiring it and ad-hoc optional (the
+official call-link placeholder that sends only the timestamp), and the
+positive-integer timestamp (absent = the envelope moment). This batch
+builds the connector leg so the upstream caller can reach the face; the
+desktop consumption half is queued.
+
+Posture (the §4.143 relays proxy discipline on the send lane):
+
+- **The connector's gate is the envelope only.** The opaque account id
+  resolves to the linked number and every other key rides verbatim —
+  the word lists, the per-leg conversation shapes, the callId domain,
+  and the per-leg callId requirement are never re-gated, re-keyed, or
+  re-shaped here; a semantic refusal is the engine's plain -32603
+  through the structured ladder (UPSTREAM_ERROR, retryable — the same
+  face the relays proxy hands back), and the §4.17 unbound matcher still
+  applies (the connector adds no matcher of its own).
+- **Verbatim in both directions.** The success `{timestamp}` — the
+  engine's envelope timestamp, the caller's value when it supplied one —
+  passes through unparsed; optional keys stay absent, never null (the
+  no-null discipline); unknown host keys fail the params face locally
+  (the deny_unknown_fields envelope, every forwarding method's posture).
+  The `timestamp` param rides as the raw JSON value on purpose: the
+  engine's documented gate owns the whole value domain (positive u64
+  milliseconds; 负/小数/字符串 are all its refusals), so connector-side
+  typing would eat part of that face instead of forwarding it.
+- **Mutating class, the send lane.** The face is a SyncMessage self-send
+  (the sendViewOnceOpen class): the reaction-class write-lane mutex and
+  delete drain barrier, and an indeterminate outcome answers
+  SEND_OUTCOME_UNKNOWN — never retried (an unknown sync outcome may
+  already sit in the self-device fan-out).
+- **No new capability bit.** Advertised through the existing
+  `call-signaling` tag, widened in place (the 1.82/1.88/1.127/1.145
+  precedent — the call-event sync is the call chain's own history face).
+  KT-extension, no upstream counterpart.
+- **Zero store involvement.** No row, no ledger, no schema move: the
+  connector is the pipe; the call state machine lives in the desktop +
+  calling sidecar (the §4.49 honest-registry posture), and the receive
+  projection of the same sync messages is the engine's (§3 receive row).
+
+Boundary: the event source wiring — one engine call per local
+call-history transition, the statusToProto mapping (Accepted → accepted,
+Declined → not-accepted, Deleted → delete, generic ad-hoc → observed) —
+is the kt-signal-calling sidecar's batch (queued); the desktop
+consumption of the mirrored records is its own queued batch.
+
+Tests: integration +2 (`tests/call_events.rs`) — the forward arm (the
+direct leg with every documented key and the ad-hoc leg with both
+optional keys absent, the send-log pinned byte-for-byte per leg with the
+resolved signal account, the `{timestamp}` echo and the envelope-moment
+answer) and the error arm (the engine's parse-gate -32603 face through
+the ladder to UPSTREAM_ERROR retryable, the unknown engine account, the
+engine-down RUNTIME_NOT_RUNNING face); lib: the registry/lane grouping
+rows (the send-lane/mutating classification table grows the new method).
+Tests 817 → 819, all green.
 
 ## 5. signal-cli Boundary
 
