@@ -1,9 +1,10 @@
 # `runtime.doctor` — the read-only diagnostic face
 
-Contract revisions 1.97 (§4.79), 1.101 (§4.82), and 1.133 (§4.116) of
-`docs/implementation-plan.md` are the normative specification; this document is
-the field-level quick reference for consumers (the desktop support surface). The
-method answers the whole diagnostic payload in one Control-lane call.
+Contract revisions 1.97 (§4.79), 1.101 (§4.82), 1.133 (§4.116), and 1.163
+(§4.161) of `docs/implementation-plan.md` are the normative specification; this
+document is the field-level quick reference for consumers (the desktop support
+surface). The method answers the whole diagnostic payload in one Control-lane
+call.
 
 ## Call
 
@@ -28,9 +29,10 @@ The doctor never acts. Concretely:
   the lock-file read is capped at 32 bytes, and the engine is asked only
   through its existing read face with a 3-second budget (a wedged engine
   cannot hold a diagnostic anywhere near the ordinary 15 s request timeout);
-- it makes no network request beyond the two declared service-plane probes
+- it makes no network request beyond the three declared service-plane probes
   below (read-only GETs to fixed compile-time URLs, 3-second budget each,
-  through the launcher's SOCKS proxy environment when present).
+  through the launcher's SOCKS proxy environment when present; the third is
+  the 1.163 system-trust leg).
 
 The report is a snapshot: by the time the caller reads a field the process
 may have moved on. Nothing in the answer is a lease or a reservation.
@@ -57,7 +59,8 @@ may have moved on. Nothing in the answer is a lease or a reservation.
                                     "count", "lastAtUnixMs" } ] },
   "service":      { "proxyConfigured",
                     "chat":    { "classification", "status"?, "latencyMs"? },
-                    "storage": { "classification", "status"?, "latencyMs"? } }
+                    "storage": { "classification", "status"?, "latencyMs"? },
+                    "systemTrust"?: { "classification", "status"?, "latencyMs"? } }
 }
 ```
 
@@ -65,6 +68,8 @@ may have moved on. Nothing in the answer is a lease or a reservation.
 absent (not null) when the value does not apply. `face?|` is the engine's own
 answer verbatim; `face?*` (the `perfMetrics` face, contract 1.133) is the
 connector's allowlist projection — see the perf-metrics face below.
+`systemTrust?` (contract 1.163) is present exactly when `proxyConfigured` is
+true — see the service face below.
 
 ## Engine face
 
@@ -212,34 +217,60 @@ until a Windows test host exists; every other field behaves identically.
 
 ## Service face
 
-`service` is the doctor's only outbound network surface — two read-only HTTPS
-GETs through the launcher's SOCKS proxy environment:
+`service` is the doctor's only outbound network surface — read-only HTTPS GETs
+through the launcher's SOCKS proxy environment, on a deliberate dual track
+(contract 1.163):
 
 - `proxyConfigured` is whether the process environment carries a well-formed
   `KT_SIGNAL_SOCKS_PROXY` (`host:port`, the variable the engine child inherits;
   an explicit `socks5(h)://` prefix is tolerated). Per-group proxy plans are
   deliberately not consulted: the probe reflects the process-wide launch
   environment, so a flag-only proxy reads as unconfigured. When false, both
-  probes answer `not_configured` and no request is attempted at all.
-- `chat` is `GET https://chat.signal.org/v1/accounts/whoami` (unauthenticated —
-  read the link healthy at the service edge's own 401); `storage` is
-  `GET https://storage.signal.org/` (any HTTP response is a healthy link).
-- The client is built fresh per diagnostic: HTTPS only, the vendored Signal
+  strict probes answer `not_configured`, `systemTrust` is absent (no probe
+  ran — absence, never a literal, is how the wire says so), and no request is
+  attempted at all.
+- The **strict pair** `chat` (`GET
+  https://chat.signal.org/v1/accounts/whoami`, unauthenticated — read the link
+  healthy at the service edge's own 401) and `storage` (`GET
+  https://storage.signal.org/` — any HTTP response is a healthy link) ride one
+  client built fresh per diagnostic: HTTPS only, the vendored Signal
   production root CA as the **only** trust anchor (the kt-engine's
   tls_certs_only attitude — the probe validates exactly the TLS reality the
   engine's own traffic meets), the launcher proxy as a `socks5h://` route
   (remote DNS, matching the engine's `ALL_PROXY` mapping), 3-second connect
   and overall budgets, redirects off.
+- The **system-trust leg** `systemTrust` (contract 1.163, §4.161) probes the
+  same chat target through the same route on its own client — the platform
+  trust store with **no** custom anchor: on macOS the Security.framework
+  trust settings across the user, admin, and system domains (a user-installed
+  CA included), the official desktop's own posture (Chromium + system store),
+  and the same roots the connector's CDN attachment-download client rides.
+  Present exactly when `proxyConfigured` is true; independent of the strict
+  pair by construction (each side builds its own client and either verdict
+  stands alone).
 
-Each probe's `classification` is exactly one fixed literal:
+**The dual-track consumption contract** (the desktop's proxy self-check reads
+this; the implementation batch lives on the desktop side): `chat`/`storage`
+classifying `tls_failed` while `systemTrust` classifies `http` means the
+pinned-anchor plane fails but the system-trust plane works end to end — the
+*official-equivalent usable* verdict. The official desktop under the same
+proxy stays silent (its Chromium trusts what the user's system trusts), so the
+banner must not scream: treat that combination as passing (a non-blocking
+notice at most). Only when `systemTrust` also fails to reach (`tls_failed`/
+`timeout`/`socks_refused`) is the link genuinely broken and the blocking
+warning honest. `systemTrust` absent (pre-1.163 connector or unconfigured
+face) keeps the pre-1.163 reading of the strict legs.
+
+Each probe's `classification` is exactly one fixed literal (the same
+vocabulary on both tracks — no new literal was invented):
 
 | `classification`  | meaning |
 | ----------------- | ------- |
 | `http`            | the service edge answered; the only classification carrying `status` (the HTTP status code) and `latencyMs` |
 | `timeout`         | the 3-second connect or overall budget was exhausted |
 | `socks_refused`   | the SOCKS-routed link was refused at or below the proxy hop (proxy down, proxy refused, upstream refused through the tunnel) |
-| `tls_failed`      | the link reached the TLS handshake and failed against the pinned CA — a trust mismatch, distinct from a dead route |
-| `not_configured`  | no proxy environment — the probe never ran |
+| `tls_failed`      | the link reached the TLS handshake and failed — a trust mismatch (pinned CA rejecting, or the platform store empty/rejecting on the system leg), distinct from a dead route; also the fold for a system-trust client build failure (zero valid platform roots found) |
+| `not_configured`  | no proxy environment — the probe never ran (strict legs only; `systemTrust` is absent instead) |
 
 The mapping is a pure function over the transport error's own kind flags and a
 source-chain marker walk; it is pinned by unit tests with no network. The red

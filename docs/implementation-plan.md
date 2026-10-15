@@ -42,7 +42,46 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.162 (2026-10-15; the in-conversation search scope
+- Contract revision: 1.163 (2026-10-15; the TLS trust-chain alignment
+  (§4.161): the 2026-10-15 real-device pain point + the user's own words
+  「别把处理代理的任务给客户」 — the user runs a Shadowrocket MITM proxy (TUN +
+  fake-ip, its CA installed into the macOS system keychain); the official
+  Signal desktop (Chromium + system trust chain) stays silently healthy on
+  the same machine while our connector's attachment CDN downloads all die
+  (「对方发来的媒体暂时无法下载：附件数据不可用」), because the data-plane
+  client rode the compiled-in webpki root set, which never reads the system
+  keychain and therefore can never trust the user's proxy CA. The fix aligns
+  the connector with the official posture — trust the system store; the
+  user's proxy and the customer stay untouched. Three moves: ① the reqwest
+  feature swaps `rustls-tls-webpki-roots` → `rustls-tls-native-roots` (the
+  rustls stack kept, only the root source changes; `rustls-native-certs`
+  walks the Security.framework trust settings on macOS — user/admin/system
+  domains, a user-installed CA included — and the platform store on
+  Linux/Windows), so the §4.38 step-3 CDN attachment-download client now
+  accepts exactly what the official desktop accepts; no wire face, recorded
+  in-batch. ② the doctor's service plane (§4.79) grows the dual track: the
+  strict vendored-CA-pinned pair (chat/storage) keeps its name, its
+  classification literals, and its `tls_built_in_root_certs(false)` +
+  `add_root_certificate` posture byte-for-byte, and a second probe — the
+  same chat target, the same route, the platform trust store, no custom
+  anchor — rides the additive optional `service.systemTrust` key (a
+  `ServiceProbe`-shaped face: the same fixed literal vocabulary, `status`/
+  `latencyMs` riding only with `http`; present exactly when `proxyConfigured`
+  is true, absent — never a literal — on the unconfigured face). The strict
+  pair failing `tls_failed` while `systemTrust` answers `http` is the
+  *official-equivalent usable* verdict the desktop's proxy self-check reads
+  (consumption contract recorded; the desktop batch is downstream, zero
+  tickets opened in this batch). Wire additive: one optional key on the
+  doctor report face only, every existing key and classification literal
+  untouched, zero new methods/events/error codes/store moves/capability
+  bits. Schema: no change — the schema carries no `runtime.doctor` result
+  def (the response `result` is free-form), so there is nothing to extend
+  and the consistency pointers stay put. ③ docs/doctor-contract.md updated
+  (the consumer quick reference gains the leg, its presence rule, and the
+  dual-track consumption contract). Tests 853 → 856 (lib +3), all green —
+  fmt, check, clippy, full cargo test, release build, schema parse +
+  consistency) —
+  previously 1.162 (2026-10-15; the in-conversation search scope
   (§4.160): the B3 chat/messaging batch (the user's 2026-10-15
   chat/sync-first directive) — `messages.search` gains the optional
   `conversationId` param, the official search-in-conversation posture
@@ -13408,6 +13447,129 @@ empty-query faces inside a known and an unknown scope); lib +1 — the
 store filter arm (scope filtering, the key-absent account-wide face
 unchanged, cursor paging inside the scope, the cross-scope replay
 semantics).
+
+### 4.161 The TLS trust chain aligns with the official batch: system roots on the data plane, the doctor's dual track (contract revision 1.163, 2026-10-15)
+
+The empirical shape (2026-10-15, the user's real device): the user runs a
+Shadowrocket proxy on macOS — TUN + fake-ip + the system HTTP proxy at
+`127.0.0.1:1082`, its CA installed into the system keychain. On that machine
+the official Signal desktop is **silently healthy** (Chromium rides the system
+trust chain, and the user opted into the proxy's CA, so every MITM'd hop
+validates), while our connector's data plane — the §4.38 step-3 CDN
+attachment-download client — died on every download
+(「对方发来的媒体暂时无法下载：附件数据不可用」). The root cause is one Cargo
+feature: `rustls-tls-webpki-roots` bakes a compiled-in root set into the
+binary, which never reads the system keychain and therefore can never trust
+the CA the user themselves installed. The user's verdict, verbatim: 「别把
+处理代理的任务给客户」 — handling the proxy is our job, not the customer's.
+The alignment direction follows: **fix us, align with the official = trust
+the system certificate store**; the user's proxy keeps zero changes and the
+customer performs zero operations.
+
+**① The data plane switches to the system trust chain.** The reqwest feature
+swaps `rustls-tls-webpki-roots` → `rustls-tls-native-roots` — the rustls
+stack kept, only the root *source* changes. `rustls-native-certs` 0.8.5 read
+first-hand (the actual vendored source, not the docs): on macOS it walks the
+Security.framework trust settings across `Domain::User → Admin → System`
+(user overrides admin overrides system; an empty trust-settings array means
+*always trust as root* — a user-installed CA in any domain lands in the
+store); on Linux it reads the standard paths (honoring `SSL_CERT_FILE`/
+`SSL_CERT_DIR`); on Windows the system store via `schannel`. The one client
+this silently re-anchors is the `attachment_download_client` (supervisor) —
+it configures no roots of its own, so it follows the feature; the doctor's
+strict client pins its own anchor and is unaffected by the switch. No wire
+face exists for a Cargo feature, so this move is recorded in-batch under this
+revision without a schema touch. After this batch the connector's CDN
+download accepts exactly the TLS reality the official desktop accepts — under
+a MITM proxy the user trusted, and under no proxy at all, alike.
+
+**② The doctor's dual-track adjudication (§4.79 wire face, additive).** The
+strict probe pair (§4.79: chat + storage on the vendored Signal production
+root CA, `tls_built_in_root_certs(false)` + `add_root_certificate` — the
+kt-engine `tls_certs_only` attitude, the probe validating exactly the TLS
+reality the engine's own traffic meets) keeps its name, its five
+classification literals, and its bytes byte-for-byte. The batch adds a second
+probe: the same chat target (`https://chat.signal.org/v1/accounts/whoami`),
+the same launcher `socks5h://` route, the same 3-second budgets, redirects
+off — on its own client built with **no custom anchor**, so it rides the
+platform store (the feature switch above). The face key is
+`service.systemTrust`, additive and optional, shaped exactly like its
+siblings (`classification` always; `status`/`latencyMs` riding only with
+`http`; the same fixed literal vocabulary — no sixth literal invented). The
+presence rule: present exactly when `proxyConfigured` is true; on the
+declared unconfigured face the key is **absent** — no probe ran, and absence
+(not a `not_configured` literal) is how the wire says so; a system-trust
+client build failure folds to `tls_failed` like the strict pair's build
+failure always has. The two tracks are independent by construction (separate
+clients, concurrent probes, either verdict stands alone). The consumption
+contract: `chat`/`storage` classifying `tls_failed` while `systemTrust`
+classifies `http` is the **official-equivalent usable** verdict — the
+pinned-anchor plane fails but the system-trust plane works end to end, which
+is precisely the user's MITM situation and precisely what the official
+desktop tolerates silently. The desktop's proxy self-check
+(`signalConnectivityCopy.ts` banner policy) is the downstream consumer batch;
+this batch opens zero desktop tickets and only records the contract (see
+boundaries).
+
+**Site audit (the whole repository, all `reqwest::Client::builder()`
+sites):** exactly four exist, three functional + one test fixture —
+`doctor.rs service_client` (the strict leg, keeps its vendored pin,
+deliberate), `doctor.rs system_trust_client` (new, the system-trust leg, no
+anchor by design), `supervisor.rs attachment_download_client` (the data
+plane, follows the feature → now system roots), and the `socks_refused`
+doctor unit fixture (a dead loopback SOCKS proxy, fails before any TLS —
+root source irrelevant). No `tls_built_in_root_certs(false)` /
+`danger_accept_invalid_certs` counter-site exists anywhere else; the vendored
+`vendor/certs/production-root-ca.pem` stays exactly where it is, still
+consumed by the strict leg alone.
+
+Boundaries, all recorded: **①the engine's `tls_certs_only` attitude is
+untouched by this batch** — the kt-engine pins the same vendored Signal
+production root CA as its single anchor for its own upstream traffic, and the
+empirical evidence on the user's machine is that the engine's history-download
+supplement worked fine under the same MITM environment (its pinned CA
+validated the un-MITM'd Signal CDN chain), so there is no observed failure to
+fix there; the strict doctor legs intentionally keep mirroring that engine
+reality. **②the desktop consumer batch is downstream and unbilled here** —
+the self-check banner policy (strict `tls_failed` + `systemTrust` `http` ⇒
+pass, at most a non-blocking notice; only a `systemTrust` failure is a
+genuinely broken link worth the blocking warning) is the contract recorded in
+`docs/doctor-contract.md`; the desktop batch that consumes it lands
+separately (queued behind this batch in the parity pipeline). **③the
+no-system-certs environments are recorded honestly from the source** (reqwest
+0.12.28 `async_impl/client.rs` read first-hand): an empty platform store with
+zero load errors builds the client normally and every TLS handshake then
+fails — the CDN downloads answer their existing UPSTREAM_ERROR face and the
+doctor leg answers `tls_failed`; a store that yields zero valid and ≥1
+invalid/error makes the client **build fail**, folding to the same
+`tls_failed` literal (doctor) / `ServiceError::Io` (CDN client); ≥1 valid
+root with parse failures keeps the valid ones (native stores often carry
+ancient junk — reqwest's own precedent); there is **no webpki fallback** —
+the compiled-in set is gone from the build, so a Linux container must ship
+`ca-certificates` or all connector TLS fails honestly (this batch's CI runs
+macOS and the full suite stays green; the boundary matters for future Linux
+deployment).
+
+Wire additive: one optional key on the §4.79 doctor report face, zero
+existing keys moved or retyped, zero classification literals changed, zero
+new methods/events/error codes/store moves/capability bits (the doctor rides
+the handshake advertisement as always). Schema: no change — the schema
+declares no `runtime.doctor` result def (the response's `result` is
+free-form), so there is nothing to extend and the consistency pointers stay
+put. Tests 853 → 855 (lib +2): the dual-track face forms
+(`system_trust_face_rides_both_forms_additively` — the absent form keeping
+the pre-1.163 key set exactly, the present form riding the sibling probe
+shape next to untouched strict legs) and the independent client builds
+(`dual_track_clients_build_independently` — the strict client keeps its
+static vendored anchor, the system-trust client builds on the platform store
+whatever it holds); the literal mapping is shared code already pinned by
+`service_probe_classification_maps_every_literal` (its unconfigured arm now
+also pins the key's absence), the structure test carries the present-form
+assertions, and the integration `not_configured` test pins the absence over
+the wire. The data plane has no feasible TLS unit test (a real CDN
+handshake is not a fixture); recorded honestly — the full existing suite
+(all local fake/mocked faces, HTTP loopback wiremock included) is the
+regression, and the feature switch touches no test-visible byte of it.
 
 ## 5. signal-cli Boundary
 

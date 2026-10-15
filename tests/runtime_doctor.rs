@@ -349,7 +349,10 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
     // The service-plane face (revision 1.97): fixed classification literals
     // only; `status`/`latencyMs` ride exclusively with `http`. The
     // environment here is whatever the test host exported, so only the
-    // contract shape is pinned, not a specific classification.
+    // contract shape is pinned, not a specific classification. The 1.163
+    // system-trust leg is additive and environment-tolerant: present exactly
+    // when a proxy was configured, riding the same literal family and the
+    // same status/latency discipline.
     let service = &result["service"];
     assert!(service["proxyConfigured"].is_boolean());
     let literals = [
@@ -380,6 +383,36 @@ async fn doctor_reports_versions_data_dir_lock_errors_and_reachability() {
                 service[probe].get("latencyMs"),
                 None,
                 "{probe}: latencyMs rides only with http"
+            );
+        }
+    }
+    match service
+        .as_object()
+        .expect("service face")
+        .get("systemTrust")
+    {
+        Some(system_trust) => {
+            assert!(
+                service["proxyConfigured"] == json!(true),
+                "the system-trust leg is present only on the configured face"
+            );
+            let classification = system_trust["classification"].as_str().unwrap_or_default();
+            assert!(
+                literals.contains(&classification),
+                "systemTrust classification must be a contract literal, got {classification:?}"
+            );
+            if classification == "http" {
+                assert!(system_trust["status"].is_u64());
+                assert!(system_trust["latencyMs"].is_u64());
+            } else {
+                assert_eq!(system_trust.get("status"), None);
+                assert_eq!(system_trust.get("latencyMs"), None);
+            }
+        }
+        None => {
+            assert!(
+                service["proxyConfigured"] == json!(false),
+                "an absent system-trust leg is the unconfigured face only"
             );
         }
     }
@@ -447,6 +480,8 @@ async fn doctor_credentials_face_reports_credentials_invalid_on_auth_failure() {
 /// without the launcher proxy environment answers `proxyConfigured: false`
 /// and both probes `not_configured`, with no `status`/`latencyMs` anywhere —
 /// the only path where the doctor deliberately never touches the network.
+/// The 1.163 system-trust leg stays absent on this face: no probe ran, and
+/// absence (not a literal) is how the wire says so.
 #[tokio::test]
 async fn doctor_service_face_answers_not_configured_without_proxy_env() {
     let temp = TempDir::new().unwrap();
@@ -468,6 +503,14 @@ async fn doctor_service_face_answers_not_configured_without_proxy_env() {
         assert_eq!(service[probe].get("status"), None);
         assert_eq!(service[probe].get("latencyMs"), None);
     }
+    assert_eq!(
+        service
+            .as_object()
+            .expect("service face")
+            .get("systemTrust"),
+        None,
+        "the unconfigured face carries no system-trust leg at all"
+    );
 
     drop(client);
     let _ = connector.kill().await;

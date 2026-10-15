@@ -7270,7 +7270,14 @@ fn map_download_failure(failure: crate::history_attachment::DownloadFailure) -> 
 /// mapping the engine child gets, so a walled or DNS-poisoned network still
 /// reaches the transit CDN over the route the engine's own transport takes.
 /// A missing or malformed value builds the direct client: byte-for-byte the
-/// behavior before the route existed.
+/// behavior before the route existed. Trust anchor (contract revision 1.163,
+/// §4.161): the platform trust store (the `rustls-tls-native-roots` chain —
+/// on macOS the Security.framework keychains, user-installed CAs included),
+/// the official desktop's own posture (Chromium + system store); until this
+/// revision the client rode the compiled-in webpki set, which a user-trusted
+/// MITM proxy's CA could never satisfy and the attachment downloads died on
+/// while the official desktop stayed silent. No custom anchor, no override:
+/// this client and the doctor's system-trust leg are the same trust story.
 fn attachment_download_client(proxy: Option<&str>) -> Result<reqwest::Client, ServiceError> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(crate::history_attachment::CONNECT_TIMEOUT)

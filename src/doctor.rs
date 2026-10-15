@@ -27,7 +27,11 @@
 //! - the Signal service plane (revision 1.97): the doctor's ONLY declared
 //!   direct network probes — two read-only HTTPS GETs (chat, storage) through
 //!   the launcher's SOCKS proxy environment, each folding into one fixed
-//!   classification literal. The report never carries error text, request
+//!   classification literal, plus (revision 1.163, §4.161) the system-trust
+//!   leg: the same chat target through the same route riding the platform
+//!   trust store with no custom anchor — the official desktop's own trust
+//!   posture — answering the same literal family as an additive optional
+//!   face key. The report never carries error text, request
 //!   content, a URL, or a proxy endpoint.
 //! - the per-group credential state (revision 1.101): one read-only
 //!   `getUserStatus` ride through each group's own live engine — the
@@ -132,6 +136,21 @@ pub struct ServiceFace {
     pub chat: ServiceProbe,
     /// `GET https://storage.signal.org/` (any HTTP response is healthy).
     pub storage: ServiceProbe,
+    /// The system-trust leg (contract revision 1.163, §4.161): the chat
+    /// target through the same route, riding the platform trust store (the
+    /// `rustls-tls-native-roots` chain — on macOS the Security.framework
+    /// keychains, user-installed CAs included) with **no** custom anchor —
+    /// the official desktop's own trust posture (Chromium + system store).
+    /// Present exactly when `proxyConfigured` is true (the declared
+    /// unconfigured path probes nothing); absent means "no probe ran", never
+    /// "probe failed". `classification === "http"` ⇒ the system-trust plane
+    /// is usable end to end — the verdict the desktop reads against a
+    /// pinned-anchor `tls_failed` to conclude *official-equivalent usable*
+    /// (a MITM proxy whose CA the user trusts breaks the engine-pinned leg
+    /// but not this one). Strict and system legs are independent by
+    /// construction: either can answer while the other fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_trust: Option<ServiceProbe>,
 }
 
 /// One service-plane probe's outcome, folded into exactly one fixed
@@ -908,31 +927,58 @@ async fn service_face_for(proxy: Option<SocksProxy>) -> ServiceFace {
             proxy_configured: false,
             chat: probe.clone(),
             storage: probe,
+            system_trust: None,
         };
     };
-    // A build failure here is a connector defect (static CA bytes, static
-    // settings) or a broken TLS backend: both faces fold to the TLS-layer
-    // literal rather than inventing a sixth one. No request is sent.
-    let Some(client) = service_client(&proxy) else {
+    // The §4.161 dual track: the strict pair and the system-trust leg are
+    // independent verdicts — each builds its own client and either can
+    // answer while the other fails. They run concurrently under the same
+    // 3-second diagnostic budget.
+    let ((chat, storage), system_trust) =
+        tokio::join!(strict_service_pair(&proxy), system_trust_leg(&proxy),);
+    ServiceFace {
+        proxy_configured: true,
+        chat,
+        storage,
+        system_trust: Some(system_trust),
+    }
+}
+
+/// The strict pair (chat, storage) on the vendored-CA-pinned client. A
+/// client build failure is a connector defect (static CA bytes, static
+/// settings) or a broken TLS backend: both faces fold to the TLS-layer
+/// literal rather than inventing a sixth one. No request is sent. The pair
+/// shares one client, fresh per diagnostic — a wedged connection pool is
+/// never reused across calls.
+async fn strict_service_pair(proxy: &SocksProxy) -> (ServiceProbe, ServiceProbe) {
+    let Some(client) = service_client(proxy) else {
         let probe = ServiceProbe {
             classification: "tls_failed",
             status: None,
             latency_ms: None,
         };
-        return ServiceFace {
-            proxy_configured: true,
-            chat: probe.clone(),
-            storage: probe,
-        };
+        return (probe.clone(), probe);
     };
-    let (chat, storage) = tokio::join!(
+    tokio::join!(
         probe_service_face(&client, CHAT_SERVICE_PROBE_URL),
         probe_service_face(&client, STORAGE_SERVICE_PROBE_URL),
-    );
-    ServiceFace {
-        proxy_configured: true,
-        chat,
-        storage,
+    )
+}
+
+/// The system-trust leg (§4.161): the chat target through the same route on
+/// its own client — the platform trust store, no custom anchor. Deliberately
+/// independent of the strict pair (either verdict stands alone: a MITM proxy
+/// whose CA the user trusts pins the strict leg to `tls_failed` while this
+/// leg answers `http`), and a build failure here folds to the TLS-layer
+/// literal exactly like the strict pair's does.
+async fn system_trust_leg(proxy: &SocksProxy) -> ServiceProbe {
+    match system_trust_client(proxy) {
+        Some(client) => probe_service_face(&client, CHAT_SERVICE_PROBE_URL).await,
+        None => ServiceProbe {
+            classification: "tls_failed",
+            status: None,
+            latency_ms: None,
+        },
     }
 }
 
@@ -953,8 +999,9 @@ pub(crate) fn parse_socks_proxy_env(raw: &str) -> Option<SocksProxy> {
     SocksProxy::parse(bare).ok()
 }
 
-/// The service-plane HTTPS client: the vendored Signal production root CA as
-/// the ONLY trust anchor (the kt-engine's tls_certs_only attitude — the probe
+/// The strict service-plane HTTPS client — the pinned-anchor leg of the
+/// §4.161 dual track: the vendored Signal production root CA as the ONLY
+/// trust anchor (the kt-engine's tls_certs_only attitude — the probe
 /// validates exactly the TLS reality the engine's own traffic meets), the
 /// launcher proxy as the only `socks5h://` route (remote DNS, matching the
 /// engine's `ALL_PROXY` mapping), connect+overall budgets at the doctor's
@@ -968,6 +1015,29 @@ fn service_client(proxy: &SocksProxy) -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .add_root_certificate(certificate)
         .tls_built_in_root_certs(false)
+        .proxy(reqwest::Proxy::all(&socks_url).ok()?)
+        .connect_timeout(DOCTOR_ENGINE_CALL_TIMEOUT)
+        .timeout(DOCTOR_ENGINE_CALL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("kt-signal-connector/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()
+}
+
+/// The system-trust leg's HTTPS client (§4.161): everything the strict
+/// client is — the launcher proxy as the only `socks5h://` route, the
+/// 3-second diagnostic budgets, redirects off, fresh per diagnostic — minus
+/// the pinned anchor. The roots come from the platform trust store (the
+/// `rustls-tls-native-roots` chain: on macOS the Security.framework
+/// keychains, user-installed CAs included) — the official desktop's own
+/// trust posture, and the same roots the supervisor's CDN
+/// attachment-download client rides since contract revision 1.163. An
+/// environment with no platform roots at all still builds the client; the
+/// leg then answers `tls_failed` honestly (empty store — every handshake
+/// fails), never a fabricated verdict.
+fn system_trust_client(proxy: &SocksProxy) -> Option<reqwest::Client> {
+    let socks_url = format!("socks5h://{}:{}", proxy.host, proxy.port);
+    reqwest::Client::builder()
         .proxy(reqwest::Proxy::all(&socks_url).ok()?)
         .connect_timeout(DOCTOR_ENGINE_CALL_TIMEOUT)
         .timeout(DOCTOR_ENGINE_CALL_TIMEOUT)
@@ -1137,6 +1207,11 @@ mod tests {
                     status: None,
                     latency_ms: None,
                 },
+                system_trust: Some(ServiceProbe {
+                    classification: "http",
+                    status: Some(200),
+                    latency_ms: Some(7),
+                }),
             },
         };
         let value = serde_json::to_value(&report).expect("serialize");
@@ -1223,6 +1298,15 @@ mod tests {
             Value::Null,
             "latencyMs rides only with the http classification"
         );
+
+        // The system-trust leg (revision 1.163): present on the configured
+        // face, riding the same probe shape as the strict legs.
+        let system_trust = service
+            .get("systemTrust")
+            .expect("the configured face carries the 1.163 system-trust leg");
+        assert_eq!(system_trust["classification"], json!("http"));
+        assert_eq!(system_trust["status"], json!(200));
+        assert_eq!(system_trust["latencyMs"], json!(7));
     }
 
     /// Engine-unreachable degradation: a non-running engine marks
@@ -1607,6 +1691,106 @@ mod tests {
             assert_eq!(value[probe].get("status"), None);
             assert_eq!(value[probe].get("latencyMs"), None);
         }
+        assert_eq!(
+            value.get("systemTrust"),
+            None,
+            "the unconfigured face probes nothing: the 1.163 leg stays absent, never failed"
+        );
+    }
+
+    /// The §4.161 dual track's two wire forms, pinned additively: the key
+    /// absent keeps the pre-1.163 face key set exactly (chat, storage,
+    /// proxyConfigured — nothing else), and the key present rides the same
+    /// probe shape the strict legs use (classification always, status/
+    /// latencyMs only with `http` — the literal mapping itself is shared
+    /// code, pinned by `service_probe_classification_maps_every_literal`).
+    #[test]
+    fn system_trust_face_rides_both_forms_additively() {
+        let absent = ServiceFace {
+            proxy_configured: false,
+            chat: ServiceProbe {
+                classification: "not_configured",
+                status: None,
+                latency_ms: None,
+            },
+            storage: ServiceProbe {
+                classification: "not_configured",
+                status: None,
+                latency_ms: None,
+            },
+            system_trust: None,
+        };
+        let value = serde_json::to_value(&absent).expect("serialize");
+        let mut keys: Vec<_> = value
+            .as_object()
+            .expect("face object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["chat", "proxyConfigured", "storage"],
+            "the absent form keeps the pre-1.163 key set byte-stable"
+        );
+        for probe in ["chat", "storage"] {
+            assert_eq!(
+                value[probe].as_object().map(|object| object.len()),
+                Some(1),
+                "{probe} carries exactly its classification here"
+            );
+        }
+
+        let present = ServiceFace {
+            proxy_configured: true,
+            chat: ServiceProbe {
+                classification: "tls_failed",
+                status: None,
+                latency_ms: None,
+            },
+            storage: ServiceProbe {
+                classification: "tls_failed",
+                status: None,
+                latency_ms: None,
+            },
+            system_trust: Some(ServiceProbe {
+                classification: "http",
+                status: Some(401),
+                latency_ms: Some(9),
+            }),
+        };
+        let value = serde_json::to_value(&present).expect("serialize");
+        assert_eq!(value["systemTrust"]["classification"], json!("http"));
+        assert_eq!(value["systemTrust"]["status"], json!(401));
+        assert_eq!(value["systemTrust"]["latencyMs"], json!(9));
+        // The strict legs keep their own shape next to the new key — the
+        // pinned-anchor face unchanged (status absent off-http).
+        assert_eq!(value["chat"]["classification"], json!("tls_failed"));
+        assert_eq!(
+            value["chat"].as_object().map(|object| object.len()),
+            Some(1)
+        );
+    }
+
+    /// Both §4.161 clients build from static settings alone: the strict
+    /// client keeps loading its vendored anchor, and the system-trust client
+    /// builds on the platform store whatever it holds — an environment with
+    /// no platform roots still builds (the leg then answers `tls_failed`
+    /// honestly), so the two verdicts stand independently.
+    #[test]
+    fn dual_track_clients_build_independently() {
+        let proxy = SocksProxy {
+            host: "127.0.0.1".into(),
+            port: 1080,
+        };
+        assert!(
+            service_client(&proxy).is_some(),
+            "the strict client keeps its static vendored anchor"
+        );
+        assert!(
+            system_trust_client(&proxy).is_some(),
+            "the system-trust client builds without any custom anchor"
+        );
     }
 
     /// The SOCKS-layer marker survives reqwest's real error chain: a loopback

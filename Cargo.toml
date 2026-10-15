@@ -18,7 +18,13 @@ hex = "0.4"
 hmac = "0.12"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls-webpki-roots",
+    # Contract revision 1.163 (§4.161): the platform trust store, not the
+    # compiled-in webpki set — on macOS rustls-native-certs reads the
+    # Security.framework keychains (user-installed CAs included), so the CDN
+    # attachment-download client validates exactly the TLS reality the
+    # official desktop (Chromium + system store) accepts. The doctor's strict
+    # probe stays pinned to the vendored root independently (src/doctor.rs).
+    "rustls-tls-native-roots",
     "socks",
     "stream",
 ] }
