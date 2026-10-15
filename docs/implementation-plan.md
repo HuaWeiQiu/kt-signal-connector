@@ -42,7 +42,45 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.160 (2026-10-15; the own-story sync transcript
+- Contract revision: 1.161 (2026-10-15; the media-story pointer answer
+  faces (§4.159): the connector half of the engine's sendStory pointer
+  batch (engine `941c091`, already on the engine mainline — the second
+  link of the own-media read-back chain, the engine leg having closed
+  the gap first): the engine answers `messages.sendStory` with the
+  media leg's upload AttachmentPointer projection — `fileAttachment`
+  on the result's top level (the roster leg's pointer) and
+  `group.fileAttachment` inside the 1.157 group face (the group leg's
+  own) — and the connector's answer projection (`story_from_engine`,
+  the one reassembly point on this face: host and registry layers are
+  serde passthrough) would have stripped both keys, so this batch adds
+  the two arms. Raw-value transit, deliberately untyped: the pointer's
+  whole face is the engine projection's product (the same full face the
+  receive side carries — locator included, no plaintextHash, the
+  official proto has no such bit), so connector-side typing would
+  reshape a face the connector never consumes (the §4.150/§4.151
+  conduit posture: zero CDN resolution, zero pointer consumption, the
+  locator stays opaque transit) and every engine-side pointer key the
+  caption batch ever added would need a connector follow-up. The split
+  keys are the official two-job symmetry mirrored: the mixed audience
+  runs two independent uploads and the pointers are distinct objects,
+  so neither leg's pointer may ride the other's key. No-null: absent
+  and explicit-null fold to the same no-key state; the text leg, a send
+  failure, and the group single leg (whose pointer rides inside the
+  group face) leave the top level absent; every pre-1.161 answer reads
+  byte-identically. Wire additive: two optional keys on one existing
+  method's answer (one of them nested in the existing group face), zero
+  new methods/events/error codes/store moves/capability bits (the
+  `stories` tag widened in place, the 1.82 precedent chain, now reading
+  1.161 → 1.160 → 1.159 → 1.158 → 1.157 → 1.156 → 1.154 → 1.130).
+  Schema: the answer face pinned as the new `messagesSendStoryResult`
+  def (the first per-method result def on this schema — the batch is
+  pure answer-face, so the wire truth gets its def) referenced from the
+  request branch, both pointer arms typed as raw values (no type
+  constraint — the 1.157 group param posture), and the params
+  description chain gains the 1.161 sentence. Tests 846 → 850
+  (integration +2, lib +2), all green — fmt, check, clippy, full cargo
+  test, release build, schema parse + consistency) —
+  previously 1.160 (2026-10-15; the own-story sync transcript
   (§4.158): the connector half of the multi-device own-story mirror —
   the engine's `syncMessage.sentMessage.storyMessage` projection (the
   engine HEAD `48e69a2` projection chain, the same
@@ -13134,6 +13172,127 @@ and anchorless faces skipping) and the service arm (the outgoing row
 face emission with zero store writes, the stories-disabled gate
 dropping before anything downstream, the id stability, the
 conversation-less keys honest).
+
+### 4.159 The media pointer rides home in the answer: `fileAttachment` on both send legs, the own read-back chain's connector half (contract revision 1.161, 2026-10-15)
+
+The gap this batch closes: the account posts a media story, the engine
+uploads the bytes to the transit CDN and rides the resulting
+AttachmentPointer into the wire's `StoryMessage.fileAttachment` — and
+then throws the pointer away as far as this machine is concerned. The
+engine keeps no local archive and never self-receives (the vendored
+presage fork records "not saved to the local store…no sent-transcript";
+the sync rides the wire to the *other* devices only), so a KT desktop
+posting a media story has no byte source after a restart: no local
+file (the 16KiB transit cap and the dataUri-not-on-disk posture are
+deliberate), no sync copy, no pointer. The official desktop does not
+need one — its My Stories read-back consumes the local attachment store
+(MyStories.dom.tsx:198-211 `viewStory(story.messageId)`, :280-292 the
+detail face) — but the official sender *does hold the upload pointer*
+as a plain fact of sending (`uploadAttachment.preload.ts`'s return
+value *is* the sent-state pointer), and that fact face is this batch's
+behavior anchor. The engine leg landed first (`941c091`): the sendStory
+answer now carries the pointer projection — `fileAttachment` on the
+result's top level for the roster leg, `group.fileAttachment` inside
+the 1.157 group face for the group leg. The connector's answer
+projection was the hole: `story_from_engine` reassembles the answer
+key-by-key (timestamp, results, group), so both pointer keys would have
+been stripped and the desktop's own read-back chain (the third link,
+the desktop batch) would have had nothing to consume.
+
+Response-chain audit (the task's standing question, answered by reading
+the current code, not the 1.159 note): the 1.159 batch ruled the
+*sendReaction* answer had zero reassembly — true for that face, which
+passes the engine's success object through untouched. The sendStory
+face is different and has always reassembled: `story_from_engine`
+(supervisor.rs) is the single projection point, and host.rs /
+registry.rs are serde passthrough above it. So the additive keys need
+arms exactly there — confirmed by reading the current HEAD before
+touching anything.
+
+Official anchors (upstream `abe80d3`, first-hand, behavior alignment
+— zero code copied): the sender holds the upload pointer
+(`uploadAttachment.preload.ts` return value), the official story wire
+carries it (`StoryMessage.attachment` oneof, `fileAttachment` = 3,
+protos/SignalService.proto:476-479), the official read-back consumes
+local bytes the KT posture does not keep (MyStories.dom.tsx:198-211,
+:280-292), and the locator carries no plaintextHash anywhere on the
+proto (AttachmentPointer ends before it; the desktop's plaintextHash is
+a local upload-object private field, never wire) — the engine
+projection's honest absence, mirrored here by mirroring the projection.
+
+Ruling — raw-value transit, deliberately untyped. The pointer face is
+the engine projection's product, full face (id/contentType/filename?/
+size?/width?/height?/caption?/blurHash?/incrementalMac?/chunkSize?/
+isVoiceNote/isBorderless/isGif/waveform?/duration? + locator{key?,
+cdnKey?, cdnNumber?, uploadTimestamp?, digest?}, absent keys absent —
+the same face the receive side carries, the projection function being
+strictly self-inverse). Typing it connector-side would (a) reshape a
+face the connector never consumes — the §4.150/§4.151 conduit posture
+holds here harder than on any prior face, because the connector
+performs zero CDN resolution and zero pointer consumption — and (b)
+demand a connector follow-up for every engine-side pointer key the
+future adds (the caption batch added one already). The 1.157 group
+param's raw-value reasoning, applied to an answer key. Null folds to
+absence (the engine's 缺席 caliber, the 1.157 group-face precedent);
+there is no shape gate on the value's internals — a malformed pointer
+is the engine projection's defect to never produce, not a connector
+refusal to eat, and the group face's own half-form discipline (the
+pinned `{groupId, timestamp}` pair answering Protocol) is unchanged and
+regression-pinned with the pointer keys riding along.
+
+The leg split is the official two-job symmetry mirrored: the mixed
+audience runs two independent uploads (the official two-job
+orchestration, sendStoryMessage.preload.ts:327-332/:337-378) and every
+upload generates its own key material, so the roster pointer and the
+group pointer are distinct objects — hence split keys (top level =
+roster leg, group face = group leg), the group single leg leaving the
+top level absent. The connector never merges, swaps, or drops one
+leg's pointer into the other key (pinned with deliberately distinct
+values on both keys).
+
+Boundary: the connector performs zero CDN resolution and zero pointer
+consumption — the locator rides as opaque transit from the engine
+projection to the desktop consumer (the same locator full-face the
+receive side forwards, the §4.54 reciprocal face); the desktop's
+own-media read-back chain (local arm → file arm over the locator
+download gate, the own-list download button widening) is the
+downstream batch (the read-back chain's third link) and opens nothing
+here. The fixture answers the engine fake's stub discipline (metadata
+family with the constant empty id and the three false booleans, the
+locator carrying cdnKey `fake-story-attachment` / cdnNumber 3 / the
+stub moment; no key/digest material invented — 宁缺勿错; caption rides
+in-cap-out), because the stub has no CDN upload face. Wire additive:
+two optional keys on one existing method's answer, zero new
+methods/events/error codes/store moves/capability bits — the `stories`
+tag widened in place (the 1.82 precedent chain, now reading 1.161 →
+1.160 → 1.159 → 1.158 → 1.157 → 1.156 → 1.154 → 1.130). Schema: the
+answer face pinned as the new `messagesSendStoryResult` def — the
+first per-method result def on this schema (the batch is pure
+answer-face, so the wire truth gets its def; the request branch gains
+the result reference, the numeric-bounds and method-set consistency
+pointers stay put since the event allOf branches are untouched) — both
+pointer arms untyped raw values (no type constraint, the 1.157 group
+param posture: the connector performs no gate the def must not
+overstate), the group face pinned to its `{groupId, timestamp}` pair
+plus the raw pointer arm, and the params description chain gains the
+1.161 sentence.
+
+Tests: integration +2 (`tests/story_send_pointer.rs`) — the passthrough
+arm (the roster media single leg riding the top-level stub pointer with
+the attachment data URI verbatim on the frame, the group media single
+leg riding the pointer inside the group face with the top level absent,
+the mixed audience carrying both under their split keys, the group text
+leg's face staying pointer-free) and the absence arm (the text leg's
+answer serializing exactly the pre-1.161 shape, the stub face carrying
+exactly its documented key set, the send staying rowless); lib +2 —
+the verbatim arm (the full-face roster pointer riding byte-for-byte,
+the group pointer inside its face, the mixed audience's two distinct
+pointers preserved under their split keys without merging, a non-object
+raw value riding ungated, null folding to absence with no key
+serialized) and the absence/half-form arm (the pre-1.161 answer
+byte-identical, the pointer-less group face serializing exactly its
+pinned pair, the half-form group face staying a protocol defect with
+the pointer keys riding along).
 
 ## 5. signal-cli Boundary
 

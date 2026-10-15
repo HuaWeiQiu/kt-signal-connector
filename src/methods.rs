@@ -813,7 +813,18 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `story.deleteCandidate` candidacy event over the group-DOE true buffer
 /// miss, and the stories-disabled gate realigned onto the reaction (the
 /// official stories-blocked whole-envelope drop); the same no-new-bit
-/// discipline) and by revision 1.160 (the §4.158 own-story sync
+/// discipline) and by revision 1.161 (the §4.159 media-story pointer
+/// answer faces on the `messages.sendStory` face — the engine's
+/// sendStory pointer batch (engine `941c091`), the official sender-holds-
+/// the-upload-pointer fact face: the engine answer's `fileAttachment`
+/// (the roster leg) and `group.fileAttachment` (the group leg, the mixed
+/// audience's two independent uploads being distinct objects) pass the
+/// projection through as raw values, untyped and unshaped — the pointer
+/// face is the engine projection's product and stays opaque transit for
+/// the desktop's own read-back chain (zero CDN resolution, zero pointer
+/// consumption); absent stays absent, every pre-1.161 answer reads
+/// byte-identically; the same no-new-bit discipline) and by revision
+/// 1.160 (the §4.158 own-story sync
 /// transcript — the engine's `syncMessage.sentMessage.storyMessage`
 /// projection riding home as the outgoing row face the desktop's
 /// message-upserted story intercept consumes (isStory + storyMessage,

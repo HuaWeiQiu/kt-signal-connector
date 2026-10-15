@@ -2342,6 +2342,39 @@ for line in sys.stdin:
             "timestamp": int(time.time() * 1000),
             "results": [],
         }
+        # §4.159 (contract 1.161) the media pointer answer faces, mirroring
+        # the engine fake's stub discipline: the stub face is metadata-only
+        # (id constant empty, contentType the generic word, the three
+        # booleans false) + a locator{cdnKey fake-story-attachment,
+        # cdnNumber 3, uploadTimestamp stub moment} — no key/digest crypto
+        # material is invented (宁缺勿错), caption rides in-cap-out (the
+        # documented caption-through-the-pointer shape). The roster leg
+        # (attachment riding, recipients non-empty) answers the top-level
+        # key; the group leg answers group.fileAttachment — the mixed
+        # audience's two uploads are independent stubs (the real legs'
+        # pointers are distinct objects, the split-key fact). The text leg
+        # answers neither key (absent = never serialized).
+        def fixture_story_pointer():
+            pointer = {
+                "id": "",
+                "contentType": "application/octet-stream",
+                "isVoiceNote": False,
+                "isBorderless": False,
+                "isGif": False,
+                "locator": {
+                    "cdnKey": "fake-story-attachment",
+                    "cdnNumber": 3,
+                    "uploadTimestamp": int(time.time() * 1000),
+                },
+            }
+            caption = params.get("caption")
+            if caption is not None:
+                pointer["caption"] = caption
+            return pointer
+
+        media_leg = params.get("attachment") is not None
+        if media_leg and params.get("recipients"):
+            result["fileAttachment"] = fixture_story_pointer()
         # §4.155 (contract 1.157) the group audience leg's additive answer
         # face: group present (absent = the pre-1.157 no-group shape) adds
         # {groupId, timestamp} — the single leg shares the batch timestamp,
@@ -2354,6 +2387,8 @@ for line in sys.stdin:
                 "timestamp": result["timestamp"]
                 + (1 if params.get("recipients") else 0),
             }
+            if media_leg:
+                result["group"]["fileAttachment"] = fixture_story_pointer()
     elif method == "getBlockedConversations":
         # Contract 1.46 §4.45 blocked read: the storage-order projection as a
         # fixture constant (one contact + one legacy group). Read face, no

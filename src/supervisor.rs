@@ -2541,7 +2541,12 @@ impl RuntimeSupervisor {
     /// projection passes it through (absent stays absent); a group-leg
     /// refusal rides the structured ladder, its non-allowlisted `SEND_*`
     /// literals degrading to the plain UPSTREAM_ERROR exactly like every
-    /// upstream code the host contract does not declare.
+    /// upstream code the host contract does not declare. Contract 1.161
+    /// (§4.159): the engine's media-upload pointer faces ride the answer
+    /// verbatim on both legs (the top-level `fileAttachment` for the roster
+    /// leg, `group.fileAttachment` for the group leg) — raw-value transit,
+    /// zero CDN resolution, zero pointer consumption; the desktop's own
+    /// read-back chain is the downstream consumer batch.
     pub async fn send_story(
         &self,
         params: MessagesSendStoryParams,
@@ -8618,6 +8623,15 @@ pub(crate) fn avatar_from_engine_for_tests(result: &Value) -> Result<AvatarDownl
 /// 缺席 caliber) stays absent and the projection keeps the pre-1.157 shape
 /// byte-identically; present, both keys are pinned to the engine's
 /// documented shape, the same pinned-face discipline as the required pair.
+/// Contract 1.161 (§4.159): the additive `fileAttachment` pointer faces
+/// pass through as raw values on both legs — the result's top level
+/// carries the roster leg's upload pointer, the group face carries the
+/// group leg's own (the mixed audience runs two independent uploads and
+/// the pointers are distinct objects, hence the split keys); the pointer
+/// face is never typed or reshaped (the engine projection owns its whole
+/// shape, the locator stays opaque transit for the desktop's own
+/// read-back chain), absent (or null) stays absent, and the pre-1.161
+/// answer reads byte-identically.
 fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
     let timestamp = result
         .get("timestamp")
@@ -8659,12 +8673,21 @@ fn story_from_engine(result: &Value) -> Result<StorySendResult, ServiceError> {
                 .get("timestamp")
                 .and_then(Value::as_u64)
                 .ok_or(ServiceError::Engine(EngineError::Protocol))?,
+            file_attachment: match face.get("fileAttachment") {
+                None | Some(Value::Null) => None,
+                Some(pointer) => Some(pointer.clone()),
+            },
         }),
+    };
+    let file_attachment = match result.get("fileAttachment") {
+        None | Some(Value::Null) => None,
+        Some(pointer) => Some(pointer.clone()),
     };
     Ok(StorySendResult {
         timestamp,
         results,
         group,
+        file_attachment,
     })
 }
 
@@ -11630,6 +11653,225 @@ mod tests {
             json!({"timestamp": 1u64, "results": [], "group": {"groupId": "abc"}}),
             json!({"timestamp": 1u64, "results": [], "group": {"groupId": 7, "timestamp": 2u64}}),
             json!({"timestamp": 1u64, "results": [], "group": "abc"}),
+        ] {
+            let error = super::story_from_engine(&broken).err().unwrap();
+            assert!(
+                matches!(
+                    error,
+                    crate::service::ServiceError::Engine(EngineError::Protocol)
+                ),
+                "expected a protocol defect for {broken}"
+            );
+        }
+    }
+
+    /// Contract 1.161 (§4.159): the sendStory answer projection passes the
+    /// engine's additive `fileAttachment` pointer faces through as raw
+    /// values on both legs — the roster leg on the result's top level, the
+    /// group leg inside the group face — untyped and unshaped (the pointer
+    /// face is the engine projection's product; the locator stays opaque
+    /// transit), the mixed audience's two independent uploads staying
+    /// distinct objects under their split keys (the pointers never merge),
+    /// a non-object raw value riding ungated (the whole value domain is
+    /// the engine's, connector-side gating would eat the transit), and an
+    /// explicit null folding to absence.
+    #[test]
+    fn send_story_answer_pointer_faces_ride_verbatim_and_split_by_leg() {
+        // The roster media leg: the full pointer face rides the top level
+        // byte-for-byte (the engine's documented face — the metadata family
+        // plus the locator, exactly the keys fed).
+        let roster_face = json!({
+            "id": "",
+            "contentType": "application/octet-stream",
+            "size": 123456u64,
+            "caption": "a caption",
+            "blurHash": "blurred",
+            "incrementalMac": "bWFj",
+            "chunkSize": 8192u64,
+            "isVoiceNote": false,
+            "isBorderless": false,
+            "isGif": false,
+            "waveform": "d2F2ZWZvcm0=",
+            "duration": 4.5,
+            "locator": {
+                "key": "a2V5",
+                "cdnKey": "AWESOME-CDN-KEY",
+                "cdnNumber": 3u64,
+                "uploadTimestamp": 1_700_000_000_000u64,
+                "digest": "ZGlnZXN0",
+            },
+        });
+        let roster = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [
+                {"recipientNumber": "+15555550101",
+                 "success": {"timestamp": 1001u64}}
+            ],
+            "fileAttachment": roster_face.clone(),
+        }))
+        .unwrap();
+        assert_eq!(roster.file_attachment.as_ref().unwrap(), &roster_face);
+        let serialized = serde_json::to_value(&roster).unwrap();
+        assert_eq!(serialized["fileAttachment"], roster_face);
+
+        // The group media leg: the group leg's own pointer rides the group
+        // face, byte-for-byte, beside the pinned {groupId, timestamp}.
+        let group_face = json!({
+            "id": "",
+            "contentType": "application/octet-stream",
+            "isVoiceNote": false,
+            "isBorderless": false,
+            "isGif": false,
+            "locator": {"cdnKey": "GROUP-CDN-KEY", "cdnNumber": 3u64,
+                        "uploadTimestamp": 1_700_000_000_001u64},
+        });
+        let grouped = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [],
+            "group": {
+                "groupId": "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=",
+                "timestamp": 1001u64,
+                "fileAttachment": group_face.clone(),
+            },
+        }))
+        .unwrap();
+        let face = grouped.group.as_ref().expect("the group face rides");
+        assert_eq!(face.file_attachment.as_ref().unwrap(), &group_face);
+        assert_eq!(
+            serde_json::to_value(&grouped).unwrap()["group"]["fileAttachment"],
+            group_face
+        );
+
+        // The mixed audience: two distinct pointers under their split keys,
+        // each preserved verbatim — the projection never merges, swaps, or
+        // drops one leg's pointer into the other key.
+        let mixed = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [],
+            "fileAttachment": {"locator": {"cdnKey": "ROSTER-KEY"}},
+            "group": {
+                "groupId": "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=",
+                "timestamp": 1001u64,
+                "fileAttachment": {"locator": {"cdnKey": "GROUP-KEY"}},
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            mixed.file_attachment.as_ref().unwrap()["locator"]["cdnKey"],
+            json!("ROSTER-KEY")
+        );
+        let face = mixed.group.as_ref().expect("the group face rides");
+        assert_eq!(
+            face.file_attachment.as_ref().unwrap()["locator"]["cdnKey"],
+            json!("GROUP-KEY")
+        );
+
+        // A non-object raw value rides ungated — the pointer face's whole
+        // value domain is the engine's, and a connector-side shape gate
+        // would eat the transit instead of forwarding it.
+        let bare = super::story_from_engine(&json!({
+            "timestamp": 1u64,
+            "results": [],
+            "fileAttachment": "the-engine-owns-this",
+        }))
+        .unwrap();
+        assert_eq!(
+            bare.file_attachment.as_ref().unwrap(),
+            &json!("the-engine-owns-this")
+        );
+
+        // An explicit null folds to absence (the engine's 缺席 caliber).
+        let nulled = super::story_from_engine(&json!({
+            "timestamp": 1u64,
+            "results": [],
+            "fileAttachment": null,
+            "group": {"groupId": "abc", "timestamp": 2u64, "fileAttachment": null},
+        }))
+        .unwrap();
+        assert!(nulled.file_attachment.is_none());
+        let face = nulled.group.as_ref().expect("the group face rides");
+        assert!(face.file_attachment.is_none());
+        let serialized = serde_json::to_value(&nulled).unwrap();
+        assert!(
+            serialized.get("fileAttachment").is_none()
+                && serialized["group"].get("fileAttachment").is_none(),
+            "an absent pointer never serializes, null included"
+        );
+    }
+
+    /// Contract 1.161 (§4.159): the pointer-less answers keep the exact
+    /// pre-1.161 shapes — the text leg's answer (and a group face without
+    /// its own upload) never serializes a pointer key — and the group
+    /// face's half-form discipline stays a protocol defect with the
+    /// pointer keys riding along (the additive keys change no pinned-face
+    /// verdict).
+    #[test]
+    fn send_story_answer_pointer_absence_keeps_pre161_shapes_and_half_faces_protocol() {
+        // The pre-1.161 text answer: the serialization shape is
+        // byte-identical to the pre-1.157 shape (no pointer key, no group
+        // key — absence never serializes).
+        let pre = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [
+                {"recipientNumber": "+15555550101",
+                 "success": {"timestamp": 1001u64}}
+            ],
+        }))
+        .unwrap();
+        assert!(pre.file_attachment.is_none());
+        assert_eq!(
+            serde_json::to_value(&pre).unwrap(),
+            json!({
+                "timestamp": 1000u64,
+                "results": [
+                    {"recipientNumber": "+15555550101",
+                     "success": {"timestamp": 1001u64}}
+                ],
+            })
+        );
+
+        // The group single leg without a media upload: the group face
+        // serializes exactly its pinned pair, no pointer key inside.
+        let group_text = super::story_from_engine(&json!({
+            "timestamp": 1000u64,
+            "results": [],
+            "group": {
+                "groupId": "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=",
+                "timestamp": 1001u64,
+            },
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(&group_text).unwrap();
+        assert!(serialized["group"].get("fileAttachment").is_none());
+        assert_eq!(
+            serialized,
+            json!({
+                "timestamp": 1000u64,
+                "results": [],
+                "group": {
+                    "groupId": "pUUd9rRO9u2Yffq7vIYYOXNTlNLAWzCvTfgAFpBYK5Q=",
+                    "timestamp": 1001u64,
+                },
+            })
+        );
+
+        // The group face's half-form discipline stays a protocol defect
+        // when a pointer key rides along — the additive keys pin no verdict
+        // of their own (raw transit) and change none of the pinned pair's.
+        for broken in [
+            json!({
+                "timestamp": 1u64, "results": [],
+                "fileAttachment": {"locator": {"cdnKey": "k"}},
+                "group": {"timestamp": 2u64},
+            }),
+            json!({
+                "timestamp": 1u64, "results": [],
+                "group": {"groupId": "abc", "fileAttachment": {"locator": {"cdnKey": "k"}}},
+            }),
+            json!({
+                "timestamp": 1u64, "results": [],
+                "group": {"timestamp": 2u64, "fileAttachment": "abc"},
+            }),
         ] {
             let error = super::story_from_engine(&broken).err().unwrap();
             assert!(

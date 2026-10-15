@@ -13451,7 +13451,21 @@ pub struct StoriesDisabled {
 /// untouched — absent stays absent (the key never serializes, every
 /// pre-1.157 response reads byte-identically), present is pinned to the
 /// engine's documented `{groupId, timestamp}` shape (a malformed face is
-/// the same protocol defect the required keys answer).
+/// the same protocol defect the required keys answer). Contract 1.161
+/// (§4.159): the additive `fileAttachment` answer face — the media
+/// roster leg's upload AttachmentPointer projection — passes through as
+/// a raw value, untouched and untyped: the pointer's whole face is the
+/// engine projection's product (the same face the receive side carries,
+/// locator included), so connector-side typing would reshape a face the
+/// connector never consumes (the §4.150 conduit posture — zero CDN
+/// resolution, zero pointer consumption, the locator stays opaque
+/// transit for the desktop's own read-back chain, the downstream batch)
+/// and every engine-side key the pointer gains would need a connector
+/// follow-up (the caption batch precedent). Absent stays absent — the
+/// key never serializes (the text leg, a send failure, the group single
+/// leg on the top level), every pre-1.161 response reads
+/// byte-identically, and an explicit null folds to absence (the
+/// engine's 缺席 caliber, the 1.157 group face precedent).
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorySendResult {
@@ -13459,17 +13473,27 @@ pub struct StorySendResult {
     pub results: Vec<StorySendRecipientResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<StorySendGroupFace>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_attachment: Option<Value>,
 }
 
 /// The engine sendStory answer's group leg face (contract 1.157, §4.155):
 /// the engine's own additive `{groupId, timestamp}` — the group id echoed
 /// and the group leg's own timestamp (the single leg shares the batch
 /// timestamp, the mixed audience answers the official +1 offset).
+/// Contract 1.161 (§4.159): the group leg's own media pointer rides the
+/// face as the optional raw-value `fileAttachment` key — the mixed
+/// audience runs two independent uploads (the official two-job symmetry)
+/// and the two pointers are distinct objects, so the legs split keys
+/// (the roster leg on the result's top level, the group leg here); the
+/// same raw-value transit and absence discipline as the top-level key.
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorySendGroupFace {
     pub group_id: String,
     pub timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_attachment: Option<Value>,
 }
 
 /// One per-recipient story outcome (contract revision 1.76, §4.67): the

@@ -1498,7 +1498,8 @@
           },
           "then": {
             "properties": {
-              "params": { "$ref": "#/$defs/messagesSendStoryParams" }
+              "params": { "$ref": "#/$defs/messagesSendStoryParams" },
+              "result": { "$ref": "#/$defs/messagesSendStoryResult" }
             }
           }
         },
@@ -4124,7 +4125,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "recipients"],
-      "description": "Post one story (contract revision 1.76, §4.67; the link-preview metadata keys joined with 1.91, §4.74, capability stories) through the engine's sendStory face (engine compat §3). There is no clientRequestId and no conversation addressing: a story lands in no conversation row, so there is no pending settlement — the synchronous result is {timestamp, results: [{recipientNumber, success: {timestamp}}]} and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN without retry. recipients is the caller-computed expansion (1..1001 entries, each 1..128 chars; since 1.157 the batch may ride empty when the group leg rides — see group below): the desktop owns v1 list storage — the official desktop expands My story from its own connections minus exclusions and custom lists from its own member tables (ts/util/sendStoryMessage.preload.ts:87-116) — so the connector neither re-expands nor filters. distributionListId is the official isStoryDistributionId face mirrored fail-closed: absent means the official My story zero UUID (00000000-0000-0000-0000-000000000000), any other value must be a strict 36-char UUID and passes through lowercased (normalizeStoryDistributionId); anything else is the officially unreachable shape and answers INVALID_REQUEST. textStyle is the official TextDisplayStyle vocabulary (DEFAULT = the key omitted on the engine frame); bodyRanges ride the §4.62 write face verbatim (64-entry cap, unknown style fails closed). previewImage is a data URI within the avatar frame budget. previewUrl/previewTitle (1.91, §4.74) are independently optional link-preview metadata: each, when present, must be non-empty and within its budget (url 2048 chars, title 1024 UTF-8 bytes) and the url must start https:// (the official isValidLink posture — unlike the messages.sendText link preview both schemes are not admitted here); violations answer the deterministic INVALID_REQUEST before the account ladder, and past the gates both ride the engine frame verbatim as the camelCase keys beside the unchanged previewImage pointer key (the engine composes the proto Preview{url,title,image}). message and attachment (contract revision 1.156, §4.154) are the story's two content legs — the text leg and the media leg (the engine's media story batch, engine 7e3652e, the official StoryMessage.fileAttachment oneof alignment): both are optional on this face and the connector performs no leg-exclusivity gate — message/attachment co-presence, a text-leg key (message/textStyle/preview*) riding the attachment leg, and a bare no-payload frame are the engine's fail-closed parse answering plain -32603 → UPSTREAM_ERROR (retryable); the attachment data URI is verbatim transit material (the connector never deep-parses the content and never checks caps — the transit-CDN upload gate is the engine's), and the message byte gates run only when the text leg rides. group (contract revision 1.157, §4.155) is the group audience leg (the engine's group story batch, engine ffab2a8, the official StoryMessage.group GroupContextV2 alignment): the engine groupId rides verbatim as a raw value (the whole value domain is the engine's fail-closed parse — non-string/empty -32603, the 32B decode refusal, terminated and announcements-only structured -1 faces), the recipients empty batch rides only with this key (the group single leg, the engine's audience-at-least-one-domain gate mirrored) and keeps its refusal without it, group + recipients co-present forwards as-is (the mixed audience is the engine's orchestration), and the answer face is additive group: {groupId, timestamp} (absent stays absent — every pre-1.157 frame and answer reads byte-identically). On the receive half the engine-projected textAttachment.preview{url,title} rides the story.received event verbatim (the projection is a bounded clone, never a reshape — no whitelist to widen, pinned by the 1.91 regression tests). Send lane, account-scoped mutating.",
+      "description": "Post one story (contract revision 1.76, §4.67; the link-preview metadata keys joined with 1.91, §4.74, capability stories) through the engine's sendStory face (engine compat §3). There is no clientRequestId and no conversation addressing: a story lands in no conversation row, so there is no pending settlement — the synchronous result is {timestamp, results: [{recipientNumber, success: {timestamp}}]} and an indeterminate mutating outcome answers SEND_OUTCOME_UNKNOWN without retry. recipients is the caller-computed expansion (1..1001 entries, each 1..128 chars; since 1.157 the batch may ride empty when the group leg rides — see group below): the desktop owns v1 list storage — the official desktop expands My story from its own connections minus exclusions and custom lists from its own member tables (ts/util/sendStoryMessage.preload.ts:87-116) — so the connector neither re-expands nor filters. distributionListId is the official isStoryDistributionId face mirrored fail-closed: absent means the official My story zero UUID (00000000-0000-0000-0000-000000000000), any other value must be a strict 36-char UUID and passes through lowercased (normalizeStoryDistributionId); anything else is the officially unreachable shape and answers INVALID_REQUEST. textStyle is the official TextDisplayStyle vocabulary (DEFAULT = the key omitted on the engine frame); bodyRanges ride the §4.62 write face verbatim (64-entry cap, unknown style fails closed). previewImage is a data URI within the avatar frame budget. previewUrl/previewTitle (1.91, §4.74) are independently optional link-preview metadata: each, when present, must be non-empty and within its budget (url 2048 chars, title 1024 UTF-8 bytes) and the url must start https:// (the official isValidLink posture — unlike the messages.sendText link preview both schemes are not admitted here); violations answer the deterministic INVALID_REQUEST before the account ladder, and past the gates both ride the engine frame verbatim as the camelCase keys beside the unchanged previewImage pointer key (the engine composes the proto Preview{url,title,image}). message and attachment (contract revision 1.156, §4.154) are the story's two content legs — the text leg and the media leg (the engine's media story batch, engine 7e3652e, the official StoryMessage.fileAttachment oneof alignment): both are optional on this face and the connector performs no leg-exclusivity gate — message/attachment co-presence, a text-leg key (message/textStyle/preview*) riding the attachment leg, and a bare no-payload frame are the engine's fail-closed parse answering plain -32603 → UPSTREAM_ERROR (retryable); the attachment data URI is verbatim transit material (the connector never deep-parses the content and never checks caps — the transit-CDN upload gate is the engine's), and the message byte gates run only when the text leg rides. group (contract revision 1.157, §4.155) is the group audience leg (the engine's group story batch, engine ffab2a8, the official StoryMessage.group GroupContextV2 alignment): the engine groupId rides verbatim as a raw value (the whole value domain is the engine's fail-closed parse — non-string/empty -32603, the 32B decode refusal, terminated and announcements-only structured -1 faces), the recipients empty batch rides only with this key (the group single leg, the engine's audience-at-least-one-domain gate mirrored) and keeps its refusal without it, group + recipients co-present forwards as-is (the mixed audience is the engine's orchestration), and the answer face is additive group: {groupId, timestamp} (absent stays absent — every pre-1.157 frame and answer reads byte-identically). On the receive half the engine-projected textAttachment.preview{url,title} rides the story.received event verbatim (the projection is a bounded clone, never a reshape — no whitelist to widen, pinned by the 1.91 regression tests). The answer's media pointer faces (contract revision 1.161, §4.159 — the engine's sendStory pointer batch, engine 941c091, the official sender-holds-the-upload-pointer fact face): when the media leg uploaded, the answer carries fileAttachment (the roster leg's upload AttachmentPointer projection, on the result's top level) and/or group.fileAttachment (the group leg's own, inside the group face) — the mixed audience runs two independent uploads and the pointers are distinct objects, hence the split keys (the group single leg leaves the top level absent). Both faces pass through as raw values, untyped: the pointer's whole shape is the engine projection's product (the same full face the receive side carries — id/contentType/filename?/size?/width?/height?/caption?/blurHash?/incrementalMac?/chunkSize?/isVoiceNote/isBorderless/isGif/waveform?/duration? + locator{key?, cdnKey?, cdnNumber?, uploadTimestamp?, digest?}, absent keys absent; locator has no plaintextHash — the official proto has no such bit, the honest absence), the connector performs zero CDN resolution and zero pointer consumption (the locator stays opaque transit; the desktop's own-media read-back chain is the downstream consumer batch), the text leg and a send failure leave the keys absent, absent never serializes (null folds to absence — the 1.157 group-face caliber), and every pre-1.161 answer reads byte-identically. Send lane, account-scoped mutating.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "message": {
@@ -4203,6 +4204,65 @@
         },
         "group": {
           "description": "Contract revision 1.157 (§4.155): the group audience leg — the engine groupId (the group master key standard base64, the sendTextGroup group-id caliber; the official StoryMessage.group GroupContextV2 alignment, engine ffab2a8), forwarded verbatim onto the engine sendStory frame's group key. A raw value by design (the 1.153 three-key / 1.156 storyReplyTimestamp posture): the engine's fail-closed parse owns the whole value domain — a non-string or empty group answers its plain -32603, a non-32B group id its decode refusal, a terminated group and an announcements-only non-admin group its structured -1 SEND_TARGET_* faces — all degrading through the connector's ladder to UPSTREAM_ERROR retryable, which connector-side typing would eat. The audience gate is the engine's mirrored: an empty recipients batch rides only with this key (the group single leg); group and recipients co-present forwards as-is (the mixed audience is the engine's orchestration). The answer face is additive: the result gains group: {groupId, timestamp} when the engine's group leg answered (the single leg shares the batch timestamp, the mixed audience answers the +1 offset), and the key is absent — never null — when it did not. Absent = the key never rides the engine frame; every pre-1.157 frame and answer reads byte-identically."
+        }
+      }
+    },
+    "messagesSendStoryResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "results"],
+      "description": "The messages.sendStory answer (contract revision 1.76, §4.67; pinned as a def with contract revision 1.161, §4.159 — the media-pointer answer batch, engine 941c091). timestamp is the story's send timestamp; results lists one success entry per roster recipient — the engine's own per-recipient shape echoed verbatim (the fixture's empty list is the honest offline face; an any-failure send folds into an upstream error instead of a partial list). group rides only when the engine's group leg answered (contract 1.157, §4.155); fileAttachment rides only when the media leg uploaded (contract 1.161, §4.159) — the two pointer faces are the batch's additive answer surface.",
+      "properties": {
+        "timestamp": {
+          "type": "integer",
+          "description": "The story's send timestamp (the batch timestamp; the group single leg shares it, the mixed audience's group leg answers the official +1 offset on the group face's own timestamp)."
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["recipientNumber", "success"],
+            "properties": {
+              "recipientNumber": {
+                "type": "string",
+                "description": "The roster recipient the entry settles, echoed verbatim."
+              },
+              "success": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["timestamp"],
+                "properties": {
+                  "timestamp": {
+                    "type": "integer",
+                    "description": "The recipient's own send timestamp."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "group": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["groupId", "timestamp"],
+          "description": "Contract revision 1.157 (§4.155): the group leg face — the engine groupId echoed and the group leg's own timestamp (the single leg shares the batch timestamp, the mixed audience answers the official +1 offset). A malformed face is the same protocol defect the required keys answer.",
+          "properties": {
+            "groupId": {
+              "type": "string",
+              "description": "The engine groupId echoed verbatim (the group master key standard base64)."
+            },
+            "timestamp": {
+              "type": "integer",
+              "description": "The group leg's own send timestamp."
+            },
+            "fileAttachment": {
+              "description": "Contract revision 1.161 (§4.159): the group leg's own media upload pointer — the same raw-value transit as the top-level fileAttachment (the mixed audience runs two independent uploads and the pointers are distinct objects, hence the split keys; the group single leg leaves the top level absent). Untyped by design, absent = never serialized, never null."
+            }
+          }
+        },
+        "fileAttachment": {
+          "description": "Contract revision 1.161 (§4.159): the roster leg's media upload pointer — a raw value by design (the 1.157 group-answer posture): the pointer's whole shape is the engine projection's product, passed through untouched (untyped and unshaped — no connector gate on the value's internals). Documented full face: id/contentType/filename?/size?/width?/height?/caption?/blurHash?/incrementalMac?/chunkSize?/isVoiceNote/isBorderless/isGif/waveform?/duration? + locator{key?, cdnKey?, cdnNumber?, uploadTimestamp?, digest?}, absent keys absent (no-null); locator has no plaintextHash — the official proto has no such bit, the honest absence. The connector performs zero CDN resolution and zero pointer consumption: the locator stays opaque transit, and the desktop's own-media read-back chain (the engine batch's purpose — own media has no local bytes without the pointer) is the downstream consumer batch. Absent = the key never serializes: the text leg, a send failure, and the group single leg (the group leg's pointer rides group.fileAttachment); every pre-1.161 answer reads byte-identically."
         }
       }
     },
