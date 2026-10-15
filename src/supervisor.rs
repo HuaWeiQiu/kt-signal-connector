@@ -129,6 +129,22 @@ const RECEIPT_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 /// conversations keep hitting the engine, never an unbounded map).
 const RECEIPT_FAILURE_MAP_CAP: usize = 4_096;
 
+/// §4.167 group-history resync TTL: the official lazy group update window —
+/// `waitThenMaybeUpdateGroup` skips the fetch when the group was fetched
+/// within five minutes (`FIVE_MINUTES`, groups.preload.ts:3057/:3074-3082),
+/// so opening a conversation can never hammer the upstream. The connector
+/// stamps the attempt on a successful refresh only; a failed refresh clears
+/// the stamp (official `setLastSuccessfulGroupFetch(id, undefined)` on
+/// failure, :3094) so the next open retries immediately — which is what
+/// makes a boot-window miss self-heal without any manual `contacts.sync`.
+const GROUP_RESYNC_TTL_MS: u64 = 5 * 60_000;
+/// Hard cap on the resync throttle map (AGENTS.md bounded-maps rule): expired
+/// entries prune on every touch and insertion is refused past the cap — a
+/// pathological burst of distinct group reads past the cap keeps reaching
+/// the engine, never an unbounded map (the receipt debounce's own cap
+/// direction).
+const GROUP_RESYNC_MAP_CAP: usize = 512;
+
 /// One queued auto delivery receipt (contract revision 1.34, §4.29): after an
 /// incoming dataMessage row lands, the connector best-effort tells the engine
 /// to send the official delivery receipt to its author. Fully silent: failures
@@ -290,6 +306,12 @@ pub struct RuntimeSupervisor {
     /// std clock keeps `duration_since` saturating — a backwards wall-clock
     /// jump reads as "just failed", never a panic.
     receipt_failures: StdMutex<HashMap<String, std::time::Instant>>,
+    /// §4.167 single-group resync throttle: (account, group) → last
+    /// successful refresh stamp (epoch ms). Success-only stamps — a failed
+    /// refresh removes its entry so the next conversation open retries
+    /// immediately. Bounded like the receipt debounce; never held across an
+    /// await.
+    group_resync_stamps: StdMutex<HashMap<(String, String), u64>>,
 }
 
 impl RuntimeSupervisor {
@@ -395,6 +417,7 @@ impl RuntimeSupervisor {
             backup_counters: StdMutex::new(HashMap::new()),
             plaintext_tasks: Arc::new(crate::backup_export::PlaintextTaskRegistry::new()),
             receipt_failures: StdMutex::new(HashMap::new()),
+            group_resync_stamps: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -6816,16 +6839,311 @@ impl RuntimeSupervisor {
             .unwrap_or_default();
         // Store-only read: the service lock guards in-memory state only.
         let store = Arc::clone(&self.store);
-        blocking_service(move || {
+        let account = account_id.clone();
+        let group = group_key.clone();
+        let cached = blocking_service(move || {
             store_get_group_with_requesting(
                 &store,
-                &account_id,
-                &group_key,
+                &account,
+                &group,
                 requesting.as_deref(),
                 pending.as_deref(),
             )
         })
-        .await
+        .await;
+        // §4.167: a cache miss or an empty roster triggers the throttled
+        // single-group resync — the official lazy group update, with the
+        // conversation open itself as the trigger. A terminated row (the
+        // §4.50 appendix face, which the definitive-negative arm writes)
+        // never re-pulls, and every other answer answers exactly the
+        // pre-1.167 read.
+        let needs_resync = match &cached {
+            Err(ServiceError::Api(api)) if api.code == "GROUP_NOT_FOUND" => true,
+            Err(_) => false,
+            Ok(details) => {
+                !details.is_terminated && details.member_count.is_none_or(|count| count == 0)
+            }
+        };
+        if !needs_resync {
+            return cached;
+        }
+        self.get_group_with_resync(&account_id, &group_key, cached)
+            .await
+    }
+
+    /// §4.167: the throttled single-group resync behind a `groups.get` cache
+    /// miss or an empty roster. Official anchor (behavior alignment, zero
+    /// code copied): `waitThenMaybeUpdateGroup` (`groups.preload.ts:3058-3101`)
+    /// — the conversation open triggers one group fetch under a five-minute
+    /// TTL; a failed fetch clears the stamp so the next open retries
+    /// immediately (`:3074-3094`); a definitive nonexistent answer folds to
+    /// left semantics (`:3772-3777`), which this face records as the §4.50
+    /// appendix terminated bit (the connector has no left face; the
+    /// terminated presentation disables the composer the same way). Success
+    /// backfills the cache row through the passive upsert — the account-wide
+    /// sync marker deliberately untouched — and replays the original read;
+    /// every failure answers the incoming cache face unchanged.
+    async fn get_group_with_resync(
+        &self,
+        account_id: &str,
+        group_key: &str,
+        cached: Result<GroupDetails, ServiceError>,
+    ) -> Result<GroupDetails, ServiceError> {
+        let now_ms = crate::link::now_ms();
+        if self.group_resync_throttled(account_id, group_key, now_ms) {
+            return cached;
+        }
+        if !self.note_group_resync_attempt(account_id, group_key, now_ms) {
+            return cached;
+        }
+        match self.refresh_group_from_engine(account_id, group_key).await {
+            Ok(GroupResync::Refreshed {
+                requesting,
+                pending,
+            }) => {
+                let store = Arc::clone(&self.store);
+                let account = account_id.to_string();
+                let group = group_key.to_string();
+                blocking_service(move || {
+                    store_get_group_with_requesting(
+                        &store,
+                        &account,
+                        &group,
+                        requesting.as_deref(),
+                        pending.as_deref(),
+                    )
+                })
+                .await
+            }
+            Ok(GroupResync::Gone) => {
+                if self.mark_group_terminated(account_id, group_key).await? {
+                    let store = Arc::clone(&self.store);
+                    let account = account_id.to_string();
+                    let group = group_key.to_string();
+                    blocking_service(move || {
+                        store_get_group_with_requesting(&store, &account, &group, None, None)
+                    })
+                    .await
+                } else {
+                    cached
+                }
+            }
+            // The engine is not ready or refused the read — never a group
+            // negative. The stamp clears (official :3094) so the next open
+            // retries immediately, and the cache face above answers byte for
+            // byte (the boot-window degrade keeps its exact shape).
+            Err(_) => {
+                self.clear_group_resync_stamp(account_id, group_key);
+                cached
+            }
+        }
+    }
+
+    /// §4.167 throttle read: a successful refresh inside
+    /// [`GROUP_RESYNC_TTL_MS`] suppresses the next trigger — the official
+    /// `isMoreRecentThan(lastSuccessfulGroupFetch, FIVE_MINUTES)` gate.
+    fn group_resync_throttled(&self, account_id: &str, group_key: &str, now_ms: u64) -> bool {
+        let stamps = self
+            .group_resync_stamps
+            .lock()
+            .expect("group resync stamps mutex");
+        stamps
+            .get(&(account_id.to_string(), group_key.to_string()))
+            .is_some_and(|stamp| now_ms.saturating_sub(*stamp) < GROUP_RESYNC_TTL_MS)
+    }
+
+    /// §4.167 throttle write: prune expired stamps, then record — bounded by
+    /// [`GROUP_RESYNC_MAP_CAP`] (AGENTS.md bounded-maps rule); a refused
+    /// insertion only means that group keeps reaching the engine (the
+    /// receipt debounce's cap direction).
+    fn note_group_resync_attempt(&self, account_id: &str, group_key: &str, now_ms: u64) -> bool {
+        let mut stamps = self
+            .group_resync_stamps
+            .lock()
+            .expect("group resync stamps mutex");
+        stamps.retain(|_, stamp| now_ms.saturating_sub(*stamp) < GROUP_RESYNC_TTL_MS);
+        let key = (account_id.to_string(), group_key.to_string());
+        if stamps.len() >= GROUP_RESYNC_MAP_CAP && !stamps.contains_key(&key) {
+            return false;
+        }
+        stamps.insert(key, now_ms);
+        true
+    }
+
+    /// §4.167 failure stamp clear (official `setLastSuccessfulGroupFetch(id,
+    /// undefined)`, groups.preload.ts:3094): a failed refresh never
+    /// suppresses the next trigger.
+    fn clear_group_resync_stamp(&self, account_id: &str, group_key: &str) {
+        let mut stamps = self
+            .group_resync_stamps
+            .lock()
+            .expect("group resync stamps mutex");
+        stamps.remove(&(account_id.to_string(), group_key.to_string()));
+    }
+
+    /// §4.167 definitive-negative stamp: record the §4.50 appendix
+    /// terminated face on the group's cache row so the replayed read (and
+    /// every later read) carries `isTerminated`, and the resync gate never
+    /// re-pulls a terminated row. The conversation must already exist — the
+    /// official fold marks the user's existing conversation left; a key no
+    /// conversation answers materializes nothing. Returns whether the stamp
+    /// was written.
+    async fn mark_group_terminated(
+        &self,
+        account_id: &str,
+        group_key: &str,
+    ) -> Result<bool, ServiceError> {
+        let store = Arc::clone(&self.store);
+        let account = account_id.to_string();
+        let group = group_key.to_string();
+        let title = blocking_service(move || -> Result<Option<String>, ServiceError> {
+            // Peer-key addressing, the same ladder groups.get itself uses:
+            // the conversation id is the derived stable hash, never the raw
+            // key.
+            let Some(row) = store.conversation_by_peer(&account, "group", &group)? else {
+                return Ok(None);
+            };
+            store
+                .conversation_title(&row.id)
+                .map_err(ServiceError::Store)
+        })
+        .await?;
+        let Some(title) = title else {
+            return Ok(false);
+        };
+        let changed = blocking_service({
+            let store = Arc::clone(&self.store);
+            let account = account_id.to_string();
+            let group = group_key.to_string();
+            move || {
+                let entries = [SyncedContact {
+                    kind: "group",
+                    peer_key: group.as_str(),
+                    title: title.as_str(),
+                    extra: Some(r#"{"isTerminated":true}"#),
+                }];
+                store
+                    .upsert_passive_contacts(&account, &entries, crate::link::now_ms())
+                    .map_err(ServiceError::Store)
+            }
+        })
+        .await?;
+        self.emit_passive_changes(account_id, changed).await?;
+        Ok(true)
+    }
+
+    /// §4.135 semantics for one passive upsert's change set: one
+    /// `conversation.changed` per newly materialized skeleton or upgraded
+    /// title, summaries read after the commit, replay-silent by
+    /// construction.
+    async fn emit_passive_changes(
+        &self,
+        account_id: &str,
+        changed: Vec<String>,
+    ) -> Result<(), ServiceError> {
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let store = Arc::clone(&self.store);
+        let account = account_id.to_string();
+        let summaries =
+            blocking_service(move || -> Result<Vec<ConversationSummary>, ServiceError> {
+                Ok(changed
+                    .iter()
+                    .filter_map(|id| store.conversation_summary(&account, id).transpose())
+                    .collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?;
+        for summary in summaries {
+            let _ = self
+                .host_events
+                .send(HostSideEvent::ConversationChanged(summary));
+        }
+        Ok(())
+    }
+
+    /// §4.167: one single-group engine listing, filtered the way the
+    /// §4.53/§4.57 folds read it (`groupId: [key]`) and searched by id —
+    /// never assumed `first()`. `Ok(Refreshed)` carries the same answer's
+    /// requesting/pending arrays for the replay; `Ok(Gone)` is the
+    /// definitive negative: the engine answered and this group is absent
+    /// from the listing, or present with `isMember != true` (the sync
+    /// persist's own member gate). `Err` is everything else — an unbound
+    /// engine, a refused read, a store write failure — never a group
+    /// negative.
+    async fn refresh_group_from_engine(
+        &self,
+        account_id: &str,
+        group_key: &str,
+    ) -> Result<GroupResync, ServiceError> {
+        let engine = self.running_engine().await.map_err(ServiceError::Engine)?;
+        let number = self
+            .service
+            .lock()
+            .await
+            .account_signal_number(account_id)?;
+        let listed = engine
+            .call(
+                "listGroups",
+                json!({ "account": number, "groupId": [group_key] }),
+                CallClass::ReadOnly,
+            )
+            .await
+            .map_err(ServiceError::Engine)?;
+        let entry = listed.as_array().and_then(|groups| {
+            groups
+                .iter()
+                .find(|group| group.get("id").and_then(Value::as_str) == Some(group_key))
+        });
+        let Some(entry) = entry else {
+            return Ok(GroupResync::Gone);
+        };
+        if entry.get("isMember").and_then(Value::as_bool) != Some(true) {
+            return Ok(GroupResync::Gone);
+        }
+        // The sync persist's own projection (§4.39 roster capture): the same
+        // entry shape, the same title truncation, the same bounded roster.
+        let title = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(64).collect::<String>())
+            .unwrap_or_else(|| "group".to_string());
+        let extra = entry
+            .get("members")
+            .and_then(Value::as_array)
+            .map(|members| group_extra_json(members, entry));
+        let changed = blocking_service({
+            let store = Arc::clone(&self.store);
+            let account = account_id.to_string();
+            let group = group_key.to_string();
+            let title = title.clone();
+            let extra = extra.clone();
+            move || {
+                let entries = [SyncedContact {
+                    kind: "group",
+                    peer_key: group.as_str(),
+                    title: title.as_str(),
+                    extra: extra.as_deref(),
+                }];
+                store
+                    .upsert_passive_contacts(&account, &entries, crate::link::now_ms())
+                    .map_err(ServiceError::Store)
+            }
+        })
+        .await?;
+        self.emit_passive_changes(account_id, changed).await?;
+        Ok(GroupResync::Refreshed {
+            requesting: entry
+                .get("requestingMembers")
+                .and_then(Value::as_array)
+                .cloned(),
+            pending: entry
+                .get("pendingMembers")
+                .and_then(Value::as_array)
+                .cloned(),
+        })
     }
 
     /// The engine's live requesting-members array for one group (contract
@@ -7322,6 +7640,18 @@ impl Drop for RuntimeSupervisor {
             handle.abort();
         }
     }
+}
+
+/// §4.167 single-group refresh outcome: backfilled (with the same engine
+/// answer's live member faces for the replay) or definitively gone — the
+/// engine answered the listing and this group is absent from it or carries
+/// `isMember != true`.
+enum GroupResync {
+    Refreshed {
+        requesting: Option<Vec<Value>>,
+        pending: Option<Vec<Value>>,
+    },
+    Gone,
 }
 
 /// Run one store-backed call on the blocking pool: rusqlite is synchronous

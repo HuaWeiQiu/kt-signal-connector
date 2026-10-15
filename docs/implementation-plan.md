@@ -5,6 +5,22 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- No-revision record: 2026-10-16; the group-history resync batch (§4.167)
+  lands as connector-internal behavior only — a `groups.get` cache miss
+  or an empty roster now triggers one throttled (5-minute TTL, official
+  `waitThenMaybeUpdateGroup`) engine `listGroups` refresh for that single
+  group, backfills the cache row through the passive upsert (the
+  account-wide sync marker untouched), and replays the original read, so
+  opening the conversation itself becomes the resync trigger instead of
+  depending on the boot window's one-shot contacts pull; a failed refresh
+  clears the throttle stamp (the next open retries immediately) and a
+  definitive "engine has no such group" answer (absent from a successful
+  single-group listing, or present with `isMember=false`) writes the
+  existing §4.50 appendix terminated face and stops re-pulling (the
+  official `GROUP_NONEXISTENT` → left fold, the connector's terminated
+  bit standing in for the official left face). Zero wire change: every
+  answer face, error face, and event face keeps its pre-1.167 shape, the
+  contract revision stays 1.167 (the §4.167 entry below)
 - No-revision record: 2026-10-16; the boot-window send-integrity batch
   (§4.166) lands as one log-only stalled-dispatch line plus the audit's
   pinned tests — the three forensic questions close with every audited
@@ -14070,6 +14086,105 @@ a duplicate clientRequestId re-answers the stored row with no second
 engine call (`duplicate_send_text_answers_the_persisted_row_without_engine_traffic`);
 and a typing success writes no row and touches no send face beyond its
 own upstream call (`typing_success_writes_no_row_and_touches_no_send_face`).
+
+### 4.167 The group-history resync: opening the conversation becomes the group-refresh trigger (no-revision record, 2026-10-16)
+
+The wound (2026-10-16, the "gggg" group): the desktop opened a group
+conversation to an empty message window and a "0 members" header, while
+the sidebar preview carried the account's own "你: 1 01:15 ✓" row. The
+forensics, all read-only:
+
+**(a) The message window emptiness is not a connector rejection and not a
+missing import.** The desktop's timeline read is `messages.list`, and its
+connector ladder gates on exactly two rows — the account row and the
+conversation row (`store_list_messages`) — never on group state, so a
+`GROUP_NOT_FOUND` cannot reject it. The group's message row exists in the
+connector store: the sidebar preview's direction and send-state faces are
+read-time projections of the newest `messages` row
+(`conversation_last_message_meta`), and "你: … ✓" is only reachable when
+that row is there. The desktop-side rendering gate is its own: the roster
+read that failed during the boot window leaves the group details null and
+the member subtitle falls back to the roster length (zero), and the
+timeline load early-returns while the runtime transition gate holds —
+neither is a connector answer. The connector side of the wound is the
+cache miss below.
+
+**(b) The "0 members" face is the desktop's fallback over a connector
+cache miss.** The conversation summary carries no member count at all;
+the connector's only member-count face is `groups.get`, projected from
+the contacts row's `extra` JSON (`memberCount`/`members`, written only by
+a contacts pull). With the contacts row missing, `groups.get` answers the
+existing `GROUP_NOT_FOUND` cache arm (`retryable=false`) and the desktop
+renders zero from its own fallback. The row was missing because the boot
+window's only automatic pull had already failed: the startup re-sync runs
+once, two seconds after the engine lands, and the engine needed ~13.5s to
+bind — the field log shows the exact shape (two instant `listGroups`
+upstream failures and the `GROUP_NOT_FOUND` host rejection in the same
+millisecond window), and nothing ever retried. The three manual
+`contacts.sync` triggers were never fired.
+
+**The repair aligns the official lazy group update.** The official
+desktop refreshes a group on conversation open under a five-minute TTL
+(`waitThenMaybeUpdateGroup`, `FIVE_MINUTES`), clears the timestamp on a
+failed update so the next open retries immediately
+(`setLastSuccessfulGroupFetch(id, undefined)`), and folds a
+nonexistent-group answer into left semantics (`GROUP_NONEXISTENT` →
+`generateLeftGroupChanges`). The connector mirror:
+
+- A `groups.get` whose cached read misses (`GROUP_NOT_FOUND`) or whose
+  roster is empty (no `memberCount`, or zero — never a terminated row)
+  triggers ONE single-group engine `listGroups` refresh under the same
+  5-minute TTL, in-memory and bounded (a fixed entry cap: past the cap a
+  new stamp is refused, so that one group keeps reaching the engine —
+  never an unbounded map). A successful refresh backfills the row through the
+  passive upsert — the same columns and conflict semantics as the sync
+  persist, deliberately NOT advancing the account-wide
+  `contacts_synced_at` marker — and replays the original read, with the
+  live requesting/pending faces projected from the same engine answer.
+  The throttle stamps success only: a failed refresh (engine not bound
+  yet, engine refused, store write failed) clears the stamp so the next
+  open retries immediately, which is also what makes the boot window
+  self-heal — the incident's exact shape (read at T+2s, engine bound at
+  T+13.5s) converges on the next conversation open without any manual
+  `contacts.sync`.
+- A definitive negative — the engine answered the single-group listing
+  and the group is absent from it, or present with `isMember != true` —
+  writes the existing §4.50 appendix terminated face onto the group's
+  cache row (only when the conversation already exists; a garbage key
+  materializes nothing) and replays the read carrying `isTerminated`:
+  the connector has no left bit, so the terminated face is the recorded
+  stand-in, and a terminated row never re-pulls. An engine that is not
+  ready or refuses the read is NOT a negative: the answer stays the
+  pre-existing `GROUP_NOT_FOUND` face byte for byte.
+- The message rows need no replay leg: they were never missing (a), and
+  the read ladder has no group gate to reject them.
+
+Zero wire change: no new method, event, error code, capability, schema
+move, or metric; every answer (including the degrade) keeps its
+pre-1.167 shape, `conversation.changed` rides only through the §4.135
+semantics the pull and the passive batch already share, and the error
+faces the desktop already consumes are untouched. The engine's own group
+gate stays the authority past the trigger: the connector still never
+decodes a group id (the §4.150 opaque-transit posture), and the
+connector-side roster write is the same projection the sync persist has
+run since §4.39.
+
+Tests (integration +4, all against the fake engine): the cache miss
+resyncs, backfills, and replays the read
+(`group_cache_miss_resyncs_replays_and_backfills_the_roster`); the
+throttle holds within the TTL — the backfilled row removed, the next
+read answers the cache-miss face again without a second refresh
+(`group_resync_throttles_within_the_ttl_after_success`); a definitive
+negative marks the terminated face and stops re-pulling — the fixture's
+former-group entry (`isMember=false`) and, under the empty-listing
+marker, an absent id both land on the same arm, the row persists
+`isTerminated`, and the next read answers the terminated face without a
+refresh
+(`group_true_negative_marks_terminated_and_stops_repulling`); and the
+boot-window shape self-heals — a read with no engine answers the
+untouched `GROUP_NOT_FOUND` face, and after the engine lands the same
+read succeeds with no manual sync
+(`group_boot_window_degrades_then_self_heals_once_the_engine_lands`).
 
 ## 5. signal-cli Boundary
 

@@ -897,6 +897,12 @@ for line in sys.stdin:
                 "members": [],
             },
         ]
+        # §4.167 resync definitive-negative: the marker answers an empty
+        # listing — the engine knows no groups at all — so the "group absent
+        # from a successful single-group listing" arm is exercisable against
+        # the real wire shape (a filtered query that drops its subject).
+        if (SIGNAL_DATA_DIR / ".fixture-groups-empty").exists():
+            result = []
     elif method == "deleteLocalAccountData":
         if DELETE_MODE == "crash_after_delete_once" and DELETED_MARKER.exists():
             response = {
