@@ -42,26 +42,26 @@ use crate::service::{
     MessagesReportSpamParams, MessagesSendContactParams, MessagesSendPollCreateParams,
     MessagesSendPollTerminateParams, MessagesSendPollVoteParams, MessagesSendStickerParams,
     MessagesSendStoryParams, NotificationProfileSyncs, NotificationProfilesListParams,
-    NotificationProfilesSetRecordsParams, PeerTarget, PinnedConversations, PreparedHistoryDownload,
-    PreparedSend, ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams,
-    SendTextPreviewParams, SendTextStyleParams, ServiceError, StickerManifestEntry,
-    StickerPackGetSyncsParams, StickerPackImage, StickerPackImageParams, StickerPackManifest,
-    StickerPackManifestParams, StickerPackSetSyncParams, StickerPackSyncs,
-    StorageGetCallLinksParams, StorageIngestParams, StorageSetCallLinkParams, StoriesDisabled,
-    StoriesGetDisabledParams, StoriesMarkViewedParams, StoriesSendReactionParams,
-    StoriesSetDisabledParams, StoryDistributionListSyncs, StoryDistributionListsListParams,
-    StoryDistributionListsSetRecordsParams, StorySendGroupFace, StorySendRecipientResult,
-    StorySendResult, StorySendSuccess, UsernameLookupEntry, UsernameLookupParams,
-    UsernameLookupResult, account_device_capabilities_from_engine, account_limit_error,
-    blocked_conversations_result, call_link_syncs_result, chat_folder_syncs_result,
-    conversation_state_from_engine, device_list_from_engine, group_create_result_from_engine,
-    group_invite_join_status_from_engine, group_invite_link_parse_from_engine,
-    group_invite_link_password_from_engine, group_invite_link_preview_from_engine,
-    group_migrate_result_from_engine, identity_from_engine, import_groups_summary_from_engine,
-    merge_contacts_summary_from_engine, notification_profile_syncs_result,
-    pinned_conversations_result, sticker_pack_syncs_result, store_adjacent_media,
-    store_get_group_with_requesting, store_get_message_text, store_list_contacts,
-    store_list_conversations, store_list_messages, store_search_messages,
+    NotificationProfilesSetRecordsParams, PeerTarget, PhoneLookupEntry, PhoneLookupParams,
+    PhoneLookupResult, PinnedConversations, PreparedHistoryDownload, PreparedSend,
+    ReportSpamFailure, ReportSpamResult, SendTarget, SendTextMentionParams, SendTextPreviewParams,
+    SendTextStyleParams, ServiceError, StickerManifestEntry, StickerPackGetSyncsParams,
+    StickerPackImage, StickerPackImageParams, StickerPackManifest, StickerPackManifestParams,
+    StickerPackSetSyncParams, StickerPackSyncs, StorageGetCallLinksParams, StorageIngestParams,
+    StorageSetCallLinkParams, StoriesDisabled, StoriesGetDisabledParams, StoriesMarkViewedParams,
+    StoriesSendReactionParams, StoriesSetDisabledParams, StoryDistributionListSyncs,
+    StoryDistributionListsListParams, StoryDistributionListsSetRecordsParams, StorySendGroupFace,
+    StorySendRecipientResult, StorySendResult, StorySendSuccess, UsernameLookupEntry,
+    UsernameLookupParams, UsernameLookupResult, account_device_capabilities_from_engine,
+    account_limit_error, blocked_conversations_result, call_link_syncs_result,
+    chat_folder_syncs_result, conversation_state_from_engine, device_list_from_engine,
+    group_create_result_from_engine, group_invite_join_status_from_engine,
+    group_invite_link_parse_from_engine, group_invite_link_password_from_engine,
+    group_invite_link_preview_from_engine, group_migrate_result_from_engine, identity_from_engine,
+    import_groups_summary_from_engine, merge_contacts_summary_from_engine,
+    notification_profile_syncs_result, pinned_conversations_result, sticker_pack_syncs_result,
+    store_adjacent_media, store_get_group_with_requesting, store_get_message_text,
+    store_list_contacts, store_list_conversations, store_list_messages, store_search_messages,
     story_distribution_lists_result, validate_account_delete_operation_id,
 };
 use crate::store::{
@@ -4365,6 +4365,56 @@ impl RuntimeSupervisor {
                             .get("uuid")
                             .and_then(Value::as_str)
                             .map(str::to_string),
+                        is_registered: entry
+                            .get("isRegistered")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, ServiceError>>()?,
+        })
+    }
+
+    /// phone.lookup (contract revision 1.164, §4.162): resolution under the
+    /// service lock, then the read-only `phoneLookup` engine call (the CDSI
+    /// batch, engine d088a59 — connector wire `phone.lookup`, engine method
+    /// camelCase, the username chain's naming posture). The upstream answer
+    /// is a top-level array projected entry-for-entry — the keys ride the
+    /// engine's names verbatim (`number`/`aci`/`pni`/`isRegistered`, absent
+    /// service ids absent, a miss pre-degraded `{number, isRegistered:
+    /// false}`), a missing `number` is a protocol face, not a silently
+    /// dropped item, and the projection answers from memory alone: nothing
+    /// lands in the connector store. The three structured error faces
+    /// (PHONE_INVALID / PHONE_RATE_LIMITED + data.retryAfterSeconds /
+    /// PHONE_SERVER_FAILED) ride the engine's literals through the global
+    /// mapping; the plain -32603 unknown-account face stays UPSTREAM_ERROR.
+    pub async fn lookup_phones(
+        &self,
+        params: PhoneLookupParams,
+    ) -> Result<PhoneLookupResult, ServiceError> {
+        let engine = self.running_engine().await?;
+        let upstream = {
+            let service = self.service.lock().await;
+            service.prepare_phone_lookup(&params)?
+        };
+        let result = engine
+            .call("phoneLookup", upstream, CallClass::ReadOnly)
+            .await?;
+        let entries = result
+            .as_array()
+            .ok_or(ServiceError::Engine(EngineError::Protocol))?;
+        Ok(PhoneLookupResult {
+            entries: entries
+                .iter()
+                .map(|entry| {
+                    Ok(PhoneLookupEntry {
+                        number: entry
+                            .get("number")
+                            .and_then(Value::as_str)
+                            .ok_or(ServiceError::Engine(EngineError::Protocol))?
+                            .to_string(),
+                        aci: entry.get("aci").and_then(Value::as_str).map(str::to_string),
+                        pni: entry.get("pni").and_then(Value::as_str).map(str::to_string),
                         is_registered: entry
                             .get("isRegistered")
                             .and_then(Value::as_bool)

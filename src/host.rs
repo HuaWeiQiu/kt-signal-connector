@@ -58,7 +58,7 @@ use crate::service::{
     MessagesSendPollVoteParams, MessagesSendReactionParams, MessagesSendStickerParams,
     MessagesSendStoryParams, MessagesSendTextParams, MessagesSendUnpinMessageParams,
     MessagesSendViewOnceOpenParams, MessagesSyncReadParams, MessagesSyncViewedParams,
-    NotificationProfilesListParams, NotificationProfilesSetRecordsParams,
+    NotificationProfilesListParams, NotificationProfilesSetRecordsParams, PhoneLookupParams,
     PresenceSetTypingMessageParams, SendTarget, StickerPackGetSyncsParams, StickerPackImageParams,
     StickerPackManifestParams, StickerPackSetSyncParams, StorageGetCallLinksParams,
     StorageIngestParams, StorageSetCallLinkParams, StoriesDeleteForEveryoneParams,
@@ -1158,6 +1158,24 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
             Err(_) => HostResponse::failure(
                 request_id,
                 ApiError::new("INVALID_REQUEST", "invalid username.lookup params", false),
+            ),
+        },
+        // Phone lookup (contract revision 1.164, §4.162): the CDSI batch read
+        // projects the engine's answer entry-for-entry (the keys ride the
+        // engine's names verbatim); the structured error faces
+        // (PHONE_INVALID / PHONE_RATE_LIMITED + data.retryAfterSeconds /
+        // PHONE_SERVER_FAILED) pass through the global mapping untouched.
+        "phone.lookup" => match serde_json::from_value::<PhoneLookupParams>(request.params) {
+            Ok(params) => match runtime.lookup_phones(params).await {
+                Ok(result) => HostResponse::success(
+                    request_id,
+                    serde_json::to_value(result).unwrap_or(Value::Null),
+                ),
+                Err(error) => HostResponse::failure(request_id, error.into_api()),
+            },
+            Err(_) => HostResponse::failure(
+                request_id,
+                ApiError::new("INVALID_REQUEST", "invalid phone.lookup params", false),
             ),
         },
         "link.start" => match serde_json::from_value::<LinkStartParams>(request.params) {

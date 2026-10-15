@@ -42,7 +42,44 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.163 (2026-10-15; the TLS trust-chain alignment
+- Contract revision: 1.164 (2026-10-15; §4.162 the phone-number lookup relay
+  (`phone.lookup`): the connector-side registration of the engine's
+  `phoneLookup` CDSI batch reader (engine d088a59, compat §3 phone row + §5
+  batch block) — the connector half of the desktop D-batch
+  find-by-phone-number supply (desktop 64584c27, wire face locked first:
+  method name, capability tag, Read lane, batch cap, the `account` param
+  key, and the `{entries:[...]}` answer shape all arrive pre-pinned and this
+  batch does not move them). Wire additive: one new Read-lane method, one
+  feature tag (`phone-lookup`), three new error codes (PHONE_INVALID /
+  PHONE_RATE_LIMITED / PHONE_SERVER_FAILED); zero new events, zero store
+  moves, zero capability bits (the tag joins the constant feature table).
+  Params `{account, numbers[1..20]}` — the engine frame grammar mirrored
+  fail-closed locally (the batch cap and the E.164 `^\+\d{7,15}$` shape
+  answer the same refusals the desktop hostAdapter gate does,
+  INVALID_REQUEST retryable=false, before any engine traffic; the engine's
+  PHONE_INVALID stays the authority past the gate). The answer projects the
+  engine's top-level array entry-for-entry
+  (`{entries: [{number, aci?, pni?, isRegistered}]}`) — the keys ride the
+  engine's names verbatim, null folds to absence, a miss arrives
+  pre-degraded `isRegistered: false` (the usernameLookup discipline), no
+  entry is ever dropped, and the projection answers from memory alone:
+  nothing lands in the connector store (the number→account local mapping
+  stays the contacts sync chain's). The error faces ride the engine's
+  literals through the global structured-code mapping — PHONE_INVALID
+  deterministic, PHONE_RATE_LIMITED carrying the promised
+  `data.retryAfterSeconds` verbatim (retryable=true on the
+  USERNAME_RATE_LIMITED channel: a later attempt may succeed, the wait is
+  the caller's decision, nothing retries automatically), PHONE_SERVER_FAILED
+  the same may-succeed-later channel; the unknown-account face stays the
+  plain -32603 → UPSTREAM_ERROR ladder. Schema: +2 defs
+  (phoneLookupParams / phoneLookupResult, the request branch pins the
+  result ref), the method enum +1, the error enum +3, the error `data`
+  description gains the retryAfterSeconds face; the consistency pairs +1
+  (numbers.maxItems ↔ PHONE_LOOKUP_MAX_ENTRIES), every pre-existing pointer
+  name-based and unmoved. Tests 855 → 860 (integration +3, lib +2), all
+  green — fmt, check, clippy, full cargo test, release build, schema parse +
+  consistency) —
+  previously 1.163 (2026-10-15; the TLS trust-chain alignment
   (§4.161): the 2026-10-15 real-device pain point + the user's own words
   「别把处理代理的任务给客户」 — the user runs a Shadowrocket MITM proxy (TUN +
   fake-ip, its CA installed into the macOS system keychain); the official
@@ -13570,6 +13607,82 @@ the wire. The data plane has no feasible TLS unit test (a real CDN
 handshake is not a fixture); recorded honestly — the full existing suite
 (all local fake/mocked faces, HTTP loopback wiremock included) is the
 regression, and the feature switch touches no test-visible byte of it.
+
+### 4.162 The phone-number lookup relay: `phone.lookup` mirrors the engine's CDSI batch reader (contract revision 1.164, 2026-10-15)
+
+The supply chain: the desktop D-batch (64584c27) lands find-by-phone-number
+— a contact card's phone number resolving to an addressable recipient —
+and its hostAdapter calls `supervisor.request("phone.lookup", {account,
+numbers})` with the wire face locked first: the method name, the
+`phone-lookup` capability tag, the Read lane, the batch cap, the `account`
+param key (the value stays the opaque connector account id), and the
+`{entries:[...]}` answer shape all arrive pre-pinned by that batch, and
+this connector half registers the face without moving any of them. The
+engine half is the `phoneLookup` CDSI batch reader (engine d088a59, its
+compat §3 phone row and its §5 batch block): params
+`{account, numbers[1..20]}` under the E.164 `^\+\d{7,15}$` shape gate, a
+top-level JSON answer array in input order — each entry
+`{number, aci?, pni?, isRegistered}` with single-hit semantics (a
+ServiceId resolves as an Aci or a Pni, never both), null folding to
+absence, and a miss arriving pre-degraded as
+`{number, isRegistered: false}` — the usernameLookup discipline
+(§4.55, §4.65) carried to phone numbers.
+
+**① The connector side is registration, not invention.**
+`prepare_phone_lookup` gates locally before any engine traffic — the
+opaque account id validates, the batch answers its cap refusal
+(`PHONE_LOOKUP_MAX_ENTRIES` = 20; the empty batch and the over-cap batch
+both `INVALID_REQUEST`, retryable=false — the same refusals the desktop
+hostAdapter gate answers), and every number passes the E.164 shape gate
+(hand-written, the crate carries no regex dependency) — then the account
+resolves to the engine's signal number and the frame leaves as
+`{account: <signal number>, numbers}` verbatim. The engine's own
+PHONE_INVALID stays the authority past the gate; the local gate answers
+only the shapes the engine would refuse anyway, so the two gates never
+disagree about a number the engine accepts.
+
+**② The answer projects entry-for-entry from memory alone.** The
+engine's top-level array becomes `{entries: [...]}` in input order, the
+keys ride the engine's names verbatim, null folds to absence, no entry
+is dropped or reordered. The projection is discard-after-render: nothing
+lands in the connector store — the number→account local mapping stays
+the contacts sync chain's (the §4.97 persist-nothing posture), and the
+connector keeps no phone-number ledger of its own.
+
+**③ The error faces ride the engine's literals through the global
+structured-code mapping.** PHONE_INVALID deterministic (retryable=false,
+no data — the message is the literal); PHONE_RATE_LIMITED carries the
+promised `data.retryAfterSeconds` verbatim on the may-succeed-later
+channel (retryable=true, the USERNAME_RATE_LIMITED channel: a later
+attempt may succeed, the wait decision is the caller's, and nothing
+retries automatically — the no-auto-retry red line covers a
+rate-limit-shaped face the same as an unknown send outcome);
+PHONE_SERVER_FAILED the same channel without data; the unknown-account
+face stays the plain -32603 → UPSTREAM_ERROR ladder.
+
+Wire additive: one new Read-lane method, one feature tag (`phone-lookup`
+joining the constant feature table), three new error codes; zero new
+events, zero store moves, zero capability bits. Schema: +2 defs
+(phoneLookupParams / phoneLookupResult, the request branch pins the
+result ref), the method enum +1, the error enum +3, the error `data`
+description gains the retryAfterSeconds face; the consistency pairs +1
+(numbers.maxItems ↔ PHONE_LOOKUP_MAX_ENTRIES), every pre-existing
+pointer name-based and unmoved. Tests 855 → 860 (integration +3, lib
++2): the full-chain hit/miss relay
+(`phone_lookup_rides_the_engine_projection_verbatim_hit_and_miss` — the
+send log pinning the frame's `account` as the resolved signal number
+with the numbers verbatim, the aci+pni hit and the pre-degraded miss
+riding one answer, ACCOUNT_NOT_FOUND on the unknown host account, zero
+rows landing anywhere), the local gates refusing with zero engine
+frames (`phone_lookup_local_gates_refuse_before_any_engine_traffic` —
+the empty batch, the 21-number batch, four shape violations, the
+boundary 20 passing), and the three error faces relayed honestly
+(`phone_lookup_error_faces_ride_the_engine_literals_verbatim` — the
+promised `retryAfterSeconds` 42 verbatim, no data invented on the
+data-less faces, the rate-limit and server faces zero auto-retries);
+the lib pair pins the preparation bounds/gates and the error faces'
+retryability, the fake engine stub speaks the sentinel numbers, and the
+handshake capabilities assertion carries the new method + tag.
 
 ## 5. signal-cli Boundary
 

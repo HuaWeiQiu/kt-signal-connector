@@ -430,6 +430,13 @@ pub const METHODS: &[MethodRow] = &[
     // bounded cloud read, no mutation, no local state; the candidate bounds
     // mirror the username shape rules.
     ("username.lookup", Lane::Read, false, "read"),
+    // Phone lookup (contract revision 1.164, §4.162): the engine's
+    // `phoneLookup` CDSI read (engine d088a59) — one bounded cloud batch
+    // (1..20 full E.164 numbers, the engine's own frame grammar mirrored
+    // fail-closed), no mutation, no local state; the results are a memory
+    // projection only (the number→account local mapping stays the contacts
+    // sync chain's — zero rows land in the connector store).
+    ("phone.lookup", Lane::Read, false, "read"),
     // Message-request response faces (contract revision 1.63, §4.56): the
     // pinned upstream's native `sendMessageRequestResponse` sync face —
     // accept/decline over the multi-device MessageRequestResponse sync
@@ -890,7 +897,12 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// 1.125) marks the §4.106 poll send faces (`messages.sendPollCreate` /
 /// `messages.sendPollVote` / `messages.sendPollTerminate` — the official
 /// PollCreateSchema/PollVoteSchema content gate, group-conversation legs
-/// exclusively). They never
+/// exclusively); and `phone-lookup` (contract revision 1.164) marks the
+/// §4.162 phone-number lookup face (`phone.lookup` — the engine's
+/// `phoneLookup` CDSI batch reader, engine d088a59, the desktop D-batch
+/// find-by-phone-number supply; the desktop gates its entry on the tag, so
+/// an older connector keeps the entry rendered away, never a
+/// `METHOD_NOT_ALLOWED` surprise). They never
 /// join [`METHOD_NAMES`]: the schema request-frame method enum and the
 /// dispatch table describe real methods only — desktops gate a new surface on
 /// its tag so an old connector answers a clean capability gap instead of
@@ -941,6 +953,7 @@ pub const FEATURE_CAPABILITIES: &[&str] = &[
     "polls",
     "delete-for-me",
     "storage-sync",
+    "phone-lookup",
 ];
 
 #[cfg(test)]
@@ -984,6 +997,7 @@ mod tests {
             "calls.getState",
             "accounts.getUsername",
             "username.lookup",
+            "phone.lookup",
             "identities.get",
             "stories.getDisabled",
             "stories.openAttachment",

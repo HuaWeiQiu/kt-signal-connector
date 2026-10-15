@@ -2242,6 +2242,66 @@ for line in sys.stdin:
             else:
                 entries.append({"recipient": name, "isRegistered": False})
         result = entries
+    elif method == "phoneLookup":
+        # Contract 1.164 §4.162: the kt-engine CDSI lookup route — the same
+        # top-level array contract as the usernameLookup face (first entry
+        # the registered hit face with both service ids, the rest the
+        # pre-degraded unregistered face; the connector re-keys nothing).
+        # Sentinels mirror the engine's structured read faces (code -1 + the
+        # literal in the message): "+15550000001" answers PHONE_RATE_LIMITED
+        # with the promised {retryAfterSeconds} backoff fact,
+        # "+15550000002" answers PHONE_SERVER_FAILED, "+15550000003" answers
+        # PHONE_INVALID (the engine's own E.164 grammar refusal — a drift-net
+        # face here, the connector mirrors the grammar locally). The exact
+        # upstream params ride SEND_LOG (tests assert the resolved account
+        # and the numbers verbatim); the answer itself is a memory
+        # projection — nothing is written to any store.
+        with WRITE_LOCK:
+            with SEND_LOG.open("a") as log:
+                log.write(json.dumps(params, separators=(",", ":")) + "\n")
+        numbers = params.get("numbers", [])
+        if "+15550000001" in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -1,
+                    "message": "PHONE_RATE_LIMITED",
+                    "data": {"retryAfterSeconds": 42},
+                },
+            }
+            emit_json(response)
+            continue
+        if "+15550000002" in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "PHONE_SERVER_FAILED"},
+            }
+            emit_json(response)
+            continue
+        if "+15550000003" in numbers:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -1, "message": "PHONE_INVALID"},
+            }
+            emit_json(response)
+            continue
+        entries = []
+        for index, number in enumerate(numbers):
+            if index == 0:
+                entries.append(
+                    {
+                        "number": number,
+                        "aci": "00000000-0000-0000-0000-00000000000" + str(index % 10),
+                        "pni": "00000000-0000-0000-0000-00000000001" + str(index % 10),
+                        "isRegistered": True,
+                    }
+                )
+            else:
+                entries.append({"number": number, "isRegistered": False})
+        result = entries
     elif method == "usernameReserve":
         # Contract 1.75 §4.66: the kt-engine username write face, hop one.
         # Record the exact upstream params (tests assert the resolved account

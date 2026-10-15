@@ -5267,6 +5267,8 @@ async fn handshake_advertises_receipts_and_mentions_reach_the_upstream() {
         "accounts.getUsername",
         "username.lookup",
         "username",
+        "phone.lookup",
+        "phone-lookup",
     ] {
         assert!(
             capabilities

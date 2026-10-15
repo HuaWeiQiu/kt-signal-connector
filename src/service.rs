@@ -167,6 +167,13 @@ pub const USERNAME_MAX_WIRE_CHARS: usize = 38;
 /// one host frame — the official getUserStatus takes an open array, the
 /// connector refuses anything wider.
 pub const USERNAME_LOOKUP_MAX_ENTRIES: usize = 20;
+/// phone.lookup batch cap (contract revision 1.164, §4.162): the engine
+/// `phoneLookup` frame bound (engine d088a59, `PHONE_LOOKUP_MAX_ENTRIES`)
+/// mirrored — the CDSI single-request face stays small on purpose (the
+/// server's rate-limit threshold is unpublished; a small batch is rate-limit
+/// politeness), so the connector refuses anything wider before any engine
+/// traffic.
+pub const PHONE_LOOKUP_MAX_ENTRIES: usize = 20;
 /// Result-face coarse guard for `conversations.getAvatar` (§4.47): the
 /// engine caps a download at [`MAX_AVATAR_BYTES`] decoded, so the data URI
 /// — `data:<mime>;base64,` prefix plus the padded base64 encoding of the
@@ -573,6 +580,26 @@ impl ServiceError {
                         data,
                     );
                 }
+                // §4.162 phone lookup (contract 1.164, engine d088a59
+                // phoneLookup): RATE_LIMITED carries the engine's promised
+                // {retryAfterSeconds} backoff fact verbatim — the caller owns
+                // the wait (the engine holds no backoff state, the desktop's
+                // retry is an explicit click, nothing retries automatically).
+                // Retryability is the contract-fixed family face (the
+                // USERNAME_RATE_LIMITED channel: a later attempt may
+                // succeed), reasserted over the with_data default; the
+                // data-less face keeps the plain arm in the match below.
+                if code == "PHONE_RATE_LIMITED"
+                    && let Some(data) = data
+                {
+                    let mut api = ApiError::with_data(
+                        "PHONE_RATE_LIMITED",
+                        "the phone lookup was rate-limited",
+                        data,
+                    );
+                    api.retryable = true;
+                    return api;
+                }
                 match code {
                     "STICKER_PACK_KEY_INVALID" => ApiError::new(
                         "STICKER_PACK_KEY_INVALID",
@@ -783,6 +810,37 @@ impl ServiceError {
                     "USERNAME_SERVER_FAILED" => ApiError::new(
                         "USERNAME_SERVER_FAILED",
                         "the username server request failed",
+                        true,
+                    ),
+                    // §4.162 phone lookup (contract 1.164, engine d088a59
+                    // phoneLookup): the CDSI read faces. INVALID is the
+                    // engine's deterministic E.164 grammar refusal (the same
+                    // shape never resolves) — retryable=false; the connector
+                    // mirrors the grammar locally, so this arm is the drift
+                    // net for an engine/connector shape divergence, not the
+                    // working path. RATE_LIMITED carries the engine's
+                    // promised {retryAfterSeconds} backoff fact verbatim (the
+                    // pre-match arm above; the data-less face answers without
+                    // it) — retryable=true on the USERNAME_RATE_LIMITED
+                    // channel: a later attempt may succeed, the wait is the
+                    // caller's decision, and nothing ever retries
+                    // automatically. SERVER_FAILED is the remaining
+                    // server/connection family, details withheld by the
+                    // engine (细节不外泄) — retryable=true, the same
+                    // may-succeed-later channel.
+                    "PHONE_INVALID" => ApiError::new(
+                        "PHONE_INVALID",
+                        "the number is not a valid E.164 phone number",
+                        false,
+                    ),
+                    "PHONE_RATE_LIMITED" => ApiError::new(
+                        "PHONE_RATE_LIMITED",
+                        "the phone lookup was rate-limited",
+                        true,
+                    ),
+                    "PHONE_SERVER_FAILED" => ApiError::new(
+                        "PHONE_SERVER_FAILED",
+                        "the phone lookup server request failed",
                         true,
                     ),
                     // §4.73 call-link credential faces (contract 1.88, engine
@@ -5393,6 +5451,40 @@ impl ConnectorService {
         Ok(json!({
             "account": account.signal_account,
             "usernames": params.usernames,
+        }))
+    }
+
+    /// phone.lookup (contract revision 1.164, §4.162): the number batch
+    /// resolves through the engine's `phoneLookup` CDSI reader (engine
+    /// d088a59, compat §3 phone row + §5 batch block). The connector's gate
+    /// is the engine's own frame grammar mirrored fail-closed — the batch cap
+    /// and the E.164 shape answer the same refusals the desktop's hostAdapter
+    /// gate does, locally, before any engine traffic; the engine's
+    /// PHONE_INVALID face stays the authority for anything past this gate.
+    /// The engine frame key for the account is `account`, the same word the
+    /// host face carries (the D-batch desktop wire lock).
+    pub fn prepare_phone_lookup(&self, params: &PhoneLookupParams) -> Result<Value, ServiceError> {
+        validate_opaque_id(&params.account, "account")?;
+        if params.numbers.is_empty() || params.numbers.len() > PHONE_LOOKUP_MAX_ENTRIES {
+            return Err(ServiceError::Api(ApiError::new(
+                "INVALID_REQUEST",
+                "numbers must contain between 1 and 20 entries",
+                false,
+            )));
+        }
+        for number in &params.numbers {
+            if !is_e164_phone_number_shape(number) {
+                return Err(ServiceError::Api(ApiError::new(
+                    "INVALID_REQUEST",
+                    "each number entry must be a full E.164 phone number",
+                    false,
+                )));
+            }
+        }
+        let account = self.resolve_account(&params.account)?;
+        Ok(json!({
+            "account": account.signal_account,
+            "numbers": params.numbers,
         }))
     }
 
@@ -12276,6 +12368,35 @@ pub struct UsernameLookupResult {
     pub results: Vec<UsernameLookupEntry>,
 }
 
+/// One §4.162 `phone.lookup` entry: the caller's number echoed verbatim,
+/// plus the CDSI hit face. `aci`/`pni` are the engine's single-hit service-id
+/// projections (the official directory.rs double-hit takes the ACI) — absent
+/// means no hit on that id, and a miss/unregistered entry arrives
+/// pre-degraded (`{number, isRegistered: false}`, the usernameLookup
+/// discipline); no entry is ever dropped. The connector re-keys nothing:
+/// the keys ride the engine's names verbatim.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneLookupEntry {
+    pub number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aci: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pni: Option<String>,
+    pub is_registered: bool,
+}
+
+/// The §4.162 result of `phone.lookup`: entries in upstream (input) order,
+/// capped at [`PHONE_LOOKUP_MAX_ENTRIES`] by the params gate. Zero local
+/// persistence — the projection answers from the engine's memory face alone
+/// and nothing lands in the connector store (the number→account local
+/// mapping stays the contacts sync chain's).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneLookupResult {
+    pub entries: Vec<PhoneLookupEntry>,
+}
+
 /// The §4.48 result of `calls.getState` (contract revision 1.50): the
 /// connector's call-state registry, honestly empty — the connector is a
 /// signaling pipe; the RingRTC state machine lives in the desktop + calling
@@ -13297,6 +13418,19 @@ pub struct AccountsGetUsernameParams {
 pub struct UsernameLookupParams {
     pub account_id: String,
     pub usernames: Vec<String>,
+}
+
+/// `phone.lookup` params (contract revision 1.164, §4.162): full E.164
+/// numbers resolved against the account's own engine session (its CDSI face,
+/// engine d088a59). The account key is `account` on this face — the D-batch
+/// desktop wire lock (username.lookup carries the same opaque id under
+/// `accountId`; the engine frame key is the same word) — and the engine frame
+/// carries the resolved signal number under the same key.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhoneLookupParams {
+    pub account: String,
+    pub numbers: Vec<String>,
 }
 
 /// `messages.sendStory` params (contract revision 1.76, §4.67; the
@@ -15016,6 +15150,21 @@ fn validate_emoji(emoji: &str) -> Result<(), ServiceError> {
 /// against fat frames — a full username is ≤32 chars and a username link is
 /// far below 64.
 pub const USERNAME_LOOKUP_ENTRY_MAX_CHARS: usize = 64;
+
+/// The phone.lookup per-entry shape gate (contract revision 1.164, §4.162):
+/// the engine's E.164 grammar `^\+\d{7,15}$` mirrored fail-closed — a
+/// leading `+` and 7..15 ASCII digits, nothing else (hand-rolled regex
+/// semantics, the engine `is_valid_e164` shape; zero regex dependency, the
+/// engine's own precedent). The connector answers the same refusals the
+/// desktop's hostAdapter gate does, before any engine traffic; the engine's
+/// PHONE_INVALID face stays the authority — this gate only fast-fails the
+/// shapes the engine would refuse anyway.
+fn is_e164_phone_number_shape(number: &str) -> bool {
+    let Some(digits) = number.strip_prefix('+') else {
+        return false;
+    };
+    (7..=15).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 /// The local shape gate for `accounts.setUsername` (contract revision 1.59,
 /// §4.55): the official desktop username grammar (`ts/util/Username.dom.ts`
@@ -33676,6 +33825,123 @@ mod tests {
                 "usernames": ["kt_test.01", "https://signal.me/#eu"],
             })
         );
+    }
+
+    /// phone.lookup (contract 1.164, §4.162) bounds the batch and the E.164
+    /// shape before any engine traffic, and the frame carries the resolved
+    /// signal account under the engine's `account` key with the numbers
+    /// verbatim.
+    #[test]
+    fn phone_lookup_preparation_bounds_batch_and_gates_the_e164_shape() {
+        let (_temp, service) = service();
+        let account = service
+            .sync_accounts_from_numbers(
+                &[("+15555550100".into(), None)],
+                crate::DEFAULT_PROXY_GROUP_ID,
+            )
+            .unwrap()
+            .remove(0);
+        let params = |numbers: Vec<String>| PhoneLookupParams {
+            account: account.id.clone(),
+            numbers,
+        };
+
+        // Empty and over-cap batches.
+        let error = service.prepare_phone_lookup(&params(vec![])).unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+        let over = vec!["+15550000001".to_string(); PHONE_LOOKUP_MAX_ENTRIES + 1];
+        let error = service.prepare_phone_lookup(&params(over)).unwrap_err();
+        assert!(matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"));
+
+        // The E.164 shape gate, rule by rule: the lower/upper digit bounds,
+        // the leading +, the ASCII-digits-only body (a fullwidth digit is
+        // not ASCII), no embedded separators, no double +.
+        for malformed in [
+            "15550000001",       // no leading +
+            "+",                 // + alone
+            "+155500",           // 6 digits — below the 7-digit floor
+            "+1555000000000000", // 16 digits — above the 15-digit ceiling
+            "+1555abc23456",     // letters
+            "+1555 000 0001",    // embedded spaces
+            "++15550000001",     // double +
+            "+1555123456７",     // fullwidth digit (non-ASCII)
+            "+1555-000-0001",    // dashes
+        ] {
+            let error = service
+                .prepare_phone_lookup(&params(vec![malformed.to_string()]))
+                .unwrap_err();
+            assert!(
+                matches!(error, ServiceError::Api(ref api) if api.code == "INVALID_REQUEST"),
+                "malformed E.164 must refuse locally: {malformed}"
+            );
+        }
+        // The gate boundaries pass: exactly 7 and exactly 15 digits.
+        assert!(is_e164_phone_number_shape("+1555001"));
+        assert!(is_e164_phone_number_shape(&format!("+{}", "1".repeat(15))));
+
+        // The frame: the resolved signal account under `account`, the
+        // numbers verbatim, nothing else.
+        assert_eq!(
+            service
+                .prepare_phone_lookup(&params(vec!["+15551234567".into(), "+15557654321".into()]))
+                .unwrap(),
+            json!({
+                "account": "+15555550100",
+                "numbers": ["+15551234567", "+15557654321"],
+            })
+        );
+    }
+
+    /// The phone.lookup error faces ride the engine's literals with the
+    /// contract-fixed retryability: INVALID deterministic, RATE_LIMITED
+    /// carrying the promised {retryAfterSeconds} verbatim (retryability
+    /// reasserted over the with_data default), SERVER_FAILED
+    /// may-succeed-later — and every face has its schema-declared literal.
+    #[test]
+    fn phone_lookup_error_faces_carry_the_promised_retry_face() {
+        let rate_limited = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PHONE_RATE_LIMITED",
+            data: Some(json!({ "retryAfterSeconds": 42 })),
+        })
+        .into_api();
+        assert_eq!(rate_limited.code, "PHONE_RATE_LIMITED");
+        assert!(rate_limited.retryable);
+        assert_eq!(rate_limited.data, Some(json!({ "retryAfterSeconds": 42 })));
+
+        // A data-less RATE_LIMITED face keeps the contract-fixed
+        // retryability without inventing a data object.
+        let bare = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PHONE_RATE_LIMITED",
+            data: None,
+        })
+        .into_api();
+        assert!(bare.retryable);
+        assert_eq!(bare.data, None);
+
+        let invalid = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PHONE_INVALID",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(invalid.code, "PHONE_INVALID");
+        assert!(!invalid.retryable);
+
+        let server_failed = ServiceError::Engine(EngineError::UpstreamCode {
+            code: "PHONE_SERVER_FAILED",
+            data: None,
+        })
+        .into_api();
+        assert_eq!(server_failed.code, "PHONE_SERVER_FAILED");
+        assert!(server_failed.retryable);
+
+        // The allowlist carries all three faces (the schema error enum's
+        // code-side mirror is the consistency test).
+        for code in ["PHONE_INVALID", "PHONE_RATE_LIMITED", "PHONE_SERVER_FAILED"] {
+            assert!(
+                crate::engine::ENGINE_STRUCTURED_ERROR_CODES_FOR_TESTS.contains(&code),
+                "{code} must be allowlisted"
+            );
+        }
     }
 
     /// The username shape gate is exactly the desktop grammar: a focused

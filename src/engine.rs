@@ -3237,6 +3237,19 @@ const ENGINE_STRUCTURED_ERROR_CODES: &[&str] = &[
     // UPLOAD_FAILED and the transport family rides STORAGE_UNAVAILABLE,
     // both registered above.
     "GROUP_CREATE_FAILED",
+    // §4.162 phone lookup (contract 1.164, engine d088a59 phoneLookup): the
+    // CDSI read faces. INVALID is the engine's deterministic E.164 grammar
+    // refusal (the same shape never resolves; the connector mirrors the
+    // grammar locally, so the arm is a drift net, not the working path) —
+    // retryable=false. RATE_LIMITED carries the engine's promised
+    // {retryAfterSeconds} backoff fact verbatim; retryable=true on the
+    // USERNAME_RATE_LIMITED channel — a later attempt may succeed, the wait
+    // is the caller's, and nothing retries automatically. SERVER_FAILED is
+    // the remaining server/connection family, details withheld by the
+    // engine — retryable=true, the same may-succeed-later channel.
+    "PHONE_INVALID",
+    "PHONE_RATE_LIMITED",
+    "PHONE_SERVER_FAILED",
 ];
 
 /// Extract a known structured engine error code from a JSON-RPC error object.

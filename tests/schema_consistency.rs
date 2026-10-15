@@ -53,9 +53,9 @@ use kt_signal_connector::service::{
     MAX_SNAPSHOT_DIR_BYTES, MAX_STICKER_EMOJI_CHARS, MAX_STICKER_PACK_ID_CHARS,
     MAX_STICKER_PACK_KEY_CHARS, MAX_STORY_DISTRIBUTION_ID_CHARS, MAX_STORY_LIST_BATCH,
     MAX_STORY_LIST_ID_CHARS, MAX_STORY_PREVIEW_TITLE_BYTES, MAX_STORY_PREVIEW_URL_CHARS,
-    MAX_TEXT_BYTES, REPORT_SPAM_MESSAGE_IDS_LIMIT, STICKER_PACK_BROWSE_ID_HEX_CHARS,
-    STICKER_PACK_SYNC_KEY_B64_CHARS, USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES,
-    USERNAME_MAX_WIRE_CHARS,
+    MAX_TEXT_BYTES, PHONE_LOOKUP_MAX_ENTRIES, REPORT_SPAM_MESSAGE_IDS_LIMIT,
+    STICKER_PACK_BROWSE_ID_HEX_CHARS, STICKER_PACK_SYNC_KEY_B64_CHARS,
+    USERNAME_LOOKUP_ENTRY_MAX_CHARS, USERNAME_LOOKUP_MAX_ENTRIES, USERNAME_MAX_WIRE_CHARS,
 };
 use kt_signal_connector::store::MAX_PAGE_LIMIT;
 
@@ -822,6 +822,17 @@ fn schema_numeric_bounds_match_code_constants() {
             "/$defs/usernameLookupParams/properties/usernames/items",
             "maxLength",
             USERNAME_LOOKUP_ENTRY_MAX_CHARS as u64,
+        ),
+        // Phone lookup (contract 1.164, §4.162): the batch cap mirrors the
+        // engine's own frame bound through the service-ladder constant. The
+        // per-entry shape is the E.164 grammar (pattern + minLength/
+        // maxLength 8..16 in the schema) enforced by the regex-semantics
+        // gate, mechanism-not-constant — no pair (the cursor maxLength
+        // inventory reason).
+        (
+            "/$defs/phoneLookupParams/properties/numbers",
+            "maxItems",
+            PHONE_LOOKUP_MAX_ENTRIES as u64,
         ),
         // Safety-number faces (contract 1.68, §4.61): both faces share the
         // pinned face's 256-char conversation bound; the caller-echoed

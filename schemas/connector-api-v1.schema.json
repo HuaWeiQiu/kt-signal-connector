@@ -52,6 +52,7 @@
             "accounts.getDevices",
             "accounts.unlinkDevice",
             "username.lookup",
+            "phone.lookup",
             "link.start",
             "link.finish",
             "link.cancel",
@@ -309,6 +310,18 @@
           "then": {
             "properties": {
               "params": { "$ref": "#/$defs/usernameLookupParams" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "method": { "const": "phone.lookup" } },
+            "required": ["method"]
+          },
+          "then": {
+            "properties": {
+              "params": { "$ref": "#/$defs/phoneLookupParams" },
+              "result": { "$ref": "#/$defs/phoneLookupResult" }
             }
           }
         },
@@ -1779,6 +1792,63 @@
           "minItems": 1,
           "maxItems": 20,
           "description": "Usernames or username-link URLs to resolve, 1..20 entries."
+        }
+      }
+    },
+    "phoneLookupParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["account", "numbers"],
+      "description": "Resolve full E.164 phone numbers against the account's own engine session — its CDSI (Contact Discovery Service) face (contract revision 1.164, \u00a74.162; the kt-engine face is the phoneLookup reader, engine d088a59; capability phone-lookup). The account key is `account` on this face (the D-batch desktop wire lock, desktop commit 64584c27 — username.lookup carries the same opaque id under `accountId`). numbers carries 1..20 entries (the engine's own frame bound mirrored; a small batch is rate-limit politeness — the CDSI threshold is unpublished), each a complete E.164 number ^\\+\\d{7,15}$ (a leading + and 7..15 ASCII digits): the connector mirrors the grammar fail-closed before any engine traffic and the engine's PHONE_INVALID face stays the authority. The result projects the upstream array entry-for-entry: {entries: [{number, aci?, pni?, isRegistered}]} — number is the entry echoed verbatim, aci/pni are the engine's single-hit service-id projections (the official directory.rs double-hit takes the ACI), absent means no hit on that id, and a miss/unregistered entry arrives pre-degraded ({number, isRegistered: false}, the usernameLookup discipline) — no entry is ever dropped. Read lane; zero local persistence — the projection answers from the engine's memory face alone, nothing lands in the connector store, and the number→account local mapping stays the contacts sync chain's. Error faces (engine d088a59): PHONE_INVALID (deterministic E.164 refusal, retryable=false), PHONE_RATE_LIMITED (CDSI 429-family, carries data.retryAfterSeconds — the server's retry-after seconds verbatim, the wait decision is the caller's, nothing retries automatically), PHONE_SERVER_FAILED (the remaining server/connection family, details withheld, retryable=true); the unknown-account face stays the plain -32603 → UPSTREAM_ERROR ladder. The desktop D-batch (64584c27) consumes the face behind the phone-lookup tag — find-by-phone-number in the new-chat compose flow.",
+      "properties": {
+        "account": { "$ref": "#/$defs/opaqueId" },
+        "numbers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 16,
+            "pattern": "^\\+\\d{7,15}$",
+            "description": "One complete E.164 phone number (+ and 7..15 ASCII digits), forwarded verbatim."
+          },
+          "minItems": 1,
+          "maxItems": 20,
+          "description": "Full E.164 numbers to resolve, 1..20 entries (the engine's own frame bound mirrored)."
+        }
+      }
+    },
+    "phoneLookupResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries"],
+      "description": "The phone.lookup answer (contract revision 1.164, \u00a74.162): the engine's CDSI projection entry-for-entry in input order, keys riding the engine's names verbatim — the connector re-keys nothing (null folds to absence, the repo no-null discipline). Zero local persistence: the answer is a memory projection only.",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["number", "isRegistered"],
+            "properties": {
+              "number": {
+                "type": "string",
+                "description": "The caller's entry echoed verbatim."
+              },
+              "aci": {
+                "type": "string",
+                "description": "The ACI service-id UUID when the CDSI hit resolved an ACI; absent (never null) when not."
+              },
+              "pni": {
+                "type": "string",
+                "description": "The PNI service-id UUID when the CDSI hit resolved a PNI; absent (never null) when not. Single-hit semantics: the official double-hit face takes the ACI."
+              },
+              "isRegistered": {
+                "type": "boolean",
+                "description": "Whether the entry resolved to a registered account; a miss/unregistered entry arrives pre-degraded {number, isRegistered: false}."
+              }
+            }
+          },
+          "description": "One entry per input number, input order, capped at 20 by the params gate; no entry is ever dropped."
         }
       }
     },
@@ -5769,6 +5839,9 @@
             "USERNAME_RESERVATION_GONE",
             "USERNAME_RATE_LIMITED",
             "USERNAME_SERVER_FAILED",
+            "PHONE_INVALID",
+            "PHONE_RATE_LIMITED",
+            "PHONE_SERVER_FAILED",
             "CALL_CREDENTIALS_FAILED",
             "CALL_CREDENTIALS_UNAVAILABLE",
             "DEVICES_FAILED",
@@ -5803,7 +5876,7 @@
         },
         "data": {
           "type": "object",
-          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one; since contract 1.122 DEVICES_FAILED carries {status?} the same way (the device-plane server-rejection family); since contract 1.123 GROUP_MIGRATION_FAILED carries {status?} the same way (the migration server-rejection family); since contract 1.126 GROUP_CREATE_FAILED carries {status?} the same way (the new-group server-rejection family). The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
+          "description": "Contract 1.50: optional engine-supplied error facts, pass-through only. PROFILE_UPLOAD_FAILED carries {retryable, textSaved} (the engine's honest partial-success report: the text face landed, the avatar upload failed); since contract 1.89 GROUP_AVATAR_UPLOAD_FAILED carries the same {retryable, textSaved} shape, group-faced (the group change landed, the avatar upload chain failed); since contract 1.115 GROUP_UPDATE_FAILED carries {status?} — the server HTTP status code's honest pass-through for the wired groups.update face, present only when the server answered with one; since contract 1.117 GROUP_INVITE_LINK_UNAVAILABLE (the build face's server-rejection / link-not-set family) and GROUP_INVITE_LINK_PREVIEW_FAILED (the preview face's server-rejection family) carry the same {status?} pass-through; since contract 1.83 the four message-carrying cloud-restore families (BACKUP_TRANSPORT_FAILED / BACKUP_DOWNLOAD_FAILED / BACKUP_DECRYPT_FAILED / BACKUP_EXPORT_FAILED) carry {detail} — the engine's promised detail face, passed verbatim; since contract 1.87 the three message-carrying cloud-upload families (BACKUP_TRANSPORT_FAILED / BACKUP_UPLOAD_FAILED / BACKUP_IO_FAILED — the upload face of BACKUP_IO_FAILED, whose §4.46 export face stays content-free) carry {detail} the same way; since contract 1.88 CALL_CREDENTIALS_FAILED carries {status?} — the server HTTP status code's honest pass-through, present only when the server answered with one; since contract 1.122 DEVICES_FAILED carries {status?} the same way (the device-plane server-rejection family); since contract 1.123 GROUP_MIGRATION_FAILED carries {status?} the same way (the migration server-rejection family); since contract 1.126 GROUP_CREATE_FAILED carries {status?} the same way (the new-group server-rejection family); since contract 1.164 PHONE_RATE_LIMITED carries {retryAfterSeconds} — the CDSI server's retry-after seconds verbatim (§4.162), the wait decision is the caller's and nothing retries automatically. The connector never invents a `data` object and never strips keys from a promised one; hosts that predate this field ignore it as an unknown JSON member."
         }
       }
     }

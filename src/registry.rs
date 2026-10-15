@@ -1110,6 +1110,18 @@ impl ProxyGroupRuntime {
         slot.supervisor.lookup_usernames(params).await
     }
 
+    /// phone.lookup (contract 1.164, §4.162): the number batch is resolved
+    /// against the account's own engine session (its CDSI face, engine
+    /// d088a59), so the read routes through the account's owning engine —
+    /// ACCOUNT_NOT_FOUND keeps its precedence.
+    pub async fn lookup_phones(
+        &self,
+        params: crate::service::PhoneLookupParams,
+    ) -> Result<crate::service::PhoneLookupResult, ServiceError> {
+        let slot = self.slot_for_account(&params.account).await?;
+        slot.supervisor.lookup_phones(params).await
+    }
+
     /// messages.sendStory (contract 1.76, §4.67): a story goes out through
     /// the sender account's own engine like every mutating face.
     pub async fn send_story(
