@@ -74,6 +74,7 @@ static RECEIVE_DROPPED: AtomicU64 = AtomicU64::new(0);
 static WATCHDOG_RESTARTS: AtomicU64 = AtomicU64::new(0);
 static HOST_PENDING_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static RECEIVE_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static DECRYPTION_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 fn class_metrics(method_class: &str) -> &'static ClassMetrics {
     let index = METHOD_CLASSES
@@ -103,6 +104,20 @@ pub fn record_request(method_class: &str, result_class: &str, duration: Duration
 /// enqueue timeout (engine-side degraded-storage path).
 pub fn record_receive_drop() {
     RECEIVE_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The engine reported a decryption-error receive envelope (contract 1.165,
+/// §4.163): an inbound envelope failed to decrypt and carries no message row.
+/// Consumption counting only — the arm never acts on it (no session reset,
+/// no retry), the count is what makes the failure class visible.
+pub fn record_decryption_error() {
+    DECRYPTION_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Process-lifetime decryption-error envelope count, for the metrics
+/// snapshot (§4.163) — read back.
+pub fn decryption_errors_total() -> u64 {
+    DECRYPTION_ERRORS_TOTAL.load(Ordering::Relaxed)
 }
 
 /// The watchdog executed an engine restart (initial or pending retry).
@@ -146,6 +161,7 @@ pub fn log_snapshot() {
         watchdog_restarts_total = WATCHDOG_RESTARTS.load(Ordering::Relaxed),
         host_pending_requests = HOST_PENDING_REQUESTS.load(Ordering::Relaxed),
         receive_queue_depth = RECEIVE_QUEUE_DEPTH.load(Ordering::Relaxed),
+        decryption_errors_total = DECRYPTION_ERRORS_TOTAL.load(Ordering::Relaxed),
         "connector metrics snapshot"
     );
     for (index, class) in METHOD_CLASSES.iter().enumerate() {
@@ -292,6 +308,7 @@ mod tests {
         let output = captured_output(|| {
             record_request("send", "ok", Duration::from_millis(3));
             record_receive_drop();
+            record_decryption_error();
             record_watchdog_restart();
             set_host_pending(2);
             log_snapshot();
@@ -307,6 +324,9 @@ mod tests {
         assert!(output.contains("watchdog_restarts_total="));
         assert!(output.contains("host_pending_requests="));
         assert!(output.contains("receive_queue_depth="));
+        // §4.163: the decryption-error consumption counter rides the same
+        // snapshot series (count-only, never content).
+        assert!(output.contains("decryption_errors_total="));
         assert!(output.contains("host request metrics"));
         assert!(output.contains("method_class=\"send\""));
         // Per-engine RSS gauges (M3.4): one line per sampled group, keyed by

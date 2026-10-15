@@ -89,6 +89,14 @@ const EXPIRE_SWEEP_STARTUP_SETTLE: Duration = Duration::from_secs(5);
 /// bounded, lossy by design — a full queue drops the job, never the receive.
 const DELIVERY_RECEIPT_QUEUE_CAP: usize = 512;
 
+/// §4.163 contacts.sync wall-clock budget: the whole face — engine resolve,
+/// the two read-only listings, and the store upsert transaction — must answer
+/// inside it or the request folds to the retryable timeout face. Without a
+/// budget the desktop's "正在同步联系人与群组" empty state could hang forever
+/// on a wedged leg (a starved service lock, a store stall); the cache
+/// short-circuit above it stays budget-free (local store only).
+const CONTACTS_SYNC_BUDGET: Duration = Duration::from_secs(120);
+
 /// §4.123 outbox drain cadence: the periodic sweep runs at most this often
 /// per group. The cadence is deliberately slow — the queue's own schedule
 /// (190 ms exponential → 15-minute cap) is what paces retries; the tick only
@@ -5445,11 +5453,16 @@ impl RuntimeSupervisor {
     /// group without it. markViewed first-stamps the selected rows' local
     /// `viewed_at` (§4.77) before any fan-out — the stamp is the request's
     /// own local effect, not a receipt consequence, so it lands even when
-    /// the group list is empty and survives an upstream failure. Zero groups
-    /// is the trivial `sent` no-op; the per-author params are exactly the
-    /// engine contract `{account, recipient, timestamps}` — recipient is the
-    /// single author, timestamps ascend (the engine chunks 100 per
-    /// envelope).
+    /// the group list is empty and survives an upstream failure. markRead
+    /// carries the §4.163 issuance ledger instead: the `read_receipt_sent_at`
+    /// stamp lands ONLY after a confirmed fan-out (a failed or unknown send
+    /// stamps nothing, so the next deliberate trigger re-supplies the batch),
+    /// and on the empty-group path (a group conversation's authors are
+    /// unresolvable upstream — those rows will never ride) — best-effort,
+    /// never overriding the send's own answer. Zero groups is the trivial
+    /// `sent` no-op; the per-author params are exactly the engine contract
+    /// `{account, recipient, timestamps}` — recipient is the single author,
+    /// timestamps ascend (the engine chunks 100 per envelope).
     ///
     /// §4.119 failure debounce: a failed face records its (account,
     /// conversation, face) key, and another trigger of the same key inside
@@ -5484,6 +5497,18 @@ impl RuntimeSupervisor {
             prepared
         };
         if prepared.groups.is_empty() {
+            // The §4.163 ledger still closes the selection on the no-fan-out
+            // path: those rows can never ride upstream, so leaving the ledger
+            // open would reselect them on every trigger. Best-effort — a
+            // store hiccup costs one more reselection, never the answer.
+            if method == "sendReadReceipt"
+                && let Err(error) = self.service.lock().await.complete_mark_read(&prepared)
+            {
+                tracing::warn!(
+                    error_class = error.class(),
+                    "read receipt ledger stamp failed"
+                );
+            }
             return Ok("sent");
         }
         let mut all_confirmed = true;
@@ -5504,6 +5529,16 @@ impl RuntimeSupervisor {
         }
         if !all_confirmed {
             self.note_receipt_failure(&failure_key, std::time::Instant::now());
+        } else if method == "sendReadReceipt" {
+            // §4.163: the ledger closes on a CONFIRMED fan-out only. A store
+            // hiccup here never overrides the send's own answer — the worst
+            // case is one more reselection on the next trigger.
+            if let Err(error) = self.service.lock().await.complete_mark_read(&prepared) {
+                tracing::warn!(
+                    error_class = error.class(),
+                    "read receipt ledger stamp failed"
+                );
+            }
         }
         Ok(if all_confirmed { "sent" } else { "unknown" })
     }
@@ -6858,6 +6893,13 @@ impl RuntimeSupervisor {
     /// device into the local cache. Both calls are ReadOnly on the single engine
     /// queue, so they cannot starve or corrupt mutating sends. A successful
     /// sync less than 60s old short-circuits to the cached counts.
+    ///
+    /// §4.163 budget: the engine-and-store pass rides one wall-clock budget
+    /// ([`CONTACTS_SYNC_BUDGET`]) — any leg that stalls (a starved service
+    /// lock, a store stall, a wedged engine call) folds the whole face to the
+    /// retryable timeout code instead of hanging the desktop's sync empty
+    /// state forever. The budget covers the whole pass, not each engine call:
+    /// the hang can sit in any leg.
     pub async fn sync_contacts(
         &self,
         account_id: &str,
@@ -6876,8 +6918,20 @@ impl RuntimeSupervisor {
                 });
             }
         }
-        let engine = self.running_engine().await?;
-        sync_contacts_with(&self.service, &engine, account_id, &self.host_events).await
+        tokio::time::timeout(CONTACTS_SYNC_BUDGET, async {
+            let engine = self.running_engine().await?;
+            sync_contacts_with(&self.service, &engine, account_id, &self.host_events).await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            // The same face an engine read timeout answers (retryable): the
+            // caller re-triggers when it chooses; nothing is retried here.
+            Err(ServiceError::Api(ApiError::new(
+                "UPSTREAM_TIMEOUT",
+                "contacts sync exceeded its budget; retry later",
+                true,
+            )))
+        })
     }
 }
 
@@ -7310,6 +7364,16 @@ fn map_download_failure(failure: crate::history_attachment::DownloadFailure) -> 
     ServiceError::Api(ApiError::new(code, text, retryable))
 }
 
+/// The §4.163 CDN download trust anchor: the vendored Signal production root
+/// CA (the same `vendor/certs/production-root-ca.pem` the doctor's strict leg
+/// pins). The CDN chains to Signal's private root — it is in neither the
+/// webpki set nor any platform keychain, so both earlier trust stories died
+/// on the real chain (the compile-time `include_bytes!` makes the anchor
+/// non-optional; a parse failure fails the client build like any other).
+fn cdn_root_certificate() -> Option<reqwest::Certificate> {
+    reqwest::Certificate::from_pem(include_bytes!("../vendor/certs/production-root-ca.pem")).ok()
+}
+
 /// The §4.38 step-3 CDN download client: the same connect/total budgets and
 /// no-redirect posture the chain has always used, plus the launcher's SOCKS
 /// route when the caller passes the `KT_SIGNAL_SOCKS_PROXY` environment
@@ -7320,16 +7384,28 @@ fn map_download_failure(failure: crate::history_attachment::DownloadFailure) -> 
 /// mapping the engine child gets, so a walled or DNS-poisoned network still
 /// reaches the transit CDN over the route the engine's own transport takes.
 /// A missing or malformed value builds the direct client: byte-for-byte the
-/// behavior before the route existed. Trust anchor (contract revision 1.163,
-/// §4.161): the platform trust store (the `rustls-tls-native-roots` chain —
-/// on macOS the Security.framework keychains, user-installed CAs included),
-/// the official desktop's own posture (Chromium + system store); until this
-/// revision the client rode the compiled-in webpki set, which a user-trusted
-/// MITM proxy's CA could never satisfy and the attachment downloads died on
-/// while the official desktop stayed silent. No custom anchor, no override:
-/// this client and the doctor's system-trust leg are the same trust story.
+/// behavior before the route existed.
+///
+/// Trust anchors (contract revision 1.165, §4.163; superseding the 1.163
+/// platform-store-only posture): the vendored Signal production root CA
+/// first — the CDN's real chain terminates at Signal's private root, which
+/// neither the webpki set nor any keychain carries, so the 1.163
+/// native-roots-only client rejected every clean-network handshake exactly
+/// like its webpki predecessor (two dead generations). The platform store
+/// stays loaded beneath it (the `rustls-tls-native-roots` feature default —
+/// reqwest 0.12.28 assembles custom roots first, then webpki, then the
+/// native set; the coarse `tls_built_in_root_certs(false)` would drop the
+/// native leg too and that call is deliberately NOT made here): a
+/// user-trusted MITM proxy keeps the official-desktop tolerance (Chromium +
+/// system store) 1.163 promised. The webpki leg needs no explicit off
+/// switch — this dependency is built with `rustls-tls-native-roots` only
+/// (no `rustls-tls-webpki-roots`), so that set is not compiled in at all;
+/// `tls_built_in_webpki_certs` does not even exist on 0.12.28's builder
+/// without that feature (the per-leg toggles are 0.13 API).
 fn attachment_download_client(proxy: Option<&str>) -> Result<reqwest::Client, ServiceError> {
+    let certificate = cdn_root_certificate().ok_or(ServiceError::Io)?;
     let mut builder = reqwest::Client::builder()
+        .add_root_certificate(certificate)
         .connect_timeout(crate::history_attachment::CONNECT_TIMEOUT)
         .timeout(crate::history_attachment::TOTAL_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
@@ -8169,7 +8245,10 @@ fn run_media_governor_pass(governor: MediaGovernor) -> JoinHandle<()> {
 /// forward their host frames here; an unmatchable account drops warn-only
 /// inside the service (never silently claimed as forwarded). Contract 1.141
 /// §4.137: the storage-manifest pull outcome event (`engine.storagePull`)
-/// joins the same lane with the same attribution discipline.
+/// joins the same lane with the same attribution discipline. Contract 1.165
+/// §4.163: the engine's decryption-error receive envelope joins it too —
+/// counted in the metrics snapshot, forwarded as the fact alone, and never
+/// acted on (no session reset, no retry).
 async fn engine_event_watch_loop(
     mut engine_events: broadcast::Receiver<EngineEvent>,
     service: Arc<Mutex<ConnectorService>>,
@@ -8233,6 +8312,21 @@ async fn engine_event_watch_loop(
                 let forwarded = {
                     let guard = service.lock().await;
                     guard.forward_storage_pull(&account, &trigger, contacts_ok, groups_ok)
+                };
+                emit_forwarded(&host_events, forwarded);
+            }
+            Ok(EngineEvent::ReceiveDecryptionError { account }) => {
+                // Contract 1.165 §4.163: the decryption-error envelope's
+                // consumption arm — the count lands in the metrics snapshot
+                // and the fact forwards through the account-domain transient
+                // lane (an unmatchable account drops warn-only inside the
+                // service). Observability only: no session reset, no retry,
+                // no automatic action of any kind rides this arm (the
+                // engine's DERM retry protocol is the self-heal path).
+                crate::metrics::record_decryption_error();
+                let forwarded = {
+                    let guard = service.lock().await;
+                    guard.forward_decryption_error(&account)
                 };
                 emit_forwarded(&host_events, forwarded);
             }
@@ -8773,11 +8867,12 @@ mod tests {
     use super::{
         EngineStderrClass, HistoryImportProbe, IMPORT_FAILURE_NO_ARCHIVE,
         MAX_IMPORT_FAILURE_CODE_CHARS, RECEIPT_FAILURE_MAP_CAP, RuntimeSupervisor,
-        attachment_download_client, classify_engine_stderr, cloud_archive_face,
-        cloud_status_from_engine, compose_contact_display_name, compose_import_progress,
-        engine_import_failure_code, group_extra_json, history_import_status_projection,
-        import_progress_from_engine_snapshot, is_receive_fatal_stderr, probe_history_import,
-        receipt_failure_key, upload_status_from_engine,
+        attachment_download_client, cdn_root_certificate, classify_engine_stderr,
+        cloud_archive_face, cloud_status_from_engine, compose_contact_display_name,
+        compose_import_progress, engine_import_failure_code, group_extra_json,
+        history_import_status_projection, import_progress_from_engine_snapshot,
+        is_receive_fatal_stderr, probe_history_import, receipt_failure_key,
+        upload_status_from_engine,
     };
     use crate::DEFAULT_PROXY_GROUP_ID;
     use crate::engine::{EngineConfig, NormalizedReceive};
@@ -12540,6 +12635,33 @@ mod tests {
                 "the refusal must be the proxy hop, got: {error}"
             );
         }
+    }
+
+    /// §4.163: the CDN client's pinned anchor is the vendored Signal
+    /// production root — present, parseable, and byte-identical to the file
+    /// the doctor's strict leg pins (the SHA-256 pins the exact vendored
+    /// bytes, so a swapped or truncated pem fails here before any client
+    /// rides it). The real CDN chain terminates at Signal's private root,
+    /// carried by neither the webpki set nor any platform keychain — the
+    /// anchor is the whole clean-network story; a real-CDN TLS handshake is
+    /// not unit-fixture material (the 1.163 boundary note stands), so this
+    /// parse-and-build pin is the honest mount point.
+    #[test]
+    fn download_client_pins_the_vendored_signal_root() {
+        let pem = include_bytes!("../vendor/certs/production-root-ca.pem");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(pem);
+        assert_eq!(
+            hex::encode(digest),
+            "d3f89b971ae3d1dee9ad250e8f101d140da6ab3ebb8c3580190fe22d1d52f1aa",
+            "the vendored root pem moved — re-verify the Signal production root \
+             fingerprint before updating this anchor"
+        );
+        let certificate = cdn_root_certificate().expect("the vendored production root CA parses");
+        let _ = reqwest::Client::builder()
+            .add_root_certificate(certificate)
+            .build()
+            .expect("the pinned-anchor client builds");
+        assert!(attachment_download_client(None).is_ok());
     }
 
     /// §4.115 (contract revision 1.132): the plaintext arm of

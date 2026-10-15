@@ -4603,7 +4603,8 @@
             "receive.emptied",
             "receive.clockSkew",
             "conversation.stateChanged",
-            "engine.storagePull"
+            "engine.storagePull",
+            "receive.decryptionError"
           ]
         },
         "data": {
@@ -5763,6 +5764,25 @@
                     "type": "boolean",
                     "description": "Whether the pull's groups leg landed."
                   }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "event": { "const": "receive.decryptionError" } },
+            "required": ["event"]
+          },
+          "then": {
+            "properties": {
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["accountId"],
+                "description": "One decryption-error envelope forwarded (contract 1.165, §4.163): the engine's structured report that an inbound envelope failed to decrypt (the receive notification whose envelope carries the decryptionError marker — no message row exists for it). Account-domain transient lane (the receive.emptied attribution discipline): the signal account resolves through the store to this accountId, an unmatchable account drops warn-only. The fact alone — nothing persists, and no reset action exists on this face (the engine's DERM retry protocol is the self-heal path); the connector's metrics snapshot counts the envelopes independently, so a missed event costs nothing.",
+                "properties": {
+                  "accountId": { "$ref": "#/$defs/opaqueId" }
                 }
               }
             }

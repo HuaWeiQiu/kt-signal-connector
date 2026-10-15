@@ -32,8 +32,8 @@ use crate::media::{MEDIA_CHUNK_BYTES, MediaGovernor, MediaHandleError, MediaHand
 use crate::protocol::ApiError;
 use crate::store::{
     AccountDeletePlan, AccountRow, AccountSummary, AdjacentMediaDirection, ContactSummary,
-    ConversationRow, ConversationSummary, MessageRecord, Page, RetryClaim, Store, StoreError,
-    SyncedContact,
+    ConversationRow, ConversationSummary, MessageRecord, Page, ReceiptResupply, RetryClaim, Store,
+    StoreError, SyncedContact,
 };
 
 /// Bounds below are the code-side enforcement of the host-facing schema
@@ -1558,6 +1558,16 @@ pub enum HostSideEvent {
         trigger: String,
         contacts_ok: bool,
         groups_ok: bool,
+    },
+    /// The engine's decryption-error receive envelope forwarded (contract
+    /// 1.165, §4.163): an inbound envelope failed to decrypt — the fact
+    /// alone, the receive.emptied posture. Observability only: the consumer
+    /// learns the account hit decryption failures; nothing persists, and no
+    /// reset action rides it (the engine's DERM retry protocol is the
+    /// self-heal path). A missed event costs nothing — the metrics snapshot
+    /// counts independently.
+    ReceiveDecryptionError {
+        account_id: String,
     },
 }
 
@@ -7391,20 +7401,31 @@ impl ConnectorService {
             .conversation_summary(account_id, conversation_id)?)
     }
 
-    /// messages.markRead (contract revision 1.34, §4.29): select the
-    /// receipt-eligible incoming rows of one conversation and group their
-    /// upstream timestamps by author — one engine `sendReadReceipt` per
-    /// author, the official per-author fan-out (the engine chunks 100 per
-    /// envelope). No local row changes — the desktop owns its read state —
-    /// so there is no complete step; an empty group list is the trivial
-    /// no-op the supervisor answers `{"status":"sent"}` for.
+    /// messages.markRead (contract revision 1.34, §4.29; resupply ledger
+    /// contract 1.165, §4.163): select the receipt-eligible incoming rows of
+    /// one conversation and group their upstream timestamps by author — one
+    /// engine `sendReadReceipt` per author, the official per-author fan-out
+    /// (the engine chunks 100 per envelope). No local read state changes —
+    /// the desktop owns its read state — but the selection carries the
+    /// §4.163 resupply boundary: rows whose read receipt was already issued
+    /// (a CONFIRMED fan-out stamped them) never re-select, so a repeated
+    /// trigger re-supplies only what has not ridden upstream yet. A failed
+    /// or unknown fan-out stamps nothing, so the next trigger re-sends the
+    /// batch (the §4.119 debounce holds the replay pressure in between). An
+    /// empty group list is the trivial no-op the supervisor answers
+    /// `{"status":"sent"}` for.
     pub fn prepare_mark_read(
         &self,
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids, false)
+        self.prepare_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            ReceiptResupply::UnissuedRead,
+        )
     }
 
     /// messages.markViewed: identical addressing, selection, and grouping,
@@ -7421,7 +7442,12 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids, true)
+        self.prepare_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            ReceiptResupply::UnplayedViewed,
+        )
     }
 
     /// messages.syncRead (contract revision 1.108, §4.89): the SELF-SYNC
@@ -7433,16 +7459,25 @@ impl ConnectorService {
     /// markConversationRead.preload.ts:252 note): the peer receipt tells the
     /// AUTHOR we read their message, the sync tells OUR OWN DEVICES — and
     /// the sync channel is not gated by the account's readReceipts
-    /// configuration flag. The prepared shape is identical
-    /// (`PreparedReceipts`), so the supervisor picks the engine face while
-    /// the selection semantics stay byte-identical.
+    /// configuration flag. The selection carries NO resupply boundary
+    /// (§4.163): the §4.163 ledger is the peer face's, and a shared ledger
+    /// would let one channel's confirmed send silence the other — the sync
+    /// channel's replays are self-addressed and protocol-idempotent. The
+    /// prepared shape is identical (`PreparedReceipts`), so the supervisor
+    /// picks the engine face while the addressing semantics stay
+    /// byte-identical.
     pub fn prepare_sync_read(
         &self,
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids, false)
+        self.prepare_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            ReceiptResupply::Any,
+        )
     }
 
     /// messages.syncViewed (contract revision 1.108, §4.89): identical
@@ -7459,7 +7494,12 @@ impl ConnectorService {
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
     ) -> Result<PreparedReceipts, ServiceError> {
-        self.prepare_receipt(account_id, conversation_id, message_ids, true)
+        self.prepare_receipt(
+            account_id,
+            conversation_id,
+            message_ids,
+            ReceiptResupply::UnplayedViewed,
+        )
     }
 
     /// The local half of messages.markViewed (contract 1.94, §4.77):
@@ -7471,6 +7511,28 @@ impl ConnectorService {
     /// case whose fan-out skips (an empty group list still played locally).
     pub fn complete_mark_viewed(&self, prepared: &PreparedReceipts) -> Result<(), ServiceError> {
         self.store.stamp_incoming_viewed(
+            &prepared.account_id,
+            &prepared.conversation_id,
+            &prepared.row_ids,
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// The local half of messages.markRead's resupply ledger (contract
+    /// revision 1.165, §4.163): first-stamp `read_receipt_sent_at` on the
+    /// selected incoming rows — the connector's own issuance bookkeeping,
+    /// written ONLY after the supervisor's `sendReadReceipt` fan-out
+    /// confirmed upstream (a failed or unknown send must not close the
+    /// ledger; the next deliberate trigger has to re-supply the batch). It
+    /// is never the desktop's read state (`read_at` stays the §4.81
+    /// cross-device sync's projection) and never touches outgoing rows. The
+    /// stamp covers the whole selection, including the group-conversation
+    /// case whose fan-out skips (those rows' authors are unresolvable
+    /// upstream, §4.28 — nothing will ever ride for them, so the ledger
+    /// closes them out and stops the reselection churn).
+    pub fn complete_mark_read(&self, prepared: &PreparedReceipts) -> Result<(), ServiceError> {
+        self.store.stamp_incoming_read_receipt(
             &prepared.account_id,
             &prepared.conversation_id,
             &prepared.row_ids,
@@ -7613,16 +7675,17 @@ impl ConnectorService {
     /// rows are all the peer's; group rows persist only a local sender hash
     /// (§4.28), so their author is unknown and they are skipped from the
     /// fan-out — skipped, not an error (spec: rows whose author cannot be
-    /// resolved are skipped). `unviewed_only` marks the viewed faces: their
-    /// absent selection skips rows that already carry a `viewed_at` stamp
-    /// (§4.119 — the first stamp is the resupply boundary), while the read
-    /// faces select regardless (the store carries no read state).
+    /// resolved are skipped). The face's resupply boundary
+    /// ([`ReceiptResupply`]) marks the viewed faces (`viewed_at`, §4.119)
+    /// and the peer read face (the §4.163 issuance ledger), while the
+    /// self-sync read face selects regardless (no ledger — the channels are
+    /// independent protocol faces).
     fn prepare_receipt(
         &self,
         account_id: &str,
         conversation_id: &str,
         message_ids: Option<Vec<String>>,
-        unviewed_only: bool,
+        boundary: ReceiptResupply,
     ) -> Result<PreparedReceipts, ServiceError> {
         validate_opaque_id(account_id, "accountId")?;
         validate_opaque_id(conversation_id, "conversationId")?;
@@ -7648,11 +7711,12 @@ impl ConnectorService {
                 account_id,
                 conversation_id,
                 MARK_RECEIPT_MESSAGE_IDS_LIMIT as u32,
-                unviewed_only,
+                boundary,
             )?,
         };
         // The selected rows' local ids ride along so a later
-        // `complete_mark_viewed` first-stamps exactly this selection (§4.77),
+        // `complete_mark_viewed` first-stamps exactly this selection (§4.77)
+        // or a confirmed read fan-out closes the §4.163 ledger on it,
         // independent of the upstream fan-out's shape.
         let row_ids = rows.iter().map(|row| row.id.clone()).collect();
         let groups = if conversation.kind == "direct" {
@@ -8307,6 +8371,26 @@ impl ConnectorService {
             trigger: trigger.to_string(),
             contacts_ok,
             groups_ok,
+        }])
+    }
+
+    /// The decryption-error arm of the account-domain lane (contract 1.165,
+    /// §4.163): the engine's decryption-error receive envelope — the fact
+    /// alone (the receive.emptied posture). Pure observability: the count
+    /// lives in the metrics snapshot, the frame tells the desktop, and
+    /// nothing acts on it (no session reset, no retry — the engine's DERM
+    /// retry protocol self-heals the failure).
+    pub fn forward_decryption_error(
+        &self,
+        signal_account: &str,
+    ) -> Result<Vec<HostSideEvent>, ServiceError> {
+        let Some(account) =
+            self.resolve_account_transient(signal_account, "receive.decryptionError")?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![HostSideEvent::ReceiveDecryptionError {
+            account_id: account.id.clone(),
         }])
     }
 
@@ -28021,11 +28105,11 @@ mod tests {
     }
 
     /// The account-domain transient lane (contract 1.134, §4.117; the
-    /// storage-pull arm joins with 1.141, §4.137): the four standalone
-    /// notifications resolve their bound account and forward one host frame
-    /// each — the conversations array verbatim — while an unbound signal
-    /// account drops warn-only with the perf counter, never claimed as
-    /// forwarded.
+    /// storage-pull arm joins with 1.141, §4.137; the decryption-error arm
+    /// joins with 1.165, §4.163): the five standalone notifications resolve
+    /// their bound account and forward one host frame each — the
+    /// conversations array verbatim — while an unbound signal account drops
+    /// warn-only with the perf counter, never claimed as forwarded.
     #[test]
     fn account_transient_lane_resolves_or_drops_unattributed() {
         crate::perf_metrics::reset_for_tests();
@@ -28099,22 +28183,35 @@ mod tests {
         assert!(*contacts_ok);
         assert!(!*groups_ok);
 
+        // Contract 1.165 (§4.163): the decryption-error report rides the same
+        // lane — the fact alone, pure observability.
+        let events = service.forward_decryption_error("+15555550100").unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(&events[0], HostSideEvent::ReceiveDecryptionError { account_id } if account_id == &account.id)
+        );
+
         // The unbound account: no frame, the honest warn-only drop.
         let events = service.forward_receive_emptied("+15555550999").unwrap();
         assert!(
             events.is_empty(),
             "an unbound account forwards nothing: {events:?}"
         );
+        let events = service.forward_decryption_error("+15555550999").unwrap();
+        assert!(
+            events.is_empty(),
+            "an unbound decryption report drops the same way: {events:?}"
+        );
 
         let snapshot = crate::perf_metrics::snapshot_json();
         let counters = snapshot["counters"].as_object().unwrap();
         assert_eq!(
             counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_FORWARDED],
-            4
+            5
         );
         assert_eq!(
             counters[crate::perf_metrics::keys::ACCOUNT_TRANSIENT_UNATTRIBUTED],
-            1
+            2
         );
     }
 
@@ -30073,13 +30170,153 @@ mod tests {
         service.complete_mark_viewed(&group_viewed).unwrap();
         assert!(stored(&service, &group.id, "g1").viewed_at.is_some());
 
-        // markRead has no local stamp: the desktop owns its read state.
+        // markRead has no `read_at` stamp: the desktop owns its read state
+        // (the §4.163 issuance ledger is a separate column, not this one).
         let read = service
             .prepare_mark_read(&account.id, &conversation.id, None)
             .unwrap();
         assert!(!read.groups.is_empty());
         let before = stored(&service, &conversation.id, "m1").read_at;
         assert_eq!(before, None, "markRead never stamps rows locally");
+    }
+
+    /// Contract revision 1.165 (§4.163): the read face's resupply ledger.
+    /// `complete_mark_read` closes the ledger on exactly the selected rows,
+    /// so a repeated `prepare_mark_read` re-supplies nothing; a fan-out that
+    /// never confirmed (no `complete` call) leaves the ledger open and the
+    /// same batch re-selects on the next trigger; the self-sync read face
+    /// (`prepare_sync_read`, `ReceiptResupply::Any`) ignores the ledger —
+    /// the two channels are independent protocol faces; and the ledger is
+    /// connector bookkeeping only — `read_at` (the desktop's read state)
+    /// stays untouched.
+    #[test]
+    fn mark_read_ledger_supplies_each_row_once() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+        let seed = |service: &ConnectorService, conv: &str, id: &str, sent_at: u64| {
+            let record = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conv.to_string(),
+                direction: "incoming",
+                sender_id: "peer-hash".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: None,
+                text: Some("body".into()),
+                text_bytes: Some(4),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+                is_story: false,
+                story_message: None,
+            };
+            assert!(
+                service
+                    .store_ref()
+                    .insert_message(&record, None, Some("body"), true)
+                    .unwrap()
+            );
+        };
+        let stored = |service: &ConnectorService, conv: &str, id: &str| {
+            service
+                .store_ref()
+                .message_by_id(&account.id, conv, id)
+                .unwrap()
+                .unwrap()
+        };
+        let now = now_ms();
+        seed(&service, &conversation.id, "m1", now);
+        seed(&service, &conversation.id, "m2", now + 1);
+        seed(&service, &conversation.id, "m3", now + 2);
+
+        // A confirmed fan-out closes the ledger: the same absent-mode trigger
+        // re-supplies nothing.
+        let first = service
+            .prepare_mark_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(first.row_ids, ["m1", "m2", "m3"]);
+        assert_eq!(first.groups.len(), 1);
+        assert_eq!(first.groups[0].timestamps, [now, now + 1, now + 2]);
+        service.complete_mark_read(&first).unwrap();
+        let resupplied = service
+            .prepare_mark_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert!(
+            resupplied.groups.is_empty() && resupplied.row_ids.is_empty(),
+            "issued rows never re-select: {resupplied:?}"
+        );
+
+        // The ledger is connector bookkeeping: read_at (the desktop's read
+        // state) stays the §4.81 sync's projection — untouched.
+        for id in ["m1", "m2", "m3"] {
+            let row = stored(&service, &conversation.id, id);
+            assert_eq!(row.read_at, None, "{id} keeps its read state clean");
+            assert_eq!(row.viewed_at, None, "{id} keeps its played state clean");
+        }
+
+        // A fan-out that never confirmed leaves the ledger open: the next
+        // deliberate trigger re-sends the same batch (the §4.119 debounce
+        // holds the replay pressure in between, not the ledger).
+        let failed_conversation = service
+            .store_ref()
+            .ensure_conversation(&account.id, "direct", "+15555550103", "Failed")
+            .unwrap();
+        seed(&service, &failed_conversation.id, "f1", now);
+        seed(&service, &failed_conversation.id, "f2", now + 1);
+        let unconfirmed = service
+            .prepare_mark_read(&account.id, &failed_conversation.id, None)
+            .unwrap();
+        assert_eq!(unconfirmed.row_ids, ["f1", "f2"]);
+        // (no complete_mark_read — the send failed upstream)
+        let retry = service
+            .prepare_mark_read(&account.id, &failed_conversation.id, None)
+            .unwrap();
+        assert_eq!(
+            retry.row_ids, unconfirmed.row_ids,
+            "an unstamped batch re-supplies in full"
+        );
+        let group_shape = |prepared: &PreparedReceipts| -> Vec<(String, Vec<u64>)> {
+            prepared
+                .groups
+                .iter()
+                .map(|group| (group.recipient.clone(), group.timestamps.clone()))
+                .collect()
+        };
+        assert_eq!(
+            group_shape(&retry),
+            group_shape(&unconfirmed),
+            "the re-supplied fan-out is byte-identical"
+        );
+
+        // The self-sync read face carries no ledger: it still selects the
+        // rows the peer face already issued.
+        let sync = service
+            .prepare_sync_read(&account.id, &conversation.id, None)
+            .unwrap();
+        assert_eq!(
+            sync.row_ids,
+            ["m1", "m2", "m3"],
+            "the sync channel ignores the peer face's ledger"
+        );
     }
 
     /// Contract 1.108 (§4.89): the SELF-SYNC faces prepare exactly like the

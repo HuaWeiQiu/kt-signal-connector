@@ -73,11 +73,18 @@ const MAX_IMPORT_ATTACHMENTS: usize = 32;
 /// the account is deleted or re-linked.
 pub const MAX_ATTEMPTS: u32 = 3;
 /// How long after `linked_at` the face answers `pending` while no archive has
-/// appeared — the engine's own transfer long-poll plus transfer budget lives
-/// well inside this window. Past it the honest answer is `unavailable`
-/// (`no-archive`): the engine's failure modes are indistinguishable from "the
-/// phone had nothing to transfer".
-pub const LINK_WAIT_MS: u64 = 10 * 60 * 1000;
+/// appeared. Past it the honest answer is `unavailable` (`no-archive`): the
+/// engine's failure modes are indistinguishable from "the phone had nothing to
+/// transfer".
+///
+/// Contract revision 1.165 (§4.163): raised 10 min → 60 min to cover the
+/// engine's transfer-download budget, which the engine half is widening to the
+/// official ~1 h figure in lockstep — this constant is the connector-side
+/// upper bound on the same wait, so the two must move together (a watcher
+/// window shorter than the engine's transfer budget abandons the poll while
+/// the transfer is still legitimately running and answers `no-archive` on a
+/// link that later succeeds).
+pub const LINK_WAIT_MS: u64 = 60 * 60 * 1000;
 /// The backup proto's mutually exclusive attachment flag for voice notes
 /// (engine `message_attachment::Flag::VoiceMessage`).
 const ATTACHMENT_FLAG_VOICE_MESSAGE: i64 = 1;
@@ -1956,6 +1963,17 @@ mod tests {
 
     fn test_store(dir: &Path) -> Arc<Store> {
         Arc::new(Store::open(dir, Some(StoreKey::from_bytes(TEST_KEY_BYTES))).unwrap())
+    }
+
+    /// §4.163: the link-time wait window covers the engine's transfer
+    /// download budget (the engine half widened to the official ~1 h in
+    /// lockstep) — the constant is the connector-side upper bound on the
+    /// same wait, so the value is pinned: a regression below the engine's
+    /// budget would abandon the poll while the transfer legitimately runs.
+    #[test]
+    fn link_wait_window_covers_the_engine_transfer_budget() {
+        assert_eq!(LINK_WAIT_MS, 60 * 60 * 1000);
+        assert_eq!(LINK_WAIT_MS, 3_600_000);
     }
 
     /// An idle cancel flag for the unit runs that never get cancelled.

@@ -14,7 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -36,6 +36,26 @@ pub const PLAINTEXT_BACKUP_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// late-receipt margin (an offline stretch, a clock delivered late) while
 /// never replaying last week's rows.
 const RECEIPT_RECENCY_WINDOW_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// The absent-mode receipt selection's resupply boundary (§4.119, §4.163):
+/// which stamp already marks a row as receipted, so the selection never
+/// re-supplies it. The explicit-`messageIds` mode applies no boundary — the
+/// desktop naming ids is itself the incremental act.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptResupply {
+    /// The peer read face: rows whose read receipt has not been issued yet —
+    /// the `read_receipt_sent_at` ledger column is NULL (§4.163; a confirmed
+    /// fan-out stamps it, a failed one leaves it open for the next trigger).
+    UnissuedRead,
+    /// The viewed faces: rows never played locally — the `viewed_at` first
+    /// stamp is absent (§4.77).
+    UnplayedViewed,
+    /// No boundary: select every window row (the self-sync read face — the
+    /// sync channel is an independent protocol face and carries no ledger; a
+    /// shared one would let the peer face's confirmed send silence it).
+    Any,
+}
+
 /// A readable plaintext SQLite store starts with these 16 bytes; an encrypted
 /// (SQLCipher) store is indistinguishable from random bytes.
 const SQLITE_PLAINTEXT_HEADER: &[u8; 16] = b"SQLite format 3\0";
@@ -5552,6 +5572,44 @@ impl Store {
         Ok(stamped)
     }
 
+    /// First-stamp the read-receipt issuance ledger on the given incoming
+    /// rows (contract revision 1.165, §4.163): the peer `sendReadReceipt`
+    /// fan-out CONFIRMED, so these rows' timestamps rode upstream and the
+    /// absent-mode selection closes them out. The stamp is the connector's
+    /// own bookkeeping — never the desktop's read state (`read_at` stays the
+    /// §4.81 cross-device sync's projection) and never written before the
+    /// fan-out: a failed or unknown send leaves the ledger open so the next
+    /// deliberate trigger re-supplies the batch. First-stamp-wins like
+    /// [`Self::stamp_incoming_viewed`]; only incoming rows qualify. Returns
+    /// how many rows took their first stamp.
+    pub fn stamp_incoming_read_receipt(
+        &self,
+        account_id: &str,
+        conversation_id: &str,
+        row_ids: &[String],
+        when: u64,
+    ) -> Result<u64, StoreError> {
+        if row_ids.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "UPDATE messages SET read_receipt_sent_at=?4
+                 WHERE account_id=?1 AND conversation_id=?2 AND id=?3
+                   AND direction='incoming' AND read_receipt_sent_at IS NULL",
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        let mut stamped = 0u64;
+        for row_id in row_ids.iter().take(256) {
+            let changes = stmt
+                .execute(params![account_id, conversation_id, row_id, when as i64])
+                .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            stamped += changes as u64;
+        }
+        Ok(stamped)
+    }
+
     /// First-stamp `read_at` on the given incoming rows (contract 1.100,
     /// §4.81): the cross-device read sync's local projection — the account
     /// read these rows on another device, so this store carries the same
@@ -5743,23 +5801,25 @@ impl Store {
     /// §4.119 stopgap filters: the selection only carries rows newer than
     /// [`RECEIPT_RECENCY_WINDOW_MS`] (the upstream rejects stale receipt
     /// timestamps, so a resupply past that age is protocol-meaningless), and
-    /// `unviewed_only` (the viewed faces) additionally carries only rows with
-    /// no `viewed_at` stamp yet — the §4.77 first stamp is the resupply
-    /// boundary, so an already-played row is never re-sent. The
-    /// explicit-`messageIds` mode (`incoming_rows_by_ids`) applies neither
-    /// filter: the desktop naming ids is itself the incremental act.
+    /// the face's resupply boundary ([`ReceiptResupply`]) — the viewed faces
+    /// carry only rows with no `viewed_at` stamp yet (§4.77 first stamp), the
+    /// peer read face only rows whose read receipt has not been issued yet
+    /// (§4.163 ledger; the self-sync read face carries no boundary — the two
+    /// channels are independent protocol faces and a shared ledger would let
+    /// one confirmed channel silence the other). The explicit-`messageIds`
+    /// mode (`incoming_rows_by_ids`) applies neither filter: the desktop
+    /// naming ids is itself the incremental act.
     pub fn incoming_rows_for_receipts(
         &self,
         account_id: &str,
         conversation_id: &str,
         limit: u32,
-        unviewed_only: bool,
+        boundary: ReceiptResupply,
     ) -> Result<Vec<MessageRecord>, StoreError> {
-        let conn = self.lock_conn()?;
-        let viewed_clause = if unviewed_only {
-            "   AND viewed_at IS NULL\n"
-        } else {
-            ""
+        let boundary_clause = match boundary {
+            ReceiptResupply::UnissuedRead => "   AND read_receipt_sent_at IS NULL\n",
+            ReceiptResupply::UnplayedViewed => "   AND viewed_at IS NULL\n",
+            ReceiptResupply::Any => "",
         };
         let sql = format!(
             "SELECT id, account_id, conversation_id, direction, sender_id, sent_at, received_at,
@@ -5768,9 +5828,10 @@ impl Store {
                  FROM messages
                  WHERE account_id=?1 AND conversation_id=?2 AND direction='incoming'
                    AND sent_at > ?3
-{viewed_clause}                 ORDER BY sent_at ASC, id ASC
+{boundary_clause}                 ORDER BY sent_at ASC, id ASC
                  LIMIT ?4"
         );
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -7993,6 +8054,25 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
         // until an engine answer lands.
         conn.execute("ALTER TABLE accounts ADD COLUMN aci TEXT", [])
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
+    }
+    if current < 25 {
+        // Contract revision 1.165 (§4.163): the outbound read receipt's
+        // issuance ledger. One additive nullable column on the incoming row —
+        // the connector's own bookkeeping that its peer `sendReadReceipt`
+        // fan-out carried this row's timestamp (and only a CONFIRMED fan-out:
+        // a failed or unknown send leaves the column NULL so the next
+        // deliberate trigger re-supplies it). Distinct from `read_at` (the
+        // cross-device read sync's projection, §4.81) and from the
+        // desktop-owned read state. Pre-1.165 rows legitimately carry none —
+        // whether a past trigger already receipted a row was never stored,
+        // and backfilling would suppress legitimate re-supplies.
+        if !table_has_column(conn, "messages", "read_receipt_sent_at")? {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN read_receipt_sent_at INTEGER",
+                [],
+            )
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        }
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -10624,7 +10704,12 @@ mod tests {
         }
 
         let bounded = store
-            .incoming_rows_for_receipts(&account.id, &conversation.id, 2, false)
+            .incoming_rows_for_receipts(
+                &account.id,
+                &conversation.id,
+                2,
+                ReceiptResupply::UnissuedRead,
+            )
             .unwrap();
         assert_eq!(
             bounded
@@ -10747,14 +10832,24 @@ mod tests {
         // Both faces agree inside the window: the overage rows (eight days
         // old, and exactly at the cutoff — strictly older-than) never select.
         let viewed = store
-            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, true)
+            .incoming_rows_for_receipts(
+                &account.id,
+                &conversation.id,
+                512,
+                ReceiptResupply::UnplayedViewed,
+            )
             .unwrap();
         assert_eq!(
             viewed.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
             ["in-window-old", "in-window-fresh"]
         );
         let read = store
-            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, false)
+            .incoming_rows_for_receipts(
+                &account.id,
+                &conversation.id,
+                512,
+                ReceiptResupply::UnissuedRead,
+            )
             .unwrap();
         assert_eq!(
             read.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
@@ -10762,8 +10857,9 @@ mod tests {
         );
 
         // The first viewed stamp (§4.77) becomes the resupply boundary: the
-        // stamped row drops out of the viewed face but stays for the read
-        // face, which tracks no local state.
+        // stamped row drops out of the viewed face. The read face carries its
+        // own ledger (§4.163 `read_receipt_sent_at`) — nothing has stamped
+        // read issuance here, so the stamped-for-viewed row still selects.
         assert_eq!(
             store
                 .stamp_incoming_viewed(
@@ -10776,7 +10872,12 @@ mod tests {
             1
         );
         let viewed_after = store
-            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, true)
+            .incoming_rows_for_receipts(
+                &account.id,
+                &conversation.id,
+                512,
+                ReceiptResupply::UnplayedViewed,
+            )
             .unwrap();
         assert_eq!(
             viewed_after
@@ -10786,7 +10887,12 @@ mod tests {
             ["in-window-fresh"]
         );
         let read_after = store
-            .incoming_rows_for_receipts(&account.id, &conversation.id, 512, false)
+            .incoming_rows_for_receipts(
+                &account.id,
+                &conversation.id,
+                512,
+                ReceiptResupply::UnissuedRead,
+            )
             .unwrap();
         assert_eq!(
             read_after
@@ -16823,6 +16929,108 @@ mod tests {
             .query_row("SELECT viewed_at FROM messages WHERE id='m-1'", [], |row| {
                 row.get(0)
             })
+            .unwrap();
+        assert!(stamped.is_none(), "history rows are never backfilled");
+        let version: i64 = store
+            .conn()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// A pre-ledger store upgrades in place (contract revision 1.165,
+    /// §4.163): the migration ladder's §4.163 step adds the additive
+    /// `read_receipt_sent_at` column to `messages`, existing rows stay NULL
+    /// (never backfilled — a past issuance is only known from a fan-out that
+    /// actually confirmed) and the version stamp moves to
+    /// [`SCHEMA_VERSION`]. The fixture seeds the same v20-era schema the
+    /// §4.77 test uses, so the whole ladder runs and this assertion covers
+    /// the ledger step inside it.
+    #[test]
+    fn schema_v25_upgrade_adds_read_receipt_sent_at() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("connector.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES('schema_version', '20');
+             CREATE TABLE accounts (
+               id TEXT PRIMARY KEY,
+               signal_account TEXT NOT NULL UNIQUE,
+               masked_address TEXT NOT NULL,
+               display_name TEXT,
+               state TEXT NOT NULL,
+               linked_at INTEGER,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE conversations (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               kind TEXT NOT NULL,
+               peer_key TEXT NOT NULL,
+               title TEXT NOT NULL,
+               last_message_preview TEXT,
+               last_message_at INTEGER,
+               unread_count INTEGER NOT NULL DEFAULT 0,
+               unread_mentions INTEGER NOT NULL DEFAULT 0,
+               muted INTEGER NOT NULL DEFAULT 0,
+               pinned INTEGER NOT NULL DEFAULT 0,
+               expire_timer_seconds INTEGER,
+               mrr_factors_json TEXT,
+               UNIQUE(account_id, kind, peer_key)
+             );
+             CREATE TABLE messages (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL,
+               conversation_id TEXT NOT NULL,
+               direction TEXT NOT NULL,
+               sender_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL,
+               received_at INTEGER,
+               stored_at INTEGER,
+               body TEXT,
+               body_bytes INTEGER,
+               body_truncated INTEGER NOT NULL DEFAULT 0,
+               status TEXT NOT NULL,
+               client_request_id TEXT,
+               quote_message_id TEXT,
+               quote_snapshot TEXT,
+               attachments_json TEXT,
+               attachment_locators TEXT,
+               live_attachment_locators TEXT,
+               rich_json TEXT,
+               sticker_json TEXT,
+               expire_seconds INTEGER,
+               expire_start_at INTEGER,
+               expire_at INTEGER,
+               server_guid TEXT,
+               edited_at INTEGER,
+               sender_name TEXT,
+               mentions_self INTEGER NOT NULL DEFAULT 0,
+               delivered_at INTEGER,
+               read_at INTEGER,
+               admin_deleted INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO messages(id, account_id, conversation_id, direction, sender_id, sent_at, status)
+               VALUES('m-1', 'acc-1', 'conv-1', 'incoming', 'peer', 400, 'delivered');",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        assert!(table_has_column(&store.conn(), "messages", "read_receipt_sent_at").unwrap());
+        let stamped: Option<i64> = store
+            .conn()
+            .query_row(
+                "SELECT read_receipt_sent_at FROM messages WHERE id='m-1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(stamped.is_none(), "history rows are never backfilled");
         let version: i64 = store

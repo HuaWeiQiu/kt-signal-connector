@@ -290,12 +290,15 @@ impl ProxyGroupRuntime {
             | EngineEvent::ReceiveEmptied { .. }
             | EngineEvent::ReceiveClockSkew { .. }
             | EngineEvent::ConversationState { .. }
-            | EngineEvent::StoragePull { .. } => {
+            | EngineEvent::StoragePull { .. }
+            | EngineEvent::ReceiveDecryptionError { .. } => {
                 // Contract 1.21: handled by the supervisor's engine-event
                 // watcher, which owns the service handle. Contract 1.134
                 // §4.117: the account-domain transient notifications ride
                 // the same watcher (their host frames need the store-backed
                 // account resolution); the registry has nothing to forward.
+                // Contract 1.165 §4.163: the decryption-error envelope joins
+                // the same lane (metrics count + transient host frame).
             }
         }
     }

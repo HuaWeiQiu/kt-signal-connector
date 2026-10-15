@@ -42,6 +42,22 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
+- Contract revision: 1.165 (2026-10-16; §4.163 the four-face 止血批①:
+  the CDN download trust chain pins the vendored Signal production root CA
+  (`vendor/certs/production-root-ca.pem`, compile-time) beneath the
+  platform store — the chain terminates at Signal's private root, which
+  neither the webpki set nor any keychain carries, so both 1.163 client
+  generations rejected clean-network handshakes; the peer read face grows
+  the `read_receipt_sent_at` issuance ledger (schema v25, additive) — a
+  confirmed `sendReadReceipt` fan-out stamps, a failed one re-supplies,
+  and the self-sync read face deliberately carries no ledger (two
+  independent protocol channels); the engine's decryption-error envelope
+  (`receive` + envelope `decryptionError` marker) routes to a new
+  account-domain event (`receive.decryptionError`) — counted in the
+  metrics snapshot, forwarded to the desktop, and never acted on
+  automatically (the engine's DERM retry protocol is the self-heal); and
+  `contacts.sync` gains a 120 s budget while the link-time engine-transfer
+  wait widens to 60 min. Store schema v24 → v25. Tests 860 → 865 (lib +5).
 - Contract revision: 1.164 (2026-10-15; §4.162 the phone-number lookup relay
   (`phone.lookup`): the connector-side registration of the engine's
   `phoneLookup` CDSI batch reader (engine d088a59, compat §3 phone row + §5
@@ -13683,6 +13699,129 @@ data-less faces, the rate-limit and server faces zero auto-retries);
 the lib pair pins the preparation bounds/gates and the error faces'
 retryability, the fake engine stub speaks the sentinel numbers, and the
 handshake capabilities assertion carries the new method + tag.
+
+### 4.163 The stop-the-bleeding batch: the pinned CDN root, the read-face issuance ledger, the decryption-error event, and the stall budgets (contract revision 1.165, 2026-10-16)
+
+The empirical shape (2026-10-15/16, production): four independent wounds,
+four minimal faces, every one a connector-local fix — the CDN attachment
+download still dead on clean networks despite 1.163, the peer read
+receipt re-sending the same batch on every trigger, the engine's
+decryption-error report vanishing silently, and two unbounded waits (the
+contacts sync that could hang forever, the link-time transfer wait that
+gave up too early). None of them move a method, an error code, or a
+capability bit; the wire grows one event, the store one column.
+
+**① The CDN trust chain pins the vendored Signal production root.** The
+1.163 native-roots client rejected every clean-network handshake exactly
+like its webpki predecessor: the transit CDN's chain terminates at
+Signal's own private root CA, carried by neither the webpki set nor any
+platform keychain — two dead client generations for one missing anchor.
+The fix is the anchor:
+`vendor/certs/production-root-ca.pem` (the same pem the doctor's strict
+probe pins) rides the download client via `add_root_certificate`,
+compile-time (`include_bytes!`; a parse failure fails the client build).
+reqwest 0.12.28's assembly order (read first-hand from the vendored
+source): custom roots first, then webpki, then the native set — the
+pinned anchor leads and the platform store stays loaded beneath it (the
+`rustls-tls-native-roots` feature default), keeping 1.163's MITM-proxy
+tolerance (a user-trusted proxy CA still validates, the official-desktop
+Chromium-plus-system-store posture). The coarse
+`tls_built_in_root_certs(false)` is deliberately NOT called — it would
+drop the native leg too — and the webpki leg needs no off switch: the
+`rustls-tls-webpki-roots` feature is not compiled into this dependency,
+and the per-leg `tls_built_in_webpki_certs` toggle is 0.13 API that does
+not exist on this build. Test: the vendored pem's SHA-256 pins the exact
+bytes (a swapped or truncated file fails before any client rides it) plus
+the parse-and-build pin; a real-CDN TLS handshake stays boundary-note
+material (not unit-fixture material — the honest mount point is the
+anchor's identity).
+
+**② The peer read face grows an issuance ledger.** The wound:
+`prepare_mark_read` had no completion step, and the §4.119 absent-mode
+selection re-selected the whole seven-day window on every trigger — the
+desktop's read-marker churn re-sent the same upstream timestamp batch
+indefinitely (upstream-idempotent, so protocol-clean; the waste and churn
+were ours). The fix mirrors the viewed face's §4.77 first-stamp
+discipline: schema v25 adds the additive nullable
+`messages.read_receipt_sent_at` (never backfilled — a past issuance is
+only known from a fan-out that actually confirmed), and
+`complete_mark_read` stamps the selection ONLY after the supervisor's
+`sendReadReceipt` fan-out confirmed — a failed or unknown send must not
+close the ledger, so the next deliberate trigger re-supplies the batch
+(the §4.119 debounce holds the replay pressure in between). The stamp
+covers the whole selection, including the group-conversation early
+return: those rows' authors are unresolvable upstream (§4.28), nothing
+will ever ride for them, so the ledger closes them out and stops the
+reselection churn. The self-sync read face (`messages.syncRead`)
+deliberately carries NO ledger: the desktop fires `messages.markRead`
+(the readReceipts-flag-gated peer face) and `messages.syncRead` (the
+unconditional self-sync) as independent channels, and a shared ledger
+would let one channel's confirmed send silence the other — the sync
+channel's replays are self-addressed and protocol-idempotent.
+`ReceiptResupply` types the per-face boundary: `UnissuedRead` (peer read,
+`read_receipt_sent_at IS NULL`), `UnplayedViewed` (both viewed faces,
+§4.77), `Any` (self-sync read). The ledger is connector bookkeeping
+only — `read_at` stays the §4.81 cross-device sync's projection, and the
+explicit-`messageIds` mode applies no boundary (the desktop naming ids is
+itself the incremental act).
+
+**③ The decryption-error envelope gains a consumption arm.** The engine
+already reports inbound envelopes it cannot decrypt — as a `receive`
+notification whose envelope carries the `decryptionError` marker
+(`{account, envelope: {sourceUuid, decryptionError: {}, timestamp?}}`,
+the engine's structured report) — and the connector silently dropped it
+at the receive arm: no metric, no event, no trace. The fix routes it
+before the receive ladder (a marker envelope never carries a message
+row; there is nothing to project): the parse diverts to the
+account-domain event lane with the accountUnbound attribution
+discipline (a missing, empty, or non-string account falls back to the
+unknownNotification warning — never an invented identity), producing
+`EngineEvent::ReceiveDecryptionError`; the registry files it with the
+watcher-owned events; the watcher arm counts it into the metrics
+snapshot (`decryption_errors_total`) and forwards
+`HostSideEvent::ReceiveDecryptionError` → the wire frame
+`receive.decryptionError {accountId}`. Pure observability: nothing
+persists, and NO reset action exists on this face — decryption failures
+self-heal through the engine's own DERM retry protocol, and an automatic
+session reset here would be the self-inflicted reset storm the official
+client explicitly avoids. An unmatchable account drops warn-only (the
+lane's discipline), the perf counter makes the drop visible, and the
+metrics snapshot counts independently of the event stream — a missed
+frame costs nothing.
+
+**④ The two stall budgets.** `contacts.sync` had no budget: a stalled
+leg (a starved service lock, a store stall, a wedged engine call) hung
+the desktop's sync empty state forever. The engine-and-store pass now
+rides one 120 s wall-clock budget (`CONTACTS_SYNC_BUDGET`; the 60 s
+cache short-circuit stays outside it), folding to the retryable
+`UPSTREAM_TIMEOUT` face (the link-finish timeout's precedent) — the
+caller re-triggers when it chooses, nothing retries automatically. And
+the link-time history-transfer wait widens 10 min → 60 min
+(`LINK_WAIT_MS`): a real archive transfer over a slow proxy outlives the
+old ceiling, and the importer was declaring defeat mid-transfer (the
+engine side widens its own budget to match, in parallel).
+
+Wire additive: one event enum entry (`receive.decryptionError`) + one
+allOf branch pinning `{accountId}`; store schema v24 → v25 (additive
+nullable column, no backfill); zero new methods, error codes, or
+capability bits. Schema consistency holds by the standing discipline
+(the frame literal and the enum entry move together — the consistency
+test pins both directions). Tests 860 → 865 (lib +5): the CDN anchor pin
+(`download_client_pins_the_vendored_signal_root` — the SHA-256 identity
+plus the parse-and-build), the ledger once-only discipline
+(`mark_read_ledger_supplies_each_row_once` — a confirmed fan-out closes
+the selection, a failed one re-supplies byte-identically, the sync face
+ignores the ledger, `read_at`/`viewed_at` stay untouched), the schema
+step (`schema_v25_upgrade_adds_read_receipt_sent_at` — the ladder
+landing, history rows NULL, the version stamp moving), the envelope
+diversion (`receive_decryption_error_envelope_routes_to_the_event_lane`
+— one attributed event and an empty queue, the unattributed trio, the
+marker-free envelope still queueing), and the transfer-wait pin
+(`link_wait_window_covers_the_engine_transfer_budget`); the lane test
+and the wire-frame test gain the fifth arm
+(`account_transient_lane_resolves_or_drops_unattributed`,
+`engine_notification_events_ride_their_contract_frames`), and the
+metrics snapshot test carries the new series key.
 
 ## 5. signal-cli Boundary
 

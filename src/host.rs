@@ -4229,6 +4229,20 @@ where
             )
             .await
         }
+        HostSideEvent::ReceiveDecryptionError { account_id } => {
+            // Contract 1.165, §4.163: the decryption-error envelope — the
+            // fact alone (the receive.emptied posture). Observability only:
+            // no reset action exists on this face, the metrics snapshot
+            // counts independently.
+            send_shared(
+                writer,
+                &HostEvent::new(
+                    "receive.decryptionError",
+                    json!({ "accountId": account_id }),
+                ),
+            )
+            .await
+        }
     }
 }
 
@@ -5059,11 +5073,12 @@ mod tests {
         assert_eq!(frame["data"]["timestamp"], 1727000002000u64);
     }
 
-    /// Contract 1.134 (§4.117): the five engine-notification wire frames —
-    /// the two envelope-key projections with their absent-optional
-    /// identities, and the account-domain lane's three standalone
-    /// notifications with the conversations array verbatim (no reshape, no
-    /// trim, the overflow marker beside it).
+    /// Contract 1.134 (§4.117; the storage-pull face joins with 1.141,
+    /// §4.137; the decryption-error face with 1.165, §4.163): the
+    /// engine-notification wire frames — the two envelope-key projections
+    /// with their absent-optional identities, and the account-domain lane's
+    /// standalone notifications with the conversations array verbatim (no
+    /// reshape, no trim, the overflow marker beside it).
     #[tokio::test]
     async fn engine_notification_events_ride_their_contract_frames() {
         let read_frame = |event: HostSideEvent| async {
@@ -5186,6 +5201,15 @@ mod tests {
             frame["data"]["trigger"], "someFutureEngineTrigger",
             "an unseen trigger forwards verbatim: {frame}"
         );
+
+        // Contract 1.165 (§4.163): the decryption-error frame — the fact
+        // alone (the receive.emptied posture), observability only.
+        let frame = read_frame(HostSideEvent::ReceiveDecryptionError {
+            account_id: "acct-1".into(),
+        })
+        .await;
+        assert_eq!(frame["event"], "receive.decryptionError");
+        assert_eq!(frame["data"]["accountId"], "acct-1");
     }
 
     /// Contract 1.100 (§4.81 D3): the `group.changed` wire frame — the

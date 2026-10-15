@@ -399,6 +399,22 @@ pub enum EngineEvent {
         contacts_ok: bool,
         groups_ok: bool,
     },
+    /// The engine's decryption-error receive envelope (contract 1.165,
+    /// §4.163): a `receive` notification whose envelope carries the
+    /// `decryptionError` marker (`{account, envelope: {sourceUuid,
+    /// decryptionError: {}, timestamp?}}`) — the engine's structured report
+    /// that an inbound envelope failed to decrypt (the 止血批① face; the
+    /// official Android observer acks and records it, this connector only
+    /// observes). The envelope carries no message row, so the receive
+    /// ladder has nothing to project; the account-domain transient lane
+    /// (the supervisor's engine-event watcher) counts it in the metrics
+    /// snapshot, resolves the account, and forwards the host frame. No
+    /// automatic reset action ever rides it — decryption failures self-heal
+    /// through the engine's own DERM retry protocol, not through session
+    /// resets.
+    ReceiveDecryptionError {
+        account: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2716,6 +2732,38 @@ async fn handle_upstream_line(
         }
         if method == "receive" {
             let params = object.get("params").ok_or(EngineError::Protocol)?;
+            // Contract 1.165 §4.163: a decryption-error envelope (the
+            // engine's structured report that an inbound envelope failed to
+            // decrypt) never carries a message row, so the receive ladder
+            // has nothing to project — the envelope routes to the
+            // account-domain event lane instead (the watcher counts it in
+            // the metrics snapshot and forwards the host frame). The
+            // attribution discipline is the accountUnbound arm's: a
+            // malformed or empty account carries no attributable identity
+            // and falls back to the unknown-notification warning rather
+            // than inventing one. No automatic reset action ever rides the
+            // event — decryption failures self-heal through the engine's
+            // DERM retry protocol.
+            if params
+                .get("envelope")
+                .and_then(|envelope| envelope.get("decryptionError"))
+                .is_some()
+            {
+                let attributed = params
+                    .get("account")
+                    .and_then(Value::as_str)
+                    .filter(|account| !account.is_empty());
+                if let Some(account) = attributed {
+                    let _ = events.send(EngineEvent::ReceiveDecryptionError {
+                        account: account.to_string(),
+                    });
+                } else {
+                    let _ = events.send(EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification",
+                    });
+                }
+                return Ok(());
+            }
             if let Some(normalized) = normalize_receive(params)? {
                 match receive_ingress.enqueue(normalized).await? {
                     EnqueueOutcome::Enqueued => {
@@ -10076,6 +10124,120 @@ mod tests {
                 }
             ));
         }
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// Contract revision 1.165 (§4.163): the engine's decryption-error report
+    /// rides as a `receive` notification whose envelope carries the
+    /// `decryptionError` marker — the connector diverts it to the
+    /// account-domain event lane instead of the receive ladder (the envelope
+    /// carries no message row), the attribution follows the accountUnbound
+    /// discipline (a missing, empty, or non-string account falls back to the
+    /// unknown-notification warning), and a marker-free receive envelope
+    /// still queues normally.
+    #[tokio::test]
+    async fn receive_decryption_error_envelope_routes_to_the_event_lane() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, mut queue_rx) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+
+        let line = |value: serde_json::Value| serde_json::to_string(&value).unwrap();
+
+        // The structured report: marker envelope with an optional timestamp —
+        // one attributed event, nothing enqueued.
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": "+15555550100",
+                    "envelope": {
+                        "sourceUuid": "11111111-1111-1111-1111-111111111111",
+                        "timestamp": 1727000000000u64,
+                        "decryptionError": {},
+                    },
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                event_rx.recv().await.unwrap(),
+                EngineEvent::ReceiveDecryptionError { ref account }
+                    if account == "+15555550100"
+            ),
+            "expected the ReceiveDecryptionError event"
+        );
+        assert!(
+            queue_rx.try_recv().is_err(),
+            "the marker envelope never enters the receive ladder"
+        );
+        assert!(!degraded, "the diversion leaves the queue posture alone");
+
+        // The attribution discipline: no account, an empty account, and a
+        // non-string account all stay unattributed.
+        for params in [
+            json!({ "envelope": { "decryptionError": {} } }),
+            json!({ "account": "", "envelope": { "decryptionError": {} } }),
+            json!({ "account": 42, "envelope": { "decryptionError": {} } }),
+        ] {
+            handle_upstream_line(
+                &line(json!({
+                    "jsonrpc": "2.0",
+                    "method": "receive",
+                    "params": params,
+                })),
+                &mut pending,
+                &events,
+                &ingress,
+                &mut degraded,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    event_rx.recv().await.unwrap(),
+                    EngineEvent::ProtocolWarning {
+                        kind: "unknownNotification"
+                    }
+                ),
+                "expected the unattributed warning: {params}"
+            );
+        }
+        assert!(queue_rx.try_recv().is_err());
+
+        // A receive envelope without the marker keeps the ordinary ladder:
+        // it queues (and never emits a decryption event).
+        handle_upstream_line(
+            &line(json!({
+                "jsonrpc": "2.0",
+                "method": "receive",
+                "params": {
+                    "account": "+15555550100",
+                    "envelope": {
+                        "sourceUuid": "11111111-1111-1111-1111-111111111111",
+                        "timestamp": 1727000000001u64,
+                        "dataMessage": { "message": "plain text" },
+                    },
+                },
+            })),
+            &mut pending,
+            &events,
+            &ingress,
+            &mut degraded,
+        )
+        .await
+        .unwrap();
+        assert!(
+            queue_rx.try_recv().is_ok(),
+            "the marker-free envelope queues normally"
+        );
         assert!(event_rx.try_recv().is_err());
     }
 
