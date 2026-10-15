@@ -2356,11 +2356,19 @@ impl RuntimeSupervisor {
         query: String,
         limit: u32,
         cursor: Option<String>,
+        conversation_id: Option<String>,
     ) -> Result<Page<MessageRecord>, ServiceError> {
         // Store-only read: the service lock guards in-memory state only.
         let store = Arc::clone(&self.store);
         blocking_service(move || {
-            store_search_messages(&store, &account_id, &query, limit, cursor.as_deref())
+            store_search_messages(
+                &store,
+                &account_id,
+                &query,
+                limit,
+                cursor.as_deref(),
+                conversation_id.as_deref(),
+            )
         })
         .await
     }

@@ -706,10 +706,11 @@ impl ProxyGroupRuntime {
         query: String,
         limit: u32,
         cursor: Option<String>,
+        conversation_id: Option<String>,
     ) -> Result<Page<MessageRecord>, ServiceError> {
         let slot = self.slot_for_account(&account_id).await?;
         slot.supervisor
-            .search_messages(account_id, query, limit, cursor)
+            .search_messages(account_id, query, limit, cursor, conversation_id)
             .await
     }
 

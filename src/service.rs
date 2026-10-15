@@ -2241,8 +2241,16 @@ impl ConnectorService {
         query: &str,
         limit: u32,
         cursor: Option<&str>,
+        conversation_id: Option<&str>,
     ) -> Result<Page<MessageRecord>, ServiceError> {
-        store_search_messages(&self.store, account_id, query, limit, cursor)
+        store_search_messages(
+            &self.store,
+            account_id,
+            query,
+            limit,
+            cursor,
+            conversation_id,
+        )
     }
 
     pub fn get_message_text(
@@ -11543,9 +11551,22 @@ pub(crate) fn store_search_messages(
     query: &str,
     limit: u32,
     cursor: Option<&str>,
+    conversation_id: Option<&str>,
 ) -> Result<Page<MessageRecord>, ServiceError> {
     if store.account_by_id(account_id)?.is_none() {
         return Err(ServiceError::Store(StoreError::AccountNotFound));
+    }
+    // Contract 1.162: the optional conversation scope is an addressing gate
+    // ahead of the query normalization — an unknown conversation answers
+    // CONVERSATION_NOT_FOUND (the `messages.list` ladder) no matter the
+    // query, while a known one keeps the empty-query empty-page answer.
+    // The key absent keeps the pre-1.162 account-wide face byte-identically.
+    if let Some(conversation_id) = conversation_id
+        && store
+            .conversation_by_id(account_id, conversation_id)?
+            .is_none()
+    {
+        return Err(ServiceError::Store(StoreError::ConversationNotFound));
     }
     // An empty (or whitespace-only) query would match every stored body;
     // the client treats that as "no query", so answer with an empty page.
@@ -11565,7 +11586,7 @@ pub(crate) fn store_search_messages(
             false,
         )));
     }
-    let mut page = store.search_messages(account_id, query, limit, cursor)?;
+    let mut page = store.search_messages(account_id, query, limit, cursor, conversation_id)?;
     page.items = page
         .items
         .into_iter()
@@ -12688,6 +12709,13 @@ pub struct MessagesSearchParams {
     pub query: String,
     pub cursor: Option<String>,
     pub limit: u32,
+    /// Contract 1.162 (§4.160): the optional conversation scope — the
+    /// official search-in-conversation posture (the header search action
+    /// carries `conversation.id`, ConversationHeader.preload.tsx:262-264).
+    /// Absent keeps the pre-1.162 account-wide search byte-identically;
+    /// present scopes the same read to one conversation (an unknown
+    /// conversation answers CONVERSATION_NOT_FOUND).
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

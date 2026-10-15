@@ -42,7 +42,34 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.161 (2026-10-15; the media-story pointer answer
+- Contract revision: 1.162 (2026-10-15; the in-conversation search scope
+  (§4.160): the B3 chat/messaging batch (the user's 2026-10-15
+  chat/sync-first directive) — `messages.search` gains the optional
+  `conversationId` param, the official search-in-conversation posture
+  (the header search action carries `conversation.id`). The key absent
+  keeps the pre-1.162 account-wide face byte-identically; the key
+  present is a pure filter over the same newest-first ordering and the
+  same account-bound cursor format (the cursor stays a sort-key resume,
+  not a scope token — a scoped cursor replayed unscoped, or the other
+  way, stays a valid resume point over the same global ordering), an
+  unknown conversation answers CONVERSATION_NOT_FOUND ahead of the
+  query normalization (the `messages.list` ladder), and an empty query
+  inside a known conversation keeps the honest empty page. The
+  deep-link audit closed with zero keys added: the hit rows already
+  carry the minimal sufficient identity the official result row
+  consumes (`id` + `conversationId` + `sentAt`,
+  `showConversation({conversationId, messageId: id})`) — the wire
+  `serverGuid`/`serverTimestamp` are connector-internal faces (§4.48/
+  §4.109, never serialized) the official pair does not need. Wire
+  additive: one optional param on one existing method, zero new
+  methods/events/error codes/store moves/capability bits (search stays
+  the plain Read-lane store read, §4.25 unchanged otherwise). Schema:
+  the `messagesSearchParams` def gains the optional property plus the
+  description-chain sentence (no new def, no allOf branch — the
+  consistency pointers stay put). Tests 850 → 853 (integration +2, lib
+  +1), all green — fmt, check, clippy, full cargo test, release build,
+  schema parse + consistency) —
+  previously 1.161 (2026-10-15; the media-story pointer answer
   faces (§4.159): the connector half of the engine's sendStory pointer
   batch (engine `941c091`, already on the engine mainline — the second
   link of the own-media read-back chain, the engine leg having closed
@@ -13293,6 +13320,94 @@ serialized) and the absence/half-form arm (the pre-1.161 answer
 byte-identical, the pointer-less group face serializing exactly its
 pinned pair, the half-form group face staying a protocol defect with
 the pointer keys riding along).
+
+### 4.160 The conversation scope rides the search: `messages.search` conversationId (contract revision 1.162, 2026-10-15)
+
+The gap this batch closes: the desktop's sidebar search (contract 1.28,
+§4.25) answers account-wide and its hit rows already deep-link (the
+§6.3 quick win — `openSearchHit` opening the conversation, paging back
+to the hit, and flashing the targeted row), but there is no
+*in-conversation* search domain: no header search entry, no
+conversation-scoped result set, nothing to scope a query to one chat.
+The user's 2026-10-15 chat/messaging-first directive makes this the
+next connector contract the desktop half (a 3–4 file batch) waits on.
+The connector's store is the searchable corpus (§4.25 — upstream offers
+no server-side search), so the scope is a read-face widening, not a new
+corpus: `messages.search` gains the optional `conversationId` param.
+
+Official anchors (upstream `abe80d3`, first-hand, behavior alignment —
+zero code copied; the official search is a local-database search over
+the desktop's indexeddb, so the connector's counterpart is the local
+store and the alignment is the *scoped-filter + addressable-result*
+semantics, not the implementation): the conversation header carries the
+search entry (`ConversationHeader.dom.tsx:378-385`, the `search` icon
+button wired to `onSearchInConversation`), the action binds the open
+conversation's id (`ConversationHeader.preload.tsx:262-264`,
+`searchInConversation(conversation.id)`), the result row carries the
+identity family plus the snippet (`MessageSearchResult.dom.tsx:37-41` —
+`id`, `conversationId`, `sentAt`, `snippet`/`body`/`bodyRanges`) and
+its click deep-links (`:93-95`,
+`showConversation({conversationId, messageId: id})`), and the timeline
+consumes the targeted jump (`Timeline.dom.tsx:88-90`,
+`targetedMessageId?`).
+
+The contract: the key absent keeps the pre-1.162 account-wide face
+byte-identically (no-null — absent and explicit-null fold to the same
+no-key state); the key present is a pure filter over the same
+newest-first ordering (`sent_at DESC, id DESC`), the same 128-char
+query cap, and the same account-bound cursor format. Addressing gates
+run ahead of the query normalization, mirroring the `messages.list`
+ladder: an unknown conversation answers CONVERSATION_NOT_FOUND
+(non-retryable) even for an empty query, while a known conversation
+keeps the empty-query empty-page answer (the client's "no query" face).
+The scope never mutates: search stays the READ-lane store read with no
+unread-clearing side effect, scoped or not (the §4.25 boundary carries
+over), and the ASCII-only LIKE folding boundary carries over too.
+
+The deep-link consumption contract (the desktop half implements
+against this): the search hit row is the plain `MessageRecord` wire
+face, which always serializes `id`, `conversationId`, and `sentAt` —
+exactly the identity trio the official result row carries and its
+click consumes (`MessageSearchResult.dom.tsx:37-41` fed to
+`showConversation({conversationId, messageId: id})` at :93-95). The
+KT desktop's existing `openSearchHit({conversationId, messageId})`
+triple (selectConversation → jumpToMessage paging back by row id →
+scrollTimelineToMessageId → `signalTargetedMessage.target`) addresses
+rows by exactly this pair, so the audit closed with **zero keys added
+and zero reshaped**: the wire `serverGuid`/`serverTimestamp` are
+connector-internal faces (§4.48 / §4.109, `#[serde(skip)]` — never
+serialized) that neither the official pair nor the desktop's jump
+chain consumes. "缺什么补什么" resolved to: nothing missing.
+
+Boundaries, all recorded: the cursor stays the account-bound
+`s1:accountId:sentAt:id` sort-key format on both faces — the scope is
+a filter, not a cursor component, so the same cursor replayed across
+scopes (a scoped page's cursor resumed unscoped, or the other way) is
+a valid resume point over the same global ordering, never an error
+(pinned in both directions); the conversation-existence gate is the
+plain store read (no `validate_opaque_id` pre-gate — a malformed id
+finds no conversation and answers the same CONVERSATION_NOT_FOUND,
+the `messages.list` discipline); the search is pure store query, zero
+engine face, and the fixture needs no search arm (none existed);
+Wire additive: one optional param on one existing method, zero new
+methods/events/error codes/store moves/capability bits (search keeps
+its plain Read-lane row, no FEATURE_CAPABILITIES tag of its own — the
+1.30 capability posture unchanged). Schema: the `messagesSearchParams`
+def gains the optional `conversationId` property (`$ref: opaqueId`)
+plus the description-chain sentence — no new def, no allOf branch, so
+the consistency pointers stay put. Tests: integration +2
+(`tests/search_conversation_scope.rs`) — the scoped-filter arm (two
+conversations, the scope returning only its own rows newest-first,
+every hit carrying the deep-link trio, the other conversation's scoped
+answer holding, the unknown conversation answering
+CONVERSATION_NOT_FOUND non-retryable) and the absence/cursor arm (the
+unscoped page face staying `items`-only byte-identically, the scoped
+cursor paging its scope's remainder, the same cursor replayed
+unscoped reappearing the out-of-scope rows in global order, the
+empty-query faces inside a known and an unknown scope); lib +1 — the
+store filter arm (scope filtering, the key-absent account-wide face
+unchanged, cursor paging inside the scope, the cross-scope replay
+semantics).
 
 ## 5. signal-cli Boundary
 

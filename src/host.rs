@@ -1677,7 +1677,13 @@ async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResp
         "messages.search" => match serde_json::from_value::<MessagesSearchParams>(request.params) {
             Ok(params) if (1..=MAX_PAGE_LIMIT).contains(&params.limit) => {
                 match runtime
-                    .search_messages(params.account_id, params.query, params.limit, params.cursor)
+                    .search_messages(
+                        params.account_id,
+                        params.query,
+                        params.limit,
+                        params.cursor,
+                        params.conversation_id,
+                    )
                     .await
                 {
                     Ok(page) => HostResponse::success(

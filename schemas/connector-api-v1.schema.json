@@ -1830,11 +1830,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["accountId", "query", "limit"],
-      "description": "Contract 1.30: account-wide substring search over stored message bodies. Empty or whitespace-only queries answer an empty page; queries over 128 characters are rejected (INVALID_REQUEST). Contract 1.72 (§4.64): hit rows carry the same optional `textStyles` ranges as messages.list — one stored shape, every read face agrees.",
+      "description": "Contract 1.30: account-wide substring search over stored message bodies. Empty or whitespace-only queries answer an empty page; queries over 128 characters are rejected (INVALID_REQUEST). Contract 1.72 (§4.64): hit rows carry the same optional `textStyles` ranges as messages.list — one stored shape, every read face agrees. Contract 1.162 (§4.160): the optional `conversationId` scopes the same read to one conversation — the official search-in-conversation posture (the header search action carries `conversation.id`) — as a pure filter over the same newest-first ordering and the same account-bound cursor format; an unknown conversation answers CONVERSATION_NOT_FOUND (the messages.list ladder) ahead of the query normalization, and the key absent keeps the account-wide search byte-identically. The hit rows already carry the deep-link identity face the official result row consumes (id + conversationId + sentAt, showConversation({conversationId, messageId: id})) — no result-face key was added or needed.",
       "properties": {
         "accountId": { "$ref": "#/$defs/opaqueId" },
         "query": { "type": "string", "maxLength": 4096 },
         "cursor": { "type": "string", "maxLength": 256 },
+        "conversationId": {
+          "$ref": "#/$defs/opaqueId",
+          "description": "Contract 1.162 (§4.160): optional conversation scope — present scopes the search to that conversation (unknown answers CONVERSATION_NOT_FOUND), absent keeps the account-wide search byte-identically."
+        },
         "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
       }
     },

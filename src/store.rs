@@ -2856,13 +2856,19 @@ impl Store {
     /// Newest-first pages across every conversation; reactions are attached
     /// so a hit renders identically to a thread read. The caller normalizes
     /// the query (trim, empty → no-op); this method only defends against an
-    /// empty pattern matching every row.
+    /// empty pattern matching every row. Since contract 1.162 an optional
+    /// `conversation_id` scopes the same read to one conversation — the
+    /// official search-in-conversation posture (the header search action
+    /// carries `conversation.id`) — as a pure filter over the same
+    /// ordering: the cursor format and its account binding are unchanged,
+    /// so every pre-1.162 call (the key absent) reads byte-identically.
     pub fn search_messages(
         &self,
         account_id: &str,
         query: &str,
         limit: u32,
         cursor: Option<&str>,
+        conversation_id: Option<&str>,
     ) -> Result<Page<MessageRecord>, StoreError> {
         if query.is_empty() {
             return Ok(Page {
@@ -2898,13 +2904,21 @@ impl Store {
                      WHERE account_id=?1
                        AND body LIKE '%'||?2||'%' ESCAPE '\\'
                        AND (?3 IS NULL OR sent_at < ?3 OR (sent_at = ?3 AND id < ?4))
+                       AND (?6 IS NULL OR conversation_id = ?6)
                      ORDER BY sent_at DESC, id DESC
                      LIMIT ?5",
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
             let rows = stmt
                 .query_map(
-                    params![account_id, like, before_sent_at, before_id, fetch as i64],
+                    params![
+                        account_id,
+                        like,
+                        before_sent_at,
+                        before_id,
+                        fetch as i64,
+                        conversation_id
+                    ],
                     message_record_from_row,
                 )
                 .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -13187,7 +13201,7 @@ mod tests {
         hit("miss", &one.id, 30, "nothing to see here");
         hit("attachment-only", &one.id, 40, "");
         let ids = store
-            .search_messages(&account.id, "needle", 10, None)
+            .search_messages(&account.id, "needle", 10, None, None)
             .unwrap()
             .items
             .into_iter()
@@ -13198,7 +13212,7 @@ mod tests {
         // than every row.
         assert_eq!(
             store
-                .search_messages(&account.id, "NEEDLE", 10, None)
+                .search_messages(&account.id, "NEEDLE", 10, None, None)
                 .unwrap()
                 .items
                 .len(),
@@ -13206,7 +13220,7 @@ mod tests {
         );
         assert!(
             store
-                .search_messages(&account.id, "", 10, None)
+                .search_messages(&account.id, "", 10, None, None)
                 .unwrap()
                 .items
                 .is_empty()
@@ -13217,7 +13231,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .search_messages(&other.id, "needle", 10, None)
+                .search_messages(&other.id, "needle", 10, None, None)
                 .unwrap()
                 .items
                 .is_empty()
@@ -13283,7 +13297,7 @@ mod tests {
         // % and _ in the query match literally, not as wildcards.
         let ids = |query: &str| -> Vec<String> {
             store
-                .search_messages(&account.id, query, 10, None)
+                .search_messages(&account.id, query, 10, None, None)
                 .unwrap()
                 .items
                 .into_iter()
@@ -13301,12 +13315,12 @@ mod tests {
         // matter what later happens to the row it was cut from; a cursor
         // from another account is refused.
         let first_page = store
-            .search_messages(&account.id, "plain body", 1, None)
+            .search_messages(&account.id, "plain body", 1, None, None)
             .unwrap();
         assert_eq!(first_page.items.len(), 1);
         let cursor = first_page.next_cursor.unwrap();
         let second_page = store
-            .search_messages(&account.id, "plain body", 10, Some(&cursor))
+            .search_messages(&account.id, "plain body", 10, Some(&cursor), None)
             .unwrap();
         assert_eq!(
             second_page
@@ -13320,20 +13334,123 @@ mod tests {
         // The cursor carries its own sort key, so re-paging from it is
         // deterministic regardless of what happens to the anchor row.
         let repaged = store
-            .search_messages(&account.id, "plain body", 10, Some(&cursor))
+            .search_messages(&account.id, "plain body", 10, Some(&cursor), None)
             .unwrap();
         assert_eq!(repaged.items[0].id, "row-2");
         let other = store
             .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
             .unwrap();
         assert!(matches!(
-            store.search_messages(&other.id, "plain body", 10, Some(&cursor)),
+            store.search_messages(&other.id, "plain body", 10, Some(&cursor), None),
             Err(StoreError::InvalidCursor),
         ));
         assert!(matches!(
-            store.search_messages(&account.id, "plain body", 10, Some("m1:bogus")),
+            store.search_messages(&account.id, "plain body", 10, Some("m1:bogus"), None),
             Err(StoreError::InvalidCursor),
         ));
+    }
+
+    #[test]
+    fn search_conversation_scope_filters_and_keeps_the_unscoped_face() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let one = store
+            .ensure_conversation(&account.id, "direct", "+15555550101", "One")
+            .unwrap();
+        let two = store
+            .ensure_conversation(&account.id, "group", "group-id-1", "Two")
+            .unwrap();
+        let hit = |id: &str, conversation_id: &str, sent_at: u64, text: &str| {
+            let message = MessageRecord {
+                id: id.into(),
+                account_id: account.id.clone(),
+                conversation_id: conversation_id.into(),
+                direction: "incoming",
+                sender_id: "peer".into(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: Some(sent_at),
+                text: Some(text.into()),
+                text_bytes: Some(text.len() as u32),
+                text_truncated: false,
+                text_retrievable: true,
+                status: "delivered",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                admin_deleted: false,
+                server_guid: None,
+                server_timestamp: None,
+                is_story: false,
+                story_message: None,
+            };
+            store.insert_message(&message, None, None, false).unwrap();
+        };
+        hit("old", &one.id, 10, "needle in the old thread");
+        hit("new", &two.id, 20, "Needle in the new group");
+        hit("newest", &one.id, 30, "needle again at the top");
+        // The scope is a pure filter over the same newest-first ordering:
+        // only the named conversation's rows come back, newest first.
+        let ids = |conversation_id: Option<&str>| -> Vec<String> {
+            store
+                .search_messages(&account.id, "needle", 10, None, conversation_id)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|row| row.id)
+                .collect()
+        };
+        assert_eq!(ids(Some(&one.id)), ["newest", "old"]);
+        assert_eq!(ids(Some(&two.id)), ["new"]);
+        // The key absent keeps the account-wide face: the same call without
+        // the scope still spans conversations (the pre-1.162 contract).
+        assert_eq!(ids(None), ["newest", "new", "old"]);
+        // A scoped page's cursor stays the account-bound sort-key format, so
+        // it keeps resolving inside the scope it was minted for — and the
+        // same sort key replayed unscoped (or the other way) stays a valid
+        // resume point over the same global ordering, never an error.
+        let first_page = store
+            .search_messages(&account.id, "needle", 1, None, Some(&one.id))
+            .unwrap();
+        assert_eq!(first_page.items[0].id, "newest");
+        let cursor = first_page.next_cursor.unwrap();
+        let scoped_second = store
+            .search_messages(&account.id, "needle", 10, Some(&cursor), Some(&one.id))
+            .unwrap();
+        assert_eq!(
+            scoped_second
+                .items
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+        let unscoped_resume = store
+            .search_messages(&account.id, "needle", 10, Some(&cursor), None)
+            .unwrap();
+        assert_eq!(
+            unscoped_resume
+                .items
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new", "old"]
+        );
     }
 
     #[test]
