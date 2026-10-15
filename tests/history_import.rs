@@ -1184,3 +1184,162 @@ async fn running_row_with_failure_snapshot_drops_progress_keeps_running() {
 
     supervisor.shutdown().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Contract revision 1.166 (§4.164): the wait-window `pending` carries the
+// live download face. The same single consult that §4.146 used for failure
+// consumption now projects the engine's live transfer snapshot as the §4.51
+// progress face — failure terminal keeps priority, absent/malformed keeps
+// the bare pending, and the disk-pending still never consults.
+// ---------------------------------------------------------------------------
+
+/// Contract 1.166: inside the wait window with no archive the live engine
+/// snapshot rides the pending answer — byte brothers when the engine read a
+/// content-length, stage alone when it did not (the long-poll stretch), and
+/// the bare pre-1.166 pending when the snapshot is absent. A disk-pending
+/// (archive present) still never consults: stale markers produce no
+/// progress beside an archive the connector is about to import.
+#[tokio::test]
+async fn wait_window_pending_projects_live_download_progress() {
+    let temp = TempDir::new().unwrap();
+    let signal_data = temp.path().join("signal-data");
+    // Registry names the account directory, no archive on it yet: the
+    // wait-window pending branch owns the answer.
+    let account_dir = signal_data.join("accounts").join("lk-abc");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    std::fs::write(
+        signal_data.join("engine-state.json"),
+        format!(
+            r#"{{"version":2,"accounts":[{{"number":"{SIGNAL_ACCOUNT}","dir":"accounts/lk-abc"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let seeded = {
+        let seed = test_store(temp.path());
+        seed.upsert_account_from_signal(
+            SIGNAL_ACCOUNT,
+            Some(kt_signal_connector::link::now_ms()),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap()
+    };
+    let store = test_store(temp.path());
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        kt_engine_config(&fixture(), &signal_data),
+        Arc::clone(&store),
+        kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
+        None,
+    ));
+
+    supervisor.start().await.unwrap();
+
+    // CDN streaming stretch with a content-length: the byte brothers ride
+    // the pending face exactly as they ride the running face.
+    set_transfer_snapshot(&signal_data, Some((120, Some(480))));
+    let face = status(&supervisor, &seeded.id).await;
+    assert_eq!(face["state"], "pending");
+    assert_eq!(face["progress"]["stage"], "downloading");
+    assert_eq!(face["progress"]["bytesTransferred"], 120);
+    assert_eq!(face["progress"]["bytesTotal"], 480);
+
+    // Long-poll stretch (bytesRead 0, no total): stage alone, never a
+    // zero-filled total.
+    set_transfer_snapshot(&signal_data, Some((0, None)));
+    let face = status(&supervisor, &seeded.id).await;
+    assert_eq!(face["state"], "pending");
+    assert_eq!(face["progress"]["stage"], "downloading");
+    assert!(face["progress"].get("bytesTransferred").is_none());
+    assert!(face["progress"].get("bytesTotal").is_none());
+
+    // Malformed byte shape (transferred > total): the object drops and the
+    // bare pending stands — no progress invented.
+    set_transfer_snapshot(&signal_data, Some((900, Some(300))));
+    let face = status(&supervisor, &seeded.id).await;
+    assert_eq!(face["state"], "pending");
+    assert!(face.get("progress").is_none());
+
+    // Snapshot absent (engine down/restarted/success-cleared): the honest
+    // pre-1.166 pending, byte for byte.
+    set_transfer_snapshot(&signal_data, None);
+    let face = status(&supervisor, &seeded.id).await;
+    assert_eq!(face["state"], "pending");
+    assert!(face.get("reason").is_none());
+    assert!(face.get("progress").is_none());
+
+    // The disk-pending boundary: archive on the engine face flips the
+    // projection to the never-consults branch. Stale live markers stay up —
+    // and no progress may appear beside an archive the connector is about
+    // to import.
+    set_transfer_snapshot(&signal_data, Some((120, Some(480))));
+    std::fs::write(
+        crate_tests_archive_path(&signal_data),
+        "{\"type\":\"recipient\",\"id\":1,\"kind\":\"contact\",\"name\":\"Alice Import\"}\n",
+    )
+    .unwrap();
+    let face = status(&supervisor, &seeded.id).await;
+    assert_eq!(face["state"], "pending");
+    assert!(face.get("progress").is_none());
+    // And nothing landed: the disk-pending consumes nothing either.
+    assert!(store.history_import_row(&seeded.id).unwrap().is_none());
+
+    supervisor.shutdown().await.unwrap();
+}
+
+/// The failure-code face stays a verbatim pass-through (§4.146, re-pinned by
+/// §4.164): the engine's new `relink_requested` and `continue_without_upload`
+/// terminal codes land immediate persisted failed rows with `errorClass`
+/// exactly as the engine spelled them — one attempt each, no normalization,
+/// no connector-side semantics (the engine owns the word list).
+#[tokio::test]
+async fn engine_relink_and_continue_without_upload_codes_land_failed_rows_verbatim() {
+    let temp = TempDir::new().unwrap();
+    let signal_data = temp.path().join("signal-data");
+    let first = {
+        let seed = test_store(temp.path());
+        seed.upsert_account_from_signal(
+            SIGNAL_ACCOUNT,
+            Some(kt_signal_connector::link::now_ms()),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap()
+    };
+    let second = {
+        let seed = test_store(temp.path());
+        seed.upsert_account_from_signal(
+            "+15555550101",
+            Some(kt_signal_connector::link::now_ms()),
+            kt_signal_connector::DEFAULT_PROXY_GROUP_ID,
+        )
+        .unwrap()
+    };
+    let store = test_store(temp.path());
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        kt_engine_config(&fixture(), &signal_data),
+        Arc::clone(&store),
+        kt_signal_connector::DEFAULT_PROXY_GROUP_ID.to_string(),
+        None,
+    ));
+
+    supervisor.start().await.unwrap();
+
+    set_transfer_error(&signal_data, Some("relink_requested"));
+    let face = status(&supervisor, &first.id).await;
+    assert_eq!(face["state"], "failed");
+    assert_eq!(face["errorClass"], "relink_requested");
+    assert_eq!(face["attempts"], 1);
+    assert_eq!(face["accountId"], first.id.as_str());
+    let row = store.history_import_row(&first.id).unwrap().unwrap();
+    assert_eq!(row.state, "failed");
+    assert_eq!(row.error_class.as_deref(), Some("relink_requested"));
+    assert_eq!(row.attempts, 1);
+
+    set_transfer_error(&signal_data, Some("continue_without_upload"));
+    let face = status(&supervisor, &second.id).await;
+    assert_eq!(face["state"], "failed");
+    assert_eq!(face["errorClass"], "continue_without_upload");
+    assert_eq!(face["attempts"], 1);
+    let row = store.history_import_row(&second.id).unwrap().unwrap();
+    assert_eq!(row.error_class.as_deref(), Some("continue_without_upload"));
+
+    supervisor.shutdown().await.unwrap();
+}

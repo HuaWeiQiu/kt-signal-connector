@@ -42,6 +42,21 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
+- Contract revision: 1.166 (2026-10-16; §4.164 the wait-window pending learns
+  the live transfer face: `history.importStatus` answers the engine's
+  `transfer.downloadStatus` progress on the wait-window `pending` — stage
+  downloading with the byte brothers when the engine's snapshot is live,
+  the bare pre-1.166 pending when it is absent, malformed, or the engine is
+  down — so the desktop watches the real archive transfer across the whole
+  up-to-60-min wait window instead of static copy. The §4.146
+  failure-consumption face keeps priority on the same single consult and
+  stays a length-capped verbatim pass-through: the engine's new
+  `relink_requested`/`continue_without_upload` terminal codes ride the same
+  failed-row arm as every code before them, unnormalized — the engine owns
+  the word list, the connector adds no semantics. Wire additive: one
+  optional `progress` key on one state face; zero new methods, events,
+  error codes, capability bits, or store moves. Tests 865 → 867
+  (integration +2).)
 - Contract revision: 1.165 (2026-10-16; §4.163 the four-face 止血批①:
   the CDN download trust chain pins the vendored Signal production root CA
   (`vendor/certs/production-root-ca.pem`, compile-time) beneath the
@@ -3921,7 +3936,9 @@ documented data-directory artifact instead of an RPC surface.
   1.148, §4.146, resolves the wait-window `pending` against the engine's failure terminal
   snapshot (`unavailable`/`no-archive` at once for `no_archive`, an immediate persisted
   `failed` row for every other engine code, the new `unavailable` reason `cancelled` after a
-  `history.importCancel`) — that section owns the widened face. Contract
+  `history.importCancel`) — that section owns the widened face. Contract 1.166, §4.164,
+  carries the same `progress` face onto the wait-window `pending` (the live engine download
+  snapshot, downloading stage) — that section owns the widened face. Contract
   1.56, attachv2 above, widens the import payload itself with the attachment pointer faces;
   the status/progress/retry faces are untouched by it.)
 - Store: one `history_imports` row per account (schema version 15, FK cascade with the account;
@@ -5363,7 +5380,9 @@ zero copy).
   `processing` is the connector's own NDJSON import pass (a `running` row with no engine
   download snapshot) and never carries byte fields — the official Process stage renders
   copy without numbers (`InstallScreenBackupImportStep.dom.tsx` L287-296).
-  `pending`/`completed`/`failed`/`unavailable` never carry `progress`. Shape gate: the
+  `pending`/`completed`/`failed`/`unavailable` never carry `progress` (as of this revision;
+  contract 1.166, §4.164, later gives the wait-window `pending` the downloading stage —
+  that section owns the widening). Shape gate: the
   snapshot is engine output, not trusted input — `present` must be a true boolean, byte
   fields non-negative integers within u64, `bytesTransferred ≤ bytesTotal` when both ride;
   a malformed snapshot drops the `progress` object and keeps the state (better to omit
@@ -13822,6 +13841,71 @@ and the wire-frame test gain the fifth arm
 (`account_transient_lane_resolves_or_drops_unattributed`,
 `engine_notification_events_ride_their_contract_frames`), and the
 metrics snapshot test carries the new series key.
+
+### 4.164 The wait window watches the transfer: `history.importStatus` pending carries the live download face (contract revision 1.166, 2026-10-16)
+
+The wound (2026-10-15, transfer-observation audit): during the link-time wait
+window the desktop polled `history.importStatus` and got the bare
+`{accountId, state: "pending"}` — static "preparing" copy for the entire
+up-to-60-min window — while the engine's transfer snapshot was live the whole
+time. The engine's window has two stretches: the `transfer_archive` long poll
+waiting for the phone to produce and upload the archive (most of the window,
+snapshot at `bytesRead: 0`, no total — no numbers exist yet), then the CDN
+streaming stretch (bytes accumulating, a total once a content-length is
+read). The connector consulted that snapshot in pending since §4.146 — but
+only to consume a terminal: a live snapshot with no `errorCode` changed
+nothing, so the honest answer stayed the bare pending face and the desktop
+had nothing to render until the connector's own import row went `running`,
+which happens only after the archive has fully landed. The running face's
+§4.51 progress contract was exactly the missing half.
+
+**The fix is a second consumer on the same single consult, failure priority
+unchanged.** The wait-window `pending` still reads `transfer.downloadStatus`
+once per poll (the consult-flag discipline untouched — a disk-pending, the
+archive-present face, still never consults: no stale terminal may land a
+failed row beside an archive the connector is about to import, and none may
+decorate it with stale progress either). A snapshot carrying a consumable
+`errorCode` resolves exactly as §4.146 taught: `no_archive` onto the
+information class, every other code onto an immediate persisted failed row.
+A snapshot without one is the live transfer, and it now rides the same
+§4.51 shape gate (`import_progress_from_engine_snapshot`) the running face
+uses: `progress: {stage: "downloading", bytesTransferred?, bytesTotal?}` on
+the pending answer — byte brothers together only when the engine read a
+content-length, stage alone otherwise (the long-poll stretch answers
+`bytesRead: 0` with no total, and the gate renders that as stage alone,
+never a zero-filled guess). Absent snapshot (engine down, restarted,
+success-cleared), malformed byte shape, or transferred > total: the
+pre-1.166 bare pending, byte for byte — no progress invented. The
+`processing` stage is deliberately unreachable on pending: it names the
+connector's own NDJSON import pass, which by definition holds a `running`
+row, not a pending face.
+
+**The failure-code face stays a verbatim pass-through — re-pinned, not
+changed.** `engine_import_failure_code` is a shape gate (non-empty string
+within [`MAX_IMPORT_FAILURE_CODE_CHARS`]), never a whitelist: the code rides
+the failed row's `errorClass` exactly as the engine spelled it, and the
+engine is the word list's owner. The engine's new terminal vocabulary —
+`relink_requested` and `continue_without_upload`, same wire face as the
+existing `no_archive`/`network`/`cdn_unreachable`/`decode_failed`/`io` —
+therefore needs zero connector change: both codes land immediate persisted
+failed rows with `errorClass` verbatim, one attempt, exactly like every code
+before them. The connector adds no semantics and no translation (only
+`no_archive` is special-cased, the §4.146 information class); the desktop
+decides the copy per code.
+
+Wire additive: one optional `progress` key on one state face; zero new
+methods, events, error codes, capability bits, or store moves. Schema
+consistency holds unchanged (the result stays free-form; the contract text
+lives in the `historyImportStatusParams` description). Tests: the
+wait-window pending projection pair
+(`wait_window_pending_projects_live_download_progress` — byte brothers,
+stage-only during the long-poll stretch, bare pending without a snapshot,
+and the disk-pending never-consults boundary) and the verbatim-code pin
+(`engine_relink_and_continue_without_upload_codes_land_failed_rows_verbatim`
+— the two new engine codes land `errorClass` verbatim, one attempt each,
+persisted); the lib gate test carries the new vocabulary
+(`engine_import_failure_code_gate`), and the §4.146 tests stand unchanged —
+the failure consumption keeps priority over the progress face.
 
 ## 5. signal-cli Boundary
 

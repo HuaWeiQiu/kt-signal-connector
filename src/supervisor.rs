@@ -946,8 +946,13 @@ impl RuntimeSupervisor {
     /// once: the engine's failure terminal state resolves the wait at once
     /// (`no_archive` onto the existing NO_ARCHIVE information class, any
     /// other code onto an immediately-landed persisted failed row) instead of
-    /// hanging `pending` until the window expires; every other state is
-    /// store/disk-only exactly as before.
+    /// hanging `pending` until the window expires. Since contract 1.166
+    /// (§4.164) that same consult also projects the snapshot's live
+    /// downloading face onto the pending answer — the same `progress` object
+    /// the running face carries, failure terminal keeping priority — so the
+    /// desktop watches the real transfer across the whole wait window instead
+    /// of static copy; every other state is store/disk-only exactly as
+    /// before.
     pub async fn history_import_status(&self, account_id: String) -> Result<Value, ServiceError> {
         let store = Arc::clone(&self.store);
         let data_dir = self.config.data_dir.clone();
@@ -956,13 +961,13 @@ impl RuntimeSupervisor {
         let (mut status, signal_account) = blocking_service(move || {
             // The engine face is consulted only where it can change the
             // answer: a `running` row (byte progress) and a wait-window
-            // `pending` with no archive (failure consumption). The
-            // projection's consult flag names the second: a disk-`pending`
-            // (archive present, the sweep or watcher about to claim it)
-            // never consults — a stale terminal snapshot must not land a
-            // failed row beside an archive the connector is about to
-            // import. Every other state is already terminal or
-            // store/disk-derived.
+            // `pending` (failure consumption plus the live download face,
+            // §4.164). The projection's consult flag names the second: a
+            // disk-`pending` (archive present, the sweep or watcher about to
+            // claim it) never consults — a stale terminal snapshot must not
+            // land a failed row beside an archive the connector is about to
+            // import, nor decorate it with stale progress. Every other
+            // state is already terminal or store/disk-derived.
             let (status, consult_engine) =
                 history_import_status_projection(&store, &data_dir, &cancels, &row_account_id)?;
             let signal_account = match (status["state"].as_str(), consult_engine) {
@@ -1007,13 +1012,20 @@ impl RuntimeSupervisor {
                 object.insert("progress".to_owned(), progress);
             }
         }
-        // Failure consumption (contract 1.148, §4.146): a wait-window
-        // `pending` with no archive resolves immediately against the engine's
-        // terminal snapshot. `no_archive` is the existing information class
-        // (the phone transferred nothing — never a failed row); any other
-        // code lands an honest persisted failed row through one atomic
-        // insert-or-ignore and renders it. A down engine, a malformed code,
-        // or a snapshot without `errorCode` keeps the pre-1.48 answer.
+        // Failure consumption (contract 1.148, §4.146) with the live-face
+        // projection (contract 1.166, §4.164) riding the same single bounded
+        // consult: a wait-window `pending` reads the engine's snapshot once.
+        // A terminal `errorCode` keeps priority — `no_archive` is the
+        // existing information class (the phone transferred nothing — never
+        // a failed row), any other code lands an honest persisted failed row
+        // through one atomic insert-or-ignore and renders it (the code rides
+        // verbatim: the engine owns the word list, the connector adds no
+        // semantics). A snapshot without a consumable code is the live
+        // transfer: the same `progress` face the running state carries, so
+        // the desktop sees the real state across the whole wait window. A
+        // down engine, a malformed code, a malformed byte shape, or an
+        // absent snapshot keeps the honest bare pending — no progress
+        // invented.
         if status["state"] == "pending"
             && let Some(signal_account) = signal_account
             && let Ok(engine) = self.running_engine().await
@@ -1024,26 +1036,35 @@ impl RuntimeSupervisor {
                     CallClass::ReadOnly,
                 )
                 .await
-            && let Some(code) = engine_import_failure_code(&snapshot)
         {
-            if code == IMPORT_FAILURE_NO_ARCHIVE {
-                status = json!({
-                    "accountId": account_id,
-                    "state": "unavailable",
-                    "reason": "no-archive",
-                });
-            } else {
-                let store = Arc::clone(&self.store);
-                let row_account_id = account_id.clone();
-                let code = code.to_string();
-                let row = blocking_service(move || {
-                    store
-                        .land_history_import_failure(&row_account_id, &code, crate::link::now_ms())
-                        .map_err(ServiceError::from)
-                })
-                .await?;
-                status = serde_json::to_value(row)
-                    .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)))?;
+            if let Some(code) = engine_import_failure_code(&snapshot) {
+                if code == IMPORT_FAILURE_NO_ARCHIVE {
+                    status = json!({
+                        "accountId": account_id,
+                        "state": "unavailable",
+                        "reason": "no-archive",
+                    });
+                } else {
+                    let store = Arc::clone(&self.store);
+                    let row_account_id = account_id.clone();
+                    let code = code.to_string();
+                    let row = blocking_service(move || {
+                        store
+                            .land_history_import_failure(
+                                &row_account_id,
+                                &code,
+                                crate::link::now_ms(),
+                            )
+                            .map_err(ServiceError::from)
+                    })
+                    .await?;
+                    status = serde_json::to_value(row)
+                        .map_err(|_| ServiceError::Store(StoreError::Unavailable(None)))?;
+                }
+            } else if let Some(progress) = import_progress_from_engine_snapshot(&snapshot)
+                && let Some(object) = status.as_object_mut()
+            {
+                object.insert("progress".to_owned(), progress);
             }
         }
         Ok(status)
@@ -7791,10 +7812,11 @@ fn engine_import_failure_code(snapshot: &Value) -> Option<&str> {
 /// every store/disk branch: the account was cancelled, and no pending face
 /// may resurrect it until a retry clears the marker. The boolean in the
 /// answer is the consult face: `true` only for the wait-window `pending`
-/// branch — the one state whose answer the engine's terminal snapshot can
-/// still change (§4.146 failure consumption). A row answers with `false`
-/// (the caller consults for `running` byte progress by state, never by this
-/// flag) and every store/disk-derived answer with `false`.
+/// branch — the one state whose answer the engine's snapshot can still
+/// change (the §4.146 failure consumption and, since §4.164, the live
+/// download face). A row answers with `false` (the caller consults for
+/// `running` byte progress by state, never by this flag) and every
+/// store/disk-derived answer with `false`.
 fn history_import_status_projection(
     store: &Arc<Store>,
     data_dir: &Path,
@@ -8918,13 +8940,19 @@ mod tests {
         assert_eq!(IMPORT_FAILURE_NO_ARCHIVE, "no_archive");
         // The engine 0a2ab18 vocabulary — every one of the five consumes
         // immediately (never a ten-minute pending), and unseen codes ride
-        // the same verbatim arm.
+        // the same verbatim arm. The engine's §4.164 word-list additions
+        // (`relink_requested`, `continue_without_upload`) pass through
+        // unnormalized, exactly like every code before them — the gate is a
+        // shape gate (non-empty string within the cap), never a whitelist;
+        // the engine owns the word list, the connector adds no semantics.
         for code in [
             "no_archive",
             "network",
             "cdn_unreachable",
             "decode_failed",
             "io",
+            "relink_requested",
+            "continue_without_upload",
             "something_new",
         ] {
             assert_eq!(
