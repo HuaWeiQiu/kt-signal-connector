@@ -431,7 +431,7 @@ impl ServiceError {
             ServiceError::Engine(EngineError::Protocol) => {
                 ApiError::new("UPSTREAM_PROTOCOL_ERROR", "engine protocol error", true)
             }
-            ServiceError::Engine(EngineError::Upstream) => {
+            ServiceError::Engine(EngineError::Upstream { .. }) => {
                 ApiError::new("UPSTREAM_ERROR", "engine returned an error", true)
             }
             // Contract 1.36 structured engine errors (§4.32/§4.33): the code
@@ -8483,7 +8483,7 @@ impl ConnectorService {
     pub(crate) fn auto_retry_schedule(error: &EngineError) -> crate::store::SendRetrySchedule {
         match error {
             EngineError::RateLimited => crate::store::SendRetrySchedule::RateLimit,
-            EngineError::ServerUnavailable | EngineError::Upstream => {
+            EngineError::ServerUnavailable | EngineError::Upstream { .. } => {
                 crate::store::SendRetrySchedule::Backoff
             }
             _ => crate::store::SendRetrySchedule::None,
@@ -18407,7 +18407,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let enrollable = [EngineError::ServerUnavailable, EngineError::Upstream];
+        let enrollable = [
+            EngineError::ServerUnavailable,
+            EngineError::Upstream { cause: None },
+        ];
         for (index, error) in enrollable.iter().enumerate() {
             let request = format!("req-enroll-{index}");
             let pending_id = match service
@@ -18540,7 +18543,7 @@ mod tests {
             SendRetrySchedule::Backoff
         );
         assert_eq!(
-            ConnectorService::auto_retry_schedule(&EngineError::Upstream),
+            ConnectorService::auto_retry_schedule(&EngineError::Upstream { cause: None }),
             SendRetrySchedule::Backoff
         );
         for error in [

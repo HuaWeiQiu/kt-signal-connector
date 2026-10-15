@@ -3192,7 +3192,7 @@ impl RuntimeSupervisor {
                 "mutating request has an unknown outcome",
                 false,
             ))),
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -3225,7 +3225,7 @@ impl RuntimeSupervisor {
                 "mutating request has an unknown outcome",
                 false,
             ))),
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4653,7 +4653,7 @@ impl RuntimeSupervisor {
             // The bare -32603 face (an account the engine no longer holds, a
             // malformed parameter the typed ladder cannot produce) is a
             // deterministic refusal — retryable=false, the 1.115 discipline.
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4699,7 +4699,7 @@ impl RuntimeSupervisor {
             // The bare -32603 face rejects the parameters before any write
             // lands — a deterministic refusal, retryable=false (the 1.115
             // groups discipline).
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4765,7 +4765,7 @@ impl RuntimeSupervisor {
             // discipline; the structured link families
             // (GROUP_INVITE_LINK_UNAVAILABLE, STORAGE_UNAVAILABLE) map
             // through the allowlist channels.
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4799,7 +4799,7 @@ impl RuntimeSupervisor {
             // tolerance ladder refuses before anything goes upstream) is a
             // deterministic refusal — retryable=false, a replay fails the
             // same way.
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4833,7 +4833,7 @@ impl RuntimeSupervisor {
             // retryable=false; the structured faces
             // (GROUP_INVITE_LINK_PREVIEW_FAILED, STORAGE_UNAVAILABLE) map
             // through the allowlist channels.
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4874,7 +4874,7 @@ impl RuntimeSupervisor {
             // The bare -32603 face (a malformed link the engine's parse
             // gate refuses before anything goes upstream) is a
             // deterministic refusal — retryable=false.
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,
@@ -4907,7 +4907,7 @@ impl RuntimeSupervisor {
                 "mutating request has an unknown outcome",
                 false,
             ))),
-            Err(EngineError::Upstream) => Err(ServiceError::Api(ApiError::new(
+            Err(EngineError::Upstream { .. }) => Err(ServiceError::Api(ApiError::new(
                 "UPSTREAM_ERROR",
                 "engine returned an error",
                 false,

@@ -42,6 +42,22 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
+- Contract revision: 1.167 (2026-10-16; §4.165 the `engine call failed`
+  log line carries the engine's embedded cause class on the generic
+  upstream face: when a JSON-RPC error degrades to the plain upstream
+  family — no authorization signature, no §4.80/§4.95 anchor, no
+  allowlisted structured code — the tailmost parenthesized class-name
+  literal in the engine's `message` rides the log line as a bounded
+  `cause` field (≤120 bytes), so an unclassified send-chain cause is
+  observable in the field instead of being lost with the raw error body
+  — the official desktop behavior of surfacing a send failure's cause
+  name. The shape gate admits only letter-led `[A-Za-z0-9._]` tokens —
+  fixed engine class literals, never message text, phone numbers, or
+  contact data — and a missing or shape-hostile message keeps the
+  pre-1.167 line byte for byte. Zero wire change: the host answer stays
+  `UPSTREAM_ERROR` byte for byte, the auto-retry schedule keeps mapping
+  the upstream family to Backoff, and the contract revision records a
+  log-face contract only. Tests +4 (lib).)
 - Contract revision: 1.166 (2026-10-16; §4.164 the wait-window pending learns
   the live transfer face: `history.importStatus` answers the engine's
   `transfer.downloadStatus` progress on the wait-window `pending` — stage
@@ -13906,6 +13922,60 @@ and the disk-pending never-consults boundary) and the verbatim-code pin
 persisted); the lib gate test carries the new vocabulary
 (`engine_import_failure_code_gate`), and the §4.146 tests stand unchanged —
 the failure consumption keeps priority over the progress face.
+
+### 4.165 The `engine call failed` log carries the engine's cause class (contract revision 1.167, 2026-10-16)
+
+The wound (2026-10-16, intermittent-send audit): the engine folds a
+send-chain transport failure into the plain internal_error face (-32603)
+whose `message` embeds the cause class (§4.80), and the connector
+classifies only the four frozen anchor literals — rate limit, proof
+challenge, server unavailability, the identity gate. A cause outside that
+set degraded to the generic upstream family, and the raw error body — the
+only place the cause was ever visible — was dropped at the response
+classifier, so the `engine call failed` log line named the failure
+`error_class="upstream"` with nothing underneath: an intermittent send
+could not be attributed to a transport family from the field.
+
+**The fix surfaces the embedded literal; it does not widen the
+classifier.** The frozen §4.80/§4.95 anchor set is a wire contract and
+stays byte-frozen. The generic upstream arm now runs `upstream_error_cause`
+over the same message and carries the tailmost parenthesized class-name
+literal on the error itself (`EngineError::Upstream { cause }`), bounded
+to 120 bytes (`ENGINE_ERROR_CAUSE_MAX_BYTES`; oversize truncates). The log
+line gains one field on that face only: `cause="(SomeException)"` after
+`error_class` — a fixed engine class literal, never free-form text. The
+shape gate is the content red line: a candidate token must be letter-led
+and `[A-Za-z0-9._]`-only (the §4.80 anchor family's shape), so message
+text, phone numbers, contact names, digit-led timestamps, and any
+whitespace-bearing prose cannot ride the field; the tailmost position is
+the contract-pinned one (the cause class embedded at the message tail), so
+an earlier incidental token never wins.
+
+Zero wire change: the host answer stays `UPSTREAM_ERROR` byte for byte
+(the cause never reaches an `ApiError`), the auto-retry schedule keeps
+mapping the upstream family to Backoff regardless of the cause, and no
+schema, method, event, or error-code face moves. Everything but the
+cause-bearing face keeps the pre-1.167 line byte for byte: the other
+error classes carry no message at all, an upstream message with no
+class-shaped token answers `None` and emits the old line, and the
+emit-site's no-cause arm is the unchanged source line.
+
+Tests (lib +4): the extraction unit
+(`upstream_error_cause_extracts_the_tail_class_literal_bounded` — the
+tailmost token wins over an earlier incidental one, the dotted FQN
+literal, the shape-hostile ladder: no parens, space-bearing prose, a
+`+`-led phone token, a digit-led token, an unclosed paren, an empty
+wrapper, missing and non-string messages, and the 120-byte truncation),
+the log-face pair (`engine_call_failed_log_carries_the_upstream_cause` /
+`engine_call_failed_log_stays_byte_identical_outside_the_cause` — the
+cause line's field set with the bound riding whole at the emitter, and
+the regression pin that a non-upstream class and a causeless upstream
+emit no `cause=`), and the through-the-wire carry
+(`generic_upstream_error_carries_the_embedded_cause_literal` — the
+response handler attaches the extracted literal, a shape-hostile message
+stays causeless, neither emits an account event). The existing
+generic-upstream fixtures update to the carried literal
+(`(UserErrorException)`) and to the causeless shape.
 
 ## 5. signal-cli Boundary
 

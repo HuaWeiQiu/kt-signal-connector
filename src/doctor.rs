@@ -1382,7 +1382,7 @@ mod tests {
             (Err(Error::NotRunning), "unreachable"),
             (Err(Error::Exited), "unreachable"),
             (Err(Error::Backpressure), "unreachable"),
-            (Err(Error::Upstream), "indeterminate"),
+            (Err(Error::Upstream { cause: None }), "indeterminate"),
             (Err(Error::Protocol), "indeterminate"),
         ];
         for (result, expected) in cases {

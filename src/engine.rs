@@ -243,7 +243,17 @@ pub enum EngineError {
     #[error("engine produced invalid protocol output")]
     Protocol,
     #[error("engine returned an error")]
-    Upstream,
+    Upstream {
+        /// Contract 1.167 §4.165: the engine's embedded cause-class literal,
+        /// extracted at the response classifier when the frozen §4.80/§4.95
+        /// anchor set leaves the error unclassified — the tailmost
+        /// parenthesized class-name token (letter-led `[A-Za-z0-9._]`),
+        /// bounded to 120 bytes. Log-only observability: the
+        /// `engine call failed` line carries it; the host wire answer
+        /// (`UPSTREAM_ERROR`) stays byte for byte. `None` — including every
+        /// shape-hostile message — keeps the pre-1.167 log shape.
+        cause: Option<String>,
+    },
     #[error("engine rejected the device credentials")]
     Unauthorized,
     /// Contract 1.99 §4.80: the engine's send-chain transport families. The
@@ -302,7 +312,7 @@ impl EngineError {
             EngineError::UnknownOutcome => "unknown_outcome",
             EngineError::Exited => "exited",
             EngineError::Protocol => "protocol",
-            EngineError::Upstream => "upstream",
+            EngineError::Upstream { .. } => "upstream",
             EngineError::Unauthorized => "unauthorized",
             EngineError::RateLimited => "rate_limited",
             EngineError::ProofRequired => "proof_required",
@@ -2331,12 +2341,11 @@ impl EngineHandle {
                 result = "ok",
                 "engine call completed"
             ),
-            Err(error) => tracing::warn!(
-                upstream_method = method,
-                call_class = call_class_label(class),
-                duration_ms = started.elapsed().as_millis() as u64,
-                error_class = error.class(),
-                "engine call failed"
+            Err(error) => log_engine_call_failure(
+                method,
+                call_class_label(class),
+                started.elapsed().as_millis() as u64,
+                error,
             ),
         }
         outcome
@@ -2375,6 +2384,41 @@ impl EngineHandle {
                 Ok(())
             }
         }
+    }
+}
+
+/// The `engine call failed` log face (contract 1.167 §4.165): classified
+/// fields only, never upstream error content. On the generic upstream face
+/// the engine's embedded cause-class literal — the bounded fixed literal the
+/// response classifier extracted, never free-form text — rides the line as
+/// the trailing `cause` field; every other face (and a causeless upstream)
+/// emits the pre-1.167 line byte for byte.
+fn log_engine_call_failure(
+    upstream_method: &'static str,
+    call_class: &'static str,
+    duration_ms: u64,
+    error: &EngineError,
+) {
+    let cause = match error {
+        EngineError::Upstream { cause: Some(cause) } => Some(cause.as_str()),
+        _ => None,
+    };
+    match cause {
+        Some(cause) => tracing::warn!(
+            upstream_method,
+            call_class,
+            duration_ms,
+            error_class = error.class(),
+            cause,
+            "engine call failed"
+        ),
+        None => tracing::warn!(
+            upstream_method,
+            call_class,
+            duration_ms,
+            error_class = error.class(),
+            "engine call failed"
+        ),
     }
 }
 
@@ -3023,7 +3067,13 @@ async fn handle_upstream_line(
                 .response
                 .send(Err(EngineError::UpstreamCode { code, data }));
         } else {
-            let _ = request.response.send(Err(EngineError::Upstream));
+            // Contract 1.167 §4.165: the frozen anchor set did not classify;
+            // the embedded cause-class literal — if the message carries a
+            // class-shaped one — rides the error log-only (bounded) so the
+            // field can attribute the failure; the wire answer stays the
+            // plain upstream face.
+            let cause = upstream_error_cause(object.get("error"));
+            let _ = request.response.send(Err(EngineError::Upstream { cause }));
         }
     } else {
         let result = object.get("result").cloned().unwrap_or(Value::Null);
@@ -3129,6 +3179,46 @@ fn upstream_error_send_class(error: Option<&Value>) -> Option<EngineError> {
     } else {
         None
     }
+}
+
+/// Contract 1.167 §4.165: the generic upstream face's bounded cause literal.
+/// When the frozen §4.80/§4.95 anchor set leaves a JSON-RPC error
+/// unclassified, the tailmost parenthesized class-name token in the error
+/// `message` is surfaced log-only instead of being lost with the raw error
+/// body — the official desktop behavior of carrying a send failure's cause
+/// name. The shape gate mirrors the anchor family: a letter-led
+/// `[A-Za-z0-9._]` token, so message text, phone numbers, contact data, and
+/// digit-led timestamps cannot ride the field — a fixed engine class
+/// literal, never user data. The value is bounded to 120 bytes including
+/// the parenthesized wrapper (oversize truncates; the gate is ASCII-only,
+/// so the slice stays on a char boundary). Missing, non-string, and
+/// shape-hostile messages answer `None` and keep the pre-1.167 log shape.
+fn upstream_error_cause(error: Option<&Value>) -> Option<String> {
+    const ENGINE_ERROR_CAUSE_MAX_BYTES: usize = 120;
+    let message = error?.get("message").and_then(Value::as_str)?;
+    let mut rest = message;
+    let mut cause: Option<&str> = None;
+    while let Some(open) = rest.find('(') {
+        let tail = &rest[open + 1..];
+        let Some(close) = tail.find(')') else {
+            break;
+        };
+        let inner = &tail[..close];
+        let letter_led = matches!(inner.chars().next(), Some(first) if first.is_ascii_alphabetic());
+        if letter_led
+            && inner
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
+        {
+            // The tailmost qualifying token wins: the contract pins the
+            // cause class at the message tail.
+            cause = Some(inner);
+        }
+        rest = tail;
+    }
+    let literal = cause?;
+    let cap = ENGINE_ERROR_CAUSE_MAX_BYTES.saturating_sub(2);
+    Some(format!("({})", &literal[..literal.len().min(cap)]))
 }
 
 /// Known engine error codes the connector maps onto structured host errors
@@ -7240,12 +7330,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
+        assert_eq!(
+            response_rx.await.unwrap(),
+            Err(EngineError::Upstream { cause: None })
+        );
         assert!(event_rx.try_recv().is_err());
     }
 
     /// Any other upstream error keeps the generic Upstream classification and
-    /// must not emit an account event.
+    /// must not emit an account event. Contract 1.167 §4.165: the embedded
+    /// cause-class literal rides the error log-only — the class-shaped
+    /// wrapper in this fixture message is carried verbatim.
     #[tokio::test]
     async fn generic_upstream_error_stays_unclassified() {
         let (events, mut event_rx) = event_channel();
@@ -7272,7 +7367,209 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response_rx.await.unwrap(), Err(EngineError::Upstream));
+        assert_eq!(
+            response_rx.await.unwrap(),
+            Err(EngineError::Upstream {
+                cause: Some("(UserErrorException)".to_string())
+            })
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// In-memory capture for log-face assertions (the metrics.rs pattern).
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured_log(log: impl FnOnce()) -> String {
+        let buffer = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, log);
+        String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// Contract 1.167 §4.165: the extraction unit — the tailmost qualifying
+    /// token wins, the dotted FQN literal rides, and the shape-hostile ladder
+    /// answers `None` (no parens, space-bearing prose, a `+`-led phone token,
+    /// a digit-led token, an unclosed paren, an empty wrapper, missing and
+    /// non-string messages). The bound: a class token past the cap truncates
+    /// inside the 120-byte wrapper.
+    #[test]
+    fn upstream_error_cause_extracts_the_tail_class_literal_bounded() {
+        let cause = |message: &str| {
+            upstream_error_cause(Some(&json!({ "code": -32603, "message": message })))
+        };
+        // The tailmost token wins over an earlier incidental one.
+        assert_eq!(
+            cause("prefix (incidental) then failed (UnregisteredUserException)"),
+            Some("(UnregisteredUserException)".to_string())
+        );
+        // The dotted FQN form rides.
+        assert_eq!(
+            cause(
+                "Failed to send message: connection reset (org.whispersystems.signalservice.api.PushNetworkException)"
+            ),
+            Some("(org.whispersystems.signalservice.api.PushNetworkException)".to_string())
+        );
+        // Shape-hostile ladder: none of these can be a class literal.
+        assert_eq!(cause("no parentheses at all"), None);
+        assert_eq!(cause("failed (user note with spaces)"), None);
+        assert_eq!(cause("failed (+15555550200)"), None);
+        assert_eq!(cause("failed (20261016)"), None);
+        assert_eq!(cause("failed (UnregisteredUserException"), None);
+        assert_eq!(cause("failed ()"), None);
+        // Missing and non-string messages answer None.
+        assert_eq!(upstream_error_cause(None), None);
+        assert_eq!(upstream_error_cause(Some(&json!({ "code": -32603 }))), None);
+        assert_eq!(
+            upstream_error_cause(Some(&json!({ "code": -32603, "message": 42 }))),
+            None
+        );
+        // The bound: an oversize class token truncates inside the 120-byte
+        // wrapper cap.
+        let oversize = format!("{}Exception", "A".repeat(200));
+        let truncated = cause(&format!("Failed to send message: timed out ({oversize})")).unwrap();
+        assert_eq!(truncated.len(), 120);
+        assert!(truncated.starts_with("(AAAAAAAA"));
+        assert!(!truncated.contains("Exception"));
+    }
+
+    /// Contract 1.167 §4.165: the cause-bearing face — the upstream class
+    /// with an extracted literal logs `cause=` after `error_class`, and the
+    /// 120-byte bound rides whole at the emitter (the extraction enforces
+    /// the cap; the line carries whatever the classifier bounded).
+    #[test]
+    fn engine_call_failed_log_carries_the_upstream_cause() {
+        let output = captured_log(|| {
+            log_engine_call_failure(
+                "send",
+                "mutating",
+                2480,
+                &EngineError::Upstream {
+                    cause: Some("(UnregisteredUserException)".to_string()),
+                },
+            )
+        });
+        assert!(output.contains("engine call failed"));
+        assert!(output.contains("upstream_method=\"send\""));
+        assert!(output.contains("error_class=\"upstream\""));
+        assert!(output.contains("cause=\"(UnregisteredUserException)\""));
+
+        let bounded_cause = format!("({})", "A".repeat(118));
+        assert_eq!(bounded_cause.len(), 120);
+        let output = captured_log(|| {
+            log_engine_call_failure(
+                "send",
+                "mutating",
+                2480,
+                &EngineError::Upstream {
+                    cause: Some(bounded_cause.clone()),
+                },
+            )
+        });
+        assert!(output.contains(&format!("cause=\"{bounded_cause}\"")));
+    }
+
+    /// Contract 1.167 §4.165 regression pin: every other face keeps the
+    /// pre-1.167 line byte for byte — a non-upstream class and a causeless
+    /// upstream (a shape-hostile message) emit no `cause=` field at all.
+    #[test]
+    fn engine_call_failed_log_stays_byte_identical_outside_the_cause() {
+        for error in [
+            EngineError::Timeout,
+            EngineError::UnknownOutcome,
+            EngineError::Upstream { cause: None },
+        ] {
+            let output = captured_log(|| log_engine_call_failure("send", "mutating", 2500, &error));
+            assert!(output.contains("engine call failed"));
+            assert!(output.contains("error_class="));
+            assert!(!output.contains("cause="));
+        }
+    }
+
+    /// Contract 1.167 §4.165: the generic upstream arm carries the extracted
+    /// cause literal on the error (log-only); a shape-hostile message stays
+    /// causeless; neither emits an account event.
+    #[tokio::test]
+    async fn generic_upstream_error_carries_the_embedded_cause_literal() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-1".to_string(),
+            PendingRequest {
+                class: CallClass::Mutating,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-1",
+            "error": {
+                "code": -32603,
+                "message": "Failed to send message: Timed out waiting for a response (UnregisteredUserException)"
+            }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response_rx.await.unwrap(),
+            Err(EngineError::Upstream {
+                cause: Some("(UnregisteredUserException)".to_string())
+            })
+        );
+        assert!(event_rx.try_recv().is_err());
+
+        // A shape-hostile message stays causeless.
+        let (response_tx, response_rx) = oneshot::channel();
+        pending.insert(
+            "kt-2".to_string(),
+            PendingRequest {
+                class: CallClass::Mutating,
+                account: Some("+15555550100".to_string()),
+                response: response_tx,
+            },
+        );
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-2",
+            "error": { "code": -32603, "message": "fixture send failed" }
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response_rx.await.unwrap(),
+            Err(EngineError::Upstream { cause: None })
+        );
         assert!(event_rx.try_recv().is_err());
     }
 
@@ -7804,12 +8101,12 @@ mod tests {
                 "message": "SOME_FUTURE_ENGINE_CODE"
             }))
             .await,
-            Err(EngineError::Upstream)
+            Err(EngineError::Upstream { cause: None })
         );
         // Ordinary JSON-RPC error shape (unrelated message): plain Upstream.
         assert_eq!(
             classify(json!({ "code": -1, "message": "fixture malformed" })).await,
-            Err(EngineError::Upstream)
+            Err(EngineError::Upstream { cause: None })
         );
     }
 
