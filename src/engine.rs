@@ -1200,6 +1200,25 @@ pub enum ControlReceive {
         timestamp: u64,
         recipients: Vec<NormalizedStoryRecipient>,
     },
+    /// The engine's `syncMessage.sentMessage.storyMessage` projection
+    /// (contract 1.160, §4.158): the account's own story posted from another
+    /// linked device — the multi-device transcript the official
+    /// `#handleStoryMessage` sent face lands as own story rows
+    /// (MessageReceiver.preload.ts:3028-3036 → :2141; the group leg one
+    /// SentEvent at :2246-2260, the per-list fan-out at :2262-2340). The
+    /// bounded story face rides verbatim (the §4.67 3MiB bound — the
+    /// same face the envelope-level `story.received` forwards, media
+    /// locator full-face included); the service layer turns it into the
+    /// outgoing row shape the desktop's message-upserted story intercept
+    /// consumes and keeps no row. The engine's sync projection has already
+    /// split the official storyRecipientUpdate gate into its own
+    /// envelope-level key, so what reaches this variant is the plain story
+    /// body — the first-send transcript's `storyMessageRecipients` rich
+    /// material rides the sent object beside it and stays the recipient
+    /// update event's job (contract 1.154), never the row's.
+    SyncStoryMessage {
+        message: Value,
+    },
     /// The engine's `syncMessage.read[]` / `.viewed[]` projection (contract
     /// 1.100, §4.81): the account's own linked device marked upstream
     /// messages read (or viewed) — the official #handleRead/#handleViewed
@@ -1951,6 +1970,11 @@ impl NormalizedReceive {
                                         .sum::<usize>()
                             })
                             .sum::<usize>()
+                }
+                // The own-story transcript carries one bounded story face —
+                // the serialized length counts here (§4.13).
+                Some(ControlReceive::SyncStoryMessage { message }) => {
+                    serde_json::to_vec(message).map_or(0, |bytes| bytes.len())
                 }
                 _ => 0,
             }
@@ -5799,6 +5823,47 @@ fn normalize_receive_fields(params: &Value) -> Result<NormalizedReceive, EngineE
                 ));
             }
             let sent_ts = sent.get("timestamp").and_then(Value::as_u64).or(timestamp);
+            // The own-story multi-device transcript (contract 1.160, §4.158):
+            // the account posted a story from another linked device — the
+            // engine's `sentMessage.storyMessage` projection riding home.
+            // The official ladder sits the story face after the edit arm and
+            // the storyRecipientUpdate gate (which the engine's sync
+            // projection has already split into its own envelope-level key),
+            // before the ordinary sent-message material — the same order
+            // here, right after the control ladder. The bounded story face
+            // forwards verbatim (the §4.67 bound; an oversized or otherwise
+            // unusable face keeps the plain skip, 宁缺勿错), and a sync
+            // with no anchor timestamp has no story to date and keeps the
+            // skip too. The direction is the 自发同步 posture — the self
+            // send's own timestamp, never an unread.
+            if let Some(story) = sent.get("storyMessage").and_then(Value::as_object) {
+                return Ok(match sent_ts.zip(bounded_story_material(story)) {
+                    Some((story_ts, message)) => make(
+                        Some(story_ts),
+                        "storyMessage",
+                        "outgoing",
+                        destination,
+                        group_id,
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                        Some(ControlReceive::SyncStoryMessage { message }),
+                    ),
+                    None => make(
+                        sent_ts,
+                        "storyMessage",
+                        "skip",
+                        destination,
+                        group_id,
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
+                });
+            }
             // Our own device set the conversation's disappearing timer (the
             // phone-side toggle): the mirror is the same timer-notice system
             // row a peer's change lands as (§4.41), addressed by destination.
@@ -11158,6 +11223,168 @@ mod tests {
         }
         assert!(echo.rich.is_none(), "the card does not ride a control echo");
         assert!(echo.attachments.is_empty());
+    }
+
+    /// The own-story multi-device transcript (contract 1.160, §4.158): the
+    /// account's own story posted from another linked device rides the
+    /// `syncMessage.sentMessage.storyMessage` projection into the
+    /// `SyncStoryMessage` control face — the bounded face forwards
+    /// verbatim (the media locator's full face included), the first-send
+    /// `storyMessageRecipients` mirror beside it changes nothing (the
+    /// audience state is the `story.recipientUpdate` event's job, contract
+    /// 1.154), a group face keeps its group key on the normalized receive,
+    /// and an oversized face or a sync with no anchor timestamp keeps the
+    /// plain skip (宁缺勿错).
+    #[test]
+    fn sync_sent_story_routes_the_own_transcript_face() {
+        // The locator full-face forwards verbatim: the story face rides the
+        // control receive untouched, and the anchor timestamp is the self
+        // send's own ts, never the envelope's.
+        let normalized = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "storyMessage": {
+                            "text": "story body",
+                            "allowsReplies": true,
+                            "fileAttachment": {
+                                "id": "att-story-1",
+                                "contentType": "image/jpeg",
+                                "size": 12345,
+                                "key": "a2V5",
+                                "cdnKey": "Y2RuLWtleQ==",
+                                "cdnNumber": 3,
+                                "uploadTimestamp": 1726999996000u64,
+                                "digest": "ZGlnZXN0",
+                                "plaintextHash": "cGxhaW50ZXh0aGFzaA==",
+                            },
+                        },
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(normalized.content_kind, "storyMessage");
+        assert_eq!(normalized.direction, "outgoing");
+        assert_eq!(normalized.timestamp, Some(1726999997000));
+        let Some(ControlReceive::SyncStoryMessage { message }) = normalized.control else {
+            panic!("the own story transcript routes to the sync story face");
+        };
+        assert_eq!(
+            message,
+            json!({
+                "text": "story body",
+                "allowsReplies": true,
+                "fileAttachment": {
+                    "id": "att-story-1",
+                    "contentType": "image/jpeg",
+                    "size": 12345,
+                    "key": "a2V5",
+                    "cdnKey": "Y2RuLWtleQ==",
+                    "cdnNumber": 3,
+                    "uploadTimestamp": 1726999996000u64,
+                    "digest": "ZGlnZXN0",
+                    "plaintextHash": "cGxhaW50ZXh0aGFzaA==",
+                },
+            }),
+            "the bounded story face forwards verbatim"
+        );
+
+        // The first-send mirror: storyMessage + storyMessageRecipients ride
+        // the sent object side by side; the story arm takes the body and
+        // the audience state stays the recipient-update event's job — the
+        // face never carries it.
+        let first_send = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "storyMessage": { "text": "story body" },
+                        "storyMessageRecipients": [{
+                            "destinationUuid": "33333333-3333-3333-3333-333333333333",
+                            "distributionListIds": [
+                                "00000000-0000-0000-0000-000000000000"
+                            ],
+                            "allowReplies": true,
+                        }],
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(first_send.content_kind, "storyMessage");
+        assert_eq!(first_send.direction, "outgoing");
+        assert!(matches!(
+            first_send.control,
+            Some(ControlReceive::SyncStoryMessage { .. })
+        ));
+
+        // A group face keeps its group key on the normalized receive and
+        // routes the same story face (the group story rides the same
+        // transcript; the desktop's group-story boundary is its own shape
+        // gate's call).
+        let group_face = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "groupInfo": { "groupId": "ZmFrZS1ncm91cC0x" },
+                        "storyMessage": { "text": "group story" },
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(group_face.content_kind, "storyMessage");
+        assert_eq!(group_face.direction, "outgoing");
+        assert_eq!(group_face.group_id.as_deref(), Some("ZmFrZS1ncm91cC0x"));
+        assert!(matches!(
+            group_face.control,
+            Some(ControlReceive::SyncStoryMessage { .. })
+        ));
+
+        // Oversized material keeps the plain skip: no control, no face.
+        let oversized = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "timestamp": 1727000000000u64,
+                "syncMessage": {
+                    "sentMessage": {
+                        "timestamp": 1726999997000u64,
+                        "storyMessage": { "text": "x".repeat(3 * 1024 * 1024 + 1) },
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(oversized.content_kind, "storyMessage");
+        assert_eq!(oversized.direction, "skip");
+        assert!(oversized.control.is_none());
+
+        // No anchor timestamp anywhere (sent + envelope both absent): no
+        // story to date, the plain skip again.
+        let timeless = normalize_receive_fields(&json!({
+            "account": "+15555550100",
+            "envelope": {
+                "syncMessage": {
+                    "sentMessage": {
+                        "storyMessage": { "text": "story body" },
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(timeless.content_kind, "storyMessage");
+        assert_eq!(timeless.direction, "skip");
+        assert!(timeless.timestamp.is_none());
+        assert!(timeless.control.is_none());
     }
 
     /// The self-send transcript echoes (§4.118): the engine's own group

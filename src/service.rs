@@ -2973,6 +2973,8 @@ impl ConnectorService {
             expire_start_at: None,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         let inserted = self
             .store
@@ -3124,6 +3126,8 @@ impl ConnectorService {
             expire_start_at: None,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         // Preview mirrors the visible row: the caption when present, else the
         // attachment filename — never an empty string for an attachment send.
@@ -8545,6 +8549,8 @@ impl ConnectorService {
             // envelope's server-recorded receive time rides the row the same
             // honest verbatim way (the 48h edit-window judgment input).
             server_timestamp: receive.server_timestamp,
+            is_story: false,
+            story_message: None,
         };
         let preview = message
             .text
@@ -9069,6 +9075,75 @@ impl ConnectorService {
                 timestamp: receive.timestamp,
                 story: message.clone(),
             }]);
+        }
+        // Own-story multi-device transcript (contract 1.160, §4.158): the
+        // account posted a story from another linked device — the engine's
+        // `syncMessage.sentMessage.storyMessage` projection intercepted
+        // before the ladder like the story.received face (a story addresses
+        // no conversation). The official sent face lands own story rows
+        // (`#handleStoryMessage`, MessageReceiver.preload.ts:2141 — the
+        // group leg one SentEvent at :2246-2260, the per-list fan-out at
+        // :2262-2340), so the connector emits the outgoing row face the
+        // desktop's message-upserted story intercept consumes (isStory +
+        // storyMessage, direction outgoing — the self sender key;
+        // hostAdapter `message.upserted` passthrough carries both keys
+        // verbatim). The desktop owns the story timeline and its
+        // persistence, so the connector keeps no row and no store write
+        // (the §4.67 story posture) — the record below is event payload
+        // only, its conversation-less keys honest empties (the own story
+        // renders under the self sender key; the desktop's own-story title
+        // join reads the self key, never this id). The stories-disabled
+        // gate applies — the official `getStoriesBlocked` leg gates before
+        // the own/peer split (:2155-2161); the 1.154 recipientUpdate arm's
+        // no-gate reading stays that arm's own ruling, not this one's. The
+        // face forwards verbatim — no re-shape, no prune; a group face
+        // rides too and stays the desktop shape-gate's call (the v1
+        // group-story non-consumption is the desktop's recorded boundary).
+        // The transcript's `storyMessageRecipients` rich material (the
+        // first-send mirror may ride it beside the body) changes nothing:
+        // the audience state is the `story.recipientUpdate` event's job
+        // (contract 1.154), never the row's.
+        if let ControlReceive::SyncStoryMessage { message } = &control {
+            if self.store.stories_disabled(&account.id)? {
+                return Ok(Vec::new());
+            }
+            let sent_at = receive.timestamp.unwrap_or(0);
+            let record = MessageRecord {
+                id: stable_hash_id(&["signal-story-sync", &account.id, &sent_at.to_string()]),
+                account_id: account.id.clone(),
+                conversation_id: String::new(),
+                direction: "outgoing",
+                sender_id: account.id.clone(),
+                sender_name: None,
+                mentions_self: false,
+                sent_at,
+                received_at: Some(now_ms()),
+                text: None,
+                text_bytes: None,
+                text_truncated: false,
+                text_retrievable: false,
+                status: "sent",
+                client_request_id: None,
+                quote_message_id: None,
+                quote_snapshot: None,
+                attachments: Vec::new(),
+                rich: None,
+                edited_at: None,
+                reactions: Vec::new(),
+                edits: Vec::new(),
+                delivered_at: None,
+                read_at: None,
+                viewed_at: None,
+                admin_deleted: false,
+                sticker: None,
+                expire_seconds: None,
+                expire_start_at: None,
+                server_guid: receive.server_guid.clone(),
+                server_timestamp: receive.server_timestamp,
+                is_story: true,
+                story_message: Some(message.clone()),
+            };
+            return Ok(vec![HostSideEvent::MessageUpserted(record)]);
         }
         // Peer story reactions (contract 1.154 §4.153, group legs contract
         // 1.158, §4.156): the routing split the reaction face a story apart
@@ -9928,6 +10003,8 @@ impl ConnectorService {
                     expire_start_at: None,
                     server_guid: receive.server_guid,
                     server_timestamp: receive.server_timestamp,
+                    is_story: false,
+                    story_message: None,
                 };
                 let preview = message
                     .text
@@ -10004,6 +10081,10 @@ impl ConnectorService {
             // as well (a story addresses no conversation), so this arm is
             // the unreachable fall-through too.
             ControlReceive::Story { .. } => Ok(Vec::new()),
+            // The own-story transcript is intercepted the same way (the
+            // outgoing row face is emitted upstream of the ladder), so this
+            // arm is the same unreachable fall-through.
+            ControlReceive::SyncStoryMessage { .. } => Ok(Vec::new()),
             // The three 1.154 story faces are intercepted the same way (a
             // story reaction and the recipient sync address no conversation,
             // and the story remote-delete short-circuits on the
@@ -16007,6 +16088,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         }
     }
 
@@ -22290,6 +22373,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         for record in [
             base("m-view-in", &conversation.id, "incoming"),
@@ -27325,6 +27410,132 @@ mod tests {
         assert_eq!(events.len(), 1, "the own-distribution sync rides the gate");
     }
 
+    /// The own-story multi-device transcript (contract 1.160, §4.158): the
+    /// engine's `SyncStoryMessage` projection becomes the outgoing
+    /// `MessageUpserted` row face the desktop's story intercept consumes —
+    /// the two story keys ride the record additively (`is_story` +
+    /// `story_message`, the face verbatim), the record is event payload
+    /// only (no store row, no conversation — the §4.67 story posture), the
+    /// id is stable across replays, and the stories-disabled gate drops
+    /// the whole transcript (the official gate sits before the own/peer
+    /// split, #handleStoryMessage:2155-2161).
+    #[test]
+    fn own_story_sync_lands_the_outgoing_row_face_without_a_row() {
+        let (_temp, mut service) = service();
+        let (account, conversation) = linked_account_and_conversation(&mut service);
+
+        let face = json!({
+            "text": "story body",
+            "allowsReplies": true,
+            "fileAttachment": {
+                "id": "att-story-1",
+                "contentType": "image/jpeg",
+                "size": 12345,
+                "key": "a2V5",
+                "cdnKey": "Y2RuLWtleQ==",
+                "cdnNumber": 3,
+                "uploadTimestamp": 1726999996000u64,
+                "digest": "ZGlnZXN0",
+                "plaintextHash": "cGxhaW50ZXh0aGFzaA==",
+            },
+        });
+        let mut receive = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::SyncStoryMessage {
+                message: face.clone(),
+            },
+        );
+        // The engine's projection face: the 自发同步 posture — the self
+        // send's own transcript, never an unread.
+        receive.content_kind = "storyMessage";
+        receive.direction = "outgoing";
+
+        let events = service
+            .ingest_receive(receive.clone(), crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::MessageUpserted(record) = &events[0] else {
+            panic!("expected a MessageUpserted row face: {events:?}");
+        };
+        assert_eq!(
+            record.id,
+            stable_hash_id(&["signal-story-sync", &account.id, "500"])
+        );
+        assert_eq!(record.account_id, account.id);
+        assert_eq!(
+            record.conversation_id, "",
+            "a story addresses no conversation"
+        );
+        assert_eq!(record.direction, "outgoing");
+        assert_eq!(record.sender_id, account.id, "the self sender key");
+        assert_eq!(record.status, "sent");
+        assert_eq!(record.sent_at, 500);
+        assert!(record.is_story);
+        assert_eq!(
+            record.story_message.as_ref(),
+            Some(&face),
+            "the bounded story face forwards verbatim"
+        );
+        assert!(record.text.is_none());
+
+        // The wire face carries both additive keys (camelCase): this is
+        // the shape the desktop's story intercept reads.
+        let wire = serde_json::to_value(record).unwrap();
+        assert_eq!(wire["isStory"], serde_json::Value::Bool(true));
+        assert_eq!(wire["storyMessage"], face);
+
+        // The id is stable: a replayed transcript converges on the same
+        // row face, not a fresh identity.
+        let events = service
+            .ingest_receive(receive, crate::DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let HostSideEvent::MessageUpserted(replay) = &events[0] else {
+            panic!("expected the replay's row face: {events:?}");
+        };
+        assert_eq!(replay.id, record.id);
+
+        // Nothing persisted: no row anywhere, the story creates no
+        // conversation of its own.
+        let listed = service
+            .store_ref()
+            .list_messages(&account.id, &conversation.id, 50, None)
+            .unwrap();
+        assert!(
+            listed.items.is_empty(),
+            "the row face is event payload only"
+        );
+        let conversations = service
+            .store_ref()
+            .list_conversations(&account.id, 50, None)
+            .unwrap();
+        assert_eq!(
+            conversations.items.len(),
+            1,
+            "the story creates no conversation"
+        );
+
+        // Disabled (the official getStoriesBlocked leg): the whole
+        // transcript drops before any event.
+        service
+            .store_ref()
+            .set_stories_disabled(&account.id, true)
+            .unwrap();
+        let disabled = control_receive(
+            "+15555550100",
+            "+15555550100",
+            ControlReceive::SyncStoryMessage { message: face },
+        );
+        assert!(
+            service
+                .ingest_receive(disabled, crate::DEFAULT_PROXY_GROUP_ID)
+                .unwrap()
+                .is_empty(),
+            "a disabled own-story transcript drops"
+        );
+    }
+
     /// The §4.156 group legs carry their group key (contract 1.158): the
     /// group story reaction forwards as `story.reaction` with the group's
     /// master key on the event, and the conservative leg — a group
@@ -28577,6 +28788,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 service
@@ -28739,6 +28952,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 service
@@ -29482,6 +29697,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 service
@@ -29595,6 +29812,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 service
@@ -29706,6 +29925,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 service
@@ -29806,6 +30027,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         assert!(
             service
@@ -29872,6 +30095,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 service
@@ -29971,6 +30196,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         assert!(
             service

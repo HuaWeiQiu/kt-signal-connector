@@ -1255,6 +1255,23 @@ pub struct MessageRecord {
     /// folded the proto-absent 0 to unknown (never backfilled).
     #[serde(skip)]
     pub server_timestamp: Option<u64>,
+    /// The own-story sync transcript bit (contract 1.160, §4.158): true only
+    /// on the event-only row face the multi-device
+    /// `syncMessage.sentMessage.storyMessage` mirror lands — the outgoing
+    /// shape the desktop's message-upserted story intercept consumes (the
+    /// self sender key). Stories stay rowless in the store (the §4.67
+    /// posture): the bit rides the wire event only and is false — key
+    /// absent — on every stored row.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_story: bool,
+    /// The bounded story face the own-story sync transcript carries
+    /// (contract 1.160, §4.158): the engine's `sentMessage.storyMessage`
+    /// projection verbatim, the same face the `story.received` event
+    /// forwards (media locator full-face included). Event-payload-only —
+    /// never persisted, key absent on every stored row and on every row
+    /// this connector emitted before 1.160.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub story_message: Option<serde_json::Value>,
 }
 
 /// One claimed §4.123 retry: everything the drain pass needs to rebuild
@@ -5420,6 +5437,8 @@ impl Store {
                                 viewed_at: Some(when),
                                 server_guid: None,
                                 server_timestamp: None,
+                                is_story: false,
+                                story_message: None,
                                 ..record
                             });
                         }
@@ -5467,6 +5486,8 @@ impl Store {
                         viewed_at,
                         server_guid: None,
                         server_timestamp: None,
+                        is_story: false,
+                        story_message: None,
                         ..record
                     });
                 }
@@ -8453,6 +8474,8 @@ fn message_record_from_row(row: &Row<'_>) -> rusqlite::Result<MessageRecord> {
         server_timestamp: row
             .get::<_, Option<i64>>(27)?
             .map(|value| value.max(0) as u64),
+        is_story: false,
+        story_message: None,
     })
 }
 
@@ -8519,6 +8542,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         assert!(
             store
@@ -9981,6 +10006,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         assert!(
             store
@@ -10050,6 +10077,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
 
         let mut rich = base("rich-1");
@@ -10229,6 +10258,8 @@ mod tests {
                 expire_start_at: None,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             }
         };
         let insert = |message: &MessageRecord| {
@@ -10439,6 +10470,8 @@ mod tests {
             expire_start_at: None,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         // Same sent_at as the anchor: id below the anchor is older, id above
         // is newer — the tiebreak matches list_messages' keyset order.
@@ -10559,6 +10592,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         let now = now_ms();
         for (id, sent_at, direction) in [
@@ -10680,6 +10715,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 store
@@ -11124,6 +11161,8 @@ mod tests {
             expire_start_at: None,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
 
         let mut sticker_row = base("sticker-row", 60);
@@ -11240,6 +11279,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         assert!(
             store
@@ -11404,6 +11445,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         assert!(
             store
@@ -11506,6 +11549,8 @@ mod tests {
                     admin_deleted: false,
                     server_guid: None,
                     server_timestamp: None,
+                    is_story: false,
+                    story_message: None,
                 };
                 store.insert_message(&message, None, text, false).unwrap();
             };
@@ -11648,6 +11693,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store.insert_message(&message, None, text, false).unwrap();
         };
@@ -11835,6 +11882,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -11950,6 +11999,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store
                 .insert_message(&message, None, None, increment_unread)
@@ -12062,6 +12113,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store.insert_message(&plain, None, None, true).unwrap();
 
@@ -12098,6 +12151,8 @@ mod tests {
             }),
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
             ..plain.clone()
         };
         store.insert_message(&mentioned, None, None, true).unwrap();
@@ -12162,6 +12217,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(
@@ -12267,6 +12324,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
 
         assert!(matches!(
@@ -12340,6 +12399,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("hello"), true)
@@ -12418,6 +12479,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("control notice"), false)
@@ -12480,6 +12543,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("body"), false)
@@ -12558,6 +12623,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -12653,6 +12720,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -12754,6 +12823,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             let increment_unread = direction == "incoming";
             store
@@ -12861,6 +12932,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store
                 .insert_message(&message, None, Some(id), false)
@@ -12943,6 +13016,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&changed, None, Some("newer-message-2"), false)
@@ -12999,6 +13074,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&other_message, None, Some("other-message"), false)
@@ -13096,6 +13173,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             if id == "attachment-only" {
                 message.text = None;
@@ -13196,6 +13275,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         }
@@ -13298,6 +13379,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
 
@@ -14058,6 +14141,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -14135,6 +14220,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -14232,6 +14319,8 @@ mod tests {
                     admin_deleted: false,
                     server_guid: None,
                     server_timestamp: None,
+                    is_story: false,
+                    story_message: None,
                 };
                 store
                     .insert_message(&message, None, Some("body"), true)
@@ -14386,6 +14475,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, Some("request-pending"), Some("body"), false)
@@ -14464,6 +14555,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&recent, None, Some("body"), true)
@@ -14537,6 +14630,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("kept body"), true)
@@ -14613,6 +14708,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("body"), true)
@@ -15041,6 +15138,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("hello"), false)
@@ -15092,6 +15191,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&message, None, Some("v0"), true)
@@ -15348,6 +15449,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
         // FK 合法的幽灵行：账户存在、会话存在，但 account 归属另一账户。
@@ -15492,6 +15595,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
         for record in [
             base("m-incoming", &peer.id, "incoming", true),
@@ -15615,6 +15720,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&record, None, Some("self-destructing"), true)
@@ -15686,6 +15793,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         }
     }
 
@@ -16411,6 +16520,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         }
     }
 
@@ -16656,6 +16767,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         for (id, sent_at, status) in [
             ("m-400", 400, "sent"),
@@ -16792,6 +16905,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         for (id, sent_at, direction) in [
             ("m-in-1", 500, "incoming"),
@@ -16896,6 +17011,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         for (id, sent_at, direction) in [
             ("m-in-1", 500, "incoming"),
@@ -17005,6 +17122,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         for (id, sent_at, direction) in [
             ("m-in-old", 500, "incoming"),
@@ -17767,6 +17886,8 @@ mod tests {
                     admin_deleted: false,
                     server_guid: None,
                     server_timestamp: None,
+                    is_story: false,
+                    story_message: None,
                 };
                 store.insert_message(&message, None, None, false).unwrap();
             };
@@ -17955,6 +18076,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             store.insert_message(&message, None, None, false).unwrap();
         };
@@ -18151,6 +18274,8 @@ mod tests {
             admin_deleted: false,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store.insert_message(&message, None, None, false).unwrap();
 

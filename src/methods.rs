@@ -813,7 +813,14 @@ pub const ATTACHMENT_DOWNLOAD_CAPABILITY: &str = "attachment-download";
 /// `story.deleteCandidate` candidacy event over the group-DOE true buffer
 /// miss, and the stories-disabled gate realigned onto the reaction (the
 /// official stories-blocked whole-envelope drop); the same no-new-bit
-/// discipline) and by revision 1.159 (the §4.157 group leg on the
+/// discipline) and by revision 1.160 (the §4.158 own-story sync
+/// transcript — the engine's `syncMessage.sentMessage.storyMessage`
+/// projection riding home as the outgoing row face the desktop's
+/// message-upserted story intercept consumes (isStory + storyMessage,
+/// direction outgoing), zero rows and zero store writes (the §4.67 story
+/// posture), the stories-disabled gate on the official pre-split
+/// `getStoriesBlocked` leg, and the bounded story face forwarding
+/// verbatim; the same no-new-bit discipline) and by revision 1.159 (the §4.157 group leg on the
 /// `stories.sendReaction` face — the engine's group story-reaction batch
 /// (engine `a6c0520`), the official ordinary-group-channel alignment: the
 /// optional host `group` key riding onto the engine frame's `groupId` key

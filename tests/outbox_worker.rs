@@ -89,6 +89,8 @@ fn seed_queued_row(store: &Store, account_id: &str, conversation_id: &str, reque
         admin_deleted: false,
         server_guid: None,
         server_timestamp: None,
+        is_story: false,
+        story_message: None,
     };
     store
         .insert_message(&record, Some(request), None, false)

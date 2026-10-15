@@ -9330,6 +9330,8 @@ mod tests {
             expire_start_at: None,
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         };
         store
             .insert_message(&expired, None, Some("body"), true)
@@ -10624,6 +10626,8 @@ mod tests {
             expire_start_at: Some(deadline_ms.saturating_sub(60_000)),
             server_guid: None,
             server_timestamp: None,
+            is_story: false,
+            story_message: None,
         }
     }
 
@@ -11905,6 +11909,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 store
@@ -12051,6 +12057,8 @@ mod tests {
                 admin_deleted: false,
                 server_guid: None,
                 server_timestamp: None,
+                is_story: false,
+                story_message: None,
             };
             assert!(
                 store

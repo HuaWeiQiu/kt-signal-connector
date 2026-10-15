@@ -42,7 +42,51 @@
   (seven-day recency window + viewed-face selection filter + supervisor failure debounce)
   lands as connector-internal behavior only — zero wire change, the contract revision stayed
   1.135 at that batch (since superseded by the 1.136 entry below)
-- Contract revision: 1.159 (2026-10-15; the group leg on the
+- Contract revision: 1.160 (2026-10-15; the own-story sync transcript
+  (§4.158): the connector half of the multi-device own-story mirror —
+  the engine's `syncMessage.sentMessage.storyMessage` projection (the
+  engine HEAD `48e69a2` projection chain, the same
+  `project_story_message` face the receive side forwards; the
+  connector's sync `sentMessage` routing ladder had no storyMessage arm
+  and the envelope fell into the plain "sent without body — skip"
+  drop, so this desktop never saw a story its own account posted
+  elsewhere): the bounded story face rides the sync ladder verbatim as
+  the outgoing row face (`isStory` + `storyMessage`, direction
+  outgoing) the desktop's message-upserted story intercept consumes —
+  the desktop zero-change ruling: the row-shaped carrier is the
+  desktop's own first-party expectation (`shared/signalWire.ts` §5
+  header note "connector C1 batch forwards the engine projection onto
+  the `message.upserted` event row", the `SignalMessage.isStory` /
+  `storyMessage` keys the 2026-10-08 Stories batch typed there, the
+  `isSignalStoryMessage` intercept in front of the message-upserted
+  dispatch, and `signalStoryFromMessage`'s outgoing arm already
+  landing the row under the self sender key with the locator full-face
+  media extraction); the new-transient-event route stays rejected (the
+  `story.received` event arm is hardwired direction incoming / isOwn
+  false, and a fresh event would re-type the same story face the
+  desktop already consumes, buying nothing but a desktop follow-up).
+  Zero store: the record is event payload only — stories stay rowless
+  in the store (the §4.67 posture), no store move, no read-lane row
+  ever carries the keys; the conversation-less keys are honest
+  empties. The stories-disabled gate applies — the official
+  `getStoriesBlocked` leg gates `#handleStoryMessage` before the
+  own/peer split (MessageReceiver.preload.ts:2155-2161); the 1.154
+  recipientUpdate arm's no-gate reading stays that arm's own recorded
+  ruling, honestly noted as a divergence, not overturned here. The
+  bounded face forwards verbatim — no re-shape, no prune; a group face
+  rides verbatim and stays the desktop shape-gate's call (the v1
+  group-story non-consumption is the desktop's recorded boundary), the
+  official group-leg/per-list SentEvent fan-out converging to the one
+  row face (the audience state is the story.recipientUpdate event's
+  job, contract 1.154). No-null: absent and explicit-null fold to the
+  same no-key state; every pre-1.160 frame, row, and read shape reads
+  byte-identically. Wire additive: two optional keys on one existing
+  event payload, zero new methods/error codes/store moves/capability
+  bits (the `stories` tag widened in place, the 1.82 precedent chain,
+  now reading 1.160 → 1.159 → 1.158 → 1.157 → 1.156 → 1.154 →
+  1.130). Tests 842 → 846 (integration +2, lib +2), all green — fmt,
+  check, clippy, full cargo test, release build, schema parse) —
+  previously 1.159 (2026-10-15; the group leg on the
   `stories.sendReaction` face (§4.157): the connector half of the
   engine's group story-reaction batch (engine `a6c0520`, the official
   ordinary-group-channel alignment — the group story reaction rides the
@@ -12963,6 +13007,133 @@ gate_order` — the serde null fold with the pre-1.159 frame
 byte-identical, the remove-plus-group refusal ahead of the account
 ladder, the envelope ladder running on the group path). Tests 838 →
 842, all green.
+
+### 4.158 The own story rides home as the outgoing row face: `syncMessage.sentMessage.storyMessage`, the sync ladder's story arm (contract revision 1.160, 2026-10-15)
+
+The gap this batch closes: the account posts a story from another
+linked device (the phone), the engine's sync projection carries it
+(`syncMessage.sentMessage.storyMessage`, the same
+`project_story_message` single point the receive side forwards —
+engine mod.rs Sent.storyMessage=8 projection, the 48e69a2 chain), but
+the connector's sync `sentMessage` routing ladder had no storyMessage
+arm, so the envelope fell into the terminal "sent without body (other
+control sync) — skip" and this desktop never saw its own story. The
+audience sibling (`storyMessageRecipients` → `story.recipientUpdate`,
+contract 1.154) already had its arm; the body itself was the hole.
+
+Official anchors (upstream `abe80d3`, first-hand):
+`handleSyncMessage` gates `sentMessage.storyMessageRecipients.length
+&& sentMessage.isRecipientUpdate` → StoryRecipientUpdateEvent first
+(:3004-3016) and `sentMessage.storyMessage` → `#handleStoryMessage`
+second (:3028-3036); `#handleStoryMessage` (:2141) opens with the
+`getStoriesBlocked()` drop (:2155-2161) **before** the own/peer
+split, builds the bounded attachment/preview material from the CDN
+pointers, and lands the sent faces as own rows — the group leg one
+SentEvent (:2246-2260), the distribution-list fan-out one SentEvent
+per listId (:2262-2340).
+
+Ruling — the existing outgoing row face, the desktop zero-change
+route. The row-shaped carrier is the desktop's own first-party
+expectation, not a connector invention: `shared/signalWire.ts`'s §5
+Stories header note says "connector C1 batch forwards the engine
+projection onto the `message.upserted` event row, the desktop consumes
+by this face" (typed `SignalMessage.isStory` / `storyMessage` keys,
+2026-10-08), `SignalWorkspace.vue`'s message-upserted dispatch runs
+the `isSignalStoryMessage` intercept in front of everything (story
+rows never enter the message window, the unread badge, or
+notifications), and `signalStoryFromMessage`'s outgoing arm already
+lands the row under the self sender key with the locator full-face
+media extraction (`signalStoryMediaOf`). Feeding that intercept costs
+two optional keys on one event payload; nothing desktop-side moves.
+
+The rejected route, with the code evidence: a fresh transient event
+(e.g. `story.ownSync`) would re-type the same story face the desktop
+already consumes — and the one transient arm that exists cannot carry
+own semantics at all: `signalStoryFromReceivedEvent` (the
+`story.received` consumer) hardwires `direction: 'incoming'` /
+`isOwn: false` (signalStories.ts:595-596), so routing the own
+transcript through it would display the account's own story as
+someone else's. A new event would need a desktop consumer batch
+(typed event + pump arm + intercept), contradicting the zero-change
+ruling for zero information gain.
+
+Posture:
+
+- **Zero store.** The row face is event payload only — stories stay
+  rowless in the store (the §4.67 posture; the desktop's own story
+  persistence is the desktop's own timeline layer), so no store move,
+  no schema column, and no read-lane row ever carries the keys. The
+  conversation-less keys are honest empties (the own story renders
+  under the self sender key; the desktop's own-story title join reads
+  the self key, never the row's id), and the Main-side reaction
+  notification arm short-circuits on the empty conversation id.
+- **The gate follows the official split point.** The official
+  `getStoriesBlocked()` drop sits before the own/peer split
+  (:2155-2161), so the connector's stories-disabled gate applies to
+  this arm exactly like the `story.received` arm. The 1.154
+  recipientUpdate arm's no-gate reading ("own-story sync, not incoming
+  story material") stays that arm's own recorded ruling — the official
+  recipients gate (:3006-3013) actually gates, and this batch records
+  the divergence honestly rather than overturning it in the dark; the
+  realignment, if any, is its own future batch.
+- **Verbatim face, the §4.67 bound.** The bounded story face forwards
+  through the same `bounded_story_material` single point the receive
+  arm uses (3MiB, clone-not-reshape); an oversized or otherwise
+  unusable face keeps the plain skip (宁缺勿错), and a sync with no
+  anchor timestamp has no story to date and keeps the skip too. The
+  arm sits right after the control ladder (the official order: the
+  edit arm, then the recipients gate — already split into the
+  envelope-level key by the engine's sync projection — then the story
+  face, then the ordinary sent material), so a story plus a control
+  echo keeps its control routing. The transcript's
+  `storyMessageRecipients` rich material rides the sent object beside
+  the body on the first-send mirror and changes nothing here: the
+  audience state is the `story.recipientUpdate` event's job (contract
+  1.154), never the row's.
+- **The group face rides verbatim.** The official group leg lands one
+  own SentEvent; the KT face carries the `group` key verbatim and the
+  desktop's shape gate refuses it (the v1 group-story
+  non-consumption is the desktop's recorded boundary) — the connector
+  never parses the story body and stays the conduit (the §4.150/§4.151
+  posture). The per-list SentEvent fan-out converges to the one row
+  face the same way: the desktop's story timeline has no per-list
+  rows, and the distribution state lives in the recipientUpdate event.
+- **No-null, byte-identical predecessors.** The keys serialize only
+  when the transcript lands; absent and explicit-null fold to the same
+  no-key state. Every pre-1.160 frame, stored row, and read shape
+  reads byte-identically (the two keys are event-payload-only).
+
+Boundary: the connector does zero story-body parsing — the face is
+opaque transit from the engine's projection to the desktop's
+`signalStoryMediaOf` extraction (the locator full-face: key/cdnKey/
+cdnNumber/uploadTimestamp/digest, the §4.54 reciprocal face). The
+desktop consumes with zero changes (the intercept, the outgoing arm,
+the media arm, and the Main passthrough `data as SignalMessage` all
+predate this batch); no desktop follow-up opens here. The engine side
+is zero-change for this batch (the sync projection predates it — the
+caption key landed with 48e69a2, usable transit from day one). Wire
+additive: two optional keys on one existing event payload, zero new
+methods/error codes/store moves/capability bits — the `stories` tag
+widened in place (the 1.82 precedent chain, now reading 1.160 → 1.159
+→ 1.158 → 1.157 → 1.156 → 1.154 → 1.130). Schema: the
+`messagesListParams` row-face description chain gains the 1.160
+sentence (zero new defs, zero new allOf branches — the schema
+consistency pointers stay put).
+
+Tests: integration +2 (`tests/story_own_sync.rs`) — the passthrough
+arm (the file-attachment transcript landing the outgoing row face
+byte-for-byte: isStory true, the storyMessage locator full-face
+verbatim, the sentAt anchoring, zero store rows behind it, the group
+face riding verbatim) and the pre-1.160 arm (the ordinary sync text
+transcript landing the unchanged plain row without either key, the
+oversized face and the anchorless face keeping the silent skip); lib
++2 — the engine arm (the sync storyMessage face routing the
+SyncStoryMessage control with the bounded body verbatim, the
+recipients-rich first-send mirror riding the same arm, the oversized
+and anchorless faces skipping) and the service arm (the outgoing row
+face emission with zero store writes, the stories-disabled gate
+dropping before anything downstream, the id stability, the
+conversation-less keys honest).
 
 ## 5. signal-cli Boundary
 
