@@ -5,6 +5,14 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- No-revision record: 2026-10-16; the boot-window send-integrity batch
+  (§4.166) lands as one log-only stalled-dispatch line plus the audit's
+  pinned tests — the three forensic questions close with every audited
+  face already honest (strict per-request engine resolution, the
+  engine-free send faces bounded on paper, the Unbound-window failure
+  settlement armed with the retryable schedule), so the only repair is
+  the forensics line itself — zero wire change, the contract revision
+  stays 1.167 (the §4.166 entry below)
 - No-revision record: 2026-10-14; the engine-wording residue batch (§4.148)
   lands as connector-internal naming and copy only — the argv engine flag
   becomes `--engine-bin` with `--signal-cli` kept as a hidden compatibility
@@ -13976,6 +13984,92 @@ response handler attaches the extracted literal, a shape-hostile message
 stays causeless, neither emits an account event). The existing
 generic-upstream fixtures update to the carried literal
 (`(UserErrorException)`) and to the causeless shape.
+
+### 4.166 The boot-window send-integrity audit: the three send questions closed honest, the stalled-dispatch log line (no-revision record, 2026-10-16)
+
+The wound (2026-10-16, the intermittent-send window): during one boot
+window the desktop sidebar showed send checkmarks the connector had no
+row for, three host requests stayed pending forever, and a text the
+user typed never surfaced in the connector at all. The audit asked three
+questions before touching anything: which code paths can answer a send
+ok with no engine round trip; how an Unbound-window text failure
+settles; and whether the engine's request/response matching could let a
+typing ok complete a text's row.
+
+All three close honest — nothing in the audited behavior is wrong.
+
+**(a) The engine-free send faces are bounded and none flips state.** Four
+families answer a send-shaped request without an engine round trip: the
+receipt funnel's empty-group short-circuit (`Ok("sent")` when no group
+needs a receipt) and its failure-debounce answer (`Ok("unknown")` inside
+the cooldown); the pure-local send-lane writes (draft save/clear, the
+local contact alias — the engine stays out of the path by design); and
+the clientRequestId idempotent answer, which returns the already-stored
+row unchanged. None of these invents a delivery: the receipt faces move
+no message row, the local writes touch no message row, and the
+idempotent answer is the honest projection of a row that already exists
+— the desktop reconnect-resend contract face, deliberately left
+untouched. The sidebar's checkmarks in this window were never connector
+attestation: that text has no row, no engine dispatch trace, and no
+host completion on the connector side.
+
+**(b) The Unbound-window failure settlement is armed, and this window's
+text never entered the funnel.** A send inserts its pending row under
+the deterministic (account, conversation, clientRequestId) identity
+before the engine call; an upstream-family engine error settles the row
+failed and arms the automatic Backoff schedule atomically, and the host
+answer carries `UPSTREAM_ERROR` with `retryable=true`; an unknown face
+retires the row as unknown and nothing retries it. That machinery was
+simply not reached: this window's text left no row, no engine dispatch
+trace, and no host completion (the send metrics closed as ok+rejected
+only, with the unknown face at zero and the pending requests never
+answered). The desktop's "send outcome pending" fold came from the
+desktop side — its own request timeout and mutating-call
+disconnect-folding answer `unknown_outcome` locally when the connector
+stops answering within the desktop's own budget; the connector's
+unknown-face completion path requires an engine answer, and the engine
+never saw the send. The scattered `engine call failed` lines in the
+same window were the outbox retrying old failed rows on the capped
+backoff rhythm, not this text.
+
+**(c) Cross-request resolution is impossible.** Engine request ids are
+monotonic per connection; a response resolves strictly by removing its
+own id from the pending map, and an id with no waiting request is a
+protocol warning and nothing else — it cannot complete any call. A
+oneshot resolves only the request it was paired with. Typing has no
+pending row to settle by construction, and a send's row settlement is
+bound to the engine call inside the same dispatch arm, with the row
+matched on the full (message id, account, conversation) key. A typing
+ok therefore cannot complete a text's pending row, and in this window
+the text's row did not exist anywhere in the connector to complete.
+
+**The audit's real finding is the blind spot, and the repair is one
+log line.** An admitted-but-never-completed host dispatch — exactly the
+three forever-pending requests and the swallowed send above — currently
+ends with no trace once the process restarts. A dispatch still in
+flight after every bounded budget has run out (engine calls are
+timeout-capped at seconds, media downloads at two minutes) now warns
+once per request, carrying the method name, its class, the account, the
+request byte size, and the stall threshold; `link.*` waits are exempt
+because their approval window is legitimately long. The line answers
+nothing on the wire, changes no state, adds no method, event, error
+code, capability, store face, or metric — it exists so the next
+intermittent-send window names its stalled requests instead of
+replaying this audit.
+
+Tests (lib +1, integration +3): the strict-resolution pin
+(`response_for_another_request_cannot_resolve_the_waiting_call` — a
+response for one pending request resolves only that request, a second
+request stays waiting, and an unknown id warns and resolves nothing),
+and the three integration pins against the fake engine — the generic
+upstream failure settles the row failed, arms the Backoff schedule,
+answers `UPSTREAM_ERROR` retryable, and the automatic retry then settles
+it sent with exactly two upstream calls
+(`generic_upstream_failure_settles_failed_arms_the_schedule_and_answers_retryable`);
+a duplicate clientRequestId re-answers the stored row with no second
+engine call (`duplicate_send_text_answers_the_persisted_row_without_engine_traffic`);
+and a typing success writes no row and touches no send face beyond its
+own upstream call (`typing_success_writes_no_row_and_touches_no_send_face`).
 
 ## 5. signal-cli Boundary
 

@@ -7573,6 +7573,83 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// §4.166 regression pin: resolution is strictly per request id — a
+    /// response completes only its own waiting call, the other pending call
+    /// stays waiting, and an id with no waiting request warns and completes
+    /// nothing (the id-map remove is the only resolution path).
+    #[tokio::test]
+    async fn response_for_another_request_cannot_resolve_the_waiting_call() {
+        let (events, mut event_rx) = event_channel();
+        let (ingress, _receiver) = receive_channel();
+        let mut pending = HashMap::new();
+        let mut degraded = false;
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        for (id, response) in [("kt-1", first_tx), ("kt-2", second_tx)] {
+            pending.insert(
+                id.to_string(),
+                PendingRequest {
+                    class: CallClass::Mutating,
+                    account: Some("+15555550100".to_string()),
+                    response,
+                },
+            );
+        }
+
+        // kt-2's success resolves kt-2 and nothing else.
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-2",
+            "result": {}
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+        assert!(second_rx.await.unwrap().is_ok());
+        assert!(
+            pending.contains_key("kt-1"),
+            "kt-1 must still be waiting: another id's answer resolves nothing"
+        );
+
+        // An id with no waiting request is a protocol warning; no pending
+        // call moves.
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-9",
+            "result": {}
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+        assert!(pending.contains_key("kt-1"));
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            EngineEvent::ProtocolWarning {
+                kind: "unknownOrDuplicateResponseId"
+            }
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "the warning is the only trace"
+        );
+
+        // kt-1's own answer still resolves kt-1 afterwards.
+        let line = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": "kt-1",
+            "result": {}
+        }))
+        .unwrap();
+        handle_upstream_line(&line, &mut pending, &events, &ingress, &mut degraded)
+            .await
+            .unwrap();
+        assert!(first_rx.await.unwrap().is_ok());
+        assert!(pending.is_empty());
+        assert!(event_rx.try_recv().is_err());
+    }
+
     /// Contract 1.113 §4.94: the engine's unbound stop-ring notification
     /// replays onto the attributed AccountUnauthorized lane the unlink
     /// watcher already consumes — exactly one event, no warning.

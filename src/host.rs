@@ -95,6 +95,13 @@ const CONTROL_CONCURRENCY: usize = 1;
 const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
+/// Forensic floor for a stalled host dispatch (§4.166): every bounded
+/// dispatch budget has run out long before this — engine calls are
+/// timeout-capped at seconds, media downloads at two minutes — so a request
+/// still in flight here has already escaped every face that owns a budget.
+/// One warn per request, log-only; `link.*` waits are exempt (their approval
+/// window is legitimately long).
+const HOST_DISPATCH_STALL_WARN_AFTER: Duration = Duration::from_secs(300);
 
 type HostWriter<S> = Arc<Mutex<SplitSink<Framed<S, LinesCodec>, String>>>;
 type DispatchFuture = BoxFuture<'static, DispatchCompletion>;
@@ -655,7 +662,34 @@ where
                     }
                     .await;
                     let response = match acquired {
-                        Ok(_permit) => dispatch(request, &task_runtime).await,
+                        Ok(_permit) => {
+                            // §4.166 stall watchdog: a dispatch still in
+                            // flight after every bounded budget has run out
+                            // is exactly the forensic blind spot the
+                            // intermittent-send audit hit. Warn once, answer
+                            // nothing, change no state; the permit keeps
+                            // bounding the dispatch exactly as before.
+                            let stall_exempt = method.starts_with("link.");
+                            let mut stall_warned = false;
+                            let dispatching = dispatch(request, &task_runtime);
+                            tokio::pin!(dispatching);
+                            loop {
+                                tokio::select! {
+                                    response = &mut dispatching => break response,
+                                    _ = tokio::time::sleep(HOST_DISPATCH_STALL_WARN_AFTER), if !stall_warned && !stall_exempt => {
+                                        stall_warned = true;
+                                        tracing::warn!(
+                                            method = %method,
+                                            method_class = metrics::method_class(&method),
+                                            account_id = task_account.as_deref().unwrap_or("-"),
+                                            request_bytes,
+                                            stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
+                                            "host request still pending; every bounded face budget is exhausted"
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         Err(error) => HostResponse::failure(request.request_id, error),
                     };
                     let elapsed = started.elapsed();
