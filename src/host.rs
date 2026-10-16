@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
@@ -95,12 +96,15 @@ const CONTROL_CONCURRENCY: usize = 1;
 const LINK_WAIT_CONCURRENCY: usize = 1;
 const READ_CONCURRENCY: usize = 4;
 const SEND_CONCURRENCY: usize = 2;
-/// Forensic floor for a stalled host dispatch (§4.166): every bounded
-/// dispatch budget has run out long before this — engine calls are
-/// timeout-capped at seconds, media downloads at two minutes — so a request
-/// still in flight here has already escaped every face that owns a budget.
-/// One warn per request, log-only; `link.*` waits are exempt (their approval
-/// window is legitimately long).
+/// Forensic floor and answer deadline for an admitted host dispatch
+/// (§4.166 forensic line, §4.168 bounded answer): every bounded dispatch
+/// budget has run out long before this — engine calls are timeout-capped at
+/// seconds, media downloads at two minutes — so a request still in flight
+/// here has already escaped every face that owns a budget. At this point the
+/// §4.166 warn fires once and the dispatch is answered with the deadline
+/// face (`INTERNAL_ERROR`, retryable) instead of pending forever; the lane
+/// permit and the pending budget release with the answered future. `link.*`
+/// waits are exempt (their approval window is legitimately long).
 const HOST_DISPATCH_STALL_WARN_AFTER: Duration = Duration::from_secs(300);
 
 type HostWriter<S> = Arc<Mutex<SplitSink<Framed<S, LinesCodec>, String>>>;
@@ -631,66 +635,71 @@ where
                     } else {
                         None
                     };
+                    // §4.168: an admitted request must be answered within the
+                    // stall budget. Both pre-dispatch waits (the lane permit,
+                    // possibly held forever by a wedged earlier dispatch) and
+                    // the dispatch itself are bounded by the same deadline;
+                    // expiry answers the retryable `INTERNAL_ERROR` deadline
+                    // face — the same shape as the capacity face — and drops
+                    // the abandoned future, whose guards release the lane and
+                    // the pending budget with it.
+                    let stall_exempt = method.starts_with("link.");
+                    let request_id = request.request_id.clone();
+                    let acquired: Result<HostDispatchPermit, ApiError> = {
+                        let acquire = async {
+                            match &link_params {
+                                Some(params) => {
+                                    let Some(group) = task_runtime
+                                        .resolve_link_session(&params.link_session_id)
+                                        .await
+                                    else {
+                                        return Err(ApiError::new(
+                                            "LINK_NOT_FOUND",
+                                            "link session was not found",
+                                            false,
+                                        ));
+                                    };
+                                    task_limits
+                                        .acquire(&method, task_account.as_deref(), Some(&group))
+                                        .await
+                                }
+                                None => {
+                                    task_limits
+                                        .acquire(&method, task_account.as_deref(), None)
+                                        .await
+                                }
+                            }
+                        };
+                        acquire_within_stall_budget(
+                            acquire,
+                            stall_exempt,
+                            &method,
+                            account_id.as_deref(),
+                            request_bytes,
+                        )
+                        .await
+                    };
                     // The permit itself must stay bound for the whole
                     // dispatch: dropping it early (e.g. by reducing the
                     // acquire result to its error) would release the account
                     // mutex, the delete barrier and the lane before the work
                     // has run, letting same-account requests interleave.
-                    let acquired: Result<HostDispatchPermit, ApiError> = async {
-                        match &link_params {
-                            Some(params) => {
-                                let Some(group) = task_runtime
-                                    .resolve_link_session(&params.link_session_id)
-                                    .await
-                                else {
-                                    return Err(ApiError::new(
-                                        "LINK_NOT_FOUND",
-                                        "link session was not found",
-                                        false,
-                                    ));
-                                };
-                                task_limits
-                                    .acquire(&method, task_account.as_deref(), Some(&group))
-                                    .await
-                            }
-                            None => {
-                                task_limits
-                                    .acquire(&method, task_account.as_deref(), None)
-                                    .await
-                            }
-                        }
-                    }
-                    .await;
                     let response = match acquired {
                         Ok(_permit) => {
-                            // §4.166 stall watchdog: a dispatch still in
-                            // flight after every bounded budget has run out
-                            // is exactly the forensic blind spot the
-                            // intermittent-send audit hit. Warn once, answer
-                            // nothing, change no state; the permit keeps
-                            // bounding the dispatch exactly as before.
-                            let stall_exempt = method.starts_with("link.");
-                            let mut stall_warned = false;
-                            let dispatching = dispatch(request, &task_runtime);
-                            tokio::pin!(dispatching);
-                            loop {
-                                tokio::select! {
-                                    response = &mut dispatching => break response,
-                                    _ = tokio::time::sleep(HOST_DISPATCH_STALL_WARN_AFTER), if !stall_warned && !stall_exempt => {
-                                        stall_warned = true;
-                                        tracing::warn!(
-                                            method = %method,
-                                            method_class = metrics::method_class(&method),
-                                            account_id = task_account.as_deref().unwrap_or("-"),
-                                            request_bytes,
-                                            stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
-                                            "host request still pending; every bounded face budget is exhausted"
-                                        );
-                                    }
-                                }
+                            if stall_exempt {
+                                dispatch(request, &task_runtime).await
+                            } else {
+                                dispatch_within_stall_budget(
+                                    async move { dispatch(request, &task_runtime).await },
+                                    request_id,
+                                    &method,
+                                    account_id.as_deref(),
+                                    request_bytes,
+                                )
+                                .await
                             }
                         }
-                        Err(error) => HostResponse::failure(request.request_id, error),
+                        Err(error) => HostResponse::failure(request_id, error),
                     };
                     let elapsed = started.elapsed();
                     let method_class = metrics::method_class(&method);
@@ -838,6 +847,12 @@ where
         }
     })
     .await;
+    // §4.168: the drain above cannot complete a dispatch that wedged past
+    // every budget, so the process-global gauge would keep the stale count
+    // after the session that owned it is gone. All dispatch futures are
+    // done or dropped here and this process serves no second authenticated
+    // session, so the honest gauge value is zero.
+    metrics::set_host_pending(0);
     connection_result
 }
 
@@ -954,6 +969,83 @@ enum AttachmentSendForm {
     Plural {
         entries: Vec<crate::service::MessagesSendAttachmentEntry>,
     },
+}
+
+/// §4.168: the lane-permit wait of one admitted dispatch, bounded by the
+/// stall budget. A permit held forever by a wedged earlier dispatch used to
+/// park every later same-lane request here with no timeout, no warn and no
+/// answer — the admitted-but-forever-pending shape the intermittent-send
+/// audit hit. Expiry warns once (the §4.166 fields, acquire-shaped message)
+/// and answers the retryable `INTERNAL_ERROR` deadline face; the request
+/// provably never started, so the face is honest for every method class.
+/// `link.*` waits are exempt with the caller.
+async fn acquire_within_stall_budget(
+    acquire: impl Future<Output = Result<HostDispatchPermit, ApiError>>,
+    stall_exempt: bool,
+    method: &str,
+    account_id: Option<&str>,
+    request_bytes: usize,
+) -> Result<HostDispatchPermit, ApiError> {
+    if stall_exempt {
+        return acquire.await;
+    }
+    match timeout(HOST_DISPATCH_STALL_WARN_AFTER, acquire).await {
+        Ok(acquired) => acquired,
+        Err(_) => {
+            tracing::warn!(
+                method = %method,
+                method_class = metrics::method_class(method),
+                account_id = account_id.unwrap_or("-"),
+                request_bytes,
+                stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
+                "host request still pending; no lane permit was granted before the stall budget expired"
+            );
+            Err(ApiError::new(
+                "INTERNAL_ERROR",
+                "connector dispatch budget expired before dispatch",
+                true,
+            ))
+        }
+    }
+}
+
+/// §4.168: the execution of one permitted dispatch, bounded by the stall
+/// budget. A dispatch wedged past every face budget used to warn once and
+/// then hang forever — the permit, the pending budget and the answer itself
+/// all stayed parked. Expiry emits the §4.166 stall warn (byte-identical
+/// fields and message) and answers the retryable `INTERNAL_ERROR` deadline
+/// face; the abandoned future drops at its await point, releasing every
+/// guard it holds (lane permit, account mutex, store locks) exactly like a
+/// connection teardown does.
+async fn dispatch_within_stall_budget(
+    dispatching: impl Future<Output = HostResponse>,
+    request_id: String,
+    method: &str,
+    account_id: Option<&str>,
+    request_bytes: usize,
+) -> HostResponse {
+    tokio::pin!(dispatching);
+    match timeout(HOST_DISPATCH_STALL_WARN_AFTER, &mut dispatching).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                method = %method,
+                method_class = metrics::method_class(method),
+                account_id = account_id.unwrap_or("-"),
+                request_bytes,
+                stall_after_ms = HOST_DISPATCH_STALL_WARN_AFTER.as_millis() as u64,
+                "host request still pending; every bounded face budget is exhausted"
+            );
+            HostResponse::failure(
+                request_id,
+                ApiError::new(
+                    "INTERNAL_ERROR",
+                    "connector dispatch budget expired; the stalled dispatch was abandoned",
+                    true,
+                ),
+            )
+        }
+    }
 }
 
 async fn dispatch(request: HostRequest, runtime: &ProxyGroupRuntime) -> HostResponse {
@@ -4338,7 +4430,7 @@ impl RecentRequestIds {
 mod tests {
     use std::path::PathBuf;
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::{FutureExt, SinkExt, StreamExt};
     use hmac::{Hmac, Mac};
     use serde_json::Value;
     use sha2::Sha256;
@@ -4443,6 +4535,165 @@ mod tests {
         let mut bytes = HostPendingBudget::default();
         assert!(bytes.try_admit(None, MAX_PENDING_HOST_BYTES));
         assert!(!bytes.try_admit(None, 1));
+    }
+
+    /// §4.168 bounded answer, starvation arm: a control permit held forever by
+    /// a wedged earlier dispatch used to park every later same-lane request in
+    /// `acquire` with no timeout, no warn and no answer. The stall budget now
+    /// bounds the wait: one tick before it the request is still honestly
+    /// pending, at it the retryable `INTERNAL_ERROR` deadline face comes back
+    /// and the caller holds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn starved_lane_permit_answers_the_deadline_face_within_the_stall_budget() {
+        let limits = HostDispatchLimits::new();
+        // The wedged head: holds the single control permit forever.
+        let held = limits.acquire("runtime.status", None, None).await.unwrap();
+
+        let waiter = acquire_within_stall_budget(
+            limits.acquire("accounts.list", None, None),
+            false,
+            "accounts.list",
+            None,
+            10,
+        );
+        tokio::pin!(waiter);
+
+        // First poll registers the deadline timer at the unadvanced clock;
+        // the wait is honest at every tick before the budget.
+        assert!(waiter.as_mut().now_or_never().is_none());
+        tokio::time::advance(HOST_DISPATCH_STALL_WARN_AFTER - Duration::from_secs(1)).await;
+        assert!(
+            waiter.as_mut().now_or_never().is_none(),
+            "one tick before the budget the request is still honestly pending"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let answered = waiter
+            .now_or_never()
+            .expect("the stall budget must answer the starved request");
+        let error = match answered {
+            Ok(_) => panic!("the starved request must be answered, not permitted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "INTERNAL_ERROR");
+        assert!(error.retryable, "the deadline face must be retryable");
+
+        // The answered waiter never held a permit: once the wedged head
+        // drains, the lane admits the next request immediately.
+        drop(held);
+        limits.acquire("accounts.list", None, None).await.unwrap();
+    }
+
+    /// §4.168 bounded answer, wedge arm: a dispatch stuck past every face
+    /// budget used to warn once and then hang forever — permit, pending
+    /// budget and the answer itself all parked. The stall budget now emits
+    /// the §4.166 warn and answers the retryable `INTERNAL_ERROR` deadline
+    /// face carrying the original request id, so every admitted request gets
+    /// an answer and every guard drops with the abandoned future.
+    #[tokio::test(start_paused = true)]
+    async fn wedged_dispatch_answers_the_deadline_face_within_the_stall_budget() {
+        let task = tokio::spawn(dispatch_within_stall_budget(
+            std::future::pending::<HostResponse>(),
+            "kt-9".to_string(),
+            "accounts.list",
+            None,
+            10,
+        ));
+        // Let the spawned dispatch register its deadline timer before the
+        // paused clock moves.
+        tokio::task::yield_now().await;
+        tokio::time::advance(HOST_DISPATCH_STALL_WARN_AFTER).await;
+        let response = timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the stall budget must answer the wedged dispatch")
+            .unwrap();
+        let error = response
+            .error
+            .expect("a wedged dispatch must be answered with the deadline face");
+        assert_eq!(error.code, "INTERNAL_ERROR");
+        assert!(error.retryable, "the deadline face must be retryable");
+        assert_eq!(response.request_id, "kt-9");
+    }
+
+    /// §4.168: the stall deadline never touches a lane-starved `link.*`
+    /// waiter — their approval window is legitimately long, so an exempt
+    /// wait stays pending past the budget — while every non-exempt wait is
+    /// bounded.
+    /// §4.168: the stall budget never bounds a `link.*` wait — the caller
+    /// marks them exempt because their approval window is legitimately long,
+    /// so an exempt wait stays pending with the clock far past the budget
+    /// (the §4.166-era behaviour, unchanged).
+    #[tokio::test(start_paused = true)]
+    async fn link_waits_stay_exempt_from_the_stall_budget() {
+        let exempt = acquire_within_stall_budget(
+            std::future::pending::<Result<HostDispatchPermit, ApiError>>(),
+            true,
+            "link.finish",
+            None,
+            10,
+        );
+        tokio::pin!(exempt);
+        tokio::time::advance(HOST_DISPATCH_STALL_WARN_AFTER * 2).await;
+        assert!(
+            exempt.now_or_never().is_none(),
+            "an exempt link wait stays pending beyond the budget"
+        );
+    }
+
+    /// §4.168: a full session ends with the process-global pending gauge at
+    /// zero — the exit reset keeps `host_pending_requests` a truthful
+    /// picture even when the §4.166-era wedge shape would have left the
+    /// teardown drain unable to complete a stuck dispatch.
+    #[tokio::test]
+    async fn connection_exit_resets_the_host_pending_gauge() {
+        metrics::set_host_pending(0);
+        let secret_bytes = [7_u8; 32];
+        let secret = Arc::new(BootstrapSecret::for_test(secret_bytes));
+        let runtime = test_runtime();
+        let (server_stream, client_stream) = duplex(64 * 1024);
+        let server = tokio::spawn(handle_connection(server_stream, secret, runtime));
+        let mut client = Framed::new(client_stream, LinesCodec::new());
+        let challenge: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        let server_nonce = challenge["data"]["serverNonce"].as_str().unwrap();
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": "handshake-1",
+                    "method": "handshake",
+                    "params": {
+                        "clientNonce": hex::encode([9_u8; 32]),
+                        "proof": client_proof(&secret_bytes, server_nonce, &hex::encode([9_u8; 32])),
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let _handshake_reply = client.next().await.unwrap().unwrap();
+        client
+            .send(
+                json!({
+                    "apiVersion": API_VERSION,
+                    "requestId": "status-1",
+                    "method": "runtime.status",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+        let _status_reply: Value =
+            serde_json::from_str(&client.next().await.unwrap().unwrap()).unwrap();
+        drop(client);
+        let _ = server.await;
+
+        assert_eq!(
+            metrics::host_pending_requests(),
+            0,
+            "a finished session must leave the pending gauge at zero"
+        );
     }
 
     #[tokio::test]

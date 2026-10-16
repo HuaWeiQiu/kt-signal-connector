@@ -63,6 +63,9 @@ windows-sys = { version = "0.61", features = [
 http = "1"
 tempfile = "3"
 wiremock = "0.6"
+# §4.168 bounded-answer tests drive the real 300s stall budget with the
+# paused test clock instead of a wall-clock wait.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

@@ -5,6 +5,17 @@
 - Decision date: 2026-08-04
 - Current status: Connector Phases 1–3 are implemented locally; the separate KT Desktop Phase 4
   integration is locally merged at `5e18793c`, while production Phase 3 exit gates remain open
+- Contract revision: 1.168 (2026-10-16; §4.168 the bounded host dispatch answer: every
+  admitted host request now answers within the §4.166 stall budget — the lane-permit
+  wait and the dispatch itself are both bounded by `HOST_DISPATCH_STALL_WARN_AFTER`,
+  expiry emits the §4.166 warn (byte-identical on the dispatch arm) and answers the
+  retryable `INTERNAL_ERROR` deadline face, the same shape as the capacity face — so
+  the admitted-but-forever-pending shape the intermittent-send audit hit can no longer
+  strand a request without an answer, a lane permit, or a truthful
+  `host_pending_requests` gauge (the connection exit now resets the gauge). `link.*`
+  waits stay exempt: their approval window is legitimately long. The answerability
+  contract changes; the wire vocabulary does not — zero new methods, events, error
+  codes, capability bits, or schema moves. Tests +4 (lib).)
 - No-revision record: 2026-10-16; the group-history resync batch (§4.167)
   lands as connector-internal behavior only — a `groups.get` cache miss
   or an empty roster now triggers one throttled (5-minute TTL, official
@@ -14185,6 +14196,87 @@ boot-window shape self-heals — a read with no engine answers the
 untouched `GROUP_NOT_FOUND` face, and after the engine lands the same
 read succeeds with no manual sync
 (`group_boot_window_degrades_then_self_heals_once_the_engine_lands`).
+
+### 4.168 The bounded host dispatch answer: every admitted request answers within the stall budget (contract revision 1.168, 2026-10-16)
+
+The wound (the Main↔connector RPC queue batch forensics): the desktop
+showed read requests timing out at its own 30s face while the connector
+logged zero completed requests, and an earlier window had left
+`host_pending_requests=3` stuck permanently. The forensic chain, all
+read-only:
+
+**(a) The desktop queue is not where the request stopped being honest, but
+it is where the user felt it.** The desktop Main scheduler
+(`requestScheduler.ts`) bounds four lanes (control 1, linkWait 1, read 4,
+send 2) with per-queue soft timeouts; a queued task evicted after 10s
+answers `queue_timeout` — the literal "请求排队超时，请求未发出" banner.
+The connector client (`connectorClient.ts`) times each request out at 30s
+and folds a non-mutating timeout into a plain error, which the host
+payload path turns into `internal_error` (`retryable=false`) — a terminal
+face on what is a transient transport condition. Both faces are honest
+about "never reached the wire work", but neither is the root cause.
+
+**(b) The connector could strand an admitted request forever.** Three
+never-answer shapes existed past every budgeted face:
+
+1. **Lane-permit starvation.** A dispatch's lane wait (`acquire`) has no
+   timeout. Control holds exactly one permit, so a single wedged control
+   dispatch parked every later control request in the semaphore forever —
+   admitted into the pending budget (the gauge counts them), never
+   dispatched, never answered, never warned: the §4.166 stall warn arms
+   only after the permit is granted.
+2. **The wedged dispatch itself.** The §4.166 warn fires at 300s and then
+   deliberately answers nothing: a dispatch stuck past every face budget
+   (engine calls are seconds-capped, CDN two minutes — the budget that
+   escaped is a non-engine face such as a store lock or a blocked write)
+   held its lane permit, its pending-budget slot and the answer itself
+   forever.
+3. **The stale gauge.** The connection teardown drains in-flight
+   dispatches for 5s and then gives up; a wedged dispatch leaves the
+   process-global `host_pending_requests` at a count nothing will ever
+   decrement — the "3 forever" shape.
+
+The engine call path was never the hole: `call_with_timeout` bounds every
+engine request (timeout → `UPSTREAM_TIMEOUT`/`SEND_OUTCOME_UNKNOWN`, a
+dropped oneshot → `UPSTREAM_EXITED`, a dead engine → `NotRunning`), so
+bootstrap, engine restart handover and engine death all answer inside
+their budgets already.
+
+**The repair bounds every admitted dispatch to the §4.166 budget.** Both
+the lane-permit wait and the dispatch execution are wrapped in the same
+`HOST_DISPATCH_STALL_WARN_AFTER` deadline (300s — beyond the CDN face,
+the longest real budget):
+
+- expiry on the permit wait warns once with the §4.166 field set (an
+  acquire-shaped message) and answers the retryable `INTERNAL_ERROR`
+  deadline face — the request provably never started, so the face is
+  honest for every method class;
+- expiry on the dispatch emits the §4.166 warn byte for byte and answers
+  the same retryable `INTERNAL_ERROR` face carrying the original request
+  id; the abandoned future drops at its await point, releasing every guard
+  it holds (lane permit, account mutex, store locks) exactly like a
+  connection teardown already does;
+- `link.*` stays exempt from both (the §4.166 exemption: approval windows
+  are legitimately long);
+- the connection exit resets `host_pending_requests` to zero after the
+  drain, so a finished session can no longer leave the gauge stuck.
+
+Zero wire vocabulary change: no new method, event, error code, capability,
+or schema move — the deadline face reuses the `INTERNAL_ERROR` retryable
+shape the capacity face already teaches the desktop. The answerability
+contract changes, which is what the 1.168 revision records. The stall warn
+is preserved (now terminal on the dispatch arm), and the §4.166 log-only
+behaviour survives verbatim on the `link.*` exemption.
+
+Tests (+4 lib): the starved permit answers the deadline face within the
+budget and leaves the lane free
+(`starved_lane_permit_answers_the_deadline_face_within_the_stall_budget`);
+a wedged dispatch answers the deadline face carrying the original request
+id (`wedged_dispatch_answers_the_deadline_face_within_the_stall_budget`);
+the `link.*` exemption stays unbounded
+(`link_waits_stay_exempt_from_the_stall_budget`); and a full session ends
+with the pending gauge at zero
+(`connection_exit_resets_the_host_pending_gauge`).
 
 ## 5. signal-cli Boundary
 

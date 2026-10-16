@@ -142,6 +142,13 @@ pub fn set_host_pending(depth: usize) {
     HOST_PENDING_REQUESTS.store(depth as u64, Ordering::Relaxed);
 }
 
+/// Read back the admitted-but-unfinished host request gauge (`runtime.doctor`
+/// forensics and tests): the §4.168 bounded-answer face and the connection
+/// exit reset both keep this value a truthful picture of the dispatch set.
+pub fn host_pending_requests() -> u64 {
+    HOST_PENDING_REQUESTS.load(Ordering::Relaxed)
+}
+
 /// A receive entered the persistence queue.
 pub fn receive_queue_enqueued() {
     RECEIVE_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
@@ -312,6 +319,9 @@ mod tests {
             record_watchdog_restart();
             set_host_pending(2);
             log_snapshot();
+            // Leave the shared gauge clean for parallel tests (the §4.168
+            // exit-reset semantics keep the honest value at zero).
+            set_host_pending(0);
             log_engine_rss(&[
                 ("default".to_string(), Some(196 * 1024 * 1024)),
                 ("team-a".to_string(), None),
