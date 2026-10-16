@@ -14468,7 +14468,14 @@ carries an `aci` distinct from that number → the call re-keys to
 key is the ACI, which fails the equals-the-number test; the degenerate
 `aci == signal_account` answer redirects nothing. Every path that
 materializes or touches the self chat through `ensure_conversation` —
-contacts sync, ingest, history import — lands canonical from then on.
+contacts sync, ingest, history import — lands canonical from then on. The
+§6.5 contacts-sync and §4.122 passive-batch skeleton materializers do not
+route through `ensure_conversation` — their insert loops apply the same
+predicate directly (`skeleton_conversation_peer_key`), so the own entry
+lands canonical there too while their contacts-cache rows keep the number
+key (the §4.43 contacts face is untouched). The `memo_migrations` ledger
+row dies with its account (the FK cascades): a fold ledger must never
+outlive the account it folded, or `accounts.deleteLocalData` fails its FK.
 Read paths that query a conversation by an explicit id or by a non-self
 peer key are untouched.
 
@@ -14564,6 +14571,10 @@ reads `isSelf` on both list and single-row faces
 (`canonical_aci_key_redirects_the_own_number_and_marks_is_self`, beside an
 extended arm in the §4.42 self-boundary test); the sync seam folds and
 announces (`account_sync_backfills_the_memo_identity_and_announces_the_canonical_row`).
+The integration faces ride the same keys: the note-to-self skeleton test
+derives the answered ACI from the finish answer and asserts the upstream
+dispatch targets it, and the phase2 account delete runs with a fold ledger
+row present (the cascade face).
 
 ## 5. signal-cli Boundary
 

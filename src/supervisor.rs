@@ -1574,8 +1574,42 @@ impl RuntimeSupervisor {
             .lock()
             .await
             .sync_accounts_from_numbers(&numbers, &self.group_id)?;
+        // Contract 1.170 (§4.170): the ACI was just (re)written for these
+        // accounts — fold each number-keyed memo shell into the canonical
+        // ACI-keyed row and announce it.
+        self.backfill_memo_identities(&accounts).await;
         let _ = engine;
         Ok(accounts)
+    }
+
+    /// Contract 1.170 (§4.170): fold each freshly-ACI'd account's number-keyed
+    /// memo shell into the canonical ACI-keyed row (§4.170) and announce the
+    /// canonical summary. Best-effort at the seam — a store hiccup degrades
+    /// to a warn and the next sync retries (the fold is idempotent).
+    async fn backfill_memo_identities(&self, accounts: &[AccountSummary]) {
+        for account in accounts {
+            let store = Arc::clone(&self.store);
+            let account_id = account.id.clone();
+            let folded = blocking_service(move || {
+                store
+                    .normalize_memo_identity(&account_id)
+                    .map_err(ServiceError::from)
+            })
+            .await;
+            match folded {
+                Ok(Some(summary)) => {
+                    let _ = self
+                        .host_events
+                        .send(HostSideEvent::ConversationChanged(summary));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    error_class = error.class(),
+                    account_id = %account.id,
+                    "memo identity backfill failed; the next sync retries"
+                ),
+            }
+        }
     }
 
     /// Resolve a human-readable profile label for the local linked account.
@@ -1770,6 +1804,18 @@ impl RuntimeSupervisor {
             let mut service = self.service.lock().await;
             service.complete_link_session(&link_session_id, number, &self.group_id, aci)?
         };
+        // Contract 1.170 (§4.170): the finish answer may have just written the
+        // account's first ACI — fold the number-keyed memo shell and announce
+        // the canonical row before the account-changed event rides.
+        self.backfill_memo_identities(std::slice::from_ref(&account))
+            .await;
+        if let Some(summary) = self
+            .store
+            .account_summary(&account.id)
+            .map_err(ServiceError::from)?
+        {
+            account = summary;
+        }
         // Refresh profile display name right after link (best-effort).
         if let Ok(engine) = self.running_engine().await
             && let Some(name) = self.fetch_self_display_name(&engine, number).await
@@ -10013,6 +10059,110 @@ mod tests {
         .unwrap();
         assert!(saw_message);
         assert!(saw_recovered);
+    }
+
+    /// Contract 1.170 (§4.170): the account-sync seam folds the freshly
+    /// ACI'd account's number-keyed memo shell into the canonical ACI-keyed
+    /// row and announces exactly the canonical summary on the host lane —
+    /// the message material moves with it and the shell row is gone.
+    #[tokio::test]
+    async fn account_sync_backfills_the_memo_identity_and_announces_the_canonical_row() {
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(test_store(temp.path()));
+        let supervisor = RuntimeSupervisor::new(
+            EngineConfig::new(
+                temp.path().join("unused-engine"),
+                temp.path().join("unused-signal-data"),
+            ),
+            store.clone(),
+            DEFAULT_PROXY_GROUP_ID.to_string(),
+            None,
+        );
+        let mut host_events = supervisor.subscribe_host();
+
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Note to Self")
+            .unwrap();
+        store
+            .insert_message(
+                &MessageRecord {
+                    id: "m-shell-1".into(),
+                    account_id: account.id.clone(),
+                    conversation_id: shell.id.clone(),
+                    direction: "outgoing",
+                    sender_id: "self".into(),
+                    sender_name: None,
+                    mentions_self: false,
+                    sent_at: 1_000,
+                    received_at: None,
+                    text: Some("memo body".into()),
+                    text_bytes: Some(9),
+                    text_truncated: false,
+                    text_retrievable: true,
+                    status: "sent",
+                    client_request_id: None,
+                    quote_message_id: None,
+                    quote_snapshot: None,
+                    attachments: Vec::new(),
+                    edited_at: None,
+                    rich: None,
+                    reactions: Vec::new(),
+                    edits: Vec::new(),
+                    delivered_at: None,
+                    read_at: None,
+                    viewed_at: None,
+                    sticker: None,
+                    expire_seconds: None,
+                    expire_start_at: None,
+                    admin_deleted: false,
+                    server_guid: None,
+                    server_timestamp: None,
+                    is_story: false,
+                    story_message: None,
+                },
+                None,
+                Some("memo body"),
+                false,
+            )
+            .unwrap();
+        let aci = crate::store::canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        store.set_account_aci(&account.id, Some(&aci)).unwrap();
+
+        supervisor
+            .backfill_memo_identities(std::slice::from_ref(&account))
+            .await;
+
+        // The fold announces exactly the canonical row, marked self.
+        let summary = match host_events.try_recv().unwrap() {
+            HostSideEvent::ConversationChanged(summary) => summary,
+            other => panic!("expected ConversationChanged, got {other:?}"),
+        };
+        let canonical = store
+            .conversation_by_peer(&account.id, "direct", &aci)
+            .unwrap()
+            .expect("the canonical row exists");
+        assert_eq!(summary.id, canonical.id);
+        assert!(summary.is_self);
+
+        // The shell is gone and the message moved with the fold.
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "+15555550100")
+                .unwrap()
+                .is_none()
+        );
+        let moved: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                rusqlite::params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
     }
 
     #[test]

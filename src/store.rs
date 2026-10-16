@@ -7,14 +7,14 @@ use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::ids::{mask_address, random_id, stable_hash_id};
 use crate::link::now_ms;
 
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 26;
 /// Contract 1.42 (§4.41): at most this many dead rows leave the store in one
 /// sweep transaction — the same bounded-batch family as retention and the
 /// delete-operation ledger, so a large backlog converges over several passes
@@ -292,6 +292,14 @@ CREATE TABLE IF NOT EXISTS conversation_drafts (
   PRIMARY KEY(account_id, conversation_id),
   FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE,
   FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS memo_migrations (
+  account_id TEXT PRIMARY KEY,
+  canonical_aci TEXT NOT NULL,
+  source_peer_key TEXT NOT NULL,
+  rollback_json TEXT NOT NULL,
+  migrated_at INTEGER NOT NULL,
+  FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS peer_identities (
   account_id TEXT NOT NULL,
@@ -722,32 +730,82 @@ fn u32_is_zero(value: &u32) -> bool {
     *value == 0
 }
 
-/// The number-only self match both wire faces share (§4.42/§4.43): the peer
-/// key equals the linked account's own number. Number-based by the §4.24
-/// recorded boundary — the own ACI is not queryable on either engine's
-/// jsonRpc surface, so a UUID-shaped peer key cannot be marked.
-fn peer_key_is_self(peer_key: &str, signal_account: Option<&str>) -> bool {
-    signal_account == Some(peer_key)
+/// The self match both wire faces share (§4.42/§4.43, contract 1.170): the
+/// peer key equals the linked account's own number or its stored ACI. The
+/// §4.24 recorded boundary ("the own ACI is not queryable") held until
+/// contract 1.142 made the engine's own-ACI answer a persisted column; a
+/// canonical ACI-keyed memo row is now marked the same way the number-keyed
+/// shell always was.
+fn peer_key_is_self(peer_key: &str, signal_account: Option<&str>, aci: Option<&str>) -> bool {
+    signal_account == Some(peer_key) || aci == Some(peer_key)
 }
 
-/// Contract 1.43 (§4.42): the Note-to-Self predicate for a conversation row —
-/// the direct chat whose peer key is the linked account's own number. Pure
-/// read-time derivation over (kind, peer_key) plus the account record; no
-/// column exists because the answer follows the keys it derives from. The
-/// number-only match is the shared [`peer_key_is_self`] boundary, and groups
-/// are never self.
-fn summary_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> bool {
-    kind == "direct" && peer_key_is_self(peer_key, signal_account)
+/// Contract 1.170 (§4.170): the account identity pair the contacts-batch
+/// skeleton materializers redirect on. Read through the caller's
+/// connection/transaction — those materializers run inside a held store
+/// lock, so the locking account helper cannot be used there.
+fn memo_skeleton_identity(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Option<(String, Option<String>)>, StoreError> {
+    conn.query_row(
+        "SELECT signal_account, aci FROM accounts WHERE id=?1",
+        params![account_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .map_err(|error| StoreError::Unavailable(Some(error)))
 }
 
-/// Contract 1.44 (§4.43): the Note-to-Self predicate for a contacts-cache row
-/// — the `kind='contact'` entry whose peer key is the linked account's own
-/// number. Same read-time derivation and the same shared [`peer_key_is_self`]
-/// match as the conversation summaries, so the compose list and the
-/// conversation list cannot disagree about the same entry; the kind gate
-/// keeps a group row unmarked no matter what its group id collides with.
-fn contact_is_self(kind: &str, peer_key: &str, signal_account: Option<&str>) -> bool {
-    kind == "contact" && peer_key_is_self(peer_key, signal_account)
+/// Contract 1.170 (§4.170): the peer key a direct conversation skeleton
+/// materializes under — the canonical ACI key when the entry is the linked
+/// account's own number and the account carries a distinct ACI (the same
+/// predicate the `ensure_conversation` redirect applies, degenerate answer
+/// included); every other key verbatim. The contacts-cache row keeps its
+/// own key — only the conversation skeleton re-keys.
+fn skeleton_conversation_peer_key<'k>(
+    memo: &'k Option<(String, Option<String>)>,
+    conversation_kind: &str,
+    peer_key: &'k str,
+) -> &'k str {
+    match memo {
+        Some((signal_account, Some(aci)))
+            if conversation_kind == "direct" && peer_key == signal_account && aci != peer_key =>
+        {
+            aci.as_str()
+        }
+        _ => peer_key,
+    }
+}
+
+/// Contract 1.43 (§4.42) with contract 1.170: the Note-to-Self predicate for
+/// a conversation row — the direct chat whose peer key is the linked
+/// account's own number or its canonical ACI. Pure read-time derivation over
+/// (kind, peer_key) plus the account record; no column exists because the
+/// answer follows the keys it derives from. Groups are never self.
+fn summary_is_self(
+    kind: &str,
+    peer_key: &str,
+    signal_account: Option<&str>,
+    aci: Option<&str>,
+) -> bool {
+    kind == "direct" && peer_key_is_self(peer_key, signal_account, aci)
+}
+
+/// Contract 1.44 (§4.43) with contract 1.170: the Note-to-Self predicate for
+/// a contacts-cache row — the `kind='contact'` entry whose peer key is the
+/// linked account's own number or its canonical ACI. Same read-time
+/// derivation and the same shared [`peer_key_is_self`] match as the
+/// conversation summaries, so the compose list and the conversation list
+/// cannot disagree about the same entry; the kind gate keeps a group row
+/// unmarked no matter what its group id collides with.
+fn contact_is_self(
+    kind: &str,
+    peer_key: &str,
+    signal_account: Option<&str>,
+    aci: Option<&str>,
+) -> bool {
+    kind == "contact" && peer_key_is_self(peer_key, signal_account, aci)
 }
 
 /// Contract 1.60 (§4.54): the termination flag a contacts-cache row carries —
@@ -1576,6 +1634,22 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// Contract 1.170 (§4.170): the number-keyed memo shell's mergeable state,
+/// read in one pass before the fold. Every field rides the rollback snapshot
+/// verbatim and the state-merge UPDATE takes its values from here.
+struct MemoShellRow {
+    id: String,
+    title: String,
+    unread_count: i64,
+    unread_mentions: i64,
+    muted: i64,
+    pinned: i64,
+    expire_timer_seconds: Option<i64>,
+    mrr_factors_json: Option<String>,
+    last_message_at: Option<i64>,
+    last_message_preview: Option<String>,
+}
+
 impl Store {
     /// Open the per-profile store. Encryption at rest (optimization-plan Phase
     /// 3) is decided entirely here, keeping the blast radius in this function:
@@ -1975,6 +2049,269 @@ impl Store {
         Ok(())
     }
 
+    /// Contract 1.170 (§4.170): fold the number-keyed memo shell
+    /// `(direct, signal_account)` into the canonical ACI-keyed row
+    /// `(direct, aci)`. Answers the refreshed canonical summary when a fold
+    /// happened, `None` when there is nothing to fold — no shell, no ACI, or
+    /// an ACI equal to the number (the redirect's degenerate face). The fold
+    /// runs at the two ACI-write seams (account sync, link.finish), not at
+    /// open time, and is idempotent: a folded account's shell is gone, so
+    /// every later call is a no-op. The `memo_migrations` ledger row carries
+    /// the shell snapshot and the ids of the dropped duplicates so an
+    /// operator rollback pass is mechanical.
+    pub fn normalize_memo_identity(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<ConversationSummary>, StoreError> {
+        let map_err = |error: rusqlite::Error| StoreError::Unavailable(Some(error));
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+
+        let (signal_account, aci): (String, Option<String>) = tx
+            .query_row(
+                "SELECT signal_account, aci FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(map_err)?
+            .ok_or(StoreError::AccountNotFound)?;
+        let Some(aci) = aci.filter(|aci| aci != &signal_account) else {
+            return Ok(None);
+        };
+        let shell: Option<MemoShellRow> = tx
+            .query_row(
+                "SELECT id, title, unread_count, unread_mentions, muted, pinned,
+                        expire_timer_seconds, mrr_factors_json,
+                        last_message_at, last_message_preview
+                 FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                params![account_id, signal_account],
+                |row| {
+                    Ok(MemoShellRow {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        unread_count: row.get(2)?,
+                        unread_mentions: row.get(3)?,
+                        muted: row.get(4)?,
+                        pinned: row.get(5)?,
+                        expire_timer_seconds: row.get(6)?,
+                        mrr_factors_json: row.get(7)?,
+                        last_message_at: row.get(8)?,
+                        last_message_preview: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_err)?;
+        let Some(shell) = shell else {
+            return Ok(None);
+        };
+        let shell_id = shell.id.clone();
+        let shell_title = shell.title.clone();
+
+        // The canonical row, ensured against this transaction (the public
+        // ensure locks its own connection, so the body is inlined here).
+        let canonical_id: String = match tx
+            .query_row(
+                "SELECT id FROM conversations
+                 WHERE account_id=?1 AND kind='direct' AND peer_key=?2",
+                params![account_id, aci],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_err)?
+        {
+            Some(id) => id,
+            None => {
+                let id = stable_hash_id(&[account_id, "direct", aci.as_str()]);
+                tx.execute(
+                    "INSERT INTO conversations(id, account_id, kind, peer_key, title,
+                       unread_count, muted, pinned)
+                     VALUES(?1, ?2, 'direct', ?3, ?4, 0, 0, 0)",
+                    params![id, account_id, aci, shell_title],
+                )
+                .map_err(map_err)?;
+                id
+            }
+        };
+        let canonical_title: String = tx
+            .query_row(
+                "SELECT title FROM conversations WHERE id=?1",
+                params![canonical_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if title_should_upgrade(&canonical_title, &shell_title) {
+            tx.execute(
+                "UPDATE conversations SET title=?2 WHERE id=?1",
+                params![canonical_id, shell_title],
+            )
+            .map_err(map_err)?;
+        }
+
+        // Messages move deduplicated by the signal-identity tuple (the table
+        // carries no unique constraint — the NOT EXISTS guard is the dedupe);
+        // what would duplicate stays shell-side and is deleted, the canonical
+        // copy winning. Message ids never change, so id-keyed side references
+        // stay valid; a deleted duplicate takes its edit history along (the
+        // edits FK cascades).
+        tx.execute(
+            "UPDATE messages SET conversation_id=?2
+             WHERE conversation_id=?1
+               AND NOT EXISTS (SELECT 1 FROM messages other
+                 WHERE other.conversation_id=?2
+                   AND other.account_id=messages.account_id
+                   AND other.direction=messages.direction
+                   AND other.sent_at=messages.sent_at
+                   AND other.sender_id=messages.sender_id)",
+            params![shell_id, canonical_id],
+        )
+        .map_err(map_err)?;
+        let dropped_message_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM messages WHERE conversation_id=?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(params![shell_id], |row| row.get::<_, String>(0))
+                .map_err(map_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_err)?
+        };
+        tx.execute(
+            "DELETE FROM messages WHERE conversation_id=?1",
+            params![shell_id],
+        )
+        .map_err(map_err)?;
+
+        // Reactions move under the same guard on their own unique tuple —
+        // the table's conversation FK has no cascade, so clearing the
+        // shell-side leftovers is what keeps the shell row deletable.
+        tx.execute(
+            "UPDATE message_events SET conversation_id=?2
+             WHERE conversation_id=?1
+               AND NOT EXISTS (SELECT 1 FROM message_events other
+                 WHERE other.conversation_id=?2
+                   AND other.account_id=message_events.account_id
+                   AND other.kind=message_events.kind
+                   AND other.target_timestamp=message_events.target_timestamp
+                   AND other.actor_id=message_events.actor_id)",
+            params![shell_id, canonical_id],
+        )
+        .map_err(map_err)?;
+        let dropped_event_ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM message_events WHERE conversation_id=?1")
+                .map_err(map_err)?;
+            let rows = stmt
+                .query_map(params![shell_id], |row| row.get::<_, String>(0))
+                .map_err(map_err)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(map_err)?
+        };
+        tx.execute(
+            "DELETE FROM message_events WHERE conversation_id=?1",
+            params![shell_id],
+        )
+        .map_err(map_err)?;
+
+        // Pins and drafts move when the canonical row lacks them; the
+        // shell's leftovers cascade away with the shell.
+        for table in ["conversation_pins", "conversation_drafts"] {
+            tx.execute(
+                &format!(
+                    "UPDATE {table} SET conversation_id=?2
+                     WHERE conversation_id=?1
+                       AND NOT EXISTS (SELECT 1 FROM {table} other
+                         WHERE other.account_id={table}.account_id
+                           AND other.conversation_id=?2)"
+                ),
+                params![shell_id, canonical_id],
+            )
+            .map_err(map_err)?;
+        }
+
+        // State merges shell → canonical (§4.170 step 6): every SET reads
+        // the pre-update row, so the preview CASE compares against the
+        // canonical's own stamp, not the merged one.
+        tx.execute(
+            "UPDATE conversations SET
+               unread_count = MAX(unread_count, ?2),
+               unread_mentions = MAX(unread_mentions, ?3),
+               muted = MAX(muted, ?4),
+               pinned = MAX(pinned, ?5),
+               expire_timer_seconds = COALESCE(expire_timer_seconds, ?6),
+               mrr_factors_json = COALESCE(mrr_factors_json, ?7),
+               last_message_at = CASE
+                 WHEN last_message_at IS NULL THEN ?8
+                 WHEN ?8 IS NULL THEN last_message_at
+                 ELSE MAX(last_message_at, ?8) END,
+               last_message_preview = CASE
+                 WHEN ?8 IS NULL THEN last_message_preview
+                 WHEN last_message_at IS NULL THEN ?9
+                 WHEN ?8 > last_message_at THEN ?9
+                 ELSE last_message_preview END
+             WHERE id=?1",
+            params![
+                canonical_id,
+                shell.unread_count,
+                shell.unread_mentions,
+                shell.muted,
+                shell.pinned,
+                shell.expire_timer_seconds,
+                shell.mrr_factors_json,
+                shell.last_message_at,
+                shell.last_message_preview,
+            ],
+        )
+        .map_err(map_err)?;
+
+        // The shell snapshot rides the ledger before the row goes away.
+        let shell_snapshot = json!({
+            "id": shell_id,
+            "peerKey": signal_account,
+            "title": shell_title,
+            "unreadCount": shell.unread_count,
+            "unreadMentions": shell.unread_mentions,
+            "muted": shell.muted,
+            "pinned": shell.pinned,
+            "expireTimerSeconds": shell.expire_timer_seconds,
+            "mrrFactorsJson": shell.mrr_factors_json,
+            "lastMessageAt": shell.last_message_at,
+            "lastMessagePreview": shell.last_message_preview,
+            "droppedMessageIds": dropped_message_ids,
+            "droppedEventIds": dropped_event_ids,
+        });
+        tx.execute(
+            "INSERT INTO memo_migrations(account_id, canonical_aci, source_peer_key,
+               rollback_json, migrated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id) DO UPDATE SET
+               canonical_aci=excluded.canonical_aci,
+               source_peer_key=excluded.source_peer_key,
+               rollback_json=excluded.rollback_json,
+               migrated_at=excluded.migrated_at",
+            params![
+                account_id,
+                aci,
+                signal_account,
+                shell_snapshot.to_string(),
+                crate::link::now_ms() as i64,
+            ],
+        )
+        .map_err(map_err)?;
+
+        tx.execute("DELETE FROM conversations WHERE id=?1", params![shell_id])
+            .map_err(map_err)?;
+        tx.commit()
+            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+        // The guard is a Drop type and would otherwise live to the end of
+        // the function: the summary read below re-locks the same connection
+        // mutex and would self-deadlock — release the lock first.
+        drop(conn);
+        self.conversation_summary(account_id, &canonical_id)
+    }
+
     pub fn prepare_account_delete(
         &self,
         account_id: &str,
@@ -2161,6 +2498,22 @@ impl Store {
         self.complete_account_delete(account_id, None, 0)
     }
 
+    /// Contract 1.170 (§4.170): the account identity pair the memo redirect
+    /// keys on — the linked number and the persisted own ACI, if any.
+    fn account_memo_identity(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+        self.lock_conn()?
+            .query_row(
+                "SELECT signal_account, aci FROM accounts WHERE id=?1",
+                params![account_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| StoreError::Unavailable(Some(error)))
+    }
+
     pub fn ensure_conversation(
         &self,
         account_id: &str,
@@ -2168,6 +2521,21 @@ impl Store {
         peer_key: &str,
         title: &str,
     ) -> Result<ConversationRow, StoreError> {
+        // Contract 1.170 (§4.170): a direct chat keyed by the linked
+        // account's own number redirects to the canonical ACI key whenever
+        // the account carries an ACI distinct from that number — the
+        // number-keyed row is a shell, the ACI-keyed row is the conversation
+        // (the receive path's own key). The redirected call cannot loop: its
+        // peer key is the ACI, which fails the equals-the-number test; the
+        // degenerate `aci == number` answer redirects nothing.
+        if kind == "direct"
+            && let Some((signal_account, aci)) = self.account_memo_identity(account_id)?
+            && peer_key == signal_account
+            && let Some(aci) = aci
+            && aci != peer_key
+        {
+            return self.ensure_conversation(account_id, kind, &aci, title);
+        }
         if let Some(existing) = self.conversation_by_peer(account_id, kind, peer_key)? {
             // Upgrade masked/placeholder titles when we learn a real display name.
             if let Some(current) = self.conversation_title(&existing.id)?
@@ -2532,17 +2900,18 @@ impl Store {
         let cursor_sent_at = decoded.as_ref().and_then(|value| value.1);
         let cursor_id = decoded.as_ref().map(|value| value.2.as_str());
         let conn = self.lock_conn()?;
-        // Contract 1.43 (§4.42): is_self derives the row from the account's
-        // own number at read time — one lookup per page, through the already
-        // held connection guard.
-        let signal_account: Option<String> = conn
+        // Contract 1.43 (§4.42) with contract 1.170: is_self derives the row
+        // from the account's own number and stored ACI at read time — one
+        // lookup per page, through the already held connection guard.
+        let (signal_account, account_aci): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT signal_account FROM accounts WHERE id=?1",
+                "SELECT signal_account, aci FROM accounts WHERE id=?1",
                 params![account_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .unwrap_or_default();
         let mut stmt = conn
             .prepare(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
@@ -2606,7 +2975,12 @@ impl Store {
                         expire_timer_seconds: row
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
-                        is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
+                        is_self: summary_is_self(
+                            kind,
+                            &peer_key,
+                            signal_account.as_deref(),
+                            account_aci.as_deref(),
+                        ),
                         // Contract 1.60 (§4.54): stamped from the contacts
                         // cache after the row maps (page lookup / single-row
                         // query below).
@@ -6387,16 +6761,18 @@ impl Store {
         conversation_id: &str,
     ) -> Result<Option<ConversationSummary>, StoreError> {
         let conn = self.lock_conn()?;
-        // Contract 1.43 (§4.42): the same read-time is_self derivation the
-        // list applies, through the already held connection guard.
-        let signal_account: Option<String> = conn
+        // Contract 1.43 (§4.42) with contract 1.170: the same read-time
+        // is_self derivation the list applies, through the already held
+        // connection guard.
+        let (signal_account, account_aci): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT signal_account FROM accounts WHERE id=?1",
+                "SELECT signal_account, aci FROM accounts WHERE id=?1",
                 params![account_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .unwrap_or_default();
         let summary = conn
             .query_row(
                 "SELECT id, account_id, kind, title, last_message_preview, last_message_at,
@@ -6435,7 +6811,12 @@ impl Store {
                         expire_timer_seconds: row
                             .get::<_, Option<i64>>(10)?
                             .map(|value| value.max(0) as u64),
-                        is_self: summary_is_self(kind, &peer_key, signal_account.as_deref()),
+                        is_self: summary_is_self(
+                            kind,
+                            &peer_key,
+                            signal_account.as_deref(),
+                            account_aci.as_deref(),
+                        ),
                         // Contract 1.60 (§4.54): stamped from the contacts
                         // cache after the row maps (page lookup / single-row
                         // query below).
@@ -6574,8 +6955,11 @@ impl Store {
         // stable_hash_id key ensure_conversation uses; existing rows keep
         // their state (unread/muted/pinned), and a masked/placeholder title
         // upgrades through the normal path when a real message later lands.
+        // Contract 1.170 (§4.170): the own entry's skeleton lands on the
+        // canonical ACI key — the same redirect ensure_conversation applies.
         let mut changed: Vec<String> = Vec::new();
         {
+            let memo_identity = memo_skeleton_identity(&transaction, account_id)?;
             let mut stmt = transaction
                 .prepare(
                     "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
@@ -6588,13 +6972,18 @@ impl Store {
                     "contact" => "direct",
                     other => other,
                 };
-                let id = stable_hash_id(&[account_id, conversation_kind, entry.peer_key]);
+                let peer_key = skeleton_conversation_peer_key(
+                    &memo_identity,
+                    conversation_kind,
+                    entry.peer_key,
+                );
+                let id = stable_hash_id(&[account_id, conversation_kind, peer_key]);
                 let inserted = stmt
                     .execute(params![
                         id,
                         account_id,
                         conversation_kind,
-                        entry.peer_key,
+                        peer_key,
                         entry.title,
                     ])
                     .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -6690,6 +7079,10 @@ impl Store {
         }
         let mut changed: Vec<String> = Vec::new();
         {
+            // Contract 1.170 (§4.170): the passive batch skeleton lands the
+            // own entry on the canonical ACI key — the same redirect
+            // ensure_conversation applies.
+            let memo_identity = memo_skeleton_identity(&transaction, account_id)?;
             let mut stmt = transaction
                 .prepare(
                     "INSERT INTO conversations(id, account_id, kind, peer_key, title, unread_count, muted, pinned)
@@ -6702,13 +7095,18 @@ impl Store {
                     "contact" => "direct",
                     other => other,
                 };
-                let id = stable_hash_id(&[account_id, conversation_kind, entry.peer_key]);
+                let peer_key = skeleton_conversation_peer_key(
+                    &memo_identity,
+                    conversation_kind,
+                    entry.peer_key,
+                );
+                let id = stable_hash_id(&[account_id, conversation_kind, peer_key]);
                 let inserted = stmt
                     .execute(params![
                         id,
                         account_id,
                         conversation_kind,
-                        entry.peer_key,
+                        peer_key,
                         entry.title,
                     ])
                     .map_err(|error| StoreError::Unavailable(Some(error)))?;
@@ -6863,17 +7261,19 @@ impl Store {
         let cursor_peer_key = decoded.as_ref().map(|value| value.1.as_str());
         let like = query.map(escape_like);
         let conn = self.lock_conn()?;
-        // Contract 1.44 (§4.43): is_self derives the row from the account's
-        // own number at read time — one lookup per page, through the already
-        // held connection guard (the §4.42 summary-list discipline).
-        let signal_account: Option<String> = conn
+        // Contract 1.44 (§4.43) with contract 1.170: is_self derives the row
+        // from the account's own number and stored ACI at read time — one
+        // lookup per page, through the already held connection guard (the
+        // §4.42 summary-list discipline).
+        let (signal_account, account_aci): (Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT signal_account FROM accounts WHERE id=?1",
+                "SELECT signal_account, aci FROM accounts WHERE id=?1",
                 params![account_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| StoreError::Unavailable(Some(error)))?;
+            .map_err(|error| StoreError::Unavailable(Some(error)))?
+            .unwrap_or_default();
         let mut stmt = conn
             .prepare(
                 "SELECT id, kind, peer_key, title, extra
@@ -6919,7 +7319,12 @@ impl Store {
                         id: row.get(0)?,
                         is_terminated: kind == "group" && extra_is_terminated(extra.as_deref()),
                         kind,
-                        is_self: contact_is_self(kind, &peer_key, signal_account.as_deref()),
+                        is_self: contact_is_self(
+                            kind,
+                            &peer_key,
+                            signal_account.as_deref(),
+                            account_aci.as_deref(),
+                        ),
                         peer_key,
                         title: row.get(3)?,
                         service_id,
@@ -8073,6 +8478,14 @@ fn migrate_schema(conn: &Connection) -> Result<(), StoreError> {
             )
             .map_err(|error| StoreError::Unavailable(Some(error)))?;
         }
+    }
+    if current < 26 {
+        // Contract revision 1.170 (§4.170): the memo-identity fold ledger.
+        // The `memo_migrations` table is created by CREATE TABLE IF NOT
+        // EXISTS above, so no structural step is needed, and the fold itself
+        // deliberately does NOT run here: it executes at the two ACI-write
+        // seams (account sync, link.finish) where the identity is fresh and
+        // the conversation.changed lane exists, not at database-open time.
     }
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -9407,6 +9820,479 @@ mod tests {
             .collect();
         assert_eq!(other_marked.len(), 1);
         assert_eq!(other_marked[0].id, other_own.id);
+
+        // Contract 1.170 (§4.170): once the account carries an ACI, the ACI
+        // key marks the same way the number always did — and the own-number
+        // key redirects to the canonical ACI row, so the two faces agree.
+        let other_aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        store.set_account_aci(&other.id, Some(&other_aci)).unwrap();
+        let canonical = store
+            .ensure_conversation(&other.id, "direct", "+15555550199", "Other Self")
+            .unwrap();
+        assert_eq!(canonical.peer_key, other_aci, "the number key redirects");
+        assert!(
+            store
+                .conversation_summary(&other.id, &canonical.id)
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+        let canonical_listed = store.list_conversations(&other.id, 10, None).unwrap();
+        assert_eq!(
+            canonical_listed
+                .items
+                .iter()
+                .filter(|row| row.is_self)
+                .count(),
+            2,
+            "shell and canonical both mark until the fold retires the shell"
+        );
+        // The store-level fold (§4.170) is what retires the shell: after it
+        // the list marks exactly the canonical row.
+        let folded = store.normalize_memo_identity(&other.id).unwrap().unwrap();
+        assert_eq!(folded.id, canonical.id);
+        let folded_listed = store.list_conversations(&other.id, 10, None).unwrap();
+        let folded_marked: Vec<_> = folded_listed
+            .items
+            .iter()
+            .filter(|row| row.is_self)
+            .collect();
+        assert_eq!(
+            folded_marked.len(),
+            1,
+            "one self conversation after the fold"
+        );
+        assert_eq!(folded_marked[0].id, canonical.id);
+        // A foreign UUID-shaped peer key still never marks (the §4.24
+        // boundary lives on for peers that are not the account itself).
+        let stranger = store
+            .ensure_conversation(
+                &other.id,
+                "direct",
+                "0b7fca57-1234-4d0e-9b0f-4f6c1f8a2e10",
+                "Stranger",
+            )
+            .unwrap();
+        assert!(
+            !store
+                .conversation_summary(&other.id, &stranger.id)
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+    }
+
+    /// Seed one message row with explicit signal-identity fields (the fold's
+    /// dedupe tuple: direction, sent_at, sender_id).
+    fn seed_memo_message(
+        store: &Store,
+        account_id: &str,
+        conversation_id: &str,
+        id: &str,
+        direction: &'static str,
+        sender_id: &str,
+        sent_at: u64,
+    ) {
+        let record = MessageRecord {
+            id: id.into(),
+            account_id: account_id.into(),
+            conversation_id: conversation_id.into(),
+            direction,
+            sender_id: sender_id.into(),
+            sender_name: None,
+            mentions_self: false,
+            sent_at,
+            received_at: None,
+            text: Some("memo body".into()),
+            text_bytes: Some(9),
+            text_truncated: false,
+            text_retrievable: true,
+            status: "sent",
+            client_request_id: None,
+            quote_message_id: None,
+            quote_snapshot: None,
+            attachments: Vec::new(),
+            edited_at: None,
+            rich: None,
+            reactions: Vec::new(),
+            edits: Vec::new(),
+            delivered_at: None,
+            read_at: None,
+            viewed_at: None,
+            sticker: None,
+            expire_seconds: None,
+            expire_start_at: None,
+            admin_deleted: false,
+            server_guid: None,
+            server_timestamp: None,
+            is_story: false,
+            story_message: None,
+        };
+        assert!(
+            store
+                .insert_message(&record, None, Some("memo body"), false)
+                .unwrap(),
+            "seeded rows never collide"
+        );
+    }
+
+    /// Contract 1.170 (§4.170), the fold: the number-keyed shell's messages
+    /// (deduplicated by signal identity), reactions, pin, draft and merged
+    /// state land on the canonical ACI-keyed row, the shell row is deleted,
+    /// and the ledger row records the fold with the rollback snapshot.
+    #[test]
+    fn memo_migration_folds_the_number_shell_into_the_canonical_aci_row() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "8fc***e2")
+            .unwrap();
+        let canonical = store
+            .ensure_conversation(&account.id, "direct", &aci, "Canonical")
+            .unwrap();
+        assert_ne!(shell.id, canonical.id, "two keys, two rows before the fold");
+
+        // Shell-side material: two unique messages, one duplicate of a
+        // canonical message (same direction+sent_at+sender_id), a reaction,
+        // a pin and a draft. The canonical side holds its own copy of the
+        // duplicate identity plus one unique message, a masked-canonical
+        // title and a higher unread count.
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-shell-1",
+            "outgoing",
+            "self",
+            1_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-shell-2",
+            "incoming",
+            "+15555550101",
+            2_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-dup-shell",
+            "incoming",
+            "+15555550101",
+            3_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &canonical.id,
+            "m-dup-canonical",
+            "incoming",
+            "+15555550101",
+            3_000,
+        );
+        seed_memo_message(
+            &store,
+            &account.id,
+            &canonical.id,
+            "m-canonical-1",
+            "outgoing",
+            "self",
+            4_000,
+        );
+        store
+            .upsert_reaction_event(&account.id, &shell.id, "👍", 2_000, "actor-1", false, None)
+            .unwrap();
+        store
+            .upsert_reaction_event(
+                &account.id,
+                &canonical.id,
+                "🎉",
+                4_000,
+                "actor-2",
+                false,
+                None,
+            )
+            .unwrap();
+        store
+            .upsert_conversation_pin(&account.id, &shell.id, "+15555550101", 2_000, None)
+            .unwrap();
+        store
+            .save_conversation_draft(&account.id, &shell.id, 5_000)
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE conversations SET unread_count=7, muted=1, last_message_at=5000,
+                        last_message_preview='shell newest' WHERE id=?1",
+                params![shell.id],
+            )
+            .unwrap();
+
+        store.set_account_aci(&account.id, Some(&aci)).unwrap();
+        let summary = store.normalize_memo_identity(&account.id).unwrap();
+        let summary = summary.expect("a shell must fold");
+
+        // The shell is gone; the canonical row carries the folded state.
+        assert_eq!(summary.id, canonical.id);
+        assert!(summary.is_self, "the canonical row marks as self");
+        assert!(
+            store
+                .conversation_by_peer(&account.id, "direct", "+15555550100")
+                .unwrap()
+                .is_none(),
+            "the number-keyed shell row is deleted"
+        );
+        let folded = store
+            .conversation_summary(&account.id, &canonical.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(folded.unread_count, 7, "unread takes the MAX");
+        assert!(folded.muted, "muted ORs");
+        assert!(
+            !title_should_upgrade(&folded.title, "8fc***e2"),
+            "a real title never upgrades to a mask"
+        );
+
+        // Messages: the union of both rows, duplicates collapsed onto the
+        // canonical copy, every survivor keyed to the canonical conversation.
+        let count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4, "five seeded rows minus the one duplicate");
+        let shell_leftovers: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
+                params![shell.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shell_leftovers, 0);
+        let kept: String = store
+            .conn()
+            .query_row(
+                "SELECT id FROM messages WHERE direction='incoming' AND sent_at=3000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept, "m-dup-canonical",
+            "the canonical copy wins the dedupe"
+        );
+        // Reactions: both survive, none left on the shell.
+        assert_eq!(store.count_reaction_events(&account.id).unwrap(), 2);
+        // Pin and draft moved with the conversation.
+        let moved: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM conversation_pins WHERE conversation_id=?1",
+                params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 1);
+        let draft: Option<i64> = store
+            .conn()
+            .query_row(
+                "SELECT draft_timestamp FROM conversation_drafts WHERE conversation_id=?1",
+                params![canonical.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(draft, Some(5_000));
+        // The ledger row records the fold with the rollback snapshot.
+        let (ledger_aci, ledger_source, rollback): (String, String, String) = store
+            .conn()
+            .query_row(
+                "SELECT canonical_aci, source_peer_key, rollback_json FROM memo_migrations
+                 WHERE account_id=?1",
+                params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ledger_aci, aci);
+        assert_eq!(ledger_source, "+15555550100");
+        let snapshot: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(snapshot["id"], shell.id.as_str());
+        assert_eq!(
+            snapshot["droppedMessageIds"],
+            json!(["m-dup-shell"]),
+            "the deduplicated copy rides the ledger"
+        );
+    }
+
+    /// Contract 1.170 (§4.170): the fold is idempotent and honestly a no-op
+    /// on the faces that have nothing to fold — no ACI, no shell, and a
+    /// folded account (the second run must not reannounce).
+    #[test]
+    fn memo_migration_is_idempotent_and_skips_accounts_without_shell_or_aci() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let no_aci = store
+            .upsert_account_from_signal("+15555550101", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store
+            .ensure_conversation(&no_aci.id, "direct", "+15555550101", "Shell")
+            .unwrap();
+        assert!(
+            store.normalize_memo_identity(&no_aci.id).unwrap().is_none(),
+            "no ACI: nothing keys the canonical row"
+        );
+
+        let aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+        let shellless = store
+            .upsert_account_from_signal("+15555550102", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        store.set_account_aci(&shellless.id, Some(&aci)).unwrap();
+        assert!(
+            store
+                .normalize_memo_identity(&shellless.id)
+                .unwrap()
+                .is_none(),
+            "no shell: nothing folds, and no canonical placeholder is created"
+        );
+        let listed = store.list_conversations(&shellless.id, 10, None).unwrap();
+        assert!(
+            listed.items.is_empty(),
+            "the fold never materializes an empty self chat"
+        );
+
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Self")
+            .unwrap();
+        seed_memo_message(
+            &store,
+            &account.id,
+            &shell.id,
+            "m-1",
+            "outgoing",
+            "self",
+            1_000,
+        );
+        store.set_account_aci(&account.id, Some(&aci)).unwrap();
+        store
+            .normalize_memo_identity(&account.id)
+            .unwrap()
+            .expect("the first run folds");
+        let (first_stamp, first_rollback): (i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT migrated_at, rollback_json FROM memo_migrations WHERE account_id=?1",
+                params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            store
+                .normalize_memo_identity(&account.id)
+                .unwrap()
+                .is_none(),
+            "the second run finds no shell"
+        );
+        let (second_stamp, second_rollback): (i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT migrated_at, rollback_json FROM memo_migrations WHERE account_id=?1",
+                params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (first_stamp, first_rollback),
+            (second_stamp, second_rollback),
+            "the ledger is untouched by a no-op run"
+        );
+    }
+
+    /// Contract 1.170 (§4.170): once the account carries an ACI, the
+    /// own-number direct key redirects to the canonical ACI key at
+    /// `ensure_conversation` — the shell is never created through the
+    /// redirected door — the answer is stable across both spellings, the
+    /// degenerate `aci == number` answer redirects nothing, and the
+    /// canonical row reads `isSelf` on both the single-row and the list
+    /// face.
+    #[test]
+    fn canonical_aci_key_redirects_the_own_number_and_marks_is_self() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path(), Some(test_store_key())).unwrap();
+        let account = store
+            .upsert_account_from_signal("+15555550100", Some(1), DEFAULT_PROXY_GROUP_ID)
+            .unwrap();
+        let aci = canonical_aci("18E2E00B2AC755ECA25DD5646A80C042").unwrap();
+
+        // Before the ACI lands, the own-number key materializes (the §4.42
+        // shape) and marks self by the number.
+        let shell = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Note to Self")
+            .unwrap();
+        assert_eq!(shell.peer_key, "+15555550100");
+        assert!(
+            store
+                .conversation_summary(&account.id, &shell.id)
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+
+        store.set_account_aci(&account.id, Some(&aci)).unwrap();
+
+        // The own-number call now answers the canonical ACI-keyed row; a
+        // second shell is never created behind the redirect.
+        let canonical = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Note to Self")
+            .unwrap();
+        assert_eq!(canonical.peer_key, aci, "the number key redirects");
+        assert_ne!(canonical.id, shell.id);
+        let canonical_by_key = store
+            .ensure_conversation(&account.id, "direct", &aci, "Note to Self")
+            .unwrap();
+        assert_eq!(canonical_by_key.id, canonical.id, "stable across spellings");
+
+        // The canonical row reads `isSelf` on both faces. The pre-existing
+        // number-keyed shell still marks too — the fold, not the redirect,
+        // is what retires it.
+        assert!(
+            store
+                .conversation_summary(&account.id, &canonical.id)
+                .unwrap()
+                .unwrap()
+                .is_self
+        );
+        let listed = store.list_conversations(&account.id, 10, None).unwrap();
+        let marked: Vec<_> = listed.items.iter().filter(|row| row.is_self).collect();
+        assert_eq!(
+            marked.len(),
+            2,
+            "shell and canonical both mark until the fold"
+        );
+        assert!(marked.iter().any(|row| row.id == canonical.id));
+
+        // The degenerate answer — an ACI equal to the number — redirects
+        // nothing: the number key keeps answering the number-keyed row.
+        store
+            .set_account_aci(&account.id, Some("+15555550100"))
+            .unwrap();
+        let degenerate = store
+            .ensure_conversation(&account.id, "direct", "+15555550100", "Note to Self")
+            .unwrap();
+        assert_eq!(degenerate.peer_key, "+15555550100");
+        assert_eq!(degenerate.id, shell.id, "the shell answers as itself");
     }
 
     /// Contract 1.44 (§4.43): `contacts.list` marks exactly the linked

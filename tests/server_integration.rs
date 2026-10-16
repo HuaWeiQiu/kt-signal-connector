@@ -814,6 +814,10 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
     )
     .await;
     let account_id = finished["result"]["id"].as_str().unwrap().to_string();
+    // Contract 1.170 (§4.170): the self chat's canonical key is this ACI —
+    // the skeleton below materializes under it, and the self send dispatches
+    // to it (the same Signal identity the number names).
+    let self_aci = finished["result"]["aci"].as_str().unwrap();
 
     // The cached-counts answer proves the sync transaction (rows + marker)
     // committed, so the skeletons below are deterministic.
@@ -868,7 +872,11 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
     assert_eq!(sent["result"]["status"], "sent");
     assert_eq!(sent["result"]["conversationId"], conversation_id);
 
-    // The upstream dispatch carries the self recipient verbatim.
+    // The upstream dispatch carries the self recipient. Contract 1.170
+    // (§4.170): the canonical ACI-keyed row is what the send path reads, so
+    // the dispatch targets the ACI — the same Signal identity the number
+    // names (the engine's resolve_recipient parses a UUID service id on its
+    // first ladder arm, verified read-only in §4.170).
     let send_log = fs::read_to_string(
         temp.path()
             .join("signal-data")
@@ -881,7 +889,7 @@ async fn note_to_self_skeleton_marks_the_wire_and_send_reaches_the_upstream() {
         .find(|entry: &Value| entry["message"] == "note to myself")
         .expect("the self send must reach the upstream engine");
     assert_eq!(dispatch["account"], "+15555550100");
-    assert_eq!(dispatch["recipient"], json!(["+15555550100"]));
+    assert_eq!(dispatch["recipient"], json!([self_aci]));
 
     // The row landed on the self conversation and the marker stays.
     let relisted = request(
